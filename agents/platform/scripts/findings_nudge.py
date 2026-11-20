@@ -26,8 +26,34 @@ and recommendations from the detectors that registered the findings. Each run:
    objects each item covers so replies in the thread act on the right rows
    without printing ids in chat.
 4. Writes the sidecar card, prints the fallback text, records the day's state
-   in the profile home, and marks every named row surfaced as the paced
-   publisher.
+   in the profile home (the daily part sent, the items announced today), then
+   marks every named row surfaced as the paced publisher, which is what makes
+   an addition pending and records it against the day. An announced item
+   counts against the day from the state file alone while its marks have not
+   landed.
+
+Nothing is added before the first inventory report is out (its delivery
+claimed, or on the conversation path its post's outcome recorded), so that
+report is the first thing onboarding says about the fleet. The hold ends
+``FIRST_REPORT_HOLD_HOURS`` (24) after onboarding filed its sweep, delivered or
+not: an undelivered report by then means onboarding stalled, and holding on
+would keep the queue silent for good. Each run that is held, or would be but
+for that limit, says which on stderr. A run that cannot read the queue, or
+fails in any other way before it prints, fails (exit 1, which the scheduler
+posts as a failure) once a UTC day; later failures that day go to stderr and
+exit 0.
+
+The bookkeeping is best-effort, and what a failed write costs: an addition
+whose marks all fail is not offered again the same day (the state file
+remembers it), still counts against that day's limit, and holds additions back
+as a pending item of its class would, though the stop-add notice does not name
+it. Unlike a recorded addition, it counts only while undecided: a decision on
+it the same day refunds its slot. It is offered as new the next day. When only
+some of an addition's marks fail, the addition is on record: a member left new
+waits for the next day and does not count again; a non-critical one does not
+stop additions, and a critical one holds non-criticals back as a critical
+waiting for the budget does. If the state file cannot be written
+either, the same additions and the daily part are posted again every hour.
 """
 
 from __future__ import annotations
@@ -71,18 +97,38 @@ PROFILES_DIR = "profiles"
 STATE_FILE = ".findings_nudge_state.json"
 DAILY_KEY = "daily_section"
 FAILURE_KEY = "failure_reported"
+# {"day": <UTC date>, "keys": [<item key>, ...], "ids": [<member id>, ...]}:
+# what was added today and the members it named, so a mark that failed does
+# not announce the same item again an hour later, and the item still counts
+# against the day and holds additions back (`pace`). A row that joins the line
+# later is not one of the ids, so it does not hold anything back. An item
+# whose additions today are all in the queue's record (some marks succeeded)
+# does not count again; it waits for tomorrow (`pace`). A record an
+# older build wrote today has no "ids"; the key alone decides until the day ends.
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_DAY = "day"
 ANNOUNCED_KEYS = "keys"
 ANNOUNCED_IDS = "ids"
+# The run id sent with an addition's marks: one per run, so the members of an
+# item marked one by one are one addition.
 RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # Onboarding's markers (`bootstrap_scan_gate.py`, `bootstrap_delivery.py`).
+# Filed and not yet delivered means a first report is on its way.
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 DELIVERED_MARKER = ".bootstrap_completed"
+# A claim on the conversation path is one attempt and can
+# be released; the report is out only once this outcome marker exists
+# (bootstrap_delivery.py, CONVERSATION_FILE, CONVERSATION_ALIGNED_MARKER and
+# CONVERSATION_DONE_FILE).
 CONVERSATION_MARKERS = ("onboarding_conversation.json", ".user_aligned_conversation")
 CONVERSATION_DONE_MARKER = ".bootstrap_conversation_done"
+# The line of the filed marker holding when it was filed, in Unix seconds.
+# The marker's mtime stands in when the line is missing or unreadable.
 FILED_AT_PREFIX = "filed_at="
+# How long after the sweep was filed the first report is waited for. A report
+# still undelivered by then means onboarding stalled, and holding on would add
+# nothing ever again.
 FIRST_REPORT_HOLD_HOURS = 24
 FIRST_REPORT_HOLD = timedelta(hours=FIRST_REPORT_HOLD_HOURS)
 TIME_FORMAT = "%Y-%m-%d %H:%M UTC"
@@ -234,19 +280,26 @@ def _filed_at(marker: Path) -> tuple[datetime, str] | None:
     try:
         for line in marker.read_text(encoding="utf-8").splitlines():
             if line.startswith(FILED_AT_PREFIX):
-                seconds = int(line[len(FILED_AT_PREFIX) :].strip())
+                seconds = int(line[len(FILED_AT_PREFIX):].strip())
                 return datetime.fromtimestamp(seconds, timezone.utc), f"its {FILED_AT_PREFIX} line"
     except (OSError, ValueError, OverflowError):
         pass
     try:
         mtime = marker.stat().st_mtime
     except OSError:
+        # Removed since the caller saw it, as the re-arm runbook does.
         return None
     return datetime.fromtimestamp(mtime, timezone.utc), "its mtime"
 
 
 def first_report_markers(gateway_home: Path) -> tuple[Path, Path]:
-    """The sweep marker, and the marker that says the first report is out."""
+    """The sweep marker, and the marker that says the first report is out.
+
+    Out is the delivery claim, or on the conversation path
+    the recorded outcome, because a claim there can be released and taken
+    again. The board snapshot reads the same pair for the Home tab, and ends
+    its state early once delivery has registered the sweep's findings.
+    """
     filed, delivered = gateway_home / SCAN_FILED_MARKER, gateway_home / DELIVERED_MARKER
     if any((gateway_home / name).exists() for name in CONVERSATION_MARKERS):
         delivered = gateway_home / CONVERSATION_DONE_MARKER
@@ -254,7 +307,13 @@ def first_report_markers(gateway_home: Path) -> tuple[Path, Path]:
 
 
 def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
-    """Whether to add nothing yet, and the line to log about it ("" for none)."""
+    """Whether to add nothing yet, and the line to log about it ("" for none).
+
+    Held while onboarding has filed its sweep, has not delivered the report,
+    and filed it no more than `FIRST_REPORT_HOLD` ago. An install where
+    onboarding never started (the experimental front door does not run it)
+    has neither marker and is not held.
+    """
     filed, delivered = first_report_markers(gateway_home)
     if not filed.exists() or delivered.exists():
         return False, ""
@@ -777,6 +836,9 @@ def _report_failure(home: Path, state: dict, today: str) -> int:
 
 
 def _mark(endpoint: str, item, added_class: str = "", run: str = "") -> None:
+    # After the message, and best-effort: a failure costs the bookkeeping, not
+    # the message, which is already out. An addition that is not marked is
+    # offered again on a later day.
     body = {"publisher": PUBLISHER}
     if added_class:
         body["added_class"] = added_class
@@ -799,6 +861,9 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
     gateway_home, home = _homes()
     state = _load_state(home)
 
+    # Before the read, so a snooze that lapsed since the last run is back on
+    # the list this run reads. Best-effort: a failed expiry costs an hour of
+    # lateness for snoozed rows, not the message.
     try:
         _request(endpoint, "/v1/findings/expire-snoozes", {})
     except Exception as exc:
@@ -809,9 +874,13 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
         added_today = _request(endpoint, f"/v1/findings/additions?day={today}")
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError, AttributeError) as exc:
         detail = exc.read().decode("utf-8", "replace") if isinstance(exc, urllib.error.HTTPError) else str(exc)
+        # Nothing on stdout: a run that could not read the queue must not read
+        # as a quiet hour.
         sys.stderr.write(f"{LOG_PREFIX}: could not read the queue at {endpoint}: {detail}\n")
         return _report_failure(home, state, today)
 
+    # Anything else that breaks before the message is out is also one failure
+    # post a day, not one an hour.
     try:
         held, why = first_report_hold(gateway_home, now)
         if why:
@@ -827,13 +896,8 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
         else:
             announced_ids = None
         plan = fq.pace(
-            rows,
-            now,
-            fq.pacing_limits(os.environ),
-            added_today,
-            may_add=not held,
-            announced=announced_keys,
-            announced_ids=announced_ids,
+            rows, now, fq.pacing_limits(os.environ), added_today,
+            may_add=not held, announced=announced_keys, announced_ids=announced_ids,
         )
         daily = now.hour >= fq.REMIND_HOUR and state.get(DAILY_KEY) != today
         open_count = len({fq.item_key(row) for row in rows if not fq.rolled_up(row)}) + plan.rolled_up
@@ -848,12 +912,12 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
         sys.stdout.write(bundle.text + "\n")
         sys.stdout.flush()
 
+    # Before the marks, so a mark that raises cannot cost the record that the
+    # message went out.
     if plan.add:
         record = {ANNOUNCED_DAY: today, ANNOUNCED_KEYS: announced_keys + [list(item.key) for item in plan.add]}
         if announced_ids is not None:
-            record[ANNOUNCED_IDS] = announced_ids + [
-                str(member.get("id")) for item in plan.add for member in item.members
-            ]
+            record[ANNOUNCED_IDS] = announced_ids + [str(member.get("id")) for item in plan.add for member in item.members]
         state[ANNOUNCED_KEY] = record
     if daily:
         state[DAILY_KEY] = today
@@ -864,6 +928,8 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
     for item in plan.add:
         _mark(endpoint, item, item.item_class, run)
     if daily:
+        # Marking a reminded or blocking item also shows any member that joined
+        # it since, so that member is pending with the rest of its line.
         for item in plan.remind + plan.blocking:
             _mark(endpoint, item)
     return 0
