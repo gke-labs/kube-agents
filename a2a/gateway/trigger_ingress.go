@@ -518,7 +518,18 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	out := lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	if task.Final {
+		// How the run's report was delivered, from its SCHEDULED_REPORTS
+		// record (scheduled_reports.go): omitted while there is none or it
+		// can't be read, so the reconciler asks again.
+		if delivery, err := g.scheduledRunStatus(ctx, rec, q.TaskID); err != nil {
+			g.log.Warn("scheduled report status unreadable; the status reply omits it", "taskId", q.TaskID, "err", err)
+		} else {
+			out.Delivery = delivery
+		}
+	}
+	return out
 }
 
 // triggerConversationKey is a trigger's own conversation:
