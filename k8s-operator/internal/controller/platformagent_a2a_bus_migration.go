@@ -1244,6 +1244,8 @@ func a2aStreamPolicies(agent *agentv1alpha1.PlatformAgent, replicas int) []busmi
 		kv("PROFILE_LEASES", 67108864, 0),
 		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1, a2aProfileDurablesAllowed),
 		stream(a2aDispatchStopStream, []string{"a2a.stop.>"}, day, 67108864, 1, 1),
+		kv(a2aScheduledReportsBucket, 268435456, 90*day),
+		kv(a2aScheduleThreadsBucket, 8388608, 2*day),
 	}
 }
 

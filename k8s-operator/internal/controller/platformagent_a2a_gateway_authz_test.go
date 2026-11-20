@@ -275,6 +275,37 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$KV.people delete (purgePeople)", people.Delete(ctx, personKey))
 
+	// A schedule's runs (a2a/gateway/scheduled_reports.go): bound, a run's
+	// record read back (absent), created, and updated in place.
+	reports, err := js.KeyValue(ctx, a2aScheduledReportsBucket)
+	allowed("STREAM.INFO KV_SCHEDULED_REPORTS (deliverScheduledReport js.KeyValue)", err)
+	const reportKey = "compliance-audit.task-0123456789abcdef"
+	_, err = reports.Get(ctx, reportKey)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		err = nil
+	}
+	allowed("DIRECT.GET KV_SCHEDULED_REPORTS (getScheduledReport)", err)
+	rev, err := reports.Create(ctx, reportKey, []byte(`{"status":"posting"}`))
+	allowed("$KV.SCHEDULED_REPORTS create (putScheduledReport)", err)
+	_, err = reports.Update(ctx, reportKey, []byte(`{"status":"posted"}`), rev)
+	allowed("$KV.SCHEDULED_REPORTS update (putScheduledReport)", err)
+
+	// A schedule's thread for the day (a2a/gateway/schedule_threads.go):
+	// bound, read (absent), claimed, filled in, and a claim released.
+	threads, err := js.KeyValue(ctx, a2aScheduleThreadsBucket)
+	allowed("STREAM.INFO KV_SCHEDULE_THREADS (threadStore js.KeyValue)", err)
+	const threadKey = "compliance-audit.2026-11-16"
+	_, err = threads.Get(ctx, threadKey)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		err = nil
+	}
+	allowed("DIRECT.GET KV_SCHEDULE_THREADS (getScheduleThread)", err)
+	trev, err := threads.Create(ctx, threadKey, []byte(`{"claim":"task-1"}`))
+	allowed("$KV.SCHEDULE_THREADS create, the day's claim (putScheduleThread)", err)
+	trev, err = threads.Update(ctx, threadKey, []byte(`{"threadId":"t1"}`), trev)
+	allowed("$KV.SCHEDULE_THREADS update, the day's thread (putScheduleThread)", err)
+	allowed("$KV.SCHEDULE_THREADS delete, a released claim", threads.Delete(ctx, threadKey, jetstream.LastRevision(trev)))
+
 	if v := log.publishViolations("gateway"); len(v) != 0 {
 		t.Errorf("the gateway's own operations tripped %d publish violations; each is a grant a2aGatewayJetStreamGrants is missing:\n%s",
 			len(v), strings.Join(v, "\n"))
