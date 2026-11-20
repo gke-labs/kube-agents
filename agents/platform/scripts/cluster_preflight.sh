@@ -493,15 +493,15 @@ if [ "$STATUS" = "ok" ]; then
         fi
         # A hold or an exclusion is the platform's operators keeping the agents
         # out, not a cluster that can't be reached: say so, and nothing else.
-        if printf '%s' "$ERR" | grep -Eq "$SCOPE_UNREADABLE_REFUSAL_RE"; then
+        if grep -Eq "$SCOPE_UNREADABLE_REFUSAL_RE" <<<"$ERR"; then
             REASON_5="$SCOPE_UNREADABLE_REASON"
             REMEDIATION_5="$SCOPE_UNREADABLE_REMEDIATION"
-        elif printf '%s' "$ERR" | grep -Eq "$SCOPE_HOLD_REFUSAL_RE"; then
+        elif grep -Eq "$SCOPE_HOLD_REFUSAL_RE" <<<"$ERR"; then
             REASON_5="The target cluster is on hold by the platform's operators (spec.hold): kube-proxy and the credential broker refuse its API to every agent."
             HOLD_REASON="$(printf '%s' "$ERR_ONE" | sed -n "$SCOPE_HOLD_REASON_SED" | head -n 1 | cut -c1-"$SCOPE_HOLD_REASON_MAX_CHARS")"
             [ -n "$HOLD_REASON" ] && REASON_5="$REASON_5 Reason given: $HOLD_REASON."
             REMEDIATION_5="$SCOPE_HOLD_REMEDIATION"
-        elif printf '%s' "$ERR" | grep -Eq "$SCOPE_EXCLUDE_REFUSAL_RE"; then
+        elif grep -Eq "$SCOPE_EXCLUDE_REFUSAL_RE" <<<"$ERR"; then
             REASON_5="The target cluster is excluded from this install's scope (spec.scope.exclude.clusters): kube-proxy and the credential broker refuse its API to every agent."
             REMEDIATION_5="$SCOPE_EXCLUDE_REMEDIATION"
         fi
