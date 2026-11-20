@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -135,7 +136,7 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 			return "the last bus migration failed and waits for a person (retry or abandon it first)", "failed", false
 		}
 	}
-	if !busProvisioned(agent) {
+	if !busProvisioned(agent) && !r.busProvisionRefusedOnlyForWidth(ctx, agent) {
 		return "the bus is not provisioned yet", "unprovisioned", false
 	}
 	if busMigrationImage() == "" {
@@ -163,6 +164,34 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 		return over, "over-cap", false
 	}
 	return "", "", false
+}
+
+// busProvisionRefusedOnlyForWidth reports a bus whose provision Job failed
+// by its podFailurePolicy: the script's exit 2, which by its own convention
+// is only the closing max_consumers gate, reached once every stream and
+// bucket exists and the one limit is short. That is the state a reshape
+// fixes, so it counts as provisioned for one, though BusProvisioned is not
+// set: a reshape given up before its clear (or whose rollback put a narrow
+// TASKS back) drops the condition, and the provision Job that runs next
+// refuses the narrow TASKS, so the condition would never come back and no
+// reshape could start (#6598). A Job failed any other way (its backoff
+// spent: the bus down, a stream missing) is not this, and refuses as before.
+func (r *PlatformAgentReconciler) busProvisionRefusedOnlyForWidth(ctx context.Context, agent *agentv1alpha1.PlatformAgent) bool {
+	var jobs batchv1.JobList
+	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
+		a2aComponentLabel: a2aProvisionComponent,
+		labelInstance:     instanceLabel(agent.Namespace, agent.Name),
+	}); err != nil {
+		return false
+	}
+	for i := range jobs.Items {
+		for _, c := range jobs.Items[i].Status.Conditions {
+			if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue && c.Reason == batchv1.JobReasonPodFailurePolicy {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // maybeStartBusReshape starts a reshape when the annotation asks for one

@@ -503,3 +503,78 @@ func TestTheReshapeRecordsAreForgottenWithTheCR(t *testing.T) {
 		t.Error("the hold Warning record outlived the CR")
 	}
 }
+
+// The reshape counts a provision Job failed by its podFailurePolicy (exit 2)
+// as provisioned, because exit 2 is only the closing max_consumers gate
+// (busProvisionRefusedOnlyForWidth). The rendered script must keep it so:
+// exactly one `exit 2`, inside the block that compares the live TASKS width
+// with the required one, and no exit taking its status from a variable.
+func TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate(t *testing.T) {
+	script := buildA2AProvisionJob(a2aTestAgent()).Spec.Template.Spec.Containers[0].Command[2]
+	lines := strings.Split(script, "\n")
+	var exits []int
+	for i, l := range lines {
+		f := strings.Fields(l)
+		for j := 0; j+1 < len(f); j++ {
+			if f[j] == "exit" && (f[j+1] == "2" || strings.HasPrefix(f[j+1], "$") || strings.HasPrefix(f[j+1], `"$`)) {
+				exits = append(exits, i)
+			}
+		}
+	}
+	if len(exits) != 1 {
+		t.Fatalf("%d exits with status 2 or a variable status in the provision script, want exactly 1 (the max_consumers gate): lines %v", len(exits), exits)
+	}
+	// The innermost if still open at the exit is the consumer gate.
+	depth, gate := 0, ""
+	for i := exits[0]; i >= 0; i-- {
+		l := strings.TrimSpace(lines[i])
+		switch {
+		case l == "fi":
+			depth++
+		case strings.HasPrefix(l, "if "):
+			if depth == 0 {
+				gate = l
+				i = -1
+			} else {
+				depth--
+			}
+		}
+	}
+	if !strings.Contains(gate, "live_consumers") || !strings.Contains(gate, "required_consumers") {
+		t.Errorf("the provision script's exit 2 sits under %q, want the live-vs-required max_consumers gate", gate)
+	}
+}
+
+// A reshape given up before its clear drops BusProvisioned, and the
+// provision Job that runs next refuses the narrow TASKS at its consumer
+// gate (failed by its podFailurePolicy). That bus counts as provisioned for
+// a reshape, so a new request starts one; a Job failed any other way (its
+// backoff spent) still refuses as not provisioned (#6598).
+func TestAReshapeStartsOnABusRefusedOnlyForWidth(t *testing.T) {
+	for _, c := range []struct {
+		reason string
+		starts bool
+	}{{batchv1.JobReasonPodFailurePolicy, true}, {batchv1.JobReasonBackoffLimitExceeded, false}} {
+		m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
+		meta.RemoveStatusCondition(&m.agent.Status.Conditions, busProvisionedConditionType)
+		m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationReshape), RunID: "3" + busReshapeRunSuffix("first"), Phase: string(busMigrationFailed), FailedIn: string(busMigrationHashing), GivenUp: true}
+		job := buildA2AProvisionJob(m.agent)
+		m.own(job)
+		if err := m.cl.Create(context.Background(), job); err != nil {
+			t.Fatal(err)
+		}
+		job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: c.reason}}
+		if err := m.cl.Status().Update(context.Background(), job); err != nil {
+			t.Fatal(err)
+		}
+		m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "second"}
+		if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+			t.Fatal(err)
+		}
+		run := m.agent.Status.BusMigration
+		started := run.Leg == string(busMigrationReshape) && strings.HasSuffix(run.RunID, busReshapeRunSuffix("second"))
+		if started != c.starts {
+			t.Errorf("provision Job failed with %s: reshape started %v, want %v (run %+v, events %q)", c.reason, started, c.starts, run, m.reshapeEvents())
+		}
+	}
+}
