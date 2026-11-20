@@ -118,7 +118,7 @@ func a2aStatefulSetFullyOnTemplate(sts *appsv1.StatefulSet) bool {
 // and names the first that doesn't. Comparing the live template's image, not
 // only the rollout, keeps a reader from an older release that happens to be
 // fully rolled out (a pass that failed before re-applying it) from opening the
-// gate; an install that pins an older agent image, and so an older bridge,
+// gate; an install that pins an agent image other than this release's, and so another bridge,
 // stays on the five-token form.
 func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
 	ok, blocker, _, err := r.a2aSupervisorReadersCheck(ctx, agent)
@@ -220,7 +220,7 @@ func (r *PlatformAgentReconciler) a2aProfileSupervisorFormAndHold(ctx context.Co
 const a2aProfileSupervisorFormHeldReason = "ReaderNotOnReleaseImage"
 
 func profileSupervisorFormHeldMessage(heldBy string) string {
-	return heldBy + " is rendered on an image older than this release's (the hermes-bridge of a pinned spec.deployment.image), so profile terminals stay on the five-token supervisor subject; a later release that drops that subject keeps it for this install while this holds, and raising or removing the pin clears it"
+	return heldBy + " is rendered on an image other than this release's (the hermes-bridge of a pinned spec.deployment.image), so profile terminals stay on the five-token supervisor subject; a later release that drops that subject keeps it for this install while this holds, and setting the pin to this release's tag or removing it clears it"
 }
 
 // profileSupervisorFormConditionCurrent reports whether the CR already carries
