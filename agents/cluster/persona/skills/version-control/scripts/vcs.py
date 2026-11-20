@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -63,6 +64,22 @@ sys.path.append(PROFILE_WORKER_LIBEXEC)
 import credential_proxy_client  # noqa: E402
 import vcs_client as client  # noqa: E402
 from vcs_client import VcsError  # noqa: E402
+
+# How `main` prints its one JSON object, and what it prints for a document that
+# nests lists and objects deeper than MAX_PRINT_DEPTH. The indented form of N
+# levels has about 2 x N x N characters, because each level is indented by two
+# more spaces: 0.5 MB at 500 levels, 128 MB at 8,000. No answer of the broker is
+# near the bound, and each encoder that the skill runs on takes 500 levels.
+# An answer deeper than the bound is not printed: the verb's request reached the
+# broker, so the text says that it may have taken effect, and a caller does not
+# send a write again without a look. A refusal keeps its strings and numbers
+# (`error`, `code`); a part that is a list or an object is left out.
+JSON_INDENT = 2
+MAX_PRINT_DEPTH = 500
+ANSWER_TOO_DEEP_TEXT = (
+    "the answer is nested too deep to print; the request reached the broker and may have taken effect"
+)
+PART_TOO_DEEP_TEXT = "left out: nested too deep to print"
 
 
 # ---- repository verbs -----------------------------------------------------
@@ -376,11 +393,14 @@ def verb_label_ensure(arguments) -> dict:
 
 
 def verb_identity(arguments) -> dict:
-    return _collaboration(
-        arguments,
-        "identity",
-        {"login": arguments.login, "bot": True if arguments.bot else None},
-    )
+    payload = {"login": arguments.login, "bot": True if arguments.bot else None}
+    if not arguments.repo and os.environ.get(credential_proxy_client.TASK_TOKEN_FILE_ENV) and not client.all_sessions():
+        # A profile worker with nothing named and nothing cloned: ask with no
+        # repository, and the broker answers the install's managed
+        # repositories, the ones it may use (#6389). Elsewhere (the shell) the
+        # old resolution stands, with its "clone first" hint.
+        return client.call("identity", {key: value for key, value in payload.items() if value is not None})
+    return _collaboration(arguments, "identity", payload)
 
 
 def verb_remote_branch_view(arguments) -> dict:
@@ -632,7 +652,9 @@ def build_parser() -> argparse.ArgumentParser:
     repo_option(rdelete).set_defaults(run=verb_remote_branch_delete)
 
     identity = verbs.add_parser(
-        "identity", aliases=["whoami"], help="who this install is on the forge, and whether a login may write"
+        "identity", aliases=["whoami"],
+        help="who this install is on the forge, and whether a login may write; with no repository named "
+        "or cloned, on a profile worker, which repositories this install manages",
     )
     identity.add_argument("--login", help="ask about this login instead of the credential's own")
     identity.add_argument(
@@ -644,13 +666,50 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _nests_deeper_than(document: object, bound: int) -> bool:
+    """Whether `document` nests lists and objects more than `bound` levels. A loop, with no recursion."""
+    layer = [document]
+    for _ in range(bound):
+        layer = [
+            child
+            for node in layer
+            if isinstance(node, (dict, list))
+            for child in (node.values() if isinstance(node, dict) else node)
+        ]
+        if not layer:
+            return False
+    return any(isinstance(node, (dict, list)) for node in layer)
+
+
+def _as_text(document: dict) -> str | None:
+    """`document` as `main` prints it, or None when it nests deeper than MAX_PRINT_DEPTH.
+
+    The RecursionError clause is for an encoder that gives up sooner than the bound.
+    """
+    if _nests_deeper_than(document, MAX_PRINT_DEPTH):
+        return None
+    try:
+        return json.dumps(document, indent=JSON_INDENT)
+    except RecursionError:
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     client.ROOT.mkdir(parents=True, exist_ok=True)
     try:
         answer = arguments.run(arguments)
     except VcsError as exc:
-        print(json.dumps(exc.as_json(), indent=2))
+        refusal = exc.as_json()
+        text = _as_text(refusal)
+        if text is None:
+            text = _as_text(
+                {
+                    key: PART_TOO_DEEP_TEXT if isinstance(value, (dict, list)) else value
+                    for key, value in refusal.items()
+                }
+            )
+        print(text)
         return 1
     except subprocess.TimeoutExpired:
         print(json.dumps({"error": "the local git command timed out"}, indent=2))
@@ -667,7 +726,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 1
-    print(json.dumps(answer, indent=2))
+    text = _as_text(answer)
+    if text is None:
+        print(_as_text({"error": ANSWER_TOO_DEEP_TEXT}))
+        return 1
+    print(text)
     return 0
 
 
