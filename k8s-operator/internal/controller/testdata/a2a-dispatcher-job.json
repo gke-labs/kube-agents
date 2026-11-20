@@ -215,10 +215,6 @@
                 "value": "http://inference-gateway.test-ns.svc.cluster.local"
               },
               {
-                "name": "ANTHROPIC_API_KEY",
-                "value": "a2a-playground"
-              },
-              {
                 "name": "CREDENTIAL_PROXY_URL",
                 "value": "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
               },
@@ -245,6 +241,10 @@
               {
                 "name": "A2A_PROFILE_RESET_PATHS",
                 "value": "/scratch:/home/node:/tmp:/var/run/kube-agents/harness-config:/var/run/kube-agents/task-token"
+              },
+              {
+                "name": "A2A_TASK_SIGNING_PUBLIC_KEYS",
+                "value": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
               }
             ],
             "resources": {

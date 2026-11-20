@@ -431,6 +431,26 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         cr = self._render_cr(values=_proxy_values({"requests": {"cpu": "500n"}}))
         self.assertEqual(_cr_resources(cr), {"requests": {"cpu": "500n"}})
 
+    def test_an_exponent_below_minus_18_fails_naming_the_key(self):
+        # #6196: the CRD pattern admits any exponent, and the operator decodes a large
+        # negative one only after rounding through a big.Int that many digits long.
+        for value in ("1e-99999999999999999999", "1e-19"):
+            with self.subTest(value=value):
+                err = self._render_error([f"{_VALUE_PATH}.requests.cpu={value}"])
+                self.assertIn(f"{_VALUE_PATH}.requests.cpu is {value}, whose exponent is below -18", err)
+        self._render_cr([f"{_VALUE_PATH}.requests.cpu=1e-3"])
+        self._render_cr([f"{_VALUE_PATH}.requests.cpu=1e-18"])
+        # A zero escapes every overflow check, so a positive exponent past 18 on one is
+        # refused here; the operator can't decode 0e99999999999999999999 at all.
+        for value in ("0e99999999999999999999", "0.0e2147483648", "0e19"):
+            with self.subTest(value=value):
+                err = self._render_error([f"{_VALUE_PATH}.requests.cpu={value}"])
+                self.assertIn(f"{_VALUE_PATH}.requests.cpu is {value}, a zero whose exponent is past 18", err)
+        self._render_cr([f"{_VALUE_PATH}.requests.cpu=0e18"])
+        # A value outside the grammar is told so, not about its exponent.
+        err = self._render_error([f"{_VALUE_PATH}.requests.cpu=abce-19"])
+        self.assertIn("which is not a Kubernetes quantity the operator can read", err)
+
     def test_a_quantity_outside_the_grammar_fails_naming_the_key(self):
         for value in ("abc", "1e.5", "2GB"):
             err = self._render_error(values=_proxy_values({"limits": {"memory": value}}))

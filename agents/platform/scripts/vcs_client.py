@@ -209,6 +209,14 @@ BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 #: broker that refused.
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 
+#: What a caller reads for a 2xx answer that nests deeper than the broker
+#: client's bound (`credential_proxy_client.VcsAnswerTooDeep`). The verb's
+#: request reached the broker, so the text does not say "retry": a caller does
+#: not send a write again without a look.
+ANSWER_TOO_DEEP_TEXT = (
+    "the broker's answer is nested too deep to read; the request reached the broker and may have taken effect"
+)
+
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
 #: when the broker answers it with one: a single compact JSON object on its own
 #: line, `{"kube-agents.event": "proposal-opened", "proposal": {url, number,
@@ -290,6 +298,8 @@ def call(verb: str, payload: dict, target: dict | None = None) -> dict:
     """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`).
 
     `target` goes on that record only (`TARGET_FIELD`), never to the broker.
+    An answer that the broker client refuses as nested too deep raises before
+    the record: the proposal can be open with no record line.
     """
     answer = _call(verb, payload)
     if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
@@ -336,7 +346,8 @@ def _say_opened(answer: object, claim: object = None, target: dict | None = None
         return
     try:
         print(json.dumps(record, separators=(",", ":")), file=stream, flush=True)
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, RecursionError):
+        # RecursionError: a `target` of the caller that the encoder cannot take.
         pass
 
 
@@ -447,6 +458,8 @@ def _call(verb: str, payload: dict) -> dict:
             f"answer was complete ({exc}). Retry shortly; if it persists the "
             "broker is restarting under load."
         ) from exc
+    except credential_proxy_client.VcsAnswerTooDeep as exc:
+        raise VcsError(ANSWER_TOO_DEEP_TEXT) from exc
     except ValueError as exc:
         raise VcsError(
             "the broker answered with something that is not JSON; retry, and "

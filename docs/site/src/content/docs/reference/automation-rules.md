@@ -120,6 +120,31 @@ compare the pull requests that carry it with the ones your team merged. Under `o
 merge a pull request that carries `kube-agents:auto-merge`. kube-agents merges nothing in either
 mode.
 
+## When an auto-merged fix is still broken
+
+A fix that carries the `kube-agents:auto-merge` label merged without a human review. When it has
+merged and kube-agents' after-merge check finds the problem still there, it opens pull requests
+against the branch the fix merged into, and comments once on the fix to link them:
+
+- `platform-agent/revert-<number>` undoes the fix's changes, whether it merged as a merge commit, a
+  squash or a rebase. The label decides this, so turning the switch off after a bad auto-merge still
+  gets the revert.
+- With the switch `on`, `platform-agent/automerge-step-down-<number>` adds a deny rule for that kind
+  of fix in that environment to this file. It edits the file in place and keeps everything else you
+  wrote; in a block-style file a comment above the rule names the fix. Delete the rule later to
+  allow those fixes again. Under `off` or `practice` nothing else merges unattended, so no rule is
+  proposed and the comment says so.
+
+Both go through your normal review; kube-agents merges neither. Until the rules change merges, fixes
+of that kind can still merge on their own. A fix a person merged gets only the after-merge report.
+
+When one of the two cannot be made, the comment says why and the other still opens. The revert is
+skipped when the fix's changes no longer undo cleanly, for example because someone already reverted
+it. The rules change is skipped when the file is absent or refused on that branch, already denies
+that kind there, or is laid out in a way kube-agents cannot add a rule to. A failure that persists
+is tried again on later runs, five attempts in all; then kube-agents comments once on the fix with what did and did not
+open, and stops.
+
 ## Check a file
 
 In the install's shell sandbox (the `<name>-shell` Pod), where the agent's checkouts live:

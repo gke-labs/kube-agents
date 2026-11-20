@@ -124,6 +124,12 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
                 "APP_ID": "4675512",
                 "LEDGER_APP_ID": "4739812",
                 "LEDGER_INSTALLATION_ID": "1",
+                # Set beside the two above by ledger_reader_for_project, which
+                # runs after the arguments are parsed, outside this section.
+                "LEDGER_SHARD": "0",
+                "LEDGER_SHARD_COUNT": "1",
+                "LEDGER_READER_SHARD_SIZE": "10",
+                "LEDGER_READER_NUMBER": "1",
             }
         )
         proc = subprocess.run(

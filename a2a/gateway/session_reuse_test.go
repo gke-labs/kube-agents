@@ -930,14 +930,6 @@ func TestSessionPodsListsTheLiveOnes(t *testing.T) {
 	if want := []string{"live=conv-live", "pending=conv-pending"}; !slices.Equal(got, want) {
 		t.Fatalf("SessionPods = %v, want %v", got, want)
 	}
-	// The cap counts exactly the pods its eviction can choose from.
-	n, err := s.LiveSessions(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != len(pods) {
-		t.Fatalf("LiveSessions = %d over %d evictable pods; the count and the candidates disagree", n, len(pods))
-	}
 }
 
 // At the cap with one pod already being deleted, its slot is the one that

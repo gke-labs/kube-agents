@@ -1,5 +1,6 @@
 import email.message
 import http.client
+import http.server
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import threading
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -113,6 +115,74 @@ class GitHubTokenRefreshTest(unittest.TestCase):
                 self.assertIsNone(get_current_git_repo())
 
     @patch("github_token_refresh.subprocess.run")
+    def test_a_credential_in_a_remote_url_is_never_logged(self, run):
+        """Whatever the remote, refused or not, its userinfo never reaches the log."""
+        secret = "s3cr3t-remote-credential-value"
+        res = MagicMock()
+        run.return_value = res
+        for url in (
+            f"https://x-access-token:{secret}@github.com/gke-labs/kube-agents.git",
+            f"https://{secret}@github.com/gke-labs/kube-agents/tree/main",
+            f"https://{secret}@github.com/%zz",
+            f"https://user:{secret}@gitlab.com/gke-labs/kube-agents.git",
+            f"ssh://{secret}@example.com/repo",
+            f"https://u:{secret}@more@github.com/gke-labs/kube-agents.git",
+            f"https://u:p@{secret}@github.com/%zz",
+            f"x_https://u:{secret}@github.com/%zz",
+            f"9https://{secret}@github.com/o/r/x/y",
+            f"https://u:a/{secret}@github.com/o/r",
+            f"git@{secret}@gitlab.example:o/r.git",
+            f"https://user:{secret}@",
+            f"not a url user:{secret}@ http://u:{secret}@h/x",
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                err = io.StringIO()
+                with patch("sys.stderr", err):
+                    get_current_git_repo()
+                self.assertNotIn(secret, err.getvalue())
+
+    def test_redact_url_blanks_every_urls_userinfo(self):
+        self.assertEqual(
+            github_token_refresh.redact_url("fetch https://a:b@github.com/o/r and ssh://tok@h/x"),
+            "fetch https://[REDACTED]@github.com/o/r and ssh://[REDACTED]@h/x",
+        )
+        # The userinfo ends at the last "@" before the path, as a URL parser reads it.
+        self.assertEqual(
+            github_token_refresh.redact_url("https://u:p@ss@github.com/o/r"),
+            "https://[REDACTED]@github.com/o/r",
+        )
+        # A URL without userinfo, and an scp-style remote, are left as they are.
+        for text in ("https://github.com/o/r.git", "git@github.com:o/r.git"):
+            self.assertEqual(github_token_refresh.redact_url(text), text)
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_a_refused_remote_is_never_quoted_in_the_log(self, run):
+        """The refusal says why, never what: the remote's text stays out of the log."""
+        res = MagicMock()
+        run.return_value = res
+        for url, why in (
+            ("https://github.com/%zz-marker", "not a repository URL"),
+            ("https://gitlab.com/marker-org/marker-repo.git", "not a GitHub host"),
+            # A host-less path: git takes it as a local directory (#6509).
+            ("github.com/marker-org/marker-repo", "names no host"),
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                err = io.StringIO()
+                with patch("sys.stderr", err):
+                    self.assertIsNone(get_current_git_repo())
+                self.assertIn(why, err.getvalue())
+                self.assertNotIn("marker", err.getvalue())
+
+    def test_log_redacts_whatever_its_caller_formatted(self):
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            github_token_refresh.log("refresh failed: https://t0ken@github.com/o/r")
+        self.assertNotIn("t0ken", err.getvalue())
+        self.assertIn("https://[REDACTED]@github.com/o/r", err.getvalue())
+
+    @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_non_github_remote_returns_none(self, run):
         res = MagicMock()
         res.stdout = "https://gitlab.com/gke-labs/kube-agents.git\n"
@@ -185,7 +255,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
                 )
 
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_delegates_without_receiving_token(self, urlopen, run):
         response = MagicMock()
         response.__enter__.return_value.status = 200
@@ -232,7 +302,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         return str(cm.exception)
 
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_reports_the_brokers_refusal_text_after_the_code(self, urlopen, run):
         why = "the credential proxy is at its child memory budget (512 MiB in use of 512 MiB)"
         message = self._refused(
@@ -243,13 +313,13 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         )
 
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_reports_the_bare_code_for_a_body_that_is_not_json(self, urlopen, run):
         message = self._refused(urlopen, b"<html>upstream connect error</html>")
         self.assertEqual("Credential sidecar failed to refresh GitHub auth: HTTP 503", message)
 
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_reports_the_bare_code_for_a_body_cut_short(self, urlopen, run):
         # IncompleteRead is an HTTPException, neither OSError nor ValueError;
         # escaping the HTTPError clause it would replace the client's message.
@@ -257,7 +327,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual("Credential sidecar failed to refresh GitHub auth: HTTP 503", message)
 
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_waits_out_the_brokers_admission_and_the_helper(self, urlopen, run):
         # Before the helper starts, the broker may hold a refresh on the
         # refresh lock behind another refresh, queue it behind its child
@@ -297,7 +367,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_federated_identity_replaces_gcloud(self, urlopen, run, fetch):
         # The co-located sandbox proxy. gcloud refuses to mint an ID token from
         # an external_account credential, so calling it here is not a fallback
@@ -323,7 +393,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_a_host_with_neither_identity_source_still_asks_gcloud(self, urlopen, run, fetch):
         # A host with neither a federated credential nor a metadata server
         # (setUp): fetch_identity_token returns None and gcloud is the last
@@ -349,7 +419,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         )
 
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     @patch("gitops_workspace.get_managed_github_repos")
     def test_scopes_token_to_the_one_repository_asked_for(
         self, get_managed_github_repos, urlopen, run
@@ -390,7 +460,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         get_managed_github_repos.assert_not_called()
 
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     @patch("gitops_workspace.get_managed_github_repos")
     def test_scoped_repositories_attached_to_token_and_not_printed_to_stdout(
         self, get_managed_github_repos, urlopen, run
@@ -437,7 +507,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         get_managed_repo_keys.assert_not_called()
 
     @patch("github_token_refresh.time.sleep")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_fails_immediately_on_sidecar_502(self, urlopen, sleep):
         # The sidecar has already executed retries internally; client fails fast
         err_502 = urllib.error.HTTPError(
@@ -462,7 +532,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         sleep.assert_not_called()
 
     @patch("github_token_refresh.time.sleep")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_fails_immediately_on_transport_error(self, urlopen, sleep):
         err_conn = urllib.error.URLError("Connection refused")
         urlopen.side_effect = err_conn
@@ -482,7 +552,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         sleep.assert_not_called()
 
     @patch("github_token_refresh.time.sleep")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_fails_immediately_on_4xx_without_retry(self, urlopen, sleep):
         err_403 = urllib.error.HTTPError(
             "http://127.0.0.1:8765/v1/forge/refresh",
@@ -505,7 +575,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual(1, urlopen.call_count)
         sleep.assert_not_called()
 
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_sandbox_general_exception_raises_runtime_error(self, urlopen):
         urlopen.side_effect = TypeError("unexpected type error")
 
@@ -530,7 +600,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         res_ok.stdout = "fallback-oidc-token\n"
         run.side_effect = [res_fail, res_ok, MagicMock(), MagicMock(), MagicMock()]
 
-        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+        with patch("github_token_refresh.urllib.request.OpenerDirector.open") as urlopen:
             ok_response = MagicMock()
             ok_response.status = 200
             ok_response.read.return_value = b"ghs_token_xyz\n"
@@ -565,7 +635,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     @patch("gitops_workspace.get_managed_github_repos", return_value=[])
     @patch("github_token_refresh.time.sleep")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_direct_minty_retries_on_5xx_and_succeeds(self, urlopen, sleep, mock_get_managed, run):
         run_oidc = MagicMock()
         run_oidc.stdout = "mock-oidc-token\n"
@@ -595,7 +665,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     @patch("gitops_workspace.get_managed_github_repos", return_value=[])
     @patch("github_token_refresh.time.sleep")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_direct_minty_retries_on_connection_error_and_succeeds(
         self, urlopen, sleep, mock_get_managed, run
     ):
@@ -620,7 +690,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.time.sleep")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_direct_minty_fails_immediately_on_403_without_retry(
         self, urlopen, sleep, run
     ):
@@ -647,7 +717,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.time.sleep")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_direct_minty_fails_after_max_retries_on_persistent_5xx(
         self, urlopen, sleep, run
     ):
@@ -684,7 +754,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         run_oidc.stdout = "mock-oidc-token\n"
         run.return_value = run_oidc
 
-        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+        with patch("github_token_refresh.urllib.request.OpenerDirector.open") as urlopen:
             ok_response = MagicMock()
             ok_response.status = 200
             ok_response.read.return_value = b"   \n"
@@ -738,7 +808,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
         run.side_effect = fake_run
 
-        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+        with patch("github_token_refresh.urllib.request.OpenerDirector.open") as urlopen:
             ok_response = MagicMock()
             ok_response.status = 200
             ok_response.read.return_value = b"ghs_test_token\n"
@@ -773,7 +843,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
         run.side_effect = fake_run
 
-        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+        with patch("github_token_refresh.urllib.request.OpenerDirector.open") as urlopen:
             ok_response = MagicMock()
             ok_response.status = 200
             ok_response.read.return_value = b"ghs_test_token\n"
@@ -811,7 +881,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
         run.side_effect = fake_run
 
-        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+        with patch("github_token_refresh.urllib.request.OpenerDirector.open") as urlopen:
             ok_response = MagicMock()
             ok_response.status = 200
             ok_response.read.return_value = b"ghs_test_token\n"
@@ -902,7 +972,7 @@ class SandboxForwardTest(unittest.TestCase):
         # ssh into the pod the call is already running in.
         sandbox = self._sandbox(True)
         with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
-            with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+            with patch("github_token_refresh.urllib.request.OpenerDirector.open") as urlopen:
                 response = MagicMock()
                 response.status = 200
                 response.__enter__.return_value = response
@@ -988,7 +1058,7 @@ class ReadOnlyMintTest(unittest.TestCase):
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     @patch("gitops_workspace.get_managed_github_repos")
     def test_requests_the_read_scope_for_one_repository_and_installs_nothing(
         self, get_managed_github_repos, urlopen, run, fetch
@@ -1113,6 +1183,108 @@ class SweepMintTest(unittest.TestCase):
         read_only.assert_not_called()
 
 
+class _LiveBroker:
+    """A local HTTP server that records the method, the path and the `Authorization`
+    header of each request and answers `{}`; and a proxy environment whose proxy is
+    a closed port, for a test that the call does not take the proxy."""
+
+    def __init__(self, case):
+        seen = self.seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        case.addCleanup(server.server_close)
+        case.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_port}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        for patcher in (
+            patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}),
+            patch.object(urllib.request, "_opener", None),
+        ):
+            patcher.start()
+            case.addCleanup(patcher.stop)
+        for name in ("no_proxy", "NO_PROXY"):
+            os.environ.pop(name, None)
+
+
+class InClusterOpenerTest(unittest.TestCase):
+    """The broker and a minter inside the cluster take no proxy; a minter outside it keeps the environment's."""
+
+    def test_a_cluster_name_or_a_loopback_host_is_inside_the_cluster(self):
+        inside = (
+            "http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token",
+            "http://minter.kubeagents-system.svc:8080/token",
+            "http://MINTER.NS.SVC/token",
+            "http://minter.kubeagents-system.svc.cluster.local.:8080/token",
+            "http://localhost:8080/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+        )
+        outside = (
+            "https://minty.example.com/token",
+            "https://svc.example.com/token",
+            "https://cluster.local.example.com/token",
+            "http://10.0.0.7:8080/token",
+            "",
+            "not a url",
+        )
+        for url in inside:
+            with self.subTest(url=url):
+                self.assertTrue(github_token_refresh._inside_the_cluster(url))
+        for url in outside:
+            with self.subTest(url=url):
+                self.assertFalse(github_token_refresh._inside_the_cluster(url))
+
+    def test_a_minter_inside_the_cluster_is_reached_without_the_proxy(self):
+        # The operator's minter is a Service of the cluster, over http, and the call
+        # carries an identity token. With a proxy variable and no NO_PROXY entry for
+        # the host, urllib hands the request to the proxy.
+        minter = _LiveBroker(self)
+        with patch.object(github_token_refresh, "TOKEN_BROKER_URL", minter.url + "/token"):
+            github_token_refresh.request_minty_token("oidc.token", "acme", ["infra"], "read", max_attempts=1)
+        self.assertEqual([("POST", "/token", None)], minter.seen)
+
+    def test_a_minter_outside_the_cluster_keeps_the_proxy_of_the_environment(self):
+        response = MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b"ghs_installation_token"
+        with patch.object(github_token_refresh, "TOKEN_BROKER_URL", "https://minty.example.com/token"), patch.object(
+            github_token_refresh.urllib.request, "urlopen", return_value=response
+        ) as urlopen, patch.object(github_token_refresh._IN_CLUSTER_OPENER, "open") as in_cluster:
+            token = github_token_refresh.request_minty_token("oidc.token", "acme", ["infra"], "read", max_attempts=1)
+        self.assertEqual("ghs_installation_token", token)
+        self.assertEqual(1, urlopen.call_count)
+        in_cluster.assert_not_called()
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_broker(self):
+        # The broker is a Service of the cluster, or on the pod. With a proxy variable
+        # and no NO_PROXY entry for its host, urllib hands the refresh and its bearer
+        # token to the proxy.
+        broker = _LiveBroker(self)
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": broker.url}), patch("github_token_refresh.subprocess.run"):
+            refresh_git_credentials("owner/repository")
+        self.assertEqual([("POST", "/v1/forge/refresh")], [seen[:2] for seen in broker.seen])
+
+
 class MetadataIdentityTest(unittest.TestCase):
     """The identity token comes from the metadata server directly; gcloud is the fallback."""
 
@@ -1176,7 +1348,7 @@ class MetadataIdentityTest(unittest.TestCase):
     @patch("github_token_refresh.log")
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_the_metadata_server_is_asked_before_gcloud(self, urlopen, run, fetch, log):
         urlopen.side_effect = self._urlopen([b"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU\n"])
         with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
@@ -1210,8 +1382,9 @@ class MetadataIdentityTest(unittest.TestCase):
         self.assertEqual("Google", seen[0].headers["Metadata-flavor"])
 
     def test_the_metadata_opener_sends_nothing_through_an_http_proxy(self):
-        # The broker forwards HTTP_PROXY into this helper for its GitHub and
-        # Minty traffic; the link-local metadata address must not take it. The
+        # The broker forwards HTTP_PROXY into this helper for its traffic to GitHub
+        # and to a minter outside the cluster; the link-local metadata address must
+        # not take it. The
         # opener is built at import, so the module is reloaded with a proxy in
         # the environment: the default opener then carries a ProxyHandler for
         # it, and the metadata opener must carry none. (build_opener drops a
@@ -1246,7 +1419,7 @@ class MetadataIdentityTest(unittest.TestCase):
     @patch("github_token_refresh.log")
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_a_configured_credential_file_keeps_the_identity_on_gcloud(self, urlopen, run, fetch, log):
         # gcloud pointed at a key file presents that account, not the
         # instance's; the metadata server must not outrank it.
@@ -1338,7 +1511,7 @@ class MetadataIdentityTest(unittest.TestCase):
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_one_slow_metadata_answer_is_retried_not_failed(self, urlopen, run, fetch, sleep):
         # urlopen raises a bare timeout while reading and wraps one raised while
         # connecting in URLError; both are slow answers and both are retried.
@@ -1361,7 +1534,7 @@ class MetadataIdentityTest(unittest.TestCase):
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_no_metadata_server_falls_through_to_gcloud_and_says_so(
         self, urlopen, run, fetch, sleep, log
     ):
@@ -1391,7 +1564,7 @@ class MetadataIdentityTest(unittest.TestCase):
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_an_error_status_from_the_metadata_server_falls_through_to_gcloud(
         self, urlopen, run, fetch, sleep, log
     ):
@@ -1490,7 +1663,7 @@ class MetadataIdentityTest(unittest.TestCase):
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("github_token_refresh.urllib.request.OpenerDirector.open")
     def test_a_gh_login_failure_keeps_what_gh_printed(self, urlopen, run, fetch):
         urlopen.side_effect = self._urlopen([b"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU"])
         run.side_effect = subprocess.CalledProcessError(

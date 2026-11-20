@@ -500,6 +500,13 @@ type GoogleChatAdapter struct {
 	// adapter posts nothing in a sender's conversation ahead of the gateway
 	// for a sender it would refuse. Nil admits nobody.
 	admits SenderAdmission
+
+	// homeLearn is the learned home space's state, and homePending the typed
+	// messages that could set it, by message name, waiting for the gateway's
+	// verdict; homePendingOrder is its ring (gchat_home_channel.go).
+	homeLearn        homeLearner
+	homePending      map[string]gchatHomeCandidate
+	homePendingOrder []string
 }
 
 var _ SenderAdmissionSink = (*GoogleChatAdapter)(nil)
@@ -1068,6 +1075,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 	// every read is under ctx, so the wait is finite.
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	defer a.closeHomeLearn()
 	windowStart := time.Now()
 	var received, emptyPulls, failedPulls int
 	for {
@@ -1502,6 +1510,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if text != "" {
 		a.noteTypedAnswer(msg, sender)
 	}
+	a.noteHomeCandidate(ev, msg)
 	return msg, ""
 }
 
