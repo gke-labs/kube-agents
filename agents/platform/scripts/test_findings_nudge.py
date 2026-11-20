@@ -454,9 +454,13 @@ class DetectorWordingTests(unittest.TestCase):
         self.assertEqual(
             nudge.clean_action("Cordon the node, then run kubectl drain node-1 --ignore-daemonsets."), "Cordon the node."
         )
+        # A ", " does not end a command: a jsonpath or a list of ranges has one.
         self.assertEqual(
-            nudge.clean_action("Upgrade the control plane with gcloud container clusters upgrade c --master, then the pools."),
-            "Upgrade the control plane, then the pools.",
+            nudge.clean_action(
+                "Restrict access with gcloud container clusters update c "
+                "--master-authorized-networks=10.0.0.0/8, 192.168.0.0/16 --enable-master-authorized-networks."
+            ),
+            "Restrict access.",
         )
 
     def test_prose_that_names_a_tool_is_left_as_written(self):
@@ -471,6 +475,7 @@ class DetectorWordingTests(unittest.TestCase):
             "Roll back via Helm to the previous release, then pin the chart version.",
             "Fix via git revert of the last change to the overlay.",
             "Check the release notes: Helm chart 4.2 changes the default.",
+            "Run helm charts through a linter before merging.",
         ):
             self.assertEqual(nudge.clean_action(prose), prose)
 
@@ -483,6 +488,13 @@ class DetectorWordingTests(unittest.TestCase):
                 "Check the pool version and upgrade it."
             ),
             "Upgrade nodes: Run gcloud container clusters upgrade c --node-pool=p to move the pool.": "Upgrade nodes.",
+            "Raise the budget, then run `kubectl get pdb -A`.": "Raise the budget.",
+            "Run `gcloud container clusters update c --enable-shielded-nodes`. GKE recreates the nodes.": (
+                "GKE recreates the nodes."
+            ),
+            "Raise .spec.maxUnavailable to 1 (kubectl edit pdb api -n shop).": "Raise .spec.maxUnavailable to 1.",
+            "`kubectl get pdb` maxUnavailable must be 1 or more.": "maxUnavailable must be 1 or more.",
+            "kubectl delete node gke-prod-pool-8f2a.": "Remove the node gke-prod-pool-8f2a.",
             # Nothing but a command, or one word left of it, says nothing: the fallback stands in.
             "Run `gcloud container clusters update prod --enable-shielded-nodes`": nudge.FALLBACK_ACTION,
             "Run gcloud container clusters update c --location=l.": nudge.FALLBACK_ACTION,
@@ -500,6 +512,7 @@ class DetectorWordingTests(unittest.TestCase):
             nudge.clean_title("Kubelet 1.31.1 nodes lag the control plane"), "Kubelet 1.31.1 nodes lag the control plane"
         )
         self.assertEqual(nudge.clean_action("Upgrade the 1.31.1 nodes first"), "Upgrade the 1.31.1 nodes first.")
+        self.assertEqual(nudge.clean_action("Upgrade the pool-1 nodes first."), "Upgrade the pool-1 nodes first.")
 
     def test_a_subject_is_peeled_only_right_after_the_first_colon(self):
         for obj, title in (

@@ -154,8 +154,8 @@ EXPECTED_PODS_RE = re.compile(r"\(>=\s*(\d+)\s+expected\s+pods?\)", re.IGNORECAS
 EXPECTED_PODS_PLAIN = "({pods} expected)"
 NESTED_PARENS_RE = re.compile(r"\(([^()]+?)\s+\(([^()]+)\)\)")
 NESTED_PARENS_FLAT = r"(\1, \2)"
-# "1 replicas" is a count; the "1" that ends a version ("1.31.1 nodes") is not.
-ONE_PLURAL_RE = re.compile(r"(?<![\d.])\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
+# "1 replicas" is a count; the "1" that ends a version or a name ("1.31.1 nodes", "pool-1 nodes") is not.
+ONE_PLURAL_RE = re.compile(r"(?<![\d.-])\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
 
 # A command is removed only where it shows itself as one: in backticks, in
 # parentheses, or carrying a flag. A sentence that names a tool ("deploy via
@@ -165,17 +165,18 @@ CLI_TOOLS_PATTERN = r"(?:kubectl|gcloud|helm|git|gh|terraform|tofu|docker)"
 # The words that introduce a command, removed with it.
 CLI_LEAD_IN = r"(?i:,?\s+(?:(?:then|and)\s+)?(?:with|via|using|by running|run))"
 CLI_EXAMPLE_LEAD_IN = r"(?i:,?\s*(?:e\.g\.?|for example|such as),?)"
-# A command runs to the end of its sentence or to the next clause: a "." or ";"
-# inside it (a version, a CIDR, a file name) is not the end, one before a space
-# or the end of the text is, and so is ", ".
-CLI_SPAN = r"(?:(?![.;]`?(?:\s|$))(?!,\s).)+"
-CLI_HAS_FLAG = r"(?=(?:(?![.;](?:\s|$))(?!,\s).)*?\s--?[A-Za-z])"
+# A command runs to the end of its sentence: a "." or ";" inside it (a version,
+# a CIDR, a file name) is not the end, one before a space or the end of the
+# text is. A ", " does not end it either: a jsonpath or a list of ranges has one.
+CLI_SPAN = r"(?:(?![.;]`?(?:\s|$)).)+"
+CLI_HAS_FLAG = r"(?=(?:(?![.;](?:\s|$)).)*?\s--?[A-Za-z])"
 PAREN_CLI_RE = re.compile(
     rf"\s*\((?i:e\.g\.?,?\s*|for example,?\s*|run\s+)?`?{CLI_TOOLS_PATTERN}\b(?:[^()]|\([^()]*\))*\)",
 )
 RUN_CLI_TO_RE = re.compile(rf"^\s*(?i:run)\s+`?{CLI_TOOLS_PATTERN}\s+[^`]+?`?\s+to\s+(.+)$")
+# "Run `cmd` and ..." at the start of an action; further in, the lead-in goes with the command.
 RUN_BACKTICK_CLI_RE = re.compile(
-    rf"(?:^|(?<=\s))(?i:run)\s+`{CLI_TOOLS_PATTERN}\s+[^`]+`\s*(?i:,?\s*(?:and|then)\s+)?",
+    rf"^\s*(?i:run)\s+`{CLI_TOOLS_PATTERN}\s+[^`]+`\s*(?:[.;]\s*|(?i:,?\s*(?:and|then)\s+))?",
 )
 INLINE_BACKTICK_CLI_RE = re.compile(
     rf"(?:{CLI_EXAMPLE_LEAD_IN}|{CLI_LEAD_IN})?\s*`{CLI_TOOLS_PATTERN}\s+[^`]+`",
@@ -184,11 +185,16 @@ TRAILING_CLI_RE = re.compile(
     rf"(?:\s*[:;]\s+|\s+[—-]\s+|(?:{CLI_EXAMPLE_LEAD_IN})?{CLI_LEAD_IN}\s+){CLI_TOOLS_PATTERN}\s+{CLI_HAS_FLAG}{CLI_SPAN}",
 )
 # The plain form only: a flag is not a kind, and a condition after it is not dropped.
-KUBECTL_DELETE_RE = re.compile(r"^\s*`?kubectl\s+delete\s+([a-z][a-z0-9.]*)\s+([a-z0-9][a-z0-9._-]*)`?\s*\.?\s*$")
-BARE_CLI_RE = re.compile(rf"^\s*(?i:run\s+)?`?{CLI_TOOLS_PATTERN}\s+.+$")
+KUBECTL_DELETE_RE = re.compile(
+    r"^\s*`?kubectl\s+delete\s+([a-z][a-z0-9.]*)\s+([a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)`?\s*\.?\s*$"
+)
+BARE_CLI_RE = re.compile(rf"^\s*`?{CLI_TOOLS_PATTERN}\s+.+$")
+# "Run <command>" and nothing else; the flag tells it from "Run helm charts through a linter".
+RUN_BARE_CLI_RE = re.compile(rf"^\s*(?i:run)\s+`?{CLI_TOOLS_PATTERN}\s+(?=.*\s--?[A-Za-z]).+$")
 # What a removed command leaves hanging before the end of its sentence.
 DANGLING_BEFORE_END_RE = re.compile(r"[\s,;:—-]+(?=[.!?](?:\s|$))")
-SPACE_BEFORE_MARK_RE = re.compile(r"\s+(?=[,.;:!?])")
+# A space a removed command left before a mark; ".spec.replicas" and ":v2" are not that.
+SPACE_BEFORE_MARK_RE = re.compile(r"\s+(?=[,.;:!?](?:\s|$))")
 # One word left of an action says nothing ("Run.", "Check."): the fallback stands in.
 ACTION_MIN_WORDS = 2
 FALLBACK_ACTION = "Review and update the affected resource configuration."
@@ -209,8 +215,9 @@ ROLE_REMINDER = "reminder"
 ROLE_BLOCKING = "blocking"
 
 # "delay or block": a PodDisruptionBudget holds each node's drain for up to an
-# hour and the upgrade then goes on (GKE's node pool upgrade strategies page),
-# while an orphan Node object stops it.
+# hour and the upgrade then goes on (GKE's node pool upgrade strategies page);
+# the upgrade readiness review lists other criticals, an orphan Node object
+# among them, as stopping it.
 HEADLINE_UPGRADE_CRITICAL = (
     "1 critical issue will delay or block cluster upgrades",
     "{count} critical issues will delay or block cluster upgrades",
@@ -469,11 +476,12 @@ def clean_action(raw_action: str) -> str:
     if removed:
         text = SPACE_BEFORE_MARK_RE.sub("", DANGLING_BEFORE_END_RE.sub("", _one_line(text)))
     text = _fix_singular_plurals(_one_line(text)).strip(ACTION_EDGE_CHARS)
-    if BARE_CLI_RE.match(text):
+    if not text or BARE_CLI_RE.match(text) or RUN_BARE_CLI_RE.match(text):
         return FALLBACK_ACTION
     if removed and len(text.rstrip("".join(SENTENCE_ENDINGS)).split()) < ACTION_MIN_WORDS:
         return FALLBACK_ACTION
-    if removed:
+    # A plain word that now leads the sentence gets its capital; an identifier keeps its case.
+    if removed and text.split()[0].islower():
         text = text[:1].upper() + text[1:]
     return _ensure_period(text)
 
