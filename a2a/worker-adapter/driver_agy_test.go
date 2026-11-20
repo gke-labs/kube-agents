@@ -21,7 +21,9 @@ import (
 // spike's lane run, error (a gateway answering 500), timeout
 // (--print-timeout expiry), cache (two turns in one process) and thinking (a
 // reasoning prompt) from the kagents-helper probe. Only init's tool list is
-// trimmed.
+// trimmed. Only the lane captures (basic, deny) carry init.model: agy names
+// its model in gateway mode, and the probe ran on agy's own backend, which
+// names none, so the model assertions rest on those two.
 
 func agyFixture(t *testing.T, name string) [][]byte {
 	t.Helper()
@@ -302,5 +304,66 @@ func TestTheAgyFixturesAreAgyLines(t *testing.T) {
 		if want := map[string]int{"cache": 2}[name]; results != max(want, 1) {
 			t.Errorf("%s: %d results", name, results)
 		}
+	}
+}
+
+// decodeLines runs synthetic agy lines through one decoder and returns the
+// results.
+func decodeLines(t *testing.T, lines ...string) []Event {
+	t.Helper()
+	d := agyDriver{}.NewDecoder()
+	var out []Event
+	for _, l := range lines {
+		evs, err := d.Decode([]byte(l))
+		if err != nil {
+			t.Fatalf("%s: %v", l, err)
+		}
+		out = append(out, eventsOf(evs, EventResult)...)
+	}
+	return out
+}
+
+func TestAnAgyFailureDetailStaysOneShortLine(t *testing.T) {
+	page := "<html>\n<body>\n" + strings.Repeat("upstream says no ", 100) + "\n</body></html>"
+	b, _ := json.Marshal(map[string]any{"event": "result", "result": map[string]any{"status": "ERROR", "error": page}})
+	r := decodeLines(t, string(b))[0]
+	detail := strings.TrimPrefix(r.Token, agyErrorToken+reasonDetailSeparator)
+	if !r.Failed || detail == r.Token || strings.ContainsAny(detail, "\n\t") || len([]rune(detail)) > agyDetailCap {
+		t.Errorf("token %q: want one line of at most %d runes", r.Token, agyDetailCap)
+	}
+}
+
+func TestAnUnknownAgyStatusFailsUnderTheGenericToken(t *testing.T) {
+	r := decodeLines(t, `{"event":"result","result":{"status":"CANCELLED weird","error":"stopped"}}`)[0]
+	if !r.Failed || !strings.HasPrefix(r.Token, agyErrorToken+reasonDetailSeparator+"status CANCELLED weird; stopped") {
+		t.Errorf("token %q: an unknown status is a failure under the generic token, with the status in the detail", r.Token)
+	}
+	if r := decodeLines(t, `{"event":"result","result":{"error":"no status at all"}}`)[0]; !r.Failed || !strings.HasPrefix(r.Token, agyErrorToken) {
+		t.Errorf("a result with no status must fail: %+v", r)
+	}
+}
+
+func TestAnAgyFailureKeepsItsDeniedActionsInTheDetail(t *testing.T) {
+	r := decodeLines(t, `{"event":"result","result":{"status":"ERROR","error":"boom","denied_actions":[{"action":"command","display_name":"Bash"}]}}`)[0]
+	if !r.Failed || !strings.HasPrefix(r.Token, agyErrorToken+reasonDetailSeparator) || !strings.Contains(r.Token, "command (Bash)") {
+		t.Errorf("token %q", r.Token)
+	}
+	r = decodeLines(t, `{"event":"result","result":{"status":"SUCCESS","finished_reason":"print_timeout","denied_actions":[{"action":"mcp"}]}}`)[0]
+	if r.Token != agyPrintTimeoutToken+reasonDetailSeparator+"skipped for want of approval: mcp" {
+		t.Errorf("token %q", r.Token)
+	}
+}
+
+func TestAnAgyResultWithoutUsageKeepsTheBaseline(t *testing.T) {
+	results := decodeLines(t,
+		`{"event":"result","result":{"status":"SUCCESS","response":"a","usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":0}}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"b"}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"c","usage":{"input_tokens":150,"output_tokens":25,"cache_read_tokens":20}}}`,
+	)
+	if u := results[1].Telemetry.usage; u.InputTokens != 0 || u.OutputTokens != 0 {
+		t.Errorf("a result without usage reports none: %+v", u)
+	}
+	if u := results[2].Telemetry.usage; u.InputTokens != 70 || u.OutputTokens != 15 {
+		t.Errorf("turn three %+v, want its difference from turn one's (70 in, 15 out)", u)
 	}
 }

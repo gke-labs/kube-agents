@@ -208,25 +208,36 @@ func (d *agyDecoder) step(s *agyStepUpdate) []Event {
 
 func (d *agyDecoder) result(r agyResult) Event {
 	ev := Event{Kind: EventResult, Text: r.Response, Telemetry: d.telemetry(r)}
+	// A turn that also skipped tool calls says so in its detail, whichever
+	// failure names it.
+	var denied string
+	if len(r.DeniedActions) > 0 {
+		denied = deniedDetail(r.DeniedActions)
+	}
 	switch {
 	case r.FinishedReason == agyPrintTimeoutReason:
 		// Before the status: an expiry reports SUCCESS with a partial response.
-		ev.Failed, ev.Token = true, withDetail(agyPrintTimeoutToken, r.Error)
+		ev.Failed, ev.Token = true, withDetail(agyPrintTimeoutToken, r.Error, denied)
+	case r.Status == "ERROR":
+		ev.Failed, ev.Token = true, withDetail(agyErrorToken, r.Error, denied)
 	case r.Status != "SUCCESS":
-		token := agyErrorToken
-		if r.Status != "ERROR" {
-			token = "agy-" + strings.ToLower(r.Status)
-		}
-		ev.Failed, ev.Token = true, withDetail(token, r.Error)
-	case len(r.DeniedActions) > 0:
-		ev.Failed, ev.Token = true, withDetail(agyPermissionDeniedToken, deniedDetail(r.DeniedActions))
+		// A status this driver does not know is still a failed turn, under
+		// the generic token: the status itself goes in the detail, never into
+		// a token built from text agy chose.
+		ev.Failed, ev.Token = true, withDetail(agyErrorToken, "status "+r.Status, r.Error, denied)
+	case denied != "":
+		ev.Failed, ev.Token = true, withDetail(agyPermissionDeniedToken, denied)
 	}
 	return ev
 }
 
 // telemetry is this result's turn: the difference between its cumulative
 // usage and duration and the last result's. agy reports no cost, so there
-// is no running total.
+// is no running total. duration_seconds is wall time since the process
+// started (the probe's second turn read 47.3s after a first of 18.0s and a
+// 25s pause before its message), so the difference includes any wait between
+// one result and the next message; with steers written at the boundary that
+// wait is the adapter's own, and short.
 func (d *agyDecoder) telemetry(r agyResult) resultTelemetry {
 	t := resultTelemetry{usage: lib.Usage{Model: d.model}}
 	var secs float64
@@ -264,12 +275,28 @@ func (d *agyDecoder) telemetry(r agyResult) resultTelemetry {
 	return t
 }
 
-// withDetail is token, and detail after the reason separator when there is
-// one, as the adapter's own terminals spell it.
-func withDetail(token, detail string) string {
-	detail = strings.TrimSpace(detail)
-	if detail == "" {
+// agyDetailCap bounds the detail an agy failure carries into its reason:
+// agy's error text is the upstream API's, and an HTML error page or a long
+// list of skipped calls has no business in a one-line reason.
+const agyDetailCap = 200
+
+// withDetail is token, and the non-empty details joined after the reason
+// separator, as the adapter's own terminals spell it: whitespace collapsed to
+// single spaces so the reason stays one line, and the whole detail capped at
+// agyDetailCap runes.
+func withDetail(token string, details ...string) string {
+	var parts []string
+	for _, d := range details {
+		if d = strings.Join(strings.Fields(d), " "); d != "" {
+			parts = append(parts, d)
+		}
+	}
+	if len(parts) == 0 {
 		return token
+	}
+	detail := strings.Join(parts, "; ")
+	if r := []rune(detail); len(r) > agyDetailCap {
+		detail = string(r[:agyDetailCap-1]) + "…"
 	}
 	return token + reasonDetailSeparator + detail
 }
