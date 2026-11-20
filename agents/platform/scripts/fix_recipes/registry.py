@@ -10,7 +10,7 @@ and the sandbox's pre-flight (`fleet-audit/scripts/fix_preflight.py`) both load
 through :func:`checks_module`.
 Those are the lists; the code that handles one kind's fix is still per kind
 (`automerge_eligibility.FIX_TYPE`, `post_merge_check.DIRECT_OBJECTS`,
-`audit_report.GENERATED_FIX_CHECK`, `recheck.RECHECKS`, `fix_preflight.CHANGES`), so a recipe alone
+`audit_report.GENERATED_FIX_CHECK`, `fix_preflight.CHANGES`), so a recipe alone
 gets a dial row and post-merge records but no broker label.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
@@ -22,8 +22,12 @@ rather than a kind that silently drops out.
 
 Fields: `kind` (the directory's name), `name` (what text kube-agents writes
 calls the fixes), `title` and `dial_environment` (the dial's row), and the
-optional `owner` and `eval_case` (the end-to-end case that grades the fix on
-the cluster after merge).
+optional `owner`, `eval_case` (the end-to-end case that grades the fix on the
+cluster after merge), and `recheck_kinds` and `recheck_siblings`: the kubectl
+kinds the one-finding re-check reads in the target namespace (separated by
+commas, as `kubectl get` takes them), and the collector checks a fix could
+trip (separated by spaces); `recheck.py` builds its
+`RECHECKS` from them.
 """
 
 from __future__ import annotations
@@ -44,10 +48,11 @@ CHECKS_FILE = "checks.py"
 # Larger than any recipe; a cap so a stray file costs a glance to refuse.
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
-OPTIONAL = ("owner", "eval_case")
+OPTIONAL = ("owner", "eval_case", "recheck_kinds", "recheck_siblings")
 # The same shapes `automation_rules` accepts for a rule's `fix` and `environments`.
 KIND_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ENVIRONMENT_RE = re.compile(r"[a-z0-9]([-_a-z0-9]{0,61}[a-z0-9])?")
+_KUBECTL_KIND_RE = re.compile(r"[a-z][a-z0-9]*(\.[a-z0-9.-]+)?")
 _LINE_RE = re.compile(r"([a-z_]+):[ \t]+(.*)")
 # Plain values YAML reads as something other than a string: refused rather
 # than kept as text a YAML reader would disagree with.
@@ -65,6 +70,12 @@ class Recipe(NamedTuple):
     dial_environment: str
     owner: str = ""
     eval_case: str = ""
+    recheck_kinds: str = ""
+    recheck_siblings: str = ""
+
+    def siblings(self) -> tuple[str, ...]:
+        """The collector checks the fix could trip, in the order the re-check runs them."""
+        return tuple(self.recheck_siblings.split())
 
 
 def _value(raw: str, where: str) -> str:
@@ -113,6 +124,12 @@ def parse(text: str, where: str = RECIPE_FILE) -> Recipe:
         raise RecipeError(f"{where}: missing `{missing[0]}`")
     if not KIND_RE.fullmatch(fields["kind"]):
         raise RecipeError(f"{where}: `kind` must be a check id such as `no-pdb`")
+    if fields.get("recheck_siblings") and not fields.get("recheck_kinds"):
+        raise RecipeError(f"{where}: `recheck_siblings` needs `recheck_kinds`")
+    if not all(KIND_RE.fullmatch(s) for s in fields.get("recheck_siblings", "").split()):
+        raise RecipeError(f"{where}: `recheck_siblings` must be check ids separated by spaces")
+    if not all(_KUBECTL_KIND_RE.fullmatch(k) for k in fields.get("recheck_kinds", "").split(",") if fields.get("recheck_kinds")):
+        raise RecipeError(f"{where}: `recheck_kinds` must be kubectl resource names separated by commas")
     if not ENVIRONMENT_RE.fullmatch(fields["dial_environment"]):
         raise RecipeError(f"{where}: `dial_environment` must be an environment label value such as `dev`")
     return Recipe(**fields)
