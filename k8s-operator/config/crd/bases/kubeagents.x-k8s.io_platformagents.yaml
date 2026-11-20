@@ -11348,11 +11348,13 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef)
                             && has(self.appPasswordSecretRef))"
                         - message:
-                            "tenantId is required when integration.teams.inbound
-                            is enabled: the receiver serves one tenant"
+                            "integration.teams.enabled and tenantId are required
+                            when integration.teams.inbound is enabled: the receiver serves
+                            one tenant of one enabled integration"
                           rule:
                             "!has(self.inbound) || !has(self.inbound.enabled) || self.inbound.enabled
-                            == false || (has(self.tenantId) && size(self.tenantId) > 0)"
+                            == false || (has(self.enabled) && self.enabled == true &&
+                            has(self.tenantId) && size(self.tenantId) > 0)"
                   type: object
                   x-kubernetes-validations:
                     - message:
