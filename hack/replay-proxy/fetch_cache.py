@@ -11,7 +11,10 @@ them into a cache directory laid out the way replay_cache.py reads it
 records' runs, per build, for the lane's verdict comparison (lane_report.py),
 from records back to the bucket's 30-day lifecycle: an answer is kept under
 the night that first wrote it, which can be that old, and its verdict is read
-from that night's newest record (one small object per older build).
+from that night's newest record (one small object per older build). With
+`--night-out` it writes the newest night's builds by the commit they name (the
+night --print-commit chooses from, below), so the report can grade each case
+against the night that ran the commit the lane replays (lane_report.py).
 
 What fits under `--max-bytes` is chosen before anything downloads, in this
 order, newest record first within each kind: answers; slots whose answer was
@@ -83,6 +86,10 @@ import publish_cache as P
 CACHE_ROOT = P.CACHE_ROOT
 BUILDS_DIR = P.BUILDS_DIR
 RUNS_FILE = "nightly-runs.json"
+# --night-out's file and its fields: the newest night's builds, and those by the commit they name.
+NIGHT_FILE = "newest-night.json"
+NIGHT_BUILDS = "builds"
+NIGHT_COMMIT_BUILDS = "commit_builds"
 HEX = P.HEX
 # A record's key under replay-cache/.
 RECORD_KEY_RE = re.compile(rf"^builds/({P.BUILD_PATTERN})/publish-[0-9]{{1,16}}\.json\Z")
@@ -168,6 +175,9 @@ class Fetched:
     left_out: Dict[str, int] = field(default_factory=dict)
     removed: Dict[str, int] = field(default_factory=dict)
     runs: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
+    # The newest night of the lane's mode and forge (newest_night), as --night-out writes it.
+    night_builds: List[str] = field(default_factory=list)
+    night_commit_builds: Dict[str, List[str]] = field(default_factory=dict)
 
     def count(self, table: Dict[str, int], kind: str, n: int = 1) -> None:
         table[kind] = table.get(kind, 0) + n
@@ -201,6 +211,24 @@ def object_path(dest: str, name: str) -> str:
         context, _, answer = base.partition(P.VARIANT_SEPARATOR)
         return os.path.join(dest, sub, context, answer)
     return os.path.join(dest, sub, base)
+
+
+def newest_night(started: Dict[str, float], commits: Dict[str, str]) -> Tuple[List[str], Dict[str, List[str]], int]:
+    """The newest night among `commits`' builds (module docstring, --print-commit).
+
+    `started` is each build's first record's creation time; `commits` the
+    commit each build of the lane's mode and forge names, empty for none.
+    Returns the night's builds, those by the commit they name, and how many name none.
+    """
+    if not commits:
+        return [], {}, 0
+    newest = max(started[build] for build in commits)
+    builds = sorted(b for b in commits if started[b] >= newest - NIGHT_SPAN_HOURS * SECONDS_PER_HOUR)
+    commit_builds: Dict[str, List[str]] = {}
+    for build in builds:
+        if commits[build]:
+            commit_builds.setdefault(commits[build], []).append(build)
+    return builds, commit_builds, sum(1 for b in builds if not commits[b])
 
 
 class Fetcher:
@@ -351,13 +379,7 @@ class Fetcher:
                 commits[RECORD_KEY_RE.match(key).group(1)] = commit  # type: ignore[union-attr]
             if not commits:
                 return result
-            newest = max(started[build] for build in commits)
-            result.builds = sorted(b for b in commits if started[b] >= newest - NIGHT_SPAN_HOURS * SECONDS_PER_HOUR)
-            for build in result.builds:
-                if commits[build]:
-                    result.commit_builds.setdefault(commits[build], []).append(build)
-                else:
-                    result.uncommitted_builds += 1
+            result.builds, result.commit_builds, result.uncommitted_builds = newest_night(started, commits)
             if len(result.commit_builds) == 1:
                 result.commit = next(iter(result.commit_builds))
             if len(result.commit_builds) <= 1:
@@ -410,10 +432,14 @@ class Fetcher:
                 chosen[kind].append((name, size, target))
         return chosen
 
-    def fetch(self, dest: str, runs_out: Optional[str] = None) -> Fetched:
+    def fetch(self, dest: str, runs_out: Optional[str] = None, night_out: Optional[str] = None) -> Fetched:
         result = Fetched()
         listed = self.listed()
         now = self.clock()
+        started: Dict[str, float] = {}
+        for created, key in listed:  # oldest first: a build's first record sets its start
+            started.setdefault(RECORD_KEY_RE.match(key).group(1), created)  # type: ignore[union-attr]
+        commits: Dict[str, str] = {}
         keys = [key for created, key in listed if created >= now - self.max_age_seconds]
         # Older builds, within the lifecycle, for their runs only: the newest
         # record of each holds every run it graded (a later record never drops
@@ -458,6 +484,12 @@ class Fetcher:
                 if not self._same_job(record):
                     result.other_job_records += 1
                     continue
+                try:
+                    commits.setdefault(build, self._commit(record))
+                except Refused:
+                    # The cache is still fetched: this build counts as naming
+                    # no commit in the night file, and the others keep theirs.
+                    commits.setdefault(build, "")
                 for item in items:
                     confirmed.setdefault(item[0], item)
             result.objects = len(confirmed)
@@ -499,9 +531,14 @@ class Fetcher:
                     result.count(result.by_kind, kind)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
+        result.night_builds, result.night_commit_builds, _ = newest_night(started, commits)
         if runs_out:
             with open(runs_out, "w", encoding=TEXT_ENCODING) as handle:
                 json.dump(result.runs, handle, sort_keys=True)
+        if night_out:
+            with open(night_out, "w", encoding=TEXT_ENCODING) as handle:
+                json.dump({NIGHT_BUILDS: result.night_builds, NIGHT_COMMIT_BUILDS: result.night_commit_builds},
+                          handle, sort_keys=True)
         return result
 
 
@@ -556,6 +593,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--print-commit", action="store_true",
                         help="print the commit the newest recording night ran, and download nothing else")
     parser.add_argument("--runs-out", default="", help=f"where to write the records' runs per build ({RUNS_FILE})")
+    parser.add_argument("--night-out", default="",
+                        help=f"where to write the newest night's builds by the commit they name ({NIGHT_FILE})")
     parser.add_argument("--version", default=normalizer.NORMALIZER_VERSION,
                         help="the normalizer version to fetch (default: this checkout's)")
     parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
@@ -577,7 +616,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.print_commit:
         return print_commit(fetcher)
     try:
-        result = fetcher.fetch(args.dest, args.runs_out or None)
+        result = fetcher.fetch(args.dest, args.runs_out or None, args.night_out or None)
     except Refused as exc:
         summary["error"] = "refused"
         summary["reason"] = str(exc)

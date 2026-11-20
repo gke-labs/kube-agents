@@ -769,7 +769,8 @@ turn that arrived as a structured confirm.
 declares, such as the cluster persona's `project`, `location` and `cluster`. The gateway sets them
 from what the client or the parent task asked. They never ride the authority block. The dispatcher
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
-to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
+to the worker as `PROFILE_TASK_<NAME>`, or to a script-run task's script as `KA_PARAM_<NAME>`
+(`spec-profiles-dispatch.md`, #5622), whose name may be at most 32 characters. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
 
 The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
@@ -1085,7 +1086,11 @@ Worked examples:
 ### Payload
 
 A `topic-update` envelope carries an A2A `Artifact`: `name` is the topic, parts are
-typically one DataPart (the structured state) with an optional TextPart summary. When the
+typically one DataPart (the structured state) with an optional TextPart summary. The
+`topology-skew` document adds a `coverage` object to the leeway report: `clusters_swept`,
+`clusters_read`, and the projects `not_reached` or with `scan_errors` in that run, each
+mapped to its summary. A cluster absent from `clusters` was not read that run; it is not
+clean. When the
 update happened in the course of a task, the envelope carries that task's `taskId` and
 `correlationId` - which is the audit thread from a user's question to the standing state it
 changed. Updates published on an agent's own schedule carry a `correlationId` minted for
