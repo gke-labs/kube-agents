@@ -38,11 +38,20 @@ Give the operator these ways and change nothing yourself: the `PlatformAgent` in
 `kubeagents-system` is theirs to edit, and no pull request of yours reaches it. Name each as a
 setting, in words: no `kubectl` command and no manifest.
 
+To set a home channel where none is configured:
+
 - Mention the agent once, top-level, in the Slack channel or Chat space it should use (home-channel
-  policy `auto`, the default; a direct message or a thread reply never counts).
+  policy `auto`, the default; a direct message or a thread reply never counts). A mention does not
+  move a home channel that is already set and still works.
+- On Slack, an allowed member can pick it on the app's Home tab. The picker shows only while no
+  `homeChannel` is set on the `PlatformAgent` and the policy is `auto`; it also moves a home the
+  gateway learned.
+
+To set one, or move one that is already set:
+
 - Set `SLACK_HOME_CHANNEL` (the channel id) or `GOOGLE_CHAT_HOME_CHANNEL` (`spaces/<id>`) in
   `install.env` and run `upgrade.sh`.
 - Set `spec.integration.slack.homeChannel` or `spec.integration.googleChat.homeChannel` on the
-  `PlatformAgent`.
-- On Slack, under policy `auto`, an allowed member can also pick it on the app's Home tab.
-- `/sethome` does not set it on an install with the gateway.
+  `PlatformAgent`. A home channel set this way moves only by changing this setting.
+
+`/sethome` does not set it on an install with the gateway.
