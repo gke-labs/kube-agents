@@ -340,9 +340,15 @@ LITELLM_DEFAULT_NAME_LINE = re.compile(
 #: unquoted value with a space (``gemini/flash 2``) reads the text before the
 #: space here and is malformed in Go; and two entries both named
 #: ``model-default``, the first in params-first order, read the second here and
-#: the first in Go. The effort reader below shares the shape and adds one
-#: divergence of its own: a bare ``reasoning_effort: 1`` or ``true`` prints as
-#: typed here, where the Go reader drops any non-string.
+#: the first in Go. The effort reader below shares the shape and adds three
+#: divergences of its own: a bare ``reasoning_effort: 1`` or ``true`` prints as
+#: typed here, where the Go reader drops any non-string; a quoted value with a
+#: ``#`` (``"high#1"``) reads ``unset`` here and is kept in Go; and a
+#: ``litellm_params:`` nested under a sibling block, when the entry's own block
+#: states no effort, can answer here and not in Go. A value with a space, a key
+#: under a sibling of ``litellm_params`` or nested below its direct keys, a second
+#: ``model-default`` entry and a trailing comment read the same in both: absent,
+#: absent, the first entry's, and the value before the comment.
 LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
     r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
@@ -351,13 +357,23 @@ LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     r"[ \t]+model:[ \t]*(?P<mq>['\"]?)(?P<model>[^'\"\s#]*)(?P=mq)",
     re.MULTILINE,
 )
-#: The same entry's ``reasoning_effort:`` line, quoted or bare, before or after its
-#: ``model:`` line, captured possibly empty; read on the same fallback path, and only
-#: when the ``model-default`` entry is the one that answered the model line.
+#: The same entry's ``reasoning_effort:`` line, a direct key of its ``litellm_params:``
+#: block, before or after the ``model:`` line, quoted or bare, captured possibly empty,
+#: and ending the line (a trailing comment allowed): a value with a space does not
+#: match. The block's child indent is the first non-blank line's after
+#: ``litellm_params:`` (``ci``, deeper than ``pi``); every line skipped starts with it,
+#: and the key line is exactly at it, so a sibling block's key and a key nested below
+#: the direct keys are never read. Matched at the first ``model-default`` name line,
+#: not searched, so a second entry of that name cannot answer. Read on the same
+#: fallback path, and only when that entry is the one that answered the model line.
 LITELLM_DEFAULT_ENTRY_REASONING_EFFORT = re.compile(
     LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
-    r"(?:(?:[ \t]+(?![ \t-])(?!reasoning_effort:)[^\n]*)?\n)*?"
-    r"[ \t]+reasoning_effort:[ \t]*(?P<eq>['\"]?)(?P<effort>[^'\"\s#]*)(?P=eq)",
+    r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
+    r"(?P<pi>[ \t]+)litellm_params:[ \t]*(?:#[^\n]*)?\n"
+    r"(?:[ \t]*\n)*"
+    r"(?P<ci>(?P=pi)[ \t]+)"
+    r"(?:(?!reasoning_effort:)[^\n]*\n(?:(?:(?P=ci)(?!reasoning_effort:)[^\n]*|[ \t]*)\n)*?(?P=ci))?"
+    r"reasoning_effort:[ \t]*(?P<eq>['\"]?)(?P<effort>[^'\"\s#]*)(?P=eq)[ \t]*(?:#[^\n]*)?$",
     re.MULTILINE,
 )
 #: A CRLF line end, normalised to LF before the LiteLLM regexes run: MULTILINE ``$``
@@ -629,9 +645,10 @@ def reasoning_effort_from_litellm_config(config_yaml: Optional[str]) -> str:
     if not config_yaml:
         return UNAVAILABLE
     config_yaml = config_yaml.replace(CRLF_LINE_END, LF_LINE_END)
-    if not LITELLM_DEFAULT_NAME_LINE.search(config_yaml) or model_from_litellm_config(config_yaml) is None:
+    name = LITELLM_DEFAULT_NAME_LINE.search(config_yaml)
+    if name is None or model_from_litellm_config(config_yaml) is None:
         return UNAVAILABLE
-    match = LITELLM_DEFAULT_ENTRY_REASONING_EFFORT.search(config_yaml)
+    match = LITELLM_DEFAULT_ENTRY_REASONING_EFFORT.match(config_yaml, name.start())
     effort = match.group("effort") if match else ""
     return effort or REASONING_EFFORT_UNSET
 

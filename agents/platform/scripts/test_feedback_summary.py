@@ -403,6 +403,33 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(fs.reasoning_effort_from_litellm_config(config), fs.UNAVAILABLE)
         self.assertEqual(fs.reasoning_effort_from_litellm_config(None), fs.UNAVAILABLE)
 
+    def test_the_fallback_effort_reads_litellm_params_only(self):
+        after = ("model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n"
+                 "  model_info:\n    reasoning_effort: high\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(after), fs.REASONING_EFFORT_UNSET)
+        before = ("model_list:\n- model_name: model-default\n  model_info:\n    reasoning_effort: high\n"
+                  "  litellm_params:\n    model: gemini/g\n    reasoning_effort: low\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(before), "low")
+
+    def test_the_fallback_effort_drops_a_value_with_spaces_or_a_quoted_hash(self):
+        entry = "model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n    reasoning_effort: {}\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(entry.format("very high")), fs.REASONING_EFFORT_UNSET)
+        # Go keeps "high#1"; the regex cannot read a quoted hash, and prints unset rather than a partial value.
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(entry.format('"high#1"')), fs.REASONING_EFFORT_UNSET)
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(entry.format("high # a note")), "high")
+
+    def test_the_fallback_effort_reads_the_direct_key_of_litellm_params_only(self):
+        nested = ("model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n"
+                  "    extra_body:\n      reasoning_effort: high\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(nested), fs.REASONING_EFFORT_UNSET)
+        nested_then_direct = nested + "    reasoning_effort: low\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(nested_then_direct), "low")
+
+    def test_the_fallback_effort_answers_from_the_first_model_default_entry(self):
+        two = ("model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n"
+               "- model_name: model-default\n  litellm_params:\n    model: openai/o\n    reasoning_effort: low\n")
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(two), fs.REASONING_EFFORT_UNSET)
+
     def test_the_template_vocabulary_carries_the_fixed_words(self):
         for word in (fs.UNAVAILABLE, fs.UNKNOWN, fs.NONE, fs.REASONING_EFFORT_UNSET):
             self.assertIn(word, fs.template_tokens())
