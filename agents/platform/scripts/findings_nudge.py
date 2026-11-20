@@ -230,6 +230,7 @@ HEADLINE_BLOCKING = (
 
 # The count beside the headline is of issues (a check on a cluster); it says how
 # many objects those cover, so "40" is not read against a queue of 449 rows.
+# An object that fails three checks is one object: the queue's rows are not counted.
 NOTE_OPEN_ACROSS = "· {issues} covering {objects} on {clusters}"
 NOTE_OPEN_ONLY = "· {issues} covering {objects}"
 # Without the queue's rows there is no object count to give.
@@ -237,6 +238,7 @@ NOTE_OPEN_ACROSS_PLAIN = "· {open_count} open across {clusters}"
 NOTE_OPEN_ONLY_PLAIN = "· {open_count} open"
 OPEN_ISSUE_NOUN = ("open issue", "open issues")
 OBJECT_NOUN = ("object", "objects")
+OBJECT_KEY_FIELDS = ("project", "cluster", "namespace", "object")
 NOTE_SINGLE_CLUSTER = "· {cluster}"
 NOTE_MULTI_CLUSTER = "· across {clusters}"
 
@@ -255,10 +257,13 @@ REVIEW_FIRST_LABEL = "Review first item"
 # built, so answering a press needs no fetch of the queue's rows (a queue of 40
 # issues is 449 rows, and listing those took an agent turn of several minutes).
 SEE_NEXT_LABEL = "See next {count}"
-SEE_NEXT_REPLY = "See next {count} open issues, from the list saved with this message"
+SEE_NEXT_REPLY = "See next {issues}, from the list saved with this message"
 NEXT_ITEMS_MAX = 10
-NEXT_ITEMS_HEADER = '[Next {count} open issues, for the "See next {count}" button]'
+NEXT_ITEMS_HEADER = '[Next {issues}, for the "See next {count}" button]'
+# A saved line gives the objects its issue covers as a plain count. "(+N more)"
+# is a shown row's, where it says what a decision on the row reaches.
 NEXT_ITEM_LINE = "- {severity} · {summary}"
+NEXT_ITEM_LINE_MANY = "- {severity} · {summary} ({objects})"
 NEXT_ITEMS_REST = "{rest} more open after these; the message's queue breakdown counts them by cluster."
 NEXT_ITEMS_LAST = "These are all the open issues the message did not show."
 BACKLOG_LINK_LABEL = "Open backlog"
@@ -794,6 +799,11 @@ def _queue_fold(
     return fold, remaining_critical
 
 
+def _object_key(row: dict) -> tuple:
+    """What makes two rows the same object: one object can fail several checks."""
+    return tuple(str(row.get(field) or "") for field in OBJECT_KEY_FIELDS)
+
+
 def _next_items(rows: list[dict], surfaced_keys: set[tuple], ambiguous: frozenset[str]) -> tuple[list[str], int]:
     """The next issues by rank that the message does not show, one plain line each, and how many more follow.
 
@@ -809,9 +819,13 @@ def _next_items(rows: list[dict], surfaced_keys: set[tuple], ambiguous: frozense
             grouped.setdefault(key, []).append(row)
     lines = []
     for index, (key, members) in enumerate(list(grouped.items())[:NEXT_ITEMS_MAX], start=1):
-        item = SimpleNamespace(key=key, members=members, covers=len(members))
-        entry = format_item(index, ROLE_NEW, item, ambiguous=ambiguous)
-        lines.append(NEXT_ITEM_LINE.format(severity=entry.severity, summary=entry.reply_summary))
+        severity = _best_severity(members)
+        top = next((row for row in members if row.get("severity") == severity), members[0])
+        entry = format_item(index, ROLE_NEW, SimpleNamespace(key=key, members=[top], covers=1), ambiguous=ambiguous)
+        template = NEXT_ITEM_LINE_MANY if len(members) > 1 else NEXT_ITEM_LINE
+        lines.append(
+            template.format(severity=severity, summary=entry.reply_summary, objects=_plural(len(members), *OBJECT_NOUN))
+        )
     return lines, max(0, len(grouped) - len(lines))
 
 
@@ -860,7 +874,7 @@ def build_nudge(
         if not fq.rolled_up(row) and cluster_label(row, ambiguous)
     ]
     headline = _headline(added_critical, reminded, added_other, blocking)
-    objects = sum(1 for row in rows if not fq.rolled_up(row)) if rows is not None else 0
+    objects = len({_object_key(row) for row in rows if not fq.rolled_up(row)}) if rows is not None else 0
     note = _note(open_actionable, len(tagged), all_clusters, objects)
 
     fold: dict | None = None
@@ -910,7 +924,7 @@ def build_nudge(
     if next_lines:
         see_next = SEE_NEXT_LABEL.format(count=len(next_lines))
         choices.append(see_next)
-        replies[see_next] = SEE_NEXT_REPLY.format(count=len(next_lines))
+        replies[see_next] = SEE_NEXT_REPLY.format(issues=_plural(len(next_lines), *OPEN_ISSUE_NOUN))
 
     clean_backlog = backlog_url.strip() if backlog_url and backlog_url.strip().startswith(HTTP_SCHEMES) else ""
     links = [[BACKLOG_LINK_LABEL, clean_backlog]] if clean_backlog else []
@@ -932,7 +946,11 @@ def build_nudge(
     if next_lines:
         closing = NEXT_ITEMS_REST.format(rest=next_rest) if next_rest else NEXT_ITEMS_LAST
         thread_context += (
-            f"\n\n{NEXT_ITEMS_HEADER.format(count=len(next_lines))}\n" + "\n".join(next_lines) + f"\n{closing}"
+            "\n\n"
+            + NEXT_ITEMS_HEADER.format(issues=_plural(len(next_lines), *OPEN_ISSUE_NOUN), count=len(next_lines))
+            + "\n"
+            + "\n".join(next_lines)
+            + f"\n{closing}"
         )
     tone = (
         chat_message.TONE_CRITICAL

@@ -67,7 +67,7 @@ class ComposeTests(unittest.TestCase):
         rows = [finding(id="a"), finding(id="b", check_slug="x", severity="minor")]
         message = nudge.compose(plan_for(rows), 2, False, rows=rows)
         self.assertTrue(
-            message.startswith("**1 new critical issue needs attention** · 2 open issues covering 2 objects on 1 cluster\n\n")
+            message.startswith("**1 new critical issue needs attention** · 2 open issues covering 1 object on 1 cluster\n\n")
         )
         self.assertIn("1 more issue is open.", message)
         self.assertNotIn("Findings queue", message)
@@ -531,15 +531,17 @@ class DetectorWordingTests(unittest.TestCase):
         ]
         bundle = nudge.build_nudge(plan_for(rows), 14, False, rows=rows)
         chat, _ = nudge_card.chat_from_card(bundle.card)
-        # The count beside the headline says what it covers.
-        self.assertEqual(chat["note"], "· 14 open issues covering 38 objects on 1 cluster")
+        # The count beside the headline says what it covers: objects, not the queue's rows.
+        # The 38 rows are 4 objects (payments/api, w0, w1, w2); one object fails many checks.
+        self.assertEqual(chat["note"], "· 14 open issues covering 4 objects on 1 cluster")
         # The button asks for ten, and its message asks for the saved list.
         self.assertEqual([choice["text"] for choice in chat["choices"]], ["Fix first issue", "See next 10"])
         self.assertEqual(chat["choices"][1]["reply"], "See next 10 open issues, from the list saved with this message")
         # The ten are in the stored note, one plain line each, in rank order, and are not posted.
         saved = bundle.card["thread_context"].split('[Next 10 open issues, for the "See next 10" button]\n', 1)[1].splitlines()
-        self.assertEqual(saved[0], "- minor · payments/w0 (+2 more) on prod — lacks limit 0")
-        self.assertEqual(saved[9], "- minor · payments/w0 (+2 more) on prod — lacks limit 9")
+        # A saved line counts its objects plainly; "(+N more)" is a shown row's, for what a decision reaches.
+        self.assertEqual(saved[0], "- minor · payments/w0 on prod — lacks limit 0 (3 objects)")
+        self.assertEqual(saved[9], "- minor · payments/w0 on prod — lacks limit 9 (3 objects)")
         self.assertEqual(saved[10], "2 more open after these; the message's queue breakdown counts them by cluster.")
         self.assertEqual(len(saved), 11)
         self.assertNotIn("lacks limit", bundle.text)
@@ -549,6 +551,10 @@ class DetectorWordingTests(unittest.TestCase):
         rows = [finding(id="a"), finding(id="b", check_slug="b"), finding(id="c", check_slug="c"), finding(id="m", check_slug="m")]
         bundle = nudge.build_nudge(plan_for(rows), 4, False, rows=rows)
         self.assertEqual(bundle.card["choices"], ["Fix first issue", "See next 2"])
+        one_left = rows[:3]
+        single = nudge.build_nudge(plan_for(one_left), 3, False, rows=one_left)
+        self.assertEqual(single.card["replies"]["See next 1"], "See next 1 open issue, from the list saved with this message")
+        self.assertIn('[Next 1 open issue, for the "See next 1" button]\n- critical · payments/api on prod', single.card["thread_context"])
         self.assertTrue(bundle.card["thread_context"].endswith("These are all the open issues the message did not show."))
         # Nothing left to show: no button, and no list in the note.
         only = rows[:2]
@@ -930,7 +936,7 @@ class MainTests(NudgeHarness):
         )
         self.run_at(at(6, 12), rows)
         output = self.out.getvalue()
-        self.assertIn("· 3 open issues covering 5 objects on 1 cluster", output)
+        self.assertIn("· 3 open issues covering 4 objects on 1 cluster", output)
         self.assertIn("1 more issue is open", output)
 
     def test_the_open_count_counts_provider_managed_observations_by_item(self):
