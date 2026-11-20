@@ -9169,6 +9169,279 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
         )
 
 
+# deploy/shared/docker-entrypoint.sh: DEFAULTS_PLUGINS_DIR, the plugins the
+# image ships for the front door, and the volume copy step 2b refreshes
+# from it, `$TARGET_DIR/plugins` with TARGET_DIR the agent home.
+GATEWAY_PLUGINS_IMAGE = "/opt/defaults/plugins"
+GATEWAY_PLUGINS_COPY = "/opt/data/plugins"
+# docker-entrypoint.sh: PINNED_EXTERNAL_PLUGINS, the plugins step 2b leaves
+# alone because the directory holds the plugin's own state (hermes_otel's
+# config.yaml carries the collector endpoint step 4 writes). Step 2's bulk
+# copy still has to put them on the volume, so they are read for presence
+# and owner, not diffed. Change both together.
+GATEWAY_PLUGINS_PINNED = ("hermes_otel",)
+# The states the plugin script reports: the diff states above, plus
+# `present` for a pinned plugin that is there and is not diffed.
+_PLUGIN_STATES = _SANDBOX_TREE_STATES + ("present",)
+# How `diff -rq` names an entry one side lacks: "Only in <dir>: <name>".
+_DIFF_ONLY_IN_PREFIX = "Only in "
+
+# Runs in the gateway's agent container as `sh -c`, with the paths and the
+# pinned names as positionals. One begin/end unit per plugin directory the
+# image ships, against the same name under the volume's plugins directory,
+# and, inside the unit, an `owner` line with the copy's numeric owner when
+# the copy is a directory (`ls -ldn`: `stat` takes different flags on GNU
+# and BSD, and the tests run this script on both); `uid` is the user the
+# script runs as, which is the agent's. A pinned plugin ends `present` rather than being diffed.
+# `count` is an independent tally of the image's plugin directories, which
+# the parser holds the units to. `LC_ALL=C` pins diff's message grammar
+# ("Only in <dir>: <name>"), which the parser reads for the copy's extras.
+# The copy's parent is deliberately not
+# created or touched: the state this reads is the parent being root-owned
+# so that no copy could be made (gke-labs/kube-agents#6279).
+_GATEWAY_PLUGINS_SCRIPT = r"""
+img=$1 copy=$2 pinned=$3
+[ -d "$img" ] || echo "ref_missing $img"
+echo "uid $(id -u)"
+n=$(find "$img" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l)
+for s in "$img"/*/; do
+  s=${s%/}; b=${s##*/}; d="$copy/$b"
+  echo "begin $d"
+  if [ -L "$d" ]; then st=symlink
+  elif [ ! -d "$d" ]; then st=missing
+  else
+    o=$(ls -ldn "$d" 2>/dev/null | awk '{print $3}') && [ -n "$o" ] && echo "owner $o"
+    case " $pinned " in
+      *" $b "*) st=present ;;
+      *)
+        out=$(LC_ALL=C diff -rq --no-dereference "$s" "$d" 2>&1)
+        case $? in 0) st=same ;; 1) st=differ ;; *) st=trouble ;; esac
+        [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/| /'
+        ;;
+    esac
+  fi
+  echo "end $d $st"
+done
+echo "count $(( n ))"
+echo done
+"""
+
+
+@VERIFIERS.register("gateway_plugins_as_shipped")
+class GatewayPluginsAsShippedVerifier(_OnboardingPollVerifier):
+    """The front door is running the plugins its image ships.
+
+    WHY THIS EXISTS. The entrypoint copies every plugin directory under
+    ``/opt/defaults/plugins`` onto the agent's data volume at
+    ``/opt/data/plugins`` (step 2b of ``deploy/shared/docker-entrypoint.sh``)
+    and Hermes loads the ``default`` profile's plugins from there: the
+    specialist roster, the onboarding hooks, the session store, the
+    tool-call audit. When the volume's ``plugins`` directory was created by
+    the container runtime as the parent of a plugin mounted beneath it, it
+    is root-owned, the copy fails for every plugin, and on a new volume the
+    front door starts with none of them (gke-labs/kube-agents#6279). Nothing
+    graded over chat is certain to notice: the agent still answers, and it
+    may still route correctly without its roster. This reads the volume.
+
+    WHAT IT ASSERTS. After the run it execs into the agent container
+    (``AGENT_CONTAINER``, default ``platform-agent``) of the agent Service
+    (``svc/<AGENT_SERVICE_NAME>``; a resolved ``pod/<name>`` is used as
+    given), in ``AGENT_NAMESPACE`` on ``AGENT_CLUSTER_CONTEXT``, and for each
+    directory under the image's plugins directory requires its namesake
+    under the volume's to be a real directory owned by the user the agent
+    runs as, and, for every plugin but the pinned ones
+    (``GATEWAY_PLUGINS_PINNED``, which the entrypoint does not refresh
+    because the directory carries the plugin's own state), ``diff -rq``
+    clean against the image's copy. A missing plugin, one swapped for a
+    symlink, one that differs, and one another user owns each fail; the
+    reason names them. "Differs" is a file the image ships that is missing
+    from the copy or has other content; an entry beside them that the image
+    does not ship is reported in ``raw["extra"]`` and decides nothing,
+    because the entrypoint copies the plugins over the volume without
+    pruning, so an image change that drops a file leaves it on every
+    volume that predates the change, and a case that failed on it would
+    read red on a long-lived install with every plugin loaded. The script
+    prints its own count of the image's plugin
+    directories, and the units it reported must match it, so a loop that
+    compared nothing cannot pass. An install that has rolled since the state
+    arose may read clean: each new Pod's ``fsGroup`` pass adds group write to
+    the directory and that Pod's entrypoint copies the plugins, so what this
+    reads is the serving Pod's boot, which on a fresh install is the first.
+
+    Fails closed: a kubectl that cannot run, exits non-zero or times out,
+    output that stops before the script's last line, an image with no
+    plugins directory, a count the units do not meet, and a ``diff`` that
+    could not compare are all ``status="error"``, never a pass. A definite
+    difference outranks a comparison that could not be made, and a ``fail``
+    seen on an earlier poll outranks a final poll that errors
+    (``_OnboardingPollVerifier``).
+
+    The reference is writable by the agent: the image keeps
+    ``/opt/defaults/plugins`` hermes-owned by design (the Dockerfile's caution
+    about a directory with several live readers), so a clean diff proves that
+    the two copies agree, no more. The state this reads for is a copy that is
+    missing or stale, which no edit to the reference produces.
+
+    No field: the comparison is the whole assertion.
+    """
+
+    type: Literal["gateway_plugins_as_shipped"]
+
+    def _kubectl(self) -> tuple[list[str], str, str, str]:
+        namespace = os.environ.get("AGENT_NAMESPACE", onboarding.DEFAULT_AGENT_NAMESPACE)
+        agent = os.environ.get("AGENT_SERVICE_NAME", onboarding.DEFAULT_AGENT_SERVICE)
+        pod = agent if "/" in agent else f"svc/{agent}"
+        container = os.environ.get("AGENT_CONTAINER", onboarding.DEFAULT_AGENT_CONTAINER)
+        cmd = ["kubectl"]
+        if self.kubeconfig:
+            cmd += ["--kubeconfig", self.kubeconfig]
+        context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+        if context:
+            cmd += ["--context", context]
+        cmd += [
+            "-n", namespace, "exec", pod, "-c", container, "--", "sh", "-c",
+            _GATEWAY_PLUGINS_SCRIPT, "sh",
+            GATEWAY_PLUGINS_IMAGE, GATEWAY_PLUGINS_COPY, " ".join(GATEWAY_PLUGINS_PINNED),
+        ]
+        return cmd, pod, namespace, container
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        cmd, pod, namespace, container = self._kubectl()
+        where = f"{namespace}/{pod} container {container}"
+        raw: dict[str, Any] = {"pod": pod, "namespace": namespace}
+        try:
+            # Bytes, split on "\n" alone, for the reason SandboxTreeMatchesImageVerifier gives.
+            proc = subprocess.run(cmd, capture_output=True, timeout=read_timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "error", f"could not exec into {where}: {exc}", raw
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            return (
+                "error",
+                f"kubectl exec into {where} exited {proc.returncode}: "
+                f"{stderr.strip()[-_REASON_TAIL_CHARS:] or '(no stderr)'}",
+                raw,
+            )
+        lines = stdout.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if "done" not in lines:
+            return (
+                "error",
+                f"the plugin script in {where} stopped before its last line: "
+                f"{stdout.strip()[-_REASON_TAIL_CHARS:] or '(no output)'}",
+                raw,
+            )
+
+        ref_missing: str | None = None
+        uid: int | None = None
+        count: int | None = None
+        plugins: dict[str, str] = {}
+        owners: dict[str, int] = {}
+        diffs: dict[str, list[str]] = {}
+        current: str | None = None
+        unexpected: list[str] = []
+        for line in lines:
+            word, _, rest = line.partition(" ")
+            if current is not None and line.startswith(_SANDBOX_DIFF_LINE_PREFIX):
+                diffs[current].append(line[len(_SANDBOX_DIFF_LINE_PREFIX) :])
+            elif current is not None and word == "owner" and rest.isdigit():
+                owners[current] = int(rest)
+            elif current is None and word == "ref_missing":
+                ref_missing = rest
+            elif current is None and word == "uid" and rest.isdigit():
+                uid = int(rest)
+            elif current is None and word == "count" and rest.isdigit():
+                count = int(rest)
+            elif current is None and word == "begin":
+                current, diffs[rest] = rest, []
+            elif (
+                current is not None
+                and word == "end"
+                and rest.startswith(current + " ")
+                and rest[len(current) + 1 :] in _PLUGIN_STATES
+            ):
+                plugins[current] = rest[len(current) + 1 :]
+                current = None
+            elif line != "done" or current is not None:
+                unexpected.append(line)
+        raw.update(plugins=plugins, owners=owners, diffs=diffs, uid=uid, count=count)
+        if unexpected:
+            return (
+                "error",
+                f"the plugin script in {where} printed lines it does not print: "
+                f"{'; '.join(unexpected)[:_REASON_TAIL_CHARS]}",
+                raw,
+            )
+        if ref_missing:
+            return "error", f"the image in {where} has no plugins directory at {ref_missing}.", raw
+        if uid is None:
+            return "error", f"the plugin script in {where} did not report the user it ran as.", raw
+        if count is None:
+            return (
+                "error",
+                f"the plugin script in {where} did not report its count of the image's plugin "
+                f"directories: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                raw,
+            )
+        if count < 1 or count != len(plugins):
+            return (
+                "error",
+                f"the plugin script in {where} read {len(plugins)} plugin directories against a "
+                f"count of {count}: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                raw,
+            )
+
+        # A `differ` unit whose every diff line is an entry only the copy has is
+        # a copy with extras, not a stale one: `diff -rq` prints "Only in
+        # <dir>: <name>" for such an entry, and <dir> is the copy's own path or
+        # one beneath it. A line about the image side ("Only in <image dir>")
+        # or about content ("Files ... differ") keeps the unit a difference.
+        extras: list[str] = []
+        for path, state in list(plugins.items()):
+            if state != "differ":
+                continue
+            only_in_copy = [
+                line for line in diffs[path]
+                if line.startswith(_DIFF_ONLY_IN_PREFIX + path)
+                and line[len(_DIFF_ONLY_IN_PREFIX) + len(path) :][:1] in (":", "/")
+            ]
+            if diffs[path] and len(only_in_copy) == len(diffs[path]):
+                extras.extend(only_in_copy)
+                plugins[path] = "same"
+                diffs[path] = []
+        raw["extra"] = extras
+
+        def detail(path: str) -> str:
+            shown = diffs[path][:_MAX_DIFF_LINES]
+            more = len(diffs[path]) - len(shown)
+            return "; ".join(shown) + (f"; and {more} more" if more > 0 else "")
+
+        wrong = []
+        for path, state in plugins.items():
+            if state == "differ":
+                wrong.append(f"{path} differs from the image: {detail(path)}")
+            elif state == "missing":
+                wrong.append(f"{path} is missing")
+            elif state == "symlink":
+                wrong.append(f"{path} has been replaced by a symlink")
+            elif path in owners and owners[path] != uid:
+                wrong.append(f"{path} is owned by uid {owners[path]}, not the agent's {uid}")
+        if wrong:
+            return "fail", "; ".join(wrong) + ".", raw
+        broken = [f"{p}: {detail(p) or s}" for p, s in plugins.items() if s not in ("same", "present")]
+        broken += [f"{p}: owner unread" for p in plugins if p not in owners]
+        if broken:
+            return "error", f"diff could not compare every plugin in {where}: {'; '.join(broken)}.", raw
+        beside = f" ({len(extras)} {'entry' if len(extras) == 1 else 'entries'} beside them that the image does not ship, reported in raw)" if extras else ""
+        return (
+            "pass",
+            f"all {count} plugin directories the image ships are on the volume in {where}, "
+            f"owned by the agent and matching the image{beside}.",
+            raw,
+        )
+
 
 # findings_queue.py: STATES, every state a row can be in.
 FindingState = Literal["queued", "surfaced", "snoozed", "accepted", "dismissed", "resolved", "stale"]

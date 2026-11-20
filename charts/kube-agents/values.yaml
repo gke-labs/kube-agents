@@ -1426,7 +1426,11 @@ platformAgent:
       # thread. memoryBudgetMiB defaults to the agent container's memory request
       # in MiB (4096 at the default 4Gi), workerRssCapMiB to 1536,
       # queueBoundSeconds to 600 and failClosed to true; the operator renders
-      # the block with those defaults when nothing is set here.
+      # the block with those defaults when nothing is set here. Effective
+      # memoryBudgetMiB must be at least workerRssCapMiB regardless of
+      # failClosed: Helm template rendering refuses invalid admission blocks,
+      # the validating webhook refuses them where enabled, and the operator
+      # reports Degraded (InvalidKanbanAdmission).
       # admission:
       #   memoryBudgetMiB: 3072
       #   workerRssCapMiB: 1536

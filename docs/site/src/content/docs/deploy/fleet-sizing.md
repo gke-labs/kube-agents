@@ -72,7 +72,10 @@ leaves it alone, because Helm patches only the fields its render changes. The
 
 The memory request is also the dispatcher's admission budget, so the row's 6 GiB admits workers
 up to about 6 GiB of container memory
-([`tuning.admission`](/kube-agents/operator/platformagent-crd/#specharnesstuning)).
+([`tuning.admission`](/kube-agents/operator/platformagent-crd/#specharnesstuning)). Setting a
+request below `workerRssCapMiB` (`1536` MiB) without raising `admission.memoryBudgetMiB` or
+lowering `admission.workerRssCapMiB` puts one worker's cap above the pod's budget and is refused
+where the validating webhook is enabled or flagged `Degraded`.
 
 The shell sandbox's 2 vCPU and 2 GiB limits are the operator's defaults.
 [`shellSandbox.resources`](/kube-agents/operator/platformagent-crd/#shellsandbox) raises them one
@@ -300,6 +303,8 @@ kubectl get pods -n kubeagents-system -o custom-columns='NAME:.metadata.name,REQ
 
 A `Degraded` condition with reason `InvalidCredentialProxyResources` or
 `InvalidAgentAPIAuthResources` means the operator refused an override and rendered that
-container at its defaults; `DataVolumeNotExpanded` means the StorageClass does not expand
-claims online. On Autopilot the pod's limits read equal to its requests where bursting is off,
+container at its defaults. `InvalidKanbanAdmission` means the resolved `memoryBudgetMiB`
+is below `workerRssCapMiB`, so a single worker's RSS cap exceeds the pod's admission budget.
+`DataVolumeNotExpanded` means the StorageClass does not expand claims
+online. On Autopilot the pod's limits read equal to its requests where bursting is off,
 which is the cluster rewriting the manifest rather than the chart dropping a key.
