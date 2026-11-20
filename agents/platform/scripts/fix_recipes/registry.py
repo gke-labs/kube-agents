@@ -5,6 +5,8 @@ the fleet-audit check that finds the problem (`no-pdb/recipe.yaml`). The
 rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
 (`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
+A recipe's safety checks are its `checks.py`, which the broker's label gate
+loads through :func:`checks_module`.
 Those are the lists; the code that handles one kind's fix is still per kind
 (`automerge_eligibility.FIX_TYPE`, `audit_report.GENERATED_FIX_CHECK`,
 `recheck.RECHECKS`), so a recipe alone gets a dial row and post-merge records
@@ -45,13 +47,18 @@ The verification fields, all optional:
 from __future__ import annotations
 
 import functools
+import importlib.util
 import json
 import re
+from types import ModuleType
 from pathlib import Path
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 RECIPE_FILE = "recipe.yaml"
+#: A recipe's safety checks: `read_kinds` (one namespace read) and
+#: `checks(change, live)`, each result named and `pass`, `fail` or `unknown`.
+CHECKS_FILE = "checks.py"
 # Larger than any recipe; a cap so a stray file costs a glance to refuse.
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
@@ -192,3 +199,26 @@ def kinds() -> frozenset[str]:
 def recipe(kind: str) -> Recipe | None:
     """The recipe for `kind`, or None for a kind the registry does not list."""
     return next((found for found in recipes() if found.kind == kind), None)
+
+
+@functools.lru_cache(maxsize=None)
+def checks_module(kind: str) -> ModuleType | None:
+    """The `checks.py` of a known kind, imported once; None for a kind whose recipe ships none.
+
+    Loaded from its file rather than imported by name, because a kind is a
+    directory named like `no-pdb`, which no `import` statement can name.
+    """
+    if kind not in kinds():
+        raise RecipeError(f"{kind!r} is not a known kind of fix")
+    path = HERE / kind / CHECKS_FILE
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(f"fix_recipes.{kind.replace('-', '_')}.checks", path)
+    if spec is None or spec.loader is None:
+        raise RecipeError(f"{kind}/{CHECKS_FILE} cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in ("read_kinds", "checks"):
+        if not hasattr(module, name):
+            raise RecipeError(f"{kind}/{CHECKS_FILE} has no `{name}`")
+    return module

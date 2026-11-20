@@ -104,5 +104,16 @@ class ShippedRecipesTest(unittest.TestCase):
         self.assertEqual(dial_state.FIX_KINDS, (("no-pdb", "Disruption budgets", "dev"),))
 
 
+class ChecksModuleTest(unittest.TestCase):
+    def test_no_pdb_ships_its_checks(self):
+        module = registry.checks_module("no-pdb")
+        self.assertTrue(callable(module.checks))
+        self.assertIsInstance(module.read_kinds, str)
+        self.assertIs(module, registry.checks_module("no-pdb"))
+
+    def test_an_unknown_kind_is_an_error(self):
+        with self.assertRaises(registry.RecipeError):
+            registry.checks_module("no-such-kind")
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,8 +66,9 @@ HEADROOM_FROM = 6
 ADMISSION_TIMEOUT_S = 10
 # Never follow a redirect out of the broker: urllib would re-send the
 # Authorization header to wherever it points (credential_proxy_client._NoRedirect
-# says why).
-_OPENER = urllib.request.build_opener(credential_proxy_client._NoRedirect())
+# says why). And never through a proxy from the environment: the broker is an
+# in-cluster Service, and urllib does not leave out a cluster host by itself.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), credential_proxy_client._NoRedirect())
 
 _cached_width: int | None = None
 

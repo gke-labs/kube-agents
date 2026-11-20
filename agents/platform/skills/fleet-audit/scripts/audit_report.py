@@ -183,6 +183,7 @@ AUDITS: dict[str, AuditSpec] = {
             "configsync-reconciler-stalled",
             "webhook-backend-unreachable",
             "serviceentry-host-collision",
+            "webhook-ca-bundle-expired",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -1250,6 +1251,7 @@ CHECK_PHRASES = {
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
     "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
     "serviceentry-host-collision": "{object} is routed by Istio's pick in namespaces that declare none of its entries",
+    "webhook-ca-bundle-expired": "{object} has an expired or expiring webhook CA bundle",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",

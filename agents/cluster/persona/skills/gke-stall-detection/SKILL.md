@@ -65,7 +65,7 @@ The same four heuristics apply without Gateway-specific code: a Deployment whose
 
 ## Recording the finding
 
-You work under a strict read-only boundary: no patches applied, no Pull Requests opened. Report in your final answer.
+You work under a strict read-only boundary on the cluster: no patches applied, and no pull request unless the task asks for that change (`instructions.md` §2). Report in your final answer.
 
 - A request that gives a report format wins: format the answer exactly as it says. A stall alert raised through the Session KV server's `controller-stall` inject arrives as such a request, with the `What's wrong` / `Why` / `What to do` template and, when there is a fix, a `To authorize:` line; that shape is what gets the report saved so a reply of "apply" can act on it. Quote the scan's `stalled resources: <count>` line in `Why`.
 - Otherwise, follow the shape in [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md): which objects are stalled, for how long, on which heuristic, and what each is waiting for (the missing Secret, the unmet condition), grounded in the report rows and the confirming kubectl reads; or the statement that the namespace has no stalled resources. Add YAML creating or correcting the missing reference when one is identifiable.
