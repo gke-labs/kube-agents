@@ -44,6 +44,11 @@ func ValidTriggerReplySubject(source, reply string) bool {
 // published by the operator's reconciler.
 const TriggerSourceSchedule = triggerScheduleSource
 
+// TriggerRunNowKeyPrefix opens a schedule's run-now idempotency key
+// (run-now/<ns>/<name>/<token>). No event source may take it as its name,
+// or its keys could spell a schedule's.
+const TriggerRunNowKeyPrefix = "run-now"
+
 // TriggerSubmitSubject is where source submits.
 func TriggerSubmitSubject(source string) string {
 	return TriggerSubmitSubjectPrefix + source + TriggerSubmitSubjectSuffix
@@ -103,14 +108,18 @@ type ScheduleRef struct {
 
 // TriggerSubmit is a trigger's request for one task.
 type TriggerSubmit struct {
-	// Trigger is the trigger the task's grant binds: name schedule/<stream>,
-	// origin builtin, stream the schedule's report stream, and script the
-	// profile script a script run executes, absent on a prompt run.
+	// Trigger is the trigger the task's grant binds. A schedule's: name
+	// schedule/<stream>, origin builtin, stream the schedule's report
+	// stream, and script the profile script a script run executes, absent on
+	// a prompt run. An event source's (#6572): name <source>/<kind>, origin
+	// builtin, no stream or script.
 	Trigger TriggerClaim `json:"trigger"`
 	// IdempotencyKey names the run: schedule/<ns>/<name>/<slot-unix> or
-	// run-now/<ns>/<name>/<token>. A repeat answers with the same task.
+	// run-now/<ns>/<name>/<token> for a schedule, <source>/<kind>/<token>
+	// for an event source. A repeat answers with the same task.
 	IdempotencyKey string `json:"idempotencyKey"`
-	// Schedule is the AgentSchedule the run is for.
+	// Schedule is the AgentSchedule the run is for; empty for an event
+	// source.
 	Schedule ScheduleRef `json:"schedule"`
 	// Profile is the AgentProfile that runs the task, at the unattended tier.
 	Profile string `json:"profile"`
@@ -255,7 +264,7 @@ func validateIdempotencyKey(key string, sched ScheduleRef) error {
 		return fmt.Errorf("idempotency key longer than %d bytes", triggerSubmitIdempotencyMaxLn)
 	}
 	parts := strings.Split(key, "/")
-	if len(parts) != 4 || (parts[0] != "schedule" && parts[0] != "run-now") {
+	if len(parts) != 4 || (parts[0] != TriggerSourceSchedule && parts[0] != TriggerRunNowKeyPrefix) {
 		return fmt.Errorf("idempotency key %q is not schedule/<ns>/<name>/<slot> or run-now/<ns>/<name>/<token>", key)
 	}
 	if parts[1] != sched.Namespace || parts[2] != sched.Name {

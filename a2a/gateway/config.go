@@ -137,7 +137,10 @@ const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
 const (
 	envImagePullRefs = "A2A_IMAGE_PULL_REFS"
-	imagePullRefSep  = ","
+	// envTriggerEventKinds lists the event triggers the trigger ingress
+	// admits (Config.TriggerEventKinds).
+	envTriggerEventKinds = "A2A_TRIGGER_EVENT_KINDS"
+	imagePullRefSep      = ","
 )
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
@@ -887,7 +890,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
-	for _, kind := range strings.Split(os.Getenv("A2A_TRIGGER_EVENT_KINDS"), ",") {
+	for _, kind := range strings.Split(os.Getenv(envTriggerEventKinds), ",") {
 		if kind = strings.TrimSpace(kind); kind != "" {
 			cfg.TriggerEventKinds = append(cfg.TriggerEventKinds, kind)
 		}
@@ -1044,8 +1047,8 @@ func FromEnv() (*Config, error) {
 		// schedule's idempotency key, and an event source's keys must not
 		// spell one.
 		src, k, ok := strings.Cut(kind, "/")
-		if !ok || !lib.ValidSubjectToken(src) || !lib.ValidSubjectToken(k) || src == lib.TriggerSourceSchedule || src == "run-now" {
-			return nil, fmt.Errorf("A2A_TRIGGER_EVENT_KINDS entry %q is not <source>/<kind> of dot-free DNS-1123 labels for an event source", kind)
+		if !ok || !lib.ValidSubjectToken(src) || !lib.ValidSubjectToken(k) || src == lib.TriggerSourceSchedule || src == lib.TriggerRunNowKeyPrefix {
+			return nil, fmt.Errorf(envTriggerEventKinds+" entry %q is not <source>/<kind> of dot-free DNS-1123 labels for an event source", kind)
 		}
 	}
 	if !lib.ValidSubjectToken(cfg.DefaultAddressee) {

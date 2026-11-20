@@ -184,7 +184,7 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, err.Error())
 	}
 	if route.Profile != s.Profile {
-		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the schedule's target routes to profile "+route.Profile+", not "+s.Profile)
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the submission's target routes to profile "+route.Profile+", not "+s.Profile)
 	}
 
 	// A recent run under this key is that run. One already on the bus is
