@@ -1363,6 +1363,18 @@
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
 
+# The front door is running the plugins its image ships: an exec into the
+# agent container reads each plugin directory under /opt/defaults/plugins
+# against /opt/data/plugins (agent-owned, every shipped file present and
+# unchanged; an entry only the volume has is reported), after one front-door
+# turn that the roster block should answer without a card. Written for
+# #6279, where a root-owned /opt/data/plugins on a new data volume left the
+# front door with none of its plugins while the gate stayed green; the fix
+# (the agent Pod's first init container makes the directory) is #6357's.
+# deployer: noop, no fixtures, one model turn and one exec. Nightly from its
+# first merge; a presubmit seat waits on its record.
+./tasks/platform-agent-shipped-plugins-loaded/task.yaml
+
 # A card that asks only for the install's usage summary is answered by the
 # kube-agents-feedback skill's summary subcommand (docs/designs/
 # chat-feedback-command.md §8, #4723): the result carries the script's
