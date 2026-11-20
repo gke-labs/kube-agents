@@ -209,8 +209,8 @@ type Notifier struct {
 	subject string
 	// home is the channel home requests post into, "" for none, fixed at
 	// construction from the CR. homeSource, when set, answers instead while
-	// home is empty: the Slack gateway's read of the home channel the
-	// operator projects into the pod as a file (slack_home_channel.go), so a
+	// home is empty: the backend's read of the home channel the
+	// operator projects into the pod as a file (home_channel.go), so a
 	// learned channel is read where it is mounted and never copied here.
 	// Each job takes one snapshot of it in validate and posts with that.
 	home       string
@@ -377,7 +377,7 @@ func (n *Notifier) ServesConversations() bool {
 }
 
 // SetHomeSource points home requests at the home channel the operator
-// projects into the pod (the Slack gateway's file, slack_home_channel.go),
+// projects into the pod (the backend's file, home_channel.go),
 // read on every request while the CR names no home channel. Called before
 // Start, read-only after.
 func (n *Notifier) SetHomeSource(source func() (home string, present bool)) {

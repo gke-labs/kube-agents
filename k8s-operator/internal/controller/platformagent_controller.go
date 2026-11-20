@@ -313,13 +313,19 @@ const (
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
 	// homeChannelUnsetToGchat and homeChannelUnsetToSlackRoute are the
 	// meanwhile when the other armed backend has a home: the agent sends
-	// home posts only to the platforms with one, the CR's list plus a
-	// learned Slack channel (agents/platform/scripts/chat_notify.py,
+	// home posts only to the platforms with one, the CR's list and then a
+	// learned channel or space (agents/platform/scripts/chat_notify.py,
 	// routed_platforms).
 	homeChannelUnsetToGchat      = "go to Google Chat's home channel meanwhile"
 	homeChannelUnsetToSlackRoute = "go to Slack's home channel meanwhile"
 	// homeChannelUnsetJoin joins the sentences when both backends lack a home.
 	homeChannelUnsetJoin = " "
+	// What homeChannelUnsetMessageFormat takes for Google Chat: the backend,
+	// the CR field, the install.env key and what the field holds.
+	homeChannelUnsetGchatBackend = "Google Chat"
+	homeChannelUnsetGchatField   = "spec.integration.googleChat.homeChannel"
+	homeChannelUnsetGchatEnvKey  = "GOOGLE_CHAT_HOME_CHANNEL"
+	homeChannelUnsetGchatHolds   = "a Chat space name (spaces/<id>)"
 
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
@@ -5757,28 +5763,48 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
 // spec and the home-channel record, or "" when the condition is to be absent:
 // the A2A stack holds no chat backend, or each one it holds has a home
-// channel, from the CR or (Slack) admitted from the record. With both
+// channel, from the CR or admitted from the record. With both
 // backends lacking one, the message carries both sentences, Chat first, and
 // each says the gateway keeps the posts; with one lacking it, its sentence
 // says the posts go to the other's home channel meanwhile. A
 // malformed home channel is not this condition's: the gateway refuses it at
-// start and says so. On Slack with the CR field empty the base sentence
+// start and says so. With the CR field empty each backend's base sentence
 // carries at most one more: why the record did not stand in (manual, not an
 // id, refused), or that a mention sets it.
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	var parts []string
-	if a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" {
-		meanwhile := homeChannelUnsetKept
-		if a2aSlackHasHome(agent, rec) {
-			meanwhile = homeChannelUnsetToSlackRoute
-		}
-		parts = append(parts, fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile))
+	if msg := gchatHomeChannelUnsetMessage(agent, rec); msg != "" {
+		parts = append(parts, msg)
 	}
 	if msg := slackHomeChannelUnsetMessage(agent, rec); msg != "" {
 		parts = append(parts, msg)
 	}
 	return strings.Join(parts, homeChannelUnsetJoin)
+}
+
+// gchatHomeChannelUnsetMessage is homeChannelUnsetMessage's Google Chat
+// sentence, or "" when Chat is not armed or has a home channel.
+func gchatHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
+	if !a2aChatArmed(agent) || strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) != "" || rec.gchat.space != "" {
+		return ""
+	}
+	meanwhile := homeChannelUnsetKept
+	if a2aSlackHasHome(agent, rec) {
+		meanwhile = homeChannelUnsetToSlackRoute
+	}
+	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, homeChannelUnsetGchatBackend,
+		homeChannelUnsetGchatField, homeChannelUnsetGchatEnvKey, homeChannelUnsetGchatHolds, meanwhile)
+	switch {
+	case gchatHomeChannelPolicy(agent) == gchatHomeChannelPolicyManual:
+		return msg + homeChannelUnsetManualSuffix
+	case rec.gchat.recorded == homeChannelRecordMalformed:
+		return msg + gchatHomeChannelUnsetMalformedSuffix
+	case rec.gchat.recorded != "" && rec.gchat.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.gchat.recorded, rec.gchat.refused)
+	case rec.gchat.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.gchat.refused)
+	}
+	return msg + gchatHomeChannelUnsetLearnSuffix
 }
 
 // slackHomeChannelUnsetMessage is homeChannelUnsetMessage's Slack sentence,
@@ -5788,7 +5814,7 @@ func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 		return ""
 	}
 	meanwhile := homeChannelUnsetKept
-	if a2aGchatHasHome(agent) {
+	if a2aGchatHasEffectiveHome(agent, rec) {
 		meanwhile = homeChannelUnsetToGchat
 	}
 	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
