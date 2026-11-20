@@ -27,9 +27,8 @@ pull request on either is reused, and the comment is written once, found again
 by `MARKER`.
 
 `post_merge_followups.run_followups` calls this, at most
-`FOLLOWUP_ATTEMPTS` times per fix, and nothing schedules that yet. The reference page
-(`docs/site/src/content/docs/reference/automation-rules.md`) gains a section
-when the post-merge driver is scheduled.
+`FOLLOWUP_ATTEMPTS` times per fix, from the `post-merge-check` cron job. The reference page
+(`docs/site/src/content/docs/reference/automation-rules.md`) describes it to users.
 """
 
 from __future__ import annotations
