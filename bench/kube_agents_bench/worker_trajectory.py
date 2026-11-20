@@ -37,7 +37,8 @@ Agent's card is found this way, and its session store is
 Each tool call becomes one devops-bench trajectory entry in the same shape
 ``parsing.parse_response`` emits (``name`` / ``args`` / ``result`` /
 ``status``) plus four tags: ``agent`` (the profile that made the call),
-``task`` (the card it was working), ``session`` and ``at`` (epoch seconds).
+``task`` (the card it was working), ``session`` and ``at`` (epoch seconds),
+and ``exit_code`` (integer exit code extracted from the result or recorded directly).
 Results and arguments are scrubbed and clipped inside the pod, in that order,
 so nothing credential-shaped leaves it and a chatty worker cannot make the exec
 output unbounded. The rules are the shared transcript reader's
