@@ -259,8 +259,9 @@ caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-pr
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
 broker's watcher routes), `kubeagents-credential-proxy-a2a-reports` for the A2A gateway's
-audit-report reader on every install and, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
-for the A2A gateway) as a bearer header, and the
+audit-report reader on every install, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
+for the A2A gateway, and, when the Teams inbound receiver is enabled, `kubeagents-credential-proxy-teams-inbound`
+for that receiver, which reaches one route by one method) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
 install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session

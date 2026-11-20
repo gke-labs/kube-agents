@@ -613,7 +613,7 @@ Proactive alerts and the default scheduled reports ([below](#proactive-alerts-bo
 
 When the operator runs with `A2A_TEAMS_BACKEND=true`, the A2A chat gateway consumes that queue instead of the Hermes adapter (`a2a/gateway/teams.go`, the `A2A_TEAMS_*` env), the broker admits the gateway pod as a caller, and the Hermes Teams platform is not rendered.
 
-What this means for an evaluator: enabling `spec.integration.teams` gives you the outbound half only. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams does not reach the agent: Microsoft delivers it to the bot's messaging endpoint, and the install provides none. The broker's event queue that the gateway reads admits only the gateway pod, so nothing outside the install can feed a message in either.
+What this means for an evaluator: enabling `spec.integration.teams` alone gives you the outbound half. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams reaches the agent only with the inbound receiver on (`spec.integration.teams.inbound.enabled`, with `tenantId`). The operator then runs a pod that accepts the requests Microsoft delivers for the bot, verifies Microsoft's signature on each one, and hands the message to the install. You expose its Service with your own Ingress and TLS certificate and register that address as the bot's messaging endpoint; the setup guide walks through it.
 
 ## Proactive alerts (both channels)
 
