@@ -4788,7 +4788,7 @@ class KanbanAdmissionPreflightTest(unittest.TestCase):
             env_file.write_text('PROJECT_ID="ci-test-project"\nCLUSTER_NAME="ci-test-cluster"\nREGION="us-central1"\n')
             bin_dir = tmp_path / "bin"
             bin_dir.mkdir()
-            for cmd in ("gcloud", "kubectl"):
+            for cmd in ("gcloud", "kubectl", "helm", "jq", "terraform"):
                 stub = bin_dir / cmd
                 stub.write_text("#!/usr/bin/env bash\nexit 0\n")
                 stub.chmod(0o755)
