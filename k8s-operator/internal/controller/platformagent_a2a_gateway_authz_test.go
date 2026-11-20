@@ -275,6 +275,21 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$KV.people delete (purgePeople)", people.Delete(ctx, personKey))
 
+	// A schedule's runs (a2a/gateway/scheduled_reports.go): bound, a run's
+	// record read back (absent), created, and updated in place.
+	reports, err := js.KeyValue(ctx, a2aScheduledReportsBucket)
+	allowed("STREAM.INFO KV_SCHEDULED_REPORTS (deliverScheduledReport js.KeyValue)", err)
+	const reportKey = "compliance-audit.task-0123456789abcdef"
+	_, err = reports.Get(ctx, reportKey)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		err = nil
+	}
+	allowed("DIRECT.GET KV_SCHEDULED_REPORTS (getScheduledReport)", err)
+	rev, err := reports.Create(ctx, reportKey, []byte(`{"status":"posting"}`))
+	allowed("$KV.SCHEDULED_REPORTS create (putScheduledReport)", err)
+	_, err = reports.Update(ctx, reportKey, []byte(`{"status":"posted"}`), rev)
+	allowed("$KV.SCHEDULED_REPORTS update (putScheduledReport)", err)
+
 	if v := log.publishViolations("gateway"); len(v) != 0 {
 		t.Errorf("the gateway's own operations tripped %d publish violations; each is a grant a2aGatewayJetStreamGrants is missing:\n%s",
 			len(v), strings.Join(v, "\n"))

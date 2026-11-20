@@ -3725,6 +3725,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$KV.session-state.>",
 		"$KV.feedback.>",
 		"$KV.people.>",
+		// A schedule's runs, written before any post.
+		"$KV.SCHEDULED_REPORTS.>",
 		"chat.console.*.out",
 		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
@@ -3879,6 +3881,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
+		// A schedule's runs: bind and read back, no consumer.
+		"$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduledReportsBucket:       true,
+		"$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduledReportsBucket + ".>": true,
 		// The bind on its own pre-created relay (#4173), by exact name.
 		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay": true,
 	}
@@ -3950,6 +3955,9 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"peopleDesk.follow WatchAll", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
 		{"peopleDesk.follow watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
 		{"purgePeople ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		// gateway scheduled delivery, over the SCHEDULED_REPORTS bucket.
+		{"deliverScheduledReport js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduledReportsBucket},
+		{"getScheduledReport kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduledReportsBucket + ".$KV." + a2aScheduledReportsBucket + ".compliance-audit.task-0123456789abcdef"},
 		// The ack the relay's explicit-ack durable publishes, granted
 		// beside the API list rather than in it.
 		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
@@ -3990,7 +3998,7 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
-	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket} {
+	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket, a2aScheduledReportsBucket} {
 		dataPlane := "$KV." + bucket + ".>"
 		if !slices.Contains(grants, dataPlane) {
 			t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
@@ -4483,6 +4491,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// The people count: the same four verbs (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aPeopleBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// A schedule's runs: bind, read back, write; no consumer
+				// (a2aGatewayJetStreamGrants).
+				a2aKVStreamPrefix + a2aScheduledReportsBucket: {"KV", "STREAM.INFO", "DIRECT.GET"},
 				// Minting, and only minting. The grant is
 				// `$KV.cap.root.*` -- the root namespace, one token
 				// deep, so one request id and no reach into the hop

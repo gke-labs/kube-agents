@@ -320,7 +320,7 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Six KV buckets ride the same JetStream deployment:
+Seven KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
@@ -355,7 +355,7 @@ Six KV buckets ride the same JetStream deployment:
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
   `a2a/authcallout` against the config the operator renders.
 - `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
-  exchange it rated: user content that can hold cluster data. One of the two buckets with a
+  exchange it rated: user content that can hold cluster data. One of the buckets with a
   max age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
   past it a new rating is refused until older ones expire. The gateway's user is
   the only reader and writer of its records by grant, with the registry's four verbs on
@@ -364,8 +364,8 @@ Six KV buckets ride the same JetStream deployment:
   and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
   same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway
   design owns what a record holds ("Answer feedback").
-- `people` - one hashed key and a last-put time per chat person the gateway has seen. The
-  other bucket with a max age (`--ttl=720h`), which is its retention: NATS deletes a person
+- `people` - one hashed key and a last-put time per chat person the gateway has seen. Another
+  bucket with a max age (`--ttl=720h`), which is its retention: NATS deletes a person
   30 days after their last turn. Capped at 32MiB, about a hundred thousand entries: past it
   a put is refused and the count under-counts. The gateway's user is the only reader and
   writer of its records by grant, with the registry's four verbs on `KV_people`; provision
@@ -383,6 +383,15 @@ Six KV buckets ride the same JetStream deployment:
   dispatcher can still read every lease it has to re-adopt or fail. Provision and seed
   hold CREATE and INFO on it for the info-then-add guard. The dispatcher design owns
   what a record holds (`lib.LeaseRecord`).
+- `SCHEDULED_REPORTS` - one record per finished run of a schedule trigger, keyed
+  `<jobKey>.<taskID>`: the report, its delivery status, and where it was posted. The gateway
+  writes it before any post and is its only writer by grant, with STREAM.INFO and DIRECT.GET
+  on `KV_SCHEDULED_REPORTS` and no consumer verb. A 90-day max age (`--ttl=2160h`), a
+  256KiB value cap (the gateway cuts a report at 24KiB) and a 256MiB bucket cap: it is the
+  durable record later readers enumerate, and without the age a full bucket would refuse
+  every later run's record. Provision and seed hold CREATE and INFO on it for the
+  info-then-add guard. The [scheduling design](scheduling-on-profiles.md) owns what a
+  record holds (section 4).
 
 ## Accounts and connection-time authorization
 

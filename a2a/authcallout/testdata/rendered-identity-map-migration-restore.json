@@ -1,5 +1,5 @@
 {
-  "version": "b6ae294deaa953f9",
+  "version": "5a57f90c82d0c631",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -92,7 +92,14 @@
           "$JS.API.STREAM.DELETE.DISPATCH_STOPS",
           "$JS.SNAPSHOT.RESTORE.DISPATCH_STOPS.>",
           "$JS.API.CONSUMER.NAMES.DISPATCH_STOPS",
-          "$JS.API.CONSUMER.INFO.DISPATCH_STOPS.*"
+          "$JS.API.CONSUMER.INFO.DISPATCH_STOPS.*",
+          "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+          "$JS.API.STREAM.RESTORE.KV_SCHEDULED_REPORTS",
+          "$JS.API.STREAM.UPDATE.KV_SCHEDULED_REPORTS",
+          "$JS.API.STREAM.DELETE.KV_SCHEDULED_REPORTS",
+          "$JS.SNAPSHOT.RESTORE.KV_SCHEDULED_REPORTS.>",
+          "$JS.API.CONSUMER.NAMES.KV_SCHEDULED_REPORTS",
+          "$JS.API.CONSUMER.INFO.KV_SCHEDULED_REPORTS.*"
         ],
         "subscribe": [
           "_INBOX.migrate-stream-3-1.>"

@@ -1,5 +1,5 @@
 {
-  "version": "1c2f7714bfad4cb2",
+  "version": "bc74b1cf3ebaaf94",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -44,7 +44,10 @@
           "$JS.SNAPSHOT.ACK.PROFILE_SUBMITS.>",
           "$JS.API.STREAM.INFO.DISPATCH_STOPS",
           "$JS.API.STREAM.SNAPSHOT.DISPATCH_STOPS",
-          "$JS.SNAPSHOT.ACK.DISPATCH_STOPS.>"
+          "$JS.SNAPSHOT.ACK.DISPATCH_STOPS.>",
+          "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+          "$JS.API.STREAM.SNAPSHOT.KV_SCHEDULED_REPORTS",
+          "$JS.SNAPSHOT.ACK.KV_SCHEDULED_REPORTS.>"
         ],
         "subscribe": [
           "_INBOX.migrate-stream-3-1.>"
