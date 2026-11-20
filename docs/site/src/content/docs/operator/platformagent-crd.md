@@ -1425,7 +1425,8 @@ place in fleet answers and audits; those runs meet the same refusal.
 - `all` — `true` holds every cluster, the one the harness runs in included.
 - `reason` — up to 256 characters, quoted in every refusal.
 
-A held cluster is refused as `scope.held-cluster`, with a message that names the hold and its reason
+A held cluster is refused as `scope.held-cluster` (a rule of the `scope.*` family it shares with
+[exclusions](#specscope)), with a message that names the hold and its reason
 and tells the agent to report it and stop. A Cluster Agent task that targets a held cluster is
 refused for every command, metadata reads included. The Platform Agent's own reads of the GKE
 control plane for it (the project's cluster list, a cluster's describe) stay allowed. A broker or
@@ -1433,7 +1434,7 @@ control plane for it (the project's cluster list, a cluster's describe) stay all
 (`scope.hold-unreadable`).
 
 A hold, like an exclusion, is checked when a request starts. A watch, a followed `kubectl logs -f`,
-an exec, attach or port-forward stream, or a watcher stream the broker relays that was opened before
+an exec, attach, port-forward or proxy stream, or a watcher stream the broker relays that was opened before
 the hold reached the component keeps running until it ends.
 
 The operator renders the hold into the `<agent>-hold` ConfigMap (`hold.json`), which no pod
