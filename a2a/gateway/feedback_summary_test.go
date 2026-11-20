@@ -708,3 +708,14 @@ func TestAuditSkipsTheBrokersVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// TestUsageSummaryTemplateTokensCarryTheFixedWords: every word the block prints
+// by design is in the audit's exempt vocabulary, unset included, which the empty
+// render never prints (its effort line reads unavailable).
+func TestUsageSummaryTemplateTokensCarryTheFixedWords(t *testing.T) {
+	for _, word := range []string{usageSummaryUnavailable, usageSummaryUnknown, usageSummaryNone, usageSummaryUnset} {
+		if !usageSummaryTemplateTokens[word] {
+			t.Errorf("%q is printed by design and is not in the template vocabulary", word)
+		}
+	}
+}

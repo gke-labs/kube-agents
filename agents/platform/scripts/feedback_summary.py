@@ -97,6 +97,9 @@ EXIT_LEAK = 3
 #: The one stderr prefix, here and in the feedback client's ``summary`` subcommand.
 LOG_PREFIX = "feedback-summary: "
 UNAVAILABLE = "unavailable"
+#: The ``reasoning effort`` line's value when the model is known and the config
+#: states no effort, so the model thinks at its own default.
+REASONING_EFFORT_UNSET = "unset"
 NEVER = "never"
 UNKNOWN = "unknown"
 NONE = "none"
@@ -240,6 +243,9 @@ TEMPLATE_EXTRA_TOKENS = (
     | frozenset(sub for subs in BROKER_SUBCOMMANDS.values() for sub in subs)
     | frozenset(TOOL_STATUS_ORDER)
     | {"tools", "top", "since", "broker", "start", "scale", "namespaces", "deployments", "pods", "nodes", "crds", "kcc", NONE, OTHER_BUCKET}
+    #: The effort line's fixed word for a known model with no effort; the empty
+    #: render prints ``unavailable`` there, so the word is added by name.
+    | {REASONING_EFFORT_UNSET}
 )
 #: The nine ``status.usage`` proposal-origin readings, in the origin table's
 #: order (docs/designs/proposal-origin.md); the block prints them as one line.
@@ -299,9 +305,6 @@ INFERENCE_STATUS_KEY = "inference"
 INFERENCE_PROVIDER_FIELD = "provider"
 INFERENCE_MODEL_FIELD = "model"
 INFERENCE_REASONING_EFFORT_FIELD = "reasoningEffort"
-#: The ``reasoning effort`` line's value when the model is known and the config
-#: states no effort, so the model thinks at its own default.
-REASONING_EFFORT_UNSET = "unset"
 #: The model line's start; the audit runs over the block without this line.
 MODEL_LINE_PREFIX = "  model: "
 #: The lines printed by design, each removed (its first occurrence) before the audit.
@@ -337,7 +340,9 @@ LITELLM_DEFAULT_NAME_LINE = re.compile(
 #: unquoted value with a space (``gemini/flash 2``) reads the text before the
 #: space here and is malformed in Go; and two entries both named
 #: ``model-default``, the first in params-first order, read the second here and
-#: the first in Go.
+#: the first in Go. The effort reader below shares the shape and adds one
+#: divergence of its own: a bare ``reasoning_effort: 1`` or ``true`` prints as
+#: typed here, where the Go reader drops any non-string.
 LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
     r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"

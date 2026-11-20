@@ -403,6 +403,16 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(fs.reasoning_effort_from_litellm_config(config), fs.UNAVAILABLE)
         self.assertEqual(fs.reasoning_effort_from_litellm_config(None), fs.UNAVAILABLE)
 
+    def test_the_template_vocabulary_carries_the_fixed_words(self):
+        for word in (fs.UNAVAILABLE, fs.UNKNOWN, fs.NONE, fs.REASONING_EFFORT_UNSET):
+            self.assertIn(word, fs.template_tokens())
+
+    def test_a_bare_number_effort_on_the_fallback_path_prints_as_typed(self):
+        # The Go reader drops a non-string; the regex cannot tell a bare 1 from a word.
+        # Pinned as a recorded divergence (see the note beside LITELLM_DEFAULT_ENTRY_MODEL).
+        config = "model_list:\n- model_name: model-default\n  litellm_params:\n    model: gemini/g\n    reasoning_effort: 1\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(config), "1")
+
     def test_the_environment_lines_print_in_the_shared_key_order(self):
         text = fs.render(full_snapshot(scale=None))
         keys = [line.split(":", 1)[0].strip() for line in text.split("environment:\n", 1)[1].split("\nusage:", 1)[0].splitlines()]

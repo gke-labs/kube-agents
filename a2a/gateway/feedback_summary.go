@@ -287,6 +287,9 @@ var usageSummaryTemplateTokens = func() map[string]bool {
 	for _, tok := range usageSummaryToolTokens {
 		tokens[tok] = true
 	}
+	// The effort line's fixed word for a known model with no effort: neither render
+	// above prints it (both read unavailable there), so it is added by name.
+	tokens[usageSummaryUnset] = true
 	return tokens
 }()
 
