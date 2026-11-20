@@ -159,6 +159,24 @@ UNINSTALL_LOCK_FILE_ENV = "KUBE_AGENTS_UNINSTALL_LOCK_FILE"
 UNINSTALL_LOCK_FILE_NAME = "kube-agents-uninstall.lock"
 
 
+# For the token renewers in hack/ci-eval-pr.sh (test_ci_eval_ledger_mint,
+# test_ci_eval_gitops_write_token). How long the stalled renewal write holds, and how long after the stop the test
+# looks again: longer than the stall, so a write the stop left running has landed.
+RENEWAL_WRITE_STALL_SECONDS = 0.5
+RENEWAL_AFTER_STALL_SECONDS = 1.0
+# The renewer's umask, made to hold while STALL exists: its renewal write is then
+# under way (STALLED says so) for as long as the test needs to stop it there.
+STALLED_RENEWAL_WRITE = """\
+umask() {
+  if [ -e "${STALL}" ]; then
+    : > "${STALLED}"
+    command sleep "${WRITE_STALL_SECONDS}"
+  fi
+  builtin umask "$@"
+}
+"""
+
+
 def installer_report_env():
     """The report file of each front-door script, in one folder of this test process.
 

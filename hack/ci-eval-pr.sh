@@ -1660,13 +1660,18 @@ start_ledger_token_renewal() { # <label> <file>
   (
     waited=0
     failures=0
-    nap=""
+    nap="" starting="" stopping=""
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
-    # step only once it has returned.
-    trap '[ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0' TERM
+    # command only once it has returned. While the nap is being started its
+    # pid is not known yet, so the trap only marks the stop and the line after
+    # the fork ends that nap.
+    trap 'if [ -n "${starting}" ]; then stopping=1; else [ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0; fi' TERM
     while :; do
+      starting=1
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
       nap=$!
+      starting=""
+      [ -z "${stopping}" ] || { kill "${nap}" 2>/dev/null || true; exit 0; }
       wait "${nap}" 2>/dev/null || true
       nap=""
       kill -0 "${owner}" 2>/dev/null || exit 0
@@ -1696,9 +1701,11 @@ start_ledger_token_renewal() { # <label> <file>
 }
 
 # Ends the renewer and removes the file. The renewer traps TERM, and bash runs a
-# trap only once the foreground command returns, so the wait below outlasts a
-# mint, a write or an mv under way and the rm is final. Killed outright, the
-# renewer would leave that step running to write a live token after the rm.
+# trap only once the foreground command returns, so the wait below outlasts the
+# one command under way (a mint call, a retry sleep, a write or an mv) and the
+# renewer runs nothing after it: a mint in progress is abandoned there, and the
+# rm is final. Killed outright, the renewer would leave that command running to
+# write a live token after the rm.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
@@ -1778,13 +1785,18 @@ start_gitops_write_token() { # <label> <file>
   (
     waited=0
     failures=0
-    nap=""
+    nap="" starting="" stopping=""
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
-    # step only once it has returned.
-    trap '[ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0' TERM
+    # command only once it has returned. While the nap is being started its
+    # pid is not known yet, so the trap only marks the stop and the line after
+    # the fork ends that nap.
+    trap 'if [ -n "${starting}" ]; then stopping=1; else [ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0; fi' TERM
     while :; do
+      starting=1
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
       nap=$!
+      starting=""
+      [ -z "${stopping}" ] || { kill "${nap}" 2>/dev/null || true; exit 0; }
       wait "${nap}" 2>/dev/null || true
       nap=""
       kill -0 "${owner}" 2>/dev/null || exit 0
