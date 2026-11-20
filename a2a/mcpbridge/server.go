@@ -254,6 +254,9 @@ type ServerOptions struct {
 	// StepStreaming is the bridge's step-streaming setting; empty reads EnvStreamSteps, and
 	// that unset is StepStreamingAuto.
 	StepStreaming StepStreaming
+	// VersionText is what --version prints: the binary's name and the release or commit
+	// it was built for. Empty prints the MCP server name and version initialize reports.
+	VersionText string
 }
 
 type gatewayBridgeSession struct {
@@ -1000,7 +1003,11 @@ func RunCLIWithOptions(args []string, opts ServerOptions) error {
 		return err
 	}
 	if *versionMode || (fs.NArg() > 0 && fs.Arg(0) == "version") {
-		fmt.Printf("%s %s\n", mcpServerName, mcpServerVersion)
+		if opts.VersionText != "" {
+			fmt.Println(opts.VersionText)
+		} else {
+			fmt.Printf("%s %s\n", mcpServerName, mcpServerVersion)
+		}
 		return nil
 	}
 	if opts.StepStreaming == "" {
