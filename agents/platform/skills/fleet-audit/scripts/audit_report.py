@@ -1337,7 +1337,7 @@ CHECK_PHRASES = {
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
-    "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists backup machines that it cannot use",
+    "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists machine options that it cannot use",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",

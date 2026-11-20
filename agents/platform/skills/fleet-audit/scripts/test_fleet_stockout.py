@@ -4530,7 +4530,7 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         for text in texts:
             self.assertNotIn("priority", text.lower())
             self.assertNotIn("nodePoolAutoCreation", text)
-        self.assertEqual(audit_report.CHECK_PHRASES[fs.UNBACKED_MANUAL_FALLBACK], "ComputeClass `{object}` lists backup machines that it cannot use")
+        self.assertEqual(audit_report.CHECK_PHRASES[fs.UNBACKED_MANUAL_FALLBACK], "ComputeClass `{object}` lists machine options that it cannot use")
 
 
 class UnbackedManualFallbackCollectTest(unittest.TestCase):
