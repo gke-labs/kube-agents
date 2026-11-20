@@ -60,6 +60,13 @@ class VerificationFieldsTest(unittest.TestCase):
             with self.subTest(why), self.assertRaises(registry.RecipeError):
                 registry.parse(text)
 
+    def test_a_resource_whose_plural_holds_a_hyphen_is_accepted(self):
+        recipe = registry.parse(BASE + "applied: object_present\napplied_resource: foo-bars.example.io\n")
+        self.assertEqual(recipe.applied_resource, "foo-bars.example.io")
+        for bad in ("-foo.example.io", "foo-.example.io", "Foo.example.io"):
+            with self.subTest(bad), self.assertRaises(registry.RecipeError):
+                registry.parse(BASE + f"applied: object_present\napplied_resource: {bad}\n")
+
     def test_an_unlisted_kind_has_no_recipe(self):
         self.assertIsNone(registry.recipe("not-a-kind"))
 
