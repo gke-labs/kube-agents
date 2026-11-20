@@ -86,6 +86,7 @@ class _StubUserAPIKeyAuth:
     def __init__(self, **fields):
         api_key = fields.get("api_key")
         if isinstance(api_key, str) and api_key.startswith("sk-"):
+            # SHA-256, as LiteLLM hashes a key; the keys are random, not passwords.
             fields["api_key"] = hashlib.sha256(api_key.encode()).hexdigest()
         self.fields = fields
         for name, value in fields.items():

@@ -230,6 +230,11 @@ def _authenticate(request: Any, api_key: str | None) -> UserAPIKeyAuth:
     if not api_key or api_key in PLACEHOLDER_KEYS:
         token = _caller(KEYLESS_CLASS, KEYLESS_CLASS)
     else:
+        # A fast hash is the right one here, not a password KDF: caller keys are
+        # 256-bit random values the operator mints, so a digest cannot be
+        # guessed back, and LiteLLM itself stores keys as their SHA-256.
+        # CodeQL's weak-sensitive-data-hashing query reads api_key as a
+        # password; the name stays so its clear-text queries keep watching it.
         key_digest = hashlib.sha256(api_key.encode()).hexdigest()
         caller_class = _caller_keys.lookup(os.environ.get(CALLER_KEYS_FILE_ENV, DEFAULT_CALLER_KEYS_FILE), key_digest)
         if caller_class is None:
