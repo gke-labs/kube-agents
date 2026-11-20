@@ -79,9 +79,9 @@ from typing import Any, Callable, Mapping
 import yaml
 
 import automation_rules
-import automerge_checks
 import automerge_eligibility
 import okf_guard
+from fix_recipes import registry as fix_recipes_registry
 from providers import (
     CliTransport,
     HttpTransport,
@@ -3151,7 +3151,8 @@ class VcsBroker:
           fix in the environment the cluster's own labels declare
           (`automation_rules`);
         - the three safety checks pass on the broker's own read of the
-          workload's namespace (`automerge_checks.judge`).
+          workload's namespace (the `no-pdb` recipe's `checks.py`, through
+          `fix_recipes.registry.checks_module`).
 
         Off, it reads nothing and answers so. A failed read is a reason not to
         label, never an error, except a forge read of the proposal itself.
@@ -3264,6 +3265,9 @@ class VcsBroker:
             return f"the budget names no cluster or namespace this broker reads ({budget.cluster!r}, {budget.namespace!r})"
         if self._cluster_read is None:
             return "this broker has no cluster reader"
+        recipe_checks = fix_recipes_registry.checks_module(automerge_eligibility.FIX_TYPE)
+        if recipe_checks is None:
+            return f"the {automerge_eligibility.FIX_TYPE} recipe has no safety checks"
         # The rules on the repository's own base, never on a target branch a
         # caller could have published with a rules file of its own.
         base = self._practice_base(bound)
@@ -3293,7 +3297,7 @@ class VcsBroker:
             LOGGER.info("practice label: rules refuse cluster=%s: %s", budget.cluster, decision.reason)
             return f"{automation_rules.RULES_FILE} does not allow this fix in this cluster's environment"
         code, out, err = self._cluster_read(
-            ["kubectl", "get", automerge_checks.READ_KINDS, "-n", budget.namespace, "-o", "json"],
+            ["kubectl", "get", recipe_checks.read_kinds, "-n", budget.namespace, "-o", "json"],
             f"gke_{project}_{location}_{name}",
         )
         try:
@@ -3303,7 +3307,7 @@ class VcsBroker:
         if not isinstance(dump, dict) or not isinstance(dump.get("items"), list):
             LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
             return "the workload's namespace could not be read"
-        checks += automerge_checks.judge(dump, budget.object, budget.namespace, budget.name, budget.selector)
+        checks += recipe_checks.checks(budget, dump)
         failed = [check["name"] for check in checks if not check["passed"]]
         return f"safety checks failed: {', '.join(failed)}" if failed else None
 

@@ -1,11 +1,15 @@
 """Tests for dial_state.py: the autonomy dial's board section and its three actions."""
 
+import http.server
 import json
 import os
+import socket
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -21,6 +25,49 @@ ADMIN = "U0ADMIN01"
 REAL_REFRESH_ASYNC = dial_state.refresh_pending_async
 REAL_REPORT = dial_state.report_level
 REAL_RUN_SWITCH = dial_state.run_switch
+
+
+class _LiveBroker:
+    """A local HTTP server that records the method, the path and the `Authorization`
+    header of each request and answers `{}`; and a proxy environment whose proxy is
+    a closed port, for a test that the call does not take the proxy."""
+
+    def __init__(self, case):
+        seen = self.seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        case.addCleanup(server.server_close)
+        case.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_port}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        for patcher in (
+            mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}),
+            mock.patch.object(urllib.request, "_opener", None),
+        ):
+            patcher.start()
+            case.addCleanup(patcher.stop)
+        for name in ("no_proxy", "NO_PROXY"):
+            os.environ.pop(name, None)
 
 
 def done(results, code=0):
@@ -354,6 +401,16 @@ class ReporterTest(DialCase):
         self.reported.clear()
         self.assertFalse(dial_state.report_recorded())
         self.assertEqual(self.reported, [])
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_broker(self):
+        # The broker is an in-cluster Service. With a proxy variable and no NO_PROXY
+        # entry for its host, urllib hands the level report and its bearer token to the proxy.
+        broker = _LiveBroker(self)
+        token = Path(self.home) / "token"
+        token.write_text("chat-token\n")
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": broker.url, "CREDENTIAL_PROXY_TOKEN_FILE": str(token)}):
+            REAL_REPORT("automerge")
+        self.assertEqual([("POST", "/v1/dial", "Bearer chat-token")], broker.seen)
 
     def test_report_level_posts_with_the_token_and_reads_the_answer(self):
         import http.server

@@ -36,9 +36,10 @@ on that interpreter. It is not a required check, so it holds no merge, but a red
 workflow run and files a main-broken issue like any other job in it.
 
 **The installer test files also run on bash 3.2.** `installer-tests-bash-floor.yml` runs
-`make test-python`, narrowed to the installer test files and the tests of
-`scripts/dev/repeat_under_load.sh`, on the macOS runner with `/bin/bash` 3.2 first on `PATH`, when a
-pull request or a push to `main` changes a file those tests read. It is not a required check.
+`make test-python`, narrowed to the installer test files, the tests of
+`scripts/dev/repeat_under_load.sh` and the helm retry tests of `hack/ci-deploy.sh`, on the macOS
+runner with `/bin/bash` 3.2 first on `PATH`, when a pull request or a push to `main` changes a file
+those tests read. It is not a required check.
 
 **`bench/tasks/` and `bench/cuj/` both drive an agent, and they are the two most confusable rows.**
 The difference is who supplies the failure and who owns the environment.

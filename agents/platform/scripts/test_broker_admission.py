@@ -7,11 +7,16 @@ Run:
 from __future__ import annotations
 
 import http.client
+import http.server
+import importlib
 import io
 import json
 import os
+import socket
+import threading
 import unittest
 import urllib.error
+import urllib.request
 from unittest import mock
 
 import broker_admission
@@ -60,6 +65,49 @@ class _Response(io.BytesIO):
         return False
 
 
+class _LiveBroker:
+    """A local HTTP server that records the method, the path and the `Authorization`
+    header of each request and answers `{}`; and a proxy environment whose proxy is
+    a closed port, for a test that the call does not take the proxy."""
+
+    def __init__(self, case):
+        seen = self.seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        case.addCleanup(server.server_close)
+        case.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_port}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        for patcher in (
+            mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}),
+            mock.patch.object(urllib.request, "_opener", None),
+        ):
+            patcher.start()
+            case.addCleanup(patcher.stop)
+        for name in ("no_proxy", "NO_PROXY"):
+            os.environ.pop(name, None)
+
+
 class ReadReportTest(unittest.TestCase):
     ENDPOINT = "http://credential-proxy:8080"
 
@@ -82,6 +130,18 @@ class ReadReportTest(unittest.TestCase):
         self.assertEqual("Bearer t", request.get_header("Authorization"))
         # Bounded end to end, unlike the broker client's exec opener.
         self.assertEqual(broker_admission.ADMISSION_TIMEOUT_S, timeout)
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_broker(self):
+        # The broker is an in-cluster Service. With a proxy variable and no NO_PROXY
+        # entry for its host, urllib hands the request and its bearer token to the proxy.
+        # The opener is built at import, so the module is loaded again with the
+        # proxy in the environment, as a pod that has the variable loads it.
+        self.addCleanup(importlib.reload, broker_admission)
+        broker = _LiveBroker(self)
+        importlib.reload(broker_admission)
+        with mock.patch.object(credential_proxy_client, "authorization_headers", return_value={"Authorization": "Bearer t"}):
+            broker_admission.read_report(broker.url)
+        self.assertEqual([("GET", "/v1/exec/admission", "Bearer t")], broker.seen)
 
     def test_it_reads_the_interactive_cap_when_the_broker_reports_one(self):
         headers = mock.patch.object(credential_proxy_client, "authorization_headers", return_value={})
