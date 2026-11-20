@@ -75,15 +75,15 @@ In Cloud Monitoring the collector's own `cluster` and `location` labels take pre
 
 The `kind` label of `kubeagents_broker_execution_failures_total`:
 
-| `kind`                 | Counted                                                                                          |
-| ---------------------- | ------------------------------------------------------------------------------------------------ |
-| `exec_timeout`         | a command past its deadline                                                                      |
-| `exec_failed`          | a 500 on the exec route                                                                          |
-| `vcs_failed`           | a 500 or 502 on the version-control route, and its 503 for an unreadable managed-repository list |
-| `forge_refresh_failed` | a 502 on the forge route                                                                         |
-| `api_relay_failed`     | any 5xx on the Cloud API, MCP or watcher relays, whose upstream status passes through            |
-| `chat_pull_failed`     | the broker's own chat or Slack event pull failing on its subscription                            |
-| `other_failed`         | a 500, 502 or 504 on any other route                                                             |
+| `kind`                 | Counted                                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `exec_timeout`         | a command past its deadline                                                                                                          |
+| `exec_failed`          | a 500 on the exec route                                                                                                              |
+| `vcs_failed`           | a 500 or 502 on the version-control route, and its 503 for an unreadable managed-repository list                                     |
+| `forge_refresh_failed` | a 502 on the forge route                                                                                                             |
+| `api_relay_failed`     | any 5xx on the Cloud API, MCP or watcher relays, whose upstream status passes through                                                |
+| `chat_pull_failed`     | the broker's own chat event pull failing on any chat platform's route (its Pub/Sub subscription, or the in-pod Slack or Teams queue) |
+| `other_failed`         | a 500, 502 or 504 on any other route                                                                                                 |
 
 Read the two admission series by bound. A median wait in the tens of seconds, or refusals, under `budget` is the broker telling you to raise the proxy's memory limit (`spec.deployment.credentialProxy.resources`, or a `spec.deployment.sizingProfile` row that raises it). The same under `slot` says the slot cap of eight binds, and raising the limit changes nothing: narrow what the fleet reconcile and the stall watch list at once. At the operator's 2Gi default the budget admits ten, so `slot` is the bound a default install sees; the design behind the figures is [`docs/designs/credential-proxy-child-memory-budget.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/credential-proxy-child-memory-budget.md).
 
@@ -306,6 +306,8 @@ All container `stdout`/`stderr` is ingested by Cloud Logging by the GKE log agen
 The credential broker's own log is one JSON object per line, the record that says why it refused to start included — `severity`, `timestamp`, `logger`, `message`, and `exception` when a traceback is attached — and each command on the broker's exec route adds `tool_execution_audit` records whose `request_id`, `principal`, `tool`, `subcommand`, `status`, `broker_tier`, `class` and `broker_pod` are fields of their own (plus `pod`, the caller's pod when its token was pod-bound, which is how a session pod's command is tied to its conversation), with `exit_code` and `duration_ms` once a command has run (a command killed after its caller left has the duration only) and `rule` on a refusal.
 
 A read through the broker's Cloud API relay adds the same records, with `tool` set to `gcp-api`. Its `subcommand` is the Google service: `monitoring`, `cloudtrace`, `container`, `logging`, or `other` for a host the relay does not serve. A forwarded read carries `upstream_status`, the HTTP status Google returned, in place of `exit_code`. The `message` of a relay record names the host and the path as the caller sent them, cut to a fixed length, and never the query.
+
+A log read that the relay accepts writes one more broker log line, `api body checked`, before it asks Google. That line ends with `resource=projects/<project>`, the project whose entries the read asked for, so a read that fails after that point still names its project. The line is not a `tool_execution_audit` record and has no fields of its own: its `message` carries `request_id=<id>`, so search the message text for the `request_id` of the read's records. The record of a forwarded log read ends its `message` with the same `resource=`. A refused log read names no project.
 
 `broker_tier` is `exec` on an exec-tier replica and `stateful` on the stateful broker. `class` is the admission class the request runs under, `interactive` or `background`. `broker_pod` is the pod of the broker that wrote the record, so each record is traced to one replica.
 

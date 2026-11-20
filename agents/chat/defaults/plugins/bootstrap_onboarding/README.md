@@ -373,7 +373,7 @@ hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-p
   "Prioritize the onboarding inventory report"
 ```
 
-A previously delivered report is kept at `/opt/data/INVENTORY.delivered.md` on the sandbox pod and can be re-sent without re-running either stage.
+A previously delivered report is kept at `/opt/data/INVENTORY.delivered.md` on the sandbox pod and can be re-sent without re-running either stage. In chat, "what did onboarding find?", "show me the full inventory" and "was the first-run report delivered?" are the `platform` specialist's `first-run-report` skill reading it back through the `get_first_run_report` tool, with where the report went (`docs/designs/oobe.md` §3).
 
 Review onboarding hook and delivery events in the agent logs:
 

@@ -90,6 +90,14 @@ const (
 	// run it twice in the session, and "<taskId>/<envelopeId>" for a
 	// follow-up's, so it never replays the opening answer.
 	apiIdempotencyHeader = "Idempotency-Key"
+	// apiEvalRunHeader names the eval run, case and repetition a turn serves
+	// (`<run>/<case>/<rep>`). The bridge sends it only for an inject-door
+	// conversation, whose key the eval harness mints as exactly that triple
+	// behind apiInjectConversationPrefix; no other conversation carries it.
+	// The agent records it per session while KUBEAGENTS_EVAL_RUN_TAGS is on
+	// and ignores it otherwise (deploy/docker/patches/eval_run_tag.py).
+	apiEvalRunHeader            = "X-Kube-Agents-Eval-Run"
+	apiInjectConversationPrefix = "inject:"
 	// apiRateLimitedStatus is the status the server answers when it is
 	// already running its cap of concurrent turns
 	// (gateway.api_server.max_concurrent_runs), before the turn starts. It
@@ -143,6 +151,10 @@ var apiRateLimitedReasons = map[string]bool{"rate_limit": true, "billing": true}
 // session id: the server interpolates the id into a filename and refuses a
 // separator or "..", and the bus does not vouch for a contextId's shape.
 var apiSafeContextID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// apiEvalRunPattern is the tag's shape, as the agent and the replay proxy
+// hold it: a conversation key that is not one sends no header.
+var apiEvalRunPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}$`)
 
 // apiSessionID is the Hermes session a conversation's tasks share: the
 // contextId under apiSessionIDPrefix when it is path-safe, else a hash of
@@ -510,6 +522,26 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	}
 }
 
+// apiEvalRunTag is the eval run tag of an inject-door task, "" for any other.
+func apiEvalRunTag(env *lib.Envelope) string {
+	if env == nil {
+		return ""
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return ""
+	}
+	key := strings.TrimSpace(auth.Audience.Conversation)
+	if !strings.HasPrefix(key, apiInjectConversationPrefix) {
+		return ""
+	}
+	tag := strings.TrimPrefix(key, apiInjectConversationPrefix)
+	if !apiEvalRunPattern.MatchString(tag) {
+		return ""
+	}
+	return tag
+}
+
 // apiTurnKey is a turn's Idempotency-Key. The opening turn keeps the task
 // id, which is what a redelivered submission was always keyed on; a
 // follow-up adds its own envelope id, so it never replays the opening
@@ -552,6 +584,9 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	req.Header.Set(apiSessionKeyHeader, sessionID)
 	req.Header.Set(apiSessionIDHeader, sessionID)
 	req.Header.Set(apiIdempotencyHeader, key)
+	if tag := apiEvalRunTag(run.origin); tag != "" {
+		req.Header.Set(apiEvalRunHeader, tag)
+	}
 
 	if steer != nil {
 		run.mu.Lock()

@@ -98,11 +98,6 @@ const (
 	// <agent>-kube-proxy when KUBE_PROXY_URL is set and delegates to
 	// credential-proxy-exec kubectl on AgentProfile workers where it is unset.
 	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-	// profileWorkerModelKey only satisfies the harness's "an API key exists"
-	// check: the install's inference gateway runs keyless (the session
-	// worker's default, a2a/cmd/worker-adapter).
-	profileWorkerModelKey = "a2a-playground" // #nosec G101 -- placeholder, not a credential
 )
 
 // profileWorkerLabels are a worker pod's labels: the agent's, the worker
@@ -139,9 +134,12 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
 		// The install's inference gateway, by its full name: the worker runs
 		// in the profile namespace, where the session worker's short default
-		// doesn't resolve.
+		// doesn't resolve. The gateway runs keyless. Do not set
+		// ANTHROPIC_API_KEY here: the AI workload audit flags a literal model
+		// key in a pod spec (check 3.5, model-credential-plaintext-env), also
+		// a placeholder. worker-adapter adds the placeholder to the harness
+		// env (harnessEnv).
 		{Name: "ANTHROPIC_BASE_URL", Value: fmt.Sprintf("http://%s.%s.svc.cluster.local", inferenceGatewayServiceName, agent.Namespace)},
-		{Name: "ANTHROPIC_API_KEY", Value: profileWorkerModelKey},
 		{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)},
 		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},
 		{Name: "CREDENTIAL_PROXY_TASK_TOKEN_FILE", Value: profileWorkerTaskTokenPath + "/token"},

@@ -1741,16 +1741,21 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
             self.assertEqual(validator._load_yaml(path), yaml.safe_load(text))
 
     def test_one_unreadable_case_does_not_hide_the_others(self):
-        broken = validator.TASKS_DIR / "zz-not-a-real-case" / "task.yaml"
-        broken.parent.mkdir(parents=True)
-        try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_dir = pathlib.Path(tmp)
+            broken = tasks_dir / "aa-not-a-real-case" / "task.yaml"
+            broken.parent.mkdir(parents=True)
             broken.write_text("id: [unclosed\n")
-            results = validator.validate_all()
-        finally:
-            broken.unlink()
-            broken.parent.rmdir()
-        self.assertIn("could not be parsed as YAML", " ".join(results["zz-not-a-real-case"]))
-        self.assertGreater(len(results), 1)
+            sibling = tasks_dir / "made-up-case" / "task.yaml"
+            sibling.parent.mkdir(parents=True)
+            sibling.write_text(yaml.safe_dump(TestTheRulesReject.VALID))
+            with (
+                unittest.mock.patch.object(validator, "TASKS_DIR", tasks_dir),
+                unittest.mock.patch.object(eval_rosters, "TASKS_DIR", tasks_dir),
+            ):
+                results = validator.validate_all()
+        self.assertIn("could not be parsed as YAML", " ".join(results["aa-not-a-real-case"]))
+        self.assertIn("registered nowhere", " ".join(results["made-up-case"]))
 
 
 if __name__ == "__main__":
