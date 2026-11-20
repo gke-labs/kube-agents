@@ -21,18 +21,25 @@ Fields: `kind` (the directory's name), `name` (what text kube-agents writes
 calls the fixes), `title` and `dial_environment` (the dial's row), and the
 optional `owner` and `eval_case` (the end-to-end case that grades the fix on
 the cluster after merge).
+
+A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
+`generator(kind)`; `no-pdb` has one, which `audit_report._pdb_manifest` calls.
 """
 
 from __future__ import annotations
 
 import functools
+import importlib.util
 import json
 import re
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 RECIPE_FILE = "recipe.yaml"
+# A recipe's fix generator, beside its recipe.yaml (optional until every kind has one).
+FIX_FILE = "fix.py"
 # Larger than any recipe; a cap so a stray file costs a glance to refuse.
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
@@ -131,3 +138,28 @@ def recipes() -> tuple[Recipe, ...]:
 
 def kinds() -> frozenset[str]:
     return frozenset(recipe.kind for recipe in recipes())
+
+
+def generator(kind: str, root: Path = HERE) -> ModuleType:
+    """The `fix.py` of `kind`'s recipe, loaded once per file.
+
+    Loaded from its path: a kind is a check id such as `no-pdb`, and a hyphen
+    is not an importable package name. RecipeError for a kind with no valid
+    recipe or no `fix.py`.
+    """
+    if not KIND_RE.fullmatch(kind) or not (root / kind / RECIPE_FILE).is_file():
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    if kind not in {recipe.kind for recipe in (recipes() if root == HERE else load(root))}:
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    path = root / kind / FIX_FILE
+    if not path.is_file():
+        raise RecipeError(f"{kind}/{FIX_FILE}: missing")
+    return _load_fix(path.resolve(), kind)
+
+
+@functools.cache
+def _load_fix(path: Path, kind: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(f"fix_recipes.{kind.replace('-', '_')}_fix", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
