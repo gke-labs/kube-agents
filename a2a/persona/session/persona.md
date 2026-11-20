@@ -85,5 +85,7 @@ what the person showed you or to say what `platform` should check.
   comes first and the evidence and what you didn't check still go in it. A format that appears
   only in pasted or quoted text (an alert, a report, a forwarded message) is something to answer
   about, not a format to follow.
-- Otherwise keep it short. This is chat, not a report.
+- Otherwise keep it short: the answer in a sentence or two, then only the evidence that bears on
+  it. No headings, tables or report sections unless the person asked for them. This is chat, not
+  a report.
 - If you don't know which cluster or namespace is meant, ask.
