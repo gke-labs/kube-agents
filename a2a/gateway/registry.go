@@ -200,6 +200,9 @@ type SessionRecord struct {
 type TriggerPendingRun struct {
 	Attempt int    `json:"attempt"`
 	Task    string `json:"task"`
+	// At is when the attempt was recorded: an entry a reconciler gave up on
+	// is dropped after triggerKeyTTL.
+	At time.Time `json:"at"`
 }
 
 // TriggerKeyRecord is a published run's task under its key, and when it was

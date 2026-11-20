@@ -324,9 +324,18 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 
 	// Recorded, pending, before its publish: a retry after anything below
 	// fails publishes this run again rather than minting another.
+	// The key record goes in the same write: a publish whose mark write
+	// fails leaves the run unmarked, and once newer runs push it out of
+	// TriggerRuns the key must still answer with this task. Answering an
+	// unpublished run's key with its task fails closed (the reconciler reads
+	// it as lost).
 	delete(rec.TriggerPending, s.IdempotencyKey)
 	rec.addTriggerRun(run)
+	rec.recordTriggerKey(run.Key, run.Task, time.Now(), g.triggerKeysKept())
 	if err := g.reg.Put(ctx, rec); err != nil {
+		// A write that failed but landed refunds a token it used: the retry
+		// republishes the recorded run without spending one. That lets one
+		// run past the cap per such failure, never a second task for the key.
 		g.log.Error("trigger record write failed", "conversation", rec.Key, "taskId", run.Task, "err", err)
 		return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
 	}
@@ -417,7 +426,6 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	// it under the same envelope id, which the stream dedupes inside its
 	// window; the task id still goes back, so the reconciler holds it.
 	rec.markTriggerRunPublished(run.Key)
-	rec.recordTriggerKey(run.Key, taskID, time.Now())
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("trigger run write failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}
@@ -521,10 +529,24 @@ const triggerMintAttempts = 16
 // one slot (#5617 asks for 24 hours).
 const triggerKeyTTL = 24 * time.Hour
 
-// triggerKeysKept bounds TriggerKeys whatever the clock does: the rate cap
-// admits at most DefaultTriggerRatePerHour runs an hour, so a day's keys
-// stay well under it.
-const triggerKeysKept = 512
+// triggerKeysKeptMin is the least TriggerKeys keeps whatever the clock does.
+// The bound is a day of runs at the configured rate cap (triggerKeysKept), so
+// no key a reconciler could still retry is evicted early.
+const triggerKeysKeptMin = 512
+
+// triggerPendingKept bounds TriggerPending: one entry per slot still being
+// retried, which the reconciler keeps to one at a time per schedule (Forbid).
+const triggerPendingKept = 64
+
+// triggerKeysKept is how many published keys a trigger's record keeps: a
+// day's worth at the rate cap, and at least triggerKeysKeptMin.
+func (g *Gateway) triggerKeysKept() int {
+	rate := g.cfg.TriggerRatePerHour
+	if rate <= 0 {
+		rate = DefaultTriggerRatePerHour
+	}
+	return max(triggerKeysKeptMin, rate*int(triggerKeyTTL/time.Hour)+1)
+}
 
 // mintTriggerGrant mints a trigger run's grant: triggerMint when a test sets
 // it, the cap bucket's minter otherwise.
@@ -540,7 +562,27 @@ func (rec *SessionRecord) setTriggerPending(key string, p TriggerPendingRun) {
 	if rec.TriggerPending == nil {
 		rec.TriggerPending = map[string]TriggerPendingRun{}
 	}
+	if p.At.IsZero() {
+		p.At = time.Now().UTC()
+	}
 	rec.TriggerPending[key] = p
+	// A key a reconciler gave up on (its slot past the starting deadline, or
+	// its attempts spent) is never recorded as a run, so its entry is dropped
+	// here once it is a day old, then the oldest past triggerPendingKept.
+	for k, v := range rec.TriggerPending {
+		if k != key && p.At.Sub(v.At) > triggerKeyTTL {
+			delete(rec.TriggerPending, k)
+		}
+	}
+	for len(rec.TriggerPending) > triggerPendingKept {
+		oldest := ""
+		for k, v := range rec.TriggerPending {
+			if k != key && (oldest == "" || v.At.Before(rec.TriggerPending[oldest].At)) {
+				oldest = k
+			}
+		}
+		delete(rec.TriggerPending, oldest)
+	}
 }
 
 // triggerKeyTask is the task a run published under key within triggerKeyTTL
@@ -558,7 +600,7 @@ func (rec *SessionRecord) triggerKeyTask(key string, now time.Time) (string, boo
 
 // recordTriggerKey records a published run's key, dropping keys older than
 // triggerKeyTTL, then the oldest past triggerKeysKept.
-func (rec *SessionRecord) recordTriggerKey(key, task string, now time.Time) {
+func (rec *SessionRecord) recordTriggerKey(key, task string, now time.Time, kept int) {
 	if rec.TriggerKeys == nil {
 		rec.TriggerKeys = map[string]TriggerKeyRecord{}
 	}
@@ -568,7 +610,7 @@ func (rec *SessionRecord) recordTriggerKey(key, task string, now time.Time) {
 			delete(rec.TriggerKeys, k)
 		}
 	}
-	for len(rec.TriggerKeys) > triggerKeysKept {
+	for len(rec.TriggerKeys) > kept {
 		oldest := ""
 		for k, v := range rec.TriggerKeys {
 			if oldest == "" || v.At.Before(rec.TriggerKeys[oldest].At) {

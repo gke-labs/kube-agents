@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -846,7 +847,7 @@ func TestAKeyOlderThanTheKeptRunsIsStillItsTask(t *testing.T) {
 		t.Fatalf("the repeat started a task: %d submissions", len(tr.submissions()))
 	}
 	rec.TriggerKeys = map[string]TriggerKeyRecord{"old": {Task: "t-old", At: time.Now().Add(-25 * time.Hour)}}
-	rec.recordTriggerKey("new", "t-new", time.Now())
+	rec.recordTriggerKey("new", "t-new", time.Now(), triggerKeysKeptMin)
 	if _, ok := rec.TriggerKeys["old"]; ok {
 		t.Error("a key past 24 hours wasn't pruned")
 	}
@@ -875,22 +876,77 @@ func TestARefundNeverExceedsTheBucket(t *testing.T) {
 	}
 }
 
-// An older gateway, which reads the record without TriggerPending, sees no
-// run for a key that only has a pending attempt, so never takes one for a
-// granted or publishable run.
-func TestAPendingAttemptIsNoRunToAnOlderGateway(t *testing.T) {
-	rec := &SessionRecord{Key: "k", TriggerPending: map[string]TriggerPendingRun{"key": {Attempt: 2, Task: "task-x"}}}
-	data, err := json.Marshal(rec)
-	if err != nil {
-		t.Fatal(err)
+// End to end: a real run's key is recorded when the run is, even when the
+// write marking it published fails, and after more newer runs than
+// TriggerRuns keeps have pushed it out, a repeat of the key is still answered
+// with its task and starts nothing.
+func TestAPublishedKeyOutlivesTheKeptRuns(t *testing.T) {
+	tr := startTriggerRig(t, func(c *Config) { c.TriggerRatePerHour = 1000 })
+	first := goodScheduleSubmit()
+	// The first run's publish lands but the write marking it published
+	// fails, so only the key record written with the run can answer later.
+	failMark := 1
+	tr.g.reg.beforePut = func(rec *SessionRecord) error {
+		if run := rec.triggerRun(first.IdempotencyKey); failMark > 0 && run != nil && run.Published {
+			failMark--
+			return errors.New("kv write failed")
+		}
+		return nil
 	}
-	var older struct {
-		TriggerRuns []TriggerRun `json:"triggerRuns,omitempty"`
+	r := tr.submit(t, "schedule", first)
+	if r.Refused != nil {
+		t.Fatalf("refused: %+v", r.Refused)
 	}
-	if err := json.Unmarshal(data, &older); err != nil {
-		t.Fatal(err)
+	for i := 1; i <= triggerRunsKept; i++ {
+		s := goodScheduleSubmit()
+		s.IdempotencyKey = fmt.Sprintf("schedule/kubeagents-system/compliance-audit/%d", 1763100000+i*3600)
+		if rr := tr.submit(t, "schedule", s); rr.Refused != nil {
+			t.Fatalf("run %d refused: %+v", i, rr.Refused)
+		}
 	}
-	if len(older.TriggerRuns) != 0 {
-		t.Fatalf("an older reader sees runs: %+v", older.TriggerRuns)
+	rec, err := tr.g.reg.Get(context.Background(), "trigger:schedule/kubeagents-system/compliance-audit")
+	if err != nil || rec == nil || rec.triggerRun(first.IdempotencyKey) != nil {
+		t.Fatalf("the first run is still kept (%v); the test needs it pushed out", err)
+	}
+	before := len(tr.submissions())
+	again := tr.submit(t, "schedule", first)
+	if again.Refused != nil || again.TaskID != r.TaskID {
+		t.Fatalf("the repeat = %+v, want task %s", again, r.TaskID)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := len(tr.submissions()); n != before {
+		t.Fatalf("the repeat started a task: %d submissions, was %d", n, before)
+	}
+}
+
+// Pending attempts a reconciler gave up on are dropped a day later, and the
+// map never grows past triggerPendingKept; key records are capped too, with
+// the cap sized from the configured rate.
+func TestTriggerRecordMapsAreBounded(t *testing.T) {
+	rec := &SessionRecord{}
+	now := time.Now()
+	rec.setTriggerPending("stale", TriggerPendingRun{Attempt: 3, At: now.Add(-25 * time.Hour)})
+	rec.setTriggerPending("fresh", TriggerPendingRun{Attempt: 1, At: now})
+	if _, ok := rec.TriggerPending["stale"]; ok {
+		t.Error("a day-old pending attempt wasn't dropped")
+	}
+	for i := 0; i < triggerPendingKept+10; i++ {
+		rec.setTriggerPending(fmt.Sprintf("k%d", i), TriggerPendingRun{At: now.Add(time.Duration(i) * time.Second)})
+	}
+	if len(rec.TriggerPending) != triggerPendingKept {
+		t.Errorf("TriggerPending holds %d, want %d", len(rec.TriggerPending), triggerPendingKept)
+	}
+	for i := 0; i < 40; i++ {
+		rec.recordTriggerKey(fmt.Sprintf("key%d", i), "t", now.Add(time.Duration(i)*time.Second), 30)
+	}
+	if len(rec.TriggerKeys) != 30 {
+		t.Errorf("TriggerKeys holds %d, want 30", len(rec.TriggerKeys))
+	}
+	if _, ok := rec.TriggerKeys["key0"]; ok {
+		t.Error("the oldest key wasn't the one evicted")
+	}
+	g := &Gateway{cfg: &Config{TriggerRatePerHour: 60}}
+	if got := g.triggerKeysKept(); got < 60*24 {
+		t.Errorf("at 60 an hour the key cap is %d, under a day's runs", got)
 	}
 }
