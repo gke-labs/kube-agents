@@ -385,9 +385,10 @@ func TestKanbanDispatcher_TheMessageFollowsTheCause(t *testing.T) {
 	}
 }
 
-// The stuck message gives no duration: it is written once per reason, so it
-// must read the same however long the board has been stuck. That also covers a
-// board that recovers and locks again between two polls.
+// The stuck message gives no duration: it is written again only when its
+// status, its reason or its text changes, so it must read the same however
+// long the board has been stuck. That also covers a board that recovers and
+// locks again between two polls.
 func TestKanbanDispatcher_TheStuckMessageGivesNoDuration(t *testing.T) {
 	messages := map[string]int64{}
 	for _, seconds := range []int64{0, 45, 312, 2160, 7260} {
