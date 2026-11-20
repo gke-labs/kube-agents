@@ -2,7 +2,7 @@
 """
 networking_audit.py — collector for the GCP networking fabric and VPC IPAM audit.
 
-Sweeps every project in scope for all six checks of
+Sweeps every project in scope for all seven checks of
 governance/gcp_networking_fabric_sop.md and writes the run manifest
 docs/designs/fleet-audit-collector-manifest.md §2 specifies, so
 `audit_report.py finish --manifest-file` cross-checks the worker's
@@ -17,13 +17,14 @@ Two target shapes, matching `AuditSpec.scopes` for this stream:
   host subnet counts its service projects' use (`read_subnet_usage`,
   `audit_subnet_capacity`). No Network Analyzer insight and no
   `subnets list-usable`: both need grants the agent does not hold.
-- `project/<project>` owes the other five: `cloud-nat-exhaustion`
+- `project/<project>` owes the other six: `cloud-nat-exhaustion`
   (`routers list`, then `get-status` and a per-gateway `get-nat-mapping-info`
   for each dynamic-allocation gateway), `psc-routing-deadlock`
   (`forwarding-rules list`, unfiltered), `mtu-packet-fragmentation`
   (`networks list`, comparing ACTIVE peerings), `cloud-armor-false-positive`
-  (`security-policies list` against `backend-services list`) and
+  (`security-policies list` against `backend-services list`),
   `firewall-world-open-ingress` (`firewall-rules list` against `instances
+  list`) and `missing-nodelocal-dnscache` (the sweep's `container clusters
   list`). A failed read costs only the checks that use it. Each such check
   goes in the target's `checks_unevaluated`, and the other checks keep their
   verdicts. The target is `gate-failed` only when no read passes.
@@ -157,7 +158,9 @@ UNREAD_SUBNET_USAGE = "UNREAD_SUBNET_USAGE"
 COMMAND_JOINER = " && "
 LIMITATION_JOINER = "; "
 SUBNETS_FORMAT = "--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)"
-CLUSTERS_FORMAT = "--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)"
+CLUSTERS_FORMAT = (
+    "--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)"
+)
 ADDRESSES_FILTER = "--filter=addressType=INTERNAL"
 ADDRESSES_FORMAT = "--format=json(address,subnetwork)"
 FORWARDING_RULES_FORMAT = "--format=json(IPAddress,subnetwork)"
@@ -208,6 +211,20 @@ NAT_CHECK_SLUG = "cloud-nat-exhaustion"
 MTU_CHECK_SLUG = "mtu-packet-fragmentation"
 ARMOR_CHECK_SLUG = "cloud-armor-false-positive"
 FIREWALL_CHECK_SLUG = "firewall-world-open-ingress"
+DNS_CACHE_CHECK_SLUG = "missing-nodelocal-dnscache"
+# What the DNS cache check calls its read in a limitation.
+DNS_CACHE_READ = "Cluster add-ons"
+DNS_CACHE_EXCERPT = "addonsConfig.dnsCacheConfig.enabled is not true on a Standard cluster"
+# `networkConfig.dnsConfig.clusterDns` on a cluster that uses Cloud DNS for GKE: once
+# its nodes are re-created, its Pods resolve at the metadata address, so no lookup
+# crosses kube-dns or conntrack.
+CLOUD_DNS_PROVIDER = "CLOUD_DNS"
+# A project with the Kubernetes Engine API off holds no cluster to read.
+DNS_CACHE_NO_GKE_REASON = "the Kubernetes Engine API is not enabled in this project, so it holds no cluster"
+# A listing with no `addonsConfig` says nothing about the add-on: unread, not off.
+DNS_CACHE_UNDECIDED_LIMITATION = "{check} was not decided for {clusters}: the clusters listing does not report their add-ons"
+# Between cluster names in that limitation; limitations themselves join with `; `.
+CLUSTER_NAME_SEPARATOR = ", "
 # The project target's limitation when the fleet pass measured its rules
 # without the instances of other projects whose `instances list` failed.
 FLEET_INSTANCES_UNREAD_LIMITATION = (
@@ -333,6 +350,7 @@ SEVERITY = {
     MTU_CHECK_SLUG: "major",
     ARMOR_CHECK_SLUG: "minor",
     FIREWALL_CHECK_SLUG: "critical",
+    DNS_CACHE_CHECK_SLUG: "minor",
 }
 IMPACT = {
     NAT_CHECK_SLUG: (
@@ -355,6 +373,10 @@ IMPACT = {
     FIREWALL_CHECK_SLUG: (
         "Any host on the internet can open a TCP connection to these ports on the instances named, "
         "so whatever authenticates on the far side of the port is the entire perimeter."
+    ),
+    DNS_CACHE_CHECK_SLUG: (
+        "Every Pod DNS lookup goes to the kube-dns ClusterIP and takes a conntrack entry on its node, "
+        "so lookups slow down under load and are dropped when the table fills."
     ),
 }
 
@@ -771,7 +793,9 @@ def _limitation(read: str, cmd: list[str], error: str | None) -> str:
     return f"{read} not read: `{shlex.join(cmd)}` failed: {excerpt}"
 
 
-def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -> dict:
+def read_subnet_usage(
+    projects: list[str], instance_cache: dict | None = None, cluster_cache: dict | None = None
+) -> dict:
     """First subnet-ip-exhaustion pass: what every project in scope draws from any subnet.
 
     Clusters, VMs, internal addresses and forwarding rules are read in every
@@ -782,7 +806,8 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
     the limitations of each project's failed or partial reads, keyed by project,
     and the projects whose clusters read failed or was partial. A caller that
     passes `instance_cache` gets each project's `instances list` result in it,
-    so the project checks do not list the instances again.
+    and one that passes `cluster_cache` its `clusters list` result, so the
+    project checks do not list either again.
     """
     pod_ranges: dict[tuple[str, str, str, str], dict] = {}
     used_ips: dict[tuple[str, str, str], set[str]] = {}
@@ -795,6 +820,8 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
         own = limitations.setdefault(project_id, [])
         warnings: list[str] = []
         clusters, error = run_gcloud_json(cmds["clusters"], warnings=warnings)
+        if cluster_cache is not None:
+            cluster_cache[project_id] = (clusters, error, incomplete_listing(warnings))
         if clusters == API_DISABLED:
             clusters = []
         elif error is not None or not isinstance(clusters, list):
@@ -1280,6 +1307,28 @@ def check_mtu_mismatch(networks: list, project: str) -> list[dict]:
                 "excerpt": f"{pair[0]} mtu={mtus[pair[0]]} peered with {pair[1]} mtu={mtus[pair[1]]}",
             })
     return hits
+
+
+def check_nodelocal_dnscache(clusters: list) -> tuple[list[dict], list[str]]:
+    """SOP 2.7: one hit per Standard cluster whose NodeLocal DNSCache add-on is
+    not on, and the clusters whose listing carries no add-ons to decide from.
+    Autopilot always runs the cache, and a cluster on Cloud DNS for GKE sends
+    no lookup to kube-dns once its nodes are re-created, so neither is read."""
+    hits: list[dict] = []
+    undecided: list[str] = []
+    for cluster in clusters or []:
+        if not isinstance(cluster, dict) or (cluster.get("autopilot") or {}).get("enabled"):
+            continue
+        dns = (cluster.get("networkConfig") or {}).get("dnsConfig") or {}
+        if dns.get("clusterDns") == CLOUD_DNS_PROVIDER:
+            continue
+        ref = f"{cluster.get('location', '')}/{cluster.get('name', '')}"
+        addons = cluster.get("addonsConfig")
+        if not isinstance(addons, dict):
+            undecided.append(ref)
+        elif (addons.get("dnsCacheConfig") or {}).get("enabled") is not True:
+            hits.append({"object": f"Cluster/{ref}", "excerpt": DNS_CACHE_EXCERPT})
+    return hits, undecided
 
 
 def _looks_non_production(name: str) -> bool:
@@ -1875,20 +1924,24 @@ def router_commands(project: str, router: str, region: str, nat: str | None = No
     return [GCLOUD, "compute", "routers", "get-nat-mapping-info", router, f"--nat-name={nat}", *tail]
 
 
-def collect_project_target(project: str, instance_cache: dict | None = None) -> dict | None:
-    """The `project/<project>` entry for the five project-level checks, or None
+def collect_project_target(
+    project: str, instance_cache: dict | None = None, cluster_cache: dict | None = None
+) -> dict | None:
+    """The `project/<project>` entry for the six project-level checks, or None
     for a project whose own Compute Engine API is off.
 
     A failed read costs only the checks that use it. Each such check goes in
     `checks_unevaluated` with a `limitations` sentence, and the other checks
     keep their verdicts. The target is `gate-failed` only when no check has a
     read that passed. `instance_cache` holds the `instances list` result that
-    the subnet sweep already read for this project, so the run reads it once.
+    the subnet sweep already read for this project, so the run reads it once;
+    `cluster_cache` holds its `clusters list` result the same way.
     """
     name = f"{PROJECT_TARGET_PREFIX}{project}"
     reads: dict[str, SlugReads] = {}
     candidates: list[dict] = []
     unevaluated: list[dict] = []
+    not_applicable: list[dict] = []
     limitations: list[str] = []
     errors: list[str] = []
     cmds = project_commands(project)
@@ -1996,6 +2049,33 @@ def collect_project_target(project: str, instance_cache: dict | None = None) -> 
         candidates.extend(emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits)
         undecided.extend(rules)
 
+    def dns_cache() -> None:
+        cmd = subnet_commands(project)["clusters"]
+        cached = (cluster_cache or {}).get(project)
+        if cached is None:
+            warnings: list[str] = []
+            clusters, error = run_gcloud_json(cmd, warnings=warnings)
+            cached = (clusters, error, incomplete_listing(warnings))
+        clusters, error, partial = cached
+        if clusters == API_DISABLED:
+            not_applicable.append({"check": DNS_CACHE_CHECK_SLUG, "reason": DNS_CACHE_NO_GKE_REASON})
+            return
+        if error is not None or not isinstance(clusters, list):
+            raise GateFailure(error or f"`{shlex.join(cmd)}` returned {type(clusters).__name__}")
+        reads.setdefault(DNS_CACHE_CHECK_SLUG, SlugReads()).add(shlex.join(cmd), json.dumps(clusters), 0.0)
+        if partial:
+            limitations.append(_partial_limitation(DNS_CACHE_READ, cmd, partial))
+        # The subnet sweep counts an excluded cluster's addresses; this check judges the
+        # cluster itself, which the operator left out on purpose.
+        hits, undecided_clusters = check_nodelocal_dnscache(declared_scope.drop_excluded(project, clusters))
+        candidates.extend(emit(DNS_CACHE_CHECK_SLUG, hit, shlex.join(cmd)) for hit in hits)
+        if undecided_clusters:
+            limitations.append(
+                DNS_CACHE_UNDECIDED_LIMITATION.format(
+                    check=DNS_CACHE_CHECK_SLUG, clusters=CLUSTER_NAME_SEPARATOR.join(undecided_clusters)
+                )
+            )
+
     try:
         for slug, check in (
             (NAT_CHECK_SLUG, nat),
@@ -2003,6 +2083,7 @@ def collect_project_target(project: str, instance_cache: dict | None = None) -> 
             (MTU_CHECK_SLUG, mtu),
             (ARMOR_CHECK_SLUG, armor),
             (FIREWALL_CHECK_SLUG, firewall),
+            (DNS_CACHE_CHECK_SLUG, dns_cache),
         ):
             try:
                 check()
@@ -2029,7 +2110,7 @@ def collect_project_target(project: str, instance_cache: dict | None = None) -> 
         "outcome": OUTCOME_COLLECTED,
         "commands": [{"check": slug, **joined_record(slug_reads)} for slug, slug_reads in reads.items()],
         "candidates": candidates,
-        "checks_not_applicable": [],
+        "checks_not_applicable": not_applicable,
     }
     if unevaluated:
         entry["checks_unevaluated"] = unevaluated
@@ -2122,10 +2203,15 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
     # The subnet sweep's reads come first: the firewall check uses its clusters
     # read to find the networks that hold an Autopilot cluster.
     instance_cache: dict = {}
-    usage = read_subnet_usage(projects, instance_cache) if check in (CHECK_ALL, SUBNET_CHECK_SLUG) else None
+    cluster_cache: dict = {}
+    usage = (
+        read_subnet_usage(projects, instance_cache, cluster_cache)
+        if check in (CHECK_ALL, SUBNET_CHECK_SLUG)
+        else None
+    )
     if check in (CHECK_ALL, PROJECT_CHECKS_CHOICE):
         for project in projects:
-            entry = collect_project_target(project, instance_cache)
+            entry = collect_project_target(project, instance_cache, cluster_cache)
             if entry is None:
                 api_off.append(project)
             else:

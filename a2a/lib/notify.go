@@ -97,14 +97,16 @@ type NotifyRequest struct {
 	// ReplyTo, on a request aimed at a conversation, is the id of the
 	// gateway task whose turn filed the work this reports on, when the
 	// sender knows it. Only the console passes it on (its frame's replyTo),
-	// so a console client can join a report to the turn it answers, and
+	// so a console client can join a post to the turn it reports on, and
 	// the gateway keeps the post under its root for the reply that names
 	// it (a2a/gateway/reports.go).
 	ReplyTo string `json:"reply_to,omitempty"`
 	// Report marks a conversation post as a card's report: the kanban
 	// notifier sets it on the settled card's report post alone (never on a
 	// progress note, heartbeat, queued or plan line), and the gateway keeps
-	// a post for the reply under it only when it is set and names its task.
+	// a post for the reply under it only when it is set and names its task;
+	// the console frame carries it (report), so a console client offers a
+	// reply under that post alone.
 	Report bool `json:"report,omitempty"`
 }
 

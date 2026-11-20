@@ -1,5 +1,5 @@
 {
-  "version": "6c45e2744eacf7ee",
+  "version": "022f29bd2f150cea",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -28,7 +28,6 @@
           "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
           "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
           "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
-          "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -41,7 +40,6 @@
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
           "$JS.API.STREAM.INFO.DISPATCH_STOPS",
-          "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
           "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
           "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
           "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -123,11 +121,11 @@
           "$KV.session-state.>",
           "$KV.feedback.>",
           "$KV.people.>",
-          "$KV.SCHEDULED_REPORTS.>",
           "chat.console.*.out",
           "chat.notify.reply.agent.>",
           "$KV.cap.root.*",
           "chat.board",
+          "a2a.trigger.reply.>",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.CONSUMER.CREATE.TASKS.>",
           "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -145,8 +143,6 @@
           "$JS.API.DIRECT.GET.KV_people.>",
           "$JS.API.CONSUMER.CREATE.KV_people.>",
           "$JS.API.CONSUMER.DELETE.KV_people.*",
-          "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
-          "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
           "$JS.ACK.TASKS.>",
@@ -168,6 +164,8 @@
           "chat.notify.slack",
           "chat.notify.console",
           "chat.board.reply.gateway.>",
+          "a2a.trigger.*.submit",
+          "a2a.trigger.*.status",
           "_INBOX.gateway.>"
         ],
         "denyPublish": [

@@ -87,14 +87,14 @@ other profiles' rosters every minute, `cluster-agent-reconcile`, the inventory j
 
 Beyond the rosters, six rows:
 
-| Capability      | Started by                                                                                                                       |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| First-run flow  | The `oobe` job's inventory scan and its cards, before the first-run audits start. Each first-run audit is its audit's row.       |
-| Incident triage | A session the event watcher opens.                                                                                               |
-| GitOps drift    | An inject the drift detector raises for an out-of-band change, and the work it starts.                                           |
-| Chat            | A chat turn. Which skills a turn loaded is read after the run from the session record and reported inside this row.              |
-| Memory service  | The Hindsight memory service's own model calls and memory, when the install enables it.                                          |
-| Session Pods    | The Pods that `delegate` and `/session` start under `spec.mode: next`, each under the capability of the session that started it. |
+| Capability      | Started by                                                                                                                 |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| First-run flow  | The `oobe` job's inventory scan and its cards, before the first-run audits start. Each first-run audit is its audit's row. |
+| Incident triage | A session the event watcher opens.                                                                                         |
+| GitOps drift    | An inject the drift detector raises for an out-of-band change, and the work it starts.                                     |
+| Chat            | A chat turn. Which skills a turn loaded is read after the run from the session record and reported inside this row.        |
+| Memory service  | The Hindsight memory service's own model calls and memory, when the install enables it.                                    |
+| Session Pods    | The Pods that `delegate` and `/session` start, each under the capability of the session that started it.                   |
 
 A capability's row holds the work it starts, not only its own run. Three rules carry the tag
 forward:

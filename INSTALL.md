@@ -87,7 +87,7 @@ on freshly created clusters (no Terraform field exists) and the GitHub App priva
 one place; see
 [Shared defaults live in `installer_common.sh`](scripts/installer/README.md#shared-defaults-live-in-installer_commonsh).
 
-Four behaviours worth knowing before the first run:
+Five behaviours worth knowing before the first run:
 
 - **The image/source ref defaults to the release version (in release checkouts and bundles) or the checkout's `HEAD` commit SHA (on `main`)**, and must be a SemVer release tag or a full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so the scripts and the container image stay on one revision; pass `--allow-unverified-source` to override that while iterating on the installer itself. Do not install from a `main` checkout when targeting an official release: manifests and CRD schemas on `main` diverge from older releases, and `verify_local_source_ref` blocks mismatched revisions to prevent broken installations.
 - **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
@@ -121,6 +121,25 @@ Four behaviours worth knowing before the first run:
   names its own three (`TF_VAR_drift_pubsub_topic`, `_subscription`, `_sink`) or `lifecycle.sh`
   refuses its apply; see
   [the composition's README](terraform/examples/full-install/README.md).
+- **Every run except `--dry-run` changes the project of your active `gcloud` configuration**, a
+  `--generate-only` run too. `install.sh` runs `gcloud config set project` for the target project
+  and does not set it back, so every terminal and process that uses that configuration points at
+  the new project from then on. To keep your default as it is, give the run a configuration of its
+  own, in the terminal that runs the installer:
+
+  ```bash
+  gcloud config configurations create kube-agents-install --no-activate
+  gcloud config set account "$(gcloud config get-value account)" --configuration=kube-agents-install
+  export CLOUDSDK_ACTIVE_CONFIG_NAME=kube-agents-install
+  ```
+
+  Then run the installer from that terminal, in any of its forms. `gcloud` reads
+  `CLOUDSDK_ACTIVE_CONFIG_NAME` only in the processes that have it, so the installer's `gcloud`
+  calls use and change `kube-agents-install`, and other terminals keep their project. The new
+  configuration holds your account and nothing else: pass `--gcp-region` if your default
+  configuration sets a region, and copy any other property that you rely on in the same way as
+  the account. Export the same variable before you run `upgrade.sh`, `uninstall.sh` or your own
+  `gcloud` commands for this install, so that they use the same project.
 
 ### Generate-Only Mode (Recommended for Existing Infrastructure)
 
@@ -505,6 +524,8 @@ Before beginning installation, ensure your environment meets the requirements fo
 A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
 NetworkPolicy enforcement, and the rest of the site's
 [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
+The site's [prerequisites](docs/site/src/content/docs/install/prerequisites.md) also cover the
+project's `default` VPC network and a second install for the same GitHub App.
 
 ---
 
@@ -723,7 +744,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Under **Visibility**, select **Specific people and groups in your domain** and enter your email address (`ALLOWED_USERS`).
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
-   - Neither the first message nor `/sethome` sets it: the A2A gateway posts Google Chat's alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`). The agent sends home posts to each platform that has a home channel, including a Slack channel the gateway learned. With none, every enabled platform's gateway route refuses them and keeps them (up to fifty, for thirty days) for one digest once its channel is set. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
+   - Neither this DM nor `/sethome` sets the home channel: the A2A gateway posts Google Chat's alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), or, with that empty, to the named space where the app is first mentioned top-level. The agent sends home posts to each platform that has a home channel, including one the gateway learned. With none, every enabled platform's gateway route refuses them and keeps them (up to fifty, for thirty days) for one digest once its channel is set. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
 3. **Who is answered**:
    - The A2A gateway has no pairing: it answers the addresses in `ALLOWED_USERS`, or everyone the app is visible to when that is empty.
    - Re-display these instructions at any time from the repository root; the script prints the A2A gateway's checklist:
@@ -1397,6 +1418,10 @@ a delivery run the file is renamed `INVENTORY.delivered.md`.
 kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md
 ```
 
+Or ask the agent — in the [no-chat-platform session](#step-6-talk-to-the-agent-with-no-chat-platform), or in chat once a platform is on: `what did onboarding
+find?` reads the same report back through the Platform Agent, `show me the full inventory` reads
+the sweep's complete findings, and `was the first-run report delivered?` says where it went.
+
 To see how far onboarding has got:
 
 ```bash
@@ -1551,12 +1576,12 @@ make uninstall
 
 When a Slack bot connects or is online in your workspace but never replies to messages, DMs, or mentions, verify each of the following:
 
-- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope and Event Subscriptions (`app_mention`, `message.*`) must be enabled.
+- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope, and the `message.*` Event Subscriptions (`message.im`, `message.channels`, `message.groups`, `message.mpim`) must be enabled. The gateway finds a mention in the message text, so the `app_mention` event is not needed.
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
-  - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
+  - `files:write` is not needed: the gateway's manifest does not have it, and the gateway uploads no file. An app made from the `hermes slack manifest` output has both `app_mention` and `files:write`; they can stay.
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
   - On the gateway, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)). The message shortcut also needs the `commands` scope and a `features.shortcuts` entry ([Slack app setup](docs/site/src/content/docs/install/slack-app.md)).
-  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`; the gateway's manifest is on the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-the-a2a-gateway) page.
+  - For the complete manifest and its event subscriptions, see the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-the-a2a-gateway) page. Its manifest is short enough to paste into Slack's **Create New App → From a manifest** dialog. `./scripts/installer/print_instructions_slack.sh` prints the gateway's checklist and the page's address.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). The A2A gateway answers an unlisted user once with a notice naming their member ID. An empty allowlist admits all members in the workspace. The A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list, unless the list names that member as `T…:U…` (their workspace ID, a colon, their member ID). See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace:** The A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens, Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or Slack is turned off. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
 
@@ -1628,7 +1653,7 @@ On Google Chat the gateway posts a status line for every task ([what a task look
   kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
   ```
 - **The agent says it handed the work off, and then nothing comes.** It filed a board card, and the card's report did not come back. The gateway posts a card's report into the conversation you asked in, on Slack and Google Chat alike. Check each hop:
-  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `"conversations":true`. `chat.notify route not armed` with an `err` means the home channel is set but malformed: on Google Chat `spec.integration.googleChat.homeChannel` must be a space name (`spaces/<id>`), on Slack `spec.integration.slack.homeChannel` a channel id (`C…` or `G…`). Correct or remove it; with none set the route still arms for conversations and logs `chat.notify home posts not armed: … conversation posts are`. `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
+  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `"conversations":true`. `chat.notify route not armed` with an `err` means the home channel is set but malformed: on Google Chat `spec.integration.googleChat.homeChannel` must be a space name (`spaces/<id>`), on Slack `spec.integration.slack.homeChannel` a channel id (`C…` or `G…`). Correct or remove it; with none set the route still arms for conversations. It then logs `chat.notify home posts use a learned home channel: …` when the gateway can learn one, and `chat.notify home posts not armed: … conversation posts are` when it cannot (the home channel policy is `manual`). `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
@@ -1643,5 +1668,5 @@ On Google Chat the gateway posts a status line for every task ([what a task look
        sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs /opt/data/kanban/logs 2>/dev/null | tail -n 20'
      ```
      `chat.notify: route unavailable; holding deliveries for …s` there means the agent could not reach the gateway's route and is retrying.
-- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. If it has run one, the reply adds that if the agent filed a card, that card keeps working until it finishes: the agent's turn ends seconds after it hands a question to a card, and by default `stop` cannot reach a card. To have `stop` stop the conversation's cards, deploy the operator with `A2A_CARD_STOP=true` (through the chart's `operator.extraEnv`); it renders the flag onto the gateway. That needs a hermes-bridge and agent image that answer the control. If one of them is older, or the stop fails or takes longer than `A2A_CARD_STOP_TIMEOUT` (75s), `stop` answers `⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working`. The gateway logs one `card stop ended` line per stop, with `state`, `reason` and `outcome`. `state=rejected reason=no-text-parts` means the hermes-bridge is older than the card stop. `state=failed reason=card-stop-unavailable` means the bridge got no usable answer from the agent container's session-kv, or its wait for the conversation's turn ran out (the bridge's log says which), `outcome` is one of `answered` (the reply names what was stopped), `no-result` (the control completed with no result part), `not-stopped` (the bridge rejected, failed or canceled it), `timed-out` (no answer inside the timeout), `expired` (it started before a gateway restart and ran past the timeout) or `not-started` (it never reached the bus). (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. If it has run one, the reply adds that if the agent filed a card, that card keeps working until it finishes: the agent's turn ends seconds after it hands a question to a card, and by default `stop` cannot reach a card. To have `stop` stop the conversation's cards, set `CARD_STOP_ENABLED=true` in `install.env` (the chart's `operator.cardStop.enabled`), which deploys the operator with `A2A_CARD_STOP=true`; it renders the flag onto the gateway. That needs a hermes-bridge and agent image that answer the control. If one of them is older, or the stop fails or takes longer than `A2A_CARD_STOP_TIMEOUT` (75s), `stop` answers `⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working`. The gateway logs one `card stop ended` line per stop, with `state`, `reason` and `outcome`. `state=rejected reason=no-text-parts` means the hermes-bridge is older than the card stop. `state=failed reason=card-stop-unavailable` means the bridge got no usable answer from the agent container's session-kv, or its wait for the conversation's turn ran out (the bridge's log says which), `outcome` is one of `answered` (the reply names what was stopped), `no-result` (the control completed with no result part), `not-stopped` (the bridge rejected, failed or canceled it), `timed-out` (no answer inside the timeout), `expired` (it started before a gateway restart and ran past the timeout) or `not-started` (it never reached the bus). (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
 - **`🚦 not started: … session workers are already running (cap 10)`.** The task needed a session pod, because the conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route or the message started with `delegate`, and the install's session pods are all in use. Wait, `stop` a task of yours, ask without `delegate` or send `/session off` to go back to the `platform` route, or raise `spec.harness.tuning.maxSessions`.
