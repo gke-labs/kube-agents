@@ -231,7 +231,7 @@ it; the saved report names those objects, pods and nodes among them, and a
 fail-closed webhook with no reachable backend names its configuration and its
 Service, which is tenant-written text, and the chat message names the budget,
 webhook configuration, maintenance exclusion or node pool that blocks each
-cluster, so the entry declares `risk: high` as `stall-watch` does. A project
+blocked cluster it lists, so the entry declares `risk: high` as `stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -246,8 +246,8 @@ project at all, a ledger it refuses to overwrite, and an agent image missing the
 report script end the same way. A failure a retry may clear (a timeout, a
 sandbox that failed) says instead that it tries again tomorrow, or at its next
 scheduled run when its roster entry is not daily;
-beside projects that were keyed, the table is partial, posted once with the
-reason, and the ledger's `table_errors` keeps it. The remedy is
+beside projects that were keyed, the table is partial, posted once naming the
+project, with the reason in its log line, and the ledger's `table_errors` keeps it. The remedy is
 `resourcemanager.projects.get` on the credential (every read role the install
 binds carries it, as `cluster_agent_reconcile.py` relies on, so a credential
 without it is a custom grant) or the project id in place of the number
@@ -272,10 +272,13 @@ kept per version and a retired version's directory removed with it. Each run sta
 from an empty rollout record, so a saved report's progress table is a
 first-run baseline, not a week-over-week comparison. Its stdout is what
 `deliver: "chat"` posts, in plain words: per report, a bold headline that
-counts the clusters that cannot upgrade to the version yet, one line per
-blocked cluster (five, then a count) naming the first thing that blocks it
-and the fix where its kind has one, how many more are ready or could not be
-fully checked, and the date of the next report. The agent's own tools run in
+counts the clusters not ready for the version yet (or the ready ones, when
+none is blocked), one line per blocked cluster naming the first thing that
+blocks it and the fix where its kind has one (five, fewer when the whole post
+would pass the 1,900 bytes the gateway posts as one message, then a count),
+how many more are ready or could not be fully checked, and the date the next
+report is due. The reports come first, then the lines about reads that
+failed, then the notices. The agent's own tools run in
 the sandbox and cannot open the saved report, which is why the message
 carries the verdicts and the reasons. Each line's technical twin, with the
 pending clusters, the reasons and remedies per project and the report's path
@@ -309,7 +312,8 @@ that still pended it and none does, or a readiness run (which lists every
 cluster of its project, reached by the table or not) showed every cluster
 pending it as no longer below it, a report that
 graded none of a version's pending clusters is written but not recorded (the
-chat line says the clusters could not be read and the version is tried again tomorrow), and the
+chat line says the clusters could not be read, and that it tries again tomorrow or that an admin
+must act first), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
@@ -337,7 +341,7 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 ## `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief` are one Saturday in two jobs
 
 The daily watch reads a cluster only while a release channel offers it a version it is below, and
-posts one line per report. The weekly pair reads every cluster of the roster's projects whatever its
+posts a short message per report. The weekly pair reads every cluster of the roster's projects whatever its
 version (a declared scope refuses a project outside it), and ends in one message a person reads.
 
 `upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the

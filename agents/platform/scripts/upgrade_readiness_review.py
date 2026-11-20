@@ -4,8 +4,8 @@ cluster graded, every finding registered on the findings queue, one technical
 report written, nothing said in chat.
 
 The daily ``upgrade-readiness-watch`` reads a cluster only while a release
-channel offers it a version it is below, and says one line about the report it
-wrote. This job runs once a week, on Saturday, over every cluster in the
+channel offers it a version it is below, and posts a short message about the
+report it wrote. This job runs once a week, on Saturday, over every cluster in the
 install's scope whatever its version, and feeds what the readiness report
 finds into the findings queue (``findings_queue.py``, the store behind the
 ``register_findings`` tool and the hourly ``findings-morning-nudge``). The
@@ -65,9 +65,12 @@ the recovery line. Each line is plain words, a bold headline and what
 happens next; its technical twin (the reasons per project, the queue's
 refusals, the copy's error, the record's path) goes to
 ``logs/upgrade_readiness_review.log`` under the agent home, and to stderr
-for a person running it by hand. The exit is 0 throughout, and 1 only when the record could
-not be written, a failure said every time it happens, since the marker that
-holds a failure back sits beside the record it could not write. ``--dry-run`` runs the
+for a person running it by hand. The lines about reads and the queue come
+before the recovery line. The exit is 0 throughout, a record that cannot be
+written included: a non-zero exit makes the scheduler post its own failure
+line in place of these, and that line promises a retry the disk will not
+grant. A record that cannot be written is said every time it happens, since
+the marker that holds a failure back sits beside it. ``--dry-run`` runs the
 reports and prints the summary without registering or writing anything.
 
 ``UPGRADE_READINESS_PROJECTS``, ``UPGRADE_READINESS_WATCH_HOME``,
@@ -144,18 +147,19 @@ CHECK_EXCLUSION = CHECK_PREFIX + "maintenance-exclusion"
 CHECK_SKEW = CHECK_PREFIX + "pool-skew"
 CHECK_WEBHOOK = CHECK_PREFIX + "fail-closed-webhook"
 
-# Report keys the mapping reads (the fleet-upgrade-verification report's own names).
-PDBS_KEY = "pdbs"
-MAINTENANCE_KEY = "maintenance"
-SKEW_KEY = "skew"
-WEBHOOKS_KEY = "webhooks"
-RULE_BLOCKING_KEY = "rule_blocking"
+# Report keys the mapping reads (the fleet-upgrade-verification report's own names);
+# those the watch's chat line reads too are the watch's.
+PDBS_KEY = watch.PDBS_KEY
+MAINTENANCE_KEY = watch.MAINTENANCE_KEY
+SKEW_KEY = watch.SKEW_KEY
+WEBHOOKS_KEY = watch.WEBHOOKS_KEY
+RULE_BLOCKING_KEY = watch.RULE_BLOCKING_KEY
 RISKS_KEY = "risks"
 RULES_KEY = "rules"
-BLOCKING_KEY = "blocking"
+BLOCKING_KEY = watch.BLOCKING_KEY
 OUTAGE_KEY = "outage"
-EXCLUSIONS_KEY = "exclusions"
-POOLS_KEY = "pools"
+EXCLUSIONS_KEY = watch.EXCLUSIONS_KEY
+POOLS_KEY = watch.POOLS_KEY
 READ_ERROR_KEYS = ("read_error", "webhook_read_error")
 # What the grader could not decide: a pool whose version did not parse (or every pool,
 # with no target), an exclusion with an unparsable time or scope, a rule that failed.
@@ -170,23 +174,23 @@ MEMBER_FIELD = "_member"
 MEMBERS_FIELD = "_members"  # every member a folded finding stands for
 ROW_MEMBER_KEY = "member"
 ROW_MEMBERS_KEY = "members"
-SKEW_VERDICT_BLOCKS = "blocks"
+SKEW_VERDICT_BLOCKS = watch.SKEW_VERDICT_BLOCKS
 SKEW_VERDICT_CEILING = "at ceiling"
 WORKLOAD_REPLICAS_KEY = "replicas"
 WORKLOADS_KEY = "workloads"
-NAME_KEY = "name"
-PDB_KEY = "pdb"
+NAME_KEY = watch.NAME_KEY
+PDB_KEY = watch.PDB_KEY
 NAMESPACE_KEY = "namespace"
 KIND_KEY = "kind"
 FIELD_KEY = "field"
 DISRUPTIONS_ALLOWED_KEY = "disruptions_allowed"
-BLOCKS_KEY = "blocks"
+BLOCKS_KEY = watch.BLOCKS_KEY
 SCOPE_KEY = "scope"
-END_TIME_KEY = "end_time"
+END_TIME_KEY = watch.END_TIME_KEY
 DETAIL_KEY = "detail"
-VERDICT_KEY = "verdict"
-VERSION_KEY = "version"
-CONFIG_KEY = "config"
+VERDICT_KEY = watch.VERDICT_KEY
+VERSION_KEY = watch.POOL_VERSION_KEY
+CONFIG_KEY = watch.CONFIG_KEY
 CONFIG_KIND_KEY = "config_kind"
 WEBHOOK_KEY = "webhook"
 LIVE_RULES_KEY = "live_rules"
@@ -194,7 +198,7 @@ UPGRADE_PATH_KEY = "upgrade_path"
 REASON_KEY = "reason"
 SERVICE_KEY = "service"
 RULE_KEY = "rule"
-ENTRY_KEY = "entry"
+ENTRY_KEY = watch.ENTRY_KEY
 OBJECT_KEY = "object"
 POOL_KEY = "pool"
 TEXT_KEY = "text"
@@ -410,7 +414,7 @@ FAILED_REASON_PROJECTS = "It couldn't read any project"
 RECOVERED_LINE = "**The weekly upgrade readiness review is running again.**"
 PARTIAL_LINE = (
     "**The weekly upgrade readiness review couldn't read every project.** Not read: {names}. "
-    "The clusters there keep last week's findings, and this week's counts leave them out. " + watch.DETAILS_IN_LOG
+    "The clusters there keep last week's findings, and this week's counts leave them out. {next}"
 )
 REGISTRATION_LINE = "**Part of this week's upgrade readiness review didn't reach the findings queue.** {what}"
 REGISTRATION_ROWS = "{findings} didn't arrive."
@@ -936,10 +940,12 @@ def learned_project_ids() -> dict[str, str]:
     return {str(k): str(v) for k, v in ids.items()} if isinstance(ids, dict) else {}
 
 
-def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], list[dict], dict[str, str], dict[str, str], set[str]]:
+def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], list[dict], dict[str, str], dict[str, str], set[str], set[str]]:
     """One readiness run per project inside the total budget. Returns the
     members, the report errors, the report script's tables per project, the
-    projects that failed with why, and the ids the report resolved and read.
+    projects that failed with why, the ids the report resolved and read, and
+    the failed projects a person has to act on first (`watch.needs_admin`: a
+    refusal no retry clears, a report script missing from the image).
     `on_project(members, errors)` runs as each project returns, which is where
     registration happens, so a run the hour cuts short keeps what it
     registered. A project is keyed by the id the watch's ledger learned for
@@ -960,6 +966,7 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     tables: dict[str, str] = {}
     failures: dict[str, str] = {}
     read_ids: set[str] = set()
+    needs_admin: set[str] = set()
     known_ids = learned_project_ids()
     deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     for project in names:
@@ -983,6 +990,8 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
             continue
         except (RuntimeError, ValueError) as exc:  # the watch's ReportRefused is a RuntimeError
             failures[key] = str(exc)
+            if watch.needs_admin(exc):
+                needs_admin.add(key)
             continue
         report = envelope.get(watch.ENVELOPE_REPORT_KEY) or {}
         found = [m for m in report.get(watch.MEMBERS_KEY) or [] if isinstance(m, dict)]
@@ -1018,7 +1027,7 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
         members.extend(found)
         if on_project is not None:
             on_project(found, read_errors)
-    return members, errors, tables, failures, read_ids
+    return members, errors, tables, failures, read_ids, needs_admin & set(failures)
 
 
 # --- registering ------------------------------------------------------------------
@@ -1431,11 +1440,13 @@ def shown(entries: list[str], limit: int, tail: str = OVERFLOW_NOTE) -> str:
 
 class ProjectsFailed(RuntimeError):
     """Every project failed: the text names each with its reason, and ``failures``
-    keys the announcement, so a project's name stays literal in the marker."""
+    keys the announcement, so a project's name stays literal in the marker.
+    ``needs_admin`` says a person has to act first for one of them."""
 
-    def __init__(self, detail: str, failures: dict[str, str]) -> None:
+    def __init__(self, detail: str, failures: dict[str, str], needs_admin: bool = False) -> None:
         super().__init__(detail)
         self.failures = dict(failures)
+        self.needs_admin = needs_admin
 
 
 def failure_signature(detail: str, failures: dict[str, str] | None = None) -> str:
@@ -1474,9 +1485,9 @@ def clear_failure_marker() -> bool:
     return False
 
 
-def review(dry_run: bool = False) -> tuple[list[str], list[str], int]:
-    """Run the review. Returns the chat lines, their technical lines for the
-    log (a dry run's lines are all chat's), and the exit code."""
+def review(dry_run: bool = False) -> tuple[list[str], list[str]]:
+    """Run the review. Returns the chat lines and their technical lines for
+    the log (a dry run's lines are all chat's)."""
     now = now_utc()
     stamp = now.strftime(STAMP_FORMAT)
     scope = watch.declared_scope()
@@ -1506,7 +1517,7 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str], int]:
         problems.extend(bad)
         claimed.update(done)
 
-    members, errors, tables, failures, read_ids = run_projects(ordered_names(names, previous), scope, on_project=registered)
+    members, errors, tables, failures, read_ids, needs_admin = run_projects(ordered_names(names, previous), scope, on_project=registered)
     gap = watch.resolved_scope_gap(cluster_lists)
     if gap is not None:
         # Under spec.mode: next a resolved scope that names no member left the
@@ -1514,7 +1525,7 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str], int]:
         # not a complete review of the live projects alone.
         failures[str(gap[watch.MEMBER_ID_KEYS[0]])] = str(gap[watch.MESSAGE_KEY])
     if failures and not read_ids:
-        raise ProjectsFailed(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN), failures)
+        raise ProjectsFailed(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN), failures, bool(needs_admin))
     report_path = home / stamp / REPORT_MD_NAME
     summary_doc = summary(
         stamp=stamp, now=now, names=names, members=members, errors=errors, failures=failures,
@@ -1526,7 +1537,7 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str], int]:
     if dry_run:
         lines = [DRY_RUN_HEADER, json.dumps({k: v for k, v in summary_doc.items() if k != "findings"}, indent=1, sort_keys=True)]
         lines += [f"- {r['severity']}: {r['id']}: {r['title']}" for r in summary_doc["findings"]]
-        return lines, [], 0
+        return lines, []
     report_json = {"generated_at": iso(now), "projects": summary_doc["projects"], watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors, "project_failures": failures}
     findings_json = {"generated_at": iso(now), "findings": [payload(item) for item in findings], "outcomes": outcomes, "errors": problems}
     # Said in chat, not on stderr alone, which the scheduler keeps nowhere for a
@@ -1541,13 +1552,14 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str], int]:
         failed_claims = sum(1 for problem in problems if CLAIM_FAILED_MARK in problem)
         what = [REGISTRATION_ROWS.format(findings=watch.counted(failed_rows, FINDING_FORMS))] if failed_rows else []
         what += [REGISTRATION_CLAIMS.format(clusters=watch.counted(failed_claims, watch.CLUSTER_FORMS))] if failed_claims else []
-        chat = REGISTRATION_LINE.format(what=" ".join([*what, where, watch.DETAILS_IN_LOG]))
+        chat = REGISTRATION_LINE.format(what=watch.SENTENCE_SEPARATOR.join([*what, where, watch.DETAILS_IN_LOG]))
         return [chat], [REGISTRATION_FAILED_LOG_LINE.format(prefix=LOG_PREFIX, rows=failed_rows, claims=failed_claims, detail=shown(problems, MAX_PROBLEMS_IN_LINE), where=where_log)]
 
     partial_lines, partial_log = [], []
     if failures:
         detail = shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE)
-        partial_lines.append(PARTIAL_LINE.format(names=watch.chat_project_names(list(failures))))
+        next_step = watch.NEEDS_ADMIN_FIRST if needs_admin else watch.RETRY_THEN_LOG.format(next=watch.FAILED_NEXT_UNKNOWN)
+        partial_lines.append(PARTIAL_LINE.format(names=watch.chat_project_names(list(failures)), next=next_step))
         partial_log.append(PARTIAL_LOG_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))
     try:
         write_record(home, stamp, report_md, report_json, findings_json, summary_doc)
@@ -1555,19 +1567,19 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str], int]:
         failed = FAILED_LOG_LINE.format(prefix=LOG_PREFIX, detail=f"could not write the record under {home}: {exc}")
         registration, registration_log = registration_lines(REGISTRATION_NO_RECORD_LINE, REGISTRATION_NO_RECORD)
         lines = [WRITE_FAILED_LINE.format(reason=watch.FAILED_REASON_WRITE, next=watch.FAILED_NEEDS_ADMIN), *registration, *partial_lines]
-        return lines, [failed, *registration_log, *partial_log], 1
+        return lines, [failed, *registration_log, *partial_log]
     copy_error = copy_to_sandbox(report_md, summary_doc)
-    lines, log = [], []
-    if clear_failure_marker():
-        lines.append(RECOVERED_LINE)
-        log.append(RECOVERED_LOG_LINE.format(prefix=LOG_PREFIX))
-    registration, registration_log = registration_lines(REGISTRATION_IN_REPORT_LINE, REGISTRATION_IN_REPORT)
-    lines += registration
-    log += registration_log
+    lines, log = registration_lines(REGISTRATION_IN_REPORT_LINE, REGISTRATION_IN_REPORT)
     if copy_error:
         lines.append(COPY_FAILED_LINE)
         log.append(COPY_FAILED_LOG_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
-    return lines + partial_lines, log + partial_log, 0
+    lines += partial_lines
+    log += partial_log
+    # The recovery is a notice: after what this run found, never ahead of it.
+    if clear_failure_marker():
+        lines.append(RECOVERED_LINE)
+        log.append(RECOVERED_LOG_LINE.format(prefix=LOG_PREFIX))
+    return lines, log
 
 
 def failure_reason(exc: Exception) -> str:
@@ -1581,7 +1593,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Run the reports and print what would be registered and written; change nothing.")
     args = parser.parse_args(argv)
     try:
-        lines, log, code = review(dry_run=args.dry_run)
+        lines, log = review(dry_run=args.dry_run)
     except Exception as exc:  # noqa: BLE001 - one line per distinct failure, then exit 0 so the schedule holds
         detail = str(exc) or exc.__class__.__name__
         failed = FAILED_LOG_LINE.format(prefix=LOG_PREFIX, detail=detail)
@@ -1589,7 +1601,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.dry_run:
             script_log.append(REVIEW_LOG_FILE, [failed])
         if args.dry_run or announce_failure_once(detail, exc.failures if isinstance(exc, ProjectsFailed) else None):
-            print(FAILED_LINE.format(reason=failure_reason(exc), next=watch.FAILED_NEEDS_ADMIN if watch.needs_admin(exc) else watch.FAILED_NEXT_UNKNOWN))
+            admin = exc.needs_admin if isinstance(exc, ProjectsFailed) else watch.needs_admin(exc)
+            print(FAILED_LINE.format(reason=failure_reason(exc), next=watch.FAILED_NEEDS_ADMIN if admin else watch.FAILED_NEXT_UNKNOWN))
             print(failed, file=sys.stderr)
         return 0
     script_log.append(REVIEW_LOG_FILE, log)
@@ -1597,7 +1610,7 @@ def main(argv: list[str] | None = None) -> int:
         print((watch.DRY_RUN_LINE_SEPARATOR if args.dry_run else watch.CHAT_ITEM_SEPARATOR).join(lines))
     for line in log:
         print(line, file=sys.stderr)
-    return code
+    return 0
 
 
 if __name__ == "__main__":

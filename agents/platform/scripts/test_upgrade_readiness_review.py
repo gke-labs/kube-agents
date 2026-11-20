@@ -1008,7 +1008,8 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")), \
                 mock.patch.object(review, "write_record", side_effect=OSError("No space left on device")):
             code, chat, log = self.run_main_split()
-        self.assertEqual(code, 1)
+        # Exit 0, or the scheduler posts its own line, which promises a retry, in place of these.
+        self.assertEqual(code, 0)
         self.assertEqual(
             chat,
             "**The weekly upgrade readiness review didn't finish.** It couldn't save its report. An admin needs to fix this before it can run; "
@@ -1083,7 +1084,7 @@ class TheTick(unittest.TestCase):
         self.assertEqual(
             chat,
             "**The weekly upgrade readiness review couldn't read every project.** Not read: acme-dev. The clusters there keep last week's findings, "
-            "and this week's counts leave them out. The details are in the agent's log.\n",
+            "and this week's counts leave them out. It will try again at its next scheduled run. The details are in the agent's log.\n",
         )
         self.assert_plain(chat)
         self.assertIn("1 project(s) not read this week: acme-dev: clusters list: PERMISSION_DENIED", log)
@@ -1403,6 +1404,54 @@ class TheTick(unittest.TestCase):
         self.assert_plain(chat)
         self.assertIn(review.NO_PROJECTS_DETAIL, log)
         self.assertIn(review.NO_PROJECTS_DETAIL, self.log(), "the remedy is in the agent's log, where the line points")
+
+    def test_a_refusal_no_retry_clears_asks_for_an_admin_whether_some_or_every_project_failed(self):
+        refused = watch.ReportRefused("version table for acme-dev refused by the report script: the install's declared scope does not list acme-dev", watch.REFUSAL_OUTSIDE)
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            if names[0] == OTHER_PROJECT:
+                raise refused
+            return self.envelope
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, chat, log = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review couldn't read every project.** Not read: acme-dev. The clusters there keep last week's findings, "
+            "and this week's counts leave them out. An admin needs to fix this first; the details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn("the install's declared scope does not list acme-dev", log)
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: OTHER_PROJECT}), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, chat, log = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review didn't run.** It couldn't read any project. An admin needs to fix this before it can run; "
+            "the details are in the agent's log.\n",
+        )
+        self.assertIn("the install's declared scope does not list acme-dev", log)
+        self.assertIn("does not list acme-dev", self.log())
+
+    def test_a_missing_report_script_on_every_project_asks_for_an_admin(self):
+        with mock.patch.object(watch, "run_report", side_effect=watch.ReportScriptMissing("no fleet_upgrade_report.py under /opt/platform-template")):
+            code, chat, _ = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review didn't run.** It couldn't read any project. An admin needs to fix this before it can run; "
+            "the details are in the agent's log.\n",
+        )
+
+    def test_the_recovery_comes_after_what_this_run_found(self):
+        with mock.patch.object(watch, "run_report", side_effect=RuntimeError("sandbox exited 255 without a report")):
+            self.run_main_split()
+        with mock.patch.object(review, "copy_to_sandbox", return_value="the sandbox exited 1"):
+            code, chat, log = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR), [review.COPY_FAILED_LINE, review.RECOVERED_LINE])
+        self.assert_plain(chat)
 
     def test_a_copy_that_failed_says_the_agent_reads_last_week_s_report(self):
         with mock.patch.object(review, "copy_to_sandbox", return_value="the sandbox exited 1: /opt/data/upgrade-readiness/weekly is read-only"):
