@@ -68,6 +68,7 @@ _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
 _A2A_BRIDGE = _CONTROLLER / "platformagent_a2a_bridge.go"
 _A2A_GATEWAY_LEASE = _CONTROLLER / "platformagent_a2a_gateway_lease.go"
 _A2A_DISPATCHER = _CONTROLLER / "platformagent_a2a_dispatcher.go"
+_A2A_TEAMS_INBOUND = _CONTROLLER / "platformagent_teams_inbound.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
@@ -427,6 +428,15 @@ class A2AStackTest(unittest.TestCase):
             f"operator.extraEnv[12].name={go_constant(_A2A_MANIFESTS, 'a2aNATSDebugEnvVar')}",
             "--set-string",
             "operator.extraEnv[12].value=true",
+        ]
+        # The Teams inbound receiver's image, at this build, under the name
+        # the operator reads it by; the receiver runs only when a CR enables
+        # it, so the override costs nothing on a lane that does not (#1034).
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[13].name={go_constant(_A2A_TEAMS_INBOUND, 'a2aTeamsInboundImageEnvVar')}",
+            "--set-string",
+            f"operator.extraEnv[13].value={_AR_REPO}/a2a-teams-inbound:{_TAG}",
         ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
