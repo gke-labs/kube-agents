@@ -1402,7 +1402,9 @@ GATE_REREAD_LINE_FORMAT = "- {cluster}: {verdict} ({reasons})"
 LEDGER_GATE_KEY = "gate"
 # The manifest's stand-in for the argv of the Monitoring read, as `fleet_waste.py`
 # labels its usage read: `finish` accepts a `checks_run` command only if it names an
-# inspection binary, so the label is the `curl` that issues the same two requests.
+# inspection binary, so the label is the `curl` that issues the same two requests on
+# the commercial domain. When the environment names a custom universe domain, the
+# relay client sends the read to that domain's host, and the label does not.
 MONITORING_PAGE_SIZE_KEY = "pageSize"
 COMMAND_CHAIN = " && "
 LOG_VOLUME_NOT_MADE_REASON = f"{LOG_VOLUME_READ} read not made"
@@ -4782,8 +4784,11 @@ def fetch_log_volume(session: SessionFn | None, project: str, cluster_name: str,
 
 
 def log_volume_command(project: str, requests: list[dict]) -> str:
-    """The two Monitoring requests as the `curl` lines that issue them, for
-    `checks_run`: every parameter the collector sent but the page size."""
+    """The two Monitoring requests as the `curl` lines that issue them on the
+    commercial domain, for `checks_run`: every parameter the collector sent
+    but the page size. The URL is the commercial one: when the environment
+    names a custom universe domain, the relay client sends the read to that
+    domain's host, and the label does not."""
     url = MONITORING_TIMESERIES_URL.format(project=project)
     curls = []
     for params in requests:
