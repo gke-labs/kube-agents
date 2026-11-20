@@ -1358,6 +1358,17 @@ class BrokerCallTest(unittest.TestCase):
             self.assertEqual(printed["code"], "FORGE_REJECTED")
             self.assertEqual(printed["detail"], "left out: nested too deep to print")
 
+    def test_an_encoder_error_that_is_not_a_recursion_error_gets_out_of_the_print_step(self):
+        """The clause behind the bound takes RecursionError only: another error of the encoder
+        is not printed as an answer that is nested too deep."""
+        with self.assertRaises(TypeError):
+            vcs._as_text({"entries": {1, 2}})
+        # RecursionError is a RuntimeError; the parent type is not taken either.
+        fault = RuntimeError("another fault of the encoder")
+        with mock.patch.object(vcs.json, "dumps", side_effect=fault), self.assertRaises(RuntimeError) as caught:
+            vcs._as_text({"baseBranch": "main"})
+        self.assertIs(caught.exception, fault)
+
     def test_an_answer_and_a_refusal_that_can_be_printed_are_printed_as_before(self):
         code, printed = self.main_with_the_broker_answer(return_value={"baseBranch": "main", "entries": [[1], {"a": 2}]})
         self.assertEqual(code, 0)
