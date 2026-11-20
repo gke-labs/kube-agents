@@ -102,7 +102,7 @@ A rollback that failed keeps the write freeze, the staging claim and the operato
 
 #### Recreating TASKS wider
 
-JetStream fixes a stream's `max_consumers` when the stream is created, and refuses to change it after. A TASKS stream created narrower than the PlatformAgent now renders, for example before `maxSessions` was raised, keeps its old width. The provision Job then refuses it, and the session cap is fitted to it (`SessionCapFitted`). A one to three migration widens it on the way. On a bus that keeps its count, a person can ask for a reshape:
+JetStream fixes a stream's `max_consumers` when the stream is created, and refuses to change it after. A TASKS stream created narrower than the PlatformAgent now renders, for example before `maxSessions` was raised, keeps its old width, and the provision Job refuses it. A one to three migration widens it on the way. On a bus that keeps its count, a person can ask for a reshape:
 
 ```sh
 kubectl annotate platformagent <name> -n <namespace> --overwrite kubeagents.x-k8s.io/bus-reshape=<any new value>

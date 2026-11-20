@@ -486,3 +486,20 @@ func TestAStaleReshapeRequestAfterALaterRunAndAWiderRenderStartsNothing(t *testi
 		t.Errorf("a new value started %+v, want a reshape", run)
 	}
 }
+
+// A deleted CR's reshape and hold records go with it, so a CR recreated
+// under the same name gets its Events afresh.
+func TestTheReshapeRecordsAreForgottenWithTheCR(t *testing.T) {
+	r := &PlatformAgentReconciler{}
+	agent := a2aTestAgent()
+	key := client.ObjectKeyFromObject(agent)
+	r.busReshapeRefused.Store(key, "n1/wide")
+	r.heldBusMigrationWarned.Store(key, "3-1/Freezing")
+	r.forgetUsageStatus(agent)
+	if _, ok := r.busReshapeRefused.Load(key); ok {
+		t.Error("the reshape refusal record outlived the CR")
+	}
+	if _, ok := r.heldBusMigrationWarned.Load(key); ok {
+		t.Error("the hold Warning record outlived the CR")
+	}
+}
