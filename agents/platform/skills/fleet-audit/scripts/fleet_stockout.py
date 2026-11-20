@@ -270,9 +270,9 @@ SPARE_POOLS = (
     "Node pools {pools} have this class's label and match {options}.",
 )
 NO_OPTION = "no option"
-NO_CHECKED_OPTION = "none of the options that were checked"
+NO_CHECKED_OPTION = "no option that was checked"
 PODS_WAIT = "Pods that use this class wait."
-NO_NODE_ADDED = ("GKE adds no node for this option.", "GKE adds no node for these options.")
+NO_NODE_ADDED = "GKE adds no node for {options}."
 OPTIONS_UNCHECKED = "{options} could not be checked: {names} no node pool and no machine type."
 # The name GKE gives the cluster-level default ComputeClass.
 CLUSTER_DEFAULT_CLASS = "default"
@@ -1431,17 +1431,17 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
         sentences.append(NO_OPTION_BACKED.format(options=_sentence_start(_options(no_pool, priorities)), have=HAVE[many], them=THEM[many]))
     if named_missing:
         sentences.append(NAMED_POOLS_MISSING[len(named_missing) > 1].format(options=_sentence_start(_options(named_missing, priorities))))
+    if unjudged:
+        several = len(unjudged) > 1
+        sentences.append(OPTIONS_UNCHECKED.format(options=_sentence_start(_options(unjudged, priorities)), names=IT_NAMES[several]))
     if spare:
         pools = _and_list([f"{pool_name} ({machine_type})" if machine_type else pool_name for pool_name, machine_type in spare])
         sentences.append(SPARE_POOLS[len(spare) > 1].format(pools=pools, options=NO_OPTION if all_checked else NO_CHECKED_OPTION))
-        sentences.append(NO_NODE_ADDED[len(unbacked) > 1])
+        sentences.append(NO_NODE_ADDED.format(options=_options(unbacked, priorities)))
     elif all_checked:
         # What follows for pods is said only where every option was checked:
         # an option the pool list cannot answer may still place them.
         sentences.append(POOLS_CANNOT_GROW.format(pools=_and_list(backing)) if backed else PODS_WAIT)
-    if unjudged:
-        several = len(unjudged) > 1
-        sentences.append(OPTIONS_UNCHECKED.format(options=_sentence_start(_options(unjudged, priorities)), names=IT_NAMES[several]))
     return {"object": f"ComputeClass/{name}", "excerpt": SENTENCE_SEPARATOR.join(sentences), "needs_triage": MANUAL_POOL_TRIAGE}
 
 
@@ -2570,11 +2570,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             # No class in scope is an answer the dump alone gives; a class in
             # scope needs the pools this read would have listed.
             unevaluated[UNBACKED_MANUAL_FALLBACK] = (
-                f"{', '.join(manual_fallback_unread)} {LEAVE_AND_LIST[len(manual_fallback_unread) > 1]} machine options, "
+                f"{_and_list(manual_fallback_unread)} {LEAVE_AND_LIST[len(manual_fallback_unread) > 1]} machine options, "
                 f"and the node pools those options need were not read: {pools_failure}"
             )
             limitations.append(
-                f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {', '.join(manual_fallback_unread)}: "
+                f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {_and_list(manual_fallback_unread)}: "
                 f"the node pools were not read"
             )
         else:

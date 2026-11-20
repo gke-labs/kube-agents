@@ -4452,7 +4452,7 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         """3.12 (c) passes on the label, so nothing else names this class."""
         hit = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")])
         self.assertIn("Options 1 (n4) and 2 (c3) have no node pool", hit["excerpt"])
-        self.assertTrue(hit["excerpt"].endswith("Node pool e2-pool (e2-medium) has this class's label and matches no option. GKE adds no node for these options."))
+        self.assertTrue(hit["excerpt"].endswith("Node pool e2-pool (e2-medium) has this class's label and matches no option. GKE adds no node for options 1 (n4) and 2 (c3)."))
         two = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc"), manual_pool("bare-pool", "", "general-ccc")])
         self.assertIn("Node pools e2-pool (e2-medium) and bare-pool have this class's label and match no option.", two["excerpt"])
         self.assertNotIn("wait", hit["excerpt"])
@@ -4467,8 +4467,11 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
             hit["excerpt"],
             "This class lists 2 machine options in order. Only option 1 (a) has a node pool. "
             "Option 2 (n4) has none, and automatic node pool creation is off, so GKE cannot create it. "
-            "Node pool e2-pool (e2-standard-4) has this class's label and matches no option. GKE adds no node for this option.",
+            "Node pool e2-pool (e2-standard-4) has this class's label and matches no option. GKE adds no node for option 2 (n4).",
         )
+        # The last sentence names every option with no pool: the machine option and the one that names a missing pool.
+        mixed = self.check([{"nodepools": ["a"]}, {"machineFamily": "n4"}, {"nodepools": ["gone-pool"]}], [manual_pool("a", "e2-medium"), manual_pool("e2-pool", "e2-standard-4", "general-ccc")])
+        self.assertTrue(mixed["excerpt"].endswith("Option 3 (gone-pool) names no node pool that exists. Node pool e2-pool (e2-standard-4) has this class's label and matches no option. GKE adds no node for options 2 (n4) and 3 (gone-pool)."))
 
     def test_the_detail_speaks_only_for_the_options_that_were_checked(self):
         accelerator_only = {"gpu": {"type": "nvidia-l4", "count": 1}}
@@ -4478,11 +4481,12 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
             beside_backed["excerpt"],
             "This class lists 3 machine options in order. Option 1 (a) has a node pool. "
             "Option 2 (n4) has none, and automatic node pool creation is off, so GKE cannot create it. "
-            "Node pool gpu-pool (g2-standard-4) has this class's label and matches none of the options that were checked. "
-            "GKE adds no node for this option. Option 3 could not be checked: it names no node pool and no machine type.",
+            "Option 3 could not be checked: it names no node pool and no machine type. "
+            "Node pool gpu-pool (g2-standard-4) has this class's label and matches no option that was checked. "
+            "GKE adds no node for option 2 (n4).",
         )
         none_backed = self.check([{"machineFamily": "n4"}, accelerator_only], [gpu_pool])
-        self.assertIn("matches none of the options that were checked. GKE adds no node for this option. Option 2 could not be checked", none_backed["excerpt"])
+        self.assertTrue(none_backed["excerpt"].endswith("Option 2 could not be checked: it names no node pool and no machine type. Node pool gpu-pool (g2-standard-4) has this class's label and matches no option that was checked. GKE adds no node for option 1 (n4)."))
         self.assertNotIn("Only", none_backed["excerpt"])
 
     def test_the_procedure_carries_the_collector_s_headline(self):
@@ -4610,8 +4614,12 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         entry = self.run_with(dump_items=[self.fleet_class()], pools_rc=1)
         self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
         [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == self.SLUG]
-        self.assertIn("ComputeClass/general-ccc", reason)
+        self.assertTrue(reason.startswith("ComputeClass/general-ccc leaves automatic node pool creation off and lists machine options, and the node pools those options need were not read: "))
         self.assertIn("node-pools list", reason)
+        second = compute_class("batch-ccc", FLEET_CLASS_RULES, node_pool_auto_creation=False)
+        two = self.run_with(dump_items=[self.fleet_class(), second], pools_rc=1)
+        [reason_for_two] = [e["reason"] for e in two["checks_unevaluated"] if e["check"] == self.SLUG]
+        self.assertTrue(reason_for_two.startswith("ComputeClass/general-ccc and ComputeClass/batch-ccc leave automatic node pool creation off and list machine options, "))
         self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
         self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc: the node pools were not read", entry["limitations"])
         self.assertNotIn("priority", reason.lower())
@@ -4639,8 +4647,7 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         entry = self.run_with(dump_items=[self.fleet_class()], cluster={**self.CLUSTER, "autopilot": True})
         self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
         [reason] = [e["reason"] for e in entry["checks_not_applicable"] if e["check"] == self.SLUG]
-        self.assertIn("Autopilot", reason)
-        self.assertNotIn("priority", reason.lower())
+        self.assertEqual(reason, "GKE Autopilot: GKE creates the nodes for every ComputeClass, so no machine option waits on a node pool.")
 
     def test_the_finding_s_command_stays_under_the_published_command_cap(self):
         """The class read and the discovery listing as one line, at the longest
