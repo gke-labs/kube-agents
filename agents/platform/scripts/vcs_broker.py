@@ -3127,6 +3127,9 @@ class VcsBroker:
         - its diff adds one file and changes nothing else, and that file is,
           byte for byte, what the `no-pdb` recipe's generator writes for the
           inputs it names (`automerge_eligibility.verify_added_manifest`);
+        - the file is also, byte for byte, what the generator writes from the
+          workload's live selector, read here
+          (`automerge_eligibility.regenerates_from`);
         - the rules file on the proposal's target branch allows the `no-pdb`
           fix in the environment the cluster's own labels declare
           (`automation_rules`);
@@ -3283,6 +3286,23 @@ class VcsBroker:
         if not isinstance(dump, dict) or not isinstance(dump.get("items"), list):
             LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", cluster, code, err[:400])
             return "the workload's namespace could not be read"
+        kind, _, workload_name = fix.candidate["object"].partition("/")
+        workload = next(
+            (
+                item for item in dump["items"]
+                if isinstance(item, dict) and item.get("kind") == kind
+                and (item.get("metadata") or {}).get("name") == workload_name
+                and (item.get("metadata") or {}).get("namespace") == namespace
+            ),
+            None,
+        )
+        # The file's selector is only what the file says. Regenerate from the
+        # workload's live selector, which this broker read itself: the file
+        # must be those bytes too. A missing workload is judged below.
+        if workload is not None and not automerge_eligibility.regenerates_from(
+            fix, {"pod_selector": (workload.get("spec") or {}).get("selector")}
+        ):
+            return "the added file is not, byte for byte, what the recipe generates from the workload's live selector"
         checks += automerge_checks.judge(dump, fix.candidate["object"], namespace, fix.name, fix.candidate["pod_selector"])
         failed = [check["name"] for check in checks if not check["passed"]]
         return f"safety checks failed: {', '.join(failed)}" if failed else None

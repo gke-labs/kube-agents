@@ -12,6 +12,9 @@ the sandbox reports can be trusted for that:
   anyone edited or wrote by hand is not the generated fix.
 - `path_fits`: the file sits under the generated name, in its cluster's own
   tree.
+- `regenerates_from`: once the broker has read the cluster, the file is also
+  byte for byte what the generator writes from that read (the workload's live
+  selector) in place of what the file says.
 - `PRACTICE_LABEL` and `AUTOMERGE_LABEL` are the labels, which only the broker
   writes (`vcs_broker.VcsBroker.proposal_practice_label`):
   `reserved_label_refusal` is how every caller-reachable verb refuses them.
@@ -63,6 +66,7 @@ class AddedManifest(NamedTuple):
     name: str
     candidate: dict
     finding_id: str
+    text: str
 
 
 def reserved_label_refusal(verb: str, payload: Any) -> str | None:
@@ -163,7 +167,15 @@ def verify_added_manifest(kind: str, diff: Any, *, check_path: bool = True) -> A
     name = built[0]
     if check_path and not path_fits(path, name, str(candidate.get("cluster") or "")):
         return None
-    return AddedManifest(kind, path, name, candidate, finding_id)
+    return AddedManifest(kind, path, name, candidate, finding_id, text)
+
+
+def regenerates_from(fix: AddedManifest, read: dict) -> bool:
+    """Whether `fix`'s file is byte for byte what its recipe generates when the
+    inputs the broker read itself (`read`, for example the workload's live
+    `pod_selector`) replace the ones the file names."""
+    built = registry.generator(fix.kind).generate({**fix.candidate, **read}, fix.finding_id)
+    return built == (fix.name, fix.text)
 
 
 def path_fits(path: str, name: str, cluster: str) -> bool:

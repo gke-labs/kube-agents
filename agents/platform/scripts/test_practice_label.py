@@ -262,6 +262,24 @@ class PracticeLabelTest(unittest.TestCase):
         self.assertTrue(answer["labelled"])
         self.assertEqual(self.writes(calls), [])
 
+    def test_a_file_whose_selector_is_not_the_live_one_is_refused(self):
+        # Valid for the generator, so it passes the file check, but the live
+        # workload's selector has no such expression: regenerating from the
+        # broker's own read gives other bytes.
+        selector = {"matchLabels": LABELS, "matchExpressions": [{"key": "app", "operator": "Exists", "extra": "x"}]}
+        _, text = FIX.generate(
+            {"cluster": CLUSTER, "object": "Deployment/checkout", "namespace": NS, "pod_selector": selector}, FID
+        )
+        answer, calls = self.run_verb(diff=diff_adding(PATH, text))
+        self.assertFalse(answer["labelled"])
+        self.assertIn("what the recipe generates from the workload's live selector", answer["reason"])
+        self.assertEqual(self.writes(calls), [])
+
+    def test_the_fixture_fix_regenerates_from_the_live_selector(self):
+        fix = ae.verify_added_manifest("no-pdb", diff_adding(PATH, TEXT))
+        self.assertTrue(ae.regenerates_from(fix, {"pod_selector": deployment()["spec"]["selector"]}))
+        self.assertFalse(ae.regenerates_from(fix, {"pod_selector": {"matchLabels": {"app": "other"}}}))
+
     def test_a_misplaced_budget_says_so_and_reads_nothing(self):
         answer, _ = self.run_verb(diff=diff_adding("apps/shop/checkout-pdb.yaml", TEXT))
         self.assertFalse(answer["labelled"])
