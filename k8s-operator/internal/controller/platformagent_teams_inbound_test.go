@@ -51,11 +51,12 @@ func TestTheReceiverRendersOnlyWithTeamsOnAnInboundSwitchAndATenant(t *testing.T
 		t.Fatal("the full fixture should enable the receiver")
 	}
 	for name, mutate := range map[string]func(*agentv1alpha1.PlatformAgent){
-		"no integration": func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration = nil },
-		"teams off":      func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.Enabled = ptr.To(false) },
-		"no inbound":     func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.Inbound = nil },
-		"inbound off":    func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.Inbound.Enabled = ptr.To(false) },
-		"no tenant":      func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.TenantId = "" },
+		"no integration":    func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration = nil },
+		"teams off":         func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.Enabled = ptr.To(false) },
+		"no inbound":        func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.Inbound = nil },
+		"inbound off":       func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.Inbound.Enabled = ptr.To(false) },
+		"no tenant":         func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.TenantId = "" },
+		"tenant not a GUID": func(a *agentv1alpha1.PlatformAgent) { a.Spec.Integration.Teams.TenantId = "contoso.onmicrosoft.com" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := teamsInboundTestAgent()
@@ -75,7 +76,7 @@ func TestTheReceiverRendersOnlyWithTeamsOnAnInboundSwitchAndATenant(t *testing.T
 
 func TestBuildTeamsInboundDeployment(t *testing.T) {
 	agent := teamsInboundTestAgent()
-	dep := buildTeamsInboundDeployment(agent)
+	dep := buildA2ATeamsInboundDeployment(agent)
 	if dep.Name != "test-agent-teams-inbound" || dep.Namespace != "test-ns" {
 		t.Fatalf("name/namespace = %s/%s", dep.Name, dep.Namespace)
 	}
@@ -140,11 +141,23 @@ func TestBuildTeamsInboundDeployment(t *testing.T) {
 	if ptr.Deref(dep.Spec.Replicas, 0) != 1 {
 		t.Fatalf("replicas = %d", ptr.Deref(dep.Spec.Replicas, 0))
 	}
+	if dep.Spec.Strategy.Type != "Recreate" {
+		t.Fatalf("strategy = %q, want Recreate: the quota budgets no surge pod for the receiver", dep.Spec.Strategy.Type)
+	}
+	if c.WorkingDir != "/" {
+		t.Fatalf("working dir = %q, want / on the distroless nonroot image under uid 1000", c.WorkingDir)
+	}
+	if pod.DNSConfig == nil || len(pod.DNSConfig.Options) == 0 || pod.DNSConfig.Options[0].Name != "ndots" {
+		t.Fatalf("the receiver dials the broker and Microsoft by name and must carry the broker callers' ndots: %+v", pod.DNSConfig)
+	}
+	if _, reserved := reservedProfileServiceAccounts(agent)[teamsInboundName(agent)]; !reserved {
+		t.Fatal("the receiver's ServiceAccount must be reserved against profiles and spec.security.serviceAccountName")
+	}
 }
 
 func TestTheReceiverImageCanBeOverridden(t *testing.T) {
 	t.Setenv(a2aTeamsInboundImageEnvVar, "registry.example/teams-inbound:dev")
-	if got := buildTeamsInboundDeployment(teamsInboundTestAgent()).Spec.Template.Spec.Containers[0].Image; got != "registry.example/teams-inbound:dev" {
+	if got := buildA2ATeamsInboundDeployment(teamsInboundTestAgent()).Spec.Template.Spec.Containers[0].Image; got != "registry.example/teams-inbound:dev" {
 		t.Fatalf("image = %s", got)
 	}
 }

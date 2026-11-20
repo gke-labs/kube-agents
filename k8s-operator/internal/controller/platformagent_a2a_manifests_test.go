@@ -1877,6 +1877,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
 		{"mcp", "buildA2AMCPDeployment", mcp.Spec.Template.Spec},
 		{"curator", "buildA2ACuratorDeployment", curator.Spec.Template.Spec},
+		{"teams-inbound", "buildA2ATeamsInboundDeployment", buildA2ATeamsInboundDeployment(withTeamsInboundOn(agent)).Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1951,6 +1952,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
 	curator := buildA2ACuratorDeployment(agent)
+	teamsInbound := buildA2ATeamsInboundDeployment(withTeamsInboundOn(agent))
 
 	cases := []struct {
 		render    string
@@ -2023,6 +2025,11 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// the same reasoning: it reads its token and credential files by
 		// absolute path and writes nothing.
 		{render: "mcp", builder: "buildA2AMCPDeployment", container: "mcp", spec: mcp.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The Teams inbound receiver, on the same distroless static nonroot
+		// base and UID 1000: it reads its token by absolute path and writes
+		// nothing, so traversable is enough; the render sets WorkingDir "/".
+		{render: "teams-inbound", builder: "buildA2ATeamsInboundDeployment", container: teamsInboundContainer, spec: teamsInbound.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 		// The OKF memory curator runs from the console image too, writing only
 		// to its mounted /var/lib/curator emptyDir by absolute path.

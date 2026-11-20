@@ -3132,6 +3132,10 @@ BROKER_FAILURE_KIND_BY_ROUTE: dict[str, str | None] = {
     watcher_policy.WATCHER_K8S_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
     "/v1/chat/a2a": None,
     "/v1/chat/api": None,
+    # The Teams intake sits ahead of the chat prefix in ROUTE_ROLES, so its
+    # label is its own; a relay 5xx there belongs to the caller as under
+    # /v1/chat, and a pull failure is recorded at its site.
+    TEAMS_INBOUND_ROUTE: None,
     "/v1/chat": None,
 }
 

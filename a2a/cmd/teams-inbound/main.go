@@ -21,8 +21,14 @@ import (
 const (
 	// shutdownGrace is how long in-flight requests get once a stop arrives.
 	shutdownGrace = 10 * time.Second
-	// headerTimeout bounds a slow client's headers on the public listener.
+	// headerTimeout bounds a slow client's headers on the public listener;
+	// readTimeout the whole request, body included, so a client that trickles
+	// bytes under a bearer it never proves cannot hold a goroutine; writeTimeout
+	// the answer; idleTimeout a kept-alive connection that sends nothing.
 	headerTimeout = 10 * time.Second
+	readTimeout   = 20 * time.Second
+	writeTimeout  = 20 * time.Second
+	idleTimeout   = 60 * time.Second
 	// warmTimeout bounds the startup read of Microsoft's signing keys
 	// (Verifier.Warm runs its fetch on this context); a failure is logged
 	// and the first request fetches again.
@@ -47,8 +53,8 @@ func main() {
 	}
 	cancel()
 
-	public := &http.Server{Addr: cfg.Listen, Handler: srv.Handler(), ReadHeaderTimeout: headerTimeout}
-	status := &http.Server{Addr: cfg.StatusListen, Handler: srv.StatusHandler(), ReadHeaderTimeout: headerTimeout}
+	public := &http.Server{Addr: cfg.Listen, Handler: srv.Handler(), ReadHeaderTimeout: headerTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout}
+	status := &http.Server{Addr: cfg.StatusListen, Handler: srv.StatusHandler(), ReadHeaderTimeout: headerTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout}
 	errs := make(chan error, 2)
 	go func() { errs <- public.ListenAndServe() }()
 	go func() { errs <- status.ListenAndServe() }()
