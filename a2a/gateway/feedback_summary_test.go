@@ -309,6 +309,37 @@ func TestRenderUsageSummaryModelLineReadsStatusInference(t *testing.T) {
 	}
 }
 
+// TestRenderUsageSummaryReasoningEffortLineFollowsTheModelLine: the effort line
+// prints the status value under the model line, unset when a known model has none,
+// and unavailable whenever the model line is.
+func TestRenderUsageSummaryReasoningEffortLineFollowsTheModelLine(t *testing.T) {
+	cr := summaryCR()
+	status := cr["status"].(map[string]any)
+	inference := status["inference"].(map[string]any)
+	inference["reasoningEffort"] = "high"
+	if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  model: vertex_ai/claude-opus-5\n  reasoning effort: high\n") {
+		t.Errorf("block lacks the effort line under the model line:\n%s", text)
+	}
+	delete(inference, "reasoningEffort")
+	if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  reasoning effort: unset\n") {
+		t.Errorf("a known model with no effort must print unset:\n%s", text)
+	}
+	for name, value := range map[string]any{
+		"empty":         map[string]any{},
+		"provider only": map[string]any{"provider": "vertex_ai", "reasoningEffort": "high"},
+		"absent":        nil,
+	} {
+		if value == nil {
+			delete(status, "inference")
+		} else {
+			status["inference"] = value
+		}
+		if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  model: unavailable\n  reasoning effort: unavailable\n") {
+			t.Errorf("%s: the effort must be unavailable with the model:\n%s", name, text)
+		}
+	}
+}
+
 // TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys: the environment
 // block prints usageSummaryEnvironmentKeys in order, one line each, and the
 // whole block stays under the cap with the model line in it.

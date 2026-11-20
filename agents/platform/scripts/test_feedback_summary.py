@@ -964,7 +964,7 @@ class GatewayCopyTest(unittest.TestCase):
         source = self.GO_FILE.read_text()
         start = source.index(f"var {var} = ")
         body = source[start : source.index("}", start)]
-        return re.findall(r'"([A-Za-z0-9]+)"', body)
+        return re.findall(r'"([A-Za-z0-9 ]+)"', body)
 
     def test_the_gateway_prints_the_same_counters_and_readings(self):
         self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))

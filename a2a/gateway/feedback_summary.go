@@ -36,7 +36,7 @@ const (
 	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
 	//: matches its own block's shape (the script adds the live LiteLLM figures and
 	//: task rows this block does not carry); nothing holds the two in step, by design.
-	usageSummaryMaxLines = 56
+	usageSummaryMaxLines = 57
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
 	//: SessionTTL, past which idle records (and their tasks) are deleted.
@@ -84,9 +84,12 @@ const (
 	//: What the roll-up counts. The script's line with the same window counts
 	//: kanban cards; this one counts the gateway's task records, one per chat
 	//: turn, so the label says so and a reader of both pastes is not misled.
-	usageSummaryTurnsLabel     = "chat turns"
-	usageSummaryFence          = "```"
-	usageSummaryUnavailable    = "unavailable"
+	usageSummaryTurnsLabel  = "chat turns"
+	usageSummaryFence       = "```"
+	usageSummaryUnavailable = "unavailable"
+	//: The reasoning effort line's value when the model is known and the config
+	//: states no effort, so the model thinks at its own default.
+	usageSummaryUnset          = "unset"
 	usageSummaryUnknown        = "unknown"
 	usageSummaryNever          = "never"
 	usageSummaryNone           = "none"
@@ -108,15 +111,17 @@ const (
 	usageSummaryOriginLinePrefix = "  proposals by origin: "
 	//: What precedes the origin's name in its field.
 	usageSummaryOriginFieldPrefix = "proposalsFrom"
-	//: status.inference, the operator's reading of the install's default model.
-	inferenceStatusKey        = "inference"
-	inferenceProviderField    = "provider"
-	inferenceModelField       = "model"
-	inferenceSeparator        = "/"
-	usageNoReading            = "no reading"
-	usageForgeReadingSuffix   = " (as the forge reports)"
-	usageGatewayReadingSuffix = " (as the gateway reports)"
-	usageAgentReadingSuffix   = " (as the agent reports)"
+	//: status.inference, the operator's reading of the install's default model and
+	//: of the reasoning effort configured on it.
+	inferenceStatusKey            = "inference"
+	inferenceProviderField        = "provider"
+	inferenceModelField           = "model"
+	inferenceReasoningEffortField = "reasoningEffort"
+	inferenceSeparator            = "/"
+	usageNoReading                = "no reading"
+	usageForgeReadingSuffix       = " (as the forge reports)"
+	usageGatewayReadingSuffix     = " (as the gateway reports)"
+	usageAgentReadingSuffix       = " (as the agent reports)"
 	//: status.usage.topTools: the operator's reading of the broker's five
 	//: most-invoked tool and subcommand pairs since the broker pod started,
 	//: and the row fields it carries. The script's TOP_TOOLS_* names.
@@ -228,7 +233,7 @@ var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageS
 
 // : The environment lines, in the order the block prints them: the script's
 // : ENVIRONMENT_KEYS verbatim.
-var usageSummaryEnvironmentKeys = []string{"version", "mode", "model", "kubernetes", "installed", "interfaces"}
+var usageSummaryEnvironmentKeys = []string{"version", "mode", "model", "reasoning effort", "kubernetes", "installed", "interfaces"}
 
 // : Spec subtrees whose string leaves name the install and must not reach the
 // : block: the script's list verbatim, so the two audits read the same (chat
@@ -472,6 +477,20 @@ func inferenceModelLine(cr map[string]any) string {
 	return provider + inferenceSeparator + model
 }
 
+// inferenceReasoningEffortLine is status.inference.reasoningEffort under the model
+// line: unavailable whenever the model line is, unset when the pair is present
+// without an effort, the value as written otherwise.
+func inferenceReasoningEffortLine(cr map[string]any) string {
+	if inferenceModelLine(cr) == usageSummaryUnavailable {
+		return usageSummaryUnavailable
+	}
+	inference, _ := nested(cr, "status", inferenceStatusKey).(map[string]any)
+	if effort := asString(inference[inferenceReasoningEffortField]); effort != "" {
+		return effort
+	}
+	return usageSummaryUnset
+}
+
 // usageSummaryOriginLine lists the origins whose reading is above zero in the
 // table's order, "none" when every reading is zero, and "no reading" when the
 // readings are absent. The operator writes all nine or none; a status carrying only
@@ -527,12 +546,13 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		joined = usageSummaryNone
 	}
 	environment := map[string]string{
-		"version":    tag,
-		"mode":       mode,
-		"model":      inferenceModelLine(cr),
-		"kubernetes": serverVersion,
-		"installed":  fmt.Sprintf("%s; ready: %s", installAge(cr, now), readyState(cr)),
-		"interfaces": joined,
+		"version":          tag,
+		"mode":             mode,
+		"model":            inferenceModelLine(cr),
+		"reasoning effort": inferenceReasoningEffortLine(cr),
+		"kubernetes":       serverVersion,
+		"installed":        fmt.Sprintf("%s; ready: %s", installAge(cr, now), readyState(cr)),
+		"interfaces":       joined,
 	}
 	for _, key := range usageSummaryEnvironmentKeys {
 		lines = append(lines, "  "+key+": "+environment[key])
