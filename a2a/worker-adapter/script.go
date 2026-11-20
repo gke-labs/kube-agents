@@ -30,9 +30,10 @@ import (
 //   - its task credential verifies against the install's task-signing keys,
 //     names this task and this pod, and carries a trigger whose script is the
 //     confirm's (so neither the confirm nor the credential alone decides);
-//   - the path resolves, symlinks and all, to a regular file under the script
-//     root, owned by root and writable by no one else, in directories that
-//     are the same.
+//   - the path resolves to a regular file under the script root, owned by
+//     root and writable by no one else, in directories that are the same on
+//     both the named path and the resolved one; the file itself may be a
+//     symlink within the root, and no directory on the named path may be.
 //
 // The script gets a cleared environment: the worker's own PATH and HOME and
 // the broker hand-off (all rendered by the operator), plus the task's
@@ -94,7 +95,8 @@ func (c scriptFileCheck) withDefaults() scriptFileCheck {
 
 // resolve is the real path of the script at path, or why it can't run. The
 // path has ScriptPath's shape under the root; its real path lies under the
-// root too; every directory from the root down to it, and the file itself,
+// root too; every directory from the root down to it, and down to the named
+// path (where none may be a symlink), and the file itself,
 // is owned by the owner and writable by no group or other; the file is a
 // regular file; and the worker isn't the owner, so it can't have written
 // it. The root's own ancestors are image layers, which the build-time check
@@ -116,16 +118,9 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 	if !strings.HasPrefix(real, root) {
 		return "", fmt.Errorf("%s resolves to %s, outside %s", path, real, root)
 	}
-	dirs := []string{strings.TrimSuffix(root, "/")}
-	rel := strings.TrimPrefix(filepath.Dir(real), root)
-	if filepath.Dir(real)+"/" != root {
-		cur := strings.TrimSuffix(root, "/")
-		for _, seg := range strings.Split(rel, "/") {
-			cur = cur + "/" + seg
-			dirs = append(dirs, cur)
-		}
-	}
-	for _, d := range dirs {
+	// Both chains: the resolved file's, and the named path's, so a directory on the way that is a
+	// symlink or writable by someone else is refused even when the file it leads to passes.
+	for _, d := range append(dirChain(root, path), dirChain(root, real)...) {
 		if err := c.ownedAndUnwritable(d, true); err != nil {
 			return "", err
 		}
@@ -136,12 +131,29 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 	return real, nil
 }
 
+// dirChain is every directory from root (which ends in "/") down to file's
+// own, root first.
+func dirChain(root, file string) []string {
+	dirs := []string{strings.TrimSuffix(root, "/")}
+	if filepath.Dir(file)+"/" == root {
+		return dirs
+	}
+	cur := strings.TrimSuffix(root, "/")
+	for _, seg := range strings.Split(strings.TrimPrefix(filepath.Dir(file), root), "/") {
+		cur = cur + "/" + seg
+		dirs = append(dirs, cur)
+	}
+	return dirs
+}
+
 func (c scriptFileCheck) ownedAndUnwritable(path string, dir bool) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", path, err)
 	}
 	switch {
+	case dir && fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("%s is a symlink, and no directory on a script's path may be one", path)
 	case dir && !fi.IsDir():
 		return fmt.Errorf("%s is not a directory", path)
 	case !dir && !fi.Mode().IsRegular():
@@ -245,11 +257,16 @@ func (b *cappedBuffer) text() string {
 	defer b.mu.Unlock()
 	if b.over {
 		// The cap is a byte count, so it can fall inside a multi-byte character; drop that character's
-		// leading bytes rather than publish invalid UTF-8 before the marker.
+		// leading bytes (at most UTFMax-1) rather than cut it before the marker. Only the cut point is
+		// trimmed: an invalid byte earlier is the script's and stays, so no output past it is lost.
 		kept := b.buf.Bytes()
-		for len(kept) > 0 && !utf8.Valid(kept) {
-			_, size := utf8.DecodeLastRune(kept)
-			kept = kept[:len(kept)-size]
+		for i := len(kept) - 1; i >= 0 && i >= len(kept)-(utf8.UTFMax-1); i-- {
+			if utf8.RuneStart(kept[i]) {
+				if !utf8.FullRune(kept[i:]) {
+					kept = kept[:i]
+				}
+				break
+			}
 		}
 		return string(kept) + scriptTruncated
 	}
@@ -333,11 +350,15 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	<-watchDone
 	res.abandoned, res.canceled = watchedAbandon, watchedCancel
 	res.stdout, res.stderr = stdout.text(), stderr.String()
+	// A script that exited on its own (not killed by a signal) finished inside its bound, even when
+	// the bound passed while the worker waited, up to scriptKillGrace, on a pipe a child it started
+	// still held: its exit status, not the timeout, is how it ended.
+	exitedOnItsOwn := cmd.ProcessState != nil && cmd.ProcessState.Exited()
 	switch {
 	case res.abandoned, res.canceled:
 	case ctx.Err() != nil:
 		res.stopped = true
-	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
+	case errors.Is(runCtx.Err(), context.DeadlineExceeded) && !exitedOnItsOwn:
 		res.timedOut = true
 	}
 	var exitErr *exec.ExitError
