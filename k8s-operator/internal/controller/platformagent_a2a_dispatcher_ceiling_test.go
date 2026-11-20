@@ -417,7 +417,7 @@ func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 	}
 	largest := 0
 	for _, imageVolumes := range []bool{true, false} {
-		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -463,7 +463,7 @@ func TestUnderJobModeTheConfigLimitCutsFirst(t *testing.T) {
 	// either rendering, and at the larger it uses most of the budget: the cut
 	// is safe and not far early.
 	for _, imageVolumes := range []bool{true, false} {
-		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -621,7 +621,7 @@ func TestJobModeAloneNoLongerFillsTheConfig(t *testing.T) {
 	if refused := a2aDispatcherCeilingRefused(agent, profiles); len(refused) != 0 {
 		t.Errorf("%d of 400 two-tier profiles under Job mode were refused", len(refused))
 	}
-	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -78,7 +78,7 @@ func TestNoProfileWorkerContainerSetsALiteralModelCredential(t *testing.T) {
 	profile := unattendedProfile(agent, "tse")
 	for _, imageVolumes := range []bool{false, true} {
 		check(t, "warm pool", buildProfilePool(agent, &profile, agentv1alpha1.AgentProfileTierRead, agentProfileServiceAccountName(&profile, agentv1alpha1.AgentProfileTierRead), imageVolumes).Spec.Template.Spec)
-		set := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{profile}, imageVolumes)[profile.Name]
+		set := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{profile}, imageVolumes, a2aTaskSigningKeyPlaceholder)[profile.Name]
 		if len(set) == 0 {
 			t.Fatalf("precondition: no Job templates for %s (imageVolumes %v)", profile.Name, imageVolumes)
 		}

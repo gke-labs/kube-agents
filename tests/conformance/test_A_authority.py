@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
+import json
 import dataclasses
 import email.message
 import io
@@ -555,14 +557,21 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             ),
             proposal_update=lambda payload: ran.append(payload) or {"proposal": proposals[payload["number"]]},
         )
-        permitted = types.SimpleNamespace(permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        permitted = types.SimpleNamespace(
+            task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})
+        )
         principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
         principal = dataclasses.replace(principal, task=permitted)
+        # Every proposal here is this task's own (#6400), so only the ownership read can refuse one.
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(Forge(), repo)
+        for number in proposals:
+            record.record_proposal("task-1", 4_000_000_000, key, number)
 
         def update(number: int) -> list:
             body = json.dumps({"repository": f"https://github.com/{repo}", "number": number, "title": "t"}).encode()
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
-            handler.principal, handler.vcs = principal, vcs
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
             handler.headers = email.message.Message()
             handler.headers["Content-Length"] = str(len(body))
             handler.rfile = io.BytesIO(body)
@@ -582,6 +591,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 replies = update(number)
                 self.assertEqual(403, replies[0][0], replies)
                 self.assertEqual(cp.RULE_CALLER_VCS_OWNERSHIP, replies[0][1]["rule"])
+                self.assertNotEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1].get("code"), replies)
         self.assertEqual(1, len(ran), "a refused update reached the forge")
 
     def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
@@ -639,6 +649,68 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         self.assertIsNotNone(cp.report_write_permitted(
             cp.CALLER_ROLE_PROFILE, "fleet-audit", trigger(), audit, "acme%2Fterraform", key, allowlist, registered
         ))
+
+    def test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work(self) -> None:
+        # #6400: the permit is per task, so under it a profile worker writes only
+        # on what that task made. Another open proposal of the install's, one
+        # the ownership check admits, is refused when a different task opened
+        # it. Driven through the handler's own dispatch, so a dispatch that
+        # stops asking the task bar is red, not only the record.
+        cp = h.credential_proxy
+        repo = "acme/infra"
+        ran: list = []
+
+        class Vcs(types.SimpleNamespace):
+            def __getattr__(self, name):
+                return lambda payload: {}
+
+        vcs = Vcs(
+            registry=types.SimpleNamespace(resolve=lambda named: (types.SimpleNamespace(name="github"), repo)),
+            snapshot_source=lambda named: (named, None),
+            require_agent_proposal=lambda verb, payload: None,  # the install's own: the ownership bar passes
+            proposal_update=lambda payload: ran.append(payload) or {"proposal": {"number": payload["number"]}},
+        )
+        task = types.SimpleNamespace(task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        principal = dataclasses.replace(
+            cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u"), task=task
+        )
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(types.SimpleNamespace(name="github"), repo)
+        record.record_proposal("task-1", 4_000_000_000, key, 7)
+        record.record_proposal("task-2", 4_000_000_000, key, 8)
+
+        def update(number: int) -> list:
+            return write("proposal-update", {"number": number, "title": "t"})
+
+        def write(verb: str, fields: dict) -> list:
+            body = json.dumps({"repository": f"https://github.com/{repo}", **fields}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda role: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler._repository_is_permitted = lambda repository, forge: True
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._dispatch_vcs_post(verb)
+            return replies
+
+        self.assertEqual(200, update(7)[0][0], "the task's own proposal must stay updatable")
+        replies = update(8)
+        self.assertEqual(403, replies[0][0], replies)
+        self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
+        self.assertEqual([7], [payload["number"] for payload in ran], "another task's proposal reached the forge")
+        # And the other two writes: a publish to, and a proposal from, another task's branch.
+        allowed, _ = record.claim_branch("task-2", 4_000_000_000, key, "platform-agent/theirs", lambda: False)
+        self.assertTrue(allowed)
+        for verb, field in (("publish", "branch"), ("proposal-create", "source")):
+            with self.subTest(verb=verb):
+                replies = write(verb, {field: "platform-agent/theirs", "title": "t", "target": "main"})
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
 
     def test_A3_only_a_profile_learns_the_managed_list_from_identity(self) -> None:
         # #6389: a profile task that names no repository may ask `identity` with
@@ -1298,10 +1370,19 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         class vacuously -- which is how the `worker` grant on `…events` came
         to report as absent while the served config still carried it.
         """
-        source = h.text("a2a_identities")
-        consts = cls._go_string_consts(source, h.text("a2a_jetstream_grants"))
+        # Every file that builds a row of the identity map: the identities
+        # file, and the dispatcher's, whose row the authmap appends when an
+        # AgentProfile is dispatched. A builder left out of this list is a
+        # principal left out of every writer set below.
+        sources = [h.text("a2a_identities"), h.text("a2a_dispatcher")]
+        consts = cls._go_string_consts(*sources, h.text("a2a_jetstream_grants"))
         grants = {}
-        for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
+        builders = [
+            (source, builder)
+            for source in sources
+            for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE)
+        ]
+        for source, builder in builders:
             body = h.go_function_body(source, builder)
             # A5's two halves of the old `worker` name themselves through
             # constants, because the operator renders one of them into an env
@@ -1316,9 +1397,17 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 raise AssertionError(
                     f"{builder} names its user as `{expr.group(1)}`, which this test cannot resolve"
                 )
-            field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
+            field = re.search(
+                r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|append\(\w+,.*?\n\t\t\)|\w+),", body, re.DOTALL
+            )
             if field is None:
+                if re.search(r"\n\t\tpublish:", body):
+                    # A publish field in a shape the reader does not know
+                    # must not read as an empty, complete list.
+                    raise AssertionError(f"{builder} sets publish in a shape this test cannot read")
                 grants[name] = ([], True)
+            elif field.group(1).startswith("append("):
+                grants[name] = cls._resolve_appended_publish(body, field.group(1), consts)
             elif field.group(1).startswith("[]string{"):
                 # Entry by entry rather than scraping every quoted run out of
                 # the block, because a concatenated entry scraped that way
@@ -1367,6 +1456,53 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 else:
                     grants[name] = (read, False)
         return grants
+
+    @classmethod
+    def _resolve_appended_publish(cls, body: str, field: str, consts: dict[str, str]) -> tuple[list[str], bool]:
+        """`publish: append(local, ...)`, where `local` is built in `for` loops.
+
+        The dispatcher's shape: a `var local []string` filled by
+        `local = append(local, ...)` inside `for _, x := range ...` loops over
+        the profiles and durables, then the fixed grants appended in the field.
+        A loop variable is read as `*`, one token of anything, so a per-profile
+        grant counts as reaching every profile's subject. That over-reports
+        writers, which fails loudly, where a placeholder would under-report.
+        Anything else assigned to the local makes the reading partial.
+        """
+        text = re.sub(r"//[^\n]*", "", body)
+        consts = dict(consts)
+        for local, value in re.findall(r"\n\tconst (\w+) = \"([^\"]*)\"", text):
+            consts[local] = value
+        head = re.fullmatch(r"append\((\w+),(.*)\n\t\t\)", re.sub(r"//[^\n]*", "", field), re.DOTALL)
+        if head is None:
+            return [], False
+        var, rest = head.group(1), head.group(2)
+        grants: list[str] = []
+        complete = re.search(rf"\n\tvar {var} \[\]string\n", text) is not None
+        appends = 0
+        for loop_var, loop_body in re.findall(r"\n\tfor _, (\w+) := range \w+ \{\n(.*?)\n\t\}", text, re.DOTALL):
+            scoped = {**consts, loop_var: "*"}
+            for arg in re.findall(rf"\t\t{var} = append\({var},(.*?)\)\n", loop_body + "\n", re.DOTALL):
+                appends += 1
+                for element in arg.split(","):
+                    if not element.strip():
+                        continue
+                    value = cls._resolve_expr(element, scoped)
+                    if value is None:
+                        complete = False
+                    else:
+                        grants.append(value)
+        if appends == 0 or appends != len(re.findall(rf"^\t+{var}\s*=[^=]", text, re.MULTILINE)):
+            complete = False
+        for element in rest.split(","):
+            if not element.strip():
+                continue
+            value = cls._resolve_expr(element, consts)
+            if value is None:
+                complete = False
+            else:
+                grants.append(value)
+        return grants, complete
 
     @staticmethod
     def _go_string_consts(*sources: str) -> dict[str, str]:
@@ -1570,6 +1706,27 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assert "profileWorkerGrants(" in profile, "profileGrants no longer starts from profileWorkerGrants"
         return block.group(1) + "\n".join((session, task, worker, profile))
 
+    @staticmethod
+    def _derived_subject_spellings(derivation: str) -> list[str]:
+        """Every subject the derivation spells, as a NATS pattern to match on.
+
+        Each string literal on its own, and each `+`-joined expression with
+        its non-literal parts read as `*`: `"_INBOX." + pod + ".>"` is
+        `_INBOX.*.>`. Comments are stripped first; they quote the subjects
+        they explain the absence of. A grant built by a named helper
+        (`lib.TaskEventsSubject(...)`) is opaque here; the helpers build
+        `a2a.` subjects.
+        """
+        text = re.sub(r"//[^\n]*", "", derivation)
+        operand = r'(?:"[^"\n]*"|[\w.]+(?:\([^()\n]*\))?)'
+        spellings = re.findall(r'"([^"\n]*)"', text)
+        for chain in re.finditer(rf"{operand}(?:\s*\+\s*{operand})+", text):
+            parts = re.split(r"\s*\+\s*(?=[\"\w])", chain.group(0))
+            spellings.append(
+                "".join(p[1:-1] if p.startswith('"') else "*" for p in parts)
+            )
+        return [s for s in spellings if s]
+
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
         """The principals the writer-set tests iterate, so a moved one is loud.
 
@@ -1579,7 +1736,9 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier"):
+        for user in (
+            "gateway", "agent", "bridge", "web", "console", "console-mcp", "seed", "provision", "verifier", "dispatcher",
+        ):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
@@ -1621,15 +1780,24 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         `…events` with the executor, and a session that ended its own task
         wearing the gateway's `from` was indistinguishable on replay from
         the gateway ending it. The gateway is the supervisor for the chat
-        sessions it spawns; the dispatcher's janitor inherits the token at
-        stage 3 and joins this set when it does, deliberately.
+        sessions it spawns; the dispatcher is the supervisor for the profile
+        tasks it dispatches and writes their terminal failures on
+        `a2a.tasks.<profile>.*.supervisor`, one grant per profile. Read with
+        the profile as `*`, that grant reaches the probe, and it must be the
+        only one of the dispatcher's that does.
         """
+        grants = self._rendered_publish_grants()
         writers = sorted(
             builder
-            for builder, grants in self._rendered_publish_grants().items()
-            if any(self._subject_matches(g, self.SUPERVISOR_PROBE) for g in grants)
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.SUPERVISOR_PROBE) for g in allow)
         )
-        self.assertEqual(["gateway"], writers)
+        self.assertEqual(["dispatcher", "gateway"], writers)
+        self.assertEqual(
+            ["a2a.tasks.*.*.supervisor"],
+            [g for g in grants["dispatcher"] if self._subject_matches(g, self.SUPERVISOR_PROBE)],
+            "the dispatcher reaches a task's supervisor subject other than through its per-profile grant",
+        )
         self.assertNotIn(
             "TaskSupervisorSubject",
             self._session_publish_derivation(),
@@ -1731,6 +1899,43 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         body = self._dispatcher_identity()
         publish = body[body.index("publish:") : body.index("subscribe:")]
         self.assertNotIn("stops", publish, "the dispatcher's stop-record subscription list reaches its publish grants")
+
+    CONSOLE_CONFIRM_PROBE = "chat.console.tab-1.confirm"
+    CONSOLE_IN_PROBE = "chat.console.tab-1.in"
+
+    def test_A3_the_console_confirm_subject_has_exactly_one_writer(self) -> None:
+        """A console confirm is written by the human console user and nobody else.
+
+        The gateway takes a frame on `chat.console.<token>.confirm` as a
+        confirm and submits its task with `ChangeRequested`, the one way a
+        task is granted the permit to make a change. The subject is the only
+        route to it, so its writer set is the whole of who can confirm. The
+        console MCP server's user, `console-mcp`, is driven by a model: it
+        writes the same turns on `.in` and must not reach `.confirm`. No
+        session or profile worker derives a grant on any console subject.
+        """
+        grants = self._rendered_publish_grants()
+        writers = sorted(
+            builder
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.CONSOLE_CONFIRM_PROBE) for g in allow)
+        )
+        self.assertEqual(["console"], writers)
+        # Not vacuous: console-mcp is rendered, and does reach the `.in` door.
+        in_writers = sorted(
+            builder
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.CONSOLE_IN_PROBE) for g in allow)
+        )
+        self.assertEqual(["console", "console-mcp"], in_writers)
+        derived = self._derived_subject_spellings(self._session_publish_derivation())
+        self.assertTrue(derived, "no subject spellings read out of the derivation; the check goes vacuous")
+        self.assertEqual(
+            [],
+            [g for g in derived if self._subject_matches(g, self.CONSOLE_CONFIRM_PROBE)],
+            "the callout derives an executor a publish grant that reaches the console's confirm "
+            "subject; a worker that can write `.confirm` can grant its own task the change permit",
+        )
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
