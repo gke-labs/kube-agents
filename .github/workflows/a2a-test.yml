@@ -143,6 +143,10 @@ jobs:
               - "agents/cluster/persona/**"
               - "agents/platform/scripts/stall_report.py"
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+              # The cluster persona's copies of these are checked against them
+              # (scriptSources in a2a/lib/persona/claudecode).
+              - "agents/platform/scripts/workload_triage.py"
+              - "agents/platform/skills/version-control/scripts/vcs.py"
               - "agents/platform/scripts/mcp_policy.py"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
