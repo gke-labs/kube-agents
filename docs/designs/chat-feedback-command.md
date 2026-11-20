@@ -289,7 +289,7 @@ that the line reads `unavailable`. It reads the
 `PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
 grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
 needs no grant. The token and spend totals are the operator's, on the resource, so the block
-prints them; latency is not the gateway's to see and the block says where it is. Before posting, the block less its model line is audited as the script audits its own: every
+prints them; latency is not the gateway's to see and the block says where it is. Before posting, the block less its model, reasoning effort and origin lines is audited as the script audits its own: every
 string leaf of the spec's naming subtrees plus the resource's name and namespace, as whole
 tokens, with booleans, numbers, short strings and the template's own vocabulary skipped; a
 hit posts a fixed refusal instead, and a resource that cannot be read posts a fixed
@@ -315,7 +315,7 @@ else, acks with a line saying the block will post into the thread and that their
 context-less read of the host cluster, and the agent's local Role grants `get` on the
 `PlatformAgent`, while `exec` is a write verb to the broker's command policy. The block therefore carries the environment
 and usage sections and prints `unavailable` for tokens, spend, latency and the task roll-up;
-those stay with `scripts/feedback-summary.sh`. The block less its model and origin lines is audited as
+those stay with `scripts/feedback-summary.sh`. The block less its model, reasoning effort and origin lines is audited as
 the script audits its own; a clean block, less the rating form the pasted block ends with (an empty form in an issue reads as a rating nobody gave), is the card's `result`, verbatim, and a hit is a
 `BLOCKED` line that says how many identifiers were found and never which. The worker files
 nothing on this card.

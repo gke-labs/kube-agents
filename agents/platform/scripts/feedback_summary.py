@@ -243,9 +243,6 @@ TEMPLATE_EXTRA_TOKENS = (
     | frozenset(sub for subs in BROKER_SUBCOMMANDS.values() for sub in subs)
     | frozenset(TOOL_STATUS_ORDER)
     | {"tools", "top", "since", "broker", "start", "scale", "namespaces", "deployments", "pods", "nodes", "crds", "kcc", NONE, OTHER_BUCKET}
-    #: The effort line's fixed word for a known model with no effort; the empty
-    #: render prints ``unavailable`` there, so the word is added by name.
-    | {REASONING_EFFORT_UNSET}
 )
 #: The nine ``status.usage`` proposal-origin readings, in the origin table's
 #: order (docs/designs/proposal-origin.md); the block prints them as one line.
@@ -307,8 +304,11 @@ INFERENCE_MODEL_FIELD = "model"
 INFERENCE_REASONING_EFFORT_FIELD = "reasoningEffort"
 #: The model line's start; the audit runs over the block without this line.
 MODEL_LINE_PREFIX = "  model: "
+#: The reasoning effort line's start: a setting, not an identifier, printed by design
+#: like the model line, so an install named after its effort word is not refused for it.
+REASONING_EFFORT_LINE_PREFIX = "  reasoning effort: "
 #: The lines printed by design, each removed (its first occurrence) before the audit.
-FIXED_LINE_PREFIXES: Tuple[str, ...] = (MODEL_LINE_PREFIX, ORIGIN_LINE_PREFIX)
+FIXED_LINE_PREFIXES: Tuple[str, ...] = (MODEL_LINE_PREFIX, REASONING_EFFORT_LINE_PREFIX, ORIGIN_LINE_PREFIX)
 #: The model_list entry whose model is the install's default (the operator's agentModelName).
 LITELLM_DEFAULT_MODEL_ALIAS = "model-default"
 #: The ``model_name: model-default`` line, quoted or bare, at any indent.
@@ -345,7 +345,9 @@ LITELLM_DEFAULT_NAME_LINE = re.compile(
 #: typed here, where the Go reader drops any non-string; a quoted value with a
 #: ``#`` (``"high#1"``) reads ``unset`` here and is kept in Go; and a
 #: ``litellm_params:`` nested under a sibling block, when the entry's own block
-#: states no effort, can answer here and not in Go. A value with a space, a key
+#: states no effort, can answer here and not in Go; and a comment line inside the
+#: block indented less than its keys stops this reader (``unset``) where the YAML
+#: parser reads on. A value with a space, a key
 #: under a sibling of ``litellm_params`` or nested below its direct keys, a second
 #: ``model-default`` entry and a trailing comment read the same in both: absent,
 #: absent, the first entry's, and the value before the comment.
@@ -833,7 +835,7 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
 
 
 def _without_fixed_lines(text: str) -> str:
-    """The block less its first ``model:`` line and its first origin line, the lines printed by design.
+    """The block less its first ``model:``, ``reasoning effort:`` and origin lines, the lines printed by design.
 
     A deployment name can carry a spec identifier as a segment
     (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``), and the
@@ -868,8 +870,8 @@ def _origin_line(usage: Mapping[str, Any]) -> str:
 def audited_block(snapshot: Snapshot) -> Tuple[str, List[str]]:
     """The rendered block and the identifiers that leak into it.
 
-    The audit runs over the block less its model line and its origin line, the
-    lines printed by design. ``main`` and the feedback client's ``summary``
+    The audit runs over the block less its model, reasoning effort and origin lines,
+    the lines printed by design. ``main`` and the feedback client's ``summary``
     subcommand both go through here, so the check that guards a pasted block
     and the check that guards an attached one are one check.
     """

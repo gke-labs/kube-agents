@@ -709,13 +709,19 @@ func TestAuditSkipsTheBrokersVocabulary(t *testing.T) {
 	}
 }
 
-// TestUsageSummaryTemplateTokensCarryTheFixedWords: every word the block prints
-// by design is in the audit's exempt vocabulary, unset included, which the empty
-// render never prints (its effort line reads unavailable).
-func TestUsageSummaryTemplateTokensCarryTheFixedWords(t *testing.T) {
-	for _, word := range []string{usageSummaryUnavailable, usageSummaryUnknown, usageSummaryNone, usageSummaryUnset} {
-		if !usageSummaryTemplateTokens[word] {
-			t.Errorf("%q is printed by design and is not in the template vocabulary", word)
-		}
+// TestUsageSummaryWithoutFixedLinesDropsTheReasoningEffortLine: the effort line
+// is a setting printed by design, like the model line, so an install whose name
+// equals its effort word is not refused for it; every other line stays audited.
+func TestUsageSummaryWithoutFixedLinesDropsTheReasoningEffortLine(t *testing.T) {
+	text := "```\n  model: x/y\n  reasoning effort: prod-eu-1\n  kubernetes: prod-eu-1\n```"
+	got := usageSummaryWithoutFixedLines(text)
+	if strings.Contains(got, "reasoning effort:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
+		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
+	}
+	if want := len(strings.Split(text, "\n")) - 2; len(strings.Split(got, "\n")) != want {
+		t.Fatalf("dropped other than the model and effort lines: %q", got)
+	}
+	if leaked := auditUsageSummary(got, []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("the rest of the block must stay audited, got %v", leaked)
 	}
 }

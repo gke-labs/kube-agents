@@ -28,8 +28,8 @@ import (
 // Role) and its own task records, which count chat turns, not the kanban
 // cards the script's tasks line counts; the line is labelled for that. No model is in the loop, and the block
 // names no cluster, project, namespace, task or person: the audit below
-// refuses a block that does, outside the model line and the proposals-by-origin
-// line, which are printed by design.
+// refuses a block that does, outside the model line, the reasoning effort line and
+// the proposals-by-origin line, which are printed by design.
 
 const (
 	usageSummaryTitle = "kube-agents usage & feedback summary"
@@ -106,6 +106,10 @@ const (
 	platformAgentNameEnv = "PLATFORM_AGENT_NAME"
 	//: The model line's start: the audit runs over the block without this line.
 	usageSummaryModelLinePrefix = "  model: "
+	//: The reasoning effort line's start: a setting, not an identifier, printed by
+	//: design like the model line, so an install named after its effort word is not
+	//: refused for it.
+	usageSummaryReasoningEffortLinePrefix = "  reasoning effort: "
 	//: The origin line's start: the audit runs over the block without this
 	//: line, which carries only fixed words and digits.
 	usageSummaryOriginLinePrefix = "  proposals by origin: "
@@ -229,7 +233,7 @@ var usageSummaryOriginFields = []string{
 }
 
 // : The lines printed by design, each removed (its first occurrence) before the audit.
-var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageSummaryOriginLinePrefix}
+var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageSummaryReasoningEffortLinePrefix, usageSummaryOriginLinePrefix}
 
 // : The environment lines, in the order the block prints them: the script's
 // : ENVIRONMENT_KEYS verbatim.
@@ -287,9 +291,6 @@ var usageSummaryTemplateTokens = func() map[string]bool {
 	for _, tok := range usageSummaryToolTokens {
 		tokens[tok] = true
 	}
-	// The effort line's fixed word for a known model with no effort: neither render
-	// above prints it (both read unavailable there), so it is added by name.
-	tokens[usageSummaryUnset] = true
 	return tokens
 }()
 
@@ -693,11 +694,12 @@ func usageIdentifiers(cr map[string]any) []string {
 	return ids
 }
 
-// usageSummaryWithoutFixedLines is the block less its first model line and its
-// first origin line, the lines printed by design: a deployment name can carry
-// a spec identifier as a segment, and the origin line prints origin words a
-// cluster may be named ("chat", "drift"). Neither line is the reason a block
-// is refused; every other line stays audited.
+// usageSummaryWithoutFixedLines is the block less its first model line, its first
+// reasoning effort line and its first origin line, the lines printed by design: a
+// deployment name can carry a spec identifier as a segment, an effort word is a
+// setting a cluster may be named after ("high"), and the origin line prints origin
+// words a cluster may be named ("chat", "drift"). None of the three is the reason a
+// block is refused; every other line stays audited.
 func usageSummaryWithoutFixedLines(text string) string {
 	lines := strings.Split(text, "\n")
 	for _, prefix := range usageSummaryFixedLinePrefixes {

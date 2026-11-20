@@ -430,10 +430,6 @@ class RenderTest(unittest.TestCase):
                "- model_name: model-default\n  litellm_params:\n    model: openai/o\n    reasoning_effort: low\n")
         self.assertEqual(fs.reasoning_effort_from_litellm_config(two), fs.REASONING_EFFORT_UNSET)
 
-    def test_the_template_vocabulary_carries_the_fixed_words(self):
-        for word in (fs.UNAVAILABLE, fs.UNKNOWN, fs.NONE, fs.REASONING_EFFORT_UNSET):
-            self.assertIn(word, fs.template_tokens())
-
     def test_a_bare_number_effort_on_the_fallback_path_prints_as_typed(self):
         # The Go reader drops a non-string; the regex cannot tell a bare 1 from a word.
         # Pinned as a recorded divergence (see the note beside LITELLM_DEFAULT_ENTRY_MODEL).
@@ -963,6 +959,21 @@ class MainTest(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.object(fs, "collect", return_value=snapshot), mock.patch.object(fs, "render", return_value=text):
             self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), fs.EXIT_LEAK)
+
+    def test_the_audit_skips_the_reasoning_effort_line_and_nothing_else(self):
+        text = f"```\n  model: x/y\n  reasoning effort: {CLUSTER}\n  kubernetes: {CLUSTER}\n```"
+        stripped = fs._without_fixed_lines(text)
+        self.assertNotIn("reasoning effort:", stripped)
+        self.assertIn(f"  kubernetes: {CLUSTER}", stripped)
+        self.assertEqual(len(stripped.splitlines()), len(text.splitlines()) - 2)
+
+    def test_an_effort_equal_to_the_cluster_name_is_not_refused(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"]["reasoningEffort"] = CLUSTER
+        snapshot = full_snapshot(cr=cr)
+        text = fs.render(snapshot)
+        self.assertIn(f"\n  reasoning effort: {CLUSTER}\n", text)
+        self.assertEqual(fs.audit(fs._without_fixed_lines(text), snapshot.identifiers), [])
 
     def test_the_audit_skips_the_origin_line_and_nothing_else(self):
         text = f"```\n  model: x/y\n  proposals by origin: chat 3 (as the agent reports)\n  kubernetes: {CLUSTER}\n```"

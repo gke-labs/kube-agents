@@ -202,7 +202,9 @@ and `sum by (reasoning_effort)` is the new headcount; a second gauge was rejecte
 it would force and the second publish path. Both summary copies print `reasoning effort:` directly
 under `model:`: the value, `unset` when the model is known and the status holds none, and
 `unavailable` whenever the model line is `unavailable`; each copy's line cap rises by one, as the
-origin line's did. The script's ConfigMap fallback, taken only when the status has no `inference`
+origin line's did, and the line joins the model and origin lines the audit skips, because an
+effort word is a setting an install may be named after and must never be the reason a block is
+refused. The script's ConfigMap fallback, taken only when the status has no `inference`
 key, reads the key from the `model-default` entry alone, and prints `unavailable` when the
 first-qualified scan answered the model, whose entry that reader does not know.
 
@@ -246,7 +248,8 @@ Out of scope, as for the pair: the fallback alias's own effort, `max_tokens`, a 
   script's fallback,
   the environment keys as a shared list, the copy test extended to it.
   Section 2.5 adds the `reasoning effort:` line to both copies, the script's fallback read of the
-  key, the `unset` word in both audit vocabularies, and one more line on each copy's cap.
+  key, the effort line among the lines printed by design that the audit skips, and one more line
+  on each copy's cap.
 - **Docs**: `platformagent-fields.md` (generated), `platformagent-crd.md` (`## status`, the skew
   list), `observability.md` (the gauges table, the summary paragraph, the headcount query),
   `usage-counters-producer.md` (the status-as-gauges and security sections), the chart README's
