@@ -7,11 +7,10 @@
 //
 // The auth callout is no longer on that list - it is armed, and the sessions
 // this gateway spawns authenticate through it with per-pod grants. The gateway
-// itself is still a static NATS user, and that is sequencing rather than
-// posture: it has a ServiceAccount and a map entry could be rendered for it
-// tomorrow, but this program dials with NATS_USER/NATS_PASSWORD and moving the
-// identity before the program would refuse the gateway at connect on every
-// install.
+// itself dials as the static NATS user (NATS_USER/NATS_PASSWORD) by default,
+// or, at A2A_GATEWAY_BUS_AUTH=token, with its projected ServiceAccount token,
+// which the callout mints from the gateway's own map entry (#5301). Both are
+// rendered until the static user is retired a release after the flip.
 package main
 
 import (
@@ -194,7 +193,11 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// mint validates every grant against the tier table.
 	capability.StartTierFile(ctx, os.Getenv, log)
 
-	natsOpts := gatewayNATSOptions(cfg)
+	natsOpts, err := gatewayNATSOptions(cfg)
+	if err != nil {
+		log.Error("nats auth", "err", err)
+		return err
+	}
 	client, err := lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
@@ -233,7 +236,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// token only under its eval flag. See a2a/gateway/inject.go.
 	var doors []gateway.DoorSpec
 	if cfg.InjectArmed() {
-		door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+		door, err := newInjectDoor(cfg, log)
 		if err != nil {
 			log.Error("inject door", "err", err)
 			return err
@@ -383,19 +386,28 @@ func gatewayElection(cfg *gateway.Config, log *slog.Logger) (gateway.Election, e
 	}, nil
 }
 
+// gatewayInboxOwner is the gateway user's inbox owner, _INBOX.gateway: the
+// static user's name and the callout map entry's user alike.
+const gatewayInboxOwner = "gateway"
+
 // gatewayNATSOptions is how the gateway's user dials, the gateway's own
-// connection and the feedback export's alike.
-func gatewayNATSOptions(cfg *gateway.Config) []nats.Option {
+// connection and the feedback export's alike: as the static user, or on
+// A2A_GATEWAY_BUS_AUTH=token with its ServiceAccount token, which the
+// callout mints as the same user with the same inbox (#5301).
+func gatewayNATSOptions(cfg *gateway.Config) ([]nats.Option, error) {
+	if cfg.BusAuth == gateway.BusAuthToken {
+		return lib.KSATokenNATSOptions(cfg.BusTokenFile, gatewayInboxOwner)
+	}
 	natsOpts := []nats.Option{
 		// The gateway user may only subscribe under its own inbox prefix
 		// (per-user _INBOX prefixes, deployment spec); the JS API replies
 		// every publish and consume depends on land there.
-		nats.CustomInboxPrefix("_INBOX.gateway"),
+		nats.CustomInboxPrefix("_INBOX." + gatewayInboxOwner),
 	}
 	if cfg.NATSUser != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPassword))
 	}
-	return natsOpts
+	return natsOpts, nil
 }
 
 // chatNotifiers builds one chat.notify route per real backend adapter, in
@@ -567,4 +579,18 @@ func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gat
 			log.Error(metricsUnavailableAlert, "err", err)
 		}
 	}()
+}
+
+// newInjectDoor builds the inject door from the config, armed for intent
+// "confirm" only when A2A_INJECT_CONFIRM is set (Config.InjectConfirm). It is
+// realMain's one route to the door, split out so the wiring is testable.
+func newInjectDoor(cfg *gateway.Config, log *slog.Logger) (*gateway.InjectAdapter, error) {
+	door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.InjectConfirm {
+		door.AllowConfirm()
+	}
+	return door, nil
 }

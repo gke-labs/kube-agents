@@ -17,9 +17,22 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from test_dedup import adapter_mod
+import test_dedup
 
-LOGGER_NAME = adapter_mod.__name__
+LOGGER_NAME = test_dedup.ADAPTER_MODULE_NAME
+adapter_mod = None
+_put_back = None
+
+
+def setUpModule():
+    """This file's own load of the adapter; what it changes in the process is put back after."""
+    global adapter_mod, _put_back
+    adapter_mod, _put_back = test_dedup.load_adapter_for_a_test_file()
+
+
+def tearDownModule():
+    _put_back()
+
 PROJECT = "example-project"
 SUB_PATH = f"projects/{PROJECT}/subscriptions/stockout-alerts-sub"
 ROUTE = "gke_stockout_alerts"
@@ -140,9 +153,20 @@ class RelayTestCase(unittest.TestCase):
             "PUBSUB_RELAY_URL": self.broker.url,
             "CREDENTIAL_PROXY_TOKEN_FILE": self.token_file.name,
             "GCP_PROJECT_ID": PROJECT,
+            # The adapter's opener takes a proxy from the shell's variables. With this value it
+            # uses none, so the calls go to the fake broker.
+            "no_proxy": "*",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
+        # The operator's project wins over GCP_PROJECT_ID, so a value from the shell must not
+        # reach a test. The patch above puts the value back.
+        os.environ.pop("PUBSUB_RELAY_PROJECT", None)
+        # The expected paths have the default universe's host. The adapter takes the universe
+        # from these two variables, so a value from the shell must not reach a test. The patch
+        # above puts the values back.
+        for name in (adapter_mod.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, adapter_mod.CLOUDSDK_UNIVERSE_DOMAIN_ENV):
+            os.environ.pop(name, None)
         self.adapter = adapter_mod.PubSubAdapter.__new__(adapter_mod.PubSubAdapter)
         self.adapter._subscriptions_config = {ROUTE: dict(ROUTE_CONFIG)}
         self.adapter._relay = None
@@ -161,7 +185,9 @@ class RelayTestCase(unittest.TestCase):
         self.adapter._set_fatal_error = lambda code, detail, retryable: fatal.append((code, detail, retryable))
         self.adapter._mark_connected = lambda: None
         self.adapter._mark_disconnected = lambda: None
-        logging.getLogger(LOGGER_NAME).setLevel(logging.INFO)
+        logger = logging.getLogger(LOGGER_NAME)
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(logging.INFO)
 
     def run_connect(self, connected_for=0.3):
         async def session():

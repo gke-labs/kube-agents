@@ -735,6 +735,154 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	}
 }
 
+func TestPlatformAgentReconciler_Reconcile_UniverseDomainUnderGoogleapis(t *testing.T) {
+	scheme := setupScheme()
+	const name, namespace = "test-agent-universe", "test-ns"
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:      "sample-project",
+				Location:       kindLocation,
+				ClusterName:    "host-cluster",
+				UniverseDomain: "mtls.googleapis.com",
+			},
+		},
+	}
+	// A workload from an earlier reconcile, before the value was set.
+	running := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-gateway", Namespace: namespace, Labels: map[string]string{"kept": "yes"}},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, running).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+	ctx := context.Background()
+
+	// 1st Reconcile adds the finalizer; the 2nd reaches the universe-domain check.
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase Degraded, got %q", updated.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonUniverseDomainMismatch {
+		t.Fatalf("expected Ready False with reason %s, got %v", reasonUniverseDomainMismatch, cond)
+	}
+	// The message says what is wrong and what to set.
+	for _, want := range []string{`"mtls.googleapis.com" is under`, `Set spec.harness.universeDomain to "googleapis.com"`} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("Ready message %q does not contain %q", cond.Message, want)
+		}
+	}
+
+	// The workload that ran before stays as it was.
+	kept := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: name + "-gateway", Namespace: namespace}, kept); err != nil {
+		t.Fatalf("the running Deployment is gone: %v", err)
+	}
+	if kept.Labels["kept"] != "yes" || len(kept.Spec.Template.Spec.Containers) != 0 {
+		t.Errorf("the running Deployment was rewritten: labels %v, %d containers", kept.Labels, len(kept.Spec.Template.Spec.Containers))
+	}
+	// And nothing is rendered for the refused value.
+	deployments := &appsv1.DeploymentList{}
+	if err := cl.List(ctx, deployments, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list Deployments: %v", err)
+	}
+	if len(deployments.Items) != 1 {
+		t.Errorf("expected only the Deployment that ran before, got %d", len(deployments.Items))
+	}
+	statefulSets := &appsv1.StatefulSetList{}
+	if err := cl.List(ctx, statefulSets, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list StatefulSets: %v", err)
+	}
+	if len(statefulSets.Items) != 0 {
+		t.Errorf("expected no StatefulSet for a refused universe domain, got %d", len(statefulSets.Items))
+	}
+}
+
+func TestPlatformAgentReconciler_Reconcile_RefusedKeptUniverseDomainIsNotRendered(t *testing.T) {
+	scheme := setupScheme()
+	const name, namespace = "test-agent-kept-universe", "test-ns"
+
+	// The user removed a refused spec.harness.universeDomain, and the status
+	// still holds the value from before the operator refused it.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "sample-project",
+				Location:    "us-central1",
+				ClusterName: "host-cluster",
+			},
+		},
+	}
+	agent.Status.ResolvedUniverseDomain = "mtls.googleapis.com"
+	agent.Status.UniverseDomainSource = universeDomainSourceSpec
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	// The metadata probe fails, which is when the operator keeps the status value.
+	r := &PlatformAgentReconciler{
+		Client:                 cl,
+		Scheme:                 scheme,
+		UniverseDomainDetector: func(context.Context) (string, bool) { return "", false },
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+	ctx := context.Background()
+
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if stored.Status.ResolvedUniverseDomain != "mtls.googleapis.com" {
+		t.Fatalf("the fake API server did not keep the status this test starts from: %q", stored.Status.ResolvedUniverseDomain)
+	}
+
+	// 1st Reconcile adds the finalizer; the 2nd reaches the universe-domain check.
+	var res ctrl.Result
+	for i := 1; i <= 2; i++ {
+		var err error
+		if res, err = r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+	// The universe domain is not known, so the reconcile asks again and renders nothing.
+	if res.RequeueAfter != universeDomainMetadataRetryWindow {
+		t.Errorf("expected RequeueAfter %v, got %v", universeDomainMetadataRetryWindow, res.RequeueAfter)
+	}
+	deployments := &appsv1.DeploymentList{}
+	if err := cl.List(ctx, deployments, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list Deployments: %v", err)
+	}
+	statefulSets := &appsv1.StatefulSetList{}
+	if err := cl.List(ctx, statefulSets, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list StatefulSets: %v", err)
+	}
+	if len(deployments.Items) != 0 || len(statefulSets.Items) != 0 {
+		t.Errorf("expected no workload rendered for a refused kept universe domain, got %d Deployments and %d StatefulSets",
+			len(deployments.Items), len(statefulSets.Items))
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 
@@ -1797,8 +1945,11 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.PolicyTypes) != 2 {
 		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
 	}
-	if len(netpol.Spec.Ingress) != 3 {
-		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 4 {
+		t.Fatalf("expected 4 Ingress rules (the agent namespace, the broker to the audit-report store, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	}
+	if !reflect.DeepEqual(netpol.Spec.Ingress[1], auditReportStoreIngressRule(agent)) {
+		t.Errorf("expected the second Ingress rule to be the audit-report store's, got %v", netpol.Spec.Ingress[1])
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
@@ -1806,7 +1957,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	// The collector's rule: the watcher's metrics port alone, from the
 	// gke-gmp-system namespace and nothing narrower, matching the LiteLLM
 	// policy's scrape rule for the same collector.
-	scrape := netpol.Spec.Ingress[1]
+	scrape := netpol.Spec.Ingress[2]
 	if len(scrape.Ports) != 1 || scrape.Ports[0].Port == nil || scrape.Ports[0].Port.IntVal != 9095 {
 		t.Errorf("expected the collector ingress rule to admit port 9095 alone, got %v", scrape.Ports)
 	}
@@ -1918,8 +2069,11 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	if len(netpol.Spec.Ingress) != 3 {
-		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 4 {
+		t.Fatalf("expected 4 Ingress rules (the agent namespace, the broker to the audit-report store, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
+	}
+	if !reflect.DeepEqual(netpol.Spec.Ingress[1], auditReportStoreIngressRule(agent)) {
+		t.Errorf("expected the second Ingress rule to be the audit-report store's, got %v", netpol.Spec.Ingress[1])
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 2 {
 		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))

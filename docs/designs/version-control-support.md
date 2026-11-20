@@ -673,6 +673,24 @@ managed-repository check still applying. `CREDENTIAL_PROXY_MCP_CALLERS` binds
 the role to the MCP pod's own ServiceAccount.
 [`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) owns that caller.
 
+And it admits the `profile` role, an AgentProfile worker's pod, for every verb
+only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
+(`clone`, `proposal-view`, `proposal-list`, `proposal-commits`, `branch-view`,
+`identity`, `issue-list`, `issue-view`) and three writes, `publish`,
+`proposal-create` and `proposal-update`, which also need the credential's
+`vcs:proposal-create` permit. Each write is held to the install's own work: a
+`platform-agent/` branch named bare, no branch carrying somebody else's open
+proposal, a proposal opened by the install's login from its own branch in this
+repository, and no label edit. Its `issue-list` search fields may start no search
+qualifier of their own (plain words in `query`, no quote or backslash in a label name), and
+its `identity` with no repository answers the managed list's names (`{managedRepositories:
+[host/path, …]}`, the entries the managed check compares against, without their provider
+prefix), so a task that names no repository can find the one it may use.
+Within that, each write reaches only what the same task
+made (#6400): a branch it published while the name was free on the remote, and a
+proposal it opened. A later task can't continue an earlier task's branch or proposal
+(#6423). [`spec-subagent-profiles.md`](spec-subagent-profiles.md) owns that caller.
+
 ### No shallow clones
 
 There is no `depth`. This is a property of the transport rather than an
@@ -917,9 +935,10 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, labels, missing, baseBranch, fileUrl?}` |
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
 | `snapshot`                           | `{repository, ref?, paths?, maxBytes?}`                              | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
-| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
+| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision, decisionMemoryMarkdown?}`                               |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
 | `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
+| `proposal-practice-label`            | `{repository, number}`                                               | `{labelled, label, switch, reason, checks}`                                              |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
 | `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                             |
 | `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`                 |
@@ -928,6 +947,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                                      |
 | `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                                      |
 | `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                                            |
+| `proposal-reviews`                   | `{repository, number, limit?}`                                       | `{reviews, count, truncated}` (library callers only)                                     |
 | `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                                         |
 | `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                                |
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                                 |
@@ -962,18 +982,23 @@ labels serves `label-ensure`, and a forge without them does not: the two say one
 thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
-The rows down to `issue-create` except `snapshot` and `proposal-claim`, and the two branch rows, are the
-version-control skill's. `snapshot`, `proposal-claim` and `revision-contains` are the library verbs (`LIBRARY_VERBS` in
+The rows down to `issue-create` except `snapshot`, `proposal-claim` and `proposal-practice-label`, and the two branch rows, are the
+version-control skill's. `snapshot`, `proposal-claim`, `revision-contains`, `proposal-reviews` and `proposal-practice-label` are the library verbs (`LIBRARY_VERBS` in
 `providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
 (`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
 which presents the token from a proposal record line. `revision-contains` is for the
-post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. The rest are the union of
+post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. `proposal-reviews`, every submitted review with its state, is for the post-merge check too: a change request makes a merged fix not clean. `proposal-practice-label` is served to fleet-audit's
+`audit_report.py` after it opens a disruption-budget fix: the broker judges the proposal from its own reads
+and adds or removes the reserved `kube-agents:would-auto-merge` or `kube-agents:auto-merge` label
+([automation rules](../site/src/content/docs/reference/automation-rules.md) says when), and every other
+verb refuses those labels in a label field, or as `label-ensure`'s name, with 403 `RESERVED_LABEL` before it
+calls the forge. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
 than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
 requires. `issue-list`'s `query?` is free text each forge composes into
-its own search grammar, and its `excludeLabels?` is what a sweep that must skip
+its own search grammar (plain words only for the profile role, above), and its `excludeLabels?` is what a sweep that must skip
 its own claim marker asks with. `proposal-list` filters on the branches instead
 — `source?` and `target?` — because "is there already a proposal for this
 branch" is the question every write flow opens with. A comment carries `id` and
@@ -1012,7 +1037,10 @@ under the same name does not build on it and its publish is refused as
 `BRANCH_DIVERGED`. Every flow that derives a branch name from what it is fixing
 (one name per workload, so a repeat alert finds the earlier pull request) meets
 this on its second run. `branch-view` answers whether the remote holds the
-branch and at what revision; `branch-delete` removes a spent one. Both are broker
+branch and at what revision; `branch-delete` removes a spent one. A profile task has
+neither the delete nor a way to publish to a branch another task left on the remote (#6400), so a
+profile flow that derives its branch name meets the refusal, `PROPOSAL_NOT_THIS_TASKS`,
+not the reuse (#6423). Both are broker
 verbs — the question is `ls-remote` and the delete is a push, identical on every
 forge — but the delete's gate needs `proposal-list`, so a forge without it does
 not list `branch-delete` in `capabilities` and is refused `FORGE_UNSUPPORTED`. The skill spells them `remote-branch view|delete`,
@@ -1063,10 +1091,12 @@ whose name is not UTF-8 and so cannot be asked for; past 4096 entries it carries
 `maxBytes`, the bytes the caller unpacks at most, refuses a tree whose files pass it the same
 way, with the install's `ceiling`),
 400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal
-carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
+carries the `revision` it read), 403 `FORBIDDEN_LABEL` (`decision-override:*` labels are
+reserved for human reviewers), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
-`NOT_SPENT` and `DELETE_REFUSED`, 501 `LABELS_UNSUPPORTED`, 502 `GIT_FAILED`,
+`NOT_SPENT`, `DELETE_REFUSED`, `DECISION_MEMORY_BLOCKED` and `DECISION_MEMORY_CHECK_FAILED`,
+501 `LABELS_UNSUPPORTED`, 502 `GIT_FAILED`,
 `FORGE_TLS_UNTRUSTED`, `FORGE_IDENTITY_UNKNOWN` and `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
@@ -3407,6 +3437,13 @@ The MCP pod is the second caller, and its requests come from outside the
 cluster, through the pod. What bounds it is narrower than the `shell` role:
 `ROLE_VCS_VERBS` holds the `mcp` role to `proposal-view`, which writes nothing,
 and only on a repository the install manages.
+
+The profile worker is the third, and it runs model output. What bounds it is the
+task credential the dispatcher signed for its pod: no credential, no verb. The
+reads need nothing more. A write needs the `vcs:proposal-create` permit, which
+the dispatcher mints only for a request that asked for a change through a
+structured confirm, and even then it reaches only the branches and proposals its
+own task made (#6400), never their labels, on a repository the install manages.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it

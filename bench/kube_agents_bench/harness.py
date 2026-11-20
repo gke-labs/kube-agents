@@ -180,7 +180,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -467,6 +467,9 @@ _RUN_ID_HEX_WIDTH = 12
 # Set while a card-wake replay sends its turns, so they land on one
 # conversation: see KubeAgentsHarness._execute_card_wake.
 _PINNED_RUN_ID: ContextVar[str | None] = ContextVar("pinned_run_id", default=None)
+# Set while a fresh-session answer opens its own conversation, so its eval run
+# tag keeps the repetition's run id: see KubeAgentsHarness._execute_fresh_answer.
+_PINNED_EVAL_RUN_ID: ContextVar[str | None] = ContextVar("pinned_eval_run_id", default=None)
 # How long one injected task may run before the harness reads the record and
 # classifies it. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
 # there, with AGENT_DELEGATION_TIMEOUT covering the work across status turns;
@@ -554,6 +557,23 @@ _TIMING_DECIMALS = 3
 # Where the delivered reply's shape goes (chat_shape.measure), for the eval
 # dashboard. hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
 _SHAPE_FILE_ENV = "KUBE_AGENTS_SHAPE_FILE"
+# Where the invocation's eval run tag goes, ``{"eval_run": "<run>/<case>/<rep>",
+# "run_id", "case_id", "repetition"}``, so a retried repetition's attempt is
+# told apart from the first by its run id. hack/ci-eval-pr.sh sets it per
+# repetition and copies it beside results.json; unset, nothing is written.
+_EVAL_RUN_FILE_ENV = "KUBE_AGENTS_EVAL_RUN_FILE"
+_EVAL_RUN_KEY = "eval_run"
+_EVAL_RUN_ID_KEY = "run_id"
+_EVAL_RUN_CASE_KEY = "case_id"
+_EVAL_RUN_REPETITION_KEY = "repetition"
+# The api transport sends the tag on each turn. The agent records it for the
+# turn's session and, while the install has KUBEAGENTS_EVAL_RUN_TAGS on, stamps
+# it on every model request the work makes (deploy/docker/patches/eval_run_tag.py),
+# where the replay proxy logs it. Off, the agent ignores it. Nothing the model
+# reads carries it. On the inject transport the bridge sends the same tag from
+# the conversation key (a2a/hermes-bridge/api.go).
+_EVAL_RUN_HEADER = "X-Kube-Agents-Eval-Run"
+_EVAL_RUN_SEPARATOR = "/"
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -2602,6 +2622,36 @@ def _write_chat_shape(result: AgentResult) -> None:
         _write_sidecar(_SHAPE_FILE_ENV, shape, "reply shape")
 
 
+def _eval_run_identity(run_id: str) -> dict[str, str]:
+    """The tag ``<run>/<case>/<rep>`` for ``run_id``, with its parts.
+
+    The case and repetition are ``EVAL_CASE_ID`` and ``EVAL_REPETITION`` as the
+    presubmit exports them, ``adhoc`` and ``1`` outside it, as on the inject path.
+    """
+    case = os.environ.get(_EVAL_CASE_ID_ENV, "").strip() or _EVAL_CASE_FALLBACK
+    repetition = os.environ.get(_EVAL_REPETITION_ENV, "").strip() or _EVAL_REPETITION_FALLBACK
+    return _eval_run_record(run_id, case, repetition)
+
+
+def _eval_run_record(run_id: str, case: str, repetition: str) -> dict[str, str]:
+    """What ``KUBE_AGENTS_EVAL_RUN_FILE`` holds: the tag ``<run>/<case>/<rep>`` and its parts.
+
+    The one shape both transports write; the inject path's conversation key
+    is the same triple joined the same way.
+    """
+    return {
+        _EVAL_RUN_KEY: _EVAL_RUN_SEPARATOR.join((run_id, case, repetition)),
+        _EVAL_RUN_ID_KEY: run_id,
+        _EVAL_RUN_CASE_KEY: case,
+        _EVAL_RUN_REPETITION_KEY: repetition,
+    }
+
+
+def _write_eval_run(identity: dict[str, str]) -> None:
+    """Write the invocation's eval run tag to ``KUBE_AGENTS_EVAL_RUN_FILE``."""
+    _write_sidecar(_EVAL_RUN_FILE_ENV, identity, "eval run tag")
+
+
 def _write_sidecar(env: str, payload: dict[str, Any], what: str) -> None:
     """Write ``payload`` as JSON to the file ``env`` names, when it names one.
 
@@ -3063,6 +3113,45 @@ def _skip_report_only_judges() -> None:
     )
 
 
+def _cancel_report_entry(task: dict[str, Any], statuses: dict[str, str]) -> dict[str, Any]:
+    """:data:`stop_hook.CANCEL_REPORTED_ENTRY` for a canceled A2A door task
+    (#5528): ``completed`` when the task carries a card-stop result whose
+    stopped cards are exactly the cards the board showed archived after the
+    stop (``statuses``, as :meth:`KubeAgentsHarness._stop_after_first_card`
+    read them, before the harness archived any leftover), less any the
+    result calls already settled, and whose text opens
+    :data:`stop_hook.CANCEL_REPORT_PREFIX`. ``error`` with the reason
+    otherwise; a canceled task with no card-stop result at all is the first.
+
+    Strict on purpose: a card the stop reported still pending whose archive
+    lands inside the window fails it, since the caller was told the card may
+    run on. A card the result calls failed and that never archived is
+    ``harness_cards_stopped``'s miss as well."""
+    archived = {t for t, s in statuses.items() if s == stop_hook.STOPPED_STATUS}
+    found = a2a_door.card_stop_result(task)
+    if found is None:
+        why = "the canceled task carries no card-stop result"
+        return {"name": stop_hook.CANCEL_REPORTED_ENTRY, "args": {"archived": sorted(archived)}, "status": "error", "result": why}
+    text, card_stop = found
+    problems = []
+    listed = card_stop.get("stopped") or []
+    if not all(isinstance(c, dict) and isinstance(c.get("id"), str) for c in listed):
+        problems.append("its stopped list holds an entry that is not a card with a string id")
+    stopped = sorted(c["id"] for c in listed if isinstance(c, dict) and isinstance(c.get("id"), str))
+    settled = {c["id"] for c in card_stop.get("settled") or [] if isinstance(c, dict) and isinstance(c.get("id"), str)}
+    archived = sorted(archived - settled)
+    if not text.startswith(stop_hook.CANCEL_REPORT_PREFIX):
+        problems.append(f"its text does not open {stop_hook.CANCEL_REPORT_PREFIX.strip()!r}")
+    if stopped != archived:
+        problems.append(f"it names stopped card(s) {stopped}, the board shows archived {archived}")
+    return {
+        "name": stop_hook.CANCEL_REPORTED_ENTRY,
+        "args": {"archived": archived, "stopped": stopped},
+        "status": "error" if problems else "completed",
+        "result": "; ".join(problems) if problems else text,
+    }
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -3167,6 +3256,10 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if profile_hook.is_profile_ask(prompt):
+            return AgentResult.errored(
+                f"{profile_hook.PROFILE_DIRECTIVE} ...] needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
         if transport == TRANSPORT_SLACK:
             return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
@@ -3248,6 +3341,7 @@ class KubeAgentsHarness(AgentHarness):
             raise _TransportError(f"A2A door {what}: {last}")
 
         run_id, case_id, repetition = _inject_identity()
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
         message_id = inject.message_id(run_id, case_id, repetition)
         # A fixed context, so a retried send (the first reply lost after the
         # door took it) is the same message on the same context, which the
@@ -3406,6 +3500,8 @@ class KubeAgentsHarness(AgentHarness):
 
             card_wait = stop_hook.Stop(prompt=stop.prompt, observe_seconds=stop.observe_seconds)
             self._stop_after_first_card(result, session, card_wait, send_stop=_send_stop, poll_interval=poll_interval)
+            if cancel[0] and final_state == a2a_door.STATE_CANCELED:
+                result.trajectory.append(_cancel_report_entry(final, result.metadata.get("stop_card_statuses") or {}))
         except _TransportError as exc:
             return _abandon(str(exc))
         return result
@@ -3477,7 +3573,10 @@ class KubeAgentsHarness(AgentHarness):
         # 127.0.0.1 rather than localhost, matching _port_open's probe host: a
         # v4/v6 mismatch would make the probe and the request disagree.
         url = f"http://127.0.0.1:{local_port}{api_path}"
-        headers = {"Content-Type": "application/json"}
+        run_id = _run_id()
+        eval_run = _eval_run_identity(_PINNED_EVAL_RUN_ID.get() or run_id)
+        _write_eval_run(eval_run)
+        headers = {"Content-Type": "application/json", _EVAL_RUN_HEADER: eval_run[_EVAL_RUN_KEY]}
         token = os.environ.get("PLATFORM_AGENT_TOKEN")
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -3486,7 +3585,7 @@ class KubeAgentsHarness(AgentHarness):
             # The endpoint is stateful and replays the whole conversation's tool
             # calls, so a shared id would make each task inherit the previous
             # task's trajectory and corrupt trajectory scoring.
-            "conversation": _run_id(),
+            "conversation": run_id,
             "input": prompt,
         }
 
@@ -3809,11 +3908,14 @@ class KubeAgentsHarness(AgentHarness):
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
             return AgentResult.errored(str(exc))
+        # A new conversation, but the same repetition: the tag keeps the wake's run id.
+        tag = _PINNED_EVAL_RUN_ID.set(_run_id())
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
             return self._execute_api(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
+            _PINNED_EVAL_RUN_ID.reset(tag)
 
     def _execute_inject(self, prompt: str, *, follow_up: _InjectFollowUp | None = None) -> AgentResult:
         """The inject transport: send the prompt through the gateway's front door.
@@ -3876,6 +3978,11 @@ class KubeAgentsHarness(AgentHarness):
             poll_interval = _numeric_env(
                 "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
             )
+            # Read first. No other directive may follow it (profile_hook), so
+            # the stop and pushed-report reads below find nothing behind one.
+            target = None if follow_up else profile_hook.parse(prompt)
+            if target is not None:
+                prompt = target.prompt
             stop = None if follow_up else stop_hook.parse(prompt)
             pushed = None if follow_up else pushed_report.parse(prompt)
         except ValueError as exc:
@@ -3912,6 +4019,8 @@ class KubeAgentsHarness(AgentHarness):
         # the door dedupe a retried POST on it.
         conversation = inject.conversation_key(run_id, case_id, repetition)
         message_id = inject.message_id(run_id, case_id, repetition)
+        # The same triple the bridge sends as the tag (a2a/hermes-bridge/api.go).
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
         if follow_up is not None:
             conversation, message_id = follow_up.conversation, message_id + follow_up.suffix
         identity: dict[str, Any] = {
@@ -4200,6 +4309,9 @@ class KubeAgentsHarness(AgentHarness):
                 return "cancelled"
             return "no cancel was published (see the log), so it may still be running"
 
+        # The profile fields go only on a turn addressed to a profile, so every
+        # other turn is built exactly as it was before #5945.
+        addressed = {"profile": target.name, "parameters": target.parameters} if target is not None else {}
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
@@ -4207,6 +4319,7 @@ class KubeAgentsHarness(AgentHarness):
             token=token,
             author=author,
             message_id=message_id,
+            **addressed,
         )
 
         # A stopped ask waits on nothing it filed: the stop is the point. Sent

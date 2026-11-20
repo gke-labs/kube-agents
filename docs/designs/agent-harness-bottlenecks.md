@@ -34,6 +34,9 @@ Model responses vary from run to run, and a provider 429 can look like a harness
 
 ## Metrics
 
+These metrics are per container and per install. [`capability-usage-attribution.md`](capability-usage-attribution.md)
+designs the split of memory and model tokens by capability.
+
 Each metric has a threshold. The breaking point of a metric is the stress level where it reaches its threshold. The last column says whether the Phase 1 runner records the metric. Phases 2 and 3 add each container's requests and the CPU it used over each window (`cpu_seconds`), the commands the credential proxy ran and their run time, and the proxy load's commands per second and their times (`bench/scale/README.md` lists every metric).
 
 | Metric                                                                                                                                                                                                                                                                        | Source                                                                                                                                                                                                                             | Threshold                                                                                     | Phase 1                                                               |
@@ -166,11 +169,14 @@ Each operation runs against the factors that load it, not against every factor. 
 ## Open questions
 
 1. **Fleet size has more than one dimension.** Memory depends on total watched objects (clusters × objects per cluster), but single-factor experiments vary each factor alone. Plot memory against total watched objects so the two experiments fall on one axis, and confirm with one combined point (for example 8 clusters × 4,000 objects). Phase 2 measured that point: for memory the single-factor lines add up within about 15%, the agent's peak the furthest above the sum at 1.15 times; the shell's CPU was 2.1 times the sum (Phase 2 and Phase 3 results).
-2. **Which mode.** `spec.mode: today` and `spec.mode: next` load the harness differently (session pods, the A2A bus, kanban dispatch). The results hold only for the mode measured; each record carries it.
+2. **Which stack.** Each record carries a `mode` key, `next` on every record taken since the A2A stack became the only one; a record keyed `today`, from when `spec.mode: today` loaded the harness without session pods, the bus or kanban dispatch, holds only for that stack.
 
 # Phases
 
 Phase 1 ran from 2026-10-22 to 2026-10-24; its results are under Phase 1 results below. Phase 2, from 2026-10-26 to 2026-10-27, measured the points the Phase 1 data pointed at. Phase 3, from 2026-10-27 to 2026-10-28, measured the cluster levels again in 30-minute windows.
+
+The phases are one-off runs. [`sized-test-fleet.md`](sized-test-fleet.md) designs the recurring
+form: fixed S, M and L fleets on real nodes, M measured six nights a week and L once.
 
 ## Phase 1: two data points per factor
 

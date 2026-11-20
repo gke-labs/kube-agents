@@ -48,6 +48,10 @@
 #      decided at the last apply, a profile other than the one that apply
 #      recorded (two root outputs), since a kept profile names none and a
 #      changed one names nothing about an attribute an explicit line set.
+#      The gVisor pool can also be dropped outright: a run whose
+#      enable_gvisor_node_pool comes out false plans its destruction.
+#      `guard_gvisor_pool_teardown` refuses that unless
+#      KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true says it is meant.
 #   7. A state left by an interrupted install can hold the cluster's CMEK
 #      entries next to a create_cluster that the retry computes as false, and
 #      the module then plans their destruction. `forget_unmanaged_cluster_kms`
@@ -255,7 +259,11 @@ APPLY_OUTPUT_FILE=""
 # had landed -- and exits 1 like any failed apply. run_apply reads this line
 # as the operator's decision and retries nothing after it.
 readonly TERRAFORM_INTERRUPT_PATTERN='^(Interrupt received|Two interrupts received)'
-readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
+# The release has a count (install_helm_releases). A state from before it holds
+# the unindexed address until the next apply runs the moved block in main.tf,
+# and the guards below run before that apply, so they look for both.
+readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents[0]"
+readonly HELM_RELEASE_LEGACY_ADDRESS="helm_release.kube_agents"
 readonly CERT_MANAGER_RELEASE_ADDRESS="helm_release.cert_manager[0]"
 # The releases' own `timeout = 600` in main.tf, for the uninstall that runs ahead of terraform destroy.
 readonly HELM_UNINSTALL_TIMEOUT="10m"
@@ -267,7 +275,7 @@ readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
 # declared. tf_recorded_output reads it as "not recorded"; a state with no
 # output at all exits 0 and prints nothing, which reads the same way.
 readonly OUTPUT_NOT_RECORDED_PATTERN='Output "[^"]*" not found|could not be found in the state'
-# The drift-pubsub module's three resources. Unlike the stockout trio they are
+# The drift-pubsub module's three resources. Like the stockout trio, these are
 # NOT adopted -- guard_drift_adoption refuses an apply that would import them,
 # and says there why. Their names are read from the composition's
 # drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink
@@ -276,9 +284,9 @@ readonly OUTPUT_NOT_RECORDED_PATTERN='Output "[^"]*" not found|could not be foun
 readonly DRIFT_TOPIC_ADDRESS="module.drift_pubsub[0].google_pubsub_topic.drift_audit"
 readonly DRIFT_SUBSCRIPTION_ADDRESS="module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
 readonly DRIFT_SINK_ADDRESS="module.drift_pubsub[0].google_logging_project_sink.drift_audit"
-# The stockout trio, the other three adopt_kms imports. It is declared at the
-# composition's top level rather than in a module, so its addresses carry no
-# module prefix.
+# The stockout trio. Like the drift trio, these are NOT adopted --
+# guard_stockout_adoption refuses an apply that would import them, and says
+# there why.
 readonly STOCKOUT_TOPIC_ADDRESS="google_pubsub_topic.stockout_alerts[0]"
 readonly STOCKOUT_SUBSCRIPTION_ADDRESS="google_pubsub_subscription.stockout_alerts[0]"
 readonly STOCKOUT_SINK_ADDRESS="google_logging_project_sink.stockout_alerts[0]"
@@ -297,7 +305,7 @@ readonly GUARDED_SUBSCRIPTIONS=(
   "enable_stockout_investigator|$STOCKOUT_SUBSCRIPTION_ADDRESS|stockout_pubsub_subscription|stockout_pubsub_topic|unacknowledged stockout alerts||"
 )
 
-# The drift trio guard_drift_adoption checks, as
+# The drift and stockout trios their adoption guards check, as
 # "<state address>|<name variable>|<gcloud group>|<what to call it>". The
 # gcloud group is the whole command noun, so `gcloud $group describe <name>`
 # and `gcloud $group delete <name>` are both it plus a verb -- the three
@@ -306,6 +314,11 @@ readonly DRIFT_ADOPTION_TARGETS=(
   "$DRIFT_TOPIC_ADDRESS|drift_pubsub_topic|pubsub topics|Pub/Sub topic"
   "$DRIFT_SUBSCRIPTION_ADDRESS|drift_pubsub_subscription|pubsub subscriptions|Pub/Sub subscription"
   "$DRIFT_SINK_ADDRESS|drift_pubsub_sink|logging sinks|Log Router sink"
+)
+readonly STOCKOUT_ADOPTION_TARGETS=(
+  "$STOCKOUT_TOPIC_ADDRESS|stockout_pubsub_topic|pubsub topics|Pub/Sub topic"
+  "$STOCKOUT_SUBSCRIPTION_ADDRESS|stockout_pubsub_subscription|pubsub subscriptions|Pub/Sub subscription"
+  "$STOCKOUT_SINK_ADDRESS|stockout_pubsub_sink|logging sinks|Log Router sink"
 )
 # The `terraform import` id for each of them, printed in the guard's recovery
 # advice. All three take projects/<project>/<collection>/<name>, and the
@@ -674,12 +687,6 @@ adoption_target_exists() { # <kind> <id>
     key)          gcloud kms keys describe "${id##*/}" --location "$location" \
                     --keyring "$(echo "$id" | sed -E 's|.*/keyRings/([^/]+)/.*|\1|')" \
                     --project "$project" >/dev/null 2>&1 ;;
-    pubsub_topic) gcloud pubsub topics describe "${id##*/}" \
-                    --project "$project" >/dev/null 2>&1 ;;
-    pubsub_sub)   gcloud pubsub subscriptions describe "${id##*/}" \
-                    --project "$project" >/dev/null 2>&1 ;;
-    logging_sink) gcloud logging sinks describe "${id##*/}" \
-                    --project "$project" >/dev/null 2>&1 ;;
     *)            return 1 ;;
   esac
 }
@@ -789,24 +796,11 @@ adopt_kms() {
     )
   fi
 
-  if [[ "$(tfvar enable_stockout_investigator)" == "true" ]]; then
-    # Each of the three variables has a default in variables.tf, and tfvar
-    # exits rather than returning empty, so no fallback is spelled here.
-    local stockout_topic stockout_sub stockout_sink
-    stockout_topic=$(tfvar stockout_pubsub_topic)
-    stockout_sub=$(tfvar stockout_pubsub_subscription)
-    stockout_sink=$(tfvar stockout_pubsub_sink)
-    targets+=(
-      "$STOCKOUT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$stockout_topic"
-      "$STOCKOUT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
-      "$STOCKOUT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$stockout_sink"
-    )
-  fi
-
-  # The drift trio is deliberately absent. It has the same one-name-per-project
-  # shape as the stockout trio and was adopted the same way until the detector
-  # became an install default, which made every second install in a project
-  # reach this block; guard_drift_adoption refuses those instead, and says why.
+  # Both the drift trio and the stockout trio are deliberately absent here.
+  # Both take one fixed name per project while Terraform state is per cluster,
+  # so adopting by name could take over another live install's trio and split
+  # events between installs. guard_drift_adoption and guard_stockout_adoption
+  # refuse those instead, and say why.
 
   # Skipping both halves — cluster KMS (create_cluster or database encryption
   # off) and the minter — leaves targets empty, and macOS's bash 3.2 treats an
@@ -833,9 +827,6 @@ adopt_kms() {
       # which is where a taint would also end, by the worse route. gcloud is
       # not asked first: in the same window its describe can draw the same
       # 403, and "does not exist" from it would let the replacement run.
-      # The stockout trio in the same list is deletable, and `terraform
-      # taint` is how an operator asks for one of those to be rebuilt, so
-      # only the two kinds GCP cannot delete are untainted.
       if [[ "$kind" == "keyring" || "$kind" == "key" ]]; then
         [[ "$tainted_read" == "true" ]] || { load_tainted; tainted_read=true; }
       fi
@@ -1017,8 +1008,14 @@ guard_cluster_ownership() {
 # does not serve. Same shape as guard_gsa_identity, for the same reason.
 guard_release_namespace() {
   load_state
-  local addr="$HELM_RELEASE_ADDRESS"
-  in_state "$addr" || return 0
+  local addr
+  if in_state "$HELM_RELEASE_ADDRESS"; then
+    addr="$HELM_RELEASE_ADDRESS"
+  elif in_state "$HELM_RELEASE_LEGACY_ADDRESS"; then
+    addr="$HELM_RELEASE_LEGACY_ADDRESS"
+  else
+    return 0
+  fi
 
   local recorded
   recorded=$(state_attr "$addr" namespace)
@@ -1154,6 +1151,38 @@ guard_node_pool_shape() {
       exit 1
     done
   done
+}
+
+# The gVisor pool is the one node pool an apply can drop on its own: its
+# count is enable_gvisor_node_pool, and a run that renders that false plans the
+# pool's destruction under -auto-approve, taking the sandboxed agent's nodes
+# with it. The installer renders false whenever ENABLE_GVISOR reads false, and
+# for a long time an install.env with no ENABLE_GVISOR read false on upgrade
+# while install.sh had defaulted the pool on, so every Standard upgrade from
+# such a file planned the destroy. resolve_existing_install_gvisor now reads the
+# live pool instead; this guard is the second line, for any other way the flag
+# comes out false (a hand-edited install.env, a pool the listing could not
+# see). Turning the sandbox off on purpose is a deliberate act and says so:
+# KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true, which upgrade.sh sets for
+# --allow-node-pool-destroy and install.sh for an explicit
+# --enable-gvisor=false or "No" at its interview's gVisor prompt. Same shape
+# as guard_standard_node_count.
+guard_gvisor_pool_teardown() {
+  load_state
+  in_state "$GVISOR_POOL_ADDRESS" || return 0
+  local enabled
+  enabled=$(tfvar enable_gvisor_node_pool)
+  [[ "$enabled" == "true" ]] && return 0
+  if [[ "${KUBEAGENTS_ALLOW_NODE_POOL_DESTROY:-}" == "true" ]]; then
+    warn "enable_gvisor_node_pool is '$enabled' and the gVisor pool is in state ($GVISOR_POOL_ADDRESS): this apply destroys it, as KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true confirms."
+    return 0
+  fi
+  warn "enable_gvisor_node_pool resolved to '$enabled', but this state's cluster runs the gVisor pool ($GVISOR_POOL_ADDRESS)."
+  warn "Applying now would DESTROY that pool under -auto-approve, and the agent pod, which runs on it, with nowhere sandboxed to go."
+  warn "To keep it, set ENABLE_GVISOR=\"true\" in install.env (or enable_gvisor_node_pool = true in terraform.tfvars for a hand-driven apply)."
+  warn "To turn the sandbox off on purpose, re-run with --allow-node-pool-destroy (upgrade.sh), --enable-gvisor=false or \"No\" at the gVisor prompt (install.sh),"
+  warn "or KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true for a hand-driven apply."
+  exit 1
 }
 
 # account_id on google_service_account.agent is ForceNew, and the resource
@@ -1319,13 +1348,23 @@ guard_pubsub_subscription() {
 # A describe that fails for any reason other than absence -- no permission to
 # read Pub/Sub or Logging, say -- counts as absent here and lets the apply
 # report it, which is no worse than the 409 this replaced.
-guard_drift_adoption() {
+# Shared guard refusing an apply whose Pub/Sub topic, subscription, or Log
+# Router sink already exists in the project outside this install's Terraform
+# state. Prints all four recovery paths (per-install TF_VAR_* names, terraform
+# import when this install's state went missing, gcloud delete for leftovers, or
+# disabling the feature in install.env).
+_guard_pubsub_trio_adoption() {
+  local flag_var="$1" topic_var="$2" sub_var="$3" sink_var="$4"
+  local env_disable_line="$5" feature_noun="$6" record_noun="$7" feature_short="$8"
+  local include_source_sink_note="$9"
+  shift 9
+
   # Assigned rather than compared inline, for the reason
   # guard_pubsub_subscription gives: tfvar's `exit 1` kills only the
   # substitution's subshell, so a console that cannot answer would otherwise
   # read as "not enabled" and skip the guard.
   local enabled
-  enabled=$(tfvar enable_drift_pubsub)
+  enabled=$(tfvar "$flag_var")
   [[ "$enabled" == "true" ]] || return 0
 
   load_state
@@ -1334,7 +1373,7 @@ guard_drift_adoption() {
 
   local entry addr variable group noun name
   local -a foreign=()
-  for entry in "${DRIFT_ADOPTION_TARGETS[@]}"; do
+  for entry in "$@"; do
     IFS='|' read -r addr variable group noun <<<"$entry"
     if in_state "$addr"; then
       continue
@@ -1358,11 +1397,11 @@ guard_drift_adoption() {
     warn "$noun '$name' already exists in project '$project' and is not managed by this install's Terraform state."
   done
   warn "Applying would stop on a 409 creating them. Importing them FOR you is not the way out: an import this script runs cannot tell a trio an earlier install left behind from one another live install owns."
-  warn "Taking over another install's trio splits the project's audit records between the two detectors and deletes all three on this install's teardown, neither of which is reported on that side."
+  warn "Taking over another install's trio splits the project's ${record_noun} between the two ${feature_noun} and deletes all three on this install's teardown, neither of which is reported on that side."
   warn "If another kube-agents install in this project owns them, give this install its own three names. Through the front doors they are passthrough lines in install.env, which every front door sources with 'set -a':"
-  warn "  TF_VAR_drift_pubsub_topic=\"<a-different-name>\""
-  warn "  TF_VAR_drift_pubsub_subscription=\"<a-different-name>\""
-  warn "  TF_VAR_drift_pubsub_sink=\"<a-different-name>\""
+  warn "  TF_VAR_${topic_var}=\"<a-different-name>\""
+  warn "  TF_VAR_${sub_var}=\"<a-different-name>\""
+  warn "  TF_VAR_${sink_var}=\"<a-different-name>\""
   warn "A hand-driven apply sets the three in terraform.tfvars instead."
   warn "If they are THIS install's own and the state is what went missing -- a repointed KUBE_AGENTS_STATE_BUCKET, a 'terraform state rm', a lost local state -- import them back rather than deleting them. You are the one asserting the ownership the script cannot establish, so confirm no other install reads them first:"
   for line in ${foreign[@]+"${foreign[@]}"}; do
@@ -1375,12 +1414,42 @@ guard_drift_adoption() {
     IFS='|' read -r addr group noun name <<<"$line"
     warn "  gcloud $group delete $name --project $project"
   done
-  local sink_name
-  sink_name=$(tfvar drift_pubsub_sink)
-  warn "An install with a declared scope also owns a sink named '${sink_name}-${project}' in each project the scope lists, which this guard does not look for. Import or delete those the same way before applying, or the apply stops on a 409 in that project:"
-  warn "  terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' projects/<listed project>/sinks/${sink_name}-${project}"
-  warn "Or leave the detector off for this install: ENABLE_DRIFT_DETECTOR=false in install.env."
+  if [[ "$include_source_sink_note" == "true" ]]; then
+    local sink_name
+    sink_name=$(tfvar "$sink_var")
+    warn "An install with a declared scope also owns a sink named '${sink_name}-${project}' in each project the scope lists, which this guard does not look for. Import or delete those the same way before applying, or the apply stops on a 409 in that project:"
+    warn "  terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' projects/<listed project>/sinks/${sink_name}-${project}"
+  fi
+  warn "Or leave the ${feature_short} off for this install: ${env_disable_line} in install.env."
   exit 1
+}
+
+guard_drift_adoption() {
+  _guard_pubsub_trio_adoption \
+    enable_drift_pubsub \
+    drift_pubsub_topic \
+    drift_pubsub_subscription \
+    drift_pubsub_sink \
+    "ENABLE_DRIFT_DETECTOR=false" \
+    "detectors" \
+    "audit records" \
+    "detector" \
+    "true" \
+    "${DRIFT_ADOPTION_TARGETS[@]}"
+}
+
+guard_stockout_adoption() {
+  _guard_pubsub_trio_adoption \
+    enable_stockout_investigator \
+    stockout_pubsub_topic \
+    stockout_pubsub_subscription \
+    stockout_pubsub_sink \
+    "ENABLE_STOCKOUT_INVESTIGATOR=false" \
+    "stockout investigators" \
+    "autoscaler scale-up alerts" \
+    "stockout investigator" \
+    "false" \
+    "${STOCKOUT_ADOPTION_TARGETS[@]}"
 }
 
 # `name` is ForceNew on google_kms_key_ring and google_kms_crypto_key, neither
@@ -1754,7 +1823,7 @@ uninstall_helm_releases() {
   for addr in "${CLUSTER_ADDRESSES[@]}"; do
     in_state "$addr" && return 0
   done
-  for addr in "$HELM_RELEASE_ADDRESS" "$CERT_MANAGER_RELEASE_ADDRESS"; do
+  for addr in "$HELM_RELEASE_ADDRESS" "$HELM_RELEASE_LEGACY_ADDRESS" "$CERT_MANAGER_RELEASE_ADDRESS"; do
     in_state "$addr" && addresses+=("$addr")
   done
   [[ ${#addresses[@]} -gt 0 ]] || return 0
@@ -2032,8 +2101,10 @@ case "${1:-}" in
     guard_release_namespace
     guard_standard_node_count
     guard_node_pool_shape
+    guard_gvisor_pool_teardown
     guard_pubsub_subscription
     guard_drift_adoption
+    guard_stockout_adoption
     forget_unmanaged_cluster_kms
     guard_minter_key
     log "checking pre-existing GCP resources to adopt (KMS, Pub/Sub)..."
@@ -2096,7 +2167,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,104p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,108p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

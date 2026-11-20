@@ -97,7 +97,7 @@ The module needs Go 1.27; an older `go` command fetches the right toolchain by i
 kube-agents-mcp --version
 ```
 
-It prints `kube-agents` and the bridge's version. Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
+It prints `kube-agents-mcp` and a version: the release for a binary from a release archive, or for a build from source the module version Go recorded (a pseudo-version for `@main`; `dev` when it recorded none). Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
 
 ## Configure Antigravity
 
@@ -156,6 +156,8 @@ Use the kube-agents send_message tool to ask: Which GKE clusters do you manage, 
 
 The answer names the conversation and its token, quotes any gateway notices, and gives the turn's task and its answer. If the turn filed cards, the reports they posted while the call waited follow under **Card reports on this turn**. Each is quoted as the reporting agent's text. A later message on the same `conversation` continues it; the default conversation is `default`.
 
+To send the turn straight to an AgentProfile instead, name it in `addressee` and pass its task parameters in `parameters`, an object of string values. For the `cluster` profile, the parameters are `project`, `location` and `cluster`. `read_topics` with `action: cards` lists the profiles' agent cards. The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the answer.
+
 `wait_timeout_seconds` (default 150, at most 300) bounds the wait for the turn itself. When the wait ends first, the answer says the turn is still running and gives its task as `<addressee>/<task-id>`. Once the turn ends, the call keeps collecting card reports until none has arrived for 15 seconds or the wait runs out, whichever comes first, and returns at once when the turn handed no work to cards. A card that takes longer than that is not in the answer.
 
 **`task_control`** follows that task. `get` with `task_id` reads its state and answer, and `wait_timeout_seconds` waits for it to finish. `stop` stops a conversation's running task: pass `conversation`, or a `task_id` the bridge started in this session and is still running. A stop ends the turn; a card the turn already filed can still finish. If the host cancels a running `send_message` call, the bridge sends the stop for you.
@@ -163,6 +165,8 @@ The answer names the conversation and its token, quotes any gateway notices, and
 The other tools are `read_topics` (the install's standing topics and agent cards) and `manage_session` (named conversations and `/session` workers). There is also `discover_deployments`, which rescans your kubeconfig, and `connect_deployment`, which connects to a named install. `inspect_pr` fetches a pull request the agent filed and writes its diff to local files. The [MCP server reference](/kube-agents/reference/a2a-mcp/#the-tools) describes what each one does in the cluster.
 
 A question the install hands to a card, which is common for anything that reads a cluster, can come back first as a short acknowledgement such as "checking namespaces on the host cluster." The card's report arrives after `send_message` has returned. The answer ends with the `conversation_token` and `since` cursor to read it with: call `poll_events` with those two, and it returns the reports posted since that cursor. Set `wait_seconds` (60 at most) to have it wait for a report when none has arrived yet, and pass the cursor it returns on the next call. A `status` message on the same conversation lists the cards and whether each is done, but not what they found.
+
+To answer a report, send the next message with `reply_to` set to the task its heading gave as `on task`; the agent then reads that report before answering. That read happens on the [platform route](/kube-agents/concepts/chatops/#session), the install's default; a conversation on its own session pod does not read it yet.
 
 ## Troubleshooting
 

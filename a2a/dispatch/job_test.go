@@ -36,7 +36,7 @@ func newFakeJobs(readyAfter time.Duration) *fakeJobs {
 	return &fakeJobs{readyAfter: readyAfter, failed: map[string]bool{}, launchedAt: map[string]time.Time{}}
 }
 
-func (f *fakeJobs) Launch(_ context.Context, _, _, taskID string) (time.Time, error) {
+func (f *fakeJobs) Launch(_ context.Context, _, _, _, taskID string) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.launches = append(f.launches, taskID)
@@ -49,7 +49,7 @@ func (f *fakeJobs) Launch(_ context.Context, _, _, taskID string) (time.Time, er
 	return f.launchedAt[taskID], nil
 }
 
-func (f *fakeJobs) Pod(_ context.Context, _, _, taskID string) (string, bool, error) {
+func (f *fakeJobs) Pod(_ context.Context, _, _, _, taskID string) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.podErr != nil {
@@ -68,7 +68,7 @@ func (f *fakeJobs) Pod(_ context.Context, _, _, taskID string) (string, bool, er
 	return "job-" + taskID, false, nil
 }
 
-func (f *fakeJobs) Delete(_ context.Context, _, _, taskID string) error {
+func (f *fakeJobs) Delete(_ context.Context, _, _, _, taskID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, taskID)
@@ -402,7 +402,7 @@ func TestAnUnstartedTasksJobIsDeletedWhenItEndsAtAdmission(t *testing.T) {
 			b := newBus(t, "job-task-1")
 			b.ensure("inv", 1, 0, "unattended")
 			jobs := newFakeJobs(0)
-			if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // before the restart
+			if _, err := jobs.Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil { // before the restart
 				t.Fatal(err)
 			}
 			v := setup(b)
@@ -422,7 +422,7 @@ func TestAnUnstartedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
 	b := newBus(t, "job-task-1")
 	b.ensure("inv", 1, 0, "unattended")
 	jobs := newFakeJobs(0)
-	if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // an earlier pass, in Job mode
+	if _, err := jobs.Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil { // an earlier pass, in Job mode
 		t.Fatal(err)
 	}
 	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
@@ -468,7 +468,7 @@ func TestAnUnstartedTasksJobIsDeletedWhenItsProfileLeaves(t *testing.T) {
 			b := newBus(t, "job-task-1")
 			b.ensure("inv", 1, 0, "unattended")
 			jobs := newFakeJobs(0)
-			if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // an earlier pass
+			if _, err := jobs.Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil { // an earlier pass
 				t.Fatal(err)
 			}
 			ti := unattendedInstall(1, nil)
@@ -641,5 +641,89 @@ func TestAnUnreadableJobAtItsStartLimitKeepsTheTaskQueued(t *testing.T) {
 	}
 	if waiting == 0 {
 		t.Errorf("Health.Waiting %v: the task stays queued, so it shows as waiting", h.Waiting)
+	}
+}
+
+// A tier an administrator ends (#5850) while a task's Job is still coming
+// up ends the task canceled tier-ended at once, its Job deleted and its
+// submission tombstoned, with no breaker count: not failed no-worker when
+// the Job never gets a worker, which it wouldn't once the tier is torn down
+// (#6134).
+func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
+	b := newBus(t)
+	b.ensure("inv", 1, 0, "read", "unattended")
+	jobs := newFakeJobs(-1) // never ready
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) {
+		c.Profiles[0].Tiers = []string{"read", "unattended"}
+		c.Profiles[0].Durables = nil // derived from the tiers (#5649)
+		c.JobStartSeconds, c.BreakerThreshold = 60, 1
+	})
+	d, _ := b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the task's Job launched", func() bool { return jobs.launchCount() > 0 })
+	start := time.Now()
+	ti.update(func(c *lib.DispatchConfig) {
+		c.Profiles[0].Tiers = []string{"read"}
+		c.Profiles[0].Durables = nil // derived from the tiers and the drain (#5649)
+		c.Profiles[0].DrainingTiers = []lib.DrainingTier{{Tier: "unattended", Mode: "unattended", Until: time.Now().Add(2 * time.Minute), Ending: true}}
+	})
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonTierEnded) {
+		t.Fatalf("terminal %+v, want canceled %s", ts, ReasonTierEnded)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("ended %s after the tier was ended; want it within a refresh or two, not the Job's start window", took)
+	}
+	if !jobs.deleted("task-1") {
+		t.Error("the starting Job was not deleted")
+	}
+	waitFor(t, 5*time.Second, "the tombstone", func() bool {
+		_, ok := b.tombstones()[lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")]
+		return ok
+	})
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("breakers %v open; an administrator's end is no worker loss", open)
+	}
+}
+
+// A script-run task's confirm carries the script its trigger names, as the
+// profile's spec.scripts lists it in the config the dispatcher admitted the
+// task on (#5622): the worker takes the path from here, never from the task.
+// A model task's confirm carries none.
+func TestAScriptTasksConfirmCarriesTheProfilesScript(t *testing.T) {
+	b := newBus(t, "job-task-1", "job-task-2")
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "job-task-1", answerAccept, 200*time.Millisecond)
+	w2 := b.worker("inv", "unattended", "job-task-2", answerAccept, 200*time.Millisecond)
+	want := lib.DispatchScript{Name: "stall-watch", Path: lib.ScriptRoot + "stall_watch.py", TimeoutSeconds: 30}
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].Scripts = []lib.DispatchScript{want} })
+	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, newFakeJobs(100*time.Millisecond))
+
+	env := triggeredEnv(t, "inv", "task-1", "cap-ok", `{"name":"schedule/stall-watch","origin":"builtin","script":"stall-watch"}`, map[string]string{})
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject("inv", "unattended", lib.SubmitKindTop, "task-1"), env); err != nil {
+		t.Fatal(err)
+	}
+	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v, want completed", ts)
+	}
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-2")
+	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("model task terminal %+v, want completed", ts)
+	}
+
+	scripts := map[string]*lib.DispatchScript{}
+	for _, wk := range []*fakeWorker{w, w2} {
+		wk.mu.Lock()
+		for _, m := range wk.confirms {
+			scripts[m.TaskID] = m.Script
+		}
+		wk.mu.Unlock()
+	}
+	if got := scripts["task-1"]; got == nil || *got != want {
+		t.Errorf("the script task's confirm carried script %+v; want %+v", got, want)
+	}
+	if got, ok := scripts["task-2"]; !ok || got != nil {
+		t.Errorf("the model task's confirm (seen %v) carried script %+v; want none", ok, got)
 	}
 }

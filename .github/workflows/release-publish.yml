@@ -249,7 +249,7 @@ jobs:
 
       - name: Set up Helm
         if: steps.verify-eligibility.outputs.skip_release != 'true'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.2.3
 
@@ -267,7 +267,7 @@ jobs:
         with:
           syft-version: "v1.51.1"
 
-      # The bundle step builds the k8s-api-proxy release binaries
+      # The bundle step builds the k8s-api-proxy and kube-agents-mcp release binaries
       # (build_release_binaries.sh) with the toolchain main's go.mod pins; the
       # build runs with GOTOOLCHAIN=local, so a release commit needing a newer
       # one fails rather than downloads it. No cache: a release build restores

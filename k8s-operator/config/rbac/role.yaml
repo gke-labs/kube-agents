@@ -111,6 +111,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins
+      - agentschedules
       - tiers
     verbs:
       - get
@@ -136,6 +137,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentprofiles/status
+      - agentschedules/status
     verbs:
       - get
       - update

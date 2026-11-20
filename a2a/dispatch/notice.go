@@ -26,6 +26,14 @@ const (
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
 	ReasonStopped           = "stopped"
+	// ReasonChangeNeedsJob refuses a task whose confirmed change would put
+	// a write permit on its credential while its tier has no Job runner: a
+	// permit-carrying task runs in its own one-pod Job, never on a pool pod.
+	ReasonChangeNeedsJob = "change-needs-job"
+	// ReasonTierEnded ends a task whose tier an administrator ended the
+	// drain of (lib.DrainingTier.Ending, #5850), held or with its Job still
+	// starting (#6134): canceled, not failed.
+	ReasonTierEnded = "tier-ended"
 	// The re-check of a child whose parent is an AgentProfile task (#5686):
 	// the gateway checks the same at mint, and the dispatcher holds a child
 	// an older gateway sent, or one that breaks either rule, to them.
@@ -38,6 +46,9 @@ const (
 	// ReasonOutsideParentScope: the child's target lies outside its parent's
 	// scope.
 	ReasonOutsideParentScope = "outside-parent-scope"
+	// ReasonScriptNotAllowed: the submission's trigger names a script its
+	// profile's spec.scripts doesn't list (#5622).
+	ReasonScriptNotAllowed = "script-not-allowed"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.
@@ -86,8 +97,10 @@ func terminalEnvelopeID(hk holdKey) string {
 }
 
 // publishTerminal is the dispatcher's one write to a task: a final status
-// update on its `.supervisor` subject (lib.TaskSupervisorSubject, contract
-// addendum 6), `rejected` for a submission refused at admission (nothing
+// update on its `.supervisor` subject, the five-token
+// lib.TaskSupervisorSubject or the six-token lib.ProfileSupervisorSubject as
+// the dispatch config says (DispatchConfig.SupervisorSubjectFor; contract
+// addendum 6, #5301), `rejected` for a submission refused at admission (nothing
 // ran) or `failed` once a worker had it. `.supervisor`, not `.events`, so
 // `.events` stays the executor's alone and replay can tell the two apart.
 // Every terminal the dispatcher writes goes through here.
@@ -111,5 +124,8 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.busFor(hk.profile).Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
+	// The five- or six-token form, as the operator's config says (#5301):
+	// readers watch both, and the operator moves the dispatcher to the
+	// six-token one only once every reader that can run does.
+	return d.busFor(hk.profile).Publish(ctx, d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID), env)
 }

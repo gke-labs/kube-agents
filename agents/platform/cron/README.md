@@ -439,13 +439,65 @@ is reported like any other grant, and repeated daily like one.
 The `topology-drift` skill reads a `leeway report` on request and attributes
 the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
 "chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
---parallelism 2 --clusters <project>/<location>/<cluster>,…` in `agent-sandbox`
-across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
+--parallelism 2 --timeout <n>s --clusters <project>/<location>/<cluster>,…` in
+`agent-sandbox` across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
 `LEEWAY_WATCH_PROJECTS` or the management project plus every project a Cluster
 Agent profile's identity names; a project with no Cluster Agent profiles is
 enumerated with `gcloud container clusters list` first, since the sandbox
 relays that and not the GKE API route leeway's own `--clusters-from <project>`
 would take) and gates notifications through `<profile home>/leeway/ledger.json`.
+`--timeout` is leeway's per-cluster deadline: each call's sandbox timeout (15
+minutes, less when the tick budget is nearly spent), less 90 seconds for
+start-up and report assembly, split across the call's waves of two clusters,
+at most five minutes so one stuck cluster can't spend the tick, and never below
+leeway's own one-minute default. A project's clusters (or
+`LEEWAY_WATCH_CLUSTERS`) are read in calls of at most 12 clusters, sized so
+each cluster gets at least two minutes, about twice the slowest read measured.
+A call started late in the 45-minute tick holds only the waves of two that fit
+at that read time, and no call starts with less than one wave's worth left;
+the clusters after that point wait for a later run. A call that fails costs
+only its own clusters. Every cluster in a call is stamped in the ledger
+(`cluster_runs`) however the call ended; the least recently stamped go first,
+and clusters stamped together are shuffled by the run's date so batch
+membership changes from run to run. Projects go least recently swept first
+(`project_runs`): a project whose turn starts with a full 15 minutes is
+stamped then and rotates behind the others, so a project too big for one tick
+is covered over the next ticks without starving the rest. A project's turn
+ends at its first sandbox timeout, so a project whose calls hang costs one
+call a tick, and a tick in which no call returned still saves the stamps.
+Each project has at most one scan error. A project whose one call held all
+its clusters and raised keeps that call's message; any other is summarised by
+counts (`p1: 72 of 100 clusters read — 12 failed (<cause>) — 16 not reached
+(out of time this run)`), with error rows folded in: up to three clusters
+that returned one are named (`c00, c01 and c02 returned an error
+(forbidden)`), more are counted, and only ok rows count as read. A row is
+matched to its call's cluster by its `source`, then its context name, then a
+short name no two clusters of the call share; a row whose `source` names a
+cluster the call did not hold, or that matches nothing, is counted (`1 cluster
+returned an error (<cause>)`), never named, and marks its project's episode as
+failed as a whole. Clusters only the budget kept from being read are
+not a failure: they post nothing, keep their findings, and are listed under
+the report's "Not Reached This Run". The partial-scan line posts when a project fails that
+has no open episode, and names the projects that failed in that run, up to
+six and then "+N more". An episode remembers the clusters that failed, and
+whether the project failed as a whole (its cluster list could not be read, or
+an error row matched none of its clusters). It closes once each remembered
+cluster has read cleanly since or left its project's list and, for a project
+that failed as a whole, a call for it has started in a run where nothing
+failed for it. One line says so once every announced project's episode has
+closed, and a project that leaves the sweep drops its episode without a line.
+A ledger from before per-project episodes has its signature of error kinds
+read in the first run after the upgrade and then removed, without a line: a
+project failing in that run with a kind the signature holds opens its episode
+silently, and one failing with another kind posts. A run in which no call
+returned fails the tick with one fixed sentence that names no project and no
+count, only whether the reads timed out, failed, or both; while the tick keeps
+failing it keeps the kinds the last line named, so it does not change with the
+rotation and posts once. A run of one project whose list failed, or whose one
+call held every cluster, keeps that project's message; under
+`LEEWAY_WATCH_CLUSTERS`, one call that held every cluster keeps that call's
+own error. A finding on a cluster its project no longer lists
+retires once that list was read.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
@@ -466,13 +518,24 @@ six due subjects with their cause and share when it first appears, when its
 `suspectedCause` (a rank finding's `rule`) changes or its `severity` escalates,
 or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
 of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
-clusters are retired with a single resolution line (and a clean `latest.*`
-refresh once all clusters scan cleanly), while clusters whose scan failed
-retain their ledger entries so transient errors do not erase state and re-page
-tomorrow. When `NATS_URL` is set, the watch also writes `latest.json` to the
-`topology-skew` (`a2a.topics.agent.platform.topology-skew`) blackboard topic;
-if that write fails, it warns once in chat and retries on subsequent clean
-ticks until the write recovers.
+clusters are retired with a single resolution line, while clusters whose scan
+failed or that were not reached retain their ledger entries so transient
+errors do not erase state and re-page tomorrow. A run with a finding due
+writes and publishes its own report, partial or not. The JSON report carries
+a `coverage` block: `clusters_swept`, `clusters_read`, and the projects
+`not_reached` or with `scan_errors` this run (each with its summary), since
+`summary` counts only the clusters read; a cluster missing from a partial
+report is unread, not clean. Every other rewrite of
+`latest.*` waits for a run that reads every project in full without a
+failure: the refresh after findings retire, a refresh deferred from an
+earlier run, and the one after a threshold override changes. A failed project
+or clusters not reached hold it back. So on a fleet too big for one run,
+`latest.*` and the topic change only when a finding comes due, and otherwise
+keep the previous report. When `NATS_URL` is set, the watch also writes
+`latest.json` to the `topology-skew`
+(`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
+fails, it warns once in chat and retries on a later run that reads every
+project in full without a failure, until the write recovers.
 
 ## `session-retention` gives every profile's history an end
 
@@ -603,7 +666,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack and Google Chat, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in
@@ -615,12 +678,10 @@ them, through session-kv's `POST /v1/board/actions`, which touches only a card
 and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
-press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
-allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
-where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
-is never an agent turn. Google Chat under today, and a run that also reports
-the board's other findings, get the text.
+press: the Home tab's admission rule on Slack, and the allowed-users list (`resolvePrincipal`) on Google Chat, where
+the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap is
+never an agent turn. A run that also reports the board's other findings gets
+the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
@@ -899,7 +960,7 @@ repositories posts each finished repository's report, then a line naming any it
 did not finish. A failed run posts the scheduler's failure line in plain words,
 once until the job runs again ([the relay design](../../../docs/designs/cron-report-relay.md)),
 and a run that finished no repository without failing posts a one-line notice
-that it did not finish. On Slack, and on Google Chat under `spec.mode: next`, the report is then replaced by a headline linking its
+that it did not finish. On Slack and Google Chat, the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
 with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the

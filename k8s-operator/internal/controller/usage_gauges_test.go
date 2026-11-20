@@ -33,6 +33,8 @@ func gaugeTestAgent() *agentv1alpha1.PlatformAgent {
 		ChatMessagesInboundTotal:        2,
 		NegativeFeedbackTotal:           1,
 		PositiveFeedbackTotal:           6,
+		AutonomousNegativeFeedbackTotal: 4,
+		AutonomousPositiveFeedbackTotal: 3,
 		ClustersRegistered:              ptr.To(int64(3)),
 		ClustersMonitored:               ptr.To(int64(1)),
 		RemediationsMergedTotal:         ptr.To(int64(4)),
@@ -234,7 +236,7 @@ func TestUsageGauges_PublishEveryFieldOfTheStatus(t *testing.T) {
 	g := newUsageGauges(reg)
 	agent := gaugeTestAgent()
 	g.publishUsage(agent)
-	for field, want := range map[string]float64{"toolExecutionsTotal": 5, "chatMessagesInboundTotal": 2, "negativeFeedbackTotal": 1, "positiveFeedbackTotal": 6, "eventsIngestedTotal": 0, "clustersRegistered": 3, "clustersMonitored": 1} {
+	for field, want := range map[string]float64{"toolExecutionsTotal": 5, "chatMessagesInboundTotal": 2, "negativeFeedbackTotal": 1, "positiveFeedbackTotal": 6, "autonomousNegativeFeedbackTotal": 4, "autonomousPositiveFeedbackTotal": 3, "eventsIngestedTotal": 0, "clustersRegistered": 3, "clustersMonitored": 1} {
 		if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", field)); got != want {
 			t.Errorf("%s = %v, want %v", field, got, want)
 		}

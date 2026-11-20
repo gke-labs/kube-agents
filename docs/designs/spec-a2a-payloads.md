@@ -238,7 +238,9 @@ admit.
 `name` is `schedule/<name>` or a bare trigger source, `origin` is `builtin` (the only origin
 today, since a user's schedule runs at its creator's tier and carries no trigger), and `stream` is
 the report stream the grant binds, absent when it binds none. A stream is only ever the
-schedule's own name: `schedule/<stream>`, nothing else. The block is read strictly: a key twice,
+schedule's own name: `schedule/<stream>`, nothing else. `script`, absent on a prompt run, names
+the profile script a built-in schedule's run executes (#5622): a DNS-1123 label, never a path,
+and only on a `schedule/<name>` trigger. The block is read strictly: a key twice,
 a key that matches `trigger` or one of its fields only under case folding, or a null inside the
 trigger is refused. The gateway writes it
 on a trigger's submission and nowhere else; it is absent on every other task. It is a claim,
@@ -337,10 +339,12 @@ starting it.
 | `a2a.tasks.{addressee}.{taskId}.in`           | `message` (follow-up input, and the submission itself for a chat session or the platform agent) and `cancel`, requester to executor. The executor's own consumer takes everything after the submission (follow-ups, steers, cancels). A profile's new tasks move to `…submit` below once the dispatcher lands (#3655); a profile executor still reading its submission here then sees only follow-ups.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `a2a.tasks.{addressee}.{taskId}.events`       | `status-update` and `artifact-update`, executor to anyone. **The executor and only the executor writes here** (9/9): the addressee's own principal is the subject's writer set, which is what makes its identity subject-derived.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `a2a.tasks.{addressee}.{taskId}.supervisor`   | Added 9/9. The one terminal `status-update` a task's supervisor synthesizes for an executor that died or that it is tearing down on the requester's cancel - the gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed tasks. Supervisor to anyone; the executor's grant never reaches it. Same token count as `events`, so it shares the `TASKS` stream, its filters and its sequence.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `a2a.tasks.p.{profile}.{taskId}.supervisor`   | Added 11/11 (#5301). A profile task's supervisor subject in its profile form: six tokens, so the gateway's five-token grant can never match it, and on TASKS beside the task's `events`. Readers accept it beside the five-token form; nothing writes it until the dispatcher moves to it in a later change, after which it is the dispatcher's alone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `a2a.tasks.p.{profile}.{taskId}.supervisor`   | Added 11/11 (#5301). A profile task's supervisor subject in its profile form: six tokens, so the gateway's five-token grant can never match it, and on TASKS beside the task's `events`. Readers accept it beside the five-token form. The dispatcher writes a profile task's terminal here when its dispatch config's `profileSupervisorForm` is `profile`, and on the five-token form otherwise; the operator sets it once every reader watches both. It is the dispatcher's alone, and the auth callout refuses a session pod named `p`.                                                                                                                                                                                                                                                                                                                                                                                   |
 | `a2a.submit.{profile}.{tier}.{kind}.{taskId}` | Added 10/22 (#3660) as `a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit`, moved to its own prefix and stream (`PROFILE_SUBMITS`) 10/28 (#4121). A new task for a profile, `message` only, written by the gateway. `{tier}` is the requester's tier and `{kind}` is `top` for a task a client asked for or `child` for one another task started; both exist only to route the submission to the operator's durable for that (profile, tier, kind), whose dispatcher holds the task until it ends. Nothing on TASKS matches a submission, and a follow-up on `…in` never reaches the durable. The task's follow-ups and cancels go on `…in`, its events on `…events` and `…supervisor`. Envelope agreement: `taskId` and `to` match the tokens, and the writer is the submitter: `from.session` is the one a consumer names (the gateway), or, where it names none, neither `from.session` nor `from.profile` is the profile. |
 | `a2a.cap.verify.{caller}`                     | Added 9/9 with the capability envelope. An executor's request to resolve a capability reference, executor to the verifier. `{caller}` is the asking principal's name and the verifier reads its identity off that token rather than off the payload, which is sound only because each principal's grant is exactly one subject: a `a2a.cap.verify.*` grant would turn the identity check into a self-assertion. The `cap` KV bucket behind it is readable by the verifier alone.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `a2a.cap.reply.{caller}.{inbox}`              | Added 9/9. The verifier's answer, verifier to the one executor that asked. Scoped under `{caller}` so a principal's reply grant cannot reach another's - a subscribe permission on a reply space is interception and not observation, because any subscriber may join a queue group on it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `a2a.trigger.{source}.submit`                 | Added 11/14 (#5617). An unattended trigger's request for one task (`lib.TriggerSubmit`), core request/reply, the trigger to the elected gateway. `{source}` is the trigger's source (`schedule` today), bound to its ServiceAccount by the callout, so the gateway reads the source off the token, not the payload. The gateway mints the task's unattended grant with the trigger bound and answers on the reply subject below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `a2a.trigger.reply.{source}.{id}`             | Added 11/14 (#5617). The gateway's answer (`lib.TriggerSubmitReply`: a task ID or a refusal), gateway to the one source that asked. A namespace of its own, not the caller's `_INBOX`, for the reason `a2a.cap.reply` is: a grant to publish into callers' inboxes would reach where they read their JetStream replies. A submission naming any other reply subject is dropped unanswered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `a2a.agents.{profile}`                        | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `agents.hb.{agentType}.{owner}.{session}`     | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
@@ -606,9 +610,9 @@ envelope's to make decision-grade.
 ## Chat messages (added 10/8)
 
 A task's answer is not always prose. A report has a headline and rows, a question has
-choices, and a running task has a plan. Under `today` the Slack presenter lays these out
-from the agent's text at post time. Under `next` the chat gateway posts what comes off the
-bus, and it holds no model and does not parse prose (#2149). So the executor states the
+choices, and a running task has a plan. The Hermes Slack presenter laid these out from the agent's text at post time. The A2A chat
+gateway, which serves Slack now, posts what comes off the bus, and it holds no model and
+does not parse prose (#2149). So the executor states the
 structure, and every adapter renders it: Block Kit, a card, an embed, or plain text.
 
 The mechanism is the one topics already use. A **chat message** is one DataPart whose
@@ -634,7 +638,7 @@ consumer that missed an event renders the next one correctly.
 A click on a choice arrives like any message in the conversation: a new turn once the task
 has ended, a steer while it runs, under the steering rules above (so on the fixed route,
 which refuses steers, a click on a mid-task `notice` gets the refusal). (The Hermes bridge emits
-no `input-required` today, so under `next` choices live on `result` and `notice` for now.)
+no `input-required` today, so choices live on `result` and `notice` for now.)
 
 ### The object
 
@@ -715,14 +719,14 @@ A choice may also carry `next: true`, which marks a finished answer's optional n
 Block order is fixed so every renderer agrees: headline and note, detail, rows, after, fold,
 then the buttons, choices before links. In `progress` the `plan` follows the headline and
 takes the place of the rows. The caps on headline, row text and row detail, button
-labels, the url rule and the plan are the `today` presenter's (`slack_presenter.py`,
+labels, the url rule and the plan are the Hermes Slack presenter's (`slack_presenter.py`,
 `slack_status.py`), and fold text is #2360's. The rest are chosen here and sit inside Slack's own
-limits. The `today` path clips where this spec refuses, so the emitter applies windows:
+limits. The presenter clips where this spec refuses, so the emitter applies windows:
 the presenter's newest 20 plan items (settled ones first to go) and last 6 steps of each,
 and the first 5 `after` lines, which the presenter leaves uncapped.
 
 **The emitter composes, the renderer lays out.** A plan item's `title` arrives finished
-(`today`'s `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
+(the presenter's `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
 choice's `reply` names whatever the answer needs to reach (a card, an option). The
 renderer adds only what is its backend's own: a "✓ name: choice" rewrite of an answered
 question (#2346), a "waiting on you" context line under an open one, which emoji a mark
@@ -755,17 +759,28 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 
 Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
 delegation to profiles onward. The gateway carries a `delegate` request's `parameters` into the
-child's submission once their names pass the target profile's declared ones. Both are `data` parts, and only the gateway
+child's submission once their names pass the target profile's declared ones. These are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
-`taskParameters` parts.
+`taskParameters` parts. Of the task parameters' fields, `changeRequested` is set true only for a
+turn that arrived as a structured confirm.
 
 **Task parameters.** A profile task's submission carries
 `{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
 declares, such as the cluster persona's `project`, `location` and `cluster`. The gateway sets them
 from what the client or the parent task asked. They never ride the authority block. The dispatcher
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
-to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
+to the worker as `PROFILE_TASK_<NAME>`, or to a script-run task's script as `KA_PARAM_<NAME>`
+(`spec-profiles-dispatch.md`, #5622), whose name may be at most 32 characters. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
+
+The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
+request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
+and only for a turn that arrived as a structured confirm action, never from free text or a
+delegation's arguments. A child task or a wake carries its parent's value from the gateway's own
+record and cannot raise it. When it is true the gateway attaches the part even with no parameters.
+Absent means false, so a submission that asks for no change is byte-identical to one written before
+the field existed. The dispatcher turns it into the `vcs:proposal-create` permit on the task's
+credential-proxy token.
 
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
@@ -822,6 +837,31 @@ listed, and a turn with none reads as `platform` only.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
 
+**Reply to.** A turn that answers a card's report carries `{"replyTo": {"taskId": "<task>"}}`: the
+gateway task whose turn filed the card, which the report's console frame named as `replyTo` (the
+root of its chain when a delegated child filed it, so that card's row, keyed by the child's task, is
+not reached; the pushed report below carries it; `a2a/docs/hermes-bridge.md`) and the client echoed with its reply (the console frame's `replyTo`; the MCP server's `send_message`
+`reply_to`). The hermes-bridge reads the report the kanban notifier stored for that turn when the
+turn carries no pushed report (below) (`a2a/docs/hermes-bridge.md`, the reply under a pushed
+report) and puts it ahead of the words. A
+chat backend's turn never carries one: a Slack or Google Chat reply is in the report's thread. The
+task id is a subject token; the gateway drops one that is not and sends the turn without it, and
+a reader that finds a part breaking that, or two parts, ignores them (`lib.ReplyToOf`) and looks the
+report up by the conversation alone.
+
+**Pushed report.** A turn under a report the gateway's notify route posted into the conversation
+carries `{"pushedReport": {"taskId"?, "text"}}`: the report's text, kept by the gateway from the
+report it posted (a post the kanban notifier marks as a card's report, `report`, naming its task
+with `reply_to`; `spec-chatops-gateway.md`, "Proactive posts"), and the root of the task it reported on. The gateway
+attaches it to a human turn, on any route, that names the task (`replyTo`, read as its chain's
+root): a console or MCP turn, since only console posts name their task today; a chat thread reply
+keeps the executor's lookup. The hermes-bridge (the platform route, the install's default) frames
+the text as it frames a report it looked up, untrusted and ahead of the words, and skips the lookup
+(`a2a/docs/hermes-bridge.md`). `text` is at most 64 KiB (`lib.PushedReportTextCap`), cut by the
+gateway with a note; a part with no text, text past the cap, a task id that is not a subject
+token, or a second part is ignored (`lib.PushedReportOf`) and the executor looks the report up
+instead. Only the gateway writes it; it is the gateway's own relay, not the sender's text.
+
 ### Card work after the task ends
 
 **A stopgap.** This retires when delegated work runs as bus tasks (cards as child tasks
@@ -829,7 +869,7 @@ through the delegation primitive and the profile dispatcher), at which point car
 ride the carriers above. The plan is on #2149
 ([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
 
-Under `next` on chat platforms (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
+On the chat platforms the gateway holds (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
 its task ends (whereas on console, MCP and A2A door origins only, `waitsForCardsInTurn`, the `api` executor holds the turn open while polling `kanban.db`, emits `subtask` steps as cards settle, and synthesizes multi-card results into the task's `result` artifact; see `a2a/docs/hermes-bridge.md`). Where the task ends at the acknowledgement, the cards keep going outside that A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
 addressed to the asking conversation and checked against the gateway's session record
@@ -869,13 +909,13 @@ then carry the plan (under one `update` key per plan), ⏸️ (`settle: blocked`
 and the folded answer, and the final settle. The task is not held open for its cards:
 that would turn every follow-up into a steer queued behind hours of idle.
 
-**The emitter.** Two halves, each a port of the `today` presenter run on the shared
+**The emitter.** Two halves, each a port of the Hermes Slack presenter run on the shared
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
 first sentence as `headline`, cut at a clause when it runs past the headline's cap, or at a
 word with an ellipsis when no clause fits, the rest as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
 to five listed options to take carries them as `choices`, its opening paragraph, each
 option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
-by the rule `slack_moments.answer_choices` applies under `today`; an answer that instead
+by the rule `slack_moments.answer_choices` applied on the Hermes Slack platform; an answer that instead
 declares its one next step on a last line of its own, `[next: <label>]`, carries that
 step as its only choice, `next` and not `primary`, and leaves the line out of `headline`, `detail`
 and `fold`, by `slack_moments.next_step`'s rule; the line is plumbing, so the text fallback
@@ -983,8 +1023,8 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   a group or a channel. A markdown link renders only when its url passes the `links` rule,
   label check included. The fallback keeps the gateway's existing escaping.
 - **The gateway renders, it doesn't compose.** It neither invents fields nor reads the text
-  to fill one. Under `next` the Hermes bridge emits the chat message, as a port of the
-  `today` presenter's rules with the same fixtures (#2149).
+  to fill one. The Hermes bridge emits the chat message, as a port of the
+  Hermes Slack presenter's rules with the same fixtures (#2149).
 - **Size.** The part counts against the envelope's max message size like any other. A
   carrier too large with it is published without it: the text is the deliverable.
 - **A backend that can't hold it.** The caps fit Slack. A valid chat message may still be
@@ -1005,7 +1045,7 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
 the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
-cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
+cases in `tests/conformance/chat/` pair inputs from the Hermes Slack presenters' tests with the chat
 messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
 `tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.
@@ -1046,7 +1086,11 @@ Worked examples:
 ### Payload
 
 A `topic-update` envelope carries an A2A `Artifact`: `name` is the topic, parts are
-typically one DataPart (the structured state) with an optional TextPart summary. When the
+typically one DataPart (the structured state) with an optional TextPart summary. The
+`topology-skew` document adds a `coverage` object to the leeway report: `clusters_swept`,
+`clusters_read`, and the projects `not_reached` or with `scan_errors` in that run, each
+mapped to its summary. A cluster absent from `clusters` was not read that run; it is not
+clean. When the
 update happened in the course of a task, the envelope carries that task's `taskId` and
 `correlationId` - which is the audit thread from a user's question to the standing state it
 changed. Updates published on an agent's own schedule carry a `correlationId` minted for

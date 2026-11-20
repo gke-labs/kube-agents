@@ -16,7 +16,7 @@
 
 EVERY failure mode is a MUTATION OF A REAL RECORD, never a hand-written dict.
 The six directories under ``fixtures/runs/`` are captured devops-bench output
-(see their README for provenance and the one redacted field), and the helpers
+(see their README for provenance and the two redacted fields), and the helpers
 here copy one and change
 exactly the field under test. That discipline is not stylistic: the first draft
 of the ladder gated rung 3 on ``metadata.session_id``, a key a devops-bench
@@ -57,6 +57,16 @@ FORGE_ENV_VARS = (
 def _no_forge_from_the_shell(monkeypatch):
     for name in FORGE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_forge_rate_limit_wait(monkeypatch):
+    """A grading read under a rate limit waits for the reset (#6105); in
+    tests it doesn't, unless the test sets a budget and stubs the sleep."""
+    from kube_agents_bench import verifiers
+
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "0")
+    monkeypatch.setattr(verifiers, "_forge_rate_limit_waited", 0.0)
 
 
 @pytest.fixture(autouse=True)

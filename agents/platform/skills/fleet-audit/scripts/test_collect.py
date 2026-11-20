@@ -13,6 +13,7 @@ import importlib
 import inspect
 import io
 import json
+import time
 import os
 import re
 import shlex
@@ -427,20 +428,15 @@ def context_of(dump=None, **overrides):
         "workloads": [],
         "workload_keys": set(),
         "pod_namespaces": set(),
+        "ingresses": [],
+        "http_routes": [],
+        "backend_configs": [],
+        "health_check_policies": [],
+        "raw_workloads": [],
         "cluster_name": "test-cluster",
     }
     if dump is not None:
-        base.update(
-            claims=collect.claims_by_key(dump),
-            limitranges=collect.limitranges_by_namespace(dump),
-            pdbs=collect.pdbs_by_namespace(dump),
-            hpas=collect.hpas_by_namespace(dump),
-            services=collect.services_by_namespace(dump),
-            cronjobs=collect.cronjobs_with_jobs(dump),
-            service_endpoints=collect.services_with_endpoints(dump),
-            workloads=collect.normalize_workloads(dump),
-            workload_keys=collect.workload_keys(dump),
-        )
+        base.update(collect.build_context(dump, collect.normalize_workloads(dump)))
     base.update(overrides)
     if "workload_keys" not in overrides and dump is None:
         # A test that hands over `workloads` and no dump is saying "this is
@@ -1530,6 +1526,259 @@ class TestHpaFloorsAtOne(unittest.TestCase):
         }
         hits = collect.check_hpa_floors_at_one(ctx)
         self.assertIsNotNone(hits[0]["reconciler"])
+
+
+class TestHpaAggressiveScaledown(unittest.TestCase):
+    """§3.25 — aggressive HPA scale-down with no preStop hook."""
+
+    def ctx(
+        self,
+        *,
+        ns="seeded-autoscaling",
+        workload_kind="Deployment",
+        replicas=2,
+        min_replicas=2,
+        max_replicas=10,
+        stabilization=0,
+        policies="planted",
+        select_policy="Max",
+        containers=None,
+        grace=None,
+        target=None,
+        owned=False,
+        hpa_labels=None,
+        workload_labels=None,
+    ):
+        d = deployment("web-api-server", ns=ns, kind=workload_kind, **{"spec.replicas": replicas})
+        if workload_labels is not None:
+            d["metadata"]["labels"] = workload_labels
+        if containers is not None:
+            d["spec"]["template"]["spec"]["containers"] = containers
+        if grace is not None:
+            d["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = grace
+
+        h = hpa(
+            "web-api-server-hpa",
+            ns=ns,
+            min_replicas=min_replicas if min_replicas is not None else 1,
+            max_replicas=max_replicas,
+            target=target or {"apiVersion": "apps/v1", "kind": workload_kind, "name": "web-api-server"},
+            owned=owned,
+        )
+        if min_replicas is None:
+            del h["spec"]["minReplicas"]
+        if hpa_labels is not None:
+            h["metadata"]["labels"] = hpa_labels
+        if stabilization != "absent_behavior":
+            scale_down = {}
+            if stabilization is not None:
+                scale_down["stabilizationWindowSeconds"] = stabilization
+            if select_policy is not None:
+                scale_down["selectPolicy"] = select_policy
+            if policies == "planted":
+                scale_down["policies"] = [{"type": "Percent", "value": 100, "periodSeconds": 15}]
+            elif policies is not None:
+                scale_down["policies"] = policies
+            h["spec"]["behavior"] = {"scaleDown": scale_down}
+        return context_of(dump_of(d, h))
+
+    def test_zero_stabilization_and_hundred_percent_without_prestop_flags_hpa(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "HorizontalPodAutoscaler/web-api-server-hpa")
+        self.assertEqual(hits[0]["namespace"], "seeded-autoscaling")
+        self.assertIn("stabilizationWindowSeconds=0", hits[0]["excerpt"])
+        self.assertIn("selectPolicy=Max", hits[0]["excerpt"])
+        self.assertIn("policies=100% per 15s", hits[0]["excerpt"])
+        self.assertIn("scaling Deployment/web-api-server (minReplicas=2, maxReplicas=10)", hits[0]["excerpt"])
+        self.assertIn("target containers with no preStop hook: app (terminationGracePeriodSeconds=30)", hits[0]["excerpt"])
+
+    def test_collect_cluster_grades_it_major_without_requiring_a_service(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "hpa-aggressive-scaledown")
+        self.assertEqual(spec.severity, "major")
+        hits = spec.run(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+
+    def test_omitted_policies_with_short_window_use_kubernetes_default_hundred_percent(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=15, policies=None, select_policy=None))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("policies=100% per 15s (API default)", hits[0]["excerpt"])
+
+    def test_default_or_sixty_second_stabilization_window_is_not_flagged(self):
+        for window in ("absent_behavior", None, 60, 300):
+            with self.subTest(window=window):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=window)), [])
+
+    def test_disabled_select_policy_is_not_flagged(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(select_policy="Disabled")), [])
+
+    def test_bounded_percent_or_pods_policy_is_not_flagged(self):
+        bounded = [
+            [{"type": "Percent", "value": 25, "periodSeconds": 60}],
+            [{"type": "Percent", "value": 49, "periodSeconds": 15}],
+            [{"type": "Pods", "value": 1, "periodSeconds": 60}],
+        ]
+        for pol in bounded:
+            with self.subTest(policies=pol):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=pol)), [])
+
+    def test_select_policy_max_vs_min_handles_mixed_policy_lists(self):
+        mixed = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Pods", "value": 1, "periodSeconds": 60},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Max"))), 1)
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Min")), [])
+        all_aggressive = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Percent", "value": 50, "periodSeconds": 30},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=all_aggressive, select_policy="Min"))), 1)
+
+    def test_container_prestop_hook_clears_it_while_self_health_sidecar_is_ignored(self):
+        containers = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+            {"name": "istio-proxy", "image": "proxyv2"},
+        ]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(containers=containers)), [])
+
+    def test_serving_service_narrows_to_containers_in_its_target_port_path(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "web-api-server"}}
+        d["spec"]["template"]["spec"]["containers"] = [
+            {
+                "name": "app",
+                "image": "pause",
+                "ports": [{"containerPort": 8080}],
+                "lifecycle": {"preStop": {"sleep": {"seconds": 15}}},
+            },
+            {"name": "fluent-bit", "image": "fluent-bit"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        svc = service(
+            "web-api-server",
+            ns="seeded-autoscaling",
+            selector={"app": "web-api-server"},
+            ports=[{"name": "http", "port": 80, "targetPort": 8080}],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h, svc))), [])
+
+    def test_native_sidecar_without_prestop_is_flagged_while_plain_init_container_is_not(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["spec"]["containers"] = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+        ]
+        d["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "migrate", "image": "busybox"},
+            {"name": "envoy-proxy", "image": "envoy", "restartPolicy": "Always"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        hits = collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("target containers with no preStop hook: envoy-proxy", hits[0]["excerpt"])
+
+        d["spec"]["template"]["spec"]["initContainers"] = [{"name": "migrate", "image": "busybox"}]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h))), [])
+
+    def test_daemonset_target_is_not_flagged(self):
+        ds = deployment("node-agent", ns="seeded-autoscaling")
+        ds["kind"] = "DaemonSet"
+        ds["spec"].pop("replicas", None)
+        h = hpa(
+            "node-agent-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "DaemonSet", "name": "node-agent"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(ds, h))), [])
+
+    def test_omitted_min_replicas_defaults_floor_to_one_and_statefulset_target_is_flagged(self):
+        hits = collect.check_hpa_aggressive_scaledown(
+            self.ctx(min_replicas=None, max_replicas=5, workload_kind="StatefulSet", grace=45)
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("scaling StatefulSet/web-api-server (minReplicas=1, maxReplicas=5)", hits[0]["excerpt"])
+        self.assertIn("terminationGracePeriodSeconds=45", hits[0]["excerpt"])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=None, max_replicas=1)), [])
+
+    def test_standard_and_hpa_exclusions_hold(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(ns="kube-system")), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(hpa_labels={collect._ADDON_MANAGER_MODE_LABEL: "Reconcile"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(owned=True)), [])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=5, max_replicas=5)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(workload_labels={collect.OPT_OUT_KEY: "exempt"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(replicas=0)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "missing"})
+            ),
+            [],
+        )
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "custom.io/v1", "kind": "Deployment", "name": "web-api-server"})
+            ),
+            [],
+        )
 
 
 class TestSingleReplicaDefersToTheHpaCheck(unittest.TestCase):
@@ -4004,6 +4253,690 @@ class TestServicePortUnresolved(unittest.TestCase):
                 self.assertEqual(len(orphaned) + len(self.hits(*items)), 1)
 
 
+class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
+    """§3.26 (`ingress-gateway-healthcheck-mismatch`). Cross-checks HTTPRoute /
+    Ingress backendRefs, Service numeric targetPorts, and BackendConfig /
+    HealthCheckPolicy health-check ports against the backing workload's declared
+    containerPorts and probes in cluster without requiring a Gateway."""
+
+    def hits(self, *items):
+        return collect.check_ingress_gateway_healthcheck_mismatch(context_of(dump_of(*items)))
+
+    def svc(self, name="backend-api-svc", ns="seeded-networking", port=80, target=8080, port_name="http", annotations=None, **kwargs):
+        kwargs.setdefault("selector", {"app": "backend-api"})
+        port_spec = {"port": port, "protocol": "TCP"}
+        if port_name is not None:
+            port_spec["name"] = port_name
+        if target is not None:
+            port_spec["targetPort"] = target
+        kwargs.setdefault("ports", [port_spec])
+        doc = service(name, ns=ns, **kwargs)
+        if annotations:
+            doc["metadata"]["annotations"] = dict(annotations)
+        return doc
+
+    def backend(self, name="backend-api", ns="seeded-networking", ports=None, readiness_probe=None, replicas=1):
+        dep = deployment(name, ns=ns, **{"spec.replicas": replicas})
+        dep["spec"]["template"]["metadata"] = {"labels": {"app": "backend-api"}}
+        container = dep["spec"]["template"]["spec"]["containers"][0]
+        if ports is not None:
+            container["ports"] = ports
+        if readiness_probe is not None:
+            container["readinessProbe"] = readiness_probe
+        return dep
+
+    def httproute(self, name="backend-api", ns="seeded-networking", svc_name="backend-api-svc", svc_port=80, labels=None):
+        return {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": name, "namespace": ns, "labels": labels or {}, "annotations": {}},
+            "spec": {
+                "parentRefs": [{"name": "bench-gateway"}],
+                "rules": [{"backendRefs": [{"name": svc_name, "port": svc_port}]}],
+            },
+        }
+
+    def ingress(self, name="backend-ing", ns="seeded-networking", svc_name="backend-api-svc", port_num=80, port_name=None):
+        port_ref = {"name": port_name} if port_name else {"number": port_num}
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": name, "namespace": ns, "labels": {}, "annotations": {}},
+            "spec": {
+                "rules": [
+                    {
+                        "http": {
+                            "paths": [
+                                {
+                                    "path": "/",
+                                    "pathType": "Prefix",
+                                    "backend": {"service": {"name": svc_name, "port": port_ref}},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+
+    def backend_config(self, name="api-bc", ns="seeded-networking", hc_port=None):
+        hc = {"port": hc_port} if hc_port is not None else {"requestPath": "/healthz"}
+        return {
+            "apiVersion": "cloud.google.com/v1",
+            "kind": "BackendConfig",
+            "metadata": {"name": name, "namespace": ns, "labels": {}, "annotations": {}},
+            "spec": {"healthCheck": hc},
+        }
+
+    def health_check_policy(self, name="api-hcp", ns="seeded-networking", svc_name="backend-api-svc", hc_port=None, port_spec=None, port_name=None):
+        http_hc = {}
+        if hc_port is not None:
+            http_hc["port"] = hc_port
+        if port_spec is not None:
+            http_hc["portSpecification"] = port_spec
+        if port_name is not None:
+            http_hc["portName"] = port_name
+        return {
+            "apiVersion": "networking.gke.io/v1",
+            "kind": "HealthCheckPolicy",
+            "metadata": {"name": name, "namespace": ns, "labels": {}, "annotations": {}},
+            "spec": {
+                "targetRef": {"group": "", "kind": "Service", "name": svc_name},
+                "default": {"config": {"type": "HTTP", "httpHealthCheck": http_hc}},
+            },
+        }
+
+    def test_httproute_to_numeric_targetport_missing_from_container_ports_is_flagged(self):
+        hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"name": "https", "containerPort": 8443, "protocol": "TCP"}]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["namespace"], "seeded-networking")
+        self.assertEqual(hits[0]["object"], "Service/backend-api-svc")
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("HTTPRoute/backend-api", hits[0]["excerpt"])
+        self.assertIn("8080", hits[0]["excerpt"])
+        self.assertIn("Deployment/backend-api", hits[0]["excerpt"])
+        self.assertIn("https:8443/TCP", hits[0]["excerpt"])
+
+    def test_clean_httproute_matching_declared_container_port_is_silent(self):
+        hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"name": "https", "containerPort": 8443, "protocol": "TCP"}]),
+        )
+        self.assertEqual(hits, [])
+
+    def test_ingress_numeric_targetport_mismatch_and_clean_baseline(self):
+        bad = self.hits(
+            self.ingress(port_num=80),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(bad), 1)
+        self.assertIn("Ingress/backend-ing", bad[0]["excerpt"])
+
+        clean = self.hits(
+            self.ingress(port_num=8080),
+            self.svc(port=8080, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(
+                ports=[{"containerPort": 8080}],
+                readiness_probe={"httpGet": {"path": "/", "port": 8080}},
+            ),
+        )
+        self.assertEqual(clean, [])
+
+    def test_defaulted_targetport_is_evaluated_when_omitted(self):
+        hits = self.hits(
+            self.httproute(svc_port=80),
+            self.svc(port=80, target=None),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("targetPort 80/TCP", hits[0]["excerpt"])
+
+    def test_route_or_ingress_naming_unexposed_service_port_is_flagged(self):
+        hits = self.hits(
+            self.httproute(svc_port=8080),
+            self.svc(port=80, target=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("does not expose", hits[0]["excerpt"])
+
+        ing_hits = self.hits(
+            self.ingress(port_name="missing"),
+            self.svc(port=80, target=8443, port_name="http"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(ing_hits), 1)
+        self.assertIn("'missing'", ing_hits[0]["excerpt"])
+
+    def test_backendconfig_and_healthcheckpolicy_probe_port_mismatches(self):
+        bc_svc = self.svc(
+            port=80,
+            target=8443,
+            annotations={"cloud.google.com/backend-config": json.dumps({"default": "api-bc"})},
+        )
+        bc_hits = self.hits(
+            bc_svc,
+            self.backend_config(hc_port=9090),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(bc_hits), 1)
+        self.assertIn("BackendConfig/api-bc probes port 9090", bc_hits[0]["excerpt"])
+
+        bc_clean = self.hits(
+            bc_svc,
+            self.backend_config(hc_port=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(bc_clean, [])
+
+        hcp_hits = self.hits(
+            self.svc(port=80, target=8443),
+            self.health_check_policy(hc_port=9000, port_spec="USE_FIXED_PORT"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(hcp_hits), 1)
+        self.assertIn("HealthCheckPolicy/api-hcp probes port 9000", hcp_hits[0]["excerpt"])
+
+        hcp_serving_clean = self.hits(
+            self.svc(port=80, target=8443),
+            self.health_check_policy(hc_port=9000, port_spec="USE_SERVING_PORT"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(hcp_serving_clean, [])
+
+    def test_omitted_container_ports_without_probes_is_not_flagged(self):
+        # Containers that omit `ports` and `readinessProbe` state no port contract;
+        # flagging them would false-positive on valid workloads whose image listens on targetPort.
+        hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=None, readiness_probe=None),
+        )
+        self.assertEqual(hits, [])
+
+    def test_readiness_probe_does_not_arm_without_ports_and_clears_matching_targetport(self):
+        # A container with no `ports` and a readinessProbe on 8081 (e.g. a dedicated health port)
+        # while serving 8080 must not arm the port comparison and file `major`.
+        probe_only_clean = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=None, readiness_probe={"httpGet": {"path": "/readyz", "port": 8081}}),
+        )
+        self.assertEqual(probe_only_clean, [])
+
+        # When `ports` is declared, a readinessProbe on targetPort still satisfies the comparison.
+        clean = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(
+                ports=[{"containerPort": 8443}],
+                readiness_probe={"httpGet": {"path": "/readyz", "port": 8080}},
+            ),
+        )
+        self.assertEqual(clean, [])
+
+    def test_auxiliary_only_container_port_does_not_arm_mismatch_while_serving_port_still_fires(self):
+        # A container that declares only `metrics: 9090` and serves 8080 without declaring 8080
+        # must not falsely arm the comparison and file `major`.
+        metrics_only_clean = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"name": "metrics", "containerPort": 9090, "protocol": "TCP"}]),
+        )
+        self.assertEqual(metrics_only_clean, [])
+
+        # Declaring a serving port alongside `metrics: 9090` still arms the check on a real mismatch.
+        true_mismatch = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(
+                ports=[
+                    {"name": "http", "containerPort": 8443, "protocol": "TCP"},
+                    {"name": "metrics", "containerPort": 9090, "protocol": "TCP"},
+                ]
+            ),
+        )
+        self.assertEqual(len(true_mismatch), 1)
+        self.assertEqual(true_mismatch[0]["severity"], "major")
+        self.assertIn("targetPort 8080/TCP", true_mismatch[0]["excerpt"])
+
+    def test_multi_container_pod_requires_every_app_container_to_declare_serving_ports(self):
+        # If one application container omits `ports`, another container declaring a port must not
+        # arm the comparison for the whole Service.
+        dep_partial = self.backend(ports=None, readiness_probe=None)
+        dep_partial["spec"]["template"]["spec"]["containers"].append(
+            {"name": "helper", "ports": [{"containerPort": 9090}]}
+        )
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                dep_partial,
+            ),
+            [],
+        )
+
+        # A self-health sidecar omitting `ports` does not prevent a real mismatch on the app container.
+        dep_sidecar = self.backend(ports=[{"name": "https", "containerPort": 8443}])
+        dep_sidecar["spec"]["template"]["spec"]["containers"].append({"name": "cloud-sql-proxy"})
+        sidecar_hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            dep_sidecar,
+        )
+        self.assertEqual(len(sidecar_hits), 1)
+        self.assertEqual(sidecar_hits[0]["severity"], "major")
+
+    def test_native_sidecar_port_satisfies_targetport_while_plain_init_does_not(self):
+        dep = self.backend(ports=[{"containerPort": 8443}])
+        dep["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "envoy", "restartPolicy": "Always", "ports": [{"containerPort": 8080}]},
+        ]
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                dep,
+            ),
+            [],
+        )
+
+        dep_init = self.backend(ports=[{"containerPort": 8443}])
+        dep_init["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "migrate", "ports": [{"containerPort": 8080}]},
+        ]
+        self.assertEqual(
+            len(
+                self.hits(
+                    self.httproute(),
+                    self.svc(port=80, target=8080),
+                    endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                    dep_init,
+                )
+            ),
+            1,
+        )
+
+    def test_unrouted_service_and_zero_endpoint_service_and_unresolved_named_port_stay_quiet(self):
+        # Plain ClusterIP Service with no route or policy is not in scope.
+        self.assertEqual(
+            self.hits(
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                self.backend(ports=[{"containerPort": 8443}]),
+            ),
+            [],
+        )
+        # Scaled-to-zero / empty-endpoint Service (e.g. defects-a scaled_zero_route) stays quiet.
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", addresses=0, ports=[]),
+                self.backend(ports=[{"containerPort": 8443}], replicas=0),
+            ),
+            [],
+        )
+        # Unresolved named targetPort belongs to §3.17 (`service-port-unresolved`), not §3.26.
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target="missing-name"),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=[]),
+                self.backend(ports=[{"name": "https", "containerPort": 8443}]),
+            ),
+            [],
+        )
+
+    def test_standard_exclusions_apply_to_service_and_route(self):
+        self.assertEqual(
+            self.hits(
+                self.httproute(ns="kube-system"),
+                self.svc(ns="kube-system", port=80, target=8080),
+                endpointslice("backend-api-svc", ns="kube-system", ports=["http"]),
+                self.backend(ns="kube-system", ports=[{"containerPort": 8443}]),
+            ),
+            [],
+        )
+        exempt_route = self.httproute(labels={collect.OPT_OUT_KEY: "exempt"})
+        self.assertEqual(
+            self.hits(
+                exempt_route,
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                self.backend(ports=[{"containerPort": 8443}]),
+            ),
+            [],
+        )
+
+    def test_collect_obtainability_handles_autopilot_absent_crds_and_forbidden_reads(self):
+        route = self.httproute()
+        svc = self.svc(port=80, target=8080)
+        es = endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"])
+        dep = self.backend(ports=[{"name": "https", "containerPort": 8443}])
+
+        # 1. Autopilot cluster still evaluates HTTPRoute mismatches before returning early on ComputeClass.
+        def run_autopilot(argv: list[str], **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if argv[:3] == ["kubectl", "get", collect.HTTPROUTE_CRD_RESOURCE]:
+                return Run(argv, 0, json.dumps(dump_of(route)), "", 0.01)
+            if (
+                argv[:2] == ["kubectl", "get"]
+                and len(argv) >= 3
+                and argv[2] in (collect.BACKEND_CONFIG_CRD_RESOURCE, collect.HEALTH_CHECK_POLICY_CRD_RESOURCE)
+            ):
+                return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "backendconfigs"', 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(svc, es, dep)), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        ap_cluster = {"name": "ap", "project": "acme", "location": "us-central1", "autopilot": True}
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            res_ap = collect.collect_cluster(ap_cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run_autopilot)
+            ap_kc = collect.kubeconfig_path(ap_cluster["project"], ap_cluster["name"], ap_cluster["location"])
+        self.assertEqual(res_ap["outcome"], "collected")
+        mismatch = [c for c in res_ap["candidates"] if c["check"] == "ingress-gateway-healthcheck-mismatch"]
+        self.assertEqual(len(mismatch), 1)
+        self.assertEqual(mismatch[0]["object"], "Service/backend-api-svc")
+        mm_cmd = next(c["command"] for c in res_ap["commands"] if c["check"] == "ingress-gateway-healthcheck-mismatch")
+        expected_ap_dump = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=ap_kc)
+        self.assertEqual(
+            mm_cmd,
+            f"{expected_ap_dump}; KUBECONFIG={collect.shlex.quote(str(ap_kc))} kubectl get {collect.HTTPROUTE_CRD_RESOURCE} -A --chunk-size=500 -o json",
+        )
+
+        # 2. Forbidden / failed CRD read marks ingress-gateway-healthcheck-mismatch unevaluated.
+        def run_forbidden(argv: list[str], **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if argv[:3] == ["kubectl", "get", collect.HTTPROUTE_CRD_RESOURCE]:
+                return Run(argv, 1, "", "Error from server (Forbidden): httproutes is forbidden", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(svc, es, dep)), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            res_fb = collect.collect_cluster(ap_cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run_forbidden)
+        uneval = {e["check"]: e["reason"] for e in res_fb.get("checks_unevaluated") or []}
+        self.assertIn("ingress-gateway-healthcheck-mismatch", uneval)
+        self.assertNotIn("ingress-gateway-healthcheck-mismatch", {c["check"] for c in res_fb["commands"]})
+        self.assertEqual([c for c in res_fb["candidates"] if c["check"] == "ingress-gateway-healthcheck-mismatch"], [])
+
+    def test_multiport_service_unrouted_ports_and_fixed_probe_ports_do_not_false_positive(self):
+        # 1. Service-level HealthCheckPolicy or default BackendConfig on a multi-port Service
+        # must not flag unrouted ports when HTTPRoute only routes port 80.
+        multi_svc = service(
+            "backend-api-svc",
+            ns="seeded-networking",
+            selector={"app": "backend-api"},
+            ports=[
+                {"name": "http", "port": 80, "protocol": "TCP", "targetPort": 8443},
+                {"name": "debug", "port": 9090, "protocol": "TCP", "targetPort": 9090},
+            ],
+        )
+        multi_svc["metadata"]["annotations"] = {"cloud.google.com/backend-config": json.dumps({"default": "api-bc"})}
+        self.assertEqual(
+            self.hits(
+                self.httproute(svc_port=80),
+                multi_svc,
+                self.backend_config(hc_port=None),
+                self.health_check_policy(port_spec="USE_SERVING_PORT"),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http", "debug"]),
+                self.backend(ports=[{"name": "https", "containerPort": 8443}]),
+            ),
+            [],
+        )
+
+        # 2. Fixed-port probe (USE_FIXED_PORT or BackendConfig.spec.healthCheck.port) matching a
+        # container's readinessProbe port on a container omitting `ports:` must not flag targetPort.
+        self.assertEqual(
+            self.hits(
+                self.svc(port=80, target=8080),
+                self.health_check_policy(hc_port=9000, port_spec="USE_FIXED_PORT"),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                self.backend(ports=None, readiness_probe={"httpGet": {"path": "/readyz", "port": 9000}}),
+            ),
+            [],
+        )
+
+    def test_backendconfig_ports_map_and_healthcheckpolicy_named_and_ssl_subconfigs(self):
+        # BackendConfig `ports` map naming a nonexistent Service port is flagged, while explicit
+        # `ports` override suppresses `default` on that port.
+        bad_map_svc = self.svc(
+            port=80,
+            target=8443,
+            annotations={"cloud.google.com/backend-config": json.dumps({"ports": {"missing": "api-bc"}})},
+        )
+        bad_map_hits = self.hits(
+            bad_map_svc,
+            self.backend_config(hc_port=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(bad_map_hits), 1)
+        self.assertIn("bound to Service port 'missing'", bad_map_hits[0]["excerpt"])
+
+        override_svc = self.svc(
+            port=80,
+            target=8080,
+            port_name="http",
+            annotations={
+                "cloud.google.com/backend-config": json.dumps(
+                    {"default": "broken-default", "ports": {"http": "override-bc"}}
+                )
+            },
+        )
+        override_clean = self.hits(
+            override_svc,
+            self.backend_config(name="broken-default", hc_port=9999),
+            self.backend_config(name="override-bc", hc_port=8443),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(override_clean, [])
+
+        # USE_SERVING_PORT ignores a stale portName field alongside it.
+        serving_stale_pname = self.hits(
+            self.svc(port=80, target=8443, port_name="http"),
+            self.health_check_policy(port_spec="USE_SERVING_PORT", port_name="legacy-hc"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(serving_stale_pname, [])
+
+        # HealthCheckPolicy USE_NAMED_PORT missing portName and SSL healthCheck fixed-port mismatch.
+        named_hits = self.hits(
+            self.svc(port=80, target=8443, port_name="http"),
+            self.health_check_policy(port_spec="USE_NAMED_PORT", port_name="admin"),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(named_hits), 1)
+        self.assertIn("portName 'admin'", named_hits[0]["excerpt"])
+
+        ssl_hcp = {
+            "apiVersion": "networking.gke.io/v1",
+            "kind": "HealthCheckPolicy",
+            "metadata": {"name": "ssl-hcp", "namespace": "seeded-networking", "labels": {}, "annotations": {}},
+            "spec": {
+                "targetRef": {"group": "", "kind": "Service", "name": "backend-api-svc"},
+                "default": {
+                    "config": {
+                        "type": "SSL",
+                        "sslHealthCheck": {"portSpecification": "USE_FIXED_PORT", "port": 9999},
+                    }
+                },
+            },
+        }
+        ssl_hits = self.hits(
+            self.svc(port=443, target=8443),
+            ssl_hcp,
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(ssl_hits), 1)
+        self.assertIn("HealthCheckPolicy/ssl-hcp probes port 9999", ssl_hits[0]["excerpt"])
+
+    def test_httproute_request_mirror_cross_namespace_and_ingress_default_backend(self):
+        cross_route = {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": "edge-route", "namespace": "edge", "labels": {}, "annotations": {}},
+            "spec": {
+                "rules": [
+                    {
+                        "backendRefs": [{"name": "edge-svc", "port": 80}],
+                        "filters": [
+                            {
+                                "type": "RequestMirror",
+                                "requestMirror": {
+                                    "backendRef": {
+                                        "name": "backend-api-svc",
+                                        "namespace": "seeded-networking",
+                                        "port": 80,
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        mirror_hits = self.hits(
+            cross_route,
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(mirror_hits), 1)
+        self.assertIn("HTTPRoute/edge/edge-route", mirror_hits[0]["excerpt"])
+
+        # Per-backend RequestMirror filter under spec.rules[].backendRefs[].filters[].
+        backend_filter_route = {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": "backend-mirror", "namespace": "edge", "labels": {}, "annotations": {}},
+            "spec": {
+                "rules": [
+                    {
+                        "backendRefs": [
+                            {
+                                "name": "edge-svc",
+                                "port": 80,
+                                "filters": [
+                                    {
+                                        "type": "RequestMirror",
+                                        "requestMirror": {
+                                            "backendRef": {
+                                                "name": "backend-api-svc",
+                                                "namespace": "seeded-networking",
+                                                "port": 80,
+                                            }
+                                        },
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            },
+        }
+        backend_mirror_hits = self.hits(
+            backend_filter_route,
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(backend_mirror_hits), 1)
+        self.assertIn("HTTPRoute/edge/backend-mirror", backend_mirror_hits[0]["excerpt"])
+
+        default_ing = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "default-ing", "namespace": "seeded-networking", "labels": {}, "annotations": {}},
+            "spec": {"defaultBackend": {"service": {"name": "backend-api-svc", "port": {"number": 80}}}},
+        }
+        default_ing_hits = self.hits(
+            default_ing,
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(default_ing_hits), 1)
+        self.assertIn("Ingress/default-ing", default_ing_hits[0]["excerpt"])
+
+        # Portless HTTPRoute backendRef reports the missing port rather than blaming unrouted ports.
+        portless_route = {
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {"name": "portless", "namespace": "seeded-networking", "labels": {}, "annotations": {}},
+            "spec": {"rules": [{"backendRefs": [{"name": "backend-api-svc"}]}]},
+        }
+        multi_svc = service(
+            "backend-api-svc",
+            ns="seeded-networking",
+            selector={"app": "backend-api"},
+            ports=[
+                {"name": "http", "port": 80, "protocol": "TCP", "targetPort": 8443},
+                {"name": "debug", "port": 9090, "protocol": "TCP", "targetPort": 9090},
+            ],
+        )
+        portless_hits = self.hits(
+            portless_route,
+            multi_svc,
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http", "debug"]),
+            self.backend(ports=[{"containerPort": 8443}]),
+        )
+        self.assertEqual(len(portless_hits), 1)
+        self.assertIn("omits target Service port", portless_hits[0]["excerpt"])
+        self.assertNotIn("9090/TCP", portless_hits[0]["excerpt"])
+
+    def test_self_health_sidecars_do_not_arm_port_contract_when_app_container_omits_ports(self):
+        dep = self.backend(ports=None, readiness_probe=None)
+        dep["spec"]["template"]["spec"]["containers"].append(
+            {
+                "name": "cloud-sql-proxy",
+                "ports": [{"containerPort": 5432}],
+                "readinessProbe": {"httpGet": {"path": "/readiness", "port": 9090}},
+            }
+        )
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                dep,
+            ),
+            [],
+        )
+
+
 def fake_run(replies, calls):
     def run(argv, **kwargs):
         calls.append(argv)
@@ -4213,10 +5146,11 @@ class TestCollectCluster(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         na = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
         workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
-        # The three cluster-kind checks that grade against the workload set
+        # The four cluster-kind checks that grade against the workload set
         # examined nothing either: a PDB is only graded against the workload
-        # it covers, an HPA's floor only against a Service-backed workload.
-        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one"}
+        # it covers, an HPA's floor or scale-down behavior only against the
+        # workload it scales.
+        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one", "hpa-aggressive-scaledown"}
         self.assertEqual(set(na), workload_slugs | anchored)
         # The cluster-scoped checks still ran: an HPA pointing at a workload
         # that no longer exists, a PDB nothing can satisfy, a CronJob that has
@@ -4235,6 +5169,7 @@ class TestCollectCluster(unittest.TestCase):
                 "cronjob-runs-overlap",
                 "service-selects-nothing",
                 "service-port-unresolved",
+                "ingress-gateway-healthcheck-mismatch",
             },
         )
         self.assertFalse(cluster_slugs & set(na))
@@ -4447,10 +5382,11 @@ class TestCollectCluster(unittest.TestCase):
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
+        extra_read_slugs = {"untargeted-compute-class-workload", "ingress-gateway-healthcheck-mismatch"}
         dump_commands = {
             c["command"]
             for c in result["commands"]
-            if c["check"] != "untargeted-compute-class-workload"
+            if c["check"] not in extra_read_slugs
         }
         self.assertEqual(len(dump_commands), 1)
         self.assertIn("kubectl get", next(iter(dump_commands)))
@@ -4460,6 +5396,13 @@ class TestCollectCluster(unittest.TestCase):
             if c["check"] == "untargeted-compute-class-workload"
         )
         self.assertIn("kubectl get computeclasses", cc_cmd)
+        mm_cmd = next(
+            c["command"]
+            for c in result["commands"]
+            if c["check"] == "ingress-gateway-healthcheck-mismatch"
+        )
+        base_dump = next(iter(dump_commands))
+        self.assertTrue(mm_cmd.startswith(f"{base_dump}; KUBECONFIG="), mm_cmd)
 
     def test_every_check_records_the_paged_dump_chain_under_the_clusters_kubeconfig(self):
         """The record, not only the reads: each obtainability check's `command` is
@@ -4482,11 +5425,14 @@ class TestCollectCluster(unittest.TestCase):
         self.assertTrue(str(kubeconfig).startswith(tmp), kubeconfig)
         expected = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
         self.assertTrue(expected.startswith("( export KUBECONFIG="), expected)
-        dump_slugs = {c["check"] for c in result["commands"] if c["check"] != "untargeted-compute-class-workload"}
-        self.assertEqual({spec.slug for spec in collect.OBTAINABILITY_CHECKS} - {"untargeted-compute-class-workload"}, dump_slugs)
+        extra_read_slugs = {"untargeted-compute-class-workload", "ingress-gateway-healthcheck-mismatch"}
+        dump_slugs = {c["check"] for c in result["commands"] if c["check"] not in extra_read_slugs}
+        self.assertEqual({spec.slug for spec in collect.OBTAINABILITY_CHECKS} - extra_read_slugs, dump_slugs)
         for c in result["commands"]:
-            if c["check"] != "untargeted-compute-class-workload":
+            if c["check"] not in extra_read_slugs:
                 self.assertEqual(expected, c["command"], c["check"])
+            elif c["check"] == "ingress-gateway-healthcheck-mismatch":
+                self.assertTrue(c["command"].startswith(expected + "; KUBECONFIG="), c["command"])
 
 
 class TestCollectFleet(unittest.TestCase):
@@ -4882,6 +5828,10 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # answers with one healthy object: served and empty would
                 # declare `configsync-reconciler-stalled` inapplicable.
                 return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.SERVICEENTRY_KIND:
+                # One ServiceEntry, for the same reason: served and empty would
+                # declare `serviceentry-host-collision` inapplicable.
+                return Run(argv, 0, projected(service_entry("egress", "team-a", ["api.example.com"])), "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
             if argv[:3] == ["gcloud", "container", "clusters"]:
@@ -5045,6 +5995,31 @@ def configsync_object(kind, name, ns="config-management-system", stalled="False"
     for stage, errors in (stage_errors or {}).items():
         doc["status"][stage] = {"errors": errors, "errorSummary": {"totalCount": len(errors)}}
     return doc
+
+
+def service_entry(name, ns, hosts, export_to=None, addresses=(), ports=((443, "TLS"),), resolution="DNS", endpoints=()):
+    """An Istio ServiceEntry as `kubectl get serviceentries.networking.istio.io -A -o json`
+    returns it. `export_to=None` omits the field, which exports to every namespace."""
+    spec = {
+        "hosts": list(hosts),
+        "ports": [{"number": n, "name": f"p{n}", "protocol": proto} for n, proto in ports],
+        "resolution": resolution,
+    }
+    if export_to is not None:
+        spec["exportTo"] = list(export_to)
+    if addresses:
+        spec["addresses"] = list(addresses)
+    if endpoints:
+        spec["endpoints"] = [{"address": a} for a in endpoints]
+    return {"apiVersion": "networking.istio.io/v1", "kind": "ServiceEntry", "metadata": {"namespace": ns, "name": name}, "spec": spec}
+
+
+def projected(*entries):
+    """ServiceEntries as the collector's jsonpath projection prints them: one
+    `<namespace>\\t<name>\\t<spec JSON>` line each, nothing for none."""
+    return "".join(
+        f"{e['metadata']['namespace']}\t{e['metadata']['name']}\t{json.dumps(e['spec'])}\n" for e in entries
+    )
 
 
 def compliance_workload(kind, name, ns="default"):
@@ -7941,7 +8916,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, serviceentry_items=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -7998,6 +8973,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
                         # "one served, one unserved" arm has to accept.
                         return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds.split(".")[0]}" in group "configsync.gke.io"', 0.05)
                     return Run(argv, 0, json.dumps(dump_of(*configsync_items)), "", 0.05)
+                if kinds == collect.SERVICEENTRY_KIND:
+                    if callable(serviceentry_items):
+                        return serviceentry_items(argv, **kwargs)
+                    if serviceentry_items is None:
+                        # A cluster without Istio, which is most of a fleet
+                        # and the default here.
+                        return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "serviceentries" in group "networking.istio.io"', 0.05)
+                    return Run(argv, 0, projected(*serviceentry_items), "", 0.05)
                 if kinds in collect.AUTOPILOT_ALLOWLIST_KINDS:
                     if callable(allowlist_items):
                         return allowlist_items(argv, **kwargs)
@@ -8206,13 +9189,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # Config Connector does. It is declared by the collector rather
             # than by the Autopilot table, so it is not part of what this test
             # is about -- see `test_a_cluster_without_config_connector_...`.
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
-            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"):
                 continue
             self.assertIn("Autopilot", entry["reason"])
 
@@ -8230,7 +9213,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # wrote it: an unfalsifiable claim is the defect, not Autopilot's
             # phrasing of one.
             self.assertNotIn("cannot exist", entry["reason"])
-            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"):
                 continue
             # Scoped to the workloads the audit can see, and to the admission
             # policy holding -- both halves, on every Autopilot reason.
@@ -8248,7 +9231,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
         )
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"}
         )
         # And they report as what they are: checks that ran and found nothing.
         command_slugs = {c["check"] for c in result["commands"]}
@@ -8267,7 +9250,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
 
     def test_a_standard_cluster_never_reads_for_allowlists(self):
@@ -8288,7 +9271,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(result["outcome"], "collected")
-        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"})
+        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"})
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"},
             {c["check"] for c in result["commands"]},
@@ -8306,7 +9289,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
 
     def test_standard_cluster_declares_only_the_config_connector_check(self):
@@ -8320,7 +9303,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         and just as good at teaching a reader to ignore the column."""
         result = self.run_with()
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"}
         )
 
     def kcc_reason(self, result):
@@ -8526,7 +9509,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # Nor are the other two, though they found nothing: all three rest on
         # one admission rule, and a privileged pod says it is not holding on
         # this cluster, so a hostPath or host-namespace pod could be there too.
-        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled"})
+        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"})
         self.assertLessEqual({"host-namespace", "hostpath-mount"}, {c["check"] for c in result["commands"]})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
@@ -8574,15 +9557,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Eighteen checks minus the three Autopilot rules out and the two no
-        cluster without Config Connector or Config Sync can run is thirteen, each
-        with a command behind it, and the five dispositioned rather than silently absent --
-        absent is what §6 reads as a coverage gap."""
+        Nineteen checks minus the three Autopilot rules out and the three no
+        cluster without Config Connector, Config Sync or Istio can run is thirteen,
+        each with a command behind it, and the six dispositioned rather than silently
+        absent -- absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(len(command_slugs), 13)
-        self.assertEqual(len(na_slugs), 5)
+        self.assertEqual(len(na_slugs), 6)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 
@@ -13160,6 +14143,18 @@ class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
                 self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
                 self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
                 self.assertEqual(text, audit_report.trim_command(text))
+        obtainability_dump = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
+        crd_suffix = [
+            f"KUBECONFIG={collect.shlex.quote(str(kubeconfig))} kubectl get {crd} -A {collect.KUBECTL_CHUNK_SIZE_ARG} -o json"
+            for crd in collect.INGRESS_GATEWAY_CRD_RESOURCES
+        ]
+        mm_text = "; ".join([obtainability_dump, *crd_suffix])
+        self.assertLessEqual(len(mm_text), audit_report.MAX_COMMAND_CHARS, len(mm_text))
+        self.assertEqual(
+            mm_text,
+            audit_report.validate_check_command(mm_text, "clusters[0]", "ingress-gateway-healthcheck-mismatch"),
+        )
+        self.assertEqual(mm_text, audit_report.trim_command(mm_text))
 
 
 class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
@@ -13203,6 +14198,9 @@ class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
                 return Run(argv, 0, json.dumps(dump_of(self.COMPUTE_CLASS)), "", 0.05)
             if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
                 return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.SERVICEENTRY_KIND:
+                # Served and empty: the projection prints nothing.
+                return Run(argv, 0, "", "", 0.05)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.1)
             if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
@@ -13429,6 +14427,356 @@ class TestWebhookBackendUnreachable(unittest.TestCase):
         readiness = collect._upgrade_readiness()
         self.assertTrue(hasattr(readiness, "backend_problem"))
         self.assertEqual(readiness.__file__, str(collect.UPGRADE_READINESS_SCRIPTS / "upgrade_readiness.py"))
+
+
+class TestServiceEntryHostCollision(unittest.TestCase):
+    """§2.19. One host declared by ServiceEntries in two namespaces, where a third
+    namespace sees more than one of them and so routes by Istio's pick."""
+
+    HOST = "api.example.com"
+    # Well under audit_report's 2000-character excerpt trim: the line stays
+    # readable whatever the number of declarers.
+    BOUNDED_EXCERPT_CHARS = 1500
+
+    def hits(self, *entries):
+        return collect.check_serviceentry_host_collision({"serviceentries": list(entries)})
+
+    def test_two_teams_exporting_one_host_everywhere_is_one_finding_on_the_host(self):
+        hits = self.hits(
+            service_entry("payments", "team-a", [self.HOST], addresses=["10.0.0.1"]),
+            service_entry("payments", "team-b", [self.HOST], export_to=["*"], addresses=["10.0.0.2"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], f"ServiceEntry host {self.HOST}")
+        self.assertEqual(hits[0]["namespace"], "")
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        self.assertIn("team-a/payments", hits[0]["excerpt"])
+        self.assertIn("team-b/payments", hits[0]["excerpt"])
+        self.assertIn("every namespace that declares none of them", hits[0]["excerpt"])
+        self.assertIn("10.0.0.1", hits[0]["excerpt"])
+        self.assertIn("10.0.0.2", hits[0]["excerpt"])
+
+    def test_the_excerpt_names_only_the_differing_fields_in_plain_words(self):
+        hits = self.hits(
+            service_entry("payments", "team-a", [self.HOST], addresses=["10.0.0.1"]),
+            service_entry("payments", "team-b", [self.HOST], addresses=["10.0.0.2"]),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("They differ in addresses 10.0.0.1 in team-a/payments, 10.0.0.2 in team-b/payments.", excerpt)
+        self.assertNotIn("{", excerpt)
+        self.assertNotIn("resolution", excerpt)
+        self.assertNotIn("ports", excerpt)
+        self.assertIn('set exportTo: ["."] on team-a/payments, team-b/payments', excerpt)
+        self.assertIn("if no namespace that declares none of them needs the host", excerpt)
+
+    def test_the_fix_survives_publication_and_a_long_value_is_cut(self):
+        endpoints = tuple(f"10.1.{i}.1" for i in range(60))
+        hits = self.hits(
+            service_entry("a", "team-a", [self.HOST], endpoints=endpoints),
+            service_entry("b", "team-b", [self.HOST], endpoints=endpoints[1:]),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertLess(excerpt.index("First fix to consider"), excerpt.index("They differ"))
+        self.assertLess(excerpt.index("First fix to consider"), audit_report.MAX_EXCERPT_CHARS)
+        self.assertIn("…", excerpt)
+        self.assertLess(len(excerpt), TestServiceEntryHostCollision.BOUNDED_EXCERPT_CHARS)
+
+    def test_a_renamed_port_differs_because_endpoint_ports_are_keyed_by_name(self):
+        a = service_entry("a", "team-a", [self.HOST])
+        b = service_entry("b", "team-b", [self.HOST])
+        b["spec"]["ports"][0]["name"] = "https-renamed"
+        hits = self.hits(a, b)
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        self.assertIn("https-renamed", hits[0]["excerpt"])
+
+    def test_workload_selector_endpoint_labels_and_weights_each_count(self):
+        """Each is on the SOP's routing list; dropping any one from the comparison
+        must turn a real conflict into `minor`, and these catch it."""
+        for change in (
+            lambda spec: spec.__setitem__("workloadSelector", {"labels": {"app": "pay"}}),
+            lambda spec: spec["endpoints"][0].__setitem__("labels", {"version": "v2"}),
+            lambda spec: spec["endpoints"][0].__setitem__("weight", 10),
+        ):
+            with self.subTest(change=change):
+                a = service_entry("a", "team-a", [self.HOST], endpoints=("10.0.0.1",))
+                b = service_entry("b", "team-b", [self.HOST], endpoints=("10.0.0.1",))
+                change(b["spec"])
+                self.assertEqual(self.hits(a, b)[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+
+    def test_identical_copies_are_minor(self):
+        hits = self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-b", [self.HOST]))
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
+        self.assertIn("identical", hits[0]["excerpt"])
+
+    def test_entries_that_differ_only_in_location_or_target_port_are_not_identical(self):
+        a = service_entry("a", "team-a", [self.HOST], addresses=["10.0.0.1"])
+        b = service_entry("b", "team-b", [self.HOST], addresses=["10.0.0.1"])
+        b["spec"]["location"] = "MESH_INTERNAL"
+        self.assertEqual(self.hits(a, b)[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        c = service_entry("c", "team-c", [self.HOST], addresses=["10.0.0.1"])
+        c["spec"]["ports"][0]["targetPort"] = 8443
+        hits = self.hits(a, c)
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        self.assertIn("8443", hits[0]["excerpt"])
+
+    def test_identical_copies_with_ports_listed_in_another_order_are_minor(self):
+        a = service_entry("a", "team-a", [self.HOST], ports=((443, "TLS"), (80, "HTTP")))
+        b = service_entry("b", "team-b", [self.HOST], ports=((80, "HTTP"), (443, "TLS")))
+        self.assertEqual(self.hits(a, b)[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
+
+    def test_namespace_local_entries_do_not_collide(self):
+        self.assertEqual(
+            self.hits(
+                service_entry("a", "team-a", [self.HOST], export_to=["."]),
+                service_entry("b", "team-b", [self.HOST], export_to=["."], addresses=["10.0.0.9"]),
+            ),
+            [],
+        )
+
+    def test_one_public_entry_beside_a_local_one_has_one_answer_everywhere(self):
+        """team-b sees both and keeps its own; every other namespace sees only team-a's."""
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-b", [self.HOST], export_to=["."])),
+            [],
+        )
+
+    def test_a_declaring_namespace_that_sees_the_other_entry_keeps_its_own(self):
+        self.assertEqual(
+            self.hits(
+                service_entry("a", "team-a", [self.HOST], export_to=[".", "team-b"]),
+                service_entry("b", "team-b", [self.HOST], export_to=[".", "team-a"]),
+            ),
+            [],
+        )
+
+    def test_two_explicit_lists_naming_one_third_namespace_collide_there(self):
+        hits = self.hits(
+            service_entry("a", "team-a", [self.HOST], export_to=[".", "shared"]),
+            service_entry("b", "team-b", [self.HOST], export_to=[".", "shared", "only-b"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("namespace shared sees", hits[0]["excerpt"])
+        self.assertNotIn("only-b", hits[0]["excerpt"])
+
+    def test_a_public_entry_and_a_list_naming_a_third_namespace_collide_there(self):
+        hits = self.hits(
+            service_entry("a", "team-a", [self.HOST]),
+            service_entry("b", "team-b", [self.HOST], export_to=["team-c"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("namespace team-c sees", hits[0]["excerpt"])
+
+    def test_an_entry_exported_to_no_namespace_collides_with_nothing(self):
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-b", [self.HOST], export_to=["~"])),
+            [],
+        )
+
+    def test_a_declarer_whose_entry_is_hidden_from_itself_is_not_exempt(self):
+        """team-n's own entry is exported nowhere, so its sidecars choose between
+        team-p's public entry and team-q's, which names team-n."""
+        hits = self.hits(
+            service_entry("n", "team-n", [self.HOST], export_to=["~"]),
+            service_entry("p", "team-p", [self.HOST], addresses=["10.0.0.1"]),
+            service_entry("q", "team-q", [self.HOST], export_to=["team-n"], addresses=["10.0.0.2"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("namespace team-n sees", hits[0]["excerpt"])
+
+    def test_an_entry_no_colliding_viewer_sees_is_not_named_and_does_not_set_severity(self):
+        """team-a's local-only entry is exported to team-a alone, so no namespace
+        that sees two copies sees it: the copies it sees are identical."""
+        hits = self.hits(
+            service_entry("local-only", "team-a", [self.HOST], export_to=["."], addresses=["10.0.0.99"]),
+            service_entry("exported", "team-a", [self.HOST], export_to=["*"], addresses=["10.0.0.1"]),
+            service_entry("exported", "team-b", [self.HOST], export_to=["*"], addresses=["10.0.0.1"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
+        self.assertNotIn("local-only", hits[0]["excerpt"])
+        self.assertIn("team-a/exported", hits[0]["excerpt"])
+
+    def test_two_entries_in_one_namespace_are_one_declarer(self):
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-a", [self.HOST], addresses=["10.0.0.3"])),
+            [],
+        )
+
+    def test_hosts_match_case_insensitively(self):
+        self.assertEqual(len(self.hits(service_entry("a", "team-a", ["API.example.com"]), service_entry("b", "team-b", [self.HOST]))), 1)
+
+    def test_a_wildcard_beside_a_specific_host_is_not_a_collision(self):
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", ["*.example.com"]), service_entry("b", "team-b", [self.HOST])),
+            [],
+        )
+
+    def test_a_malformed_entry_is_skipped_not_fatal(self):
+        self.assertEqual(self.hits({"kind": "ServiceEntry"}, "not-a-dict", service_entry("a", "team-a", [self.HOST])), [])
+
+    def test_a_host_declared_in_hundreds_of_namespaces_stays_one_bounded_line(self):
+        entries = [service_entry("e", f"team-{i:03d}", [self.HOST], addresses=[f"10.0.{i // 250}.{i % 250}"]) for i in range(300)]
+        hits = self.hits(*entries)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("300 namespaces", hits[0]["excerpt"])
+        self.assertIn(f"and {300 - collect.MAX_SERVICEENTRY_NAMED} more", hits[0]["excerpt"])
+        self.assertLess(len(hits[0]["excerpt"]), self.BOUNDED_EXCERPT_CHARS)
+
+
+class TestServiceEntryHostCollisionAtScale(unittest.TestCase):
+    """The check reads ServiceEntries only, so pods and nodes cost it nothing; what
+    grows is entries per cluster and clusters per fleet. Both bounds below are an
+    order of magnitude over a pairwise compare's cost would allow, so a regression
+    to comparing every entry with every other fails here rather than in a fleet."""
+
+    # Entries in one cluster, and namespaces they spread over. 20k entries is
+    # past any mesh this repo has seen by two orders of magnitude.
+    ENTRIES = 20_000
+    NAMESPACES = 2_000
+    COLLIDING_HOSTS = 50
+    # Generous: the linear pass runs in well under a second on a laptop; a
+    # pairwise compare over 20k entries is 200M pairs.
+    SECONDS_BUDGET = 10.0
+    CLUSTERS = 40
+    ENTRIES_PER_CLUSTER = 2_000
+
+    def entries(self, count, namespaces, colliding):
+        out = []
+        for i in range(count):
+            ns = f"ns-{i % namespaces:04d}"
+            # The first `colliding` hosts are each declared from two namespaces.
+            host = f"shared-{i % colliding}.example.com" if i < 2 * colliding else f"svc-{i}.example.com"
+            out.append(service_entry(f"se-{i}", ns, [host], export_to=["*"] if i % 3 else None, addresses=[f"10.{i % 250}.0.1"]))
+        return out
+
+    def test_one_cluster_with_twenty_thousand_entries(self):
+        entries = self.entries(self.ENTRIES, self.NAMESPACES, self.COLLIDING_HOSTS)
+        started = time.monotonic()
+        hits = collect.check_serviceentry_host_collision({"serviceentries": entries})
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(hits), self.COLLIDING_HOSTS)
+        self.assertLess(elapsed, self.SECONDS_BUDGET)
+
+    def test_one_host_declared_from_every_namespace_with_long_export_lists(self):
+        """The pathological shape for a per-namespace walk: one host, 2,000
+        declarers, each exporting to 50 named namespaces."""
+        entries = [
+            service_entry("e", f"ns-{i:04d}", ["hot.example.com"], export_to=[f"consumer-{(i + k) % 500}" for k in range(50)])
+            for i in range(self.NAMESPACES)
+        ]
+        started = time.monotonic()
+        hits = collect.check_serviceentry_host_collision({"serviceentries": entries})
+        self.assertLess(time.monotonic() - started, self.SECONDS_BUDGET)
+        self.assertEqual(len(hits), 1)
+
+    def test_a_fleet_of_clusters_collects_each_through_the_real_sweep(self):
+        """`collect_fleet` over 40 clusters of 2,000 entries each: every cluster is
+        collected, records the read, and reports its own two collisions."""
+        clusters = [{"name": f"c{i:02d}", "location": "us-central1", "status": "RUNNING"} for i in range(self.CLUSTERS)]
+        payload = projected(*self.entries(self.ENTRIES_PER_CLUSTER, 200, 2))
+
+        def run(argv, **kwargs):
+            if discovered := discovery_of_acme(argv):
+                return discovered
+            if "list" in argv and "clusters" in argv:
+                return Run(argv, 0, json.dumps(clusters), "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.SERVICEENTRY_KIND:
+                return Run(argv, 0, payload, "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "x"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, "[]", "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        started = time.monotonic()
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            manifest = collect.collect_fleet("compliance-audit", run=run)
+        self.assertLess(time.monotonic() - started, self.SECONDS_BUDGET * 3)
+        targets = [t for t in manifest["clusters"] if t["outcome"] == collect.OUTCOME_COLLECTED]
+        self.assertEqual(len(targets), self.CLUSTERS)
+        for target in targets:
+            found = [c for c in target["candidates"] if c["check"] == collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+            self.assertEqual(len(found), 2, target["name"])
+            self.assertIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in target["commands"]})
+
+
+class TestServiceEntryCollection(unittest.TestCase):
+    """§2.19's read inside `_collect_compliance`: unserved is inapplicable, a failed
+    read is undetermined, and a planted pair is a candidate held for triage."""
+
+    def compliance(self, **kw):
+        return TestComplianceCollectCluster().run_with(**kw)
+
+    def reason(self, result):
+        for entry in (result.get("checks_not_applicable") or []) + (result.get("checks_unevaluated") or []):
+            if entry["check"] == collect.SERVICEENTRY_HOST_COLLISION_SLUG:
+                return entry["reason"]
+        return None
+
+    def test_a_cluster_without_istio_is_inapplicable_and_records_no_command(self):
+        result = self.compliance()
+        self.assertIn("Istio is not installed", self.reason(result))
+        self.assertNotIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in result["commands"]})
+        self.assertNotIn("checks_unevaluated", result)
+
+    def test_served_but_empty_is_inapplicable_not_clean(self):
+        result = self.compliance(serviceentry_items=[])
+        self.assertIn("no namespace declares one", self.reason(result))
+        self.assertNotIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in result["commands"]})
+
+    def test_a_forbidden_read_is_undetermined_and_the_other_checks_still_run(self):
+        result = self.compliance(
+            serviceentry_items=lambda argv, **kw: Run(argv, 1, "", "Error from server (Forbidden): serviceentries.networking.istio.io is forbidden", 0.1)
+        )
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated[collect.SERVICEENTRY_HOST_COLLISION_SLUG])
+        self.assertIn("Forbidden", unevaluated[collect.SERVICEENTRY_HOST_COLLISION_SLUG])
+        self.assertIn("lb-world-open", {c["check"] for c in result["commands"]})
+
+    def test_a_timed_out_read_is_undetermined(self):
+        result = self.compliance(serviceentry_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        self.assertIn("did not finish", self.reason(result))
+
+    def test_an_unparseable_read_is_undetermined(self):
+        result = self.compliance(serviceentry_items=lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1))
+        self.assertIn("could not read", self.reason(result))
+
+    def test_a_reply_cut_mid_line_is_undetermined_not_a_shorter_list(self):
+        whole = projected(service_entry("a", "team-a", ["api.example.com"]), service_entry("b", "team-b", ["api.example.com"]))
+        result = self.compliance(serviceentry_items=lambda argv, **kw: Run(argv, 0, whole[: len(whole) - 10], "", 0.1))
+        self.assertIn("could not read", self.reason(result))
+        self.assertNotIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in result["candidates"]})
+
+    def test_the_read_is_a_projection_not_a_full_object_list(self):
+        result = self.compliance(serviceentry_items=[service_entry("a", "team-a", ["api.example.com"])])
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+        self.assertIn("jsonpath=", command)
+        self.assertNotIn("-o json", command)
+
+    def test_a_planted_pair_is_a_candidate_held_for_triage_with_its_read_recorded(self):
+        result = self.compliance(
+            serviceentry_items=[
+                service_entry("external-api", "team-a", ["api.example.com"], export_to=["*"], addresses=["240.0.0.1"]),
+                service_entry("external-api", "team-b", ["api.example.com"], export_to=["*"], addresses=["240.0.0.2"]),
+                service_entry("scoped-api", "team-c", ["scoped.example.com"], export_to=["."]),
+                service_entry("scoped-api", "team-d", ["scoped.example.com"], export_to=["."]),
+            ]
+        )
+        found = [c for c in result["candidates"] if c["check"] == collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["object"], "ServiceEntry host api.example.com")
+        self.assertEqual(found[0]["severity"], "major")
+        self.assertEqual(found[0]["needs_triage"], collect.SERVICEENTRY_OWNER_TRIAGE)
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+        self.assertIn(collect.SERVICEENTRY_KIND, command)
+        self.assertIsNone(self.reason(result))
 
 
 if __name__ == "__main__":

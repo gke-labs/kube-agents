@@ -63,6 +63,7 @@ class GoldenFixtureTest(unittest.TestCase):
                         task_credential.TaskTrigger(**want_trigger) if want_trigger else None,
                         claims.trigger,
                     )
+                    self.assertEqual(frozenset(want.get("permits") or ()), claims.permits)
                     self.assertTrue(claims.jti)
                 else:
                     with self.assertRaises(TaskCredentialError):
@@ -98,6 +99,13 @@ class GoldenFixtureTest(unittest.TestCase):
             "a span past the ceiling, with exp-now inside it",
             "expiry past the ceiling plus skew from now",
             "the nats audience",
+            "a permit",
+            "minted by taskcred.Mint with a permit",
+            "an unknown permit",
+            "permits on the nats audience",
+            "permits as a bare string",
+            "a number in permits",
+            "an empty permits list",
             "a builtin schedule trigger",
             "an unknown trigger claim",
             "a case-variant trigger key",
@@ -123,6 +131,41 @@ class GoldenFixtureTest(unittest.TestCase):
     def _case(self, name):
         return next(case for case in self.doc["cases"] if case["name"] == name)
 
+    def test_a_permit_is_read_out(self):
+        for name in ("a permit", "minted by taskcred.Mint with a permit"):
+            with self.subTest(case=name):
+                claims = self.verify(self._case(name))
+                self.assertEqual(frozenset({task_credential.PERMIT_VCS_PROPOSAL_CREATE}), claims.permits)
+
+    def test_no_permit_reads_as_none(self):
+        self.assertEqual(frozenset(), self.verify(self._case("valid")).permits)
+
+    def test_permits_on_the_nats_audience_are_refused_for_the_permits(self):
+        # The audience check would refuse this credential anyway; the
+        # message pins that the permits rule is what refused it first, so
+        # the rule is not resting on the audience check alone.
+        with self.assertRaisesRegex(TaskCredentialError, "permits may appear only on"):
+            self.verify(self._case("permits on the nats audience"))
+
+    def test_an_unknown_permit_is_refused_by_name(self):
+        for name in ("an unknown permit", "a known permit beside an unknown one", "a case variant of the permit"):
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(TaskCredentialError, "is not one this verifier knows"):
+                    self.verify(self._case(name))
+
+    def test_a_malformed_permits_value_is_refused_by_shape(self):
+        for name, pattern in (
+            ("permits as a bare string", "not a non-empty list"),
+            ("permits as an object", "not a non-empty list"),
+            ("an empty permits list", "not a non-empty list"),
+            ("a null permits", "not a non-empty list"),
+            ("a number in permits", "not a string"),
+            ("an object in permits", "not a string"),
+            ("the permit twice", "appears twice"),
+        ):
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(TaskCredentialError, pattern):
+                    self.verify(self._case(name))
     def test_a_verifier_without_the_trigger_claim_refuses_one(self):
         # Version skew fails closed: a broker older than the trigger claim
         # refuses a credential that carries one, rather than ignoring it,

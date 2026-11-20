@@ -109,7 +109,7 @@ and each caller routes to the right one.**
   sweep can hold that cap when the clamp arrives, and the admission it keeps for background
   work holds nothing while the clamp admits background work one at a time.
 - **No priority inside the shell role.** A caller authenticates with a projected ServiceAccount token. The broker
-  learns the workload and a role (shell, chat, a2a-chat, session, watcher, mcp) from it. The
+  learns the workload and a role (shell, chat, a2a-chat, a2a-reports, session, watcher, mcp, scope, profile) from it. The
   `caller` field of `Principal` is always `None` (`credential_proxy.py:2182`). Background work
   reaches the broker as the shell role, the same as an interactive command:
   - the fleet audits are agent cron jobs (`agents/platform/cron/jobs.json`, skill `fleet-audit`).
@@ -183,18 +183,20 @@ one pod's CPU is one limit.
 | `/v1/vcs/<verb>`, `/v1/forge/refresh`, `/v1/github/refresh` | Stateful broker                                               | Keeps one forge-token coalesce cache, so GitHub mints do not multiply by N                                                                                                 |
 | `/v1/chat/*` relays, `/v1/chat/a2a/*` included              | Stateful broker                                               | **Needs one pod:** in-process receipt maps, one Socket Mode connection                                                                                                     |
 | `/v1/exec` for the `scope` role (#4119)                     | Stateful broker                                               | **Needs one pod:** a 2-hour in-memory member window                                                                                                                        |
+| `POST /v1/dial`                                             | Stateful broker                                               | **Needs one pod:** the dial's level is held in process and on the Pod's emptyDir, and `/v1/vcs/<verb>` reads it                                                            |
 | `/v1/mcp/*`, `/v1/pubsub/*`                                 | Stateful broker (first step)                                  | Safe on N pods: no state across calls                                                                                                                                      |
 | `/v1/watcher/*`, `/v1/k8s/*`, `/v1/feedback/submit`         | Stateful broker (first step)                                  | Safe on N pods: `/v1/k8s/*` keeps only a 300 s endpoint cache                                                                                                              |
+| `/v1/audit-reports*` (#5619)                                | Stateful broker                                               | The exec tier has no audit-report store token (`credential_proxy_exec_tier.go` drops it), so an exec pod answers these routes 404                                          |
 
 Two route groups need the single pod: the chat relays' event, ack and nack routes, and the
 `scope` role's `/v1/exec` calls (#4119), whose member window lives in one process. The content
 workspace's handles were a third group; the content workspace is retired (#4243). The rest
 stay on it as a first step, not because they keep state:
 
-- **The A2A Google Chat relay stays a broker route in `next` mode.** With Chat on, the install's
+- **The A2A Google Chat relay stays a broker route.** With Chat on, the install's
   subscription goes to the broker's A2A relay instance, and the legacy instance is not built
   (`platformagent_manifests.go:4587-4597`). The consumer moved to the A2A gateway; the Pub/Sub pull
-  and its receipt map did not. So the stateful pod stays in both modes.
+  and its receipt map did not. So the stateful pod stays, Chat on or off.
 - **Slack leaves the broker whenever Slack is on** (`a2aSlackArmed`,
   `platformagent_a2a_manifests.go`), Chat on or off: the A2A gateway holds it, and the broker's
   relay is not rendered.
@@ -236,7 +238,7 @@ same reason as §4.3's retry. A failed connect can take the shim's whole connect
 So the shim writes one stderr line on each fallback, and §5's `broker_tier` audit field is the
 check: exec-role commands on `stateful` while replicas > 0 mean the exec path is broken. The Cloud
 API relay client (`ApiSession`) also falls back on a connection error that comes after the request
-was sent, because every relay call is a GET and sending it again is safe; it then stays on the
+was sent, because every relay call is a read and sending it again is safe; it then stays on the
 stateful broker for the rest of the session, and it retries the broker's own busy reply on §4.3's
 schedule. The command path never resends after a send, because a command may have run. A
 malformed `CREDENTIAL_PROXY_EXEC_URL` (not a valid `http://` URL, no host, or a port that is not a number
@@ -633,7 +635,9 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   shim's wait is uniform in [half that interval, the interval], so the spread the broker drew
   is kept, at worst halved, rather than undone by a retry at once. A bare non-JSON `503` is not retried: Envoy also
   answers one when the upstream reset after the request was forwarded. Nor is a dropped
-  connection (`BrokerDisconnected`), because the command may have run. `CREDENTIAL_PROXY_BUSY` is
+  connection (`BrokerDisconnected`), because the command may have run, nor a `2xx` answer that the
+  shim cannot use (not JSON, not an object, or a field that is missing or of the wrong type), for the same reason; that
+  one is not sent to the stateful broker either. `CREDENTIAL_PROXY_BUSY` is
   raised only at admission, before the command starts, so a retry never runs a command twice.
 - The retry skips a refusal at the session cap, which uses the same code so that the model
   reports it and does not retry [code, `credential_proxy.py`, `SessionSlots`]. The busy reply
@@ -758,7 +762,7 @@ with an agent image that has the #3933 fix (`f8fc7905`) and the broker at 1 CPU 
 | Mixed concurrency | 8, 10, 12, 15 interactive questions during a sweep; interactive command time under a background `gcloud` sweep     | Interactive waits and run time behind background work, today and with §4 (the nice value) | Questions measured at 8 clusters, 3 runs each, without a parallel sweep (#4242); command time under a sweep not yet |
 | Vertical control  | Broker CPU at 2 cores at 8 clusters (`bench/scale/broker-proxy-raised.yaml` on #4242); #4107 ran 4 CPU at 2 and 16 | CPU-bound or slot-bound                                                                   | Measured, 1 run (#4242)                                                                                             |
 | Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 10, slot cap 8)                                    | No burst above the requests                                                               | Not yet                                                                                                             |
-| Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Not yet                                                                                                             |
+| Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Dropped: `spec.mode: today` went on 2026-11-14 (#5752), and every install runs the A2A stack                        |
 | Exec tier         | 1, 2 and 3 replicas at 16 and 32 clusters                                                                          | #4082 "Done when": the chosen shape at two or more sizes                                  | Not yet; needs the tier                                                                                             |
 | `kubectl` split   | The baseline points again with #4128's switch on                                                                   | The broker sized without the `kubectl` share, and the k8s-api-proxy's own load            | Not yet; needs #4128                                                                                                |
 
@@ -788,7 +792,7 @@ What they mean for this design:
 - **Interactive bursts meet the agent's 10 run slots first** (#3724), as §2.3 said.
 - **Memory is not a limit at these sizes:** at most 775 MiB of 2 GiB.
 
-Not measured yet: 16 and 32 clusters, Autopilot, `spec.mode: today`, the exec tier itself, and the
+Not measured yet: 16 and 32 clusters, Autopilot, the exec tier itself, and the
 peak slots in use (the 2026-10-28 cluster stored no series for the gauge).
 
 ### 8.4 Footprint at 250 / 1,000 / 2,500 clusters
@@ -1026,7 +1030,7 @@ copies, and `test_exec_tier_contract.py` checks that they match this section.
 | Workload names        | Deployment, Service and PodDisruptionBudget `<agent>-credential-proxy-exec-tier`; ConfigMap `<agent>-credential-proxy-exec-tier-replicas`. Port 8765 for requests, 8766 for metrics, 8768 for the readiness probe. Not `credential-proxy-exec`, which is the shim's client binary in the images. The Service name and the `app` label must fit in 63 characters, so with the tier on, an agent's name is at most 36 characters (63 minus the 27-character suffix); the operator refuses a longer name when `exec.replicas` is above 0.                                                                                                    |
 | Labels                | `app: <agent>-credential-proxy-exec-tier` and `kubeagents.x-k8s.io/component: credential-proxy-exec-tier`. Not the stateful broker's labels, and no `kubeagents.x-k8s.io/has-credential-proxy`.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Broker role           | `CREDENTIAL_PROXY_ROLE=exec`. An exec pod runs the broker and Envoy only: no watchers and no relays.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Exec routes           | `POST /v1/exec`, `GET /v1/gcp/…` (a `POST` there reaches the relay, so its policy refusal is audited), `GET /v1/exec/admission`, `/healthz` and metrics. Every other route answers 404 on an exec pod, after authentication (401) and the route's role check (403). The `scope` role's `/v1/exec` call is refused there with 403 `CALLER_ROLE_FORBIDDEN`, because its member window lives on the stateful pod.                                                                                                                                                                                                                            |
+| Exec routes           | `POST /v1/exec`, `GET /v1/gcp/…` and the relay's one `POST` read (any other `POST` there reaches the relay too, so its policy refusal is audited), `GET /v1/exec/admission`, `/healthz` and metrics. Every other route answers 404 on an exec pod, after authentication (401) and the route's role check (403). The `scope` role's `/v1/exec` call is refused there with 403 `CALLER_ROLE_FORBIDDEN`, because its member window lives on the stateful pod.                                                                                                                                                                                |
 | Caller URL            | `CREDENTIAL_PROXY_EXEC_URL`, the exec Service's URL, for the sandbox, session pods and profile workers; the A2A gateway reads it from `A2A_CREDENTIAL_PROXY_EXEC_URL`. Unset at 0 replicas, so callers use `CREDENTIAL_PROXY_URL`. The scope publisher Job keeps `CREDENTIAL_PROXY_URL`. The fleet audit's admission client (`broker_admission.py`) reads `CREDENTIAL_PROXY_EXEC_URL` when it is set, else `CREDENTIAL_PROXY_URL` (§3.5).                                                                                                                                                                                                 |
 | Replica count in pods | The ConfigMap's key `replicas`, mounted at `/etc/credential-proxy-exec-tier/replicas`; `CREDENTIAL_PROXY_EXEC_REPLICAS_FILE` names that path. A scale change rewrites the ConfigMap and does not restart the pods. The admission route reads the file on each request and, for a positive count, adds `replicas`, `tier_admitted` and `tier_interactive_cap` to its report (§3.5).                                                                                                                                                                                                                                                        |
 | Busy reply            | HTTP 503 `{"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "bound": "<bound>", "error": "…"}`. The bounds are `slot`, `budget`, `refresh-lock`, `session`, `profile`, `scope`, `background`, `draining` and `other`; `background` is the background cap `B` (§4.2) after the 60 s wait; `draining` is a replica that is stopping (§9 step 0). `scope` is the scope publisher role's refusal, not a capacity bound, so the shim does not retry it.                                                                                                                                                                                      |

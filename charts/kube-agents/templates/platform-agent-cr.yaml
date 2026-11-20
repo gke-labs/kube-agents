@@ -270,13 +270,39 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") (hasKey $tuning "busReplicas") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
+    {{- /* The session pods' requests and limits go through the sizing overrides' helpers, so a
+      values file's `cpu: 0.5` reaches the CRD as a quoted quantity and a null or empty leaf is
+      dropped (kube-agents.resourcesOverrideQuantities). */}}
+    {{- include "kube-agents.sessionResourcesCheck" (dict "resources" $tuning.sessionResources "prefix" "platformAgent.harness.tuning.sessionResources") }}
+    {{- $sessionQuantities := include "kube-agents.resourcesOverrideQuantities" $tuning.sessionResources | fromJson }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $sessionQuantities (hasKey $tuning "busReplicas") $tuning.defaultRoute $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
       {{- end }}
       {{- if hasKey $tuning "maxSessions" }}
       maxSessions: {{ $tuning.maxSessions }}
+      {{- end }}
+      {{- if $sessionQuantities }}
+      {{- /*
+        A CRD that predates the field prunes it on write, and the release
+        record keeps it, so Helm never re-sends it: the session pods would
+        keep the default requests while the release says otherwise.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "sessionResources") }}
+      {{- fail "platformAgent.harness.tuning.sessionResources is set, but the installed PlatformAgent CRD predates spec.harness.tuning.sessionResources and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      sessionResources:
+        {{- include "kube-agents.resourcesOverrideBlock" $sessionQuantities | nindent 8 }}
       {{- end }}
       {{- if hasKey $tuning "busReplicas" }}
       {{- /*
@@ -298,6 +324,26 @@ spec:
       {{- end }}
       {{- end }}
       busReplicas: {{ $tuning.busReplicas }}
+      {{- end }}
+      {{- if $tuning.defaultRoute }}
+      {{- /*
+        A CRD that predates the field prunes it on write, and the release
+        record keeps it, so Helm never re-sends it: the gateway would keep
+        routing to platform while the release says otherwise.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "defaultRoute") }}
+      {{- fail "platformAgent.harness.tuning.defaultRoute is set, but the installed PlatformAgent CRD predates spec.harness.tuning.defaultRoute and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      defaultRoute: {{ $tuning.defaultRoute | quote }}
       {{- end }}
       {{- with $tuning.default }}
       default:
@@ -479,6 +525,19 @@ spec:
     {{- if not (hasKey $userEnvNames $prLimitName) }}
     {{- $env = append $env (dict "name" $prLimitName "value" ($prLimit | int64 | toString)) }}
     {{- end }}
+    {{- end }}
+    {{- /*
+      deployment.evalRunTags renders KUBEAGENTS_EVAL_RUN_TAGS=1 when true, and
+      nothing when false, so a default render is unchanged. A name that
+      deployment.env also lists is skipped, and a valueFrom entry with the key
+      true fails the render, as for the keys above.
+    */}}
+    {{- $evalRunTagsName := "KUBEAGENTS_EVAL_RUN_TAGS" }}
+    {{- if and .Values.platformAgent.deployment.evalRunTags (hasKey $userValueFromNames $evalRunTagsName) }}
+    {{- fail (printf "platformAgent.deployment.evalRunTags is true, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and tagging stays off. Remove the valueFrom entry or the key." $evalRunTagsName) }}
+    {{- end }}
+    {{- if and .Values.platformAgent.deployment.evalRunTags (not (hasKey $userEnvNames $evalRunTagsName)) }}
+    {{- $env = append $env (dict "name" $evalRunTagsName "value" "1") }}
     {{- end }}
     {{- /*
       The event watcher's settings in deployment.eventWatcher come next, as

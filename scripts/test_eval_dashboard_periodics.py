@@ -13,6 +13,7 @@ finished builds, read from the bucket they log to, and the notes health.py carri
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import pathlib
@@ -107,7 +108,9 @@ def archive(job, builds, podinfo=None, log=None):
     return objects
 
 
-CERT = periodics.WATCHED_BY_JOB["ci-kube-agents-certification-1"]
+CERT = periodics.WATCHED_BY_JOB["ci-kube-agents-validated-capabilities-1"]
+CERT_2 = periodics.WATCHED_BY_JOB["ci-kube-agents-validated-capabilities-2"]
+CERT_OLD = periodics.WATCHED_BY_JOB["ci-kube-agents-certification-1"]
 REPLAY_LANE = periodics.WATCHED_BY_JOB["ci-kube-agents-eval-replay-lane"]
 
 
@@ -130,11 +133,11 @@ def finished(when, passed=True):
 
 class FetchTest(unittest.TestCase):
     def test_a_job_that_logs_beside_the_nightlies_is_read_from_its_own_bucket(self):
-        # The certification slice and the replay lane are decorated like the
+        # The validated-capabilities slices and the replay lane are decorated like the
         # nightlies, so their builds live under EVAL_NIGHTLY_LOGS_ROOT; a read
         # under the periodic-logs root would find nothing and the lane would be
         # unwatched without anyone knowing.
-        for job in (CERT, REPLAY_LANE):
+        for job in (CERT, CERT_2, CERT_OLD, REPLAY_LANE):
             with self.subTest(job=job.job):
                 root = f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{job.job}"
                 # The newest build is still running (no finished.json), so the read
@@ -151,7 +154,40 @@ class FetchTest(unittest.TestCase):
         self.assertNotIn(periodics.LOGS_ROOT, "".join(call[-1] for call in gcloud.calls))
         self.assertEqual(periodics.history_url(CERT.job, CERT.logs_root), f"https://oss.gprow.dev/job-history/gs/kube-agents-evals-nightly-logs/logs/{CERT.job}")
         self.assertEqual(periodics.history_url(DAILY.job), f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{DAILY.job}")
-        self.assertEqual(CERT.stale_after, timedelta(days=8), "a week between runs plus a day: a missed Saturday reads STALE on the Sunday")
+        for slice_ in (CERT, CERT_2, CERT_OLD):
+            self.assertEqual(slice_.stale_after, timedelta(days=8), "a week between runs plus a day: a missed Saturday reads STALE on the Sunday")
+
+    def test_each_lane_slice_is_watched_under_its_own_part(self):
+        # The slices hold disjoint cases, so a note has to say which part
+        # stopped recording; the same words on both would hide the second.
+        self.assertEqual(periodics.VALIDATED_CAPABILITIES_SLICE_JOBS, {1: CERT.job, 2: CERT_2.job})
+        for part, slice_ in ((1, CERT), (2, CERT_2)):
+            self.assertIn(f"slice {part}", slice_.label)
+            for words in (slice_.absence, slice_.presence, slice_.does, slice_.effect):
+                self.assertIn(f"part {part}", words)
+        self.assertEqual((CERT.logs_root, CERT.artifact, CERT.runbook), (CERT_2.logs_root, CERT_2.artifact, CERT_2.runbook))
+
+    def test_the_first_slice_stays_watched_under_the_name_its_job_still_has(self):
+        # Until oss-test-infra renames the job, the old name is the job
+        # that runs, and a failed build of it must still write a note.
+        self.assertEqual(CERT_OLD.job, periodics.VALIDATED_CAPABILITIES_SLICE_1_OLD_JOB)
+        self.assertEqual(dataclasses.replace(CERT_OLD, job=CERT.job), CERT)
+        objects = archive_at(f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{CERT_OLD.job}", {"300": finished(NOW - timedelta(days=1), passed=False)})
+        watched = (CERT, CERT_2, CERT_OLD)
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=watched, runner=FakeGcloud(objects))
+        notes = periodics.assess(readings, NOW, {}, watched=watched)
+        self.assertEqual(sorted(notes), [CERT_OLD.job], "the new names have no build yet and write nothing")
+        self.assertEqual(notes[CERT_OLD.job][periodics.KEY_VERDICT], periodics.VERDICT_FAILED)
+
+    def test_a_lane_slice_with_no_build_yet_writes_no_note(self):
+        # A slice is watched here before its job has run once: nothing to
+        # read is not a stale run, and the slice that has builds is still read.
+        objects = archive_at(f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{CERT.job}", {"300": finished(NOW - timedelta(days=2))})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(CERT, CERT_2), runner=FakeGcloud(objects))
+        self.assertEqual(sorted(readings), [CERT.job])
+        self.assertEqual(periodics.assess(readings, NOW, {}, watched=(CERT, CERT_2)), {})
         self.assertEqual(REPLAY_LANE.stale_after, timedelta(hours=36), "a daily run: one missed morning reads STALE")
 
     def test_the_latest_finished_build_is_read_with_its_artifact(self):
@@ -1145,8 +1181,8 @@ class WorkflowWiring(unittest.TestCase):
         # can check; a rename there is a rename here.
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
-            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-certification-1",
-             "ci-kube-agents-eval-replay-lane"],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-validated-capabilities-1",
+             "ci-kube-agents-validated-capabilities-2", "ci-kube-agents-certification-1", "ci-kube-agents-eval-replay-lane"],
         )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))

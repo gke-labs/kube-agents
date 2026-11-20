@@ -18,52 +18,52 @@ agree on; it reads them from [`install.defaults.env`](../../install.defaults.env
 declares none itself. `install.sh`, `uninstall.sh`, and `upgrade.sh` source it rather than keeping
 their own copies:
 
-| Symbol                                                                    | What it fixes                                                                          |
-| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
-| `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
-| `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`                                     | The data volume size (`50Gi`), the operator's default; it renders no `spec.storage`    |
-| `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
-| `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
-| `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
-| `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `_helpers.tpl` mirrors them     |
-| `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
-| `DEFAULT_LITELLM_REDACTION_ENABLED` / `_IP_ACTION`                        | Gateway redaction (`false`) and what it does with IP literals (`pseudonym`)            |
-| `DEFAULT_LITELLM_BUDGET_USD` / `_PERIOD`                                  | The gateway's spend ceiling (`0`: none) and its window (`1d`); `install.env` only      |
-| `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
-| `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
-| `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
-| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | Existing installs' minter GSA (`kubeagents-github-minter-gsa`); see below              |
-| `DEFAULT_GITHUB_MINTER_KSA_NAME`                                          | Existing installs' minter KSA (`kubeagents-github-minter`); see below                  |
-| `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project |
-| `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)              |
-| `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                |
-| `DEFAULT_ENABLE_PUBSUB_PLATFORM` / `DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR` | The optional AgentPlugins (`false`)                                                    |
-| `DEFAULT_ENABLE_DRIFT_DETECTOR`                                           | Out-of-band change detection: the audit-log ingress and its consumer (`true`)          |
-| `DEFAULT_KUBE_AGENTS_STATE_BUCKET`                                        | The `KUBE_AGENTS_STATE_BUCKET` sentinel (`auto`) that derives the state bucket         |
-| `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
-| `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
-| `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
-| `is_table_model_provider <provider>`                                      | The providers with a menu entry (`openai_compatible` and `sap` included)               |
-| `is_valid_model_provider <provider>`                                      | Those, or any other LiteLLM provider slug (`^[a-z][a-z0-9_]*$`)                        |
-| `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                  |
-| `validate_model_provider_inputs <provider> <model>`                       | A slug outside the menu needs `MODEL_DEFAULT_NAME`                                     |
-| `validate_litellm_env_secret_name <name>`                                 | `LITELLM_ENV_SECRET_NAME`: a Kubernetes Secret name, or empty                          |
-| `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
-| `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
-| `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
-| `derive_kms_location <region>`                                            | Region for Cloud KMS (strips a zone suffix)                                            |
-| `derive_chat_sub_name [topic] [sub]`                                      | Derive Google Chat Pub/Sub subscription (`<topic>-sub`) when topic is custom           |
-| `tf_state_chat_subscription_name`                                         | The subscription name managed by module.chat_pubsub, or empty                          |
-| `tf_state_bucket` / `tf_state_prefix`                                     | Where the install's Terraform state lives in GCS                                       |
-| `kms_key_enabled_version <key> <ring> <location> <project>`               | The minter key's first ENABLED version, or nothing; one probe for three callers        |
-| `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
-| `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
-| `minter_name_defaults <project> <cluster>`                                | The minter's names: its state's, else derived from the cluster                         |
-| `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
-| `read_platform_agent_install_state [namespace]`                           | The CR and release reads the scope check makes                                         |
-| `note_ignored_platform_agent_mode_key <file>`                             | Says once that a `PLATFORM_AGENT_MODE` the file still assigns is not read              |
+| Symbol                                                                    | What it fixes                                                                                                                                          |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                                                                                               |
+| `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                                                                                             |
+| `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins                                                                 |
+| `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`                                     | The data volume size (`50Gi`), the operator's default; it renders no `spec.storage`                                                                    |
+| `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                                                                                  |
+| `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)                                                                            |
+| `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                                                                                              |
+| `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `_helpers.tpl` mirrors them                                                                     |
+| `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`)                                                                 |
+| `DEFAULT_LITELLM_REDACTION_ENABLED` / `_IP_ACTION`                        | Gateway redaction (`false`) and what it does with IP literals (`pseudonym`)                                                                            |
+| `DEFAULT_LITELLM_BUDGET_USD` / `_PERIOD`                                  | The gateway's spend ceiling (`0`: none) and its window (`1d`); `install.env` only                                                                      |
+| `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)                                                                  |
+| `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                                                                                              |
+| `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project                                                                   |
+| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | Existing installs' minter GSA (`kubeagents-github-minter-gsa`); see below                                                                              |
+| `DEFAULT_GITHUB_MINTER_KSA_NAME`                                          | Existing installs' minter KSA (`kubeagents-github-minter`); see below                                                                                  |
+| `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project                                                                 |
+| `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)                                                                              |
+| `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                                                                                |
+| `DEFAULT_ENABLE_PUBSUB_PLATFORM` / `DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR` | The optional AgentPlugins (`false`; interactive `install.sh` prompts for the stockout investigator and defaults `y` with an enabled chat home channel) |
+| `DEFAULT_ENABLE_DRIFT_DETECTOR`                                           | Out-of-band change detection: the audit-log ingress and its consumer (`true`)                                                                          |
+| `DEFAULT_KUBE_AGENTS_STATE_BUCKET`                                        | The `KUBE_AGENTS_STATE_BUCKET` sentinel (`auto`) that derives the state bucket                                                                         |
+| `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`                                                                           |
+| `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                                                                                              |
+| `default_model_for_provider <provider>`                                   | The default model for a provider                                                                                                                       |
+| `is_table_model_provider <provider>`                                      | The providers with a menu entry (`openai_compatible` and `sap` included)                                                                               |
+| `is_valid_model_provider <provider>`                                      | Those, or any other LiteLLM provider slug (`^[a-z][a-z0-9_]*$`)                                                                                        |
+| `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                                                                                  |
+| `validate_model_provider_inputs <provider> <model>`                       | A slug outside the menu needs `MODEL_DEFAULT_NAME`                                                                                                     |
+| `validate_litellm_env_secret_name <name>`                                 | `LITELLM_ENV_SECRET_NAME`: a Kubernetes Secret name, or empty                                                                                          |
+| `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                                                                                |
+| `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                                                                                             |
+| `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                                                                                       |
+| `derive_kms_location <region>`                                            | Region for Cloud KMS (strips a zone suffix)                                                                                                            |
+| `derive_chat_sub_name [topic] [sub]`                                      | Derive Google Chat Pub/Sub subscription (`<topic>-sub`) when topic is custom                                                                           |
+| `tf_state_chat_subscription_name`                                         | The subscription name managed by module.chat_pubsub, or empty                                                                                          |
+| `tf_state_bucket` / `tf_state_prefix`                                     | Where the install's Terraform state lives in GCS                                                                                                       |
+| `kms_key_enabled_version <key> <ring> <location> <project>`               | The minter key's first ENABLED version, or nothing; one probe for three callers                                                                        |
+| `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)                                                                         |
+| `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns                                                                              |
+| `minter_name_defaults <project> <cluster>`                                | The minter's names: its state's, else derived from the cluster                                                                                         |
+| `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)                                                                         |
+| `read_platform_agent_install_state [namespace]`                           | The CR and release reads the scope check makes                                                                                                         |
+| `note_ignored_platform_agent_mode_key <file>`                             | Says once that a `PLATFORM_AGENT_MODE` the file still assigns is not read                                                                              |
 
 **The token minter's names.** A new install gets a key ring, key, GSA and KSA named after its cluster (`<cluster>-minter-keyring`, `<cluster>-minter-key`, `<cluster>-minter`, `<cluster>-github-minter`, from `minter_derived_names`). An install whose state already holds a minter keeps those names, because a KMS key can't be deleted and renaming one plans a replacement; its KSA is the one its Workload Identity binding names. A name set in `install.env` (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`, `GITHUB_MINTER_KSA_NAME`) always wins. A per-install KSA stops installs in one project acting as each other's minter by accident; the project is still the trust boundary (see the [github-minter module](../../terraform/modules/github-minter/README.md#trust-between-installs-in-one-project)). `lifecycle.sh` refuses to adopt a minter key ring or key that another install's owner labels claim, unless `MINTER_SHARED_KEY` names it as `<keyring>/<key>`. A key with no owner labels is adopted as this install's own, and labelled, only when its names were given explicitly (`KMS_KEYRING` and `KMS_KEY`, from `install.env`, the environment or the flags); labels win over a name. The project-wide default names don't count when `install.env` records them, since a file from before per-install names records them whether or not the install ran a minter. A GitHub environment's rebuild passes them in the environment (`scripts/release/minter_environment_names.sh`), so it adopts the environment's own key.
 
@@ -75,8 +75,9 @@ Change a default there and every front door follows. Do **not** restate one in
 this table instead. A second copy of a default is how the installer's permission-set
 default once disagreed with the provisioner's. One case is not a copy and stays: a
 fallback that deliberately differs from the fresh-install default because it reads an
-install that already exists, as `${ENABLE_GVISOR:-false}` does in the control panel and
-in `write_tfvars_from_state`. Those carry the argument beside them.
+install that already exists: `ENABLE_GVISOR`, which `resolve_existing_install_gvisor` reads
+from the live install for both the control panel and `write_tfvars_from_state`. The argument
+is beside it.
 
 It is sourced **without** `set -a`, unlike `install.env`: these are the project's
 defaults, not the install's configuration, so they stay shell variables rather than
@@ -240,9 +241,11 @@ install.defaults.env  →  an exported environment variable  →  install.env  �
 That precedence has a sharp edge on an install that already exists. A key missing from
 `install.env` is not "leave it as it is": it resolves to the default, the default is written
 into `terraform.tfvars`, and `upgrade.sh --upgrade-mode=full` then plans the destruction of
-whatever the default does not mention. `ENABLE_GVISOR` absent destroys the gVisor node pool
-on a Standard cluster (`write_tfvars_from_state` falls back to `false` for that key, not to
-`install.defaults.env`'s `true`); `MEMORY` absent falls back to `file` unless
+whatever the default does not mention. `ENABLE_GVISOR` is the exception: absent, it is read
+from the live install (the Terraform state's gVisor pool or the release's runtimeClassName,
+then the cluster's node pools; Autopilot with no state keeps the sandbox), and `lifecycle.sh`
+refuses an apply that would destroy a gVisor pool unless `KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true`
+(`upgrade.sh --allow-node-pool-destroy`) confirms it; `MEMORY` absent falls back to `file` unless
 `write_tfvars_from_state` finds a live Hindsight deployment (`hindsight-postgresql` or
 `hindsight-api`) on the target cluster, in which case `kube_agents_memory` is preserved
 (`--memory=file` or `MEMORY=file` is required to tear it down);
@@ -268,11 +271,10 @@ configuration first and real drift second.
 `ENABLE_DRIFT_DETECTOR` has the same sharp edge pointing the other way, because its absence
 provisions rather than destroys. Two things have to hold for that, and most keys fail one of
 them: `write_tfvars_from_state` has to resolve the key against `install.defaults.env` rather
-than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR`, in
-the paragraph above, clears the second and fails the first — it defaults to `true` and still
-destroys, because the generator hardcodes `${ENABLE_GVISOR:-false}`. `ENABLE_GKE_BACKUP_PLAN`,
+than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR` is
+outside the rule: it reads the live install instead of any default (above). `ENABLE_GKE_BACKUP_PLAN`,
 `ENABLE_PUBSUB_PLATFORM` and `ENABLE_STOCKOUT_INVESTIGATOR` clear the first and fail the
-second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
+second (`install.sh` still warns when a run passes `--enable-stockout-investigator` or answers the interactive prompt with `ENABLE_STOCKOUT_INVESTIGATOR=true` over an `install.env` that omits or disagrees with it). `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
 project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
@@ -342,8 +344,9 @@ Enterprise Server is installed through the composition, with the forge in its
 
 `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file the installer writes: the
 generator omits them from `terraform.tfvars` and exports them as `TF_VAR_*` for the apply
-instead, and later runs recover them from the live `platform-agent-secrets` Secret (only
-when kubectl's current context is this install's cluster). `API_SERVER_KEY` is generated
+instead, and later runs recover them from the live `platform-agent-secrets` Secret, through
+this install's own kube context, whenever the cluster exists. A read that fails
+stops `install.sh` and `upgrade.sh` rather than write the keys empty. `API_SERVER_KEY` is generated
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 

@@ -17,8 +17,8 @@
 # none of them inline, and a point of use reads its DEFAULT_* key rather than
 # repeating the value. The exception is a fallback that deliberately differs
 # from the fresh-install default because it describes an install that already
-# exists -- `${ENABLE_GVISOR:-false}` here and in install.sh's control panel,
-# each with the argument beside it. Precedence is
+# exists -- ENABLE_GVISOR, which resolve_existing_install_gvisor reads from the
+# live cluster for both this file and install.sh's control panel. Precedence is
 # install.defaults.env → an exported environment variable → install.env → a flag.
 # install.env is sourced with `set -a`, which is what puts it above the export.
 #
@@ -131,6 +131,7 @@ readonly GATEWAY_HOME_CHANNEL_SLACK_PLATFORM="Slack"
 # `helm get notes` is the command that does.
 readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
 readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_SCHEMA_FILE="values.schema.json"
 readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
 readonly FOOTPRINT_PROBE_KEY="summary"
 readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
@@ -482,6 +483,17 @@ readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
 # gcloud's answer for a cluster that does not exist. Any other describe failure
 # (auth expiry, a 403, a network blip) is a cluster that could not be read.
 readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
+# gcloud's answer when the Kubernetes Engine API is off in the project it
+# names (reason SERVICE_DISABLED). A cluster cannot exist in such a project:
+# disabling the API deletes every cluster in it, and creating one needs it on.
+# So a refusal that names the target project is absence, which a fresh
+# project reaches on its first install; one that names another project (the
+# caller's quota project) says nothing about the target and stays unread.
+# The same grammar scripts/verify_ci_pool_project.py reads for the Gemini key
+# (GEMINI_KEY_SERVICE_DISABLED, GEMINI_KEY_DISABLED_IN); its tests pin the
+# project-extraction pattern equal to this one.
+readonly GKE_API_DISABLED_PATTERN="API has not been used in project [a-z0-9-]+ before or it is disabled|SERVICE_DISABLED"
+readonly GKE_API_DISABLED_PROJECT_PATTERN="API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -971,7 +983,8 @@ tfvars_scalar() {
 # Renders the chart's footprint summary for the install terraform.tfvars
 # describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
 # $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
-# the chart is not in the checkout, or the render refuses; the caller decides
+# the chart is not in the checkout, a step of the probe chart's build fails
+# (the probe directory is removed), or the render refuses; the caller decides
 # whether that is worth more than a warning.
 render_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
@@ -989,14 +1002,15 @@ render_footprint_summary() {
   # only template beside the probe. values.schema.json comes too, so a value
   # the chart would refuse is refused here as well.
   cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
-  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  [ ! -f "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" ] || cp "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
   cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
-  mkdir -p "$probe_dir/templates"
-  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  mkdir -p "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE%/*}" || { rm -rf "$probe_dir"; return 1; }
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}" || { rm -rf "$probe_dir"; return 1; }
   # A ConfigMap, so the output is one YAML document helm's manifest sorter
   # reads; the block scalar keeps the summary's lines as they are.
   printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
-    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}" \
+    || { rm -rf "$probe_dir"; return 1; }
   local -a set_args=()
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue
@@ -4143,6 +4157,43 @@ check_service_account_ownership() {
   return 1
 }
 
+# Whether the install this state records runs the agent sandboxed, for
+# resolve_existing_install_gvisor when install.env is silent. Prints true when
+# the state holds the gVisor node pool (Standard) or the agent release renders
+# runtimeClassName gvisor (Autopilot's sandbox, which has no pool), false when
+# it holds the release without either, and nothing when there is no state to
+# read or no release in it: the caller decides what an unknown means.
+tf_state_runs_gvisor() {
+  local state
+  state=$(tf_state_read "$@") || return 0
+  printf '%s' "$state" | python3 -c '
+import json, re, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+release = None
+for res in doc.get("resources", []):
+    if res.get("mode") != "managed" or not res.get("instances"):
+        continue
+    if res.get("type") == "google_container_node_pool" and res.get("name") == "gvisor":
+        print("true")
+        sys.exit(0)
+    if res.get("type") == "helm_release" and res.get("name") == "kube_agents":
+        release = res
+if release is None:
+    sys.exit(0)
+values = (release["instances"][0].get("attributes") or {}).get("values") or []
+# The composition\x27s own document is the first; a later one is
+# extra_helm_values, where a runtimeClassName can belong to something else
+# (the shell sandbox). Within it, only the one under availability counts, and
+# the match stops at the next top-level key.
+pattern = re.compile(r"availability[\"\x27]?\s*:(?:(?!\n\S).)*?runtimeClassName[\"\x27]?\s*:\s*[\"\x27]?gvisor\b", re.S)
+first = values[0] if values and isinstance(values[0], str) else ""
+print("true" if pattern.search(first) else "false")
+'
+}
+
 # The image tag this install's Terraform state RECORDS, which is not the tag
 # the cluster is serving: the redeploy workflows move the running tag with
 # `helm upgrade` and never run Terraform. A drift plan needs this one, or every
@@ -4651,6 +4702,28 @@ gke_describe_error_is_not_found() {
   grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN" <<<"${1:-}"
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the Kubernetes Engine API is disabled in the target project ($2, by id;
+# $3 its number when known), and in no other. Read as the cluster being
+# absent: nothing can exist there until the apply's google_project_service
+# turns the API on. A refusal that names only another project, or none, is
+# not this answer.
+gke_describe_error_is_api_disabled_for() {
+  local err="${1:-}" project_id="${2:-}" project_number="${3:-}"
+  grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$err" || return 1
+  local named
+  named="$(grep -oE "$GKE_API_DISABLED_PROJECT_PATTERN" <<<"$err" \
+    | sed -E 's/^API has not been used in project ([a-z0-9-]+) .*$/\1/; s#^consumer: projects/##' | sort -u)"
+  [ -n "$named" ] || return 1
+  local name
+  while IFS= read -r name; do
+    [ "$name" = "$project_id" ] && continue
+    [ -n "$project_number" ] && [ "$name" = "$project_number" ] && continue
+    return 1
+  done <<<"$named"
+  return 0
+}
+
 is_existing_cluster_network_policy_satisfied() {
   local project_id="$1" cluster_name="$2" region="$3"
   local create_cluster_flag="${4:-${TFVARS_CREATE_CLUSTER:-true}}"
@@ -4672,6 +4745,201 @@ is_existing_cluster_network_policy_satisfied() {
   return 0
 }
 
+
+# How much of kubectl's stderr a refused Secret read quotes back.
+readonly SECRET_READ_ERR_MAX_BYTES=400
+# The credentials install.env may not carry (PERSIST_SECRETS_ON_DISK=false),
+# which write_tfvars_from_state recovers from the live Secret.
+readonly RECOVERED_SECRET_KEYS="API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT"
+
+# recover_secret_keys_from_live_secret CONTEXT exports each RECOVERED_SECRET_KEYS
+# key the environment leaves empty from the live platform agent Secret, and
+# refuses to let a key the live Secret holds be written empty (#6126).
+#
+# One read of the whole Secret, not one per key: a per-key read that failed
+# (a timeout, a dropped connection, an RBAC denial) looked exactly like an
+# absent key, and Terraform then rendered that key empty over the live value.
+# Here only a key missing from a Secret that was read is absent. A Secret that
+# doesn't exist (NotFound: a first install onto an existing cluster) has
+# nothing to recover. Any other failure stops the run, naming the keys it
+# couldn't recover, unless each of them is set in the environment or named in
+# ALLOW_EMPTY_SECRET_KEYS (comma- or space-separated), the one way to accept
+# writing a key empty on purpose.
+#
+# Stopping is for the callers that APPLY, which opt in with
+# KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true beside KUBE_AGENTS_REQUIRE_MEMORY_ANSWER
+# (install.sh and upgrade.sh). A caller that doesn't, uninstall.sh, gets a
+# warning and goes on: a destroy has no use for the keys, and an install has
+# to keep a working way to remove itself.
+#
+# Returns 1 to stop the run; prints why on stderr.
+recover_secret_keys_from_live_secret() {
+  local ctx="$1"
+  local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  # Through :- first: bash 4+ under set -u rejects ${unset//,/ }.
+  local allow_raw="${ALLOW_EMPTY_SECRET_KEYS:-}"
+  local key missing=() allow=" ${allow_raw//[,$'\t']/ } "
+  LIVE_SECRET_NONEMPTY_KEYS=""
+  for key in $RECOVERED_SECRET_KEYS; do
+    [ -n "${!key:-}" ] || missing+=("$key")
+  done
+  # Every key already in the environment: nothing to read, so an operator
+  # whose RBAC can't read Secrets can still run by exporting the keys.
+  [ "${#missing[@]}" -gt 0 ] || return 0
+
+  local err_file secret_json read_rc=0
+  err_file="$(mktemp)"
+  # trap - ERR: install.sh runs an inherited ERR trap (set -E); a failed read
+  # is handled below, not by the trap. --request-timeout bounds a context
+  # whose cluster black-holes TCP.
+  secret_json="$(trap - ERR; kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "$ns" \
+    --context "$ctx" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+    -o json 2>"$err_file")" || read_rc=$?
+  local read_err
+  read_err="$(head -c "$SECRET_READ_ERR_MAX_BYTES" "$err_file" | tr '\n' ' ')"
+  rm -f "$err_file"
+
+  if [ "$read_rc" -ne 0 ]; then
+    # This Secret's own 404 only: kubectl prints (NotFound) for any 404,
+    # including a proxy or gateway in front of the API server.
+    if [[ "$read_err" == *"secrets \"${PLATFORM_AGENT_SECRET}\" not found"* ]]; then
+      return 0
+    fi
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret (${read_err:-exit ${read_rc}}); going on without its keys." >&2
+      return 0
+    fi
+    local unknown=()
+    for key in ${missing[@]+"${missing[@]}"}; do
+      [[ "$allow" == *" ${key} "* ]] || unknown+=("$key")
+    done
+    [ "${#unknown[@]}" -gt 0 ] || return 0
+    print_error "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret in '${ns}' to recover ${unknown[*]-}: ${read_err:-kubectl exited ${read_rc}}" >&2
+    print_error "Going on would write those keys empty over their live values. Re-run once the cluster answers, export the keys yourself, or name the ones to leave empty in ALLOW_EMPTY_SECRET_KEYS." >&2
+    return 1
+  fi
+
+  # KEY<TAB>value lines for the listed keys the Secret holds, decoded here so
+  # a value that isn't base64 fails the read rather than recovering garbage.
+  local decoded
+  if ! decoded="$(trap - ERR; printf '%s' "$secret_json" | python3 -c '
+import base64, json, sys
+keys = sys.argv[1].split()
+data = (json.load(sys.stdin).get("data") or {})
+for k in keys:
+    if k in data:
+        v = base64.b64decode(data[k], validate=True).decode()
+        if "\n" in v or "\t" in v:
+            sys.exit("value of %s holds a tab or newline" % k)
+        print(k + "\t" + v)
+' "${missing[*]-}")"; then
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on without them." >&2
+      return 0
+    fi
+    print_error "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on would write them empty." >&2
+    return 1
+  fi
+
+  local val
+  while IFS=$'\t' read -r key val; do
+    [ -n "$key" ] || continue
+    if [ -n "$val" ]; then
+      export "${key}=${val}"
+      LIVE_SECRET_NONEMPTY_KEYS="${LIVE_SECRET_NONEMPTY_KEYS} ${key}"
+      print_info "Recovered ${key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
+    fi
+  done <<<"$decoded"
+
+  return 0
+}
+
+# The guard, run just before the generator renders: a key the live Secret held
+# non-empty (LIVE_SECRET_NONEMPTY_KEYS, set by the recovery above) may only be
+# replaced by a non-empty value, unless ALLOW_EMPTY_SECRET_KEYS names it. It
+# checks the values as they will be rendered, so a later change between the
+# recovery and the render can't reopen #6126 without failing here.
+refuse_blanking_live_secret_keys() {
+  local allow_raw="${ALLOW_EMPTY_SECRET_KEYS:-}"
+  local key allow=" ${allow_raw//[,$'\t']/ } "
+  for key in ${LIVE_SECRET_NONEMPTY_KEYS:-}; do
+    if [ -z "${!key:-}" ] && [[ "$allow" != *" ${key} "* ]]; then
+      print_error "${key} is set in the live '${PLATFORM_AGENT_SECRET}' Secret but would be written empty; refusing. Name it in ALLOW_EMPTY_SECRET_KEYS to empty it on purpose." >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+# What ENABLE_GVISOR means for an install that already exists, read the same
+# way by every caller that re-renders one: the Terraform variables below and
+# install.sh's control panel. A set, non-empty ENABLE_GVISOR wins, from
+# install.env, the environment or a flag. With no key, the answer is what the
+# cluster runs, not a default: install.sh defaults a fresh install ON, and a
+# fallback of false here planned the destruction of a Standard install's
+# gVisor pool on the next upgrade whenever its install.env lacked the line.
+# The Terraform state answers first, for both shapes: the gVisor pool on
+# Standard, the agent release's runtimeClassName on Autopilot. With no state,
+# Standard lists its node pools; Autopilot has none to list and keeps the
+# sandbox, since a fresh install defaults it on and only an explicit
+# ENABLE_GVISOR="false" may turn it off. A cluster that does not exist yet has nothing
+# to read; install.sh exports its own default before reaching here, and
+# uninstall.sh exports false, so neither falls through to the probe.
+# Prints true or false on stdout; everything it says goes to stderr.
+resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mode]
+  local project="$1" cluster="$2" location="$3" mode="${4:-}"
+  if [ -n "${ENABLE_GVISOR:-}" ]; then
+    printf '%s' "$ENABLE_GVISOR"
+    return 0
+  fi
+  # The Terraform state first: it is what the apply will diff against, and it
+  # answers for both shapes (the pool on Standard, the release's
+  # runtimeClassName on Autopilot).
+  local recorded
+  recorded="$(tf_state_runs_gvisor "$project" "$cluster")"
+  if [ "$recorded" = "true" ]; then
+    print_info "install.env has no ENABLE_GVISOR; this install's Terraform state runs the agent sandboxed (gVisor), so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+    return 0
+  fi
+  # A state that holds the release and no sandbox answers for either shape: a
+  # live pool it does not record is not this install's to plan around.
+  if [ "$recorded" = "false" ]; then
+    printf 'false'
+    return 0
+  fi
+  if [ -z "$mode" ]; then
+    local autopilot
+    autopilot="$(trap - ERR; gcloud container clusters describe "$cluster" --location "$location" \
+      --project "$project" --format="value(autopilot.enabled)" 2>/dev/null || true)"
+    case "${autopilot//[[:space:]]/}" in
+      True|true) mode="autopilot" ;;
+      *) mode="standard" ;;
+    esac
+  fi
+  if [ "$mode" = "autopilot" ]; then
+    # No state to read. Autopilot has no pool to list, and a fresh install
+    # defaults the sandbox on (install.defaults.env DEFAULT_ENABLE_GVISOR), so
+    # the sandbox stays on: only an explicit ENABLE_GVISOR="false" turns it off.
+    print_warning "install.env has no ENABLE_GVISOR and this install's Terraform state could not be read or records no release, so this run keeps the agent sandboxed on Autopilot cluster '${cluster}'. If it runs on the standard runtime on purpose, add ENABLE_GVISOR=\"false\" to install.env." >&2
+    printf 'true'
+    return 0
+  fi
+  local pool="${GVISOR_POOL_NAME:-$DEFAULT_GVISOR_POOL_NAME}" pools rc=0
+  pools="$(trap - ERR; gcloud container node-pools list --cluster "$cluster" --location "$location" \
+    --project "$project" --format="value(name)" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    print_warning "install.env has no ENABLE_GVISOR, and the node pools of '${cluster}' could not be listed to tell whether it runs the gVisor pool '${pool}'. Reading it as off; the apply refuses to destroy a gVisor pool it finds in state. Add ENABLE_GVISOR=\"true\" or \"false\" to install.env to say which." >&2
+    printf 'false'
+    return 0
+  fi
+  if grep -Fxq "$pool" <<<"$pools"; then
+    print_info "install.env has no ENABLE_GVISOR; cluster '${cluster}' runs the gVisor pool '${pool}', so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -4762,7 +5030,18 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! gke_describe_error_is_not_found "$describe_err"; then
+    # The refusal may name the project by number; the front doors that reach
+    # this generator before main() exports PROJECT_NUMBER (the menu, upgrade,
+    # uninstall) resolve it here, and only for a refusal of that shape.
+    local probe_number="${PROJECT_NUMBER:-}"
+    if [ -z "$probe_number" ] && grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$describe_err"; then
+      probe_number="$(trap - ERR; gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
+    fi
+    if gke_describe_error_is_api_disabled_for "$describe_err" "${PROJECT_ID}" "${probe_number}"; then
+      # A fresh project: the Kubernetes Engine API is off, so no cluster can
+      # be there, and the apply enables the API before it creates one.
+      print_info "The Kubernetes Engine API is not enabled in project '${PROJECT_ID}' yet, so no cluster exists there; the apply enables it."
+    elif ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
@@ -4825,40 +5104,24 @@ write_tfvars_from_state() {
   # re-install must keep the live salt: regenerating it re-anonymises every
   # chat user, severing their past sessions from their future ones.
   #
-  # Only when kubectl's CURRENT context is this install's cluster (the name
-  # get-credentials writes — set just above for adoption, and by upgrade.sh
-  # and uninstall.sh before they generate). A stale context pointing at some
-  # other install would otherwise silently donate that environment's
-  # credentials to this one.
-  local secret_key secret_val
-  local expected_ctx
-  expected_ctx="$(gke_context_name)"
-  if command -v kubectl >/dev/null 2>&1 &&
-    [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
-      [ -z "${!secret_key:-}" ] || continue
-      # Every stage exits 0 on its own (|| true inside the substitution):
-      # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
-      # here — no cluster yet, stale context — must be a silent no-op, not a
-      # trap-and-abort the outer || can never see. --request-timeout bounds
-      # the other stale-context failure mode: a context whose cluster was
-      # just destroyed black-holes TCP instead of refusing, and eight keys
-      # times a hung connect stalls the install for minutes.
-      secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --context "$expected_ctx" \
-        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
-        -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
-      if [ -n "$secret_val" ]; then
-        export "${secret_key}=${secret_val}"
-        print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
-      fi
-    done
+  # Only when the probe above found the cluster: a confirmed-absent cluster
+  # has no Secret, and a kubeconfig context left behind by an uninstall would
+  # otherwise send the read to an endpoint that is gone and stop a fresh
+  # install. The read names this install's context, so it can only reach this
+  # cluster, whatever current-context says (get-credentials above is
+  # best-effort, and a shared kubeconfig can be switched underneath). A
+  # context that is missing then fails the read, which stops an applying run.
+  LIVE_SECRET_NONEMPTY_KEYS=""
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    recover_secret_keys_from_live_secret "$(gke_context_name)" || return 1
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
   # re-creatable infrastructure. Every other key the generator defaults --
-  # ENABLE_GVISOR, ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the
-  # rest -- names something Terraform can build again; this one names the
+  # ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the rest -- names
+  # something Terraform can build again (ENABLE_GVISOR, also read from the live
+  # install, does so for the sandbox rather than for data:
+  # resolve_existing_install_gvisor); this one names the
   # hindsight-postgresql StatefulSet and the volume holding the database. So it
   # is the one the generator goes and asks the cluster about when nobody told
   # it, rather than taking the project default.
@@ -5029,23 +5292,19 @@ write_tfvars_from_state() {
   # module for one there fails the plan. Deriving both from the probed
   # cluster_mode keeps --enable-gvisor=true meaning the same thing on either shape.
   #
-  # The fallback stays false even though a fresh install now defaults to the
-  # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
-  # calling this function, so the fallback here
-  # never decides a new install — it only decides the callers that read an
-  # install that already exists. uninstall.sh is the one that matters:
-  # install.env is optional there, and the documented `curl … | bash` teardown
-  # runs from a fresh clone that has none. Defaulting on for that caller would
-  # let the Autopilot version-floor check below abort a destroy, leaving an
-  # install with no working way to remove itself.
-  #
-  # The fallback only reaches the teardown that has no install.env, which is not
-  # the ordinary one — a teardown from the checkout that installed loads an
-  # install.env saying ENABLE_GVISOR="true". uninstall.sh therefore exports false
-  # itself before calling this, and the comment there is where that argument
-  # lives. Do not read the fallback as protecting the teardown on its own.
-  local gvisor_node_pool="false" agent_runtime_class=""
-  if is_truthy "${ENABLE_GVISOR:-false}"; then
+  # With no ENABLE_GVISOR, an existing cluster's own state decides
+  # (resolve_existing_install_gvisor, above), never a default in either
+  # direction. A cluster this run creates has none to read: install.sh exports
+  # its default before calling this, so the false below decides only a caller
+  # that brings neither, and uninstall.sh exports false itself so the
+  # Autopilot version-floor check below can never abort a teardown.
+  local gvisor_node_pool="false" agent_runtime_class="" gvisor_intent="false"
+  if [ "$cluster_exists" = "true" ]; then
+    gvisor_intent="$(resolve_existing_install_gvisor "${PROJECT_ID}" "${CLUSTER_NAME}" "${REGION}" "$cluster_mode")"
+  elif [ -n "${ENABLE_GVISOR:-}" ]; then
+    gvisor_intent="$ENABLE_GVISOR"
+  fi
+  if is_truthy "$gvisor_intent"; then
     agent_runtime_class="gvisor"
     if [ "$cluster_mode" = "standard" ]; then
       gvisor_node_pool="true"
@@ -5257,6 +5516,7 @@ write_tfvars_from_state() {
   # Published for the front doors' ERR traps: the partial file below is mode
   # 600 and holds every secret this run was given, and it sits one character
   # from the real terraform.tfvars. Cleared after the mv succeeds.
+  refuse_blanking_live_secret_keys || { umask "$old_umask"; return 1; }
   TFVARS_TMP_FILE="${dest}.tmp"
   {
     echo "# Generated by the kube-agents installer from install.env — regenerated on every"

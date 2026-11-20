@@ -13,6 +13,9 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // attributionSaltInfo is the HKDF info string that binds the derived
@@ -221,6 +224,19 @@ type Config struct {
 	NATSPassword string
 	DiscordToken string
 
+	// BusAuth is how the gateway authenticates to the bus
+	// (A2A_GATEWAY_BUS_AUTH, #5301): BusAuthPassword, the default, as the
+	// static user nats.conf carries (NATSUser, NATSPassword); or
+	// BusAuthToken, with its projected ServiceAccount token (BusTokenFile),
+	// which the auth callout mints from the operator's map entry for the
+	// gateway's ServiceAccount. Both are rendered while the flip is
+	// pending, so rolling back across it is this setting alone.
+	BusAuth string
+
+	// BusTokenFile is the token BusAuthToken presents: lib.EnvBusTokenFile,
+	// or lib.BusTokenPath. Read on every connect and reconnect.
+	BusTokenFile string
+
 	// NATSCAFile is the CA bundle this gateway trusts the bus by
 	// (lib.EnvNATSCAFile), and NATSCAConfigMap the ConfigMap it was mounted
 	// from. The spawner hands both to every session pod: the pod mounts the
@@ -341,6 +357,16 @@ type Config struct {
 	// platform persona widens from the holders of the agent's own API key to
 	// anyone holding pods/portforward in the namespace.
 	InjectToken string
+
+	// InjectConfirm (A2A_INJECT_CONFIRM, "true" and nothing else) lets the
+	// inject door take intent "confirm", which submits the turn with a
+	// change requested (TaskParameters.ChangeRequested). Off, the door
+	// refuses that intent with a 400. The door's caller is the eval
+	// harness, a program, so a confirm over it is automation by design and
+	// belongs only on an install armed for evals: the operator renders this
+	// beside A2A_INJECT_LISTEN under the same flag (A2A_INJECT_BACKEND on
+	// the operator), and a door armed by hand without it cannot confirm.
+	InjectConfirm bool
 
 	// InjectPrincipalMapPath is the door's OWN principal map
 	// (A2A_INJECT_PRINCIPAL_MAP), separate from PrincipalMapPath and never a
@@ -636,6 +662,10 @@ type Config struct {
 	// chosen must not be a generous one.
 	AuthorityTier  capability.Tier
 	AuthorityScope capability.Scope
+	// TriggerRatePerHour is the per-trigger cap on submissions the trigger
+	// ingress accepts (trigger_ingress.go): a token bucket that holds this
+	// many and refills at this rate. Zero takes DefaultTriggerRatePerHour.
+	TriggerRatePerHour int
 
 	// CapabilityOptional relaxes exactly one thing: what happens when this
 	// gateway cannot mint. Zero value — the safe one — refuses the turn.
@@ -658,16 +688,30 @@ type Config struct {
 	// the numbers. Nothing queues, nothing drops silently.
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
-	// requests (250m/512Mi) ten concurrent sessions hold 2.5 CPU / 5Gi, which
-	// a small dev cluster absorbs without preemption. Raising it buys more
+	// default requests (150m/320Mi, SessionResources) ten concurrent sessions
+	// hold 1.5 CPU / about 3.1Gi, which a small dev cluster absorbs without
+	// preemption. Raising it buys more
 	// concurrent delegations at that per-pod price plus model-quota
 	// contention; lowering it turns busy-hour delegations into refusals
 	// sooner - a UX decision, not a safety one, because this cap is the
 	// usability half. The enforcement half is the namespace ResourceQuota
 	// the operator renders above this number (a compromised or buggy gateway
-	// ignores its own cap and cannot ignore that one), which is also what
-	// bounds the count-then-create race between concurrent conversations.
+	// ignores its own cap and cannot ignore that one). The gateway serializes
+	// the check and counts slots granted but not yet spawned, so concurrent
+	// conversations don't race past the cap (#6033); a replacing turn or a
+	// leader handover can still overshoot it briefly, which the quota's
+	// margin absorbs.
 	MaxSessions int
+
+	// SessionResources are the session pod's CPU and memory requests and
+	// limits (#2371), from A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, which
+	// the operator renders resolved from spec.harness.tuning.sessionResources
+	// (always all four). An unset variable takes spawn.go's default (the
+	// operator module's DefaultSession* constants, held equal by a test). A
+	// request above its limit is refused at start: the operator never
+	// renders one, so it's a hand-set value the API server would refuse at
+	// every spawn.
+	SessionResources corev1.ResourceRequirements
 
 	// DelegationDepthMax bounds how deep a delegation chain may run
 	// (A2A_DELEGATION_DEPTH_MAX). A human turn is depth 0, a child its
@@ -793,6 +837,14 @@ func (c *Config) Elected() bool { return c.GatewayLease != "" }
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
+// The values A2A_GATEWAY_BUS_AUTH takes.
+const (
+	BusAuthPassword = "password"
+	BusAuthToken    = "token"
+
+	envGatewayBusAuth = "A2A_GATEWAY_BUS_AUTH"
+)
+
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
@@ -886,6 +938,10 @@ func FromEnv() (*Config, error) {
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
+	cfg.InjectConfirm = os.Getenv("A2A_INJECT_CONFIRM") == "true"
+	if cfg.InjectConfirm && cfg.InjectListen == "" {
+		return nil, fmt.Errorf("A2A_INJECT_CONFIRM is set but the inject door is not armed (A2A_INJECT_LISTEN)")
+	}
 	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
 	cfg.ConsoleDoor = os.Getenv("A2A_CONSOLE_DOOR") == "true"
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
@@ -995,6 +1051,11 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	sessionResources, err := sessionResourcesFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	cfg.SessionResources = sessionResources
 	depthMax := envOr("A2A_DELEGATION_DEPTH_MAX", strconv.Itoa(defaultDelegationDepthMax))
 	dm, err := strconv.Atoi(depthMax)
 	if err != nil || dm < 1 {
@@ -1092,6 +1153,14 @@ func FromEnv() (*Config, error) {
 
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 
+	switch cfg.BusAuth = envOr(envGatewayBusAuth, BusAuthPassword); cfg.BusAuth {
+	case BusAuthPassword:
+	case BusAuthToken:
+		cfg.BusTokenFile = envOr(lib.EnvBusTokenFile, lib.BusTokenPath)
+	default:
+		return nil, fmt.Errorf("%s=%q: want %q or %q", envGatewayBusAuth, cfg.BusAuth, BusAuthPassword, BusAuthToken)
+	}
+
 	// Salt precedence: the install's provisioned SESSION_KV_SALT is the
 	// salt (the spec's settled answer); the explicit override and the
 	// derived fallback are playground posture, in that order. The trim is
@@ -1103,6 +1172,13 @@ func FromEnv() (*Config, error) {
 		cfg.AttributionSalt = []byte(strings.TrimSpace(os.Getenv("SESSION_KV_SALT")))
 	case os.Getenv("A2A_ATTRIBUTION_SALT") != "":
 		cfg.AttributionSalt = []byte(os.Getenv("A2A_ATTRIBUTION_SALT"))
+	case cfg.BusAuth == BusAuthToken:
+		// The derived fallback keys on the bus password, which a gateway
+		// on its token no longer presents and which goes from nats.conf a
+		// release after the flip. Deriving from it here would work until
+		// then and re-key every pseudonym the day it went, silently
+		// unjoining the audit trail; refusing the boot names the gap now.
+		return nil, fmt.Errorf("%s=%s needs SESSION_KV_SALT or A2A_ATTRIBUTION_SALT: the derived fallback keys on NATS_PASSWORD, which token auth retires", envGatewayBusAuth, BusAuthToken)
 	default:
 		// Derived fallback while the install has no provisioned salt Secret.
 		// An empty password would make this a public constant and the
@@ -1219,4 +1295,63 @@ func (c *Config) validateCapabilityCeiling() error {
 		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)
 	}
 	return nil
+}
+
+// sessionResourcesFromEnv reads the session pod's requests and limits from
+// A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, each defaulting to spawn.go's
+// value, and refuses an unparsable quantity or a request above its limit.
+func sessionResourcesFromEnv() (corev1.ResourceRequirements, error) {
+	read := func(env, def string) (resource.Quantity, error) {
+		raw := strings.TrimSpace(envOr(env, def))
+		q, err := resource.ParseQuantity(raw)
+		if err != nil || q.Sign() <= 0 {
+			return resource.Quantity{}, fmt.Errorf("%s %q: need a positive Kubernetes quantity", env, raw)
+		}
+		return q, nil
+	}
+	out := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
+	for _, f := range []struct {
+		set  corev1.ResourceList
+		name corev1.ResourceName
+		env  string
+		def  string
+	}{
+		{out.Requests, corev1.ResourceCPU, "A2A_SESSION_CPU_REQUEST", workerCPURequest},
+		{out.Requests, corev1.ResourceMemory, "A2A_SESSION_MEMORY_REQUEST", workerMemoryRequest},
+		{out.Limits, corev1.ResourceCPU, "A2A_SESSION_CPU_LIMIT", workerCPULimit},
+		{out.Limits, corev1.ResourceMemory, "A2A_SESSION_MEMORY_LIMIT", workerMemoryLimit},
+	} {
+		q, err := read(f.env, f.def)
+		if err != nil {
+			return corev1.ResourceRequirements{}, err
+		}
+		f.set[f.name] = q
+	}
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if req, lim := out.Requests[name], out.Limits[name]; req.Cmp(lim) > 0 {
+			return corev1.ResourceRequirements{}, fmt.Errorf("the session %s request %s is above its limit %s", name, req.String(), lim.String())
+		}
+	}
+	return out, nil
+}
+
+// sessionResources is c's session pod requests and limits, each unset one
+// at spawn.go's default (a Config built without LoadConfig, as tests do).
+func (c *Config) sessionResources() corev1.ResourceRequirements {
+	pick := func(set corev1.ResourceList, name corev1.ResourceName, def string) resource.Quantity {
+		if q, ok := set[name]; ok && !q.IsZero() {
+			return q.DeepCopy()
+		}
+		return resource.MustParse(def)
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    pick(c.SessionResources.Requests, corev1.ResourceCPU, workerCPURequest),
+			corev1.ResourceMemory: pick(c.SessionResources.Requests, corev1.ResourceMemory, workerMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    pick(c.SessionResources.Limits, corev1.ResourceCPU, workerCPULimit),
+			corev1.ResourceMemory: pick(c.SessionResources.Limits, corev1.ResourceMemory, workerMemoryLimit),
+		},
+	}
 }

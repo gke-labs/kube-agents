@@ -45,6 +45,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -209,10 +210,15 @@ const (
 	// gets the most: JetStream keeps stream indexes in memory and the TASKS
 	// stream is capped at 8GiB on disk (a2aTasksMaxBytes). Named constants so the next
 	// measurement changes one line.
-	a2aNATSCPURequest    = "250m"
-	a2aNATSMemoryRequest = "512Mi"
-	a2aNATSCPULimit      = "1"
-	a2aNATSMemoryLimit   = "1Gi"
+	a2aNATSCPURequest = "250m"
+	// The one-server bus's init step (a2aNATSStaleMetaContainer): a shell,
+	// one du and one rm. Requests equal limits, under the server's own, so
+	// it never raises the pod's effective request.
+	a2aNATSStaleMetaCPU    = "50m"
+	a2aNATSStaleMetaMemory = "64Mi"
+	a2aNATSMemoryRequest   = "512Mi"
+	a2aNATSCPULimit        = "1"
+	a2aNATSMemoryLimit     = "1Gi"
 
 	// The exporter sidecar holds one scrape's worth of /varz and /jsz JSON
 	// at a time, and -jsz=all brings every consumer with it, so its memory
@@ -375,6 +381,13 @@ const (
 	a2aInjectListenHost   = "127.0.0.1"
 	a2aInjectPort         = 8099
 
+	// a2aInjectConfirmEnvVar lets the door take intent "confirm", which
+	// submits a turn with a change requested (a2a/gateway inject.go). The
+	// door's caller is the eval harness, a program, so that is automation
+	// by design and rides on the same operator flag as the door; a gateway
+	// with the door armed by hand and without this refuses the intent.
+	a2aInjectConfirmEnvVar = "A2A_INJECT_CONFIRM"
+
 	// The one identity the inject door admits, and the principal it stands
 	// for. The gateway resolves an injected author through a principal map
 	// like any other non-gchat backend, so the eval runner needs an entry in
@@ -529,6 +542,13 @@ const (
 	// still refusing every capability-less submission: the half-armed state
 	// the single switch exists to make unreachable.
 	a2aCapabilityRequiredEnvVar = "A2A_CAPABILITY_REQUIRED"
+
+	// a2aDefaultAddresseeEnvVar carries spec.harness.tuning.defaultRoute,
+	// resolved by resolveA2ADefaultRoute, onto the gateway (which routes a
+	// plain conversation's first message by it) and onto the platform agent
+	// container, which the hermes-bridge sidecar copies, so all three read
+	// the one value.
+	a2aDefaultAddresseeEnvVar = "A2A_DEFAULT_ADDRESSEE"
 
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
@@ -728,6 +748,10 @@ const (
 	// The broker's side of the same backend.
 	a2aGoogleChatSubscriptionEnvVar      = "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME"
 	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
+	// credentialProxyA2AChatCallersEnvVar binds the a2a-chat role to the A2A
+	// gateway's ServiceAccount in the broker (#6090), rendered beside the
+	// audience above and only with it.
+	credentialProxyA2AChatCallersEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS" // #nosec G101 -- Environment variable name, not a credential
 
 	// The A2AGateway condition. Older operators published it while a next
 	// install's gateway ran nothing for want of a chat backend: withheld
@@ -1087,21 +1111,33 @@ const (
 	// a chat backend's, whose turn runs under the session lock and replays
 	// twice back to back, or the inject door's, whose read takes no lock and
 	// replays before and after its wait -- one asker, two replays, either
-	// way. The operator leaves the gateway's A2A_DEFAULT_ADDRESSEE at its
-	// default, "platform", so a plain conversation's task is a bridge run
-	// and a session pod is spawned only for a Delegate or a session-routed
-	// record; the conversations being asked about while their task runs are
-	// therefore the bridge's Concurrency runs. A conversation with a queued
-	// bridge task, or with a session pod, can be asked about too; that is a
-	// person or a harness at one conversation, once per ask, and the tail
-	// factor is the allowance for it. It is not a per-session term today,
-	// because maxSessions counts pods and a conversation's task is not one;
-	// put in the multiplier it would size the reserve by the wrong number.
-	// The day A2A_DEFAULT_ADDRESSEE flips to the session route (the
-	// RouteSession sentinel in a2a/gateway; gke-labs#2033 is the open design
-	// change that plans it), every conversation's task IS a pod, the asks row
-	// becomes per-session, and it moves into the multiplier beside
-	// a2aSessionConsumersPerSession.
+	// way. The operator renders the gateway's A2A_DEFAULT_ADDRESSEE from
+	// spec.harness.tuning.defaultRoute, "platform" unless the field says
+	// otherwise (resolveA2ADefaultRoute), so on that default a plain
+	// conversation's task is a bridge run and a session pod is spawned only
+	// for a Delegate or a session-routed record; the conversations being
+	// asked about while their task runs are therefore the bridge's
+	// Concurrency runs. A conversation with a queued bridge task, or with a
+	// session pod, can be asked about too; that is a person or a harness at
+	// one conversation, once per ask, and the tail factor is the allowance
+	// for it. On that route it is not a per-session term, because
+	// maxSessions counts pods and a conversation's task is not one; put in
+	// the multiplier it would size the reserve by the wrong number.
+	//
+	// On an install whose defaultRoute is `session` (the RouteSession
+	// sentinel in a2a/gateway; gke-labs#2033 is the open design change that
+	// plans the default's flip), every conversation's task IS a pod, so the
+	// conversations being asked about are the session pods, up to
+	// maxSessions of them. There the asks are counted per session,
+	// a2aTasksReplaySessionAsks (an asker's a2aTasksReplayAsk with its
+	// tail), in the multiplier beside a2aSessionConsumersPerSession
+	// (a2aTasksConsumersPerSession). The bridge's asks row stays in the
+	// reserve as it is: `platform` is still reachable by handle, so the
+	// bridge's workers can still be running conversations, and keeping the
+	// row only widens. The provision script's per-session arithmetic (the
+	// maxSessions that fits, one session's need) reads the same
+	// per-session figure, so the refusal and the budget agree on either
+	// route.
 	//
 	// Two more things the three bridge rows rest on, both settable on the
 	// CR. BRIDGE_CONCURRENCY is read. The sidecar is declared in
@@ -1239,6 +1275,11 @@ const (
 	// read's probeConversation before and after its wait.
 	a2aTasksReplayAsk  = 2
 	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
+	// a2aTasksReplaySessionAsks is the asks term one session pod adds on
+	// the session route: its conversation's asker, a2aTasksReplayAsk
+	// replays, held a2aTasksReplayTailFactor times like every
+	// trigger-paced source in the table (a2aTasksConsumersPerSession).
+	a2aTasksReplaySessionAsks = a2aTasksReplayTailFactor * a2aTasksReplayAsk
 	// a2aTasksReplayLookAhead is the pre-spawn look-ahead replays one bridge
 	// worker holds: lib.TaskInReplay at most once per dequeue, and at most
 	// Concurrency of them in hand across the bridge at once, which the bridge
@@ -2546,7 +2587,7 @@ websocket {
 }
 
 jetstream {
-  store_dir: /data
+  store_dir: ` + a2aNATSStoreDir + `
   # Under the 40Gi PV. Every stream's and bucket's max_bytes is reserved
   # against this at create; TestProvisionedJetStreamCapsFitTheStore holds
   # their sum under it, with room for the next one.
@@ -2692,7 +2733,7 @@ accounts {
 ` + renderA2AStaticUsers(agent, pw, a2aAccountSys, profiles) + `    ]
   }
 }
-system_account: SYS
+system_account: ` + a2aAccountSys + `
 
 # The auth callout: who a connection is, decided against the cluster that
 # issued its identity rather than against a password this file rendered.
@@ -2888,21 +2929,14 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // served until the pod restarts. A renewal rolls the bus once a year; the
 // bus pod's reloader would also apply it in place, but the hash still rolls.
 //
-// On a single server the gateway's per-profile deny is left out
-// (renderA2ANATSConf with no profiles): the config Secret carries it, the
-// reloader applies it, and planA2ABusReload confirms it, so a profile change
-// doesn't restart the bus. A cluster digests it too, so a profile change rolls
-// the servers one at a time onto it, each in lame duck while the others serve:
-// the reload's confirmation reads one config_load_time through the Service,
-// which can't tell whether every server reloaded, and its fallback restarts
-// one pod.
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string, profiles []string) string {
-	if a2aNATSReplicas(agent) <= 1 {
-		profiles = nil
-	}
+// The gateway's per-profile deny is left out (renderA2ANATSConf with no
+// profiles) on every server count: the config Secret carries it, each
+// server's reloader applies it, and planA2ABusReload confirms it server by
+// server, so a profile change restarts no server and rolls no cluster.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	}, keys, profiles)
+	}, keys, nil)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
 		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
@@ -2922,6 +2956,88 @@ const a2aConfigHashAnnotation = "kubeagents.x-k8s.io/a2a-config-hash"
 // deletion. One spelling, both sites.
 
 const a2aNATSDataClaim = "data"
+
+// a2aNATSStoreDir is where the bus's claim is mounted and JetStream keeps its
+// store (nats.conf's store_dir).
+const a2aNATSStoreDir = "/data"
+
+// a2aNATSStaleMetaContainer is the init container a one-server bus starts
+// with. A server that ran in a three-server cluster keeps the cluster's
+// metadata (the meta group and its raft groups) under
+// <store_dir>/jetstream/<system_account>/_js_, and goes on keeping it while
+// it runs alone. Clustered again later, it brings that metadata back and with
+// it streams that no longer exist, which then outvote the ones a restore has
+// just put back. Reproduced on nats-server 2.10, 2.12, 2.14 and 2.15. A
+// server running alone never reads that directory, so removing it is safe,
+// and the step removes exactly that directory and nothing else:
+//
+//   - rendered only on a one-server bus (a three-server one needs it);
+//   - only on ordinal 0, the expected pod name compared exactly;
+//   - the path is built from the store_dir and system_account nats.conf
+//     renders, with globbing off (set -f), and a symbolic link anywhere on it is refused
+//     (nats-server never writes one there), failing the pod rather than
+//     following it;
+//   - it logs the path and size it removes;
+//   - it mounts only the claim, carries no credential and makes no network
+//     call, and runs as the server does with a read-only root.
+const a2aNATSStaleMetaContainer = "stale-cluster-meta"
+
+// a2aNATSStaleMetaScript is the step's script. Its arguments are the store
+// directory, the system account and the one pod name it acts on.
+const a2aNATSStaleMetaScript = `set -euf
+store="$1"
+account="$2"
+only="$3"
+target="$store/jetstream/$account/_js_"
+if [ "${POD_NAME:-}" != "$only" ]; then
+  echo "stale-cluster-meta: ${POD_NAME:-this pod} is not $only; leaving $target alone"
+  exit 0
+fi
+for p in "$store" "$store/jetstream" "$store/jetstream/$account" "$target"; do
+  if [ -L "$p" ]; then
+    echo "stale-cluster-meta: $p is a symbolic link, which nats-server never writes; refusing to touch the store" >&2
+    exit 1
+  fi
+done
+if [ ! -e "$target" ]; then
+  echo "stale-cluster-meta: $target is absent; nothing to remove"
+  exit 0
+fi
+if [ ! -d "$target" ]; then
+  echo "stale-cluster-meta: $target is not a directory; refusing to touch the store" >&2
+  exit 1
+fi
+size="$(du -sk "$target" | cut -f1)"
+echo "stale-cluster-meta: removing $target (${size} KiB), the cluster metadata this server kept from a three-server bus"
+rm -rf -- "$target"
+echo "stale-cluster-meta: removed $target"
+`
+
+// a2aNATSInitContainers is the bus pods' init step: the stale-metadata
+// removal on a one-server bus, nothing on a three-server one.
+func a2aNATSInitContainers(statefulSet string, replicas int) []corev1.Container {
+	if replicas != 1 {
+		return nil
+	}
+	return []corev1.Container{buildA2ANATSStaleMetaContainer(statefulSet)}
+}
+
+// buildA2ANATSStaleMetaContainer renders the step for the StatefulSet's
+// ordinal-0 pod.
+func buildA2ANATSStaleMetaContainer(statefulSet string) corev1.Container {
+	return corev1.Container{
+		Name:    a2aNATSStaleMetaContainer,
+		Image:   a2aNATSImage(),
+		Command: []string{"sh", "-c", a2aNATSStaleMetaScript, a2aNATSStaleMetaContainer, a2aNATSStoreDir, a2aAccountSys, statefulSet + "-0"},
+		Env: []corev1.EnvVar{{
+			Name:      "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+		}},
+		VolumeMounts:    []corev1.VolumeMount{{Name: a2aNATSDataClaim, MountPath: a2aNATSStoreDir}},
+		SecurityContext: hardenedSecurityContext(),
+		Resources:       a2aResources(a2aNATSStaleMetaCPU, a2aNATSStaleMetaMemory, a2aNATSStaleMetaCPU, a2aNATSStaleMetaMemory),
+	}
+}
 
 const (
 	// a2aNATSStartupScript migrates an existing single-node (R1) JetStream store
@@ -3009,7 +3125,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 		podLabels[k] = v
 	}
 
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{
@@ -3062,6 +3178,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 					// default (a2aNATSTerminationGrace).
 					TerminationGracePeriodSeconds: a2aNATSTerminationGrace(replicas),
 					TopologySpreadConstraints:     a2aNATSTopologySpread(selector, replicas),
+					InitContainers:                a2aNATSInitContainers(name, replicas),
 					Containers: a2aNATSContainers(corev1.Container{
 						Name:    "nats",
 						Image:   a2aNATSImage(),
@@ -3080,7 +3197,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: a2aNATSConfMountDir, ReadOnly: true},
 							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
-							{Name: a2aNATSDataClaim, MountPath: "/data"},
+							{Name: a2aNATSDataClaim, MountPath: a2aNATSStoreDir},
 							{Name: a2aNATSPIDVolume, MountPath: a2aNATSPIDMountDir},
 						},
 						SecurityContext: hardenedSecurityContext(),
@@ -3123,6 +3240,12 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			}},
 		},
 	}
+	if busMigrationFreezeConfigured(agent) {
+		// The restart into the bus migration's write freeze, which the
+		// Freezing phase waits for by this annotation.
+		sts.Spec.Template.Annotations[a2aBusFreezeAnnotation] = agent.Status.BusMigration.RunID
+	}
+	return sts
 }
 
 func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
@@ -3458,6 +3581,14 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						labelPartOf:       a2aPartOf,
 						a2aComponentLabel: "provision",
 					}}},
+					// The bus migration's Jobs and pods
+					// (platformagent_a2a_bus_migration.go). Reaching the port
+					// grants nothing: each authenticates as its run's
+					// identity, and the hashing pod holds no credential.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						labelPartOf:       a2aPartOf,
+						a2aComponentLabel: busMigrationComponent,
+					}}},
 					// Seed tooling: hand-applied, not a render, but a
 					// legitimate bus client whose re-run must refuse at auth
 					// if anything, not hang at the dial.
@@ -3570,10 +3701,19 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// count is a render-time fact the script cannot recompute.
 	reserveN := a2aTasksReserve(agent)
 	reserve := strconv.Itoa(reserveN)
-	oneSession := strconv.Itoa(a2aSessionConsumersPerSession + reserveN)
+	perSessionN := a2aTasksConsumersPerSession(agent)
+	oneSession := strconv.Itoa(perSessionN + reserveN)
 	maxSessionsN := resolveA2AMaxSessions(agent)
 	maxSessions := strconv.Itoa(maxSessionsN)
-	perSession := strconv.Itoa(a2aSessionConsumersPerSession)
+	perSession := strconv.Itoa(perSessionN)
+	// What a session's share is, said as the refusal says it: the named
+	// consumers it creates, and on the session route the replays of its
+	// conversation's task too.
+	perSessionWhat := `creates ` + perSession + ` consumers on TASKS`
+	if perSessionN != a2aSessionConsumersPerSession {
+		perSessionWhat = `needs ` + perSession + ` consumers on TASKS (` + strconv.Itoa(a2aSessionConsumersPerSession) +
+			` it creates, ` + strconv.Itoa(a2aTasksReplaySessionAsks) + ` for replays of its task on the session route)`
+	}
 	bridgeWorkersN, bridgeWorkersCapped, bridgeWorkersDefaulted := a2aBridgeWorkers(agent)
 	bridgeWorkers := strconv.Itoa(bridgeWorkersN)
 	bridgeWorkersNoun := "workers"
@@ -3590,8 +3730,8 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// its asks and its look-ahead, each with a tail.
 	fixedReserve := strconv.Itoa(a2aTasksReservedConsumersFor(0))
 	perWorker := strconv.Itoa(a2aTasksReplayTailFactor * (a2aTasksReplayAsk + a2aTasksReplayLookAhead))
-	oneWorker := strconv.Itoa(maxSessionsN*a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
-	oneAndOne := strconv.Itoa(a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
+	oneWorker := strconv.Itoa(maxSessionsN*perSessionN + a2aTasksReservedConsumersFor(1))
+	oneAndOne := strconv.Itoa(perSessionN + a2aTasksReservedConsumersFor(1))
 	bridgeAboveDefault := bridgeWorkersN > a2aBridgeDefaultConcurrency
 
 	// The parenthetical under the reserve: where the worker count came from,
@@ -3675,7 +3815,7 @@ echo "  read it, set it in env as a literal, which the kubelet lets override env
   fi
 `
 	if bridgeAboveDefault {
-		workersFit = `  workers_fit=$(( (live_consumers - ` + strconv.Itoa(maxSessionsN*a2aSessionConsumersPerSession) + ` - ` + fixedReserve + `) / ` + perWorker + ` ))
+		workersFit = `  workers_fit=$(( (live_consumers - ` + strconv.Itoa(maxSessionsN*perSessionN) + ` - ` + fixedReserve + `) / ` + perWorker + ` ))
 `
 		oneSessionAt = ` at ` + bridgeWorkers + ` bridge workers`
 		thatLeaves = ""
@@ -4105,7 +4245,7 @@ if [ -z "${live_consumers}" ]; then
 fi
 if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
-  echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session creates ` + perSession + ` consumers on TASKS," >&2
+  echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session ` + perSessionWhat + `," >&2
   echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
 ` + bridgeNote + `  echo "Provisioning does not change this limit on an existing stream, and it could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
@@ -4129,13 +4269,15 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "  2. get provisioning to run again - that is what recreates it, and nothing re-reads" >&2
   echo "     the bus until this Job runs. Delete the Job to re-run it now, or leave it and the" >&2
   echo "     24h TTL will." >&2
-  echo "  3. once TASKS is back, restart the clients holding a durable consumer on it:" >&2
+  echo "  3. once TASKS is back, the operator restarts the clients holding a durable consumer" >&2
+  echo "     on it, if it saw the stream missing on three five-minute polls in a row. After a" >&2
+  echo "     quicker fix (deleted and recreated inside 15 minutes), restart them yourself:" >&2
   echo "       kubectl rollout restart deployment/` + a2aGatewayName(agent) + ` -n ` + agent.Namespace + `" >&2
   echo "     and, where a Hermes bridge sidecar runs, the agent workload ` + agent.Name + `-gateway" >&2
   echo "     (a Deployment or a StatefulSet, depending on the spec) with it." >&2
   echo "     Deleting a stream deletes every consumer on it, and neither client re-creates" >&2
   echo "     one: the consume underneath them carries no error handler, so a deleted consumer" >&2
-  echo "     ends the subscription with nothing logged. Skip this and the gateway goes on" >&2
+  echo "     ends the subscription with nothing logged. Without a restart the gateway goes on" >&2
   echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
   echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
   echo "     recover by themselves, which hides it rather than helping." >&2
@@ -4487,11 +4629,22 @@ func (r *PlatformAgentReconciler) recordProfileSubmitMaxAge(ctx context.Context,
 	if (have == nil && live == nil) || (have != nil && live != nil && *have == *live) {
 		return
 	}
-	patch := client.MergeFrom(agent.DeepCopy())
-	agent.Status.ProfileSubmitMaxAgeSeconds = live
-	if err := r.Status().Patch(ctx, agent, patch); err != nil {
+	// The patch goes through a copy: its answer, the stored status, would
+	// otherwise replace this pass's in-memory status, everything resolved
+	// and not yet written (the bus's count, a migration's progress). Only
+	// the field and the version the write made are carried back, and only
+	// from a write against the version this pass read: carried from a write
+	// over a status someone changed since (a poller), the version would let
+	// the pass's final full write go over that change instead of conflicting.
+	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	written := agent.DeepCopy()
+	written.Status.ProfileSubmitMaxAgeSeconds = live
+	if err := r.Status().Patch(ctx, written, patch); err != nil {
 		logf.FromContext(ctx).Error(err, "could not record PROFILE_SUBMITS' live max age; the provision Job's next run reports it again")
+		return
 	}
+	agent.Status.ProfileSubmitMaxAgeSeconds = written.Status.ProfileSubmitMaxAgeSeconds
+	agent.ResourceVersion = written.ResourceVersion
 }
 
 // a2aProvisionReport is the shape of the script's termination message: an
@@ -4758,7 +4911,9 @@ const (
 	// reconcile, each surge-first; the chart's own surges are in its count),
 	// one provisioning Job pod (at install, on any spec change and about daily
 	// after its TTL), the scope publisher's Job pods, and three for the
-	// gateway's count-then-create overshoot (a2a/gateway/spawn.go,
+	// gateway's transient overshoot at the cap: a replacing turn's slot while
+	// its old pod is still going, and a gateway older than #6033, whose
+	// count-then-create race could pass a burst together (a2a/gateway/spawn.go,
 	// refuseAtSessionCap).
 	a2aQuotaTransientMargin = 2 + 1 + a2aScopePublisherJobPods + 3
 	// a2aScopePublisherJobPods is the scope publisher's Job pods at once: one,
@@ -5011,6 +5166,44 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	return n
 }
 
+// sessionQuantity is one of the session pod's resolved requests (request
+// true) or limits, as the gateway's env carries it.
+func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name corev1.ResourceName) string {
+	var override *corev1.ResourceRequirements
+	if limits := agentTuning(agent); limits != nil {
+		override = limits.SessionResources
+	}
+	resolved := agentv1alpha1.ResolveSessionResources(override)
+	set := resolved.Limits
+	if request {
+		set = resolved.Requests
+	}
+	q := set[name]
+	return q.String()
+}
+
+// resolveA2ADefaultRoute is spec.harness.tuning.defaultRoute, or
+// DefaultRoutePlatform when it is unset: the gateway's own default, so an
+// install that sets nothing routes as it did before the field existed. The
+// gateway's A2A_DEFAULT_ADDRESSEE and the platform agent container's (which
+// the hermes-bridge sidecar copies) all come from here, so the two cannot disagree. Only the CRD's two values are
+// routes: anything else that reaches here (a CR written past the schema)
+// falls through to DefaultRoutePlatform rather than naming an addressee no
+// executor owns.
+func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
+	if limits := agentTuning(agent); limits != nil && limits.DefaultRoute != nil &&
+		*limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
+		return agentv1alpha1.DefaultRouteSession
+	}
+	return agentv1alpha1.DefaultRoutePlatform
+}
+
+// a2aDefaultAddresseeEnv is the A2A_DEFAULT_ADDRESSEE entry both containers
+// carry.
+func a2aDefaultAddresseeEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
+	return corev1.EnvVar{Name: a2aDefaultAddresseeEnvVar, Value: resolveA2ADefaultRoute(agent)}
+}
+
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
 		return *limits.MaxSessions
@@ -5020,8 +5213,8 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 
 // a2aNATSReplicas is the bus's server count: status.busReplicas, which
 // resolveA2ABusReplicas sets at the start of every pass to the count the pass
-// renders (the running bus's, which a set field cannot change: the
-// conversion is refused), otherwise spec.harness.tuning.busReplicas (a bus not
+// renders (the running bus's, which only a migration's phases change),
+// otherwise spec.harness.tuning.busReplicas (a bus not
 // yet resolved), otherwise DefaultBusReplicas. Only 1 and 3 are counts: the
 // CRD admits nothing else, and anything else that reaches here (a CR written
 // past the schema) falls through rather than rendering a two-server cluster,
@@ -5039,26 +5232,24 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // resolveA2ABusReplicas sets status.busReplicas to the server count this pass
-// renders, before anything renders. An existing bus keeps what it has,
-// because changing the count empties it (the field's doc and
-// spec-nats-deployment.md): the count last resolved, or with no record the
+// renders, before anything renders. An existing bus keeps what it has until
+// a migration converts it (startBusMigration; the field's doc): the count
+// last resolved, or with no record the
 // shape the StatefulSet's template was rendered for. The live replica count
 // is never read: a StatefulSet scaled by hand, to any count, is a hand scale
 // the next apply reverts, not a new bus shape, so a scale between 1 and 3
-// cannot convert the bus past the gate. Failing a StatefulSet, the record
+// cannot convert the bus outside a migration. Failing a StatefulSet, the record
 // again while the bus left data claims behind (a StatefulSet deleted by hand
 // keeps its claims, and the next one must come back at the bus's count, or it
 // would convert them), and with no record the count the claims imply. The
 // field decides only for a bus that does not exist yet, and three when it is
 // unset.
 //
-// A field that asks an existing bus for another count is refused unless
-// busConversionAllowed (which #4225 sets with the migration): the bus keeps
-// its count, and the refusal is a Warning once and the
-// A2ABusConversionRefused condition. With the gate open, the pass about to
-// convert the bus says so on the PlatformAgent, since the conversion is what
-// empties it.
-func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (converting bool, err error) {
+// A field that asks an existing bus for the other count starts a migration
+// (platformagent_a2a_bus_migration.go), which keeps the bus's data: the bus
+// keeps its count until the migration's phases convert it, and while one
+// runs it decides the count.
+func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	running := 0
 	recorded := int(agent.Status.BusReplicas)
 	sts := &appsv1.StatefulSet{}
@@ -5084,7 +5275,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 					running = ordinal + 1
 				}
 			case !errors.IsNotFound(err):
-				return false, err
+				return err
 			}
 		}
 		switch {
@@ -5105,7 +5296,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 			running = 3
 		}
 	default:
-		return false, err
+		return err
 	}
 	if running != 1 && running != 3 {
 		running = 0
@@ -5118,22 +5309,211 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	if want == 0 {
 		want = agentv1alpha1.DefaultBusReplicas
 	}
-	converting = running != 0 && want != running
-	if converting && !r.busConversionAllowed {
-		// The bus keeps the count it runs: converting it would empty it, and
-		// the migration that keeps the data is #4225. Said once, on the pass
-		// that first sees the ask; the condition carries it after.
-		if msg := BusConversionRefusedMessage(int32(want), int32(running)); !a2aBusConversionRefusedConditionCurrent(agent, msg) { // #nosec G115 -- 1 or 3
-			r.recordEvent(agent, corev1.EventTypeWarning, a2aBusConversionRefusedReason, msg)
+	if busMigrationActOnFailed(agent, metav1.Now()) {
+		if err := r.cleanupBusMigration(ctx, agent, agent.Status.BusMigration); err != nil {
+			return err
 		}
-		want, converting = running, false
+		// A one-to-three run given up may have cleared streams it never put
+		// back, on a count that never changed, so the provisioned-once
+		// record and the provision Job that earned it still stand. Both go:
+		// the Job runs again now and recreates what is missing, empty, and
+		// Ready and the rendered bridge wait for it.
+		if busMigrationLeg(agent.Status.BusMigration.Leg) != busMigrationShrink {
+			meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
+			if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
+				return err
+			}
+		}
 	}
-	if converting && int(agent.Status.BusReplicas) != want {
-		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
-			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
+	run := agent.Status.BusMigration
+	if running != 0 && want != running && !busProvisioned(agent) && run == nil {
+		// A bus never provisioned, with no run behind it, holds nothing a
+		// migration would keep, and a run on it would find no streams: the
+		// count is taken as asked, and the first provision Job builds the
+		// bus at it. On a cluster that can't schedule three servers this is
+		// how the count comes down.
+		running = want
+	} else if running != 0 && want != running && !busProvisioned(agent) && busMigrationTerminal(busMigrationPhase(run.Phase)) {
+		// The last run changed the count, and the provision Job after it
+		// has not completed yet: the next run waits for it, so it starts on
+		// a bus whose streams are there.
+		logf.FromContext(ctx).Info("a busReplicas change waits for the A2A bus's provisioning after the last migration",
+			"want", want, "running", running)
+	} else if running != 0 && want != running {
+		// A change between the counts starts a migration; the bus keeps the
+		// count it runs until the migration's phases convert it. Not
+		// without the operator's own image, which runs the migration's
+		// work: a run without it would freeze writes and do nothing until
+		// its deadline.
+		if busMigrationImage() == "" {
+			if run := agent.Status.BusMigration; run == nil || busMigrationTerminal(busMigrationPhase(run.Phase)) {
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationUnavailable,
+					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but this operator was deployed without OPERATOR_IMAGE, which runs the migration; the bus keeps %d", want, running, running))
+			}
+		} else if run == nil && r.busMigrationStatusPruned(agent) {
+			// The served CRD drops status.busMigration, so a run started here
+			// would be gone by the next pass, which would start another and
+			// roll the callout again, every pass.
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationUnavailable,
+				fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but the served PlatformAgent CRD drops status.busMigration, so no migration starts and the bus keeps %d; apply this release's CRD, then restart the operator", want, running, running))
+		} else if want > running && busMigrationWouldStart(agent, want) {
+			// One server to three restores every stream from a snapshot
+			// under the caps this operator renders, behind a write freeze.
+			// A stream already over its cap would fail the restore with the
+			// bus frozen, so the run is refused before anything freezes.
+			if refusal := r.busMigrationStreamsOverCap(ctx, agent); refusal != "" {
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationStreamsOverCap,
+					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but no migration starts: %s; the bus keeps %d", want, running, refusal, running))
+			} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
+				return err
+			}
+		} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
+			return err
+		}
 	}
-	agent.Status.BusReplicas = int32(want) // #nosec G115 -- want is 1 or 3
-	return converting, nil
+	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) && !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		// A run of a leg this operator does not run is held: the bus keeps
+		// the count it runs, and nothing advances.
+		r.holdUnknownBusMigrationLeg(agent)
+		if running == 0 {
+			running = int(agent.Status.BusReplicas)
+		}
+		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3, or what the last pass recorded
+		return nil
+	}
+	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
+		// A migration under way decides the count, whatever the field and
+		// the StatefulSet read mid-way.
+		n, err := r.advanceBusMigration(ctx, agent, time.Now())
+		if err != nil {
+			return err
+		}
+		agent.Status.BusReplicas = int32(n) // #nosec G115 -- 1 or 3
+		return nil
+	}
+	// No migration under way: a new bus takes the field (or three), and an
+	// existing one keeps what it runs, including one whose last migration
+	// ended without converting it.
+	if running == 0 {
+		running = want
+	}
+	agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3
+	return nil
+}
+
+// a2aBusMigrationStartAnnotation, set on the PlatformAgent to the last run's
+// ID, starts another run toward the same count after one ended without
+// converting the bus.
+const a2aBusMigrationStartAnnotation = "kubeagents.x-k8s.io/bus-migration-start"
+
+// busMigrationTarget is the server count a run set out to reach.
+func busMigrationTarget(run *agentv1alpha1.BusMigrationStatus) int {
+	if busMigrationLeg(run.Leg) == busMigrationGrow {
+		return 3
+	}
+	return 1
+}
+
+// reasonA2ABusMigrationUnavailable is the Warning when a busReplicas change
+// cannot start a migration because the operator has no image of its own.
+const reasonA2ABusMigrationUnavailable = "A2ABusMigrationUnavailable"
+
+// busMigrationRunDeadline bounds a migration run: a phase still unfinished
+// then counts as failed, and the run's bus credentials stop working.
+const busMigrationRunDeadline = 2 * time.Hour
+
+// startBusMigration starts a migration from running to want servers, unless
+// busMigrationWouldStart says no: one is under way, a Failed run waits for a
+// person, or the last one ended without converting and neither a new count
+// nor the bus-migration-start annotation naming it asks for another.
+func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, now metav1.Time) {
+	if !busMigrationWouldStart(agent, want) {
+		return
+	}
+	leg, first := busMigrationGrow, busMigrationFreezing
+	if want < running {
+		leg, first = busMigrationShrink, busMigrationPinning
+	}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{
+		Leg:                string(leg),
+		RunID:              fmt.Sprintf("%d-%d", agent.Generation, now.Unix()),
+		Phase:              string(first),
+		StartedAt:          now,
+		Deadline:           metav1.NewTime(now.Add(busMigrationRunDeadline)),
+		ObservedGeneration: agent.Generation,
+	}
+}
+
+// startBusMigrationPersisted starts a run (startBusMigration) and writes its
+// record to the API server before the pass goes on, so nothing renders with
+// a run ID that isn't persisted (#6298). The rest of the pass renders the
+// run's work from its ID straight away: the callout's freeze template and
+// identity map, the bus's pins. A record kept only in memory until the
+// pass's final status write was lost whenever that write conflicted, and the
+// next pass, finding no run, started another with a new ID and rolled the
+// callout again, every pass, the callout never becoming ready.
+//
+// The write is a status patch of the record alone, against the
+// resourceVersion this pass read, so it fails on any change since the read.
+// A failed write takes the run back out of the pass and returns the error: a
+// conflict requeues the pass, which re-reads, and finds the run if the write
+// did land after all, or starts it again. Nothing was rendered with the
+// discarded ID, and an ID is minted only while no run is persisted. An echo
+// without the record is the served CRD pruning it: the run is taken back,
+// and noteBusMigrationEcho records the prune, so the next pass refuses to
+// start one, with its Warning Event.
+func (r *PlatformAgentReconciler) startBusMigrationPersisted(ctx context.Context, agent *agentv1alpha1.PlatformAgent, running, want int) error {
+	before := agent.Status.BusMigration
+	startBusMigration(agent, running, want, metav1.Now())
+	if agent.Status.BusMigration == before {
+		return nil // nothing started
+	}
+	base := agent.DeepCopy()
+	base.Status.BusMigration = before
+	written := agent.DeepCopy()
+	if err := r.Status().Patch(ctx, written, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		agent.Status.BusMigration = before
+		return err
+	}
+	// The pass's final status write goes against the version this write
+	// made; the rest of the in-memory status, changed this pass and not yet
+	// written, stays as it is.
+	agent.ResourceVersion = written.ResourceVersion
+	r.noteBusMigrationEcho(written, true)
+	if written.Status.BusMigration == nil {
+		agent.Status.BusMigration = before
+	}
+	return nil
+}
+
+// busMigrationWouldStart reports whether startBusMigration would start a run
+// toward want: none is under way, and the last one isn't a Failed run
+// waiting for a person, or one that ended at this same target with no
+// request to try it again.
+func busMigrationWouldStart(agent *agentv1alpha1.PlatformAgent, want int) bool {
+	run := agent.Status.BusMigration
+	if run == nil {
+		return true
+	}
+	if !busMigrationTerminal(busMigrationPhase(run.Phase)) {
+		return false
+	}
+	if busMigrationPhase(run.Phase) == busMigrationFailed && !run.GivenUp {
+		// A Failed run waits for a person to retry or give it up.
+		return false
+	}
+	// The last run ended without converting the bus (or converted it and
+	// the count was asked back). A new one starts only when the field asks
+	// for a count other than the last run's target, or a person asks for
+	// another try at the same one by naming the last run: an edit to
+	// anything else, or a GitOps sync, starts nothing. A run of a leg this
+	// operator does not run has no target it can read, so any count it is
+	// asked for starts one: reading it as a shrink would ignore a request
+	// for one server, without a word.
+	if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		return true
+	}
+	return want != busMigrationTarget(run) || agent.Annotations[a2aBusMigrationStartAnnotation] == run.RunID
 }
 
 // a2aNATSRenderedReplicas is the server count a NATS StatefulSet's template
@@ -5150,62 +5530,10 @@ func a2aNATSRenderedReplicas(sts *appsv1.StatefulSet) int {
 	return 1
 }
 
-// reasonA2ABusConverting is the Warning resolveA2ABusReplicas records when a
-// set busReplicas converts a running bus.
-const reasonA2ABusConverting = "A2ABusConverting"
-
-// BusConversionRefusedMessage says why the bus keeps its count. The operator's
-// condition and Warning and the admission webhook's refusal share it, so the
-// edit refused at apply time reads the same as the one the operator holds.
-func BusConversionRefusedMessage(asked, running int32) string {
-	return fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the A2A bus runs %d. "+
-		"An existing bus's server count cannot change yet: converting it would empty the bus, and the migration "+
-		"that keeps its data is #4225. The bus keeps %d; set busReplicas to %d, or remove it, to clear this.",
-		asked, running, running, running)
-}
-
-// a2aBusConversionRefusedMessage is the A2ABusConversionRefused condition's
-// message for this pass, "" when the field asks for nothing the bus does not
-// run. Read after resolveA2ABusReplicas, whose count is the bus's.
-func a2aBusConversionRefusedMessage(agent *agentv1alpha1.PlatformAgent) string {
-	running := agent.Status.BusReplicas
-	limits := agentTuning(agent)
-	if limits == nil || limits.BusReplicas == nil || (running != 1 && running != 3) {
-		return ""
-	}
-	asked := *limits.BusReplicas
-	if (asked != 1 && asked != 3) || int32(asked) == running { // #nosec G115 -- 1 or 3
-		return ""
-	}
-	return BusConversionRefusedMessage(int32(asked), running) // #nosec G115 -- 1 or 3
-}
-
-// a2aBusConversionRefusedConditionCurrent reports whether the condition already
-// says msg, where "" means it is to be absent.
-func a2aBusConversionRefusedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
-	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aBusConversionRefusedConditionType)
-	if msg == "" {
-		return existing == nil
-	}
-	return existing != nil && existing.Status == metav1.ConditionTrue &&
-		existing.Reason == a2aBusConversionRefusedReason && existing.Message == msg
-}
-
-// setA2ABusConversionRefusedCondition writes the condition, or removes it when
-// msg is "". The caller does the API write.
-func setA2ABusConversionRefusedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
-	if msg == "" {
-		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
-		return
-	}
-	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
-		Type:               a2aBusConversionRefusedConditionType,
-		Status:             metav1.ConditionTrue,
-		Reason:             a2aBusConversionRefusedReason,
-		Message:            msg,
-		ObservedGeneration: agent.Generation,
-		LastTransitionTime: now,
-	})
+// retiredConversionRefusedAbsent reports whether the CR carries no
+// A2ABusConversionRefused condition, which only an earlier operator wrote.
+func retiredConversionRefusedAbsent(agent *agentv1alpha1.PlatformAgent) bool {
+	return meta.FindStatusCondition(agent.Status.Conditions, a2aBusConversionRefusedConditionType) == nil
 }
 
 // a2aStreamReplicas is the replica count every JetStream stream and bucket
@@ -5788,7 +6116,21 @@ func a2aTasksReserve(agent *agentv1alpha1.PlatformAgent) int {
 // stream sized at the floor holds a default install fine, and failing it for
 // being below a floor it was never going to be below is a false alarm.
 func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
-	return resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession + a2aTasksReserve(agent)
+	return resolveA2AMaxSessions(agent)*a2aTasksConsumersPerSession(agent) + a2aTasksReserve(agent)
+}
+
+// a2aTasksConsumersPerSession is the multiplier the session cap takes in the
+// budget: the a2aSessionConsumersPerSession named consumers every session
+// pod creates and, when the default route is the session route, the asks on
+// its conversation (a2aTasksReplaySessionAsks), which on that route are a
+// session's rather than a bridge worker's. On the platform route the asks
+// stay in the reserve's bridge row and the multiplier is the named
+// consumers alone, as it always was.
+func a2aTasksConsumersPerSession(agent *agentv1alpha1.PlatformAgent) int {
+	if resolveA2ADefaultRoute(agent) == agentv1alpha1.DefaultRouteSession {
+		return a2aSessionConsumersPerSession + a2aTasksReplaySessionAsks
+	}
+	return a2aSessionConsumersPerSession
 }
 
 // a2aProfileDurablesAllowed is PROFILE_SUBMITS's max_consumers: one durable
@@ -5875,6 +6217,14 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 			need += fmt.Sprintf(". %s more than %d; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct", countIs, a2aBridgeConcurrencyMax)
 		}
 	}
+	// On the session route a session's share carries its conversation's
+	// replays too (a2aTasksConsumersPerSession), so the need says so: the
+	// route is the input that raised it, and setting it back to platform is
+	// the edit that lowers it.
+	if per := a2aTasksConsumersPerSession(agent); per != a2aSessionConsumersPerSession {
+		need += fmt.Sprintf(", each session counted at %d (%d consumers and %d for replays of its task, because spec.harness.tuning.defaultRoute is %s; %s counts %d)",
+			per, a2aSessionConsumersPerSession, a2aTasksReplaySessionAsks, agentv1alpha1.DefaultRouteSession, agentv1alpha1.DefaultRoutePlatform, a2aSessionConsumersPerSession)
+	}
 	if workers > a2aBridgeDefaultConcurrency {
 		ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower %s, or none for the bridge's default of %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
 		fits = "the maxSessions, or the worker count, that fits"
@@ -5885,7 +6235,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, the operator restarts the clients that held a durable consumer on it, provided it saw the stream missing on three five-minute polls in a row; after a quicker fix (inside 15 minutes), restart them yourself: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so without a restart there is a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
@@ -5904,7 +6254,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // and nobody legitimate ever sees the admission failure.
 //
 // `pods` (not count/pods) is deliberate: it counts non-terminal pods only,
-// matching the gateway's LiveSessions denominator, so a finished worker
+// matching the gateway's session count (SessionPods), so a finished worker
 // awaiting sweep does not hold a slot. It is also the only key - a
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
@@ -6470,6 +6820,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// the door may be armed next to a real backend, and repointing
 			// A2A_PRINCIPAL_MAP would take that backend's identities away.
 			{Name: a2aInjectPrincipalMapEnv, Value: a2aInjectPrincipalMapPath},
+			{Name: a2aInjectConfirmEnvVar, Value: "true"},
 			// The bearer token every request to the door must carry. The
 			// gateway refuses to arm the door without it, so a Secret that
 			// has not been created yet crash-loops the pod rather than
@@ -6700,6 +7051,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The session pod's requests and limits (#2371), always all four,
+		// resolved per key over the defaults (ResolveSessionResources), so
+		// the rendered Deployment states what the gateway will request.
+		{Name: "A2A_SESSION_CPU_REQUEST", Value: sessionQuantity(agent, true, corev1.ResourceCPU)},
+		{Name: "A2A_SESSION_MEMORY_REQUEST", Value: sessionQuantity(agent, true, corev1.ResourceMemory)},
+		{Name: "A2A_SESSION_CPU_LIMIT", Value: sessionQuantity(agent, false, corev1.ResourceCPU)},
+		{Name: "A2A_SESSION_MEMORY_LIMIT", Value: sessionQuantity(agent, false, corev1.ResourceMemory)},
 		// The relay binds the durable the provision Job created (#4173).
 		{Name: a2aGatewayRelayPrecreatedEnvVar, Value: "true"},
 		// The busy notice's threshold, rendered explicitly
@@ -6717,6 +7075,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// it are in this same change, so the flag flips
 		// where all three become true together.
 		{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
+		// Where a plain conversation's first message goes:
+		// spec.harness.tuning.defaultRoute, `platform` when
+		// unset (resolveA2ADefaultRoute). Rendered explicitly
+		// at that default, like A2A_MAX_SESSIONS above, so
+		// the flip to the session route is an edit to a value
+		// already in the live Deployment. The session route
+		// needs the spawner the line above arms.
+		a2aDefaultAddresseeEnv(agent),
 		// The image those sessions run. Rendered even
 		// when it matches the gateway's own default, so
 		// the operator-side override reaches it.
@@ -6810,6 +7176,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	// The report reader's token and the broker's address, on every install
+	// (a2a_report_reader.go).
+	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
+	env = append(env, reportEnv...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))
@@ -6890,10 +7260,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), append(injectMounts, reportMounts...)...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), append(injectVolumes, reportVolumes...)...),
 				},
 			},
 		},
@@ -7003,6 +7373,11 @@ type a2aProvisionState struct {
 	// busReloadRequeue is when to check again on a bus config reload still
 	// pending (planA2ABusReload). Zero when none is.
 	busReloadRequeue time.Duration
+	// drainEndRequeue is when the earliest tier drain ends (#3659, #5850):
+	// the tier's teardown is that pass's, and nothing watched moves when a
+	// drain's end passes, so the pass has to be asked for. An ended drain
+	// (end-tier-drain) is minutes away, not hours.
+	drainEndRequeue time.Duration
 	// profileHoldRequeue is when to check again on a newly bound profile
 	// held until every bus server has loaded its config
 	// (a2aDispatchableProfiles). Zero when none is held.
@@ -7012,6 +7387,18 @@ type a2aProvisionState struct {
 	// (observeA2AGatewayElection). The status writers carry it as the
 	// GatewayElected condition (gatewayElectedImage).
 	gatewayElected *string
+	// busMigrationPersisted is status.busMigration as the CR carried it
+	// before this pass advanced it, and busMigrationCaptured says the pass
+	// took it. A phase can change the run's status without changing the
+	// A2ABusMigrating condition or the count (freezeConfirmed is one), so
+	// the writers compare this too, or the change is never written.
+	busMigrationPersisted *agentv1alpha1.BusMigrationStatus
+	busMigrationCaptured  bool
+}
+
+// busMigrationStatusCurrent reports the run's status unchanged by this pass.
+func busMigrationStatusCurrent(agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) bool {
+	return !a2a.busMigrationCaptured || reflect.DeepEqual(agent.Status.BusMigration, a2a.busMigrationPersisted)
 }
 
 // wantsRequeue reports whether a pass should come back at a2aPendingRequeue
@@ -7159,18 +7546,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// First: everything below renders from the server count, and a count
 	// read before this would be last pass's, or the default.
 	state.busReplicasPersisted = agent.Status.BusReplicas
-	converting, err := r.resolveA2ABusReplicas(ctx, agent)
-	if err != nil {
+	state.busMigrationPersisted, state.busMigrationCaptured = agent.Status.BusMigration.DeepCopy(), true
+	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
-	// A conversion empties the bus once the last server restarts into the new
-	// shape, so the provisioned-once record no longer describes it. Dropping
-	// it makes the provision Job count toward Ready again until the new one,
-	// held until the bus has rolled out, completes. A persisted count other
-	// than the resolved one is a conversion whose pass failed after the
-	// StatefulSet apply and before any status write: the StatefulSet already
-	// runs the new count, so only the record still says the drop is owed.
-	if converting || (state.busReplicasPersisted != 0 && state.busReplicasPersisted != agent.Status.BusReplicas) {
+	r.noteA2ABusSingleServer(ctx, agent)
+	// A count change (a migration's phase moving the bus between one server
+	// and three) leaves streams that are not there until the migration puts
+	// them back, so the provisioned-once record no longer describes the
+	// bus. Dropping it makes the provision Job count toward Ready again until
+	// the one after the migration, held until it ends, completes.
+	if state.busReplicasPersisted != 0 && state.busReplicasPersisted != agent.Status.BusReplicas {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
 	}
 
@@ -7240,6 +7626,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err != nil {
 		return state, err
 	}
+	state.drainEndRequeue = earliestDrainEnd(profiles, time.Now())
 	// The profiles still draining (#5074), read once from the applied
 	// dispatch config for both renders: the identity map keeps their
 	// .supervisor grant exactly as long as the dispatch config lists them.
@@ -7325,13 +7712,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
 	// ones and the ones still draining, the same names as the dispatcher's
 	// grant. A profile the controller refuses gets neither. The list is in
-	// the config, and on a single server not the pod template's hash, so a
-	// profile admitted, removed or done draining reaches a single-server bus
-	// by a reload (planA2ABusReload) rather than a restart. A cluster rolls
-	// onto it (a2aConfigRolloutHash).
+	// the config and not the pod template's hash, so a profile admitted,
+	// removed or done draining reaches every bus server by a reload
+	// (planA2ABusReload) rather than a restart or a roll.
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
-	annotateA2ABusProfiles(agent, sts, profileNames)
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -7346,7 +7731,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
-		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+		if err := r.actOnA2ABusReload(ctx, agent, reload); err != nil {
 			return state, err
 		}
 		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, sts); err != nil {
@@ -7585,7 +7970,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// restart itself) a server's absence isn't the meta group's, so the
 		// restart's clock starts again once the bus is back.
 		state.busMeta = a2aBusMetaState{checked: true}
-		if !calloutHold && !busHold && !state.busHeld && a2aNATSReplicas(agent) > 1 {
+		// Nor during a bus migration, which holds the Job itself: mid-way
+		// the bus is unprovisioned with no streams, which the restart's
+		// guards would read as a fresh bus, and a restart there is the
+		// migration's to make, not this check's.
+		migrationHold := busMigrationHoldsProvision(agent)
+		if !calloutHold && !busHold && !state.busHeld && !migrationHold && a2aNATSReplicas(agent) > 1 {
 			live := &appsv1.StatefulSet{}
 			if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, live); err != nil {
 				if !errors.IsNotFound(err) {
@@ -7598,13 +7988,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 				}
 			}
 		}
-		if hold := calloutHold || busHold || state.busHeld || metaHold; hold {
+		if hold := calloutHold || busHold || state.busHeld || migrationHold || metaHold; hold {
 			state.jobHeld = true
-			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus is on its current config and rolled out",
-				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld, "waitingOnMetaGroup", metaHold)
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready, the bus is on its current config and rolled out, no bus migration is under way, and its meta group is formed",
+				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld, "waitingOnMigration", migrationHold, "waitingOnMetaGroup", metaHold)
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
+	} else if existing.DeletionTimestamp != nil {
+		// Being deleted, as a given-up migration's re-provisioning deletes
+		// it: what it did is not taken as done, and the pass after it is
+		// gone creates the Job again.
+		state.jobHeld = true
 	} else {
 		// With the Job created, the condition no longer says anything about
 		// provisioning, whatever it says: the Job is created only past the

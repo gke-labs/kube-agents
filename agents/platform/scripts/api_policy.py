@@ -2,9 +2,10 @@
 """Which Google Cloud REST reads the credential proxy relays for the sandbox.
 
 The broker's `/v1/gcp/<host>/<path>?<query>` route forwards a `GET` from the
-shell sandbox to a Google API on the broker's own credential. This module is
+shell sandbox to a Google API on the broker's own credential, and a `POST` for
+a read whose arguments travel in a JSON body. This module is
 the whole of what decides whether it may: an allowlist of (host, method, path
-shape) entries, in the style of `command_policy.GCLOUD_READ_COMMANDS`, reviewed
+shape) entries, each `POST` entry with the check its body must pass, in the style of `command_policy.GCLOUD_READ_COMMANDS`, reviewed
 as a diff and widened only by pull request. `docs/designs/gcp-api-relay.md`
 argues the shape; the security section there is written against the order
 `evaluate` answers in below, so do not reorder its checks without reading it.
@@ -32,12 +33,14 @@ from dataclasses import dataclass
 from command_policy import Decision
 import credential_proxy_client
 
-# The one method this version relays. The reads that are POST -- Logging
-# `entries:list`, Monitoring `timeSeries:query` for MQL -- carry a body the
-# policy would have to inspect, and a body cap plus a schema per entry is a
-# second design (`gcp-api-relay.md`, "The decision").
+# The method of a read with no body, which is every route but the ones below.
 API_READ_METHOD = "GET"
 DEFAULT_UNIVERSE_DOMAIN = credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN
+# The method of a read whose arguments are a JSON body (Logging `entries:list`).
+# A route with this method must carry a body check, and the broker forwards its
+# own re-serialisation of the body that passed it (`gcp-api-relay.md`, "Reads
+# with a body").
+API_BODY_METHOD = "POST"
 
 # Rule ids, in the order `evaluate` answers. Each names one line of the
 # security argument, and the audit line and the 403 carry them verbatim.
@@ -45,6 +48,7 @@ RULE_METHOD = "gcp.api.method"
 RULE_HOST_REFUSED = "gcp.api.host-refused"
 RULE_HOST = "gcp.api.host"
 RULE_PATH = "gcp.api.path"
+RULE_BODY = "gcp.api.body"
 
 # Hosts whose responses are credentials, or that turn a read into a write
 # somewhere else. Checked before the table and never overridable by it: the
@@ -104,18 +108,73 @@ _ANCHOR_START = "^"
 _ANCHOR_END = "$"
 
 
+# Logging `entries:list`: the keys its body may carry, the two orders the API
+# takes, and the API's own page-size ceiling.
+LOGGING_ENTRIES_LIST_RULE = "gcp.api.logging.entries-list"
+LOGGING_RESOURCE_NAMES = "resourceNames"
+LOGGING_FILTER = "filter"
+LOGGING_ORDER_BY = "orderBy"
+LOGGING_PAGE_SIZE = "pageSize"
+LOGGING_PAGE_TOKEN = "pageToken"
+LOGGING_BODY_KEYS = frozenset(
+    {LOGGING_RESOURCE_NAMES, LOGGING_FILTER, LOGGING_ORDER_BY, LOGGING_PAGE_SIZE, LOGGING_PAGE_TOKEN}
+)
+LOGGING_ORDERS = frozenset({"timestamp asc", "timestamp desc"})
+LOGGING_MAX_PAGE_SIZE = 1000
+_LOGGING_RESOURCE = re.compile(rf"projects/{PROJECT}")
+
+
 @dataclass(frozen=True)
 class ApiRoute:
     """One permitted read: a host, a method and the exact path shape."""
 
     host: str  # exact match, lower-cased
-    method: str  # API_READ_METHOD in this version
+    method: str  # API_READ_METHOD, or API_BODY_METHOD with `body` set
     path: re.Pattern  # anchored at both ends, matched against the whole path
     rule_id: str  # what the audit line and the 403 name
     # What of a 2xx response body the caller is handed, or None to hand back the
     # upstream's body as it came. A projection returns None for a body it cannot
     # read, which the broker answers 502 rather than relaying unprojected.
     project: Callable[[bytes], bytes | None] | None = None
+    # For an API_BODY_METHOD route: what is wrong with the request's parsed JSON
+    # body, or None when the broker may forward it. Never echoes caller text.
+    body: Callable[[object], str | None] | None = None
+
+
+def check_logging_entries_list(body: object) -> str | None:
+    """What is wrong with an `entries:list` body, or None when it may be forwarded.
+
+    One project's log entries and nothing wider: `resourceNames` is exactly one
+    `projects/<project>`, so no folder, organisation, billing account, log bucket
+    or view, and the deprecated `projectIds`, a second way to name a project, is
+    not a permitted key. The filter is Google's grammar and is not parsed, as
+    `gcloud logging read`'s filter argument is not; it cannot widen the read
+    past the resource the body names.
+    """
+    if not isinstance(body, dict):
+        return "the body must be a JSON object"
+    if not set(body) <= LOGGING_BODY_KEYS:
+        return f"the body may carry only {', '.join(sorted(LOGGING_BODY_KEYS))}"
+    names = body.get(LOGGING_RESOURCE_NAMES)
+    if not (
+        isinstance(names, list)
+        and len(names) == 1
+        and isinstance(names[0], str)
+        and _LOGGING_RESOURCE.fullmatch(names[0])
+    ):
+        return f"{LOGGING_RESOURCE_NAMES} must be exactly one projects/<project>"
+    if not isinstance(body.get(LOGGING_FILTER, ""), str):
+        return f"{LOGGING_FILTER} must be a string"
+    order = body.get(LOGGING_ORDER_BY)
+    if LOGGING_ORDER_BY in body and not (isinstance(order, str) and order in LOGGING_ORDERS):
+        return f"{LOGGING_ORDER_BY} must be one of: {', '.join(sorted(LOGGING_ORDERS))}"
+    if LOGGING_PAGE_SIZE in body:
+        size = body[LOGGING_PAGE_SIZE]
+        if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= LOGGING_MAX_PAGE_SIZE:
+            return f"{LOGGING_PAGE_SIZE} must be an integer from 1 to {LOGGING_MAX_PAGE_SIZE}"
+    if not isinstance(body.get(LOGGING_PAGE_TOKEN, ""), str):
+        return f"{LOGGING_PAGE_TOKEN} must be a string"
+    return None
 
 
 # What of a GKE `Cluster` the container routes relay: whether it exists and what it
@@ -239,6 +298,19 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
         GKE_CLUSTER_GET_RULE,
         project_gke_cluster,
     ),
+    # One project's log entries, for the code-owned `gcloud logging read` callers
+    # (fleet_stockout.py, the readiness report's audit_log.py): the same read
+    # without a `gcloud` start in the broker. The one POST the relay forwards;
+    # `entries:write`, `entries:tail`, `entries:copy`, sinks, exclusions and every
+    # other Logging path stay refused, and the body check holds the read to one
+    # `projects/<project>`.
+    ApiRoute(
+        "logging.googleapis.com",
+        API_BODY_METHOD,
+        re.compile(r"^v2/entries:list$"),
+        LOGGING_ENTRIES_LIST_RULE,
+        body=check_logging_entries_list,
+    ),
 )
 
 
@@ -260,10 +332,19 @@ def _validate_routes(routes: tuple[ApiRoute, ...]) -> None:
             )
         if route.host in REFUSED_HOSTS:
             raise ValueError(f"{where}: {route.host} is in REFUSED_HOSTS and cannot be relayed")
-        if route.method != API_READ_METHOD:
+        if route.method not in (API_READ_METHOD, API_BODY_METHOD):
             raise ValueError(
-                f"{where}: method {route.method!r} is not relayed; only {API_READ_METHOD} is"
+                f"{where}: method {route.method!r} is not relayed; only {API_READ_METHOD} "
+                f"and {API_BODY_METHOD} are"
             )
+        if (route.method == API_BODY_METHOD) != (route.body is not None):
+            raise ValueError(
+                f"{where}: a {API_BODY_METHOD} route must carry a body check, and a "
+                f"{API_READ_METHOD} route must not; an unchecked body is a request the "
+                f"policy never read"
+            )
+        if route.body is not None and not callable(route.body):
+            raise TypeError(f"{where}: body must be callable or None")
         if not isinstance(route.path, re.Pattern):
             raise TypeError(
                 f"{where}: path must be a compiled regex, not {type(route.path).__name__}"
@@ -294,11 +375,62 @@ _validate_routes(API_READ_ROUTES)
 # Every host the table names, for the "known host, unknown path" answer.
 _ROUTED_HOSTS = frozenset(route.host for route in API_READ_ROUTES)
 _PROJECTIONS = {route.rule_id: route.project for route in API_READ_ROUTES}
+_BODY_CHECKS = {route.rule_id: route.body for route in API_READ_ROUTES if route.body is not None}
 
 
 def response_projection(rule_id: str) -> Callable[[bytes], bytes | None] | None:
     """The projection the allowed route `rule_id` applies to a 2xx body, if any."""
     return _PROJECTIONS.get(rule_id)
+
+
+def carries_body(rule_id: str) -> bool:
+    """Whether the allowed route `rule_id` is sent with a JSON body the broker must check."""
+    return rule_id in _BODY_CHECKS
+
+
+def _logging_resource_name(body: dict) -> str:
+    """The one `projects/<project>` of an `entries:list` body the route's check passed."""
+    return body[LOGGING_RESOURCE_NAMES][0]
+
+
+# For a route whose path does not name what it reads: where the one resource name
+# is in a body the route's check passed. The broker's log carries it on a line at
+# the check and on the forwarded line. `body_resource` runs the check; a reader
+# here only extracts.
+_BODY_RESOURCES: dict[str, Callable[[dict], str]] = {LOGGING_ENTRIES_LIST_RULE: _logging_resource_name}
+
+
+def body_resource(rule_id: str, body: object) -> str | None:
+    """The resource name the broker may log for the body of route `rule_id`, or None.
+
+    For the body of a request `evaluate_body` allowed. The name is read only from
+    a body the route's own check passes here, so what comes back has passed the
+    check's grammar and is never caller text the check refused; a body the check
+    refuses gives None, and so does a route whose body names no single resource.
+    Never raises.
+    """
+    check = _BODY_CHECKS.get(rule_id)
+    resource = _BODY_RESOURCES.get(rule_id)
+    if check is None or resource is None or check(body) is not None:
+        return None
+    return resource(body)
+
+
+def evaluate_body(rule_id: str, body: object) -> Decision:
+    """Allow or refuse the parsed JSON body of a request `evaluate` allowed.
+
+    Refuses with ``gcp.api.body`` and the check's own words, which never repeat
+    the caller's text. A rule with no body check refuses every body. Never raises.
+    """
+    check = _BODY_CHECKS.get(rule_id)
+    problem = "this route takes no body" if check is None else check(body)
+    if problem is None:
+        return Decision(allowed=True, rule_id=rule_id, message="")
+    return Decision(
+        allowed=False,
+        rule_id=RULE_BODY,
+        message=f"The credential proxy does not relay this request body: {problem}.",
+    )
 
 
 def evaluate(
@@ -313,7 +445,11 @@ def evaluate(
 
     Answers in this order, and the order is the security argument:
 
-    1. Method not ``API_READ_METHOD`` -> ``gcp.api.method``.
+    1. A ``POST`` that is not, exactly, the host and path of a route with a body
+       check (the route's host in ``universe_domain``), or any method other than
+       ``GET`` and ``POST`` -> ``gcp.api.method``. A ``POST`` that is such a route
+       is allowed here when it carries no query (``gcp.api.body`` otherwise), and
+       its body is still to pass ``evaluate_body``.
     2. Host in ``REFUSED_HOSTS`` (in either ``googleapis.com`` or ``universe_domain``) ->
        ``gcp.api.host-refused``. Listed apart from an unknown host so the log
        distinguishes "asked for a token endpoint" from "asked for a service
@@ -329,31 +465,49 @@ def evaluate(
     ``path`` is the caller's text after the host segment, with no leading
     slash, matched whole against the route regex and never normalised here:
     the handler has already refused anything not in normal form, and what this
-    function sees is exactly what the broker would forward. ``query`` is
-    accepted for the signature a later route may need and is not evaluated in
-    this version -- the filter grammar is Google's to validate, and the handler
-    strips the credential-substituting keys before forwarding.
+    function sees is exactly what the broker would forward. ``query`` is not
+    evaluated on a ``GET`` route -- the filter grammar is Google's to validate,
+    and the handler strips the credential-substituting keys before forwarding
+    -- and must be empty on a ``POST`` route, whose arguments are its body.
 
     Never raises.
     """
-    del query  # not evaluated in this version; see the docstring
     host = host.lower()
+    try:
+        universe = credential_proxy_client.normalize_universe_domain(universe_domain)
+    except ValueError:
+        # No route has a host in a universe domain that is not valid: a POST is refused on its
+        # method below, and a GET by the answer after it.
+        universe = None
+    if method == API_BODY_METHOD and universe is not None:
+        for route in API_READ_ROUTES:
+            route_host = credential_proxy_client.rewrite_google_api_host(route.host, universe)
+            if route.method == method and route_host == host and route.path.fullmatch(path):
+                if query:
+                    return Decision(
+                        allowed=False,
+                        rule_id=RULE_BODY,
+                        message=(
+                            "This read takes its arguments in the JSON body; the credential "
+                            "proxy relays it with no query string."
+                        ),
+                    )
+                return Decision(allowed=True, rule_id=route.rule_id, message="")
     if method != API_READ_METHOD:
         return Decision(
             allowed=False,
             rule_id=RULE_METHOD,
             message=(
-                f"The credential proxy relays {API_READ_METHOD} only; {method} is "
-                f"a write or carries a body the policy cannot inspect."
+                f"The credential proxy relays {API_READ_METHOD}, and {API_BODY_METHOD} only "
+                f"for the reads its table names with a body check; this {method} is a write "
+                f"or carries a body the policy cannot inspect."
             ),
         )
-    try:
-        universe = credential_proxy_client.normalize_universe_domain(universe_domain)
-    except ValueError:
+    if universe is None:
         return Decision(
             allowed=False,
             rule_id=RULE_HOST,
-            message="The configured universe domain is malformed; the credential proxy refuses every API relay.",
+            message="The configured universe domain is not valid; the credential proxy refuses every API relay.",
         )
     refused_hosts = (
         REFUSED_HOSTS
@@ -391,7 +545,7 @@ def evaluate(
         if route_host == host and route.method == method and route.path.fullmatch(path):
             return Decision(allowed=True, rule_id=route.rule_id, message="")
     permitted = ", ".join(
-        route.rule_id
+        f"{route.rule_id} ({route.method})"
         for route in API_READ_ROUTES
         if credential_proxy_client.rewrite_google_api_host(route.host, universe) == host
     )
@@ -399,7 +553,7 @@ def evaluate(
         allowed=False,
         rule_id=RULE_PATH,
         message=(
-            f"{host} relays only the reads {permitted}; this path is none of them. "
+            f"{host} relays only the reads {permitted}; this {method} path is none of them. "
             f"Reads are added to api_policy.API_READ_ROUTES by pull request."
         ),
     )

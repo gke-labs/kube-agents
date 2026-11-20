@@ -482,6 +482,43 @@ class DispatcherFailedTicksTest(unittest.TestCase):
         self._other_tries(registry, now, 700)
         self.assertEqual(1, len(_STUCK_LINE.findall(registry.render())))
 
+    def test_the_first_tick_after_a_quarantine_counts_as_a_tick(self):
+        # A board with a streak is quarantined. When the quarantine lifts, the
+        # board is locked. The tick's start must be recorded, unlike the other
+        # tries of a quarantined board: its lock failure after the busy timeout
+        # then makes the board stuck and continues the streak.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(2):
+            registry.record_dispatch_tick_start("default", tick=True)
+            now[0] += 5
+            registry.record_dispatch_tick("default", "OSError")
+            registry.record_dispatch_tick_end("default")
+        self._quarantine_tick(registry, now)
+        self._other_tries(registry, now, 290)
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+        registry.record_dispatch_tick_start("default", tick=True)
+        now[0] += 250
+        registry.record_dispatch_tick("default", "OperationalError", locked=True)
+        registry.record_dispatch_tick_end("default")
+        self.assertEqual([("default", "250")], _STUCK_LINE.findall(registry.render()))
+        self.assertEqual([("default", "OperationalError", "3")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_a_tick_in_flight_after_a_quarantine_is_seen_past_the_limit(self):
+        # The same board, with the tick after the quarantine still running at
+        # the scrape: the in-flight rule needs the tick's start too.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("default", tick=True)
+        now[0] += 5
+        registry.record_dispatch_tick("default", "OSError")
+        registry.record_dispatch_tick_end("default")
+        self._quarantine_tick(registry, now)
+        self._other_tries(registry, now, 290)
+        registry.record_dispatch_tick_start("default", tick=True)
+        now[0] += metrics.STUCK_TICK_SECONDS + 10
+        self.assertEqual([("default", "310")], _STUCK_LINE.findall(registry.render()))
+
     def test_a_quick_failure_of_another_kind_ends_the_stuck_state(self):
         # The lock ends, and the board now fails at once for another reason
         # (a full volume): the board is no longer stuck, and its streak, which
