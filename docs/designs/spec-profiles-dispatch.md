@@ -374,7 +374,7 @@ leave open:
   mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
-  admission, and a task that names no cluster gets none. When an unattended trigger submitted the
+  admission. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
   found equal to the grant's at admission (added 11/11, #4685). A `script` must also be one
   the profile allowlists in `spec.scripts`, which the operator renders into the dispatch config with
@@ -382,10 +382,14 @@ leave open:
   task. Every path lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the
   worker image. The CRD and the dispatcher's config check both hold paths to it, and
   `deploy/docker/test_script_root_ownership.py` keeps what a Dockerfile puts there root-owned and not
-  group- or world-writable (#5622). The broker also accepts a
-  `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
-  credential, which reaches only the audit-report routes and is refused on every other route,
-  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. When the submission's
+  group- or world-writable (#5622). A task that names no cluster gets
+  no `proxyToken`, except an `unattended` task a trigger started: it gets a report credential, a
+  `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
+  the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
+  only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
+  Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
+  trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
+  binds a trigger at. When the submission's
   `taskParameters.changeRequested` is true, the `proxyToken` also carries
   `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
   broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod, at
@@ -407,6 +411,30 @@ leave open:
   pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
   or holds another key type stops the dispatcher at startup. The dispatcher logs a
   credential's `jti`, never the token.
+- **Script-run tasks.** A script must run in Job mode: admission refuses `script-not-allowed` where the
+  profile has no Job template at an unattended tier. The dispatcher resolves the script from the config
+  snapshot it admitted the task on, and the confirm carries `script` (`{name, path, timeoutSeconds}`).
+  Only the dispatcher may publish on a dispatch subject (`TestOnlyTheDispatcherPublishesAConfirm`). The
+  one-shot worker runs the script in place of the harness when all of these hold:
+  - its task credential verifies against `A2A_TASK_SIGNING_PUBLIC_KEYS`, which the operator renders into
+    each Job template from the key the callout and the proxy use;
+  - the credential names this task and pod, and a trigger whose `script` is the confirm's;
+  - the path resolves, symlinks included, to a regular file under the script root, owned by root and
+    writable by no group or other, in directories that are the same, and the worker isn't its owner.
+
+  The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
+  broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
+  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. Its bound is
+  its `timeoutSeconds` within the task's deadline, and its process group is killed at the bound. Its
+  stdout, capped at 64 KiB, is the text result. Its stderr is read, capped at 16 KiB, and only its size is logged: a script can print a credential, and the log is not where a redactor's misses should land. Exit 0
+  completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
+  A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose
+  name can't be a `KA_PARAM_<NAME>` (upper case, at most 32 characters, where a task parameter may have
+  63), and a confirm with no `script` whose credential names one: a script task never runs as a model
+  turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
+  refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
+  SIGTERM ends it as `worker-evicted`.
+
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
@@ -484,7 +512,9 @@ leave open:
   Ready. With bucketed grants, the dispatcher's entry is a fixed size whatever the profile count,
   so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
-  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
+  the dispatch config's `profileSupervisorForm` is `profile`; readers read both; contract
+  addendum 6, #5301), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
@@ -493,8 +523,8 @@ leave open:
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
   `change-needs-job` (a confirmed change whose tier has no Job runner), `verifier-refused`, `parameters-invalid`,
-  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, #5622),
-  and for a child of an AgentProfile task
+  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, or one
+  where the profile has no Job mode at an unattended tier, #5622), and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`

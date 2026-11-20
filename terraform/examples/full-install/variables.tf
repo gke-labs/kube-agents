@@ -156,6 +156,12 @@ variable "namespace" {
   default     = "kubeagents-system"
 }
 
+variable "card_stop_enabled" {
+  description = "Whether a chat `stop`, or Slack's Stop button, also stops the kanban cards the conversation filed: the chart's operator.cardStop.enabled, which sets A2A_CARD_STOP=true on the operator for the A2A gateway. Off by default; it needs a hermes-bridge sidecar and agent image that answer the stop."
+  type        = bool
+  default     = false
+}
+
 variable "helm_upgrade_install" {
   description = "Install the kube-agents release with `helm upgrade --install` semantics (opt-in), so an apply whose state lost a live release adopts it instead of failing with \"cannot re-use a name that is still in use\" (#4108). It also silently takes over a release of the same name that another Terraform state or a manual `helm install` owns in the namespace, so set it only on a long-lived environment whose own state owns the release."
   type        = bool
@@ -658,6 +664,16 @@ variable "google_chat_home_channel" {
   description = "Google Chat space the agent posts unsolicited messages to (e.g. cron findings). Empty leaves it unset. Only used when enable_google_chat is true."
   type        = string
   default     = ""
+}
+
+variable "google_chat_home_channel_policy" {
+  description = "\"auto\" (also empty) or \"manual\". With google_chat_home_channel empty, \"auto\" lets the A2A gateway make the space of the first top-level mention of the agent in a named space the home channel; \"manual\" leaves google_chat_home_channel alone to decide. A set google_chat_home_channel wins under either. Only used when enable_google_chat is true."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "auto", "manual"], var.google_chat_home_channel_policy)
+    error_message = "google_chat_home_channel_policy must be \"\", \"auto\" or \"manual\"."
+  }
 }
 
 variable "google_chat_mode" {

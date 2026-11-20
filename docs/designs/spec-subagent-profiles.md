@@ -177,11 +177,12 @@ spec:
 | `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
 | `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-Everything here is dark content: the dispatcher and the profile CRD render nothing unless
-the mode switch says `next`.
+Everything here renders on every install; the `spec.mode` switch that once held it dark
+is gone.
 
 As built, the CRD reserves the name `platform`, because the Hermes bridge is that addressee's
-executor, and `resources` and `concurrency` are required rather than defaulted. The example
+executor, and refuses a new profile named `session`, the gateway's session route (one created
+before that rule keeps working), and `resources` and `concurrency` are required rather than defaulted. The example
 above and the platform worked profile below are design sketches from before the CRD existed.
 
 ## How a profile becomes a pod
@@ -199,7 +200,7 @@ carried a Role with pod create/delete/watch; that goes away.)
 **The dispatcher turns messages into Jobs.** A dispatcher controller in the operator
 binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. The
 dispatcher and the janitor run under the operator manager's leader election - the
-`--leader-elect` machinery the operator already ships, required on under `mode: next` -
+`--leader-elect` machinery the operator already ships, required on the operator Deployment (the chart passes `--leader-elect`) -
 so "one dispatcher" and "exactly one final event" are elected properties, not deployment
 accidents. Scaling the operator for HA changes nothing here: followers hold no
 consumers. Only a
@@ -403,14 +404,23 @@ What the operator renders per profile, as built (amended 10/6):
     refused (`PROFILE_QUERY_QUALIFIER`, rule `caller.vcs-query`): GitHub composes those
     fields into a search ahead of its own `repo:` qualifier, and any of them could add a
     qualifier, swallow that one, or make it an alternative, reaching past the managed
-    repository. `publish`,
+    repository. An `identity` with no `repository` answers the install's managed
+    repositories instead (`{managedRepositories: [host/path, …]}`), the names every verb is
+    held to, with no repository resolved and no forge called, so a task that names none can
+    find the one it may use. `publish`,
     `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
     `vcs:proposal-create`, which the dispatcher mints only when the submission's
     `changeRequested` is true, and only the gateway sets that, for a structured confirm. The
     claim is a closed list of strings, allowed only on the `credential-proxy` audience: an
     unknown permit, a malformed list or a `permits` key on a `nats` credential refuses the
     token, in both verifiers. The permit names no repository; the managed list bounds where
-    every verb lands, a permitted write included. Under the permit the writes are still held
+    every verb lands, a permitted write included. The permit names one task, so its writes
+    reach only what that task made (#6400): `publish` a branch the task already published, or
+    one absent from the remote, claimed by the first task to publish it; `proposal-create`
+    only from a branch the task published; `proposal-update` only on a proposal the task
+    opened (`PROPOSAL_NOT_THIS_TASKS`, rule `caller.vcs-ownership`). The record is the one
+    stateful broker pod's own memory, so a restart refuses a task's later writes rather than
+    permitting anyone's. Under the permit the writes are also held
     to the install's own work (`VcsBroker.require_agent_proposal`, profile role only, rule
     `caller.vcs-ownership`): `proposal-update` only on a proposal `forge.is_agent_pull_request`
     calls the install's (opened by the credential's login, from a branch under
@@ -430,8 +440,9 @@ What the operator renders per profile, as built (amended 10/6):
     The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
     `capabilities`, which skip the managed list, and every other write, `branch-delete`
     among them. The shim sends the credential on these calls as it does on an exec. Known
-    limits: a task that names no cluster gets no `proxyToken`, so it reaches no
-    version-control verb at all; and `submit-suggestion` deletes a spent branch with
+    limits: a task that names no cluster gets no targeted `proxyToken` (at most a report
+    credential, which the broker refuses here), so it reaches no version-control verb at
+    all; and `submit-suggestion` deletes a spent branch with
     `branch-delete`, so on a profile worker that one path is refused.
   - A report credential (no target, the `unattended` tier and a trigger; #5619) is refused on
     `/v1/exec` and the MCP relay before any of this runs.
@@ -480,20 +491,20 @@ What the operator renders per profile, as built (amended 10/6):
 
 Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
 task connection) land, a worker's pod connection still reaches every task of its profile, so
-two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
-tombstone, because there is no bus to publish one on. The directory survives a flip to
-`today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
-Nothing sweeps directory entries that have no profile. Fixing that means either holding
-deletion on a `today` install or giving the operator a read of the whole directory.
+two pods of one profile can reach each other's task subjects. And nothing sweeps directory entries
+that have no profile: a profile deleted while its agent was still on `spec.mode: today`, before
+that mode went, released its finalizer with no tombstone, because there was no bus to publish one
+on, and its entry stays on the bus's PVC until the operator gains a read of the whole directory.
 
 Profile names and session names share the addressee space on `a2a.tasks.>`. A profile named
 exactly like a live session pod (`<profile>-<animal>-<hex>`) would get that session's events
-subject. Only `platform` is reserved. Matching the session shape would mean a regex that has
+subject. Only `platform` and `session` are reserved. Matching the session shape would mean a regex that has
 to track how the gateway mints names, and creating an AgentProfile is already a privileged act.
 
 The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
 two agents in one namespace (only possible with the singleton webhook off) a profile renders
-nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.
+nothing. The name `platform` is reserved: it is the Hermes bridge's addressee. So is `session`,
+the gateway's session route, for new profiles.
 
 Spawn latency is the demo's: roughly 5-10 seconds to first streamed output with a warm
 node and pre-pulled image. Fine for delegated tasks, which today sit in a 5-second
@@ -659,7 +670,8 @@ is the harness process itself, and its death is the orphan path.
 
 The platform agent is the privileged doer - provisioning, fleet audits, the GitOps write
 path - and today it is also a kanban worker like any other when the front door delegates
-to it. As a profile:
+to it. Everything it does today, and what a profile still lacks for each, is in
+[the platform-as-profile inventory](platform-as-profile-inventory.md). As a profile:
 
 ```yaml
 apiVersion: kubeagents.x-k8s.io/v1alpha1

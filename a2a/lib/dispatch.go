@@ -162,12 +162,21 @@ type DispatchMessage struct {
 	// keeps its pod-level grants. TaskCredential (audience nats) is what the
 	// worker presents on its task connection to the bus. ProxyToken
 	// (audience credential-proxy) confines the task to the cluster the
-	// dispatcher checked at admission, and is absent when the task names no
-	// cluster. Both name the task, its profile and tier, the pod and its UID,
+	// dispatcher checked at admission. A task that names no cluster gets
+	// none, except an unattended task a trigger started, which gets a report
+	// credential with no target that the broker holds to the audit-report
+	// routes (#5619). Both name the task, its profile and tier, the pod and its UID,
 	// and expire at the task's deadline plus a clock-skew allowance, never
 	// past the configured maximum lifetime.
 	TaskCredential string `json:"taskCredential,omitempty"`
 	ProxyToken     string `json:"proxyToken,omitempty"`
+	// Script is the helper script a script-run task runs (#5622): the entry
+	// of the profile's spec.scripts the task's trigger names, resolved at
+	// admission from the dispatch config the dispatcher checked it against.
+	// A confirm only. The worker runs it in place of the harness, only in
+	// Job mode, and only when the name equals the script in its verified
+	// ProxyToken. The path comes from here, never from the task.
+	Script *DispatchScript `json:"script,omitempty"`
 }
 
 // Validate reports the first way m is malformed, or nil.
@@ -177,6 +186,14 @@ func (m DispatchMessage) Validate() error {
 	}
 	if m.Type != DispatchConfirm && (m.TaskCredential != "" || m.ProxyToken != "") {
 		return fmt.Errorf("dispatch %s: task credentials ride on a confirm only", m.Type)
+	}
+	if m.Script != nil {
+		if m.Type != DispatchConfirm {
+			return fmt.Errorf("dispatch %s: a script rides on a confirm only", m.Type)
+		}
+		if err := m.Script.Validate(); err != nil {
+			return fmt.Errorf("dispatch confirm: %w", err)
+		}
 	}
 	switch m.Type {
 	case DispatchOffer:
@@ -321,6 +338,19 @@ func (l LeaseRecord) Validate() error {
 // so a tuning or profile change applies without a restart.
 const DispatchConfigKey = "dispatch.json"
 
+// ProfileSupervisorFormProfile is DispatchConfig.ProfileSupervisorForm's one
+// value: a profile task's terminal goes on ProfileSupervisorSubject.
+const ProfileSupervisorFormProfile = "profile"
+
+// SupervisorSubjectFor is where a dispatcher under cfg writes profile's task's
+// terminal: the six-token form once cfg says so, else the five-token one.
+func (c DispatchConfig) SupervisorSubjectFor(profile, taskID string) string {
+	if c.ProfileSupervisorForm == ProfileSupervisorFormProfile {
+		return ProfileSupervisorSubject(profile, taskID)
+	}
+	return TaskSupervisorSubject(profile, taskID)
+}
+
 // DispatchConfig is everything the dispatcher reads about the install's
 // profiles: the shared caps and intervals and each bound profile's own
 // limits. The operator writes it; the dispatcher never reads an AgentProfile.
@@ -379,6 +409,13 @@ type DispatchConfig struct {
 	// tombstone at least this long. Zero is from an operator that predates
 	// the field; the dispatcher then uses ProfileSubmitRetention.
 	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
+	// ProfileSupervisorForm is the subject form the dispatcher writes a
+	// profile task's terminal on (#5301): empty for the five-token
+	// TaskSupervisorSubject, ProfileSupervisorFormProfile for the six-token
+	// ProfileSupervisorSubject. The operator sets it only once every reader
+	// that can run watches both forms. A dispatcher from before the field
+	// ignores it and keeps the five-token form, which readers still watch.
+	ProfileSupervisorForm string `json:"profileSupervisorForm,omitempty"`
 	// JobLabels go on every Job the dispatcher creates: the operator's
 	// agent labels, by which a teardown deletes only this install's Jobs,
 	// and DispatchJobLabel. Set when some profile has a Job template
@@ -578,6 +615,15 @@ const ScriptRoot = "/opt/kube-agents/scripts/"
 
 var ScriptPath = regexp.MustCompile(`^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$`)
 
+// Validate reports the first way sc can't be run, or nil: a name that's a
+// subject token, a path of ScriptPath's shape, and a positive timeout.
+func (sc DispatchScript) Validate() error {
+	if !ValidSubjectToken(sc.Name) || !ScriptPath.MatchString(sc.Path) || sc.TimeoutSeconds < 1 || sc.TimeoutSeconds > MaxDispatchSeconds {
+		return fmt.Errorf("script %q: not a subject token, a path outside %s, or a timeout outside 1 to %ds", sc.Name, ScriptRoot, MaxDispatchSeconds)
+	}
+	return nil
+}
+
 // Script is the profile's allowlisted script named name, if it lists one.
 func (p DispatchProfile) Script(name string) (DispatchScript, bool) {
 	for _, sc := range p.Scripts {
@@ -666,6 +712,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
 	case c.SubmitRetentionSeconds < 0 || c.SubmitRetentionSeconds > int(MaxSubmitRetention/time.Second):
 		return fmt.Errorf("dispatch config: submitRetentionSeconds %d is outside 0 to %d", c.SubmitRetentionSeconds, int(MaxSubmitRetention/time.Second))
+	case c.ProfileSupervisorForm != "" && c.ProfileSupervisorForm != ProfileSupervisorFormProfile:
+		return fmt.Errorf("dispatch config: profileSupervisorForm %q is not %q or empty", c.ProfileSupervisorForm, ProfileSupervisorFormProfile)
 	}
 	for k, v := range c.JobLabels {
 		if !validLabelKey(k) || !labelValue.MatchString(v) {
@@ -702,8 +750,7 @@ func (c DispatchConfig) Validate() error {
 		}
 		scripts := map[string]bool{}
 		for _, sc := range p.Scripts {
-			if !ValidSubjectToken(sc.Name) || scripts[sc.Name] || !ScriptPath.MatchString(sc.Path) ||
-				sc.TimeoutSeconds < 1 || sc.TimeoutSeconds > p.ActiveDeadlineSeconds {
+			if sc.Validate() != nil || scripts[sc.Name] || sc.TimeoutSeconds > p.ActiveDeadlineSeconds {
 				return fmt.Errorf("dispatch config: profile %s script %q is not a subject token, is listed twice, has a path outside %s, or a timeout outside 1 to %ds",
 					p.Name, sc.Name, ScriptRoot, p.ActiveDeadlineSeconds)
 			}

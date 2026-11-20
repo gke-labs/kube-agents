@@ -1,0 +1,119 @@
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# cloud posture: the GCE compute SOP's declared-intent step (§2a) reads the
+# linked repositories before it reports a posture, and a snapshot kept after
+# its source disk is gone on purpose, declared in the GitOps repo's knowledge/
+# directory, is not a finding — it is listed under the ledger's Declared
+# intent section with the file's path. The case runs the scheduled audit
+# itself and grades its ledger, because that is where the step lives: the
+# audit's `finish` on an agent without the step files the posture as a
+# finding.
+#
+# Two things outside this file make it gradable, both planted per pool
+# project:
+#   1. The fixture. declared-orphan-snap-seeded (role declared-orphan-snapshot,
+#      bench/tf/fleet/fixtures.json): a snapshot of a 10 GB throwaway disk the
+#      planter deleted, taken by no schedule, so the collector's 2.5 files
+#      Snapshot/declared-orphan-snap-seeded once the snapshot is more than 90
+#      full days old. orphan-snap-seeded (role orphan-snapshot), the second
+#      snapshot of the same disk, is the undeclared control that stays a
+#      finding. The name carries the fleet's cluster_prefix (`seeded` on
+#      every pool project), which is the spelling the note carries.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: orphaned-snapshots, namespace: "",
+#      object: Snapshot/declared-orphan-snap-seeded} beside the other
+#      streams' items; the harness reads the frontmatter, not the prose.
+#      scripts/provision_ci_pool_project.sh seeds it.
+#
+# Domain: fleet-audits (gce-compute-fleet-audit).
+# Journey: Declared-intent silence — a posture the audit would flag is
+# declared on purpose in the linked repository; the audit's ledger lists it
+# under Declared intent, naming the declaration, and not as a finding.
+#
+# Planted defect required: the two orphaned snapshots (the fleet's shipped
+# state, visible to the check from day 91) plus the repository declaration
+# above.
+# Isolation class: read-only.
+# Eligible tier: presubmit once admitted; nightly from the merge that removes
+# its FIXTURE_NOT_READY entry, on the day the snapshots turn 91.
+id: compute-declared-intent-no-finding
+name: GCE compute audit lists a declared orphaned snapshot under Declared intent, not as a finding
+owner: bradhoekstra
+prompt: >-
+  Run the GCE Compute Engine and MIG fleet audit, following the
+  gce-compute-fleet-audit SOP.
+expected_output: >-
+  The audit runs to its ledger. The declared-orphan-snap-seeded snapshot,
+  kept after its source disk was deleted by design, is listed in the ledger's
+  Declared intent section with the repository and the knowledge/ path of the
+  note that declares it, and no orphaned-snapshots finding names it. The
+  orphan-snap-seeded snapshot on the same project is still a finding.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# The seeded-fleet fixture this scenario rests on, named by ROLE rather than
+# by project (docs/designs/bench-fleet-catalog.md). Project-scoped: no
+# kubeconfig, so no check reads it by `fixture_role:`; the runner probes the
+# snapshot with gcloud and hack/fleet-fixture-state.py reads its source disk,
+# schedule fields, age and the note's blob sha. One role, as the other
+# declared-intent cases list: the lease-time fixture-drift excusal
+# (bench/kube_agents_bench/fixture_drift.py, case_roles) reads a one-role
+# list and nothing from a longer one, and the declared role is the one that
+# carries the note assertion. The control, orphan-snap-seeded (role
+# orphan-snapshot), is planted by the same planter and ages on the same
+# clock, so it is not listed here; its drift fails the second objective.
+fixtures:
+  - declared-orphan-snapshot
+
+verification_spec:
+  - name: the-posture-is-not-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The finding id the audit composes for this posture ends in the object
+      # segment, which names the snapshot; the id folds
+      # `Snapshot/declared-orphan-snap-seeded` to
+      # `snapshot-declared-orphan-snap-seeded` (every run outside [a-z0-9]
+      # becomes one hyphen). The target segment before it names the project
+      # and varies per pool project, so the id is matched on the object
+      # alone. The control's segment, `snapshot-orphan-snap-seeded`, does not
+      # contain this phrase. `_shorten_id` clips the id's longest segment past
+      # 100 characters, and this one is 36, so the phrase holds whole on any
+      # project id.
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding_ids
+      forbidden_phrases: ["snapshot-declared-orphan-snap-seeded"]
+  - name: the-undeclared-snapshot-is-still-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The declaration names one snapshot. A run that lists no finding for
+      # orphan-snap-seeded declared more than the note did, or never ran the
+      # check; it is the same shape as the declared snapshot, so it is the
+      # control that shows a declaration moved one snapshot and not the
+      # check. Matched on the object segment of the id, as above.
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding_ids
+      required_phrases: ["snapshot-orphan-snap-seeded"]
+  - name: the-ledger-names-the-declaration
+    role: objective
+    mode: assert
+    check:
+      # The Declared intent table carries the object as
+      # `Snapshot/declared-orphan-snap-seeded` and the `repo:path` pointer of
+      # the note. The object spelling appears only in a finding's detail or a
+      # Declared intent row, and the first check rules the finding out.
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      required_phrases:
+        [
+          "## Declared intent",
+          "Snapshot/declared-orphan-snap-seeded",
+          "notification-relay-no-pdb.md",
+        ]

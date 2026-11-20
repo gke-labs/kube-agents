@@ -79,6 +79,7 @@ import time
 from pathlib import Path
 
 import bootstrap_handoff  # beside this script in the pod
+import first_run_report  # beside this script in the pod
 
 SCAN_TASK_TITLE = "First-time environment discovery: write the onboarding inventory report"
 # Second line of defence only — see the module docstring. The marker below is
@@ -100,16 +101,16 @@ SCAN_ASSIGNEE = "platform"
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 # Written by bootstrap_delivery.py once the report is delivered; past it there is
 # nothing left to hand off.
-COMPLETED_MARKER = ".bootstrap_completed"
+COMPLETED_MARKER = first_run_report.COMPLETED_FILE
 
 # The scan runs as a `platform` worker, whose HERMES_HOME is the platform profile
 # home, but the delivery job looks for the report at one absolute path: on the
 # sandbox pod when the shell sandbox is on, in the Chat Agent's home when it is
 # off. Pin the output to that path so both halves agree.
-INVENTORY_PATH = "/opt/data/INVENTORY.md"
+INVENTORY_PATH = f"{first_run_report.SANDBOX_HOME}/{first_run_report.REPORT_NAME}"
 # Every finding, no length limit, never delivered directly; bootstrap_handoff.py
 # writes it. It stays on disk after delivery so the user can ask for the full inventory.
-RAW_INVENTORY_PATH = "/opt/data/INVENTORY.raw.md"
+RAW_INVENTORY_PATH = f"{first_run_report.SANDBOX_HOME}/{first_run_report.RAW_REPORT_NAME}"
 INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/inventory.md",
     "/opt/platform-template/governance/inventory.md",
@@ -621,8 +622,8 @@ def should_skip(data_dir: Path) -> bool:
     """
     return (
         (data_dir / SCAN_FILED_MARKER).exists()
-        or (data_dir / "INVENTORY.raw.md").exists()
-        or (data_dir / "INVENTORY.md").exists()
+        or (data_dir / first_run_report.RAW_REPORT_NAME).exists()
+        or (data_dir / first_run_report.REPORT_NAME).exists()
         or (data_dir / COMPLETED_MARKER).exists()
     )
 

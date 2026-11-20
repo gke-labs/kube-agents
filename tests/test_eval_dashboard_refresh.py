@@ -262,11 +262,11 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("1 releases", proc.stdout + proc.stderr)
         data = json.loads((self.target / "data.json").read_text())
-        self.assertEqual([r["rc_tag"] for r in data["releases"]], ["staging_2609092307_5b5ad10"])
+        self.assertEqual([r["rc_tag"] for r in data["releases"]], ["staging_2609092307_0707070"])
         # The Brief's release table renders from brief.json, which the
         # pipeline bakes into index.html and publishes beside it.
-        self.assertIn("staging_2609092307_5b5ad10", (self.target / "brief.json").read_text())
-        self.assertIn("staging_2609092307_5b5ad10", (self.target / "index.html").read_text())
+        self.assertIn("staging_2609092307_0707070", (self.target / "brief.json").read_text())
+        self.assertIn("staging_2609092307_0707070", (self.target / "index.html").read_text())
         self.assertFalse((self.target / "legacy.html").exists(), "the legacy page is retired")
 
     def test_second_run_merges_with_the_published_prior(self):
@@ -376,9 +376,9 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(
             [argv[i + 1] for i, a in enumerate(argv) if a == "--lane-nightly-prefix"],
             [
-                "gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/",
-                "ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/",
-                "gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/",
+                "gitlab=gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab-next/",
+                "ghes=gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-weekly-ghes-next/",
+                "gitlab-ce=gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/",
             ],
         )
         argv_log.unlink()
@@ -484,6 +484,28 @@ class RefreshScriptTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 124)
         self.assertIn("timed out after 1s", proc.stderr)
+
+
+class LanePrefixCopiesTest(unittest.TestCase):
+    """The three forge lanes' scheduled-job prefixes live twice: the workflow's env and the
+    refresh script's defaults. The two copies name the same bucket and job, or a move of one
+    leaves the other reading an empty prefix."""
+
+    def test_the_workflow_env_and_the_script_defaults_name_the_same_prefixes(self):
+        import re
+        import yaml
+
+        env = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci-health.yml").read_text())["env"]
+        workflow = {
+            "gitlab": env["GITLAB_NIGHTLY_NEXT_PREFIX"],
+            "ghes": env["GHES_WEEKLY_PREFIX"],
+            "gitlab-ce": env["GITLAB_CE_WEEKLY_PREFIX"],
+        }
+        line = next(l for l in SCRIPT.read_text().splitlines() if l.startswith("EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="))
+        defaults = dict(pair.split("=", 1) for pair in re.search(r"-(.*)}\"$", line).group(1).split())
+        self.assertEqual(defaults, workflow)
+        for prefix in workflow.values():
+            self.assertTrue(prefix.startswith("gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-"), prefix)
 
 
 if __name__ == "__main__":

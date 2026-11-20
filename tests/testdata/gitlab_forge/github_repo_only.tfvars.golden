@@ -92,6 +92,7 @@ chat_topic_name           = "platform-agent-chat-events"
 chat_subscription_name    = "platform-agent-chat-events-sub"
 google_chat_allowed_users = []
 google_chat_home_channel  = ""
+google_chat_home_channel_policy = ""
 google_chat_mode          = "default"
 
 enable_slack            = false
@@ -109,6 +110,8 @@ github_app_id        = ""
 enable_gke_backup_plan = false
 
 helm_upgrade_install = false
+
+card_stop_enabled = false
 
 # The CRD defaults dashboardEnabled to true; the installer has always
 # defaulted it to false and asks. Memory settings mirror --memory.

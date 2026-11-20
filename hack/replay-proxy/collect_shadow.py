@@ -42,7 +42,8 @@ Rollout step 2):
 - `record`, on a trusted nightly: each pass also copies the answers the proxy
   saved (the cache directory, replay_cache.py's layout) out of the pod into
   `--keep-dir` on this machine, empties each copied file in the pod (an empty
-  file still holds its name, so the first write for a key still wins), and
+  file still holds its name, so the proxy never saves that answer to that key
+  again), and
   keeps a copy of every line and stored request it fetched. Every
   `--publish-interval` seconds, and once in the last pass, publish_cache.py
   uploads the answers from runs that passed, as graded so far under
@@ -54,7 +55,8 @@ Rollout step 2):
   pass copies every pod first, then writes lane_report.py's report before it
   uploads its lines and stored text, so a deadline that cuts the pass costs
   those, not the report. The report names the commit replayed and where it
-  came from (`--lane-commit`, `--lane-commit-source`) and goes under the
+  came from (`--lane-commit`, `--lane-commit-source`), grades each case
+  against the newest night on that commit (`--newest-night`), and goes under the
   job's prefix, in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
   pod took the cache, so the lane can stop before its cases. A pod being
   deleted is never seeded, though its lines are still collected.
@@ -716,7 +718,7 @@ class Collector:
 
         Returns the bytes copied. A file is emptied only once it is on this
         machine, and an emptied file keeps its name, so the proxy still sees
-        its key as written and never saves a second answer under it.
+        name as written and never saves the same answer under it again.
         """
         if not POD_NAME_RE.match(pod):
             self.fail("cache_pod_name")
@@ -1070,6 +1072,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed-dir", default="", help="replay: the cache fetch_cache.py filled, seeded into each pod")
     parser.add_argument("--seed-once", action="store_true", help="replay: seed every live proxy pod, then exit")
     parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
+    parser.add_argument("--newest-night", default="",
+                        help="replay: fetch_cache.py's newest night's builds by commit (--night-out)")
     args = parser.parse_args(argv)
     if not CACHE_SUBDIR_RE.match(args.cache_subdir) or args.cache_subdir in (LOGS_DIR, STORE_DIR):
         parser.error("--cache-subdir must be one plain directory name other than logs and store")
@@ -1108,7 +1112,8 @@ def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optio
         import lane_report
 
         return lane_report.write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, out_dir,
-                                        commit=args.lane_commit, commit_source=args.lane_commit_source)
+                                        commit=args.lane_commit, commit_source=args.lane_commit_source,
+                                        newest_night_path=args.newest_night)
 
     return report
 

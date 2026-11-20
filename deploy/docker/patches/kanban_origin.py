@@ -106,6 +106,11 @@ ticket. A model that schedules a shipped
 script through ``cronjob_manage`` (the issue gate, for example) re-runs a
 trusted writer with that writer's own fixed origin, not one it chooses.
 
+The same two wrappers also stamp a card's eval run tag (``eval_run_tag.py``,
+side table ``kanban_task_eval_runs``) while ``KUBEAGENTS_EVAL_RUN_TAGS`` is on:
+resolved before a top-level insert's transaction, a creator's read inside it.
+Off, those steps write nothing.
+
 Nothing here may fail a create: every entry point logs and falls back to no
 stamp.
 """
@@ -191,6 +196,9 @@ WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
 #: test loads them under.
 CRON_SCOPE_MODULES = ("tools.cron_run_scope", "cron_run_scope")
 PRIORITY_MODULES = ("hermes_cli.kanban_priority", "kanban_priority")
+#: The eval run tag (``eval_run_tag.py``), stamped beside the origin while the
+#: install has it on; it does nothing while off.
+EVAL_RUN_TAG_MODULES = ("hermes_cli.eval_run_tag", "eval_run_tag")
 
 #: A top-level create's origin, resolved by :func:`wrap_create_task` before the
 #: insert's transaction and read inside it.
@@ -483,6 +491,18 @@ def creation_origin(created_by: object = None) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _eval_run_step(name: str, *args: Any) -> Any:
+    """``eval_run_tag.<name>(*args)``, or None when the module is absent or raises. Never raises."""
+    try:
+        module = _first_module(EVAL_RUN_TAG_MODULES)
+        step = getattr(module, name, None)
+        return step(*args) if step is not None else None
+    except Exception as exc:  # noqa: BLE001 — never fail a create
+        logger.warning("kanban origin: the eval run tag step %s failed: %r", name, exc)
+        return None
+
+
+
 def stamp_at_insert(conn: sqlite3.Connection, task_id: str, creator_task_id: object) -> None:
     """Stamp a card just inserted, inside the insert's transaction. Never raises.
 
@@ -510,6 +530,7 @@ def wrap_inherit_creator_origin(inherit: Callable[..., Any]) -> Callable[..., An
     def wrapper(conn, task_id, creator_task_id, *args, **kwargs):
         result = inherit(conn, task_id, creator_task_id, *args, **kwargs)
         stamp_at_insert(conn, task_id, creator_task_id)
+        _eval_run_step("stamp_new_card", conn, task_id, creator_task_id)
         return result
 
     return wrapper
@@ -524,9 +545,11 @@ def wrap_create_task(create_task: Callable[..., Any]) -> Callable[..., Any]:
         if not kwargs.get("creator_task_id"):
             pending = creation_origin(kwargs.get("created_by"))
         token = _pending_origin.set(pending)
+        eval_token = _eval_run_step("resolve_new_card", kwargs.get("creator_task_id"))
         try:
             return create_task(conn, *args, **kwargs)
         finally:
+            _eval_run_step("reset_new_card", eval_token)
             _pending_origin.reset(token)
 
     return wrapper

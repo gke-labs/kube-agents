@@ -28,9 +28,9 @@ hard enum — add new types by PR):
 
 Entries for live cluster posture (`cluster-blueprint`, `tenancy-model`, `runbook`, `metric-definition`,
 `escalation`, `observation`) may also carry `declares:`, a list of `{check, namespace, object}` items (`namespace: ""`
-written out for a cluster-scoped object; plus `cluster` for a one-cluster choice, as the qualified `<project>/<location>/<name>` every stream's
-findings carry, and `expires`, a `YYYY-MM-DD` UTC date that is the last day the item stands: past it the posture
-returns as a finding with a _Declared intent expired_ line naming the note and the date) naming a posture a declaring audit stream (`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis`, `stockout-prevention`) lists under
+written out for a cluster-scoped object; plus `cluster` for a one-cluster choice, as the finding's own target: the qualified `<project>/<location>/<name>` a cluster stream's
+findings carry, or `project/<id>` for a project-scoped stream such as the GCE compute or the networking audit; and `expires`, a `YYYY-MM-DD` UTC date that is the last day the item stands: past it the posture
+returns as a finding with a _Declared intent expired_ line naming the note and the date) naming a posture a declaring audit stream (`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis`, `stockout-prevention`, `gce-compute-fleet-audit`, `gcp-networking-fabric-audit`) lists under
 _Declared intent_ instead of reporting (`../README.md`, "Declared intent"). Proposed `decision` and `lesson` entries keep pre-push manifest assertions under `scope` and `guard.expect` separate from `declares:` so manifest guards do not suppress live `fleet-audit` findings ([`docs/designs/memory.md`](../../../docs/designs/memory.md)).
 
 ## Entries

@@ -35,6 +35,17 @@ to do neither. That held `kube-agents-evals-4` from 2026-09-01 14:33 UTC until
 a human repaired it the following afternoon, every re-run deleting the CRDs
 again on the way past. An unreadable probe keeps them for the same reason.
 
+A CRD delete that times out is held by CRs whose finalizers no operator is
+left to clear (#6458, #3764): Step 2 removed the operator after the chart's
+pre-delete hook gave up waiting on the same finalizers, and a CRD blocks on
+customresourcecleanup until its last CR is gone. Left Terminating, the CRD met
+the next lease's install, which the API server refuses to create CRs into. The
+tests below pin that on a timed-out delete Step 3 lists the CRs of every kind
+the chart's crds/ declare, releases their finalizers, deletes them and deletes
+the CRDs again; that a delete which finishes, or the keep path, releases
+nothing; and that a second timeout is still counted and still reaches the
+sweeps.
+
 The steps are lifted from the script's own text and executed under bash with
 stubbed kubectl/helm, the same approach as tests/test_ci_teardown_sweep.py.
 """
@@ -76,6 +87,20 @@ _STUB_RECORD_NAMES = (
 )
 
 _NAMESPACE = "kubeagents-system"
+
+# The CRs a timed-out CRD delete is held by, as (resource, namespace, name):
+# the two kinds the nightly of 2026-11-19 left behind (#6458). The resource
+# names are what `kubectl get -f charts/kube-agents/crds/ -o name` yields with
+# its kind prefix stripped, which is how the script addresses them.
+_CHART_CRD_DIR = _REPO_ROOT / "charts" / "kube-agents" / "crds"
+_CRD_NAME_PREFIX = "customresourcedefinition.apiextensions.k8s.io/"
+_ORPHANS = (
+    ("agentprofiles.kubeagents.x-k8s.io", _NAMESPACE, "tse"),
+    ("platformagents.kubeagents.x-k8s.io", _NAMESPACE, "platform-agent"),
+)
+# Repeated on purpose, like the selector above: the merge patch that releases
+# a CR's finalizers.
+_FINALIZERS_RELEASE_PATCH = '{"metadata":{"finalizers":null}}'
 
 # What the stubbed probe writes to stderr when it fails: the real message for
 # the one unreadable state that is knowably empty, so the test can show the
@@ -130,8 +155,16 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
         history_exit=1,
         records=(),
         crd_delete_exit=0,
+        crd_redelete_exit=0,
+        orphans=(),
     ):
         """Run the teardown steps with recording stubs.
+
+        `crd_delete_exit` answers the first CRD delete and `crd_redelete_exit`
+        the one Step 3 issues again after releasing orphaned CRs; `orphans`
+        are the (resource, namespace, name) CRs the stub lists for the kinds
+        the chart's crds/ declare, and it names only their kinds to the
+        `kubectl get -f` that reads the files.
 
         Returns (returncode, call argv lines, stdout, stderr). Each stub
         appends its argv to a log; helm answers `uninstall` and `history`
@@ -168,20 +201,42 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
                 "esac\n",
                 encoding="utf-8",
             )
+            crd_delete_count = tmp_path / "crd-deletes"
+            crd_delete_count.write_text("0", encoding="utf-8")
+            orphan_kinds = sorted({resource for resource, _, _ in orphans})
             kubectl_stub = bin_dir / "kubectl"
             kubectl_stub.write_text(
                 "#!/usr/bin/env bash\n"
                 f'echo "kubectl $*" >> "{log}"\n'
-                'if [[ "$1" == "get" ]]; then\n'
+                # The orphan release (#6458) reads the chart's CRD names from
+                # the files, then each kind's CRs across namespaces.
+                'if [[ "$1" == "get" && "$2" == "-f" ]]; then\n'
+                + "".join(f'  echo "{_CRD_NAME_PREFIX}{kind}"\n' for kind in orphan_kinds)
+                + "  exit 0\nfi\n"
+                + "".join(
+                    f'if [[ "$1" == "get" && "$2" == "{kind}" ]]; then\n'
+                    + "".join(
+                        f'  echo "{ns}   {name}"\n'
+                        for resource, ns, name in orphans
+                        if resource == kind
+                    )
+                    + "  exit 0\nfi\n"
+                    for kind in orphan_kinds
+                )
+                + 'if [[ "$1" == "get" ]]; then\n'
                 + "".join(f'  echo "{name}"\n' for name in records)
                 + f"  [[ {kubectl_exit} -ne 0 ]] && echo '{_PROBE_STDERR}' >&2\n"
                 + f"  exit {kubectl_exit}\n"
                 "fi\n"
                 # The CRD delete answers separately so a test can reach Step
                 # 3's timed-out branch, which needs a readable probe (else the
-                # keep branch fires first) and a red delete.
+                # keep branch fires first) and a red delete; the delete Step 3
+                # issues again after releasing orphaned CRs answers on its own.
                 'if [[ "$1" == "delete" && "$2" == "-f" ]]; then\n'
-                f"  exit {crd_delete_exit}\n"
+                f'  n="$(cat "{crd_delete_count}")"\n'
+                f'  echo "$((n + 1))" > "{crd_delete_count}"\n'
+                f'  [[ "$n" -eq 0 ]] && exit {crd_delete_exit}\n'
+                f"  exit {crd_redelete_exit}\n"
                 "fi\n"
                 f'if [[ "$*" == *"{_RECORD_SELECTOR}"* && {kubectl_exit} -eq 0 ]]; then\n'
                 + "".join(f'  echo "{name}"\n' for name in _STUB_RECORD_NAMES)
@@ -335,9 +390,10 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
     def test_the_crd_step_reports_which_branch_it_took(self):
         """#1172 went 25 hours unnoticed because the log said only ✓."""
         for branch, kwargs in (
-            ("deleted", {}),
+            ("deleted)", {}),
             ("skipped", {"kubectl_exit": 1}),
-            ("delete timed out or failed", {"crd_delete_exit": 1}),
+            ("deleted after releasing", {"crd_delete_exit": 1}),
+            ("delete timed out or failed", {"crd_delete_exit": 1, "crd_redelete_exit": 1}),
         ):
             with self.subTest(branch=branch):
                 rc, calls, out, err = self._run_steps(**kwargs)
@@ -347,9 +403,10 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
     def test_the_crd_delete_is_bounded(self):
         """`kubectl delete` waits forever by default, and a CRD delete blocks
         on customresourcecleanup until every CR of that kind is gone — which a
-        PlatformAgent finalizer no live operator can clear never is. Unbounded,
-        that hangs teardown past Prow's job timeout and Steps 4 and 5, whose
-        own comment says they must stay reachable on every path, never run."""
+        PlatformAgent finalizer no live operator can clear never is, until
+        Step 3 releases it. Unbounded, that hangs teardown past Prow's job
+        timeout and Steps 4 to 6, whose own comment says they must stay
+        reachable on every path, never run."""
         rc, calls, out, err = self._run_steps()
         self.assertEqual(rc, 0, err)
         deletes = self._crd_deletes(calls)
@@ -402,6 +459,111 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
             any(c.startswith("kubectl delete clusterroles") for c in calls),
             f"the cluster-scoped sweep never ran: {calls}",
         )
+
+    # --- a timed-out CRD delete releases the CRs holding it (#6458) ---------
+
+    def _patches(self, calls):
+        return [c for c in calls if c.startswith("kubectl patch ")]
+
+    def test_a_timed_out_crd_delete_releases_the_orphaned_crs_then_deletes_again(self):
+        """#6458: the nightly of 2026-11-19 left agentprofiles and
+        platformagents Terminating under the next install. Each CR of each
+        kind is released by the finalizers merge patch, namespaced, then
+        deleted without waiting, and the CRDs are deleted again after; the
+        step then reports a clean delete rather than a failure."""
+        rc, calls, out, err = self._run_steps(crd_delete_exit=1, orphans=_ORPHANS)
+        self.assertEqual(rc, 0, err)
+        for resource, ns, name in _ORPHANS:
+            self.assertIn(
+                f"kubectl patch {resource} -n {ns} {name} --type=merge -p {_FINALIZERS_RELEASE_PATCH}",
+                "\n".join(calls),
+            )
+            self.assertTrue(
+                any(
+                    c.startswith(f"kubectl delete {resource} -n {ns} {name} --ignore-not-found --wait=false")
+                    for c in calls
+                ),
+                calls,
+            )
+        self.assertEqual(len(self._patches(calls)), len(_ORPHANS), calls)
+        crd_deletes = [i for i, c in enumerate(calls) if c.startswith(_CRD_DELETE_PREFIX)]
+        patches = [i for i, c in enumerate(calls) if c.startswith("kubectl patch ")]
+        self.assertEqual(len(crd_deletes), 2, calls)
+        self.assertLess(crd_deletes[0], min(patches), calls)
+        self.assertLess(max(patches), crd_deletes[1], calls)
+        self.assertIn(f"✓ CRD step (deleted after releasing {len(_ORPHANS)} orphaned CR(s))", out)
+        self.assertNotIn("✗ CRD step", out)
+
+    def test_the_release_reads_the_kinds_from_the_chart_crds_not_a_list(self):
+        """A kind list in the script would drift the day a CRD is added; the
+        release asks the files, then every namespace for each kind."""
+        rc, calls, out, err = self._run_steps(crd_delete_exit=1, orphans=_ORPHANS)
+        self.assertEqual(rc, 0, err)
+        reads = [c for c in calls if c.startswith("kubectl get -f charts/kube-agents/crds/")]
+        self.assertEqual(len(reads), 1, calls)
+        self.assertIn("-o name", reads[0])
+        for resource in sorted({resource for resource, _, _ in _ORPHANS}):
+            self.assertTrue(
+                any(c.startswith(f"kubectl get {resource} --all-namespaces") for c in calls),
+                f"{resource} was never listed: {calls}",
+            )
+
+    def test_the_release_deletes_each_cr_without_waiting(self):
+        """A CR whose finalizers are released goes on its own; a delete that
+        waited would block on one the API server has not yet collected and
+        hold the sweeps after it, which the file forbids."""
+        rc, calls, out, err = self._run_steps(crd_delete_exit=1, orphans=_ORPHANS)
+        self.assertEqual(rc, 0, err)
+        for resource, ns, name in _ORPHANS:
+            deletes = [c for c in calls if c.startswith(f"kubectl delete {resource} -n {ns} {name} ")]
+            self.assertEqual(len(deletes), 1, calls)
+            self.assertIn("--wait=false", deletes[0].split(), deletes[0])
+
+    def test_a_crd_delete_that_finishes_releases_nothing(self):
+        """The release skips the operator's own deletion cleanup, so it runs
+        only once a delete has timed out: a delete that finishes means the
+        operator, or the hook, already cleared every CR."""
+        rc, calls, out, err = self._run_steps(orphans=_ORPHANS)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._patches(calls), [])
+        self.assertFalse(any(c.startswith("kubectl get -f") for c in calls), calls)
+        self.assertEqual(len(self._crd_deletes(calls)), 1, calls)
+
+    def test_a_surviving_record_releases_nothing(self):
+        """On the keep path the CRs are what the next lease upgrades over."""
+        rc, calls, out, err = self._run_steps(
+            uninstall_exit=1,
+            history_json=_HISTORY_DEPLOYED,
+            history_exit=0,
+            records=_STUB_RECORD_NAMES,
+            orphans=_ORPHANS,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._patches(calls), [])
+        self.assertEqual(self._crd_deletes(calls), [])
+
+    def test_a_second_timeout_is_counted_and_still_reaches_the_sweeps(self):
+        """Something other than a finalizer holding the CRD is still a failed
+        step, and the log carries what was released; the exit-code contract
+        and the sweeps after it hold as before."""
+        rc, calls, out, err = self._run_steps(
+            crd_delete_exit=1, crd_redelete_exit=1, orphans=_ORPHANS
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self._crd_deletes(calls)), 2, calls)
+        self.assertIn("✗ CRD step (delete timed out or failed", out)
+        self.assertIn(f"{len(_ORPHANS)} orphaned CR(s) released", out)
+        self.assertIn("Step 4", out)
+        self.assertIn("Step 5", out)
+
+    def test_every_chart_crd_is_namespaced(self):
+        """The release reads each CR's namespace and name and addresses it
+        with -n; a cluster-scoped CRD would need a different call, so one
+        added to the chart fails here rather than silently in a teardown."""
+        crd_files = sorted(_CHART_CRD_DIR.glob("*.yaml"))
+        self.assertTrue(crd_files, _CHART_CRD_DIR)
+        for path in crd_files:
+            self.assertIn("\n  scope: Namespaced\n", path.read_text(encoding="utf-8"), path.name)
 
 
 if __name__ == "__main__":

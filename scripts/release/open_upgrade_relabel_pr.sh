@@ -47,7 +47,8 @@ if [ -z "${relabelled}" ]; then
   exit 0
 fi
 
-# A label wider than the column changes its alignment; prettier puts the table back as CI checks it.
+# The upgrade table itself is out of Prettier (prettier-ignore, #6286), so this formats the rest of the page
+# only; a wider label stays as the relabel wrote it.
 env -u GH_TOKEN npx --yes "prettier@${PRETTIER_VERSION}" --write "${UPGRADE_PAGE}" >/dev/null
 
 if git diff --quiet -- "${UPGRADE_PAGE}"; then
@@ -61,7 +62,7 @@ rows="$(printf '%s\n' "${relabelled}" | awk -F '\t' '{f = index($2, "`") ? "``" 
 # shipped, still pending because its relabel has not merged, takes that release.
 releases="$(printf '%s\n' "${relabelled}" | cut -f1 | sort -u -t. -k1,1n -k2,2n -k3,3n | paste -sd, - | sed 's/,/, /g')"
 commit_message="docs(upgrade): relabel the pending rows ${releases} shipped"
-pr_title="docs(upgrade): relabel the pending rows ${releases} shipped, fixing main's Documentation Checks"
+pr_title="docs(upgrade): relabel the pending rows ${releases} shipped"
 
 git switch -C "${RELABEL_BRANCH}"
 # Set GIT_AUTHOR_*/GIT_COMMITTER_* inline so caller env and author.*/committer.* git config cannot override.
@@ -85,15 +86,15 @@ git ${push_auth[@]+"${push_auth[@]}"} push --force origin "HEAD:refs/heads/${REL
 IFS= read -r -d '' body <<EOF || true
 ## Summary
 
-These rows of the upgrade page's breaking-changes table still said \`pending\`, though a release now contains each. This change relabels each with the first release that contains it. Approving it turns main's docs check green again.
+These rows of the upgrade page's breaking-changes table still said \`pending\`, though a release now contains each. This change relabels each with the first release that contains it. Merging it relabels the rows before main's Documentation Checks starts failing, 48 hours after the release.
 
 ## Why This Change
 
-Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main.
+Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main once the release is 48 hours old.
 
 ## What Changed
 
-\`${UPGRADE_PAGE}\`: the Release cells of these rows change, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`), and the table's rows go back in newest-first order, which the check also holds it to. The change stays inside the breaking-changes table; \`prettier\` then restores the table's formatting, which can touch other rows of it.
+\`${UPGRADE_PAGE}\`: the Release cells of these rows change, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`), and the table's rows go back in newest-first order, which the check also holds it to. The change stays inside the breaking-changes table, which is out of \`prettier\` (\`prettier-ignore\`), so no other row of it changes.
 
 ${rows}
 

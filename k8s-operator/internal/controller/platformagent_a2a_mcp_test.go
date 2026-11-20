@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -123,6 +124,9 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	}
 	if env[a2aMCPEnvBusUser] != a2aConsoleMCPUser {
 		t.Errorf("bus user = %q, want the console-mcp principal", env[a2aMCPEnvBusUser])
+	}
+	if want := path.Join(a2aMCPBusKeyMountDir, a2aConsoleMCPPasswordKey); env[a2aMCPEnvPasswordFile] != want {
+		t.Errorf("%s = %q, want %q", a2aMCPEnvPasswordFile, env[a2aMCPEnvPasswordFile], want)
 	}
 
 	// Every file the server reads sits in a mount of this pod.
@@ -570,6 +574,35 @@ func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
 			for _, c := range pod.Containers {
 				if len(c.EnvFrom) != 0 {
 					t.Errorf("container %s has envFrom %v; every credential here is one mounted file", c.Name, c.EnvFrom)
+				}
+			}
+		})
+	}
+}
+
+// A model drives the MCP server, so the console password, whose holder can
+// publish on chat.console.*.confirm, must not reach its pod through env
+// either: TestTheMCPPodHoldsItsBusPasswordAndItsOwnTokenOnly pins the
+// volumes and TestTheMCPPodCarriesNoOtherCredential refuses envFrom, and this
+// covers what neither does, an env value naming the console password key, an
+// env valueFrom reading it, and a bus user of console, on every container,
+// with broker access on and off.
+func TestTheMCPPodEnvCarriesNoConsolePassword(t *testing.T) {
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
+			for _, c := range append(slices.Clone(pod.InitContainers), pod.Containers...) {
+				for _, e := range c.Env {
+					if strings.Contains(e.Value, a2aConsolePasswordKey) {
+						t.Errorf("container %s env %s = %q names the console password", c.Name, e.Name, e.Value)
+					}
+					if e.Name == a2aMCPEnvBusUser && e.Value == a2aConsoleConfUser {
+						t.Errorf("container %s logs in as the console user", c.Name)
+					}
+					if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && e.ValueFrom.SecretKeyRef.Key == a2aConsolePasswordKey {
+						t.Errorf("container %s env %s reads the console password", c.Name, e.Name)
+					}
 				}
 			}
 		})
