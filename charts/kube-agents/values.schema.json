@@ -2184,6 +2184,15 @@
                 "tenantId": {
                   "type": "string"
                 },
+                "inbound": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  }
+                },
                 "allowedUsers": {
                   "type": "array",
                   "items": {

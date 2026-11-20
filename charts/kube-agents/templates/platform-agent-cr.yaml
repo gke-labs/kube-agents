@@ -1253,6 +1253,10 @@ spec:
       {{- if hasKey $integ.teams "adaptiveCards" }}
       adaptiveCards: {{ $integ.teams.adaptiveCards }}
       {{- end }}
+      {{- if dig "inbound" "enabled" false $integ.teams }}
+      inbound:
+        enabled: true
+      {{- end }}
     {{- end }}
   {{- end }}
 {{- end }}

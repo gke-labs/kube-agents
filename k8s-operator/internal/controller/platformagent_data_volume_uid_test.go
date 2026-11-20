@@ -102,6 +102,9 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	a2aConsole := buildA2AConsoleDeployment(agent)
 	a2aMCP := buildA2AMCPDeployment(agent)
 	a2aCurator := buildA2ACuratorDeployment(agent)
+	// The Teams inbound receiver renders only with Teams, its inbound switch
+	// and a tenant on the CR; the walk hands it a copy of agent with those set.
+	teamsInbound := buildTeamsInboundDeployment(withTeamsInboundOn(agent))
 	gatewayStatefulSet := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
 	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
 	nats := buildA2ANATSStatefulSet(agent, "c")
@@ -130,6 +133,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildA2AConsoleDeployment", a2aConsole.Name, a2aConsole.Spec.Template.Spec},
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
 		{"buildA2ACuratorDeployment", a2aCurator.Name, a2aCurator.Spec.Template.Spec},
+		{"buildTeamsInboundDeployment", teamsInbound.Name, teamsInbound.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
 		{"a2aProvisionJobForm", provisionThird.Name, provisionThird.Spec.Template.Spec},
 		{"buildBusMigrationJob", busPin.Name, busPin.Spec.Template.Spec},
