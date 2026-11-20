@@ -1,4 +1,11 @@
-"""The three safety checks on a generated disruption-budget fix, for the credential broker.
+"""The `no-pdb` recipe's safety checks: the three checks on a generated disruption-budget fix.
+
+The recipe interface (`fix_recipes/registry.checks_module`): :data:`read_kinds`
+is the one namespace read the checks need, and :func:`checks` takes the fix
+(`change`: the workload, namespace, budget name and selector) and that read
+(`live`) and returns one named result per check, each `pass`, `fail` or
+`unknown`. The credential broker's label gate (`vcs_broker`) reads both
+through the registry rather than naming this module.
 
 Before the broker may mark a fleet-audit `no-pdb` fix as one a pipeline could
 merge without a review, it runs the checks the sandbox's `pdb_safety.py` runs for
@@ -21,12 +28,14 @@ stricter one.
 
 `fleet-audit/scripts/test_broker_checks_parity.py` holds the verdicts and the
 copied rules to the sandbox's own. Stdlib only: the credential-proxy image ships
-this directory and nothing from the fleet-audit skill.
+the scripts directory, this recipe's included, and nothing from the fleet-audit
+skill.
 """
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 REPLICAS_READY = "replicas-ready"
 NO_OVERLAPPING_BUDGET = "no-overlapping-budget"
@@ -43,6 +52,9 @@ WORKLOAD_API_VERSION = "apps/v1"
 #: selector could reach (Jobs and CronJobs too), the autoscalers, and the
 #: budgets already there.
 READ_KINDS = "deployments,statefulsets,daemonsets,cronjobs,jobs,poddisruptionbudgets,horizontalpodautoscalers"
+#: The recipe interface's name for the same read.
+read_kinds = READ_KINDS
+PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 POD_TEMPLATE_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob")
 SELECTOR_KEYS = ("matchLabels", "matchExpressions")
 
@@ -86,13 +98,13 @@ def selector_matches(selector: dict, labels: dict) -> bool:
     return True
 
 
-def _result(name: str, passed: bool, detail: str) -> dict:
-    return {"name": name, "passed": passed, "detail": detail}
+def _result(name: str, passed: bool, detail: str, status: str | None = None) -> dict:
+    return {"name": name, "passed": passed, "detail": detail, "status": status or (PASS if passed else FAIL)}
 
 
 def unanswered(detail: str) -> list[dict]:
-    """Every check failed for one reason: nothing could be judged."""
-    return [_result(name, False, detail) for name in CHECK_NAMES]
+    """Every check `unknown` for one reason: nothing could be judged. Not passed, so the gate refuses."""
+    return [_result(name, False, detail, UNKNOWN) for name in CHECK_NAMES]
 
 
 def _name(item: dict) -> str:
@@ -190,6 +202,8 @@ def judge(dump: dict, obj: str, namespace: str, budget_name: str, selector: dict
             f"{obj}: replicas={wanted}, ready={ready}"
             + (f", autoscaler floor={floor}" if hpa else "")
             + (f", status from generation {observed} of {generation}" if stale else ""),
+            # A status the controller has not caught up with cannot be judged yet.
+            UNKNOWN if stale else None,
         )
     ]
 
@@ -233,3 +247,12 @@ def judge(dump: dict, obj: str, namespace: str, budget_name: str, selector: dict
         _result(SELECTOR_MATCHES, not why, why or "the budget's selector is the workload's own and selects only its pods")
     )
     return results
+
+
+def checks(change: Any, live: dict) -> list[dict]:
+    """The recipe interface: :func:`judge` for the fix `change` against the namespace read `live`.
+
+    `change` carries `object` (`Kind/name`), `namespace`, `name` (the budget's)
+    and `selector`, as `automerge_eligibility.parse_budget`'s answer does.
+    """
+    return judge(live, change.object, change.namespace, change.name, change.selector)
