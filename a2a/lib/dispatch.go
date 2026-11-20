@@ -544,10 +544,12 @@ type DispatchProfile struct {
 	// so it never builds a Job from a template the config has moved past.
 	// Absent, the profile's unattended tasks have no worker (the operator
 	// builds warm pools for the read tier only) and the dispatcher refuses
-	// them no-worker at admission. The durables a profile is read on aren't
-	// listed either: the dispatcher derives them (DerivedDurables), and
-	// ignores a config that still lists them (#5639).
+	// them no-worker at admission.
 	JobTemplateRef *DispatchJobTemplateRef `json:"jobTemplateRef,omitempty"`
+	// The durables a profile is read on aren't listed: the dispatcher
+	// derives them (DerivedDurables), and ignores the list in a config that
+	// still has one (#5639).
+	//
 	// DrainingUntil, set, makes the profile draining (#5074): it has left
 	// the install, so it has no durables and nothing new is dispatched for
 	// it, but it stays listed, and keeps its .supervisor grant, until then,
