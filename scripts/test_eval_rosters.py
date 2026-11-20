@@ -890,6 +890,10 @@ INJECT_LANE_SAFEGUARDS = [
 # the fan-out's second phase on both lanes, after every other unit has
 # finished. A new requesting case edits this set in the same pull request.
 INJECT_LANE_REQUESTING = [
+    # chat-stop-names-pull-request-already-opened (#4061): the card opens the
+    # pull request the stop's answer has to name; listed in `requesting:`,
+    # since no check of its reads GitHub.
+    "chat-stop-names-pull-request-already-opened",
     "cluster-agent-crashloop-fix-request",
     # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
     # may propose the change as a pull request; its objective's
