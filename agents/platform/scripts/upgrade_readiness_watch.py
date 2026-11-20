@@ -644,7 +644,7 @@ BLOCKED_NAMES = " ({names})"
 RETIRED_LINE = "**No cluster is due for GKE {version} any more.** The upgrade readiness check stops tracking it."
 # A report in chat: what cannot upgrade, one line per blocked cluster, the rest
 # as counts, and the date of the next report. A cluster is named as the old
-# line named it, by its name alone.
+# line named it, by its name alone, unless the lines shown repeat the name.
 # The headline says "not ready", the report's verdict: a PodDisruptionBudget
 # holds a surge upgrade's drain for up to an hour per node before the pod is
 # removed anyway, and an exclusion holds only the automatic upgrade, so
@@ -669,8 +669,12 @@ MAX_BLOCKED_CLUSTERS_SHOWN = 5
 BLOCKED_CLUSTER_LINE = "- {cluster}: {reason}"
 BLOCKED_CLUSTER_BARE = "- {cluster}"
 BLOCKED_CLUSTERS_MORE = "- and {count} more"
-# A cluster name the lines shown repeat across projects is told apart by its project.
+# A cluster name the lines shown repeat is told apart by its project, and by its
+# location as well where two clusters of one project share it: GKE keeps a
+# cluster name unique only within one project and location. The location reads
+# as the partial line names one ("p1 in europe-west1").
 CLUSTER_IN_PROJECT = "{cluster} in {project}"
+CLUSTER_IN_LOCATION = "{cluster} in {project} in {location}"
 BLOCKER_BUDGET = "PodDisruptionBudget {pdb} allows no evictions. Fix: let it evict at least one pod."
 BLOCKER_WEBHOOK = (
     "admission webhook {config} fails closed and its backend is unreachable. "
@@ -2242,12 +2246,16 @@ def blocked_cluster_line(cluster: str, member: dict | None, now: datetime) -> st
 
 
 def shown_clusters(keys: list[str]) -> list[str]:
-    """The clusters as a message names them: by name, and by name and project
-    where a name repeats among them."""
+    """The clusters as a message names them: by name, by name and project
+    where a name repeats among them, and by name, project and location where
+    two clusters of one project share a name."""
     names = [key.rsplit(MEMBER_KEY_SEPARATOR, 1)[-1] for key in keys]
+    in_project = [(project_of(key), name) for key, name in zip(keys, names)]
     return [
-        CLUSTER_IN_PROJECT.format(cluster=name, project=project_of(key)) if names.count(name) > 1 else name
-        for key, name in zip(keys, names)
+        CLUSTER_IN_LOCATION.format(cluster=name, project=project, location=key.split(MEMBER_KEY_SEPARATOR)[1]) if in_project.count((project, name)) > 1
+        else CLUSTER_IN_PROJECT.format(cluster=name, project=project) if names.count(name) > 1
+        else name
+        for key, (project, name) in zip(keys, in_project)
     ]
 
 

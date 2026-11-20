@@ -3277,6 +3277,22 @@ class ChatWording(Base):
         self.assertEqual(code, 0)
         self.assertEqual(chat, f"**2 clusters aren't ready for GKE {TARGET} yet.**\n- a in p1\n- a in p2\nThe next report is due on October 15.\n")
 
+    def test_a_name_two_locations_of_one_project_share_is_told_apart_by_its_location(self) -> None:
+        members = [
+            member("a", "lagging", readiness="blocked"),
+            dict(member("a", "lagging", readiness="blocked"), location="us-east1-b"),
+            member("a", "lagging", readiness="blocked", project="p2"),
+        ]
+        versions = envelope([member("a", "lagging"), dict(member("a", "lagging"), location="us-east1-b"), member("a", "lagging", project="p2")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, chat, _ = run_main_split(FakeSandbox(versions, envelope(members)))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            f"**3 clusters aren't ready for GKE {TARGET} yet.**\n- a in p1 in us-central1-a\n- a in p1 in us-east1-b\n- a in p2\nThe next report is due on October 15.\n",
+        )
+        self.assert_plain(chat)
+
     def test_a_long_post_shows_fewer_blocked_clusters_and_stays_one_post(self) -> None:
         third = "1.33.5-gke.1000000"
         hook = {"blocking": [{"config": "linkerd-policy-validator-webhook-configuration-" + "x" * 20}], "outage": []}
