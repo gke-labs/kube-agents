@@ -46,6 +46,16 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `post-merge-check` follows a fix after it merges
+
+`post-merge-check` is a `no_agent` script: the tick prompts no model. Every five minutes it runs
+`post_merge_check.py`, which reads nothing while `KUBEAGENTS_POST_MERGE_CHECK` is `off`. With it on,
+it follows each recorded fix pull request through merge, apply, the health window and the fleet
+audit's re-check to one stored outcome, and then reports and follows up. A run stops starting work after four minutes, so it ends inside its
+schedule. A clean run is silent and keeps its summary in `logs/post_merge_check.log`. A run in which a record or step errored posts
+one line naming them and exits 0, at most once a day per failure. The steps and their columns are in
+[`session_management.md`](../docs/session_management.md).
+
 ## `stall-watch` hands a stall to the AutoOps pipeline
 
 `stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
@@ -531,11 +541,21 @@ failure: the refresh after findings retire, a refresh deferred from an
 earlier run, and the one after a threshold override changes. A failed project
 or clusters not reached hold it back. So on a fleet too big for one run,
 `latest.*` and the topic change only when a finding comes due, and otherwise
-keep the previous report. When `NATS_URL` is set, the watch also writes
-`latest.json` to the `topology-skew`
+keep the previous report. When `NATS_URL` is set, the watch also writes the
+JSON report it just saved to the `topology-skew`
 (`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
-fails, it warns once in chat and retries on a later run that reads every
-project in full without a failure, until the write recovers.
+fails, it warns once in chat and retries with `latest.json` on a later run
+that reads every project in full without a failure, until the write recovers.
+A report too large for one bus message (NATS's 1 MiB `max_payload`, less 64
+KiB held back for the envelope and encoding slack) is published capped: the
+same document keeping the fleet's most severe findings in order, up to the
+first that does not fit, each in its own cluster, the full report's `summary`,
+and a `truncated` block counting what was left out. Its `full_report` is the
+timestamped report's path on the Platform Agent profile's disk, which
+leeway-watch prunes once ten newer reports exist. When even the clusters
+stripped of findings do not fit, `clusters` is emptied and counted in
+`truncated.clusters_omitted`. The `--text` summary gains a suffix naming the
+cap.
 
 ## `session-retention` gives every profile's history an end
 

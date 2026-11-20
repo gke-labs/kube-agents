@@ -14,7 +14,9 @@ func TestUnverifiedTriggerReadsTheClaimsTrigger(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := Claims{Task: "t1", Profile: "helpers", Tier: "unattended", Pod: "helpers-job-1",
-		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy, Expires: time.Now().Add(time.Minute)}
+		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy, Expires: time.Now().Add(time.Minute),
+		// A target, so the no-trigger case is a credential Mint will write.
+		Target: &Target{Project: "proj-a", Location: "us-central1", Cluster: "cluster-a"}}
 	scripted := base
 	scripted.Trigger = &Trigger{Name: "schedule/stall-watch", Origin: "builtin", Script: "stall-watch"}
 	for name, tc := range map[string]struct {

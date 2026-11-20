@@ -44,7 +44,7 @@ pinned by `test_fleet_stockout.py` against captured responses:
   ticks carry neither and write `jsonPayload.status` instead.
 
 Some sub-conditions are still uncovered, and governance/stockout_prevention_sop.md
-§3 lists every one for the model to check by hand. Two are uncovered for the
+§3 lists every one for the model to check by hand. One is uncovered for the
 reason the two checks above used to be — this repository has not exercised
 the shape anywhere, and a guess encoded as tested code looks like a fact:
 
@@ -52,9 +52,6 @@ the shape anywhere, and a guess encoded as tested code looks like a fact:
   sits in an unreachable zone. `check_reservation_affinity` covers 3.10(a) and
   `check_reservation` covers 3.10(c); resolving a named reservation against the
   zones a cluster can actually reach is the part nothing here does.
-- **3.12(b)**, a ComputeClass whose own `status.conditions` reports invalid
-  configuration. `check_dangling_compute_class` covers 3.12(a), (c) and (d);
-  that CRD's condition `type`/`reason` values are the unexercised shape.
 
 The rest need a read this collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
@@ -151,6 +148,11 @@ AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
 # string has to match the one that file names, and the two files carry it
 # separately because neither imports the other.
 NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
+# The `needs_triage` marker on a §3.12(b) finding. Its fix changes a node pool or a
+# class (for `TaintMissing`, a `NoSchedule` taint on a pool), and the collector reads
+# nothing about the other Pods on that pool, so the automatic sweep leaves it to
+# `/remediate`. The string matches `TRIAGE_REASONS` in audit_report.py.
+CLASS_STATUS_TRIAGE = "class-status"
 
 # §3.1: the zone span credited to an Autopilot cluster, which has no node
 # pools to read and places nodes across its region's zones. Any value above
@@ -201,6 +203,17 @@ PENDING_PODS_QUERY = {"fieldSelector": "status.phase=Pending,spec.nodeName="}
 PENDING_PHASE = "Pending"
 POD_SCHEDULED_CONDITION = "PodScheduled"
 CONDITION_FALSE = "False"
+CONDITION_TRUE = "True"
+# How GKE says a ComputeClass is misconfigured, as read live: a condition whose
+# type ends in `Misconfigured` is True (`NodepoolMisconfigured`, reason `TaintMissing`,
+# for a pool with the class label and no class taint; `CrdMisconfigured` for a named
+# pool with autoscaling off), beside the summary condition `Health` at False.
+CCC_MISCONFIGURED_SUFFIX = "Misconfigured"
+CCC_HEALTH_CONDITION = "Health"
+CCC_CONDITION_EXCERPT = "status condition {type} is {state} ({reason}): {message}"
+CCC_CONDITION_JOINER = "; "
+# A condition message is GKE's text; this bounds what one excerpt quotes of it.
+CCC_CONDITION_MESSAGE_CHARS = 200
 UNSCHEDULABLE_REASON = "Unschedulable"
 # The scheduler's own clauses for a refusal that a node, more of them or a
 # different pool would lift: capacity and placement. A refusal that names
@@ -1245,6 +1258,29 @@ def _reads_pool_labels(workload: dict, compute_classes_by_name: dict[str, dict])
     return cc is not None and ((cc.get("spec") or {}).get("nodePoolAutoCreation") or {}).get("enabled") is not True
 
 
+def check_compute_class_status(cc: dict) -> dict | None:
+    """SOP 3.12(b): GKE's own verdict on the class. One hit when the status
+    carries a `...Misconfigured` condition as `True` or `Health` as `False`,
+    with each such condition's reason and message as the excerpt. A class with
+    no status yet, or with no condition in that state, is not judged."""
+    reported = []
+    for condition in (cc.get("status") or {}).get("conditions") or []:
+        if not isinstance(condition, dict):
+            continue
+        kind, state = condition.get("type"), condition.get("status")
+        misconfigured = str(kind or "").endswith(CCC_MISCONFIGURED_SUFFIX) and state == CONDITION_TRUE
+        if misconfigured or (kind == CCC_HEALTH_CONDITION and state == CONDITION_FALSE):
+            message = " ".join(str(condition.get("message") or "").split())[:CCC_CONDITION_MESSAGE_CHARS]
+            reported.append(CCC_CONDITION_EXCERPT.format(type=kind, state=state, reason=condition.get("reason") or "", message=message))
+    if not reported:
+        return None
+    return {
+        "object": f"ComputeClass/{cc['metadata']['name']}",
+        "excerpt": CCC_CONDITION_JOINER.join(reported),
+        "needs_triage": CLASS_STATUS_TRIAGE,
+    }
+
+
 def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[str, dict], node_pool_labels: set[str] | None, *, autopilot: bool = False) -> dict | None:
     """`node_pool_labels` is `None` when the pool labels are unknown -- an
     Autopilot cluster with no user node pools, or a `node-pools list` the
@@ -2213,6 +2249,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             for hit in [check_reservation_affinity(cc)]:
                 if hit:
                     candidates.append(_emit("reservation-mismatch-risk", hit))
+        for hit in [check_compute_class_status(cc)]:
+            if hit:
+                # Stamped, as the workload arms below are: a failed pool list pops
+                # this slug's record, and the class's own status does not need the pools.
+                candidates.append(_emit("dangling-compute-class", {**hit, "command": dump_record["command"]}))
 
     commands["dangling-compute-class"] = dump_record
     for workload in workloads:

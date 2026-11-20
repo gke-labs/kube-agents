@@ -105,8 +105,9 @@ func (d *Dispatcher) permitJobOffPool(prof lib.DispatchProfile, tier string, cha
 // carriesPermit reports whether a task's credential-proxy credential would
 // carry the vcs:proposal-create permit: a confirmed change (changeRequested,
 // which only the gateway sets, on a structured confirm) on a task with a
-// cluster, the only tasks a proxy credential is minted for. The mint and the
-// refusal read this one predicate.
+// cluster, the only tasks a targeted proxy credential is minted for (a report
+// credential, which names no cluster, never carries a permit). The mint and
+// the refusal read this one predicate.
 func carriesPermit(changeRequested bool, cluster *taskcred.Target) bool {
 	return changeRequested && cluster != nil
 }

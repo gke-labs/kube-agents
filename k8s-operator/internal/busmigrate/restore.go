@@ -47,6 +47,17 @@ const restoreFinishTimeout = 10 * time.Minute
 // that gives up early holds the name against its own retries.
 const restoreStartTimeout = 30 * time.Second
 
+// restoreSettlePoll is how often WaitRestored reads the stream again.
+var restoreSettlePoll = 250 * time.Millisecond
+
+// listAssigned is AssignedDurables' read of the stream's consumer list, a
+// variable so a test can make the server's assignments lag the restore.
+var listAssigned = consumerNames
+
+// jsConsumerNotFound is the JetStream API's error code for a consumer the
+// answering server does not hold.
+const jsConsumerNotFound = 10014
+
 // Metadata is what a snapshot records beside its data: the stream's config
 // and state as the server reported them when the snapshot began.
 type Metadata struct {
@@ -242,12 +253,20 @@ func RestoreVerifiedCounting(ctx context.Context, nc *nats.Conn, cfg nats.Stream
 // to those, on the way in and on read-back; every other field is held to the
 // operator's policy as before, and there is no fit check.
 func RestoreAsItWas(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) error {
+	_, err := RestoreAsItWasCounting(ctx, nc, cfg, state, open, wantDigest, policy)
+	return err
+}
+
+// RestoreAsItWasCounting is RestoreAsItWas, also returning how many
+// consumers the restore brought back, as RestoreVerifiedCounting does: a
+// way back into three servers (a reshape's) waits for that many to be
+// assigned before it raises the stream.
+func RestoreAsItWasCounting(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) (int, error) {
 	policy.MaxBytes, policy.MaxAge, policy.MaxConsumers = cfg.MaxBytes, cfg.MaxAge, cfg.MaxConsumers
 	if d := policy.Check(cfg); len(d) != 0 {
-		return fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
+		return 0, fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
 	}
-	_, err := restoreChecked(ctx, nc, cfg, state, open, wantDigest, policy)
-	return err
+	return restoreChecked(ctx, nc, cfg, state, open, wantDigest, policy)
 }
 
 // restoreChecked is both restores' common path once the config has passed
@@ -389,9 +408,6 @@ func sendChunk(ctx context.Context, nc *nats.Conn, subject string, chunk []byte)
 	}
 	return nil
 }
-
-// restoreSettlePoll is how often WaitRestored reads the stream again.
-var restoreSettlePoll = 250 * time.Millisecond
 
 // DurableSpec is a restored durable consumer the settle wait reads, with
 // the replica count the raise gives it (ExpectedConsumerReplicas).
@@ -574,10 +590,6 @@ func AssignedDurables(ctx context.Context, nc *nats.Conn, stream string, restore
 	}
 }
 
-// listAssigned is AssignedDurables' read of the stream's consumer list, a
-// variable so a test can make the server's assignments lag the restore.
-var listAssigned = consumerNames
-
 // consumerNames lists a stream's consumers, page by page.
 func consumerNames(ctx context.Context, nc *nats.Conn, stream string) ([]string, error) {
 	var names []string
@@ -607,10 +619,6 @@ func consumerInfo(ctx context.Context, nc *nats.Conn, stream, name string) (*nat
 	}
 	return &info, nil
 }
-
-// jsConsumerNotFound is the JetStream API's error code for a consumer the
-// answering server does not hold.
-const jsConsumerNotFound = 10014
 
 func isConsumerNotFound(err error) bool {
 	var e *jsAPIError

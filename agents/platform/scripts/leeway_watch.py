@@ -145,7 +145,13 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   `NATS_URL` is set, the JSON report is also published to the A2A blackboard
   topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
   once in chat on failure and retrying on a later tick that reads every target
-  in full without failing.
+  in full without failing. A report too large for one bus message
+  (`TOPIC_ARTIFACT_BUDGET_BYTES`: the NATS limit less the envelope reserve and
+  encoding slack) is published capped (`cap_topic_report`): the fleet's most
+  severe findings in order, up to the first that does not fit, each kept in its
+  cluster, the full report's `summary`, a `truncated` block with the counts
+  left out and the full report's path (the bare clusters too, counted, when
+  even they do not fit), and a `--text` suffix naming the cap.
 A finding is due for reporting when:
 1. It is **new** (not present in `ledger.json`),
 2. Its **suspected cause changed or severity escalated** since the last report,
@@ -429,6 +435,60 @@ A2A_PUBLISH_TIMED_OUT_DETAIL = "TimeoutExpired: a2a topics write {topic} timed o
 A2A_PUBLISH_EXCEPTION_DETAIL = "{error_type}: {error}"
 A2A_RETRY_SUMMARY = "{prefix}: topology-skew blackboard report refreshed"
 ERROR_KIND_TOPIC_PUBLISH = "topic_publish_failed"
+A2A_DATA_STDIN = "-"
+
+# The topic write's size cap. The bus refuses a message over its max_payload,
+# headers included. `a2a topics write --data` parses the JSON and re-encodes it
+# compactly with Go's encoder inside the topic artifact (`name`, `parts`: the
+# `--text` part, then the data part) inside the envelope, so the check measures
+# that encoding, not the indented file on disk.
+# NATS's default max_payload. The operator's nats.conf render sets none;
+# test_leeway_watch reads the render's fixture and fails if one appears.
+NATS_MAX_PAYLOAD_BYTES = 1024 * 1024
+# The envelope's fields outside the artifact (protocol, ids, timestamp, writer,
+# kind) and the Nats-Msg-Id header come to about 400 bytes with 63-character
+# session and profile names.
+A2A_ENVELOPE_RESERVE_BYTES = 4 * 1024
+# What the estimate of Go's encoding can still miss (float formatting, escapes
+# Go writes longer than Python). A compact finding is 2.0-2.4 KB, so this costs
+# about 25 findings of the ~400 that fit.
+A2A_ENCODING_SLACK_BYTES = 60 * 1024
+TOPIC_ARTIFACT_BUDGET_BYTES = NATS_MAX_PAYLOAD_BYTES - A2A_ENVELOPE_RESERVE_BYTES - A2A_ENCODING_SLACK_BYTES
+COMPACT_JSON_SEPARATORS = (",", ":")
+UTF8 = "utf-8"
+# Go's encoder escapes <, > and & as \u003c (6 bytes for 1) and U+2028 and
+# U+2029 as \u2028 (6 bytes for 3); Python's leaves them as they are.
+GO_HTML_ESCAPED_CHARS = ("<", ">", "&")
+GO_HTML_ESCAPE_EXTRA_BYTES = 5
+GO_LINE_SEPARATOR_CHARS = ("\u2028", "\u2029")
+GO_LINE_SEPARATOR_EXTRA_BYTES = 3
+# lib.Artifact and lib.Part field names and part kinds (a2a/lib/payload.go).
+ARTIFACT_NAME_FIELD = "name"
+ARTIFACT_PARTS_FIELD = "parts"
+PART_KIND_FIELD = "kind"
+PART_TEXT_FIELD = "text"
+PART_DATA_FIELD = "data"
+PART_KIND_TEXT = "text"
+PART_KIND_DATA = "data"
+# A comma between two findings in a list, counted for every finding kept.
+JSON_LIST_SEPARATOR_BYTES = 1
+# The capped document: the report's own fields keeping the fleet's most severe
+# findings (severity, then tier, then report order) up to the first that does not
+# fit, in their clusters, the
+# full report's summary unchanged, and this block saying what was left out.
+TRUNCATED_FIELD = "truncated"
+TRUNCATED_REASON_FIELD = "reason"
+TRUNCATED_REASON = "the full report is over the A2A bus's {limit}-byte message limit"
+TRUNCATED_FULL_REPORT_FIELD = "full_report"
+TRUNCATED_FINDINGS_TOTAL_FIELD = "findings_total"
+TRUNCATED_FINDINGS_PUBLISHED_FIELD = "findings_published"
+TRUNCATED_FINDINGS_OMITTED_FIELD = "findings_omitted"
+TRUNCATED_OMITTED_BY_SEVERITY_FIELD = "omitted_by_severity"
+TRUNCATED_CLUSTERS_OMITTED_FIELD = "clusters_omitted"
+CAPPED_TEXT_SUFFIX = " (topic copy capped at {published} of {total} findings, most severe first; full report: {path})"
+FINDING_LIST_FIELDS = (TOPOLOGY_FINDINGS_FIELD, RANK_FINDINGS_FIELD)
+# A finding without a tier sorts after every tier.
+NO_TIER_SORT_KEY = (True, "")
 SPACE_CHAR = " "
 BACKTICK_CHAR = "`"
 SINGLE_QUOTE_CHAR = "'"
@@ -1402,10 +1462,167 @@ def write_report_files(
     return md_path
 
 
+def a2a_encoded_size(value: Any) -> int:
+    """Estimate the bytes Go's json.Marshal writes for `value`, as `a2a topics write` re-encodes it."""
+    text = json.dumps(value, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS)
+    size = len(text.encode(UTF8))
+    size += GO_HTML_ESCAPE_EXTRA_BYTES * sum(text.count(c) for c in GO_HTML_ESCAPED_CHARS)
+    size += GO_LINE_SEPARATOR_EXTRA_BYTES * sum(text.count(c) for c in GO_LINE_SEPARATOR_CHARS)
+    return size
+
+
+def topic_artifact(summary_text: str, data: Any) -> dict[str, Any]:
+    """The artifact `a2a topics write` publishes for `--text` and `--data` (lib.NewTopicArtifact)."""
+    parts: list[dict[str, Any]] = []
+    if summary_text:
+        parts.append({PART_KIND_FIELD: PART_KIND_TEXT, PART_TEXT_FIELD: summary_text})
+    parts.append({PART_KIND_FIELD: PART_KIND_DATA, PART_DATA_FIELD: data})
+    return {ARTIFACT_NAME_FIELD: A2A_TOPIC_NAME, ARTIFACT_PARTS_FIELD: parts}
+
+
+def topic_artifact_size(summary_text: str, data: Any) -> int:
+    return a2a_encoded_size(topic_artifact(summary_text, data))
+
+
+def finding_severity(finding: object) -> str:
+    if not isinstance(finding, dict):
+        return DEFAULT_UNKNOWN
+    return str(finding.get(SEVERITY_FIELD) or DEFAULT_SEVERITY)
+
+
+def finding_sort_key(finding: object) -> tuple[int, tuple[bool, str]]:
+    """Most severe first, then tier A before B before C, then findings without a tier."""
+    if not isinstance(finding, dict):
+        return 0, NO_TIER_SORT_KEY
+    tier = str(finding.get(TIER_FIELD) or "")
+    return -SEVERITY_RANKS.get(finding_severity(finding), 0), ((False, tier) if tier else NO_TIER_SORT_KEY)
+
+
+def cap_topic_report(
+    report: dict[str, Any],
+    summary_text: str,
+    full_report_path: Path,
+) -> tuple[str, dict[str, Any]]:
+    """Cut `report` to its most severe findings whose topic artifact fits under TOPIC_ARTIFACT_BUDGET_BYTES.
+
+    Every finding left out is no more severe than every finding kept. The
+    summary stays the full report's; `truncated` names what was left out and
+    where the full report is. When the clusters alone do not fit, they are
+    left out too.
+    """
+    clusters = report.get(CLUSTERS_FIELD)
+    if not isinstance(clusters, list):
+        clusters = []
+    # (sort key, cluster index, list index, finding index, finding)
+    candidates: list[tuple[Any, int, int, int, Any]] = []
+    for ci, cr in enumerate(clusters):
+        if not isinstance(cr, dict):
+            continue
+        for li, field in enumerate(FINDING_LIST_FIELDS):
+            items = cr.get(field)
+            if isinstance(items, list):
+                for fi, finding in enumerate(items):
+                    candidates.append((finding_sort_key(finding), ci, li, fi, finding))
+    candidates.sort(key=lambda c: c[:4])
+    severity_totals: dict[str, int] = {}
+    for c in candidates:
+        sev = finding_severity(c[4])
+        severity_totals[sev] = severity_totals.get(sev, 0) + 1
+    total = len(candidates)
+    path = str(full_report_path)
+
+    def build(
+        kept: list[tuple[Any, int, int, int, Any]],
+        keep_clusters: bool,
+        *,
+        widest: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        placed: list[Any] = []
+        if keep_clusters:
+            for cr in clusters:
+                if isinstance(cr, dict):
+                    entry = dict(cr)
+                    for field in FINDING_LIST_FIELDS:
+                        if isinstance(cr.get(field), list):
+                            entry[field] = []
+                    placed.append(entry)
+                else:
+                    placed.append(cr)
+            for c in sorted(kept, key=lambda c: c[1:4]):
+                placed[c[1]][FINDING_LIST_FIELDS[c[2]]].append(c[4])
+        # widest: every count at the most digits it can take, for sizing.
+        published = total if widest else len(kept)
+        omitted = total if widest else total - published
+        omitted_by_severity = dict(severity_totals)
+        if not widest:
+            for c in kept:
+                sev = finding_severity(c[4])
+                omitted_by_severity[sev] -= 1
+                if not omitted_by_severity[sev]:
+                    del omitted_by_severity[sev]
+        truncated: dict[str, Any] = {
+            TRUNCATED_REASON_FIELD: TRUNCATED_REASON.format(limit=NATS_MAX_PAYLOAD_BYTES),
+            TRUNCATED_FULL_REPORT_FIELD: path,
+            TRUNCATED_FINDINGS_TOTAL_FIELD: total,
+            TRUNCATED_FINDINGS_PUBLISHED_FIELD: published,
+            TRUNCATED_FINDINGS_OMITTED_FIELD: omitted,
+            TRUNCATED_OMITTED_BY_SEVERITY_FIELD: omitted_by_severity,
+        }
+        if not keep_clusters:
+            truncated[TRUNCATED_CLUSTERS_OMITTED_FIELD] = len(clusters)
+        doc = dict(report)
+        doc[CLUSTERS_FIELD] = placed
+        doc[TRUNCATED_FIELD] = truncated
+        text = summary_text + CAPPED_TEXT_SUFFIX.format(published=published, total=total, path=path)
+        return text, doc
+
+    # Size the document with every count at its widest, so adding findings
+    # costs only their own bytes and a comma each.
+    bound_text, bound_doc = build([], True, widest=True)
+    room = TOPIC_ARTIFACT_BUDGET_BYTES - topic_artifact_size(bound_text, bound_doc)
+    keep_clusters = room >= 0
+    kept: list[tuple[Any, int, int, int, Any]] = []
+    if keep_clusters:
+        for c in candidates:
+            cost = a2a_encoded_size(c[4]) + JSON_LIST_SEPARATOR_BYTES
+            if cost > room:
+                break
+            room -= cost
+            kept.append(c)
+    text, doc = build(kept, keep_clusters)
+    while kept and topic_artifact_size(text, doc) > TOPIC_ARTIFACT_BUDGET_BYTES:
+        kept.pop()
+        text, doc = build(kept, keep_clusters)
+    return text, doc
+
+
+def capped_topic_payload(summary_text: str, json_path: Path) -> tuple[str, dict[str, Any]] | None:
+    """The capped `--text` and data for a report too large for one bus message, or None to publish it as is."""
+    try:
+        report = json.loads(json_path.read_text(encoding=UTF8))
+    except (OSError, ValueError):
+        # `a2a topics write` reads the same file and reports what is wrong with it.
+        return None
+    if not isinstance(report, dict) or topic_artifact_size(summary_text, report) <= TOPIC_ARTIFACT_BUDGET_BYTES:
+        return None
+    return cap_topic_report(report, summary_text, json_path.resolve())
+
+
 def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, str | None]:
-    """Publish the latest leeway report to `agent.platform.topology-skew` when the A2A bus is configured."""
+    """Publish the latest leeway report to `agent.platform.topology-skew` when the A2A bus is configured.
+
+    A report too large for one bus message is published capped
+    (`cap_topic_report`) on stdin instead.
+    """
     if not os.environ.get(NATS_URL_ENV, "").strip() or not shutil.which(A2A_EXECUTABLE):
         return False, None
+    data_arg = f"{A2A_DATA_FILE_PREFIX}{json_path}"
+    stdin_data = None
+    capped = capped_topic_payload(summary_text, json_path)
+    if capped is not None:
+        summary_text, payload = capped
+        data_arg = A2A_DATA_STDIN
+        stdin_data = json.dumps(payload, separators=COMPACT_JSON_SEPARATORS)
     argv = [
         A2A_EXECUTABLE,
         A2A_TOPICS_SUBCOMMAND,
@@ -1414,11 +1631,12 @@ def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, 
         A2A_TEXT_FLAG,
         summary_text,
         A2A_DATA_FLAG,
-        f"{A2A_DATA_FILE_PREFIX}{json_path}",
+        data_arg,
     ]
     try:
         completed = subprocess.run(
             argv,
+            input=stdin_data,
             capture_output=True,
             text=True,
             timeout=A2A_PUBLISH_TIMEOUT_SECONDS,

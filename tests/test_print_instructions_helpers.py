@@ -276,6 +276,8 @@ class GchatStepsAreTheGatewaysTest(unittest.TestCase):
             self._assert_gateway(out)
             self.assertIn("No home channel is configured", out)
             self.assertIn("Set GOOGLE_CHAT_HOME_CHANNEL in install.env to a space name (spaces/<id>)", out)
+            self.assertIn("under homeChannelPolicy auto (the default), @mention the app once, top-level, in the named space you want", out)
+            self.assertIn("A direct message or /sethome does not set it", out)
             self.assertNotIn("--google-chat-home-channel", out)
 
     def test_a_space_is_named(self):

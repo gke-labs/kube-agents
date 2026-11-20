@@ -202,8 +202,16 @@ type ConsoleOutFrame struct {
 	Addressee string        `json:"addressee,omitempty"`
 	TaskID    string        `json:"taskId,omitempty"`
 	// ReplyTo, on a notify frame, is the task whose turn filed the work the
-	// post reports on, when its sender knew it.
+	// post reports on, when its sender knew it: a card's report and its
+	// progress notes and plan lines alike, which is how a client gathers a
+	// turn's posts.
 	ReplyTo string `json:"replyTo,omitempty"`
+	// Report, on a notify frame, marks the post as a card's report (the
+	// notifier's mark, lib.NotifyRequest.Report): the one post under which
+	// the gateway keeps a report for a reply, so the console page offers a
+	// reply under that frame alone and never under a progress note. (The MCP
+	// server does not read it yet and labels every gathered frame a report.)
+	Report bool `json:"report,omitempty"`
 	// CardsPending, on a completed terminal frame, says the task handed
 	// work to kanban cards, whose reports follow as notify frames naming it
 	// (ReplyTo). Absent, no handoff was seen, so a client need not wait.
@@ -617,7 +625,7 @@ func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) er
 // PostNotifyFrame publishes a chat.notify post aimed at the conversation as
 // a notify frame and returns its id. An empty messageID mints a new one;
 // edit republishes messageID with new text, for a keyed post (Update).
-func (a *ConsoleAdapter) PostNotifyFrame(conversation, messageID, text, replyTo string, edit bool) (string, error) {
+func (a *ConsoleAdapter) PostNotifyFrame(conversation, messageID, text, replyTo string, report, edit bool) (string, error) {
 	token, ok := consoleConversationToken(conversation)
 	if !ok {
 		return "", fmt.Errorf("console adapter: malformed conversation id %q", conversation)
@@ -629,7 +637,7 @@ func (a *ConsoleAdapter) PostNotifyFrame(conversation, messageID, text, replyTo 
 		a.mu.Unlock()
 	}
 	err := a.publishBounded(token, consoleNotifyCutNote, ConsoleOutFrame{
-		MessageID: messageID, Text: text, Edit: edit, Kind: consoleFrameKindNotify, ReplyTo: replyTo,
+		MessageID: messageID, Text: text, Edit: edit, Kind: consoleFrameKindNotify, ReplyTo: replyTo, Report: report,
 	})
 	if err != nil {
 		return "", err

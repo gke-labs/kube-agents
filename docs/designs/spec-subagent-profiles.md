@@ -440,8 +440,9 @@ What the operator renders per profile, as built (amended 10/6):
     The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
     `capabilities`, which skip the managed list, and every other write, `branch-delete`
     among them. The shim sends the credential on these calls as it does on an exec. Known
-    limits: a task that names no cluster gets no `proxyToken`, so it reaches no
-    version-control verb at all; and `submit-suggestion` deletes a spent branch with
+    limits: a task that names no cluster gets no targeted `proxyToken` (at most a report
+    credential, which the broker refuses here), so it reaches no version-control verb at
+    all; and `submit-suggestion` deletes a spent branch with
     `branch-delete`, so on a profile worker that one path is refused.
   - A report credential (no target, the `unattended` tier and a trigger; #5619) is refused on
     `/v1/exec` and the MCP relay before any of this runs.
@@ -669,7 +670,8 @@ is the harness process itself, and its death is the orphan path.
 
 The platform agent is the privileged doer - provisioning, fleet audits, the GitOps write
 path - and today it is also a kanban worker like any other when the front door delegates
-to it. As a profile:
+to it. Everything it does today, and what a profile still lacks for each, is in
+[the platform-as-profile inventory](platform-as-profile-inventory.md). As a profile:
 
 ```yaml
 apiVersion: kubeagents.x-k8s.io/v1alpha1
