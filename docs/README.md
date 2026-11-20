@@ -229,8 +229,9 @@ CI enforcement: `make docs-check` runs the same checks as
   removal needs a relabel first; while an open release candidate (a
   `staging_*` tag no release contains yet) holds the row, the text stays until
   the release is tagged. A wrong label fails a push to
-  `main` and a pull request that adds or relabels the row or edits its entry;
-  on any other pull request it is a warning. It reads the history and the
+  `main` (after the grace above, for a `pending` row) and a pull request that
+  adds or relabels the row or edits its entry; on any other pull request it is
+  a warning. It reads the history and the
   release tags, so it fails on a shallow or tagless clone; run
   `git fetch --tags --unshallow` first.
 - `docs-check-cron-inventory` — `scripts/check_cron_inventory.py`; every job on

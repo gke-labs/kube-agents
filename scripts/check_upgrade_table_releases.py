@@ -52,9 +52,11 @@ A wrong label fails only where it can be fixed: on a push to main, and on a pull
 merge-queue group that adds the row or changes its label or change text. A wrong label on a row the
 change did not touch is printed as a warning and the check passes, so a release cut that leaves out a
 labelled row does not turn every open pull request red, nor one that edits another part of the page;
-main's push run stays red until a pull request relabels the row. Rows out of newest-first order are
+main's push run stays red until a pull request relabels the row, except for the grace a fresh release
+gives a `pending` row (above). Rows out of newest-first order are
 treated the same way: they fail a push to main and a change that edits the page, and warn on any other. Run locally, the check compares the
-page with upstream/main or origin/main, whichever exists, and fails outright when neither does. A
+page with upstream/main or origin/main, whichever exists; with neither it checks the page as a push to
+main does, with no base. A
 local run also notes the releases its rows name that have no local tag, which it cannot check.
 """
 
@@ -123,7 +125,8 @@ PENDING_REWORD_NOTE = (f" To reword a {PENDING} row after its release, label the
 TRACE_HINT = (f" If this row was reworded after its release shipped, or added after its release was tagged, "
               f"name the commit that shipped it in {TRACES_FILE} instead.")
 # A release's relabel pull request needs /ok-to-test, CLA and a reviewer, so a `pending` row a release
-# tagged this recently warns a run with no base rather than failing it: a review day, plus the next release.
+# tagged this recently warns a run with no base rather than failing it. The window covers a full review day
+# and the next daily release.
 PENDING_GRACE_HOURS = 48
 SECONDS_PER_HOUR = 3600
 GRACE_NOTE = (f"warning: a release tagged under {PENDING_GRACE_HOURS} hours ago contains these {PENDING} rows; "

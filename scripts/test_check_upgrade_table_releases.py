@@ -719,6 +719,29 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertNotIn("warning:", err)
         self.assertIn("labelled pending, but 1.0.0 contains", err)
 
+    def test_a_merge_group_that_touches_a_freshly_shipped_pending_row_fails(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        self.repo.trace(f"{added} change p")
+        self.repo.commit("docs: trace p", code=False)
+        event = Path(self.tmp.name) / "event.json"
+        event.write_text(json.dumps({"merge_group": {"base_sha": added}}), encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="merge_group", GITHUB_EVENT_PATH=str(event))
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+
+    def test_a_graced_row_does_not_hide_a_wrong_label_on_another_row(self):
+        self.repo.mislabel()  # "change b", labelled 1.0.0, which 1.0.0 does not contain
+        added = self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.git("tag", "-a", "1.1.0", "-m", "1.1.0", at=int(time.time()) - FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f'warning: {PAGE}:', err)
+        self.assertIn(f"labelled pending, but 1.1.0 contains {added[:12]}", err)
+        failures = [line for line in err.splitlines() if not line.startswith("warning:")]
+        self.assertTrue(any('the row "change b" is labelled 1.0.0, but 1.0.0 does not contain' in line
+                            for line in failures))
+        self.assertFalse(any("change p" in line for line in failures))
+
     def test_a_wrong_release_label_gets_no_grace(self):
         base = self.repo.commit("feat: before the branch point")
         self.repo.commit("fix: b", row=row("1.0.0", "change b"))

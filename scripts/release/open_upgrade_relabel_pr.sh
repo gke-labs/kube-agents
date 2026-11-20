@@ -85,11 +85,11 @@ git ${push_auth[@]+"${push_auth[@]}"} push --force origin "HEAD:refs/heads/${REL
 IFS= read -r -d '' body <<EOF || true
 ## Summary
 
-These rows of the upgrade page's breaking-changes table still said \`pending\`, though a release now contains each. This change relabels each with the first release that contains it. Approving it turns main's docs check green again.
+These rows of the upgrade page's breaking-changes table still said \`pending\`, though a release now contains each. This change relabels each with the first release that contains it. Merging it relabels the rows before main's Documentation Checks starts failing, 48 hours after the release.
 
 ## Why This Change
 
-Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main.
+Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main once the release is 48 hours old.
 
 ## What Changed
 
