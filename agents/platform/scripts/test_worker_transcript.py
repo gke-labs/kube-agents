@@ -692,17 +692,24 @@ class TestScrubStepText(unittest.TestCase):
         # A command without an escaped space has no value to read.
         self.assertEqual(worker_transcript.at_fold_flag_secrets(REDACTOR, "mysql DB_PASSWORD=x -p S3cretValue9"), [])
 
-    # The linear-time test below scrubs each input at its full length and at
-    # one over this, and compares the two CPU times. A scrub that is linear
-    # in the input takes this many times longer on the full input; one that
-    # is quadratic takes the square of it.
+    # The linear-time test below scrubs each input at its full length and
+    # with every run this many times shorter, and compares the two CPU times.
+    # A scrub that is linear in the input takes this many times longer on the
+    # full input; one whose cost is all quadratic takes the square of it.
     LINEAR_TIME_SHRINK = 4
     # The full scrub may take this many times the short one: the geometric
-    # mean of the linear growth (4) and the quadratic (16).
+    # mean of the linear growth (4) and the quadratic (16). A quadratic part
+    # beside a linear one passes until it is about twice the linear cost at
+    # the full length.
     LINEAR_TIME_GROWTH_MAX = 8
-    # Each length is scrubbed this many times and the fastest counts, which
-    # drops a reading that another process's use of the core made slow.
+    # A length is read up to this many times and the fastest reading counts.
+    # The readings are CPU time, which a busy machine raises less than the
+    # clock but still raises, through the cache and a shared core.
     LINEAR_TIME_READINGS = 2
+    # One reading scrubs its input again until this much CPU time has passed,
+    # and counts the mean: a scrub of a few milliseconds is otherwise at the
+    # mercy of one collector pass.
+    LINEAR_TIME_READING_MIN_SECONDS = 0.05
 
     @staticmethod
     def _long_lead_and_marker_run_commands(shrink):
@@ -731,16 +738,18 @@ class TestScrubStepText(unittest.TestCase):
         )
 
     def _scrub_cpu_seconds(self, cmd):
-        """The fastest of a few scrubs of `cmd`, each of which hides the value."""
+        """One reading: the mean CPU time of a scrub of `cmd`, each of which hides the value."""
         import time
 
-        readings = []
-        for _ in range(self.LINEAR_TIME_READINGS):
-            start = time.process_time()
+        scrubs = 0
+        start = time.process_time()
+        while True:
             out = _scrub("tool_call", cmd)
-            readings.append(time.process_time() - start)
+            scrubs += 1
             self.assertNotIn("S3cretValue9", out)
-        return min(readings)
+            spent = time.process_time() - start
+            if spent >= self.LINEAR_TIME_READING_MIN_SECONDS:
+                return spent / scrubs
 
     def test_a_long_lead_or_a_run_of_markers_scrubs_in_linear_time(self):
         # A value has at most three leads, whatever the lead's length, and
@@ -752,13 +761,20 @@ class TestScrubStepText(unittest.TestCase):
         # time itself. The longest input is 576 KB and its scrub takes about
         # 0.8 s of CPU time on a developer's machine, so a 1 s bound failed
         # on a slower or busier one (#6112). Both readings of a growth come
-        # from the same machine at the same moment.
+        # from the same machine, one after the other. The full length is read
+        # again only when its first reading is over the bound.
         full = self._long_lead_and_marker_run_commands(1)
         short = self._long_lead_and_marker_run_commands(self.LINEAR_TIME_SHRINK)
         for cmd, short_cmd in zip(full, short):
             with self.subTest(cmd=cmd[:40]):
-                short_seconds = self._scrub_cpu_seconds(short_cmd)
-                self.assertLess(self._scrub_cpu_seconds(cmd), self.LINEAR_TIME_GROWTH_MAX * short_seconds)
+                short_seconds = min(self._scrub_cpu_seconds(short_cmd) for _ in range(self.LINEAR_TIME_READINGS))
+                bound = self.LINEAR_TIME_GROWTH_MAX * short_seconds
+                full_seconds = self._scrub_cpu_seconds(cmd)
+                for _ in range(self.LINEAR_TIME_READINGS - 1):
+                    if full_seconds < bound:
+                        break
+                    full_seconds = min(full_seconds, self._scrub_cpu_seconds(cmd))
+                self.assertLess(full_seconds, bound)
 
     def test_key_headers_with_no_end_line_scrub_in_linear_time(self):
         # 170 KB of private key headers with no END line. The redactor's
