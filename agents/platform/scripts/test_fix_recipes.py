@@ -29,6 +29,13 @@ class ParseTest(unittest.TestCase):
         recipe = registry.parse(text)
         self.assertEqual((recipe.owner, recipe.eval_case), ("platform", ""))
 
+    def test_the_recheck_fields(self):
+        recipe = registry.parse(GOOD + "recheck_kinds: deployments,poddisruptionbudgets\n"
+                                       "recheck_siblings: pdb-overlapping blocking-pdb\n")
+        self.assertEqual(recipe.recheck_kinds, "deployments,poddisruptionbudgets")
+        self.assertEqual(recipe.siblings(), ("pdb-overlapping", "blocking-pdb"))
+        self.assertEqual(registry.parse(GOOD).siblings(), ())
+
     def test_what_it_refuses(self):
         refused = {
             "unknown key": GOOD + "tier: 1\n",
@@ -49,6 +56,9 @@ class ParseTest(unittest.TestCase):
             "a value YAML reads as null": GOOD + "owner: null\n",
             "a value YAML reads as a bool": GOOD + "owner: true\n",
             "a value YAML reads as a number": GOOD + "owner: 12\n",
+            "siblings without kinds": GOOD + "recheck_siblings: blocking-pdb\n",
+            "a sibling that is not a check id": GOOD + "recheck_kinds: deployments\nrecheck_siblings: Blocking_PDB\n",
+            "kinds that are not resource names": GOOD + "recheck_kinds: deployments, pods\n",
             "oversize": GOOD + "# " + "x" * registry.MAX_RECIPE_BYTES + "\n",
         }
         for why, text in refused.items():
@@ -103,6 +113,17 @@ class ShippedRecipesTest(unittest.TestCase):
         self.assertEqual(automation_rules.FIX_TYPE_NAMES, {"no-pdb": "disruption-budget fixes"})
         self.assertEqual(dial_state.FIX_KINDS, (("no-pdb", "Disruption budgets", "dev"),))
 
+
+class ChecksModuleTest(unittest.TestCase):
+    def test_no_pdb_ships_its_checks(self):
+        module = registry.checks_module("no-pdb")
+        self.assertTrue(callable(module.checks))
+        self.assertIsInstance(module.read_kinds, str)
+        self.assertIs(module, registry.checks_module("no-pdb"))
+
+    def test_an_unknown_kind_is_an_error(self):
+        with self.assertRaises(registry.RecipeError):
+            registry.checks_module("no-such-kind")
 
 if __name__ == "__main__":
     unittest.main()
