@@ -37,7 +37,7 @@
 #      reach the node, and the other pods' tokens on it.
 #   7. No environment read from a Secret but one variable: ANTHROPIC_API_KEY, from key `api-key`
 #      of `<name>-inference-key-a2a-session`, not optional. That is the session's inference key,
-#      the one Secret the session pod may read; no envFrom secretRef, no other Secret, key or
+#      the one Secret the session pod may read into its environment; no envFrom secretRef, no other Secret, key or
 #      variable name. The name derives from the requester, so one install's gateway cannot hand
 #      its session pods another install's key. Init containers are refused by item 5.
 #   8. Exactly the two session labels the gateway stamps (part-of a2a-next, component a2a-session):
@@ -65,6 +65,10 @@
 #   - Item 7 checks the session key reference by name only. It does not check that the Secret
 #     exists or what it holds. A pod naming a missing Secret fails to start rather than reading
 #     another.
+#   - It does not check a container's image, command or count. Whatever the gateway puts in a
+#     session pod can use the session's inference key, as the session itself does.
+#   - spec.imagePullSecrets is not checked. The kubelet uses a named pull Secret to fetch the
+#     image; the pod never sees its data.
 #   - configMap volumes are allowed whatever their name: the session pod mounts the bus's CA from
 #     one, and ConfigMaps hold no credentials in this install.
 #   - A mutating webhook that adds any other scheduling field (a nodeSelector, a toleration, a

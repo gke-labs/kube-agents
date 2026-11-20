@@ -267,6 +267,16 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 				SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "platform-agent-secrets"}, Key: "k"},
 			}})
 		}, secretEnv},
+		// Every container is checked, not only the first: a compliant second
+		// container differing only in a Secret read.
+		"a second container reading another Secret": {func(p *corev1.Pod) {
+			second := *p.Spec.Containers[0].DeepCopy()
+			second.Name = "second"
+			second.Env = append(second.Env, corev1.EnvVar{Name: "K", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "platform-agent-secrets"}, Key: "k"},
+			}})
+			p.Spec.Containers = append(p.Spec.Containers, second)
+		}, secretEnv},
 		// Init containers are refused whole, before their env is read.
 		"an init container reading another Secret": {func(p *corev1.Pod) {
 			p.Spec.InitContainers = []corev1.Container{{Name: "init", Image: "busybox", Env: []corev1.EnvVar{{Name: "K", ValueFrom: &corev1.EnvVarSource{
