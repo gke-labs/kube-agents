@@ -5475,25 +5475,49 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
 
 def _ring_envelopes(store) -> list[dict]:
     """The readable envelopes in the `runs/` ring of a store directory, newest first."""
+    return _read_ring_envelopes(store)[0]
+
+
+def _read_ring_envelopes(store) -> tuple[list[dict], bool]:
+    """`_ring_envelopes`, and whether the store answered for its whole ring:
+    False when the listing or a read of an entry failed (an OSError other
+    than the entry being gone), so a reader can tell a ring it could not read
+    from an empty one. An entry that is not a JSON object was read, and is
+    skipped."""
     store = _as_store_dir(store)
     try:
         names = sorted(store.ring(), reverse=True)
     except OSError:
-        return []
+        return [], False
     envelopes = []
+    answered = True
     for name in names:
         try:
             envelope = json.loads(store.read(f"{REPORT_RUNS_DIR}/{name}"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            continue  # pruned since the listing: gone, not unread
+        except OSError:
+            answered = False
+            continue
+        except ValueError:
             continue
         if isinstance(envelope, dict):
             envelopes.append(envelope)
-    return envelopes
+    return envelopes, answered
 
 
 def _newest_published_envelope(store) -> dict | None:
     """The newest envelope in a store directory's `runs/` ring that `is_diverted` does not mark, or None."""
-    return next((e for e in _ring_envelopes(store) if not is_diverted(e)), None)
+    return _read_newest_published_envelope(store)[0]
+
+
+def _read_newest_published_envelope(store) -> tuple[dict | None, bool]:
+    """`_newest_published_envelope`, and whether None means the ring holds no
+    such envelope: False when none was found and part of the ring could not
+    be read (`_read_ring_envelopes`), where one may be."""
+    envelopes, answered = _read_ring_envelopes(store)
+    envelope = next((e for e in envelopes if not is_diverted(e)), None)
+    return envelope, envelope is not None or answered
 
 
 def _envelope_document(envelope: object, key: str) -> dict | None:
@@ -5664,7 +5688,8 @@ def store_never_published(directory: Path) -> bool:
     that is not marked: a run that could not reach the repository creates
     the directory, but it leaves no memory of the ledger. An unreadable or
     absent `latest.json` in a directory that exists is a lost memory, not a
-    store that was never written. `directory` is a store directory
+    store that was never written, and so is a ring that could not be read
+    behind a marked one: a published envelope may be in it. `directory` is a store directory
     (report_store_dir) or the file store's Path.
     """
     store = _as_store_dir(directory)
@@ -5674,7 +5699,10 @@ def store_never_published(directory: Path) -> bool:
         latest = json.loads(store.read(REPORT_LATEST_NAME))
     except (OSError, ValueError):
         return False
-    return is_diverted(latest) and _newest_published_envelope(store) is None
+    if not is_diverted(latest):
+        return False
+    envelope, known = _read_newest_published_envelope(store)
+    return envelope is None and known
 
 
 def previous_run_memory(
@@ -10416,18 +10444,21 @@ def first_stored_record(directory, trusted: Callable[[dict], bool]) -> dict | No
     `latest.json` first, then the `runs/` ring from newest to oldest: a
     failed write drops `latest.json` and leaves the ring. `{}` when the
     directory holds no envelope at all. None when it holds envelopes and
-    none can be read or `trusted` accepts none. `directory` is a store
+    none can be read or `trusted` accepts none, and when the ring cannot be
+    listed and no `latest.json` was read and trusted: an unlisted ring may
+    hold envelopes, so it is never "no envelope at all". `directory` is a store
     directory (report_store_dir) or the file store's Path.
     """
     store = _as_store_dir(directory)
     candidates = [REPORT_LATEST_NAME]
+    listed = True
     try:
         candidates.extend(f"{REPORT_RUNS_DIR}/{name}" for name in sorted(store.ring(), reverse=True))
     except OSError:
-        pass
+        listed = False
     present = [name for name in candidates if store.has(name)]
     if not present:
-        return {}
+        return {} if listed else None
     for name in present:
         try:
             envelope = json.loads(store.read(name))
@@ -24026,7 +24057,7 @@ def _store_ledger_envelope(
       one that failed; trusting it would miss what the failed run published.
     - A diverted `latest.json` (`is_diverted`) defers to the newest envelope in
       `runs/` that is not diverted (`_newest_published_envelope`). When there
-      is none, and the ring is shorter than `REPORT_HISTORY` and no fix of
+      is none in a ring read whole, and the ring is shorter than `REPORT_HISTORY` and no fix of
       this stream is open, no run ever stored a ledger here and nothing can
       close: the run is first, as when a run that could not reach the
       repository created the directory. Otherwise the memory stays lost: a
@@ -24076,8 +24107,8 @@ def _store_ledger_envelope(
         )
         return None, False
     if is_diverted(envelope):
-        envelope = _newest_published_envelope(directory)
-        if envelope is None and open_fix is False:
+        envelope, known = _read_newest_published_envelope(directory)
+        if envelope is None and open_fix is False and known:
             try:
                 ring = len(directory.ring())
             except OSError:

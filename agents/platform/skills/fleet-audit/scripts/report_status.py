@@ -751,6 +751,8 @@ RUN_NAME_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}\.[0-9]{6}Z\.json\Z")
 # broker's own route refusal is `{"status": "not_found"}`, and the listener's
 # unknown route `{"error": "no such route"}`: neither is a missing file.
 LISTENER_NOT_FOUND = {"error": "not found"}
+# How much of a refusal's body is read for its `code`, `rule` or `status`.
+MAX_ANSWER_BODY_BYTES = 4096
 #: Left in a local stream directory once its envelopes are copied into the
 #: broker store, so the copy happens once.
 SEED_MARKER_NAME = ".seeded-to-broker"
@@ -1027,6 +1029,9 @@ class BrokerReportStore(str):
                 for repo in scan_repo_dirs(self.local_root, audit_id)[0]:
                     if repo == repo.lower():
                         self._maybe_seed(audit_id, repo)
+        except ReportStoreUnavailable:
+            # The broker, not the local store: the listing fails as an outage.
+            raise
         except (OSError, ValueError) as exc:
             self._log(f"report store: the local store at {self.local_root} could not be listed to seed the broker: {exc}")
 
@@ -1048,8 +1053,14 @@ class BrokerReportStore(str):
         Never deletes or changes a local envelope. A stream whose writes the
         broker refuses (403: a repository the install does not register) is
         skipped and logged, with no marker, so a later registration can still
-        seed it. Any other failure is logged and left for the next run, which
-        resumes where this one stopped.
+        seed it. A broker that cannot be used now (ReportStoreUnavailable)
+        raises out of here, and the stream is not counted as checked: the read
+        or write that touched it fails as an outage, rather than read a stream
+        part copied as a first run or land a run on it (which would leave the
+        broker's ring with a stamp the local one lacks, and nothing left
+        copied ever after), and the next touch in this process tries again.
+        Any other failure is logged and left for the next run, which resumes
+        where this one stopped.
         """
         try:
             key = (audit_id, broker_store_key(repo))
@@ -1058,6 +1069,14 @@ class BrokerReportStore(str):
         if key in self._seed_checked:
             return
         self._seed_checked.add(key)
+        try:
+            self._seed_unchecked(audit_id, repo)
+        except ReportStoreUnavailable:
+            self._seed_checked.discard(key)
+            raise
+
+    def _seed_unchecked(self, audit_id: str, repo: str) -> None:
+        """`_maybe_seed`'s work, once the stream is counted as checked."""
         if not self.local_root or not os.path.isdir(self.local_root):
             return
         local = store_path(self.local_root, audit_id, repo)
@@ -1130,6 +1149,12 @@ class BrokerReportStore(str):
                     raise
                 copied += 1
             latest_copied = self._seed_latest(audit_id, repo, local, runs, latest)
+        except ReportStoreUnavailable as exc:
+            self._log(
+                f"report store: seeding {label} into the broker stopped after {copied} run(s), "
+                f"to be resumed by the next request: {exc}"
+            )
+            raise
         except (OSError, ValueError) as exc:
             self._log(
                 f"report store: seeding {label} into the broker stopped after {copied} run(s), "
@@ -1185,7 +1210,7 @@ class BrokerReportStore(str):
 def _answer_body(exc: urllib.error.HTTPError) -> dict | None:
     """A refusal's JSON object body, or None."""
     try:
-        body = json.loads(exc.read(4096).decode("utf-8"))
+        body = json.loads(exc.read(MAX_ANSWER_BODY_BYTES).decode("utf-8"))
     except (OSError, ValueError):
         return None
     return body if isinstance(body, dict) else None

@@ -85,7 +85,8 @@ class FakeBroker:
                 })
                 if broker.redirect_to:
                     self.send_response(302)
-                    self.send_header("Location", broker.redirect_to + self.path)
+                    # A fixed target: nothing from the request goes into a header.
+                    self.send_header("Location", broker.redirect_to + PREFIX)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
@@ -575,6 +576,68 @@ class TestWriteSemantics(BrokerTestCase):
         self.assertIn("unreadable", err.getvalue())
 
 
+class TestAnOutageIsNoFirstRun(BrokerTestCase):
+    """A store the broker cannot answer for is there and unreadable, never
+    absent: not when the ring's listing fails, and not when every entry's read
+    does, with `latest.json` missing or marked."""
+
+    def write(self, envelope: dict, n: int) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(audit_report.write_report(AUDIT, envelope, NOW + timedelta(minutes=n)))
+
+    def diverted(self, n: int = 1) -> dict:
+        envelope = json.loads(self.envelope(n))
+        envelope.update({"issue_number": None, "status": audit_report.NO_FORGE_STATUS,
+                         audit_report.UNREACHABLE_REPO_KEY: {"repo": REPO, "reason": "r"}})
+        return envelope
+
+    def break_ring(self, listing: bool = False, entries: bool = False) -> None:
+        real = self.broker.answer
+        runs = f"{PREFIX}/{AUDIT}/{KEY}/runs"
+
+        def answer(method, path, body):
+            if method == "GET" and ((listing and path == runs) or (entries and path.startswith(runs + "/"))):
+                return 503, {"code": "AUDIT_REPORT_STORE_UNAVAILABLE"}
+            return real(method, path, body)
+
+        self.broker.answer = answer
+
+    def test_a_failed_listing_with_no_latest_is_unknowable(self):
+        self.write(json.loads(self.envelope()), 0)
+        self.broker.stream(AUDIT, KEY)["latest"] = None
+        self.break_ring(listing=True)
+        directory = audit_report.report_store_dir(AUDIT, REPO)
+        self.assertIsNone(audit_report.first_stored_record(directory, lambda envelope: True))
+        self.assertIsNone(audit_report.newest_stored_record(AUDIT, REPO))
+
+    def test_a_failed_listing_still_answers_from_a_trusted_latest(self):
+        self.write(json.loads(self.envelope()), 0)
+        self.break_ring(listing=True)
+        directory = audit_report.report_store_dir(AUDIT, REPO)
+        self.assertEqual(json.loads(self.envelope()), audit_report.first_stored_record(directory, lambda e: True))
+
+    def test_an_unread_ring_behind_a_marked_latest_was_published(self):
+        self.write(json.loads(self.envelope()), 0)
+        self.write(self.diverted(), 1)
+        for failure in ({"listing": True}, {"entries": True}):
+            with self.subTest(**failure):
+                self.broker.answer = FakeBroker.answer.__get__(self.broker)
+                self.break_ring(**failure)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertFalse(
+                        audit_report.store_never_published(audit_report.report_store_dir(AUDIT, REPO))
+                    )
+                    self.assertEqual(
+                        (None, False), audit_report._store_ledger_envelope(AUDIT, REPO, open_fix=False)
+                    )
+
+    def test_a_ring_read_whole_with_no_published_entry_was_never_published(self):
+        self.write(self.diverted(0), 0)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(audit_report.store_never_published(audit_report.report_store_dir(AUDIT, REPO)))
+            self.assertEqual((None, True), audit_report._store_ledger_envelope(AUDIT, REPO, open_fix=False))
+
+
 class TestReaders(BrokerTestCase):
     def test_project_reads_through_the_broker(self):
         self.put_remote(0)
@@ -700,7 +763,8 @@ class TestSeed(BrokerTestCase):
             return real(method, path, body)
 
         self.broker.answer = fail_the_fourth
-        self.assertIsNone(self.store(str(self.local)).read_latest(AUDIT, REPO))
+        with self.assertRaises(report_status.ReportStoreUnavailable):
+            self.store(str(self.local)).read_latest(AUDIT, REPO)
         self.assertEqual(3, len(self.remote_runs()))
         self.assertIsNone(self.broker.stream(AUDIT, KEY)["latest"])
         self.assertFalse((directory / report_status.SEED_MARKER_NAME).exists())
@@ -717,6 +781,42 @@ class TestSeed(BrokerTestCase):
         self.assertEqual(5, len(self.remote_runs()))
         self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
         self.assertEqual(before, self.tree_digest())
+
+    def test_an_outage_mid_seed_fails_the_touch_and_strands_nothing(self):
+        """A broker that stops answering part way through a seed fails the
+        read or write that touched the stream, as an outage, and the next
+        touch in the same process seeds again. A run's write never lands on a
+        stream part copied, which would leave the broker with a stamp the
+        local ring lacks and the rest of the local history never copied."""
+        directory = self.plant_local(count=5)
+        real = self.broker.answer
+        puts = []
+
+        def fail_the_fourth_once(method, path, body):
+            if method == "PUT":
+                puts.append(path)
+                if len(puts) == 4:
+                    return 503, {"code": "AUDIT_REPORT_STORE_UNAVAILABLE"}
+            return real(method, path, body)
+
+        self.broker.answer = fail_the_fourth_once
+        store = self.store(str(self.local))
+        with self.assertRaises(report_status.ReportStoreUnavailable):
+            store.read_latest(AUDIT, REPO)
+        self.assertEqual(3, len(self.remote_runs()))
+        # The same process's next touch, the run's own write: the seed first.
+        store.write_run(AUDIT, REPO, stamp_name(NOW + timedelta(minutes=9)), self.envelope(9))
+        self.assertEqual(
+            sorted(stamp_name(NOW + timedelta(minutes=n))[:-5] for n in (0, 1, 2, 3, 4, 9)),
+            sorted(self.remote_runs()),
+        )
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+
+    def test_an_outage_during_a_listing_seed_fails_the_listing(self):
+        self.plant_local()
+        self.broker.refuse[("PUT", KEY)] = 503
+        with self.assertRaises(report_status.ReportStoreUnavailable):
+            self.store(str(self.local)).stream_ids()
 
     def test_a_run_that_lands_mid_seed_keeps_its_latest(self):
         """A run writing through the broker while the seed copies (a profile

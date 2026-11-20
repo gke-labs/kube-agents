@@ -250,7 +250,8 @@ broker relays whole. Any other 404 (the broker's own `not_found`, as a broker th
 routes answers every one, or the listener's `no such route`), a 3xx, a 502, 503 or 504, or no answer
 is a store that cannot be used now, which a write logs as a warning without
 changing the exit code and a read treats as unreadable, so a run over it has a lost memory rather
-than a first run. The in-flight notes and the precheck digest stay in the pod's scratch directory.
+than a first run. That includes a ring whose listing fails, or whose entries all fail to read, behind a
+missing or marked `latest`. The in-flight notes and the precheck digest stay in the pod's scratch directory.
 
 The sandbox's own file store holds every run from before the switch, and the broker store starts
 empty. So the first time a script touches a stream through the broker (a read, or a write) while the
@@ -266,8 +267,11 @@ the broker meanwhile (a profile worker takes no local lock) keeps its own, so a 
 stream. When the broker's ring holds a run the local one does not, a run has written the stream since:
 nothing is copied, and the marker is left only when every local entry is already in the broker. A
 stream the broker refuses to take (a 403: a repository the install does not register) is skipped and
-logged with no marker, so a later registration can still seed it, and any other failure leaves no
-marker, so the next run resumes where it stopped. The copy is idempotent and never deletes or changes
+logged with no marker, so a later registration can still seed it. A store that cannot be used now
+fails the read or write that started the seed, as an outage, and the next touch in the same process
+seeds again: a run's write never lands on a stream half copied, where the broker's ring would then hold
+a stamp the local one lacks and the rest of the local history would never be copied. Any other
+failure leaves no marker, so the next run resumes where it stopped. The copy is idempotent and never deletes or changes
 a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
 worker has no local store, so nothing is seeded there. The known limit: the copied envelopes are as
 trustworthy as today's file store, which the agent can write; the seed is not attested.
