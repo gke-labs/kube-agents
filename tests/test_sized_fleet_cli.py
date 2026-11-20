@@ -276,6 +276,19 @@ class UsageWindowTest(unittest.TestCase):
             self.assertIn("overview", window)
             self.assertTrue(any(e.startswith("memory base") for e in window["errors"]))
 
+    def test_a_period_without_litellm_counters_is_checked_against_vertex_ai(self):
+        stores = {"sessions": [{"id": "s1", "source": "cli", "started_at": 10.0, "input_tokens": 70,
+                                "cache_read_tokens": 30, "output_tokens": 5}]}
+        with mock.patch.object(cli.model_counters, "vertex_tokens",
+                               return_value={cli.INSTALL_MODEL: {"input": 100, "output": 5}}), \
+                mock.patch.object(cli.model_counters, "requests_by_account", side_effect=RuntimeError("iam denied")):
+            usage = cli.measure_period(stores, "p", 0, 60)
+        self.assertEqual(usage["checks"]["sum"], {"source": "vertex", "ratio": {"input": 1.0, "output": 1.0},
+                                                  "passed": True})
+        # An unread caller list is a note on the period, not a lost period.
+        self.assertEqual(usage["requests_by_account"], {})
+        self.assertTrue(any(e.startswith("requests by account") for e in usage["errors"]))
+
 
 class InstallTimeoutTest(unittest.TestCase):
     def test_a_helm_wait_that_runs_out_fails_once_and_is_not_retried(self):

@@ -545,7 +545,9 @@ def measure_period(stores: dict, project: str, start: float, end: float, litellm
             usage.setdefault("errors", []), "memory by capability")
     vertex = model_counters.vertex_tokens(project, start, end)
     usage["vertex"] = model_counters.against_sessions(vertex, usage["recorded"], INSTALL_MODEL)
-    usage["requests_by_account"] = model_counters.requests_by_account(project, start, end)
+    # Who made the calls is a note on the window, not one of its checks: an unread list costs only itself.
+    usage["requests_by_account"] = sized_records.safe(lambda: model_counters.requests_by_account(project, start, end),
+                                                      usage["errors"], "requests by account")
     if litellm is None:
         # No LiteLLM counters for an arbitrary period: Vertex AI's own count is the sum check.
         ratio = usage["vertex"]["ratio"]
@@ -791,6 +793,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 def cmd_usage(args: argparse.Namespace) -> int:
     """Tokens by capability for any period, from the live install or a kept archive, checked against Vertex AI."""
+    if not args.since:
+        raise SystemExit("usage needs --since: the period's start, ISO 8601 with a zone")
     until = datetime.fromisoformat(args.until).timestamp() if args.until else time.time()
     since = datetime.fromisoformat(args.since).timestamp()
     if args.stores:
@@ -803,13 +807,14 @@ def cmd_usage(args: argparse.Namespace) -> int:
     period = f"{datetime.fromtimestamp(since, timezone.utc):%Y%m%dT%H%M}-{datetime.fromtimestamp(until, timezone.utc):%Y%m%dT%H%M}"
     install = collect.Install(args.project, kube.context_name(args.project, args.host_location, args.host_cluster),
                               args.namespace, args.host_cluster, args.host_location)
-    usage = {period: measure_period(stores, args.project, since, until, install=install)}
     out = Path(args.out or tempfile.mkdtemp(prefix="sized-usage-"))
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"usage-{period}.json").write_text(json.dumps(usage, indent=2) + "\n")
-    (out / f"usage-{period}.md").write_text(attribution.markdown(usage))
+    # Kept before measuring: a live read cannot be made again once the install moves on.
     if not args.stores:
         attribution.archive(stores, out / f"session-records-{period}.json.gz")
+    usage = {period: measure_period(stores, args.project, since, until, install=install)}
+    (out / f"usage-{period}.json").write_text(json.dumps(usage, indent=2) + "\n")
+    (out / f"usage-{period}.md").write_text(attribution.markdown(usage))
     body = usage[period]
     LOG.info("usage %s: %s tokens, unattributed %.1f%%, sessions against Vertex AI %s; records in %s", period,
              f"{body['total_tokens']:,}", 100 * body["checks"]["unattributed"]["share"], body["vertex"]["ratio"], out)
