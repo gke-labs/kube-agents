@@ -283,6 +283,16 @@ publish on `a2a.submit.*.*.*.*`, and the console holds direct get by subject, so
 a profile task's prompt and nothing more. Session queues on TASKS keep the exposure; that
 is #4173.
 
+**Re-creating a durable.** The operator re-creates a profile durable only when it is really
+gone. A re-created durable starts from the stream's first message with a fresh ack floor, and a
+new stream leader can answer "not found" before a durable's assignment reaches it, as after a
+replica change. So a durable whose tier is in the profile's `status.durableTiers` (written only
+by a pass whose durable sync succeeded, and kept through passes the bus refuses) is re-created
+only if it is still missing a pass later (`durableRecreateDelay`, 30s), with the card reading
+`DurableRecheck` meanwhile. A new profile, or a tier new to it, gets its durables at once.
+`lib.EnsureHeldConsumer` offers the refusal as a primitive (`HeldConsumerConfig.Existed`) and
+leaves the timing to its caller (#6283).
+
 ### Admission and holding
 
 **The dispatcher is the only fetcher and holder** (decided 2026-10-22), on both execution
@@ -397,6 +407,30 @@ leave open:
   pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
   or holds another key type stops the dispatcher at startup. The dispatcher logs a
   credential's `jti`, never the token.
+- **Script-run tasks.** A script must run in Job mode: admission refuses `script-not-allowed` where the
+  profile has no Job template at an unattended tier. The dispatcher resolves the script from the config
+  snapshot it admitted the task on, and the confirm carries `script` (`{name, path, timeoutSeconds}`).
+  Only the dispatcher may publish on a dispatch subject (`TestOnlyTheDispatcherPublishesAConfirm`). The
+  one-shot worker runs the script in place of the harness when all of these hold:
+  - its task credential verifies against `A2A_TASK_SIGNING_PUBLIC_KEYS`, which the operator renders into
+    each Job template from the key the callout and the proxy use;
+  - the credential names this task and pod, and a trigger whose `script` is the confirm's;
+  - the path resolves, symlinks included, to a regular file under the script root, owned by root and
+    writable by no group or other, in directories that are the same, and the worker isn't its owner.
+
+  The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
+  broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
+  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. Its bound is
+  its `timeoutSeconds` within the task's deadline, and its process group is killed at the bound. Its
+  stdout, capped at 64 KiB, is the text result. Its stderr is read, capped at 16 KiB, and only its size is logged: a script can print a credential, and the log is not where a redactor's misses should land. Exit 0
+  completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
+  A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose
+  name can't be a `KA_PARAM_<NAME>` (upper case, at most 32 characters, where a task parameter may have
+  63), and a confirm with no `script` whose credential names one: a script task never runs as a model
+  turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
+  refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
+  SIGTERM ends it as `worker-evicted`.
+
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
@@ -474,7 +508,9 @@ leave open:
   Ready. With bucketed grants, the dispatcher's entry is a fixed size whatever the profile count,
   so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
-  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
+  the dispatch config's `profileSupervisorForm` is `profile`; readers read both; contract
+  addendum 6, #5301), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
@@ -483,8 +519,8 @@ leave open:
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
   `change-needs-job` (a confirmed change whose tier has no Job runner), `verifier-refused`, `parameters-invalid`,
-  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, #5622),
-  and for a child of an AgentProfile task
+  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, or one
+  where the profile has no Job mode at an unattended tier, #5622), and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`

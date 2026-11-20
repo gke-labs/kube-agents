@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Records a quiet daily tick in the GA release scheduler's job summary.
+# Records a quiet evaluation in the GA release scheduler's job summary: a daily
+# tick with nothing to release, or a promotion's dispatch that found the tick
+# had already released the candidate.
 #
 # The whole point of release-scheduler.yml is that a tick with nothing to release
 # leaves no pipeline run behind to be mistaken for a passing one. That makes this
@@ -26,7 +28,7 @@ render_summary() {
     echo "No eligible staging promotion candidate exists to release."
   fi
   echo ""
-  echo "No pipeline run was started. This is the normal quiet-tick outcome and says nothing about the last pipeline run's result."
+  echo "No pipeline run was started. This is the normal quiet outcome and says nothing about the last pipeline run's result."
 }
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

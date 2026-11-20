@@ -90,12 +90,20 @@ const (
 	RBACIncompleteCause = "the ClusterRole or namespaced Role bound to the operator is older than this image; " +
 		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together"
 	// rbacAgentNamespaceCause follows RBACIncompleteCause on a condition whose
-	// denials include a PlatformAgent's own namespace: that one is not skew but
-	// a Role and RoleBinding nobody installs by default. A RoleBinding can name
-	// a Role in its own namespace only, so the Role is copied, not referenced.
+	// denials include a PlatformAgent's own namespace or its profile namespace:
+	// that one is not skew but a missing Role and RoleBinding. Both install
+	// paths render them in the install namespace and its profile namespace, so
+	// the fix there is the upgrade, not a hand-made Role: Helm refuses to adopt
+	// one on the next upgrade, so a hand-made copy goes first. A namespace
+	// neither path renders into (an agent created elsewhere; a profile
+	// namespace made by hand under a chart with platformAgent.enabled false)
+	// gets them by hand. A RoleBinding can name a Role in its own namespace
+	// only, so the Role is copied, not referenced.
 	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no copy of the " +
-		"operator's namespaced Role and no RoleBinding to it; create both there (the chart and make deploy " +
-		"render them in the install namespace and in its profile namespace)"
+		"operator's namespaced Role and no RoleBinding to it; for the install namespace's profile namespace " +
+		"(<install namespace>-profiles), which the chart and make deploy render into, delete any hand-made copy " +
+		"and run helm upgrade or make deploy; a namespace neither path renders into (an agent's namespace " +
+		"elsewhere, or a profile namespace made by hand with platformAgent.enabled false) gets both by hand"
 	// rbacAgentNamespaceLabelMark is the substring of a denied label that names
 	// an agent namespace (rbacAgentNamespaceLabelFormat's opening), which
 	// rbacIncompleteMessage looks for to add rbacAgentNamespaceCause.
@@ -196,6 +204,11 @@ var requiredPermissions = []requiredPermission{
 	// write.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers/status"}, Verbs: []string{"get", "update", "patch"}},
+	// agentschedules: the AgentSchedule reconciler reads each schedule and
+	// writes its run state (gke-labs/kube-agents#5617). Only the operator and,
+	// later, the broker write schedules: no agent ServiceAccount does.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: rbacReadVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules/status"}, Verbs: []string{"get", "update"}},
 	// Every rendered kind is two tuples: the reads cluster-wide, for the
 	// informers and for escalation prevention, and the writes namespaced, in
 	// the Role document (the markers carry `namespace=`), which both install
@@ -659,6 +672,24 @@ func TierAccessDenied(c *RBACChecker) []string {
 	var out []string
 	for _, tuple := range flattenRequiredPermissions() {
 		if tuple.resource == "tiers" && slices.Contains(denied, tuple.label) {
+			out = append(out, tuple.label)
+		}
+	}
+	return out
+}
+
+// AgentScheduleAccessDenied returns the boot probe's denials on
+// agentschedules, as TierAccessDenied does for tiers: an operator image
+// deployed ahead of its ClusterRole skips the AgentSchedule controller rather
+// than crashloop.
+func AgentScheduleAccessDenied(c *RBACChecker) []string {
+	denied := c.Denied()
+	if len(denied) == 0 {
+		return nil
+	}
+	var out []string
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.resource == "agentschedules" && slices.Contains(denied, tuple.label) {
 			out = append(out, tuple.label)
 		}
 	}

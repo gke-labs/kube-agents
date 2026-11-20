@@ -40,6 +40,7 @@ scripts/test_eval_rosters.py pins the arrays to the sets the script carried
 before the split.
 """
 
+import functools
 import os
 import pathlib
 import re
@@ -616,7 +617,7 @@ class GitLabLaneTest(unittest.TestCase):
         """The recorder decision, lifted as written: a GitLab periodic reads
         the store like a presubmit and never records, since a case's record
         is per case and version key, not per forge."""
-        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_ROLLBACK_LANE:-\}" = "1" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
+        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_FORGE:-github\}" != "github" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
         body = decision + '\necho "MAIN_RUN=${EVAL_IS_MAIN_RUN}"'
         self.assertIn("MAIN_RUN=true", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "github"}).stdout)
         self.assertIn("MAIN_RUN=false", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "gitlab"}).stdout)
@@ -771,14 +772,14 @@ class ArrayHygieneTest(unittest.TestCase):
 
 def exclusions_block() -> str:
     """The inject lane's exclusion step (#2039): the read, the existence
-    check on every entry, and the AGENT_TRANSPORT-gated drop from TASKS."""
+    check on every entry, and the drop from TASKS, which every run makes."""
     return lifted_block(r"^# ─── The inject lane's exclusions.*?^fi$")
 
 
 def lane_constants() -> str:
     """The exclusion file's path (declared beside the roster files, after a
-    comment `roster_constants` stops at) and the transport name the
-    EVAL_MODE_NEXT export uses, which the step compares against."""
+    comment `roster_constants` stops at) and the transport name section 4
+    exports."""
     return lifted_block(r"^readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE=[^\n]*\n") + lifted_block(
         r"^readonly EVAL_INJECT_TRANSPORT=[^\n]*\n"
     )
@@ -795,19 +796,19 @@ def load_matrix_through_the_lane_step(env: dict | None = None, hack_dir: pathlib
 
 
 class InjectLaneExclusionTest(unittest.TestCase):
-    """Under AGENT_TRANSPORT=inject the excluded cases leave TASKS; on any
-    other transport the matrix is byte for byte the presubmit file."""
+    """The excluded cases leave TASKS on every run: every matrix goes through
+    the inject door, so the step keys on nothing about the transport."""
 
     def excluded_entries(self) -> list[str]:
         return [f"./tasks/{name}/task.yaml" for name in eval_rosters.inject_lane_exclusions()]
 
-    def test_the_api_lane_is_untouched(self):
+    def test_the_drop_does_not_key_on_the_transport(self):
+        excluded = self.excluded_entries()
         for env in ({}, {"AGENT_TRANSPORT": "api"}):
             with self.subTest(env=env):
                 result = load_matrix_through_the_lane_step(env)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(lines_tagged(result, "TASK"), presubmit_entries())
-                self.assertNotIn("leaves the matrix", result.stdout)
+                self.assertEqual(lines_tagged(result, "TASK"), [e for e in presubmit_entries() if e not in excluded])
 
     def test_the_inject_lane_drops_the_excluded_cases_in_order(self):
         result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject"})
@@ -840,11 +841,6 @@ class InjectLaneExclusionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"AGENT_TRANSPORT=inject: {dropped} leaves the matrix", result.stdout)
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in roster if c != dropped)])
-
-    def test_the_api_lane_exports_the_whole_roster(self):
-        result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "api"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
 
     def test_the_nightly_tier_is_filtered_too(self):
         result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject", "EVAL_TIER": "nightly"})
@@ -997,12 +993,26 @@ def load_matrix_through_the_part(
     return subprocess.run(["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True, check=False, env=clean_env(env))
 
 
+@functools.cache
+def nightly_part(part: str) -> subprocess.CompletedProcess:
+    """One part of the nightly through the part step, run one time for the
+    file. The result depends on the part, on the checkout's files and on the
+    environment that clean_env passes on, and no test changes those: a test
+    that reorders the rosters passes its own hack_dir to
+    load_matrix_through_the_part for that run. For a main shard the part step
+    starts a python3 for most entries of the main part, so one run for each
+    test that reads the shards is slow."""
+    return load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+
+
 class NightlyPartTest(unittest.TestCase):
     """EVAL_NIGHTLY_PART: the nightly as two periodics, one for the cases
     that request a pull request and one for the rest."""
 
     def nightly_matrix(self) -> list[str]:
-        return presubmit_entries() + nightly_entries()
+        # Less the inject lane's exclusions, which leave every matrix.
+        excluded = {f"./tasks/{name}/task.yaml" for name in eval_rosters.inject_lane_exclusions()}
+        return [e for e in presubmit_entries() + nightly_entries() if e not in excluded]
 
     def is_writer(self, entry: str) -> bool:
         return pathlib.Path(entry).parent.name in WRITERS
@@ -1011,8 +1021,8 @@ class NightlyPartTest(unittest.TestCase):
         # The second-phase placement the docs and the roster reason blocks
         # state: a writes_alone case leaves the main halves.
         self.assertTrue(WRITES_ALONE, "no registered writes_alone case left to place")
-        main = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
-        writers = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        main = nightly_part("main")
+        writers = nightly_part("writers")
         for result in (main, writers):
             self.assertEqual(result.returncode, 0, result.stderr)
         main_names = {pathlib.Path(t).parent.name for t in lines_tagged(main, "TASK")}
@@ -1041,7 +1051,7 @@ class NightlyPartTest(unittest.TestCase):
                 self.assertNotIn("Nightly part:", result.stdout)
 
     def test_main_is_the_nightly_less_exactly_the_requesting_cases(self):
-        result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
+        result = nightly_part("main")
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = [e for e in self.nightly_matrix() if not self.is_writer(e)]
         self.assertEqual(lines_tagged(result, "TASK"), expected)
@@ -1055,7 +1065,7 @@ class NightlyPartTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c not in WRITERS)])
 
     def test_writers_is_exactly_the_requesting_cases_in_matrix_order(self):
-        result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        result = nightly_part("writers")
         self.assertEqual(result.returncode, 0, result.stderr)
         tasks = lines_tagged(result, "TASK")
         self.assertEqual(tasks, [e for e in self.nightly_matrix() if self.is_writer(e)])
@@ -1070,8 +1080,8 @@ class NightlyPartTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in WRITERS)])
 
     def test_the_two_parts_cover_the_nightly_once(self):
-        main = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
-        writers = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        main = nightly_part("main")
+        writers = nightly_part("writers")
         both = lines_tagged(main, "TASK") + lines_tagged(writers, "TASK")
         self.assertEqual(sorted(both), sorted(self.nightly_matrix()))
 
@@ -1123,7 +1133,7 @@ class NightlyPartTest(unittest.TestCase):
     def main_shards(self) -> list[list[str]]:
         out = []
         for part in MAIN_SHARDS:
-            result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+            result = nightly_part(part)
             self.assertEqual(result.returncode, 0, result.stderr)
             out.append(lines_tagged(result, "TASK"))
         return out
@@ -1213,7 +1223,8 @@ class NightlyPartTest(unittest.TestCase):
         # to the matrix between their checkouts must not move any other.
         main = [e for e in self.nightly_matrix() if not self.is_writer(e)]
         shards = self.main_shards()
-        reordered = list(reversed(self.nightly_matrix()))
+        # The roster files whole, so the exclusion list still names a case in them.
+        reordered = list(reversed(presubmit_entries() + nightly_entries()))
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
@@ -1229,7 +1240,7 @@ class NightlyPartTest(unittest.TestCase):
     def test_the_main_shards_export_only_their_own_roster_cases(self):
         for part, tasks in zip(MAIN_SHARDS, self.main_shards()):
             with self.subTest(part=part):
-                result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+                result = nightly_part(part)
                 names = set(self.names(tasks))
                 self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in names)])
                 self.assertIn(f"Nightly part: {part} ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
@@ -1242,7 +1253,7 @@ class NightlyPartTest(unittest.TestCase):
     def thirds(self) -> tuple[list[str], list[str], list[str]]:
         out = []
         for part in WRITERS_THIRDS:
-            result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+            result = nightly_part(part)
             self.assertEqual(result.returncode, 0, result.stderr)
             out.append(lines_tagged(result, "TASK"))
         return out[0], out[1], out[2]
@@ -1280,7 +1291,8 @@ class NightlyPartTest(unittest.TestCase):
 
     def test_a_writers_third_depends_on_its_name_alone(self):
         _, b, _ = self.thirds()
-        reordered = list(reversed(self.nightly_matrix()))
+        # The roster files whole, so the exclusion list still names a case in them.
+        reordered = list(reversed(presubmit_entries() + nightly_entries()))
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
@@ -1295,7 +1307,7 @@ class NightlyPartTest(unittest.TestCase):
         # half does (the roster block's comment on NIGHTLY_PART_DROPPED).
         for part, tasks in zip(WRITERS_THIRDS, self.thirds()):
             with self.subTest(part=part):
-                result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+                result = nightly_part(part)
                 names = set(self.names(tasks))
                 self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in names)])
                 self.assertIn(f"Nightly part: {part} ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
@@ -1323,59 +1335,6 @@ class NightlyPartTest(unittest.TestCase):
         self.assertLess(lane, step, "the lane step computes INJECT_LANE_REQUESTING, which the part reads")
         self.assertLess(step, roster)
         self.assertLess(step, names, "TASK_NAMES is built from TASKS; the part must come first")
-
-
-def api_lane_block() -> str:
-    """The api lane's exclusion step: the mirror of the inject lane's, applied
-    on every transport but inject."""
-    return lifted_block(r"^# The mirror \(#3263\).*?^fi$")
-
-
-def load_matrix_through_both_lane_steps(env: dict | None = None) -> subprocess.CompletedProcess:
-    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
-    constants = lane_constants() + lifted_block(r"^readonly EVAL_API_LANE_EXCLUSIONS_FILE=[^\n]*\n")
-    body = "\n".join(
-        [
-            f'SCRIPT_DIR="{HACK_DIR}"',
-            roster_constants(),
-            constants,
-            section,
-            exclusions_block(),
-            api_lane_block(),
-            roster_block(),
-            PRINT_ARRAYS,
-        ]
-    )
-    return run_bash(body, env)
-
-
-class ApiLaneExclusionTest(unittest.TestCase):
-    """Every transport but inject drops the cases only the inject door can
-    carry; the inject lane keeps them."""
-
-    def excluded_entries(self) -> list[str]:
-        return [f"./tasks/{name}/task.yaml" for name in eval_rosters.api_lane_exclusions()]
-
-    def test_the_api_lane_drops_the_door_only_cases(self):
-        for env in ({"EVAL_TIER": "nightly"}, {"EVAL_TIER": "nightly", "AGENT_TRANSPORT": "api"}):
-            with self.subTest(env=env):
-                result = load_matrix_through_both_lane_steps(env)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                excluded = self.excluded_entries()
-                self.assertTrue(excluded, "the api-lane file parsed to no entries")
-                tasks = lines_tagged(result, "TASK")
-                for entry in excluded:
-                    self.assertNotIn(entry, tasks)
-                for name in eval_rosters.api_lane_exclusions():
-                    self.assertIn(f"{name} leaves the matrix -- it runs on the inject lane only", result.stdout)
-
-    def test_the_inject_lane_keeps_them(self):
-        result = load_matrix_through_both_lane_steps({"EVAL_TIER": "nightly", "AGENT_TRANSPORT": "inject"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        tasks = lines_tagged(result, "TASK")
-        for entry in self.excluded_entries():
-            self.assertIn(entry, tasks)
-        self.assertNotIn("runs on the inject lane only", result.stdout)
 
 
 if __name__ == "__main__":

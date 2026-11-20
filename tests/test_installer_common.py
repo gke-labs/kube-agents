@@ -9,6 +9,7 @@ behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
 import base64
 import datetime
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -6727,6 +6728,89 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("values don't meet the specifications", proc.stderr)
         self.assertNotIn("Release footprint", proc.stdout)
 
+    def _failed_step(self, break_step, function="render_footprint_summary"):
+        """Run the render on a copy of the chart with one step of the probe build made to fail.
+
+        `break_step` is shell that runs after the copy exists at $CHECKOUT and before the
+        call. $TMPDIR is a directory of the run's own, listed after the call, so a probe
+        directory that stays behind shows on the `left:` line.
+        """
+        chart = _REPO_ROOT / "charts" / "kube-agents"
+        script = (
+            # C messages: the tests read cp's own error text.
+            'export LC_ALL=C\n'
+            'work="$(mktemp -d)"; CHECKOUT="$work/checkout"; export TMPDIR="$work/tmp"\n'
+            'mkdir -p "$CHECKOUT/charts/kube-agents/templates" "$TMPDIR"\n'
+            f'cp "{chart}/Chart.yaml" "{chart}/values.yaml" "{chart}/values.schema.json" "$CHECKOUT/charts/kube-agents/"\n'
+            f'cp -R "{chart}/files" "$CHECKOUT/charts/kube-agents/files"\n'
+            f'cp "{chart}/templates/_helpers.tpl" "$CHECKOUT/charts/kube-agents/templates/"\n'
+            f"{break_step}\n"
+            f'{function} "$CHECKOUT" "$TFVARS"; echo "rc=$?"\n'
+            'echo "left: $(ls -A "$TMPDIR" | tr "\\n" " ")"\n'
+            'chmod -R u+rwx "$work"; rm -rf "$work"\n'
+        )
+        return self._run(script, helm_script=_ECHO_HELM)
+
+    # The four steps of the probe build that had no handler: each must end the render
+    # with a non-zero status, with the step's own error and no helm call after it, and
+    # leave no probe directory behind.
+    _UNREADABLE_SCHEMA = 'chmod 000 "$CHECKOUT/charts/kube-agents/values.schema.json"'
+    _UNREADABLE_HELPERS = 'chmod 000 "$CHECKOUT/charts/kube-agents/templates/_helpers.tpl"'
+    _FAILING_MKDIR = 'mkdir() { case "$*" in */templates) echo "mkdir: cannot create the templates directory" >&2; return 1 ;; *) command mkdir "$@" ;; esac; }'
+    _FAILING_PROBE_WRITE = (
+        'printf() { case "$1" in "apiVersion: v1"*) echo "printf: write error" >&2; return 1 ;; *) builtin printf "$@" ;; esac; }'
+    )
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_schema(self):
+        proc = self._failed_step(self._UNREADABLE_SCHEMA)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("values.schema.json", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        # The render did not go on without the schema: helm was not called.
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_helpers_template(self):
+        proc = self._failed_step(self._UNREADABLE_HELPERS)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("_helpers.tpl", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_templates_directory_cannot_be_made(self):
+        proc = self._failed_step(self._FAILING_MKDIR)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        # The step's own error and nothing after it: without the handler the next copy
+        # fails into the directory that is not there, and its handler ends the render.
+        self.assertEqual(proc.stderr, "mkdir: cannot create the templates directory\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_probe_template_cannot_be_written(self):
+        proc = self._failed_step(self._FAILING_PROBE_WRITE)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertEqual(proc.stderr, "printf: write error\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_print_names_the_failed_step_and_nothing_after_it(self):
+        # The warning carries the step's error alone: no summary rendered without the
+        # schema, and no helm error for a template the copy never delivered.
+        for break_step, name in ((self._UNREADABLE_SCHEMA, "values.schema.json"), (self._UNREADABLE_HELPERS, "_helpers.tpl")):
+            with self.subTest(name=name):
+                proc = self._failed_step(break_step, function="print_footprint_summary")
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                warning = next((line for line in proc.stdout.splitlines() if line.startswith("WARN: ")), "")
+                self.assertIn("Could not render the release footprint summary: ", warning)
+                self.assertIn(name, warning)
+                self.assertTrue(warning.rstrip().endswith("Permission denied"), warning)
+                self.assertNotIn("args: ", proc.stdout)
+                self.assertIn("left: \n", proc.stdout)
+
     def test_print_warns_and_goes_on_without_helm(self):
         proc = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', without_helm=True
@@ -6755,7 +6839,7 @@ class FootprintSummaryTest(unittest.TestCase):
     def test_real_render_prints_the_notes_block_for_the_tfvars(self):
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn("      Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
         # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
         # which `make docs-generate` renders from the same chart template with these
@@ -6780,9 +6864,11 @@ class FootprintSummaryTest(unittest.TestCase):
                 self.assertIn("rc=0", output.stdout, output.stderr)
             r = profile["requirements"]
             gib = 1024**3
-            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
-            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
-            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            # The summary prints the standing release; the session pods' share, which the
+            # totals carry, is on its own line.
+            self.assertIn(f"CPU requests:        {(r['requestsCpu'] - r['sessionRequestsCpu']) / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {(r['requestsMemory'] - r['sessionRequestsMemory']) / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods'] - r['sessionPods']}\n", output.stdout, key)
             self.assertIn(
                 f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
                 output.stdout, key,
@@ -6793,7 +6879,7 @@ class FootprintSummaryTest(unittest.TestCase):
             profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the session pods", proc.stdout)
+        self.assertIn("Not in these figures or the cost: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

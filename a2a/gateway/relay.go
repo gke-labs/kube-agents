@@ -110,6 +110,11 @@ var reasonSentences = map[string]string{
 	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
 	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A script-run task's worker (#5622): refused before the script ran,
+	// the script failed, or it ran past its bound.
+	"script-refused": "the worker refused to run this scheduled script, and its log says why",
+	"script-failed":  "the scheduled script ended with an error",
+	"script-timeout": "the scheduled script ran past its time limit and was stopped",
 	// A script-run task naming a script its profile doesn't list (#5622).
 	"script-not-allowed": "this agent isn't set up to run the script this schedule asked for, so it didn't run; whoever manages this agent can allow the script, or change the schedule",
 	// The agent ran and produced no answer.
@@ -453,6 +458,8 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
 	defer l.Unlock()
+	// A wake that took a cap slot ends it here, as a turn does (#6033).
+	defer g.releaseCapHold(sessionKey)
 
 	// A stopping gateway renders nothing new: its run context is done, so
 	// every read would fail, and the batch's deliveries are left for the

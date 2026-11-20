@@ -583,7 +583,7 @@ _FINAL_VERDICT = re.compile(
 # The release-candidate banner hack/ci-eval-rc.sh prints once per run, between
 # two rules of `=`:
 #   🏷️ RELEASE CANDIDATE EVAL
-#   Candidate:   staging_2609092307_5b5ad10 (5b5ad10163cf10c73871b279518c7165c098bec9)
+#   Candidate:   staging_2609092307_0707070 (0707070707070707070707070707070707070707)
 #   Tier:        nightly
 #   Verdict:     GREEN (GREEN promotes this candidate to staging)
 #   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>

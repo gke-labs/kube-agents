@@ -1,0 +1,2 @@
+# Synthetic nightly registration for scripts/test_eval_dashboard_collect.py.
+./tasks/case-26/task.yaml

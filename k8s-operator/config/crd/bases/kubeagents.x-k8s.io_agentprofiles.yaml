@@ -497,6 +497,24 @@ spec:
                   x-kubernetes-list-map-keys:
                     - type
                   x-kubernetes-list-type: map
+                durableTiers:
+                  description: |-
+                    DurableTiers are the tiers whose PROFILE_SUBMITS durables the operator
+                    last made or found, written only after a durable sync succeeds and
+                    left as it was by any other pass (#6283). The operator reads it to
+                    tell a durable that existed, which it re-creates only once it is
+                    still missing a pass later, from one it never made, which it makes at
+                    once. A hint like renderedTiers: absent, every durable counts as new.
+                    It holds at most 32: the rendered tiers first, then the draining ones
+                    by name. A draining tier left out counts as new, re-created on its
+                    first miss as before #6283.
+                  items:
+                    maxLength: 10
+                    pattern: ^[a-z0-9]+$
+                    type: string
+                  maxItems: 32
+                  type: array
+                  x-kubernetes-list-type: set
                 observedGeneration:
                   description: |-
                     ObservedGeneration is the .metadata.generation the status was last
@@ -540,6 +558,11 @@ spec:
                 "AgentProfile name 'platform' is reserved: the Hermes bridge
                 is the executor for that addressee"
               rule: self.metadata.name != 'platform'
+            - message:
+                "AgentProfile name 'session' is reserved: it is the A2A gateway's
+                session route"
+              optionalOldSelf: true
+              rule: oldSelf.hasValue() || self.metadata.name != 'session'
             - message:
                 "AgentProfile name is too long for its tiers: each tier's bus
                 identity is profile-<name>-<tier>, which must fit one 63-character label,

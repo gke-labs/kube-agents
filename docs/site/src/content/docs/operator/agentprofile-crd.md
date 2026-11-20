@@ -23,7 +23,7 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
 metadata:
   # A dot-free DNS-1123 label: it is the addressee on the bus. The name plus its
-  # longest listed tier is at most 54 characters. `platform` is reserved.
+  # longest listed tier is at most 54 characters. `platform` and `session` are reserved.
   name: auditor
   namespace: kubeagents-system
 spec:
@@ -122,7 +122,7 @@ Before `yieldToPinned`, every profile that takes a target handed off to a pinned
 
 `parameters` lists the task parameters the profile's persona declares, at most 16, each a lower-case identifier the worker exports as `PROFILE_TASK_<NAME>`. The gateway and the dispatcher read it here because neither can read the persona image: the gateway sends cluster work to a profile that declares `project`, `location` and `cluster`, and the dispatcher refuses a submission missing a `required` one. The list must match the persona's, and a worker refuses to run a task when they differ.
 
-`scripts` lists the helper scripts the profile may run as a script-run task: a built-in schedule's run that execs one of them with no model turn. There are at most 16, each with a unique `name` that is a DNS-1123 label. Each `path` lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the worker image. Its segments start with a letter, digit or underscore and hold only those, dots and hyphens, so a path has no `..`, no empty segment and no shell metacharacter.
+`scripts` lists the helper scripts the profile may run as a script-run task: a built-in schedule's run that execs one of them with no model turn. A script runs only in Job mode, at an unattended tier, on a worker that verifies the task's credential before it starts. There are at most 16, each with a unique `name` that is a DNS-1123 label. Each `path` lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the worker image. Its segments start with a letter, digit or underscore and hold only those, dots and hyphens, so a path has no `..`, no empty segment and no shell metacharacter.
 
 `timeoutSeconds` may not exceed `lifecycle.activeDeadlineSeconds`, and the operator lowers it to the install's task-deadline cap when that is lower. The dispatcher refuses a task naming a script the list doesn't hold, as `script-not-allowed`. The path comes from this list, never from the task.
 
@@ -152,8 +152,8 @@ With the dispatcher on, each admitted profile also gets a warm pool for each of 
 
 [AgentProfile fields → Status](/kube-agents/operator/agentprofile-fields/#status) lists the status fields. The conditions carry the detail:
 
-| Condition                 | Meaning                                                                                                                                                                                                                                                                                          |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `TierUnknown` or `TierModeConflict` when no listed tier renders). |
-| `TiersRendered` condition | Every listed tier renders (`AllTiersRendered`), or which don't and why (`TierUnknown`, `TierModeConflict`). Its message names the tiers that render.                                                                                                                                             |
-| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, `BusConfigPending` while the bus loads a new profile's config, or the same mode and binding reasons as `IdentityReady`).                                             |
+| Condition                 | Meaning                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `TierUnknown` or `TierModeConflict` when no listed tier renders).                                                            |
+| `TiersRendered` condition | Every listed tier renders (`AllTiersRendered`), or which don't and why (`TierUnknown`, `TierModeConflict`). Its message names the tiers that render.                                                                                                                                                                                                        |
+| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, `BusConfigPending` while the bus loads a new profile's config, or the same mode and binding reasons as `IdentityReady`). `DurableRecheck` means a durable that existed can't be found, and waits a pass before it's re-created. |

@@ -700,6 +700,210 @@ class ShellIdentityTest(RoutesTestCase):
         self.assertEqual(credential_proxy.CALLER_ROLE_SHELL, authenticator._principal_from(review(SHELL_SA, "shell-aud")).role)
 
 
+class A2AReportsTest(RoutesTestCase):
+    """The A2A gateway's report reader (#5618): one finished report, on the publish key, and nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        self.a2a = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:platformagent-gateway", uid="gw-uid",
+            role=credential_proxy.CALLER_ROLE_A2A_REPORTS,
+        )
+        self.authenticator.principal = self.a2a
+
+    def test_the_publish_word_is_relayed_as_the_publish_key(self):
+        # The listener sees the resolved key, never the word the gateway sent.
+        for audit in (AUDIT, OTHER_AUDIT, "any-audit-at-all"):
+            for suffix in ("latest", f"runs/{RUN}"):
+                path = f"/v1/audit-reports/{audit}/publish/{suffix}"
+                with self.subTest(path=path):
+                    self.assert_relayed("GET", f"/v1/audit-reports/{audit}/{GITOPS_KEY}/{suffix}", self.request("GET", path))
+
+    def test_no_forge_is_the_key_when_the_install_publishes_to_none(self):
+        self.set_gitops([], None)
+        self.assert_relayed("GET", f"{NO_FORGE_STREAM}/latest", self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/latest"))
+        self.assert_relayed("GET", f"{NO_FORGE_STREAM}/runs/{RUN}",
+                            self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/runs/{RUN}"))
+
+    def test_a_real_key_is_refused_the_publish_key_included(self):
+        for key in (GITOPS_KEY, "acme%2Fterraform", "no_forge%2Flocal"):
+            for suffix in ("latest", f"runs/{RUN}"):
+                path = f"/v1/audit-reports/{AUDIT}/{key}/{suffix}"
+                with self.subTest(path=path):
+                    self.assert_refused(self.request("GET", path), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
+        self.set_gitops([], None)
+        self.assert_refused(self.request("GET", f"{NO_FORGE_STREAM}/latest"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
+
+    def test_an_unregistered_key_or_another_spelling(self):
+        for key in ("other%2Frepo", "acme%2Fremoved", "ACME%2Fgitops", "acme%2fgitops", "github.com%2Facme%252Fgitops",
+                    "PUBLISH", "Publish", "publish%2Fx", "%70ublish", "publish.", "publis"):
+            for suffix in ("latest", f"runs/{RUN}"):
+                path = f"/v1/audit-reports/{AUDIT}/{key}/{suffix}"
+                with self.subTest(path=path):
+                    self.assert_refused(self.request("GET", path), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
+
+    def test_the_list_and_the_run_index(self):
+        for path in ("/v1/audit-reports", f"{STREAM}/runs", f"{NO_FORGE_STREAM}/runs", f"/v1/audit-reports/{AUDIT}/publish/runs"):
+            with self.subTest(path=path):
+                self.assert_refused(self.request("GET", path), credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE)
+
+    def test_writes_and_deletes(self):
+        self.set_gitops([], None)
+        for stream in (STREAM, NO_FORGE_STREAM, f"/v1/audit-reports/{AUDIT}/publish"):
+            for method, path in (("PUT", f"{stream}/runs/{RUN}"), ("PUT", f"{stream}/latest"), ("DELETE", f"{stream}/latest")):
+                with self.subTest(method=method, path=path):
+                    self.assert_refused(self.request(method, path), credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE)
+
+    def test_unreadable_state_refuses_the_relays_reads(self):
+        for target in ("gitops_workspace.get_managed_repos", "gitops_workspace.gitops_repo_key_text"):
+            with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("unreadable")):
+                credential_proxy._managed_repository_cache = None
+                credential_proxy._managed_repository_name_cache = None
+                self.assert_refused(self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/latest"),
+                                    status=503, code="GITOPS_REPO_UNAVAILABLE")
+
+    def test_a_refused_read_reads_no_state(self):
+        with mock.patch.object(credential_proxy, "report_publish_store_key", side_effect=AssertionError("read")) as publish:
+            self.assert_refused(self.request("GET", f"{STREAM}/latest"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
+            self.assert_refused(self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/runs"),
+                                credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE)
+        publish.assert_not_called()
+
+    def test_the_shell_and_a_profile_sending_publish_are_not_resolved(self):
+        # The word is the a2a-reports reader's alone: another role's goes upstream
+        # as sent, where it names no stream, and the publish key is never read for it.
+        CredentialProxyHandler.report_profiles = frozenset({"auditor"})
+        for principal, token in ((self.shell, None), (self.profile, REPORT["token"])):
+            self.authenticator.principal = principal
+            for suffix in ("latest", f"runs/{RUN}"):
+                path = f"/v1/audit-reports/{AUDIT}/publish/{suffix}"
+                with self.subTest(role=principal.role, path=path), mock.patch.object(
+                    credential_proxy, "report_publish_store_key", side_effect=AssertionError("resolved")
+                ):
+                    self.assert_relayed("GET", path, self.request("GET", path, token=token))
+        # A profile write to it is the repository-key refusal, as any unregistered key.
+        self.authenticator.principal = self.profile
+        self.store.seen.clear()
+        self.assert_refused(self.request("PUT", f"/v1/audit-reports/{AUDIT}/publish/latest", token=REPORT["token"]),
+                            credential_proxy.RULE_REPORT_REPOSITORY_KEY)
+
+    def test_a_task_credential_changes_nothing(self):
+        # The relay's role is its audience's; a task credential confers no profile reads.
+        self.assert_refused(self.request("GET", f"{STREAM}/runs", token=REPORT["token"]), credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE)
+        self.assert_refused(self.request("PUT", f"{STREAM}/latest", token=REPORT["token"]), credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE)
+        self.assert_refused(self.request("GET", f"/v1/audit-reports/{AUDIT}/acme%2Fterraform/latest", token=REPORT["token"]),
+                            credential_proxy.RULE_REPORT_A2A_REPORTS_KEY)
+
+    def test_the_a2a_chat_role_reaches_no_store_route(self):
+        self.authenticator.principal = credential_proxy.Principal(
+            workload=self.a2a.workload, uid="gw-uid", role=credential_proxy.CALLER_ROLE_A2A_CHAT)
+        for method, path in READS + WRITES:
+            with self.subTest(method=method, path=path):
+                self.assert_refused(self.request(method, path), code="CALLER_ROLE_FORBIDDEN")
+
+    def test_every_other_route_refuses_the_role(self):
+        # ROUTE_ROLES names the role on the store's entry alone.
+        reached = [prefix for prefix, roles in credential_proxy.ROUTE_ROLES
+                   if credential_proxy.CALLER_ROLE_A2A_REPORTS in roles]
+        self.assertEqual([credential_proxy.AUDIT_REPORTS_PREFIX], reached)
+        for method, path in (("POST", "/v1/exec"), ("POST", "/v1/chat/api"), ("GET", "/v1/chat/a2a/events"),
+                             ("GET", credential_proxy.API_RELAY_PREFIX + "compute.googleapis.com/x"),
+                             ("POST", "/v1/vcs/issue-view"), ("POST", "/v1/forge/refresh"),
+                             ("POST", credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "developer_knowledge")):
+            with self.subTest(method=method, path=path):
+                status, answer = self.request(method, path, body=b"{}" if method == "POST" else None)
+                self.assertEqual(403, status, answer)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", answer.get("code"), answer)
+        self.assertEqual([], self.store.seen)
+
+    def env(self, **extra):
+        env = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{SHELL_SA},{self.a2a.workload},{PROFILE_SA}",
+            "CREDENTIAL_PROXY_AUDIENCE": "shell-aud",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "chat-aud",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "a2a-chat-aud",
+            credential_proxy.A2A_REPORTS_AUDIENCE_ENV: "reports-aud",
+            credential_proxy.A2A_REPORTS_CALLERS_ENV: self.a2a.workload,
+            credential_proxy.PROFILE_AUDIENCE_ENV: "profile-aud",
+            credential_proxy.PROFILE_IDENTITIES_ENV: json.dumps({PROFILE_SA: {"profile": "auditor", "tier": "unattended"}}),
+            "KUBERNETES_SERVICE_HOST": "127.0.0.1",
+        }
+        env.update(extra)
+        return env
+
+    @staticmethod
+    def review(username, *audiences):
+        return {"status": {"authenticated": True, "audiences": list(audiences),
+                           "user": {"username": username, "uid": "u", "groups": []}}}
+
+    def test_only_its_audience_and_the_gateways_account_yield_the_role(self):
+        with mock.patch.dict(os.environ, self.env()):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(["reports-aud"], [a for a, r in authenticator.audience_roles.items()
+                                           if r == credential_proxy.CALLER_ROLE_A2A_REPORTS])
+        self.assertEqual(frozenset({self.a2a.workload}), authenticator.a2a_reports_callers)
+        principal_from = authenticator._principal_from
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_REPORTS, principal_from(self.review(self.a2a.workload, "reports-aud")).role)
+        # The gateway keeps its Chat token's role, and no other audience.
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_CHAT, principal_from(self.review(self.a2a.workload, "a2a-chat-aud")).role)
+        for audience in ("shell-aud", "chat-aud", "profile-aud"):
+            with self.subTest(gateway_audience=audience), self.assertRaises(credential_proxy.AuthenticationError):
+                principal_from(self.review(self.a2a.workload, audience))
+        # Any other account presenting the reports audience is refused.
+        for username in (SHELL_SA, PROFILE_SA):
+            with self.subTest(other=username), self.assertRaises(credential_proxy.AuthenticationError):
+                principal_from(self.review(username, "reports-aud"))
+        # And no other audience yields the role for anyone.
+        for username, audience in ((SHELL_SA, "shell-aud"), (SHELL_SA, "chat-aud"), (PROFILE_SA, "profile-aud")):
+            with self.subTest(username=username, audience=audience):
+                self.assertNotEqual(credential_proxy.CALLER_ROLE_A2A_REPORTS, principal_from(self.review(username, audience)).role)
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            principal_from(self.review(self.a2a.workload, "reports-aud", "a2a-chat-aud"))
+
+    def test_with_chat_armed_the_gateway_holds_both_its_audiences(self):
+        # Chat armed: the gateway is named by the a2a-chat binding too, which
+        # must still let it present the reports audience, and nothing else.
+        with mock.patch.dict(os.environ, self.env(**{credential_proxy.A2A_CHAT_CALLERS_ENV: self.a2a.workload})):
+            authenticator = credential_proxy.build_authenticator()
+        principal_from = authenticator._principal_from
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_REPORTS, principal_from(self.review(self.a2a.workload, "reports-aud")).role)
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_CHAT, principal_from(self.review(self.a2a.workload, "a2a-chat-aud")).role)
+        for audience in ("shell-aud", "chat-aud", "profile-aud"):
+            with self.subTest(gateway_audience=audience), self.assertRaises(credential_proxy.AuthenticationError):
+                principal_from(self.review(self.a2a.workload, audience))
+        for username in (SHELL_SA, PROFILE_SA):
+            with self.subTest(other=username), self.assertRaises(credential_proxy.AuthenticationError):
+                principal_from(self.review(username, "reports-aud"))
+
+    def test_no_callers_named_confers_the_role_on_nobody(self):
+        with mock.patch.dict(os.environ, self.env(**{credential_proxy.A2A_REPORTS_CALLERS_ENV: ""})):
+            authenticator = credential_proxy.build_authenticator()
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self.review(self.a2a.workload, "reports-aud"))
+
+    def test_an_audience_that_repeats_another_confers_nothing(self):
+        for repeated in ("shell-aud", "chat-aud", "a2a-chat-aud"):
+            with self.subTest(repeated=repeated), mock.patch.dict(
+                os.environ, self.env(**{credential_proxy.A2A_REPORTS_AUDIENCE_ENV: repeated})
+            ):
+                roles = credential_proxy.build_authenticator().audience_roles
+                self.assertNotIn(credential_proxy.CALLER_ROLE_A2A_REPORTS, roles.values())
+
+    def test_a_broker_without_the_audience_still_binds_the_gateway(self):
+        # The exec tier: callers rendered, audience dropped. The gateway's
+        # account still reaches no shell or chat role there.
+        env = self.env()
+        del env[credential_proxy.A2A_REPORTS_AUDIENCE_ENV]
+        with mock.patch.dict(os.environ, env, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertNotIn(credential_proxy.CALLER_ROLE_A2A_REPORTS, authenticator.audience_roles.values())
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self.review(self.a2a.workload, "shell-aud"))
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self.review(self.a2a.workload, "reports-aud"))
+
+
 class MethodsTest(RoutesTestCase):
     def test_put_and_delete_elsewhere_keep_their_old_answer(self):
         # Before authentication, as before these methods existed: an
@@ -832,6 +1036,58 @@ class WriteDecisionTest(unittest.TestCase):
         for role in ("", None, credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_MCP):
             with self.subTest(role=role):
                 self.assertEqual(credential_proxy.RULE_REPORT_ROLE, read(role, "fleet-audit", self.ALLOW))
+                self.assertEqual(credential_proxy.RULE_REPORT_ROLE,
+                                 read(role, None, self.ALLOW, credential_proxy.REPORT_ROUTE_LATEST, "publish"))
+
+    def test_the_a2a_reports_role(self):
+        a2a = credential_proxy.CALLER_ROLE_A2A_REPORTS
+        read = credential_proxy.report_read_permitted
+        latest, run = credential_proxy.REPORT_ROUTE_LATEST, credential_proxy.REPORT_ROUTE_RUN
+        word = credential_proxy.REPORT_A2A_PUBLISH_KEY
+        self.assertEqual("publish", word)
+        self.assertIsNone(read(a2a, None, frozenset(), latest, word))
+        self.assertIsNone(read(a2a, None, frozenset(), run, word))
+        cases = {
+            "the list": (read(a2a, None, frozenset(), credential_proxy.REPORT_ROUTE_LIST, None),
+                         credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE),
+            "the run index": (read(a2a, None, frozenset(), credential_proxy.REPORT_ROUTE_RUNS, word),
+                              credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE),
+            "no route": (read(a2a, None, frozenset(), None, word), credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE),
+            "the publish key itself": (read(a2a, None, frozenset(), latest, GITOPS_KEY), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "no_forge itself": (read(a2a, None, frozenset(), run, "no_forge%2Flocal"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "another key": (read(a2a, None, frozenset(), latest, "acme%2Fterraform"), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "no key": (read(a2a, None, frozenset(), latest), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "empty key": (read(a2a, None, frozenset(), latest, ""), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "key not a str": (read(a2a, None, frozenset(), latest, [word]), credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+            "an allowlisted profile is no help": (read(a2a, "fleet-audit", self.ALLOW, latest, "acme%2Fterraform"),
+                                                  credential_proxy.RULE_REPORT_A2A_REPORTS_KEY),
+        }
+        for name, (got, rule) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rule, got)
+        self.assertNotIn(credential_proxy.RULE_REPORT_A2A_REPORTS_KEY,
+                         (credential_proxy.RULE_REPORT_REPOSITORY_KEY, credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE,
+                          credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE))
+        write = credential_proxy.report_write_permitted
+        for key, publish in ((GITOPS_KEY, GITOPS_KEY), ("no_forge%2Flocal", None)):
+            with self.subTest(key=key):
+                self.assertEqual(credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE,
+                                 write(a2a, "fleet-audit", self.trigger(), AUDIT, key, publish, self.ALLOW, frozenset({key})))
+        # The a2a-chat role reads and writes nothing here.
+        self.assertEqual(credential_proxy.RULE_REPORT_ROLE,
+                         read(credential_proxy.CALLER_ROLE_A2A_CHAT, None, frozenset(), latest, word))
+        self.assertEqual(credential_proxy.RULE_REPORT_ROLE, write(
+            credential_proxy.CALLER_ROLE_A2A_CHAT, None, None, AUDIT, GITOPS_KEY, GITOPS_KEY, self.ALLOW))
+
+    def test_the_route_kinds(self):
+        kind = credential_proxy.report_route_kind
+        self.assertEqual(credential_proxy.REPORT_ROUTE_LIST, kind("/v1/audit-reports"))
+        self.assertEqual(credential_proxy.REPORT_ROUTE_LATEST, kind(f"{STREAM}/latest"))
+        self.assertEqual(credential_proxy.REPORT_ROUTE_RUNS, kind(f"{STREAM}/runs"))
+        self.assertEqual(credential_proxy.REPORT_ROUTE_RUN, kind(f"{STREAM}/runs/{RUN}"))
+        for path in (STREAM, f"{STREAM}/latest/x", f"{STREAM}/other", f"{STREAM}/latest/{RUN}", "/v1/audit-reports/x"):
+            with self.subTest(path=path):
+                self.assertIsNone(kind(path))
 
 
 def _load_audit_report():
@@ -893,6 +1149,27 @@ class StoreKeyTest(unittest.TestCase):
                 with self.assertRaises((ValueError, AttributeError, TypeError)):
                     self.audit_report.reports_dir_for("x", repo) if isinstance(repo, str) else repo.lower()
                 self.assertIsNone(credential_proxy.report_store_key(repo))
+
+    def test_every_key_holds_an_escaped_slash_so_none_is_the_publish_word(self):
+        # The a2a-reports reader's REPORT_A2A_PUBLISH_KEY holds no %2F, so it
+        # can never be a real stream's key: every key report_store_key yields does.
+        import random
+        rng = random.Random(5619)
+        alphabet = "abcXYZ019_.-/ %:@"
+        repos = ["publish", "publish/", "/publish", "github.com/publish", "a/publish", "publish/a", "no_forge/local",
+                 "acme/gitops", "gitlab.com/a/b/c", "x.y/a/b", "..", "./a", "a/."]
+        repos += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 24))) for _ in range(20000)]
+        yielded = 0
+        for repo in repos:
+            got = credential_proxy.report_store_key(repo)
+            if got is None:
+                continue
+            yielded += 1
+            with self.subTest(repo=repo):
+                self.assertIn("%2F", got)
+                self.assertNotEqual(credential_proxy.REPORT_A2A_PUBLISH_KEY, got)
+        self.assertGreater(yielded, 100)
+        self.assertNotIn("%2F", credential_proxy.REPORT_A2A_PUBLISH_KEY.upper())
 
 
 class PublishKeyTest(unittest.TestCase):
@@ -1038,15 +1315,10 @@ class ConfigurationTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(frozenset(), credential_proxy.report_profiles_from_env())
 
-    def test_the_route_table_admits_the_shell_and_profile_alone(self):
-        self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE),
-            credential_proxy.required_roles("/v1/audit-reports"),
-        )
-        self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE),
-            credential_proxy.required_roles(f"{STREAM}/latest"),
-        )
+    def test_the_route_table_admits_the_shell_profile_and_a2a_reports_alone(self):
+        want = (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE, credential_proxy.CALLER_ROLE_A2A_REPORTS)
+        self.assertEqual(want, credential_proxy.required_roles("/v1/audit-reports"))
+        self.assertEqual(want, credential_proxy.required_roles(f"{STREAM}/latest"))
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ EXPECTED_TOOLS = {
     "mark_finding_surfaced",
     "record_finding_verification",
     "findings_publication",
+    "get_first_run_report",
 }
 
 
