@@ -12647,6 +12647,13 @@ spec:
                         Provider is the LiteLLM provider slug, the text before the first "/" of the
                         default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
                       type: string
+                    reasoningEffort:
+                      description: |-
+                        ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+                        the default model's entry (low, medium or high from the chart; a vLLM template's
+                        own words through hosted_vllm), as typed. Absent when the entry states none, so
+                        the model thinks at its own default, and absent while the served CRD predates it.
+                      type: string
                   type: object
                 lastReconcileTime:
                   description:
