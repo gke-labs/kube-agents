@@ -879,7 +879,7 @@ carry the same chat message:
 - **`chat`** is a `kube-agents.chat/v1` object beside the request's `text`, which is its
   fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
   the place of the request's raw `blocks` for a conversation post. A home-channel request
-  may carry one too: the cron relay's fleet-audit card or the first inventory's, laid out
+  may carry one too: the cron relay's fleet-audit card, its findings-nudge card or the first inventory's, laid out
   the same way, its `update` key kept per home thread as below and its `mark` not read.)
 - **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
   request with a key posts a message. A later request with the same key edits that

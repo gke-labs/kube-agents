@@ -348,10 +348,12 @@ An _item_ is the rows that share check, project and cluster, one gathered line: 
 marked together, the item is pending while any of them is, and its severity is the highest among its
 pending and never-shown members. A decision (accept, snooze, dismiss) on any row of an item is
 applied to every other row of it that is still `surfaced`, so the one id the nudge
-prints is enough to decide the line it named; a `queued` row of the item, which no message has
-named, keeps its state (§7.2); the count the nudge prints beside that id is the number of rows
-the decision reaches, which includes shown rows a sweep stopped reporting; the nudge does not list
-those, and says how many of the count they are. Two consequences of the
+keeps for a line is enough to decide the line it named; a `queued` row of the item, which no message has
+named, keeps its state (§7.2). The nudge prints no id: the id of each line it names is in the
+context stored for the message's thread (§7.2). The `(+N more)` beside the object a line names
+is the number of other rows the decision reaches, which includes shown rows a sweep stopped
+reporting; the nudge does not list those, and the stored context says how many of the count they
+are. Two consequences of the
 severity rule are accepted rather than designed around: a new critical row that joins a pending
 non-critical line makes the line a pending critical, which lifts stop-add and is reminded rather
 than added, so it spends no daily budget; and a row that joins a pending critical line outside the
@@ -922,11 +924,18 @@ and after it `findings_nudge.py` runs hourly and names only what `findings_queue
   `FINDINGS_DAILY_CRITICALS` pending critical items not first shown that day are named again.
   They are not additions and count against nothing. A pending critical below that top is named
   only on the day it was added.
-- **The stop-add notice:** the same once-a-day part names every pending non-critical item with a
-  pause notice naming the decisions that release it (resolve, snooze, dismiss), while finding ids
-  and covered-object counts ride in hidden thread context rather than visible chat text, so
-  stop-add is never silent for more than a day. A pending critical holding non-criticals back gets
-  no such notice.
+- **The stop-add notice:** the same once-a-day part names every pending non-critical item under
+  a notice that new findings are paused until it is resolved, snoozed or dismissed, so stop-add is
+  never silent for more than a day. Accepting it releases the hold too (§3.2), and so does fixing
+  it, once a complete sweep no longer reports it. A pending critical holding non-criticals back
+  gets no such notice.
+- **Ids stay out of the message:** a line names its object, its cluster and how many other objects
+  a decision on it reaches. The id of each line, its members' ids and the split between reported
+  and no-longer-reported objects go into the context stored for the message's thread
+  (`findings_nudge_card.thread_context`), which a reply in that thread is answered with. That row
+  holds one report, so a second nudge on the same UTC day, which posts into the same thread,
+  replaces the first one's ids; a report that posts without its card (a truncated report, a card
+  file that could not be written) stores the text alone.
 
 The day's limits count additions from `findings_additions` (§3.1, `GET /v1/findings/additions`),
 one row per item added, with the class the item had when it was added, so neither dismissing,
@@ -953,8 +962,8 @@ there are none), and takes the top critical items in the queue's order. It never
 with fewer criticals than the limit lists those, a sweep with none gets a report that says so and
 lists nothing, and a limit of 0 lists nothing. The worker writes the report from what `select`
 printed. Its roll-up line counts every item not listed, plus each line of provider-managed
-observations once, and a line that also has an ordinary row only once, as its item (the nudge's open
-count still counts such a line twice). It says how many of them are critical, and
+observations once, and a line that also has an ordinary row only once, as its item (the count the
+nudge shows leaves provider-managed lines out, so it counts such a line once too). It says how many of them are critical, and
 when criticals were left out or none was listed it also gives the hour and daily count at which the
 nudge adds the rest. The limit is the value the onboarding hand-off read when it filed the ranking
 card, written to `/opt/data/INVENTORY.limits.json`. `select` also writes the listed rows' ids to
