@@ -269,7 +269,8 @@ landed through the broker (a profile worker takes no local lock) keeps its own, 
 stream. The marker is left exactly when every local entry is on the broker or skipped as above,
 including when nothing needed copying. A stream the broker refuses to take (a 403: a repository the
 install does not register) is skipped and logged with no marker, so a later registration can still
-seed it; an entry it refuses alone (a 400, 409 or 413) is skipped and the rest still copy. A store
+seed it, and so is a stream whose run write it answers 409 (the store path, not the entry: a symlink, a
+full directory). An entry it refuses alone (a 400 or 413) is skipped and the rest still copy. A store
 that cannot be used now fails the read or write that started the seed, as an outage, and the next
 touch in the same process seeds again, so a run never reads a stream half copied as a first run. Any
 other failure (another refusal, a local file that cannot be read) is logged, leaves no marker, and

@@ -724,6 +724,18 @@ class TestSeed(BrokerTestCase):
         self.assertIn("HTTP 403", self.logged[-1])
         self.assertIn("not seeding compliance-audit in acme/fleet", self.logged[-1])
 
+    def test_a_stream_refused_with_409_is_left_unmarked(self):
+        """A 409 on a run write is the listener refusing the stream (a symlink,
+        a full directory), not one entry: the seed stops with no marker rather
+        than skipping every entry and marking the history copied."""
+        directory = self.plant_local()
+        self.broker.refuse[("PUT", KEY)] = 409
+        store = self.store(str(self.local))
+        store.read_latest(AUDIT, REPO)
+        self.assertEqual(1, len(self.broker.calls("PUT")))
+        self.assertFalse((directory / report_status.SEED_MARKER_NAME).exists())
+        self.assertIn("not seeding compliance-audit in acme/fleet", self.logged[-1])
+
     def test_a_listing_seeds_every_local_stream(self):
         self.plant_local()
         self.plant_local(count=1, repo_dir=("acme", "other"))

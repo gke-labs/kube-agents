@@ -1151,9 +1151,16 @@ class BrokerReportStore(str):
                             f"(HTTP 403: a repository this install does not register)"
                         )
                         return
-                    if exc.status in (400, 409, 413) and not isinstance(exc, ReportStoreUnavailable):
-                        # This one entry: not JSON, too large, or stamped in
-                        # the future. The rest of the ring still copies.
+                    if exc.status == 409 and not isinstance(exc, ReportStoreUnavailable):
+                        # The listener's 409 on a run write is about the whole
+                        # stream (a symlink on its path, a full directory, an
+                        # oversized stored entry), not this entry: stop with no
+                        # marker, so a seed after the store is fixed copies it.
+                        self._log(f"report store: not seeding {label} into the broker: it refused runs/{name} ({exc})")
+                        return
+                    if exc.status in (400, 413) and not isinstance(exc, ReportStoreUnavailable):
+                        # This one entry: not JSON, stamped in the future (400),
+                        # or too large (413). The rest of the ring still copies.
                         self._log(f"report store: seeding {label}: skipped runs/{name} ({exc})")
                         continue
                     raise
