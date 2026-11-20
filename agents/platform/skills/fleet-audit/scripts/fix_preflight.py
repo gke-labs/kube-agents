@@ -13,8 +13,8 @@ the pull request still opens, for a person to review. The answer is rendered
 into the body (`render_section`, one section and marker for every recipe) and
 carried in a hidden marker the auto-merge path reads.
 
-What the fix is (`change`) is per kind until the recipes' generators move into
-`fix.py`. For `no-pdb` only the budget `finish` generates is considered
+What the fix is (`change`) is per kind (`CHANGES`). For `no-pdb` only the
+budget `finish` generates is considered
 (`budget_from_text`, then byte for byte against `audit_report._pdb_manifest`):
 one `policy/v1` document in the finding's namespace with `maxUnavailable: 1`
 and a selector, and nothing else in the file.
@@ -41,7 +41,7 @@ from types import SimpleNamespace
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import recheck
+import recheck  # first: through audit_report, it puts the shared scripts directory on the path
 from fix_recipes import registry
 
 SECTION_HEADING = "## Safety checks"

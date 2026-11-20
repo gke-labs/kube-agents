@@ -26,8 +26,9 @@ A live budget whose selector this cannot read (an operator it does not know)
 counts as overlapping, where `collect.selector_matches` skips the unknown
 term: the stricter answer, for both callers.
 
-`fleet-audit/scripts/test_broker_checks_parity.py` holds the copied scope rules
-to the audit's own (`collect`). Stdlib only: the credential-proxy image ships
+`fleet-audit/scripts/test_broker_checks_parity.py` holds the copied scope
+rules, pod-template reach and autoscaler lookup to the audit's own (`collect`),
+case by case. Stdlib only: the credential-proxy image ships
 the scripts directory, this recipe's included, and nothing from the fleet-audit
 skill.
 """

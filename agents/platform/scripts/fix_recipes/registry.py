@@ -6,10 +6,11 @@ rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
 (`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
 A recipe's safety checks are its `checks.py`, which the broker's label gate
-loads through :func:`checks_module`.
+and the sandbox's pre-flight (`fleet-audit/scripts/fix_preflight.py`) both load
+through :func:`checks_module`.
 Those are the lists; the code that handles one kind's fix is still per kind
 (`automerge_eligibility.FIX_TYPE`, `post_merge_check.DIRECT_OBJECTS`,
-`audit_report.GENERATED_FIX_CHECK`, `recheck.RECHECKS`), so a recipe alone
+`audit_report.GENERATED_FIX_CHECK`, `recheck.RECHECKS`, `fix_preflight.CHANGES`), so a recipe alone
 gets a dial row and post-merge records but no broker label.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
