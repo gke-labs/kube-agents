@@ -29,8 +29,10 @@
 # errors.go, ObjectReconcileError; pkg/rootsync/conditions.go, SetStalled):
 # `Reconciling` True with the stage as its reason, and `Stalled` True with the
 # failed object's kind as its reason, its kind, key and kstatus in the message,
-# and the error summary for one error. The status names no cause, and the
-# fixture claims none.
+# and the error summary for one error. The conditions are a copy of a live
+# object: Config Sync v1.25.2 wrote them ten minutes after its reconciler
+# became unschedulable. The status names no cause, and the fixture claims
+# none.
 #
 # The spec is inert: a repository on a reserved `.invalid` host, no credential,
 # and a directory no repository holds, so nothing that matches a RootSync's
@@ -43,7 +45,8 @@
 # Isolation class: one namespace, the namespaced-plant module's, and one
 # cluster-scoped CRD with the module's guards: created only on a host that
 # serves none, labelled with this stack, removed by a failed plant, and
-# deleted on destroy only when it carries that label and no RootSync is left.
+# deleted on destroy only when it carries that label, still has this stack's
+# shape, and no RootSync is left.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -73,8 +76,12 @@ locals {
   stalled_stage     = "Setup"
   stalled_reason    = "Deployment"
   stalled_message   = "Deployment (${var.namespace}/${local.reconciler}) Failed: Progress deadline exceeded"
-  # One time for every condition field, as the operator stamps one write.
-  written_at = plantimestamp()
+  # The live object's own times: `Reconciling` was already True while the
+  # Deployment was in progress, so it keeps that earlier transition time; the
+  # rest carry the time of the Stalled write. No check reads them, and literal
+  # times keep a second plan from replacing the plant.
+  reconciling_since = "2026-11-20T20:56:06Z"
+  stalled_at        = "2026-11-20T21:18:23Z"
 
   manifest = <<-MANIFEST
     apiVersion: ${local.api_version}
@@ -99,8 +106,8 @@ locals {
           status: "True"
           reason: "${local.stalled_stage}"
           message: "${local.stalled_stage} stalled"
-          lastUpdateTime: "${local.written_at}"
-          lastTransitionTime: "${local.written_at}"
+          lastUpdateTime: "${local.stalled_at}"
+          lastTransitionTime: "${local.reconciling_since}"
         - type: Stalled
           status: "True"
           reason: "${local.stalled_reason}"
@@ -108,8 +115,8 @@ locals {
           errorSummary:
             totalCount: 1
             errorCountAfterTruncation: 1
-          lastUpdateTime: "${local.written_at}"
-          lastTransitionTime: "${local.written_at}"
+          lastUpdateTime: "${local.stalled_at}"
+          lastTransitionTime: "${local.stalled_at}"
   MANIFEST
 }
 

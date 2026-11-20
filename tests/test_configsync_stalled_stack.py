@@ -15,9 +15,11 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import yaml
@@ -44,8 +46,13 @@ _OTHER_STACK = "some-other-stack"
 _UPSTREAM_STALLED_MESSAGE = "Deployment (config-management-system/root-reconciler) Failed: Progress deadline exceeded"
 _SAFEGUARD_SOURCE = "audit-did-not-edit-the-rootsync-source"
 _SAFEGUARD_STATUS = "audit-did-not-clear-the-stalled-condition"
-_WRITTEN_AT = "2026-11-20T12:00:00Z"
 _SCRIPT_TIMEOUT_SECONDS = 60
+#: The signal test's waits: for the plant to reach `kubectl wait` (read off the
+#: stub's call log), and for the script to finish once signalled.
+_SIGNAL_REACH_DEADLINE_SECONDS = 20.0
+_SIGNAL_POLL_SECONDS = 0.05
+_SIGNAL_STUB_SLEEP_SECONDS = 3
+_SIGNAL_EXIT = 143
 
 
 def _local(name: str) -> str:
@@ -76,7 +83,8 @@ def _planted_manifest() -> dict:
         ("${local.stalled_stage}", _local("stalled_stage")),
         ("${local.stalled_reason}", _local("stalled_reason")),
         ("${local.stalled_message}", message),
-        ("${local.written_at}", _WRITTEN_AT),
+        ("${local.stalled_at}", _local("stalled_at")),
+        ("${local.reconciling_since}", _local("reconciling_since")),
     ):
         body = body.replace(placeholder, value)
     assert "${" not in body, body
@@ -116,20 +124,31 @@ class PlantedStatusTest(unittest.TestCase):
         # The operator's summary for one error rides the Stalled condition only.
         self.assertEqual(stalled["errorSummary"], {"totalCount": 1, "errorCountAfterTruncation": 1})
         self.assertNotIn("errorSummary", reconciling)
-        # One write, one time on every field.
-        stamps = {c[f] for c in status["conditions"] for f in ("lastUpdateTime", "lastTransitionTime")}
-        self.assertEqual(stamps, {_WRITTEN_AT})
+        # The live object's times: Reconciling was already True while the
+        # Deployment was in progress, so only its transition time is earlier.
+        stalled_at = _local("stalled_at")
+        self.assertEqual((stalled["lastUpdateTime"], stalled["lastTransitionTime"]), (stalled_at, stalled_at))
+        self.assertEqual(reconciling["lastUpdateTime"], stalled_at)
+        self.assertLess(reconciling["lastTransitionTime"], stalled_at)
+        # Literal times: a time taken at plan would replace the plant on every plan.
+        self.assertNotIn("timestamp()", _MAIN.read_text())
         stack = _MAIN.read_text()
         # The reconciler of `root-sync` has no suffix; any other sync's has its name.
         self.assertRegex(stack, "default_sync_name" + _ASSIGN + '"root-sync"')
         self.assertNotIn("OOMKilled", stack)
 
     def test_the_object_and_its_status_go_in_one_create(self):
-        # A kind with a status subresource drops `status` on create, and the
-        # suite's rule keeps a namespace-scoped plant to its manifest.
-        self.assertNotIn("subresources", _CRD_SCRIPT.read_text())
+        # The suite's rule keeps a namespace-scoped plant to its manifest, so
+        # nothing runs after the module. (The CRD the script creates has no
+        # status subresource, which would drop `status` on create: CrdScriptTest.)
         resources = re.findall(r'^(?:resource|module) "[^\n]+', _MAIN.read_text(), re.MULTILINE)
         self.assertEqual(resources, ['resource "null_resource" "crd" {', 'module "plant" {'])
+
+    def test_the_planted_object_carries_this_stacks_label(self):
+        # The CRD script tells this stack's RootSync from another owner's by
+        # this label, before it deletes a leftover CRD with everything in it.
+        labels = _planted_manifest()["metadata"]["labels"]
+        self.assertEqual(labels, {"managed-by": "kube-agents-bench", "created-by-stack": _CASE})
 
 
 #: `kubectl` records every invocation to $CALLS, with stdin appended for the
@@ -138,22 +157,26 @@ class PlantedStatusTest(unittest.TestCase):
 #: "<name>/<label>" for a present one; once the create was sent the read
 #: prints CRD_OWNER_AFTER_CREATE (default: this stack's CRD, stored), so a
 #: create the API server refused is distinct from one that failed after the
-#: object existed. FOREIGN_OBJECTS and LEFT_OBJECTS are what the two object
-#: lists print.
+#: object existed. CRD_SUBRESOURCES is what the shape read prints. The object
+#: list answers FOREIGN_OBJECTS only to the selector that excludes this
+#: stack's label, and OWN_OBJECTS to any other selector, so a wrong selector
+#: reads as "nothing foreign here". LEFT_OBJECTS is the destroy's list.
 _KUBECTL_STUB = """#!/bin/bash
 echo "kubectl $*" >> "$CALLS"
 case "$*" in
+  *"get crd"*"subresources"*) printf '%s' "${CRD_SUBRESOURCES-}"; exit 0 ;;
   *"get crd"*--ignore-not-found*)
     if [ "${CRD_READ_RC:-0}" != "0" ]; then echo "Unable to connect to the server" >&2; exit "$CRD_READ_RC"; fi
     if grep -q "kind: CustomResourceDefinition" "$CALLS"; then printf '%s' "${CRD_OWNER_AFTER_CREATE-rootsyncs.configsync.gke.io/$RC_STACK}"; exit 0; fi
     printf '%s' "${CRD_OWNER_OUT-}"; exit 0 ;;
-  *"get rootsyncs.configsync.gke.io --all-namespaces -l"*) printf '%s' "${FOREIGN_OBJECTS-}"; exit 0 ;;
+  *"get rootsyncs.configsync.gke.io --all-namespaces -l created-by-stack!=$RC_STACK -o name") printf '%s' "${FOREIGN_OBJECTS-}"; exit 0 ;;
+  *"get rootsyncs.configsync.gke.io --all-namespaces -l"*) printf '%s' "${OWN_OBJECTS-}"; exit 0 ;;
   *"get rootsyncs.configsync.gke.io --all-namespaces -o name"*) printf '%s' "${LEFT_OBJECTS-}"; exit 0 ;;
   *"delete crd"*) exit "${CRD_DELETE_RC:-0}" ;;
   *"create -f -"*)
     echo "stdin: $(cat | tr '\\n' ' ')" >> "$CALLS"
     exit "${CRD_CREATE_RC:-0}" ;;
-  *"wait --for condition=established"*) exit "${CRD_WAIT_RC:-0}" ;;
+  *"wait --for condition=established"*) /bin/sleep "${CRD_WAIT_SLEEP:-0}"; exit "${CRD_WAIT_RC:-0}" ;;
   *) exit 0 ;;
 esac
 """
@@ -213,6 +236,8 @@ class CrdScriptTest(unittest.TestCase):
         self.assertIn("kind: RootSync", created)
         self.assertNotIn("RepoSync", created)
         self.assertIn("x-kubernetes-preserve-unknown-fields: true", created)
+        # No status subresource: one create must keep the object's status.
+        self.assertNotIn("subresources", created)
         self.assertIn('managed-by: "kube-agents-bench"', created)
         self.assertIn(f'created-by-stack: "{_CASE}"', created)
         # Label values are quoted: on the lane the build id is an integer.
@@ -232,11 +257,63 @@ class CrdScriptTest(unittest.TestCase):
                 self.assertEqual(self._kubectl(calls, "create -f -"), [])
 
     def test_this_stacks_leftover_is_deleted_before_the_create(self):
-        done, calls = self._run("plant", CRD_OWNER_OUT=f"{_CRD}/{_CASE}")
+        done, calls = self._run("plant", CRD_OWNER_OUT=f"{_CRD}/{_CASE}", OWN_OBJECTS="rootsync.configsync.gke.io/root-sync")
         self.assertEqual(done.returncode, 0, done.stderr)
-        delete = calls.index(self._kubectl(calls, "delete crd")[0])
-        create = calls.index(self._kubectl(calls, "create -f -")[0])
-        self.assertLess(delete, create)
+        (deleted,) = self._kubectl(calls, "delete crd")
+        # Waited for: the create must not meet a CRD that is still terminating.
+        self.assertIn("--wait=true", deleted)
+        self.assertLess(calls.index(deleted), calls.index(self._kubectl(calls, "create -f -")[0]))
+        # The foreign-object list excludes this stack's label and nothing else.
+        self.assertEqual(
+            self._kubectl(calls, "--all-namespaces -l"),
+            [f"kubectl get {_CRD} --all-namespaces -l created-by-stack!={_CASE} -o name"],
+        )
+
+    def test_a_labelled_crd_that_serves_a_subresource_is_the_products_and_is_never_touched(self):
+        # A Config Sync install applied over a leftover keeps the label it does not own.
+        for verb in ("plant", "destroy"):
+            with self.subTest(verb=verb):
+                if self._calls.exists():
+                    self._calls.unlink()
+                done, calls = self._run(verb, CRD_OWNER_OUT=f"{_CRD}/{_CASE}", CRD_SUBRESOURCES='{"status":{}}')
+                self.assertEqual(done.returncode == 0, verb == "destroy", done.stderr)
+                self.assertEqual(self._kubectl(calls, "delete crd"), [])
+                self.assertEqual(self._kubectl(calls, "create -f -"), [])
+
+    def test_a_missing_input_stops_before_any_cluster_call(self):
+        for verb, name in (("plant", "RC_BUILD_ID"), ("plant", "RC_STACK"), ("destroy", "RC_HOST_CLUSTER")):
+            with self.subTest(verb=verb, name=name):
+                if self._calls.exists():
+                    self._calls.unlink()
+                done, calls = self._run(verb, **{name: ""})
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn(name, done.stderr)
+                self.assertEqual(calls, [])
+
+    def test_a_signal_after_the_create_removes_the_crd_and_exits_with_the_signal_code(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("RC_")}
+        env.update(_BASE_ENV)
+        env.update(
+            {
+                "CALLS": str(self._calls),
+                "PATH": f"{self._stub_dir}{os.pathsep}{env['PATH']}",
+                "CRD_WAIT_SLEEP": str(_SIGNAL_STUB_SLEEP_SECONDS),
+            }
+        )
+        proc = subprocess.Popen(["bash", str(_CRD_SCRIPT), "plant"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + _SIGNAL_REACH_DEADLINE_SECONDS
+        while time.monotonic() < deadline:
+            if self._calls.exists() and "wait --for condition=established" in self._calls.read_text():
+                break
+            time.sleep(_SIGNAL_POLL_SECONDS)
+        else:
+            proc.kill()
+            self.fail("the plant never reached kubectl wait")
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=_SCRIPT_TIMEOUT_SECONDS)
+        self.assertEqual(proc.returncode, _SIGNAL_EXIT)
+        calls = self._calls.read_text().splitlines()
+        self.assertEqual(len(self._kubectl(calls, "delete crd")), 1)
 
     def test_a_leftover_that_holds_someone_elses_rootsync_is_not_deleted(self):
         # Deleting a CRD deletes every object of its kind.
@@ -295,6 +372,31 @@ class CrdScriptTest(unittest.TestCase):
         self.assertRegex(stack, "crd_script" + _ASSIGN + re.escape('"${path.module}/rootsync_crd.sh"'))
         self.assertIn("bash '${local.crd_script}' plant", stack)
         self.assertIn('bash \\"$RC_SCRIPT\\" destroy', stack)
+
+    def test_the_stack_hands_each_verb_every_input_the_script_requires(self):
+        stack = _MAIN.read_text()
+        crd = stack[stack.index('resource "null_resource" "crd"') : stack.index('module "plant"')]
+        plant_block, destroy_block = crd.split("when        = destroy")
+        script = _CRD_SCRIPT.read_text()
+
+        def env_of(block):
+            body = block[block.index("environment = {") :]
+            return dict(re.findall(r"^\s*(RC_\w+)" + _ASSIGN + r"(.+)$", body[: body.index("\n    }")], re.MULTILINE))
+
+        def required(function):
+            body = script[script.index(f"{function}() {{") :]
+            return set(re.findall(r"rc_require (RC_\w+)", body[: body.index("\n}\n")]))
+
+        plant_env, destroy_env = env_of(plant_block), env_of(destroy_block)
+        self.assertLessEqual(required("rc_plant"), set(plant_env))
+        self.assertLessEqual(required("rc_destroy"), set(destroy_env))
+        # A destroy provisioner may read only `self` and `path`.
+        self.assertEqual(destroy_env["RC_STACK"], "self.triggers.stack")
+        self.assertEqual(destroy_env["RC_HOST_CLUSTER"], "self.triggers.host_cluster")
+        self.assertEqual(destroy_env["RC_HOST_LOCATION"], "self.triggers.host_location")
+        self.assertEqual(destroy_env["RC_PROJECT"], "self.triggers.host_project")
+        self.assertEqual(destroy_env["RC_SCRIPT"], '"${path.module}/rootsync_crd.sh"')
+        self.assertEqual(plant_env["RC_STACK"], "local.stack")
 
 
 class CaseBindingTest(unittest.TestCase):

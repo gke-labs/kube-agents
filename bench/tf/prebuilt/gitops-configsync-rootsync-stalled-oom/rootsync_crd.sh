@@ -19,8 +19,9 @@
 # (bench/README.md, "Validated Capabilities suite", rule 6): one ownership read
 # that never takes an error for "absent", a pre-clear that removes this
 # stack's leftover and stops on a foreign owner, `create` and never `apply`,
-# a failed plant that removes what it created, and a destroy that acts on
-# the label match alone. Inputs arrive as RC_* variables from main.tf beside
+# a failed plant that removes what it created, and a destroy that deletes
+# only this stack's own CRD, and only when no RootSync is left. Inputs arrive
+# as RC_* variables from main.tf beside
 # this file. Run against stub kubectl and gcloud by
 # tests/test_configsync_stalled_stack.py.
 set -euo pipefail
@@ -60,6 +61,14 @@ rc_credentials() {
 rc_owner() {
   kubectl get crd "$RC_CRD" --ignore-not-found \
     -o jsonpath="{.metadata.name}/{.metadata.labels.${RC_LABEL_OWNER}}"
+}
+
+# What tells this stack's CRD from a Config Sync CRD that was applied over a
+# leftover and kept its label: the product's serves a status subresource,
+# this one none. Prints the subresources of every version; "" for this
+# stack's shape.
+rc_subresources() {
+  kubectl get crd "$RC_CRD" --ignore-not-found -o jsonpath='{.spec.versions[*].subresources}'
 }
 
 # The RootSyncs this stack did not create, by name. Deleting a CRD deletes
@@ -106,6 +115,10 @@ rc_plant() {
   if [ -n "$owner" ]; then
     if [ "${owner#*/}" != "$RC_STACK" ]; then
       echo "ERROR: $RC_CRD is already served on $RC_HOST_CLUSTER and was not installed by this stack ($RC_LABEL_OWNER='${owner#*/}'); it will not be touched. A host that runs Config Sync cannot take this plant." >&2
+      exit 1
+    fi
+    if [ -n "$(rc_subresources)" ]; then
+      echo "ERROR: $RC_CRD carries this stack's label and is not this stack's CRD (it serves a subresource): a Config Sync install wrote over a leftover. It will not be touched." >&2
       exit 1
     fi
     local foreign
@@ -173,6 +186,10 @@ rc_destroy() {
     echo "$RC_CRD was not installed by this stack ($RC_LABEL_OWNER='${owner#*/}'); leaving it in place."
     return 0
   fi
+  if [ -n "$(rc_subresources)" ]; then
+    echo "$RC_CRD carries this stack's label and is not this stack's CRD (it serves a subresource); leaving it in place."
+    return 0
+  fi
   # The namespace is deleted without waiting, so its RootSync can outlive the
   # module's destroy by a little; wait for it before the CRD goes.
   local left="" attempt=0
@@ -183,7 +200,7 @@ rc_destroy() {
     sleep "$RC_DRAIN_INTERVAL_S"
   done
   if [ -n "$left" ]; then
-    echo "WARNING: RootSyncs remain on $RC_HOST_CLUSTER ($left); $RC_CRD left in place. The next plant clears it." >&2
+    echo "WARNING: RootSyncs remain on $RC_HOST_CLUSTER ($left); $RC_CRD left in place. The next plant clears it when they are this stack's own." >&2
     return 0
   fi
   kubectl delete crd "$RC_CRD" --ignore-not-found

@@ -13,15 +13,18 @@
 # progress at all (a pod that cannot be scheduled, an image that cannot be
 # pulled). The status names no cause, and the fixture plants none.
 #
-# The status is a copy of a live object: Config Sync v1.25.2 on a Standard
-# cluster wrote these conditions, field for field, ten minutes after its
-# reconciler became unschedulable.
+# The conditions are a copy of a live object: Config Sync v1.25.2 on a
+# Standard cluster wrote them, field for field, ten minutes after its
+# reconciler became unschedulable. The live object's other status blocks
+# (source, rendering, sync) are not planted; the check does not read them.
 #
 # What the case does not cover, by the same live test: a reconciler that is
-# OOM-killed in a loop. Each restart counts as progress, so that RootSync
-# reports `Reconciling` True with reason `Deployment` ("InProgress: Available:
-# 0/1") and no `Stalled` condition, and check 2.17 does not read `Reconciling`
-# alone. The scenario's name says "oom"; this case validates its stalled half.
+# OOM-killed in a loop from its start. Each restart counts as progress, so in
+# the 11 minutes tested that RootSync reported `Reconciling` True with reason
+# `Deployment` ("InProgress: Available: 0/1"), `Stalled` was not True, and
+# check 2.17 does not read `Reconciling` alone. Not tested: a reconciler that
+# worked and then runs out of memory, and one blocked by an admission webhook.
+# The scenario's name says "oom"; this case validates its stalled half.
 #
 # The object is planted for one run. A run stopped between plant and removal
 # leaves it on the host until this stack's next plant clears it, and a
