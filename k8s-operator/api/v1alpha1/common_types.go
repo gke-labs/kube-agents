@@ -3024,6 +3024,24 @@ type AgentStatus struct {
 	// picked up within a day.
 	// +optional
 	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
+
+	// InferenceKeys records the inference gateway key Secrets the operator
+	// created. Absent until it creates one, and while the served CRD predates
+	// the field, in which case the operator creates none.
+	// +optional
+	InferenceKeys *InferenceKeysStatus `json:"inferenceKeys,omitempty"`
+}
+
+// InferenceKeysStatus records the inference gateway caller-key Secrets, the
+// probe key Secret and the litellm-caller-keys map Secret the operator
+// created, by name and UID. The operator uses a Secret at one of those names
+// only when its UID is the one recorded here; it holds no key and no digest.
+type InferenceKeysStatus struct {
+	// SecretUIDs maps each such Secret's name to the UID it was created with.
+	// A tier key's Secret is in the profile namespace; every other one is in
+	// the PlatformAgent's namespace.
+	// +optional
+	SecretUIDs map[string]string `json:"secretUIDs,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was

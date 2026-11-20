@@ -1,6 +1,6 @@
 """The operator's `secrets` grant, and the ceiling on it.
 
-Five callers need a Secret verb on the manager role, and the grant is split in
+Six callers need a Secret verb on the manager role, and the grant is split in
 two documents of `role.yaml` by what they do:
 
 - `checkShellSandboxKeys` needs `get`. It asks whether the sandbox's
@@ -26,12 +26,20 @@ two documents of `role.yaml` by what they do:
   operator generates the NATS credential Secret once and repairs a missing key,
   renders the config Secret, and deletes the config Secret on the way back to
   `today`; all of them are owner-referenced to the `PlatformAgent`.
+- `reconcileInferenceKeys` needs `create`/`update`/`delete`. It creates each
+  inference gateway caller class's key Secret, and the gateway probe key's,
+  once, repairs one that holds no well-formed key, and writes the
+  `litellm-caller-keys` digest map, in the install namespace and
+  owner-referenced; a profile tier's key Secret is in the
+  profile namespace, carries the agent's labels instead, and is deleted when no
+  bound profile lists the tier.
 
 The three read verbs are the ClusterRole document: they are held cluster-wide
 because the agent's audit ClusterRole grants them and the API server refuses a
 grant the grantor does not hold. The four write verbs are the namespaced `Role`
 document: every write names a Secret in the namespace of the PlatformAgent
-being reconciled, so the `+kubebuilder:rbac` marker carries `namespace=`,
+being reconciled or in its profile namespace, so the `+kubebuilder:rbac` marker
+carries `namespace=`,
 controller-gen renders it as the second document in `role.yaml`, and the
 ClusterRole document carries no Secret write verb. That shape is what this file
 pins. A write verb that reappears in the ClusterRole is write of every Secret on
