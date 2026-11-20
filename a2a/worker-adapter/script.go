@@ -383,6 +383,12 @@ func killSession(procRoot string, sid int) {
 // sessionMembers is every live (not zombie) process procRoot lists whose
 // /proc/<pid>/stat session field (the sixth) is sid.
 func sessionMembers(procRoot string, sid int) []int {
+	// Reads are scoped to procRoot (os.Root), so a name can't lead outside it.
+	root, err := os.OpenRoot(procRoot)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = root.Close() }()
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
 		return nil
@@ -393,7 +399,7 @@ func sessionMembers(procRoot string, sid int) []int {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "stat"))
+		b, err := root.ReadFile(filepath.Join(e.Name(), "stat"))
 		if err != nil {
 			continue // it exited
 		}
