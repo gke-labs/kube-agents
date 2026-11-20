@@ -52,24 +52,34 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(result.target_family, "n4")
 
         by_rule = {b.rule: b for b in result.blockers}
-        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, by_rule)
-        self.assertIn(preflight.RULE_SHIELDED_VTPM_DISABLED, by_rule)
-        self.assertIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, by_rule)
-        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, by_rule)
         self.assertIn(preflight.RULE_DISK_PD_ON_HYPERDISK_ONLY, by_rule)
         self.assertIn(preflight.RULE_LSSD_UNSUPPORTED_ON_N4, by_rule)
+
+        warnings_by_rule = {w.rule: w for w in result.warnings}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, warnings_by_rule)
+        self.assertIn(preflight.RULE_SHIELDED_VTPM_DISABLED, warnings_by_rule)
+        self.assertIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, warnings_by_rule)
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, warnings_by_rule)
         # Remediation for vTPM must not hallucinate an enableVtpm field in ComputeClass/NodePool YAML.
         self.assertNotIn(
             "enableVtpm: true",
-            by_rule[preflight.RULE_SHIELDED_VTPM_DISABLED].remediation,
+            warnings_by_rule[preflight.RULE_SHIELDED_VTPM_DISABLED].remediation,
         )
         self.assertIn(
             "does not accept an enableVtpm field",
-            by_rule[preflight.RULE_SHIELDED_VTPM_DISABLED].remediation,
+            warnings_by_rule[preflight.RULE_SHIELDED_VTPM_DISABLED].remediation,
+        )
+        self.assertNotIn(
+            "requires Shielded GKE Nodes",
+            warnings_by_rule[preflight.RULE_SHIELDED_NODES_DISABLED].message,
+        )
+        self.assertNotIn(
+            "requires Shielded VM vTPM",
+            warnings_by_rule[preflight.RULE_SHIELDED_VTPM_DISABLED].message,
         )
 
     def test_proto3_omitted_false_booleans_for_shielded_nodes_and_shielded_instance_config(self):
-        """GKE Proto3 JSON omits false booleans in shieldedNodes and shieldedInstanceConfig."""
+        """GKE Proto3 JSON omits false booleans in shieldedNodes and shieldedInstanceConfig and reports them as warnings."""
         # Proto3 cluster with disabled Shielded Nodes serializes `"shieldedNodes": {}`,
         # and a pool with Secure Boot off and Integrity Monitoring on serializes
         # `"shieldedInstanceConfig": {"enableIntegrityMonitoring": true}`.
@@ -92,8 +102,9 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             "n4",
             cluster=cluster_proto3,
         )
-        self.assertFalse(res_a.compatible)
-        rules_a = {b.rule for b in res_a.blockers}
+        self.assertTrue(res_a.compatible)
+        self.assertEqual(res_a.blockers, ())
+        rules_a = {w.rule for w in res_a.warnings}
         self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, rules_a)
         self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, rules_a)
         self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, rules_a)
@@ -114,11 +125,50 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             "n4",
             cluster=cluster_tf,
         )
-        self.assertFalse(res_b.compatible)
-        rules_b = {b.rule for b in res_b.blockers}
+        self.assertTrue(res_b.compatible)
+        self.assertEqual(res_b.blockers, ())
+        rules_b = {w.rule for w in res_b.warnings}
         self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, rules_b)
         self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, rules_b)
         self.assertIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, rules_b)
+
+    def test_default_gke_pool_shape_to_n2_is_compatible(self):
+        """A default GKE e2-standard-4 pool (Secure Boot disabled by default) migrating to n2 is COMPATIBLE."""
+        default_pool = {
+            "name": "default-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "e2-standard-4",
+                "diskType": "pd-balanced",
+                "imageType": "COS_CONTAINERD",
+                "shieldedInstanceConfig": {
+                    "enableIntegrityMonitoring": True,
+                },
+            },
+        }
+        res = preflight.evaluate_node_pool_transition(default_pool, "n2")
+        self.assertTrue(res.compatible)
+        self.assertEqual(res.status, "compatible")
+        self.assertEqual(res.blockers, ())
+        self.assertEqual(
+            {w.rule for w in res.warnings},
+            {preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED},
+        )
+
+        stdout_buf = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf):
+            rc = preflight.main(
+                [
+                    "--node-pool-json",
+                    json.dumps(default_pool),
+                    "--target-family",
+                    "n2",
+                ]
+            )
+        self.assertEqual(rc, preflight.EXIT_OK)
+        rendered = stdout_buf.getvalue()
+        self.assertIn(preflight.VERDICT_COMPATIBLE, rendered)
+        self.assertNotIn(preflight.PREFLIGHT_STOP_LINE, rendered)
 
     def test_compatible_n2_to_n4_with_hyperdisk_and_shielded_defaults_passes(self):
         """A clean pool meeting version, disk, and security requirements passes on N4."""
@@ -153,7 +203,7 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(result.warnings, ())
 
     def test_confidential_vm_rejected_on_non_confidential_families_n2_n4_c4(self):
-        """Confidential GKE Nodes are rejected on n2, n4, and c4, while pool enabled=false overrides cluster."""
+        """Confidential GKE Nodes are rejected on n2 and n4; c4 requires Intel TDX on c4-standard-* shapes; pool enabled=false overrides cluster."""
         pool = {
             "name": "cvm-pool",
             "version": "1.35.3-gke.1290000",
@@ -166,12 +216,45 @@ class MachineFamilyPreflightTests(unittest.TestCase):
                 },
             },
         }
-        for target in ("n2", "n4", "c4"):
+        for target in ("n2", "n4"):
             with self.subTest(target=target):
                 res = preflight.evaluate_node_pool_transition(pool, target)
                 self.assertFalse(res.compatible)
                 rules = {b.rule for b in res.blockers}
                 self.assertIn(preflight.RULE_CVM_UNSUPPORTED_FAMILY, rules)
+
+        # AMD SEV targeting c4 fails with technology mismatch (c4 supports Intel TDX).
+        sev_on_c4 = preflight.evaluate_node_pool_transition(pool, "c4")
+        self.assertFalse(sev_on_c4.compatible)
+        self.assertIn(
+            preflight.RULE_CVM_TECHNOLOGY_MISMATCH,
+            {b.rule for b in sev_on_c4.blockers},
+        )
+
+        # Intel TDX on c3-standard-8 targeting c4 or c4-standard-8 is compatible, while non-c4-standard-* or -lssd shapes are rejected.
+        tdx_pool = {
+            "name": "tdx-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "c3-standard-8",
+                "diskType": "hyperdisk-balanced",
+                "confidentialNodes": {"enabled": True},
+            },
+        }
+        self.assertTrue(
+            preflight.evaluate_node_pool_transition(tdx_pool, "c4-standard-8").compatible
+        )
+        for bad_c4_shape in ("c4-highcpu-8", "c4-standard-8-lssd"):
+            with self.subTest(bad_c4_shape=bad_c4_shape):
+                bad_c4_res = preflight.evaluate_node_pool_transition(
+                    tdx_pool,
+                    bad_c4_shape,
+                )
+                self.assertFalse(bad_c4_res.compatible)
+                self.assertIn(
+                    preflight.RULE_CVM_TECHNOLOGY_MISMATCH,
+                    {b.rule for b in bad_c4_res.blockers},
+                )
 
         # A pool explicitly setting confidentialNodes.enabled=false on a CVM cluster is not blocked on n4.
         cvm_cluster = {
@@ -686,7 +769,8 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(code_wrap, preflight.EXIT_INCOMPATIBLE)
         self.assertEqual(report_wrap["cluster"], "wrapped-cluster")
         wrap_rules = {b["rule"] for b in report_wrap["results"][0]["blockers"]}
-        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, wrap_rules)
+        wrap_warnings = {w["rule"] for w in report_wrap["results"][0]["warnings"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, wrap_warnings)
         self.assertIn(preflight.RULE_DISK_PD_ON_HYPERDISK_ONLY, wrap_rules)
 
         # 3. Terraform state / .tf.json node pool with 1-element list node_config and shielded_instance_config.
@@ -715,13 +799,14 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         tf_row = report_tf["results"][0]
         self.assertEqual(tf_row["source_machine_type"], "n1-standard-8")
         tf_rules = {b["rule"] for b in tf_row["blockers"]}
-        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, tf_rules)
+        tf_warnings = {w["rule"] for w in tf_row["warnings"]}
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, tf_warnings)
         self.assertIn(preflight.RULE_DISK_PD_ON_HYPERDISK_ONLY, tf_rules)
         self.assertIn(preflight.RULE_LSSD_UNSUPPORTED_ON_N4, tf_rules)
-        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, tf_rules)
+        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, tf_warnings)
 
     def test_shielded_instance_config_schema_distinction_kcc_terraform_vs_gke_proto3(self):
-        """KCC and Terraform manifests default omitted enableIntegrityMonitoring to true; GKE Proto3 flags omitted false even with enableVtpm."""
+        """KCC and Terraform manifests default omitted enableIntegrityMonitoring to true; omitted enableSecureBoot is a warning, not a blocker."""
         # Hand-written KCC ContainerNodePool with enableSecureBoot: true and omitted enableIntegrityMonitoring.
         kcc_pool = {
             "spec": {
@@ -735,6 +820,7 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         kcc_res = preflight.evaluate_node_pool_transition(kcc_pool, "n4")
         self.assertTrue(kcc_res.compatible)
         self.assertEqual(kcc_res.blockers, ())
+        self.assertEqual(kcc_res.warnings, ())
 
         # GKE describe pool carrying enableVtpm: true and enableIntegrityMonitoring: true but omitting enableSecureBoot.
         gke_pool_with_vtpm = {
@@ -749,13 +835,14 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             },
         }
         gke_res = preflight.evaluate_node_pool_transition(gke_pool_with_vtpm, "n4")
-        self.assertFalse(gke_res.compatible)
-        gke_rules = {b.rule for b in gke_res.blockers}
-        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, gke_rules)
-        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, gke_rules)
+        self.assertTrue(gke_res.compatible)
+        self.assertEqual(gke_res.blockers, ())
+        gke_warnings = {w.rule for w in gke_res.warnings}
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, gke_warnings)
+        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, gke_warnings)
 
         # KCC and Terraform manifests that declare shieldedInstanceConfig but omit enableSecureBoot
-        # (which defaults to false in KCC and Terraform) must trigger shielded-secure-boot-disabled
+        # (which defaults to false in KCC and Terraform) emit shielded-secure-boot-disabled as a warning
         # without triggering shielded-integrity-monitoring-disabled.
         kcc_omitted_secure_boot = {
             "spec": {
@@ -770,9 +857,10 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             kcc_omitted_secure_boot,
             "n4",
         )
-        self.assertFalse(kcc_no_sb_res.compatible)
+        self.assertTrue(kcc_no_sb_res.compatible)
+        self.assertEqual(kcc_no_sb_res.blockers, ())
         self.assertEqual(
-            {b.rule for b in kcc_no_sb_res.blockers},
+            {w.rule for w in kcc_no_sb_res.warnings},
             {preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED},
         )
 
@@ -792,9 +880,10 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             tf_omitted_secure_boot,
             "n4",
         )
-        self.assertFalse(tf_no_sb_res.compatible)
+        self.assertTrue(tf_no_sb_res.compatible)
+        self.assertEqual(tf_no_sb_res.blockers, ())
         self.assertEqual(
-            {b.rule for b in tf_no_sb_res.blockers},
+            {w.rule for w in tf_no_sb_res.warnings},
             {preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED},
         )
 
@@ -832,7 +921,8 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(code, preflight.EXIT_INCOMPATIBLE)
         self.assertEqual(report["control_plane_version"], "1.28.5-gke.1000000")
         rules = {b["rule"] for b in report["results"][0]["blockers"]}
-        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, rules)
+        warnings = {w["rule"] for w in report["results"][0]["warnings"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, warnings)
         self.assertIn(preflight.RULE_GKE_MASTER_VERSION_FLOOR, rules)
 
         # Partial live flags (--cluster without --location) alongside --node-pool-json fail closed.
@@ -1084,7 +1174,7 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(code_live_and_wrapper, preflight.EXIT_READ_ERROR)
 
     def test_cvm_pool_with_local_ssd_targeting_c3_reports_combined_conflict(self):
-        """A Confidential VM pool that also configures Local SSDs targeting c3 reports that TDX and Local SSDs cannot be combined."""
+        """Confidential VM on c3 rejects localNvmeSsdBlockConfig while allowing c3-standard-*-lssd with ephemeralStorageLocalSsdConfig."""
         cvm_lssd_pool = {
             "name": "cvm-lssd-pool",
             "version": "1.35.3-gke.1290000",
@@ -1107,7 +1197,31 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             and b.field == preflight.FIELD_MACHINE_TYPE
         ]
         self.assertEqual(len(machine_type_cvm_blockers), 1)
-        self.assertIn("cannot be combined on target family c3", machine_type_cvm_blockers[0].message)
+        self.assertIn(
+            preflight.FIELD_NVME_SSD_BLOCK,
+            machine_type_cvm_blockers[0].message,
+        )
+
+        # Intel TDX on c3-standard-8-lssd with ephemeralStorageLocalSsdConfig targeting c3-standard-8-lssd is compatible.
+        tdx_ephemeral_lssd_pool = {
+            "name": "tdx-ephemeral-lssd-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "c3-standard-8-lssd",
+                "diskType": "pd-balanced",
+                "ephemeralStorageLocalSsdConfig": {"localSsdCount": 2},
+                "confidentialNodes": {
+                    "enabled": True,
+                    "confidentialInstanceType": "TDX",
+                },
+            },
+        }
+        res_c3_lssd = preflight.evaluate_node_pool_transition(
+            tdx_ephemeral_lssd_pool,
+            "c3-standard-8-lssd",
+        )
+        self.assertTrue(res_c3_lssd.compatible)
+        self.assertEqual(res_c3_lssd.blockers, ())
 
     def test_kcc_container_cluster_and_terraform_cluster_fields_normalized(self):
         """Config Connector ContainerCluster spec fields and Terraform min_master_version/master_version are enforced at cluster level."""
@@ -1149,10 +1263,11 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(report_kcc["location"], "us-central1")
         self.assertEqual(report_kcc["control_plane_version"], "1.28.5-gke.1000000")
         kcc_rules = {b["rule"] for b in report_kcc["results"][0]["blockers"]}
-        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, kcc_rules)
-        self.assertIn(preflight.RULE_SHIELDED_VTPM_DISABLED, kcc_rules)
-        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, kcc_rules)
-        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, kcc_rules)
+        kcc_warnings = {w["rule"] for w in report_kcc["results"][0]["warnings"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, kcc_warnings)
+        self.assertIn(preflight.RULE_SHIELDED_VTPM_DISABLED, kcc_warnings)
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, kcc_warnings)
+        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, kcc_warnings)
         self.assertIn(preflight.RULE_CVM_UNSUPPORTED_FAMILY, kcc_rules)
         self.assertIn(preflight.RULE_GKE_MASTER_VERSION_FLOOR, kcc_rules)
 
@@ -1171,7 +1286,8 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(code_tf, preflight.EXIT_INCOMPATIBLE)
         self.assertEqual(report_tf["control_plane_version"], "1.28.5-gke.1000000")
         tf_rules = {b["rule"] for b in report_tf["results"][0]["blockers"]}
-        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, tf_rules)
+        tf_warnings = {w["rule"] for w in report_tf["results"][0]["warnings"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, tf_warnings)
         self.assertIn(preflight.RULE_GKE_MASTER_VERSION_FLOOR, tf_rules)
 
         tf_master_ver_cluster = {
