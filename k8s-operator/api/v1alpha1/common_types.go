@@ -2790,8 +2790,10 @@ type StorageStatus struct {
 	Bound bool `json:"bound,omitempty"`
 
 	// CapacityBytes is the size of the filesystem on the agent's data volume,
-	// as the gateway pod's event watcher last read it. Absent when the watcher
-	// is disabled or the operator has no current reading from it.
+	// as the gateway pod's event watcher last read it. Absent before the first
+	// poll, while the watcher is disabled, after two polls in a row with no
+	// fleet reading (including k8s_event_watcher_watch_set_ready below 1), or
+	// when a ready watcher answers without the volume metric.
 	// +optional
 	CapacityBytes *int64 `json:"capacityBytes,omitempty"`
 
@@ -3599,11 +3601,15 @@ type AgentUsageStatus struct {
 	// stands. A gauge, not a counter: it falls on a removal or after such a
 	// restart. Absent when the operator has no
 	// current reading: before the first poll, while the event watcher is
-	// disabled, and after two polls in a row in which no gateway replica
-	// could be read, whether its listener failed, its pod was not running, or
-	// the operator could not reach it; the CR's events and the gateway pod's
-	// state say which. A 0 is a reading: the watcher answered and exports no
-	// series.
+	// disabled, or after two polls in a row without a current fleet
+	// reading. That includes a listener failure, a pod not running, an
+	// unreachable gateway, or a restarting watcher still building its
+	// initial watch set (k8s_event_watcher_watch_set_ready below 1). Check
+	// the CR's events, the gateway pod's state, and the watcher's logs or
+	// k8s_event_watcher_watch_set_ready metric to see which applies; a
+	// startup hold writes no CR event. A 0 is a reading once k8s_event_watcher_watch_set_ready reaches 1, or from
+	// an older watcher without that gauge: the watcher answered with no
+	// cluster series.
 	// +optional
 	ClustersRegistered *int64 `json:"clustersRegistered,omitempty"`
 
@@ -3611,12 +3617,12 @@ type AgentUsageStatus struct {
 	// events: the k8s_event_watcher_cluster_up series at 1, whose informer
 	// has completed its initial list. The difference from ClustersRegistered
 	// is the number of clusters silently unwatched, a stuck informer, a 403
-	// on the events list, or a stopped one. A 0 is a reading, and the normal
-	// one while the watcher starts, so read a fall alongside the pod's age.
-	// Absent on the same terms as ClustersRegistered: one poll in which no
-	// gateway replica could be read leaves both where they were, and a
-	// second in a row clears both, because the operator then has no current
-	// reading and an absent field says so.
+	// on the events list, or a stopped one. Once the watch set is ready
+	// (k8s_event_watcher_watch_set_ready at 1), a 0 is a reading and normal
+	// until informers finish their initial list, so read a drop alongside
+	// the pod's age. Absent on the same terms as ClustersRegistered: one poll
+	// without a current fleet reading leaves both where they were, and two
+	// in a row clear both because the operator has no current reading.
 	// +optional
 	ClustersMonitored *int64 `json:"clustersMonitored,omitempty"`
 
