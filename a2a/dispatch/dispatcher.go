@@ -128,6 +128,10 @@ type holding struct {
 	// (#4685), and with no cluster at the unattended tier it is what makes
 	// that token a report credential (#5619).
 	trigger *taskcred.Trigger
+	// script is the helper script the task runs, resolved at admission from
+	// the profile's spec.scripts (#5622), nil for a model task. The confirm
+	// carries it.
+	script *lib.DispatchScript
 
 	// Guarded by Dispatcher.mu. pod is set from the offer on, so a pod
 	// with an offer out is busy before anything is written; confirmed is
@@ -869,6 +873,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.offeringWaiting(hk)
 	h.cluster, h.changeRequested = adm.cluster, adm.changeRequested
 	h.trigger = adm.trigger
+	h.script = adm.script
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the task goes to the (profile,
@@ -1268,7 +1273,7 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		// can't be minted (the pod's UID changed, or the signer failed)
 		// is an offer withdrawn, as a declined one is: nothing is
 		// written, and the next pod is tried.
-		confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}
+		confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID, Script: h.script}
 		if d.mint != nil {
 			var err error
 			confirm.TaskCredential, confirm.ProxyToken, err = d.taskCredentials(log, h, pod, uid, deadline)

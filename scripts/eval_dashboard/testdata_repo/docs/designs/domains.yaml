@@ -1,0 +1,4 @@
+# Synthetic domain list for scripts/test_eval_dashboard_collect.py.
+domains:
+  - slug: reliability
+allowlist: []

@@ -79,7 +79,7 @@ func TestEveryLiveTierHasItsOwnJobTemplate(t *testing.T) {
 			p.Annotations = map[string]string{drainingTiersAnnotation: fmt.Sprintf("%s=%d", agentv1alpha1.AgentProfileTierUnattended, until.Unix())}
 		}),
 	}
-	got := dispatchJobTemplates(agent, profiles, false)
+	got := dispatchJobTemplates(agent, profiles, false, "")
 	want := map[string][]string{
 		"reader":    {dispatchJobTierTemplatePrefix + "reader.read"},
 		"tse":       {dispatchJobTemplatePrefix + "tse", dispatchJobTierTemplatePrefix + "tse.read"},
@@ -98,7 +98,7 @@ func TestEveryLiveTierHasItsOwnJobTemplate(t *testing.T) {
 		}
 	}
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
-	if got := dispatchJobTemplates(agent, profiles, false); got != nil {
+	if got := dispatchJobTemplates(agent, profiles, false, ""); got != nil {
 		t.Errorf("without the policy signal: %v, want none", got)
 	}
 }
@@ -119,7 +119,7 @@ func TestNoTwoProfileTierPairsShareAParamName(t *testing.T) {
 	if x, y := dispatchJobParamName(&a, "b-c"), dispatchJobParamName(&ab, "c"); x == y {
 		t.Fatalf("(a, b-c) and (a-b, c) share the param %s", x)
 	}
-	got := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{a, ab}, false)
+	got := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{a, ab}, false, "")
 	if len(got["a"]) != 1 || len(got["a-b"]) != 1 {
 		t.Errorf("rendered a %v, a-b %v, want one template each", paramsOf(got["a"]), paramsOf(got["a-b"]))
 	}
@@ -133,7 +133,7 @@ func TestTheProfilesHashMovesWithAnyTiersTemplate(t *testing.T) {
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
 	p := unattendedProfile(agent, "tse")
-	before := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{p}, false)["tse"]
+	before := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{p}, false, "")["tse"]
 	read := dispatchJobTierTemplatePrefix + "tse.read"
 	changed := profileJobTemplates{}
 	for name, tmpl := range before {
@@ -143,7 +143,7 @@ func TestTheProfilesHashMovesWithAnyTiersTemplate(t *testing.T) {
 	if dispatchJobTemplatesHash(before) == dispatchJobTemplatesHash(changed) {
 		t.Error("a change to the read tier's template left the profile's hash as it was")
 	}
-	if dispatchJobTemplatesHash(before) != dispatchJobTemplatesHash(dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{p}, false)["tse"]) {
+	if dispatchJobTemplatesHash(before) != dispatchJobTemplatesHash(dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{p}, false, "")["tse"]) {
 		t.Error("the same rendering hashes differently twice")
 	}
 	if ref := dispatchJobTemplateRef("tse", before); ref == nil || !ref.PerTier || ref.Hash != dispatchJobTemplatesHash(before) {

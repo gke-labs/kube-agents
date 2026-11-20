@@ -373,7 +373,7 @@ func (m *migrationRig) snapshotKept() {
 		m.t.Fatal(err)
 	}
 	digests, _ := parseBusDigests(validDigests())
-	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(1)})
+	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(m.agent, 1)})
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}, Data: map[string][]byte{busMigrationRunKey: body}}
 	m.own(sec)
 	if err := m.cl.Create(ctx, sec); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -475,7 +475,7 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantDigests, _ := parseBusDigests(validDigests())
-	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
+	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(m.agent, 1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
 		t.Errorf("run Secret %+v, owners %v", run, secret.OwnerReferences)
 	}
 
@@ -872,8 +872,11 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 	shrinkBanned := []string{"SNAPSHOT", "RESTORE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE"}
 	snapshot := grant{busMigrationGrow, []string{"INFO", "SNAPSHOT"}, []string{"$JS.SNAPSHOT.ACK.%s.>"},
 		[]string{"RESTORE", "RESTORE-CHUNK", "UPDATE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
-	restore := grant{busMigrationGrow, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}, []string{"$JS.SNAPSHOT.RESTORE.%s.>"},
-		[]string{"SNAPSHOT", "ACK", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
+	// The restore reads consumers (names, info) and nothing else of theirs:
+	// CREATE, DELETE and the durable create stay out (checked below).
+	restore := grant{busMigrationGrow, []string{"INFO", "RESTORE", "UPDATE", "DELETE"},
+		[]string{"$JS.SNAPSHOT.RESTORE.%s.>", "$JS.API.CONSUMER.NAMES.%s", "$JS.API.CONSUMER.INFO.%s.*"},
+		[]string{"SNAPSHOT", "ACK", "PURGE", "CREATE", "DURABLE", "MSG.DELETE", "LEADER.STEPDOWN"}}
 	want := map[busMigrationPhase]grant{
 		busMigrationPinning:           {busMigrationShrink, []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}, nil, shrinkBanned},
 		busMigrationUnpinning:         {busMigrationShrink, []string{"INFO", "UPDATE"}, nil, shrinkBanned},
@@ -905,6 +908,20 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 			t.Errorf("%s publish:\n got %v\nwant %v", phase, id.publish, expected)
 		}
 		for _, p := range id.publish {
+			if strings.Contains(p, ".CONSUMER.") {
+				// Consumers are read only, by stream name: names and info.
+				// The consumer-name wildcard under one provisioned stream
+				// is the one wildcard allowed. Which phases hold it is
+				// pinned by the exact list above.
+				ok := false
+				for _, s := range a2aProvisionedStreams {
+					ok = ok || p == "$JS.API.CONSUMER.NAMES."+s || p == "$JS.API.CONSUMER.INFO."+s+".*"
+				}
+				if !ok {
+					t.Errorf("%s grants a consumer subject: %s", phase, p)
+				}
+				continue
+			}
 			if strings.HasSuffix(p, ".*") || strings.Contains(p, "STREAM.>") || p == "$JS.API.>" || strings.HasPrefix(p, "$JS.API.STREAM.*") ||
 				p == "$JS.SNAPSHOT.RESTORE.>" || p == "$JS.SNAPSHOT.ACK.>" || p == "$JS.SNAPSHOT.>" {
 				t.Errorf("%s: wildcard over stream names: %s", phase, p)
@@ -1378,7 +1395,7 @@ func provisionCreateLines(t *testing.T) map[string]map[string]string {
 // same streams, and every value the script passes on a policy field.
 func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 	lines := provisionCreateLines(t)
-	policies := a2aStreamPolicies(1)
+	policies := a2aStreamPolicies(a2aTestAgent(), 1)
 	var names []string
 	for _, p := range policies {
 		names = append(names, p.Name)
@@ -1427,7 +1444,7 @@ func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 			_, direct := f["allow-direct"]
 			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: strings.Split(f["subjects"], ","), Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
 				MaxBytes: num(f["max-bytes"], -1), MaxAge: dur(f["max-age"]), Discard: nats.DiscardOld, MaxMsgsPerSubject: num(f["max-msgs-per-subject"], -1),
-				AllowDirect: direct, Replicas: 1}
+				AllowDirect: direct, Replicas: 1, MaxConsumers: int(num(f["max-consumers"], 0))}
 		case "kv":
 			bucket := strings.TrimPrefix(p.Name, "KV_")
 			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: []string{"$KV." + bucket + ".>"}, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
@@ -1449,7 +1466,7 @@ func TestTheStreamPoliciesMatchAFreshInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(a2aTestAgent(), 1) {
 		ref, ok := fresh.Streams[p.Name]
 		if !ok {
 			t.Errorf("%s: not in the fresh-install reference; regenerate it", p.Name)
@@ -1571,7 +1588,7 @@ func TestTheSnapshotPhaseCreatesAOnePodStage(t *testing.T) {
 		t.Errorf("storage class %v owners %v", pvc.Spec.StorageClassName, pvc.OwnerReferences)
 	}
 	var caps int64
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(a2aTestAgent(), 1) {
 		caps += p.MaxBytes
 	}
 	got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
@@ -2849,6 +2866,86 @@ func TestAGivenUpShrinkClaimsNoFreezeOrRecreatedStreams(t *testing.T) {
 	agent.Status.BusMigration.Leg = string(busMigrationGrow)
 	if got := busMigrationFailedActions(agent); !strings.Contains(got, "recreated empty") {
 		t.Errorf("given-up grow says %q, want the recreated streams named", got)
+	}
+}
+
+// The restore's settle wait is named in the run's status and in a Normal
+// Event, once.
+func TestTheRestoreSettleTimeIsInStatusAndAnEvent(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(8)
+	m.r.Recorder = recorder
+	m.finishPod("restore", corev1.PodSucceeded, `{"settleSeconds":1.234}`, "")
+	m.pass(busMigrationReleasing, 3)
+	if got := m.agent.Status.BusMigration.SettleTime; got != "1.234s" {
+		t.Errorf("status settleTime %q, want 1.234s", got)
+	}
+	select {
+	case e := <-recorder.Events:
+		if !strings.Contains(e, "Normal BusMigrationSettled") || !strings.Contains(e, "1.234s") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Normal Event for the settle time")
+	}
+}
+
+// A failed restore's report that carries a settle time too (from a pod that
+// reports both) sets no settle time and no Normal Event: the run is turning
+// back, not settled. A second report doesn't overwrite a settle time.
+func TestAFailedRestoreRecordsNoSettleTime(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	recorder := record.NewFakeRecorder(8)
+	m.r.Recorder = recorder
+	m.finishPod("restore", corev1.PodFailed, `{"settleSeconds":2.5,"error":"stream DIRECTORY: not at R3 with its consumers after 5m0s: a follower is not current"}`, "")
+	m.pass(busMigrationClearing, 3)
+	if got := m.agent.Status.BusMigration.SettleTime; got != "" {
+		t.Errorf("status settleTime %q on a failed restore, want none", got)
+	}
+	for len(recorder.Events) > 0 {
+		if e := <-recorder.Events; strings.Contains(e, "BusMigrationSettled") {
+			t.Errorf("settle Event on a failed restore: %q", e)
+		}
+	}
+}
+
+func TestASettleTimeIsWrittenOnce(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(8)
+	m.r.Recorder = recorder
+	m.agent.Status.BusMigration.SettleTime = "1s"
+	m.finishPod("restore", corev1.PodSucceeded, `{"settleSeconds":9}`, "")
+	m.pass(busMigrationReleasing, 3)
+	if got := m.agent.Status.BusMigration.SettleTime; got != "1s" {
+		t.Errorf("status settleTime %q, want the first one kept", got)
+	}
+	for len(recorder.Events) > 0 {
+		if e := <-recorder.Events; strings.Contains(e, "BusMigrationSettled") {
+			t.Errorf("a second settle Event: %q", e)
+		}
+	}
+}
+
+// A restore whose streams never settle fails the restore: the run turns back
+// (Clearing, abandoning), the cause names the wait, and the staging claim and
+// run Secret are kept, as on any give-up after the forward clear (#4488).
+func TestARestoreThatNeverSettlesRollsBackKeepingTheStage(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	m.finishPod("restore", corev1.PodFailed, `{"error":"stream TASKS: not at R3 with its consumers after 5m0s: consumer worker not found on its leader"}`, "")
+	m.pass(busMigrationClearing, 3)
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "not at R3 with its consumers after 5m0s") {
+		t.Errorf("abandoning %v cause %q, want the settle timeout as the cause", run.Abandoning, run.Cause)
+	}
+	ctx := context.Background()
+	pvc := buildBusStagePVC(m.agent, run)
+	if err := m.cl.Get(ctx, client.ObjectKeyFromObject(pvc), pvc); err != nil || !pvc.DeletionTimestamp.IsZero() {
+		t.Errorf("staging claim after a settle timeout: %v (deleting %v), want it kept", err, pvc.DeletionTimestamp)
+	}
+	if err := m.cl.Get(ctx, client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationRunSecret(m.agent, "3-1")}, &corev1.Secret{}); err != nil {
+		t.Errorf("run Secret after a settle timeout: %v, want it kept", err)
 	}
 }
 

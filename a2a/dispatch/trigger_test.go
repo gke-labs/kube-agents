@@ -27,6 +27,20 @@ func triggeredEnv(t *testing.T, profile, taskID, capKey, trigger string, params 
 	return env
 }
 
+// scriptAdmission is triggerAdmission in Job mode: a Job runner, the
+// unattended tier, and a Job template, where a script can run.
+func scriptAdmission(t *testing.T) (*Dispatcher, *fakeVerifier, lib.DispatchConfig, lib.DispatchProfile, holdKey) {
+	t.Helper()
+	v := &fakeVerifier{}
+	d := &Dispatcher{cfg: testConfig(), verifier: v, verified: map[holdKey]permit{}, jobs: newFakeJobs(0), pool: NewStaticPool()}
+	prof := testProfile("tse", 1, "unattended")
+	// By reference, as the operator renders it; the inline form is
+	// TestAdmissionHandsAnInlineTemplatesScriptOn's.
+	prof.JobTemplateRef = &lib.DispatchJobTemplateRef{Name: "dispatch-job-tse", Hash: "h1"}
+	snap := lib.DispatchConfig{Namespace: "kubeagents-system", Profiles: []lib.DispatchProfile{prof}}
+	return d, v, snap, prof, holdKey{"tse", "unattended", lib.SubmitKindTop, "task-1"}
+}
+
 func triggerAdmission(t *testing.T) (*Dispatcher, *fakeVerifier, lib.DispatchConfig, lib.DispatchProfile, holdKey) {
 	t.Helper()
 	v := &fakeVerifier{}
@@ -307,7 +321,7 @@ func TestANullAuthorityIsRefusedAsNoCapability(t *testing.T) {
 // A script-run trigger (#5622) reaches the verifier and the task credential
 // whole, script included: the copy into the credential drops no field.
 func TestAdmissionCarriesTheTriggersScriptIntoTheCredential(t *testing.T) {
-	d, v, snap, prof, hk := triggerAdmission(t)
+	d, v, snap, prof, hk := scriptAdmission(t)
 	prof.Scripts = []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
 	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
 	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
@@ -321,6 +335,9 @@ func TestAdmissionCarriesTheTriggersScriptIntoTheCredential(t *testing.T) {
 	want := taskcred.Trigger{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}
 	if adm.trigger == nil || *adm.trigger != want {
 		t.Errorf("admission handed on trigger %+v; want %+v", adm.trigger, want)
+	}
+	if adm.script == nil || *adm.script != prof.Scripts[0] {
+		t.Errorf("admission handed on script %+v; want the profile's entry %+v", adm.script, prof.Scripts[0])
 	}
 }
 
@@ -351,5 +368,56 @@ func TestAdmissionRefusesAScriptTheProfileDoesNotAllowlist(t *testing.T) {
 	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scheduleTriggerJSON, clusterParams)}
 	if _, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now()); err != nil || ref != nil {
 		t.Fatalf("a trigger without a script: refusal %+v, err %v", ref, err)
+	}
+}
+
+// A script runs only in Job mode, where each task gets a pod of its own:
+// at a tier that isn't unattended, with no Job runner, or with no Job
+// template, a listed script is refused before the verifier is asked, even
+// where a pool pod could take the task (as one serving unattended can).
+func TestAdmissionRefusesAScriptOutsideJobMode(t *testing.T) {
+	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
+	listed := []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
+	for name, edit := range map[string]func(d *Dispatcher, prof *lib.DispatchProfile, hk *holdKey){
+		"read tier": func(_ *Dispatcher, prof *lib.DispatchProfile, hk *holdKey) {
+			prof.Tiers = []string{"read", "unattended"}
+			hk.tier = "read"
+		},
+		"no Job runner": func(d *Dispatcher, _ *lib.DispatchProfile, _ *holdKey) { d.jobs = nil },
+		"no Job template": func(_ *Dispatcher, prof *lib.DispatchProfile, _ *holdKey) {
+			prof.JobTemplate, prof.JobTemplateRef = nil, nil
+		},
+	} {
+		d, v, snap, prof, hk := scriptAdmission(t)
+		prof.Scripts = listed
+		pool := NewStaticPool()
+		pool.Set("tse", "unattended", "pool-pod-1")
+		d.pool = pool
+		edit(d, &prof, &hk)
+		snap.Profiles = []lib.DispatchProfile{prof}
+		del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
+		adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+		if err != nil || ref == nil || ref.reason != ReasonScriptNotAllowed || !strings.Contains(ref.detail, "Job mode") {
+			t.Errorf("%s: refusal %+v, err %v; want %s for Job mode", name, ref, err, ReasonScriptNotAllowed)
+		}
+		if adm.script != nil || len(v.triggerList()) != 0 {
+			t.Errorf("%s: admitted script %+v, verifier asked %d time(s)", name, adm.script, len(v.triggerList()))
+		}
+	}
+}
+
+// A profile whose config carries its Job template inline still runs scripts:
+// HasJobTemplate takes either form.
+func TestAdmissionHandsAnInlineTemplatesScriptOn(t *testing.T) {
+	d, _, snap, prof, hk := scriptAdmission(t)
+	prof.JobTemplateRef = nil
+	prof.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"worker"}]}}`)
+	prof.Scripts = []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
+	snap.Profiles = []lib.DispatchProfile{prof}
+	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
+	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
+	adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+	if err != nil || ref != nil || adm.script == nil || *adm.script != prof.Scripts[0] {
+		t.Fatalf("an inline template's script: admitted %+v, refusal %+v, err %v", adm.script, ref, err)
 	}
 }

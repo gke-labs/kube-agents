@@ -263,14 +263,14 @@ func TestTheRestorePodPicksItsRestoreByLeg(t *testing.T) {
 	ctx := context.Background()
 
 	start := time.Now()
-	if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); !errors.Is(err, ErrOverRenderedLimits) {
+	if _, _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); !errors.Is(err, ErrOverRenderedLimits) {
 		t.Fatalf("into three servers: %v, want ErrOverRenderedLimits", err)
 	}
 	if took := time.Since(start); took > 5*time.Second {
 		t.Errorf("the refusal took %v; it was retried", took)
 	}
 	for i := 1; i <= 2; i++ {
-		if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 1); err != nil {
+		if _, _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 1); err != nil {
 			t.Fatalf("into one server, run %d: %v", i, err)
 		}
 	}
@@ -308,7 +308,7 @@ func TestARestoreFreesANameHeldByAnUnfinishedRestore(t *testing.T) {
 	defer func() { restoreLog = os.Stderr }()
 
 	start := time.Now()
-	if _, err := restoreAll(context.Background(), nc, []string{"TASKS"}, dir, run, 1); err != nil {
+	if _, _, err := restoreAll(context.Background(), nc, []string{"TASKS"}, dir, run, 1); err != nil {
 		t.Fatalf("restore onto a held name: %v", err)
 	}
 	if took := time.Since(start); took > 15*time.Second {
@@ -351,8 +351,18 @@ func TestARestoreRunAgainKeepsAStreamItAlreadyRaised(t *testing.T) {
 			t.Fatalf("the cluster's JetStream never came up: %v", err)
 		}
 	}
-	if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); err != nil {
+	var logged bytes.Buffer
+	oldLog := restoreLog
+	restoreLog = &logged
+	_, settled, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3)
+	restoreLog = oldLog
+	if err != nil {
 		t.Fatalf("first run: %v", err)
+	}
+	// The forward restore waits for the raised stream to settle, and says how
+	// long it took.
+	if settled <= 0 || !strings.Contains(logged.String(), "restore-window: TASKS R3 current and 1 durables up") {
+		t.Errorf("first run settled %s, logged %q; want the settle wait run and logged", settled, logged.String())
 	}
 	first, err := streamInfo(ctx, nc, "TASKS")
 	if err != nil {
@@ -361,7 +371,7 @@ func TestARestoreRunAgainKeepsAStreamItAlreadyRaised(t *testing.T) {
 	if first.Config.Replicas != 3 {
 		t.Fatalf("first run left %d replicas, want 3", first.Config.Replicas)
 	}
-	if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); err != nil {
+	if _, _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
 	second, err := streamInfo(ctx, nc, "TASKS")
@@ -373,5 +383,131 @@ func TestARestoreRunAgainKeepsAStreamItAlreadyRaised(t *testing.T) {
 	}
 	if second.Config.Replicas != 3 || second.State.Msgs != meta.State.Msgs {
 		t.Errorf("after the second run: %d replicas, %d msgs; want 3 and %d", second.Config.Replicas, second.State.Msgs, meta.State.Msgs)
+	}
+}
+
+// A forward restore whose raised streams don't settle within its budget fails,
+// naming the wait: that error is what turns the run back.
+func TestARestoreThatDoesNotSettleFails(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	dir, run := stageTasks(t, meta, data, policyOf(meta.Config))
+	base := t.TempDir()
+	s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+	defer shutdown(s2, s1, s0)
+	nc, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, _ := nc.JetStream()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+		if _, err := js.AccountInfo(); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("the cluster's JetStream never came up: %v", err)
+		}
+	}
+	old := restoreSettleTimeout
+	restoreSettleTimeout = time.Nanosecond
+	t.Cleanup(func() { restoreSettleTimeout = old })
+	if _, _, err := restoreAll(context.Background(), nc, []string{"TASKS"}, dir, run, 3); err == nil || !strings.Contains(err.Error(), "not at R3 with its consumers") {
+		t.Fatalf("restore with no time to settle = %v, want the settle wait's error", err)
+	}
+}
+
+// The restore's own consumer count holds the raise until the server lists
+// every consumer it brought back: with the list lagging the restore (the
+// server assigns restored consumers only after the restore answers), the
+// raise waits, and the worker is raised and waited for at three replicas.
+func TestARestoreWaitsForItsConsumersAssignmentsBeforeTheRaise(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	dir, run := stageTasks(t, meta, data, policyOf(meta.Config))
+	base := t.TempDir()
+	s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+	defer shutdown(s2, s1, s0)
+	nc, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, _ := nc.JetStream()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+		if _, err := js.AccountInfo(); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("the cluster's JetStream never came up: %v", err)
+		}
+	}
+	const lagging = 8
+	reads := 0
+	defer func(l func(context.Context, *nats.Conn, string) ([]string, error)) { listAssigned = l }(listAssigned)
+	real := listAssigned
+	listAssigned = func(ctx context.Context, nc *nats.Conn, stream string) ([]string, error) {
+		reads++
+		if reads <= lagging {
+			return nil, nil // not assigned yet
+		}
+		return real(ctx, nc, stream)
+	}
+	var logged bytes.Buffer
+	oldLog := restoreLog
+	restoreLog = &logged
+	_, _, err = restoreAll(context.Background(), nc, []string{"TASKS"}, dir, run, 3)
+	restoreLog = oldLog
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if reads <= lagging {
+		t.Errorf("the consumer list was read %d times, want the raise held past the %d lagging reads", reads, lagging)
+	}
+	if !strings.Contains(logged.String(), "restore-window: TASKS R3 current and 1 durables up") {
+		t.Errorf("logged %q, want the worker waited for", logged.String())
+	}
+	if ci, err := js.ConsumerInfo("TASKS", "worker"); err != nil || ci.Cluster == nil || len(ci.Cluster.Replicas) != 2 {
+		t.Errorf("worker after the restore: %+v, %v; want it at three replicas", ci, err)
+	}
+}
+
+// Consumers the server never assigns fail the restore at the assignment
+// bound, before the raise, and the run turns back like any failed restore.
+func TestARestoreWhoseConsumersAreNeverAssignedFails(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	dir, run := stageTasks(t, meta, data, policyOf(meta.Config))
+	base := t.TempDir()
+	s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+	defer shutdown(s2, s1, s0)
+	nc, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, _ := nc.JetStream()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+		if _, err := js.AccountInfo(); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("the cluster's JetStream never came up: %v", err)
+		}
+	}
+	defer func(d time.Duration) { restoreAssignTimeout = d }(restoreAssignTimeout)
+	restoreAssignTimeout = 2 * time.Second
+	defer func(l func(context.Context, *nats.Conn, string) ([]string, error)) { listAssigned = l }(listAssigned)
+	listAssigned = func(context.Context, *nats.Conn, string) ([]string, error) { return nil, nil }
+	start := time.Now()
+	_, settled, err := restoreAll(context.Background(), nc, []string{"TASKS"}, dir, run, 3)
+	if took := time.Since(start); took > 30*time.Second {
+		t.Errorf("the restore took %s to give up, want it at the assignment bound (2s here)", took.Round(time.Second))
+	}
+	if err == nil || !strings.Contains(err.Error(), "restored consumers not assigned: 0 of 1") || settled != 0 {
+		t.Fatalf("restore with its consumer never assigned = %v (settled %s), want the assignment bound's error", err, settled)
+	}
+	if info, err := streamInfo(context.Background(), nc, "TASKS"); err != nil || info.Config.Replicas != 1 {
+		t.Errorf("TASKS after the failed restore: %+v, %v; want it left at one replica, never raised", info, err)
 	}
 }

@@ -72,6 +72,8 @@ class FakeStore:
     def __init__(self):
         self.seen: list[dict] = []
         self.answer: tuple[int, bytes] = (200, b'{"ok":true}')
+        # The X-Report-Writer the listener answers with, None for none.
+        self.answer_writer: str | None = None
         store = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -82,9 +84,14 @@ class FakeStore:
                     "path": self.path,
                     "authorization": self.headers.get("Authorization"),
                     "body": self.rfile.read(length) if length else None,
+                    "writer": self.headers.get_all("X-Report-Writer") or [],
+                    "header_names": sorted(name.lower() for name in self.headers.keys()),
                 })
                 status, payload = store.answer
                 self.send_response(status)
+                if store.answer_writer is not None:
+                    self.send_header("X-Report-Writer", store.answer_writer)
+                self.send_header("X-Listener-Other", "never-passed-on")
                 if status != 204:
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(payload)))
@@ -1349,6 +1356,137 @@ class ConfigurationTest(unittest.TestCase):
         want = (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE, credential_proxy.CALLER_ROLE_A2A_REPORTS)
         self.assertEqual(want, credential_proxy.required_roles("/v1/audit-reports"))
         self.assertEqual(want, credential_proxy.required_roles(f"{STREAM}/latest"))
+
+
+class WriterStampTest(RoutesTestCase):
+    """The broker stamps who wrote each run (fleet-audit-report-store.md §3), from the verified caller alone."""
+
+    PUT_RUN = f"{STREAM}/runs/{RUN}"
+    FORGED = "builtin-schedule:compliance-audit:forged-task"
+
+    def answer(self, method, path, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.request(method, path, body=BODY if method == "PUT" else None, headers=headers or {})
+        response = connection.getresponse()
+        response.read()
+        return response
+
+    def test_a_profile_write_is_stamped_with_its_audit_and_task(self):
+        self.assert_relayed("PUT", self.PUT_RUN, self.request("PUT", self.PUT_RUN, token=REPORT["token"]), BODY)
+        self.assertEqual([f"builtin-schedule:{AUDIT}:{REPORT['claims']['task']}"], self.store.seen[-1]["writer"])
+        # The task id is the credential's own claim.
+        trigger = task_credential.TaskTrigger(name=f"schedule/{AUDIT}", origin="builtin", stream=AUDIT)
+        gate = _StandInGate("auditor", trigger)
+        gate.task = dataclasses.replace(gate.task, task="task-9z")
+        CredentialProxyHandler.profile_gate = gate
+        self.assert_relayed("PUT", self.PUT_RUN, self.request("PUT", self.PUT_RUN, token="t"), BODY)
+        self.assertEqual([f"builtin-schedule:{AUDIT}:task-9z"], self.store.seen[-1]["writer"])
+
+    def test_a_shell_write_is_stamped_shell(self):
+        self.authenticator.principal = self.shell
+        self.assert_relayed("PUT", self.PUT_RUN, self.request("PUT", self.PUT_RUN), BODY)
+        self.assertEqual(["shell"], self.store.seen[-1]["writer"])
+
+    def test_a_forged_writer_is_replaced_by_the_real_one(self):
+        for principal, token, want in (
+            (self.shell, None, "shell"),
+            (self.profile, REPORT["token"], f"builtin-schedule:{AUDIT}:task-1"),
+        ):
+            for name in ("X-Report-Writer", "x-report-writer", "X-REPORT-WRITER"):
+                for forged in ("shell", self.FORGED, f"builtin-schedule:{AUDIT}:task-1"):
+                    with self.subTest(caller=want, name=name, forged=forged):
+                        self.authenticator.principal = principal
+                        self.store.seen.clear()
+                        self.assert_relayed("PUT", self.PUT_RUN,
+                                            self.request("PUT", self.PUT_RUN, token=token, headers={name: forged}), BODY)
+                        self.assertEqual([want], self.store.seen[-1]["writer"])
+
+    def test_no_other_write_carries_a_writer(self):
+        # PUT latest copies the matched run's writer in the listener, and a
+        # DELETE writes none: the broker stamps neither, and strips a forged one.
+        for method, path in ((("PUT", f"{STREAM}/latest")), ("DELETE", f"{STREAM}/latest")):
+            with self.subTest(method=method):
+                self.assert_relayed(method, path, self.request(method, path, token=REPORT["token"],
+                                                               headers={"X-Report-Writer": self.FORGED}), BODY)
+                self.assertEqual([], self.store.seen[-1]["writer"])
+
+    def test_a_client_cannot_send_a_writer_on_a_read(self):
+        for principal, token in ((self.shell, None), (self.profile, REPORT["token"])):
+            for method, path in READS:
+                with self.subTest(principal=principal.role, path=path):
+                    self.authenticator.principal = principal
+                    self.assert_relayed(method, path, self.request(method, path, token=token,
+                                                                   headers={"x-report-writer": self.FORGED}))
+                    self.assertEqual([], self.store.seen[-1]["writer"])
+
+    def test_the_listeners_writer_is_passed_on_and_nothing_else(self):
+        self.store.answer_writer = "builtin-schedule:compliance-audit:task-1"
+        for principal, token in ((self.shell, {}), (self.profile, {credential_proxy.TASK_CREDENTIAL_HEADER: REPORT["token"]})):
+            for path in (f"{STREAM}/latest", f"{STREAM}/runs/{RUN}"):
+                with self.subTest(principal=principal.role, path=path):
+                    self.authenticator.principal = principal
+                    response = self.answer("GET", path, token)
+                    self.assertEqual(200, response.status)
+                    self.assertEqual(self.store.answer_writer, response.getheader("X-Report-Writer"))
+                    self.assertIsNone(response.getheader("X-Listener-Other"))
+
+    def test_the_a2a_reports_read_receives_the_writer(self):
+        self.authenticator.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:platformagent-gateway", uid="gw-uid",
+            role=credential_proxy.CALLER_ROLE_A2A_REPORTS,
+        )
+        self.store.answer_writer = "shell"
+        for suffix in ("latest", f"runs/{RUN}"):
+            with self.subTest(suffix=suffix):
+                response = self.answer("GET", f"/v1/audit-reports/{AUDIT}/publish/{suffix}",
+                                       {"X-Report-Writer": self.FORGED})
+                self.assertEqual(200, response.status)
+                self.assertEqual("shell", response.getheader("X-Report-Writer"))
+                self.assertEqual([], self.store.seen[-1]["writer"])
+        # No writer from the listener: none to the caller.
+        self.store.answer_writer = None
+        self.assertIsNone(self.answer("GET", f"/v1/audit-reports/{AUDIT}/publish/latest").getheader("X-Report-Writer"))
+
+    def test_a_listener_writer_that_is_not_a_writer_is_dropped(self):
+        self.authenticator.principal = self.shell
+        for bad in ("Shell", "builtin-schedule:a", "shell, shell", "profile:x"):
+            with self.subTest(bad=bad):
+                self.store.answer_writer = bad
+                response = self.answer("GET", f"{STREAM}/latest")
+                self.assertEqual(200, response.status)
+                self.assertIsNone(response.getheader("X-Report-Writer"))
+
+    def test_a_task_id_that_makes_no_writer_is_refused_unrelayed(self):
+        trigger = task_credential.TaskTrigger(name=f"schedule/{AUDIT}", origin="builtin", stream=AUDIT)
+        gate = _StandInGate("auditor", trigger)
+        gate.task = dataclasses.replace(gate.task, task="Not:A-Label")
+        CredentialProxyHandler.profile_gate = gate
+        self.assert_refused(self.request("PUT", self.PUT_RUN, token="t"), credential_proxy.RULE_REPORT_WRITER)
+
+    def test_report_writer_for(self):
+        cp = credential_proxy
+        task = dataclasses.replace(_StandInGate("auditor", None).task, task="task-2")
+        self.assertEqual("shell", cp.report_writer_for(cp.CALLER_ROLE_SHELL, None, AUDIT))
+        self.assertEqual("shell", cp.report_writer_for(cp.CALLER_ROLE_SHELL, task, AUDIT))
+        self.assertEqual(f"builtin-schedule:{AUDIT}:task-2", cp.report_writer_for(cp.CALLER_ROLE_PROFILE, task, AUDIT))
+        for role, claims in ((cp.CALLER_ROLE_PROFILE, None), (cp.CALLER_ROLE_A2A_REPORTS, task), ("", task),
+                             (cp.CALLER_ROLE_CHAT, task)):
+            with self.subTest(role=role):
+                self.assertIsNone(cp.report_writer_for(role, claims, AUDIT))
+
+    def test_the_writer_names_are_the_listeners(self):
+        tree = ast.parse(LISTENER_PATH.read_text(encoding="utf-8"))
+        listener = {
+            target.id: node.value.value
+            for node in tree.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+        cp = credential_proxy
+        self.assertEqual(listener["REPORT_WRITER_HEADER"], cp.REPORT_WRITER_HEADER)
+        self.assertEqual(listener["REPORT_WRITER_SHELL"], cp.REPORT_WRITER_SHELL)
+        self.assertEqual(listener["REPORT_WRITER_BUILTIN"], cp.REPORT_WRITER_BUILTIN)
+        self.assertEqual(listener["_WRITER_LABEL"], cp._REPORT_WRITER_LABEL)
 
 
 if __name__ == "__main__":

@@ -22,10 +22,11 @@ package controller
 // subjects. The callout refuses such a pod by name, from A2A_RESERVED_ADDRESSEES,
 // so that list has to be every fixed-name addressee the install routes to. Those
 // are read from three places: the subjects the bridge identity's grants name,
-// which the operator renders, and two defaults it does not render, the
-// gateway's (A2A_DEFAULT_ADDRESSEE) and the bridge's profile (BRIDGE_PROFILE).
-// The defaults live in the a2a module, which this module cannot import, so the
-// test reads them out of the source. Every extraction fails the test rather than falling
+// which the operator renders, the gateway's A2A_DEFAULT_ADDRESSEE, which the
+// operator renders from defaultRoute (the a2a module's default is the fallback
+// should it ever stop), and the bridge's profile default (BRIDGE_PROFILE),
+// which it does not render. The defaults live in the a2a module, which this
+// module cannot import, so the test reads them out of the source. Every extraction fails the test rather than falling
 // back, so a moved or reshaped default reds here instead of passing vacuously.
 
 import (
@@ -344,8 +345,10 @@ func configuredAddressees(t *testing.T, gatewayAddressee, bridgeProfile string) 
 }
 
 // The day the gateway's default flips to the session route, the derivation
-// must not demand that the sentinel be reserved: it is not an addressee, and a
-// list that grew to carry it would refuse a pod for a name nothing routes to.
+// must not read the sentinel as an addressee the gateway routes to: it is a
+// route, and the bridge's `platform` must stay in the set. The sentinel is
+// reserved anyway, on its own account (TestTheSessionRouteIsAReservedAddressee),
+// so nothing can hold the name the gateway means something else by.
 func TestTheSessionRouteIsNotAConfiguredAddressee(t *testing.T) {
 	routeSession := stringConstInSource(t, a2aGatewaySpawnSource, gatewayRouteSessionConst)
 	bridgeProfile := envDefaultInSource(t, a2aBridgeMainSource, bridgeProfileEnv)

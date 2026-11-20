@@ -278,12 +278,75 @@ body {
   vertical-align: middle;
 }
 
+/* A report's text with its reply action under it: a column, so the action
+   never joins the entry's flex row (the meta column at the right) nor
+   stretches to the row's height. */
+.chat-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.chat-reply {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-self: flex-start;
+  margin: 8px 0 0 -6px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ghost);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.chat-reply:hover,
+.chat-reply:focus-visible {
+  color: var(--ink-bright);
+  text-decoration: underline solid;
+}
+
+.chat-reply-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--edge);
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.chat-reply-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-reply-clear {
+  flex: 0 0 auto;
+  min-width: 24px;
+  padding: 2px 8px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
 .probe-button:hover {
   color: var(--ink-bright);
   border-color: #2c3644;
 }
 
-.probe-button:focus-visible {
+.probe-button:focus-visible,
+.chat-reply:focus-visible {
   outline: 1px solid var(--trace);
   outline-offset: 1px;
 }

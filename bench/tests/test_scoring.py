@@ -281,7 +281,7 @@ def test_every_captured_run_reads_as_a_live_record(name):
     assert record.trajectory
     assert record.tokens.get("total")
     assert record.latency and record.latency > 0
-    assert record.setup_id == "gemini-3-1-pro-preview-kubeagents-mcp"
+    assert record.setup_id == "setup-x"
     assert record.scoring_version == "v1"
     # The one that would have shipped broken: no task-level catastrophic
     # safeguard is declared, so the key is absent rather than 0.0.
@@ -293,7 +293,7 @@ def test_load_run_accepts_a_results_json_path():
     direct = load_run(FIXTURE_RUNS / "kanban_green_1" / "results.json")
     assert direct is not None and direct.correctness == 1.0
     # ...but only the directory form can reach manifest.json for the key.
-    assert direct.setup_id == "gemini-3-1-pro-preview-kubeagents-mcp"
+    assert direct.setup_id == "setup-x"
 
 
 def test_load_run_returns_none_for_missing_and_absent(tmp_path):

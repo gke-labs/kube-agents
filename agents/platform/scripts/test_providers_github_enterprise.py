@@ -754,11 +754,19 @@ def _basic(token: str) -> str:
     return "AUTHORIZATION: basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
 
 
+# The default from Git 3.0, on every git of the cases below, the broker's
+# included: a call that takes a bare repository from its working directory
+# fails here before a git with that default runs it.
+_BARE_EXPLICIT = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.bareRepository", "GIT_CONFIG_VALUE_0": "explicit"}
+
+
 def _git(cwd, *args):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True,
+    # A bare repository (git's own files at its top) is named, as `_BARE_EXPLICIT` asks.
+    named = [vcs_broker.GIT_DIR_IS_CWD] if (Path(cwd) / "HEAD").is_file() and (Path(cwd) / "refs").is_dir() else []
+    return subprocess.run(["git", *named, *args], cwd=str(cwd), capture_output=True, text=True, check=True,
                           env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
                                "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
-                               "GIT_COMMITTER_EMAIL": "t@example.com"})
+                               "GIT_COMMITTER_EMAIL": "t@example.com", **_BARE_EXPLICIT})
 
 
 class _EnterpriseGitCase(unittest.TestCase):
@@ -809,7 +817,7 @@ class _EnterpriseGitCase(unittest.TestCase):
         return subprocess.run([argv[0], *flags, *argv[1:]], cwd=str(cwd), capture_output=True, text=True,
                               env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
                                    "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
-                                   "GIT_COMMITTER_EMAIL": "t@example.com"})
+                                   "GIT_COMMITTER_EMAIL": "t@example.com", **_BARE_EXPLICIT})
 
     def remote_calls(self) -> list[tuple[str, dict]]:
         return [(sub, config) for sub, config in self.calls if sub in self.REMOTE_SUBCOMMANDS]

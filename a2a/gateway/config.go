@@ -358,6 +358,16 @@ type Config struct {
 	// anyone holding pods/portforward in the namespace.
 	InjectToken string
 
+	// InjectConfirm (A2A_INJECT_CONFIRM, "true" and nothing else) lets the
+	// inject door take intent "confirm", which submits the turn with a
+	// change requested (TaskParameters.ChangeRequested). Off, the door
+	// refuses that intent with a 400. The door's caller is the eval
+	// harness, a program, so a confirm over it is automation by design and
+	// belongs only on an install armed for evals: the operator renders this
+	// beside A2A_INJECT_LISTEN under the same flag (A2A_INJECT_BACKEND on
+	// the operator), and a door armed by hand without it cannot confirm.
+	InjectConfirm bool
+
 	// InjectPrincipalMapPath is the door's OWN principal map
 	// (A2A_INJECT_PRINCIPAL_MAP), separate from PrincipalMapPath and never a
 	// fallback to it.
@@ -686,8 +696,11 @@ type Config struct {
 	// sooner - a UX decision, not a safety one, because this cap is the
 	// usability half. The enforcement half is the namespace ResourceQuota
 	// the operator renders above this number (a compromised or buggy gateway
-	// ignores its own cap and cannot ignore that one), which is also what
-	// bounds the count-then-create race between concurrent conversations.
+	// ignores its own cap and cannot ignore that one). The gateway serializes
+	// the check and counts slots granted but not yet spawned, so concurrent
+	// conversations don't race past the cap (#6033); a replacing turn or a
+	// leader handover can still overshoot it briefly, which the quota's
+	// margin absorbs.
 	MaxSessions int
 
 	// SessionResources are the session pod's CPU and memory requests and
@@ -925,6 +938,10 @@ func FromEnv() (*Config, error) {
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
+	cfg.InjectConfirm = os.Getenv("A2A_INJECT_CONFIRM") == "true"
+	if cfg.InjectConfirm && cfg.InjectListen == "" {
+		return nil, fmt.Errorf("A2A_INJECT_CONFIRM is set but the inject door is not armed (A2A_INJECT_LISTEN)")
+	}
 	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
 	cfg.ConsoleDoor = os.Getenv("A2A_CONSOLE_DOOR") == "true"
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))

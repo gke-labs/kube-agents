@@ -304,6 +304,16 @@ type Gateway struct {
 	// session by construction (a message during a running task is a steer,
 	// never a second task). Entries are refcounted and pruned when idle.
 	sessionLocks map[string]*sessionLockEntry
+	// capCheck lets one session cap check run at a time (refuseAtSessionCap,
+	// #6033): the count, the eviction and the slot's reservation happen as
+	// one, so a burst of conversations can't all pass on the same count. It
+	// is a channel so a wait can give up with its turn's context. capHolds,
+	// guarded by capMu, are the slots granted whose pod isn't created yet,
+	// by conversation key.
+	capOnce  sync.Once
+	capCheck chan struct{}
+	capMu    sync.Mutex
+	capHolds map[string]capHold
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
@@ -616,6 +626,7 @@ func New(o Options) (*Gateway, error) {
 		log:              log,
 		runCtx:           context.Background(),
 		sessionLocks:     map[string]*sessionLockEntry{},
+		capHolds:         map[string]capHold{},
 		profiles:         newProfileDirectory(),
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
@@ -1196,6 +1207,9 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	// A cap slot this turn took ends with the turn, whatever happened between
+	// the grant and the spawn (#6033).
+	defer g.releaseCapHold(msg.Conversation)
 	// The stop may have begun while this turn waited for the lock.
 	if g.droppedAtStop(msg) {
 		return
@@ -1226,6 +1240,7 @@ func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage, backend, prin
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	defer g.releaseCapHold(msg.Conversation)
 	if g.droppedAtStop(msg) {
 		return
 	}
@@ -1434,8 +1449,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// An explicit cancel from a backend that can express one is read before
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path. Read after the strip
-	// above, so a post-flip "/session stop" is the stop it unwraps to.
-	stopping := msg.Intent == IntentCancel || chattext.IsStop(msg.Text)
+	// above, so a post-flip "/session stop" is the stop it unwraps to. Any
+	// other intent keeps its own meaning whatever its text says.
+	stopping := msg.Intent == IntentCancel || (msg.Intent == "" && chattext.IsStop(msg.Text))
 	// A program holds a delegation chain's root id only (observedAs), so a
 	// cancel naming the root while the chain runs is a cancel of the task
 	// that is running: the child, or the wake. Published at the root's own
@@ -1580,6 +1596,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// follow-up to whatever runs here; steering it in would drop the
 		// profile and its parameters without a word.
 		g.post(rec.Key, noticeTurnNotStarted+noticeProfileWhileRunning)
+	case active != nil && !active.Detached && msg.Intent == IntentConfirm:
+		// A confirm is a new task's grant, and a steer cannot widen what
+		// the running task was granted: refused rather than steered in as
+		// text that asks for a change the task has no permit to make.
+		g.post(rec.Key, noticeTurnNotStarted+noticeConfirmWhileRunning)
 	case active != nil && !active.Detached && rec.fanOutPending(active.TaskID):
 		// Text while a batch runs steers nothing: the turn that asked has
 		// ended, and which child it was meant for isn't for the gateway to
@@ -3205,6 +3226,11 @@ type taskStart struct {
 	// "Addressing"). rec.Addressee is the resolved profile. Nil for every
 	// task addressed to platform or a session.
 	Route *profileRoute
+	// ChangeRequested goes onto the entry and, for a profile task, onto
+	// its submission (TaskParameters.ChangeRequested). True for a human
+	// turn only when it arrived with IntentConfirm; a child or a wake
+	// copies its chain's entry, never anything the session wrote.
+	ChangeRequested bool
 }
 
 // startTask opens a turn for a human message, and returns its task id once
@@ -3222,6 +3248,8 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
+		// A structured confirm action only: free text never sets it.
+		ChangeRequested: msg.Intent == IntentConfirm,
 	})
 	return taskID
 }
@@ -3256,7 +3284,10 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		"backendMessageId", ts.MessageID,
 		"principal", ts.Principal,
 		"conversation", rec.Key,
-		"addressee", addressee)
+		"addressee", addressee,
+		// Whether a human's structured confirm asked for a change: the
+		// audit record of what this task's submission may mint a permit for.
+		"changeRequested", ts.ChangeRequested)
 
 	// The root capability, minted before anything is published. The
 	// gateway allocates the taskId and the addressee in the same breath, so
@@ -3338,7 +3369,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			}
 		}
 	}
-	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, extra...)
+	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, ts.ChangeRequested, extra...)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
 		return "", false
@@ -3410,6 +3441,8 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Depth:        ts.Depth,
 		RootTaskID:   ts.RootTaskID,
 		Request:      ts.Request,
+		// What a child of this task inherits (handleDelegateRequest).
+		ChangeRequested: ts.ChangeRequested,
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID

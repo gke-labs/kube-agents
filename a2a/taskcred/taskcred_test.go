@@ -621,6 +621,7 @@ func TestPermitsAreForTheCredentialProxyAlone(t *testing.T) {
 	}
 
 	c.Audience = AudienceCredentialProxy
+	c.Target = &Target{Project: "p", Location: "l", Cluster: "c"}
 	got, err := Verify(mint(t, kp, c), []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew)
 	if err != nil {
 		t.Fatalf("a proxy credential with a permit was refused: %v", err)
@@ -640,6 +641,7 @@ func TestMalformedPermitsAreRefused(t *testing.T) {
 	} {
 		c := validClaims(now)
 		c.Audience = AudienceCredentialProxy
+		c.Target = &Target{Project: "p", Location: "l", Cluster: "c"}
 		c.Permits = permits
 		if _, err := Mint(kp, c); err == nil {
 			t.Errorf("Mint accepted %s", name)

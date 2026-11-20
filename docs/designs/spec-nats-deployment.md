@@ -18,8 +18,8 @@ spec's layout wins and this doc binds to its subjects and topic classes.
 ## What we deploy
 
 NATS 2.10 or later (auth callout requires it), JetStream enabled, file storage on a PV.
-The operator renders the whole deployment from the mode switch: `mode: next` gets a NATS
-cluster, the default gets nothing. Dark until promoted.
+The operator renders the whole deployment for every `PlatformAgent`; the `spec.mode` switch
+that once held it dark is gone, and the field is deprecated and ignored.
 
 Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run a single
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
@@ -69,14 +69,24 @@ another `busReplicas` change while one runs.
   and web logins drop, and the gateway and bridge cannot publish), the operator's pods
   snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
   snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
-  stream, checked against the operator's policy for it before and after, and raises it to
-  three replicas.
+  stream, checked against the operator's policy for it before and after, raises it to
+  three replicas, and waits (up to 5 minutes for all streams) until every replica is
+  current and every restored durable consumer answers from its leader. Each stream comes back
+  at the rendered `max_bytes` and `max_age`, and its `max_consumers` is widened to the render's
+  but never narrowed: JetStream fixes it when a stream is created, so the restore is the one
+  moment it can grow, and a wider stream's consumers must still fit (amended 11/18). The way
+  back restores each stream as the snapshot recorded it, its width included.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
   replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
   restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.
+- **A run of a leg this operator does not run** (one a later release started, found after a
+  rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
+  the bus keeps its count, until the operator that started it is back or a person gives it up
+  with the same abandon annotation. It is never retried. `Reshape` is reserved in the leg enum
+  for such a leg (amended 11/19).
 
 **Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
 The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
@@ -102,6 +112,16 @@ A server still outside after 3 minutes is restarted once, under every one of the
 The record is an annotation the operator writes before the delete, with its own patch, so the
 StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
 its one restart stays named in the condition, for a person.
+
+**Amended 11/18 (#6273): a fresh bus that agrees no meta leader at all is restarted whole, once.**
+Once in a nightly, one server campaigned alone and its peers' votes never reached it, so no leader was
+ever agreed, and there was no single stray to restart. After the same 3 minutes, every server is
+restarted once, under the same guards: the bus hasn't been provisioned, no server holds a stream or
+consumer, every server's meta node has started, and the record names none of them yet. The record is
+written first, with every server, so a pass that dies part-way, or an operator restarted mid-way,
+never tries again: a partial restart counts as the one attempt. An `A2ABusMetaGroupRestarted`
+Warning names the servers. A bus still without a leader after that keeps the condition, which says
+every server was restarted once and leaves it for a person.
 
 If a server isn't running while the others are (its pod absent, being deleted, or not Running,
 as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
@@ -776,6 +796,14 @@ Layout:
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
 
+  **Amended 10/30 (#3993):** a confirm has a subject of its own, `chat.console.*.confirm`:
+  a frame there is the same ask as one on `.in`, which the gateway submits with
+  `TaskParameters.ChangeRequested`, the one way a task is granted the permit to make a
+  change. `console` is its only publisher and the gateway its only subscriber (the grants
+  arrive with the account split; see the 11/3 amendment below for `console-mcp`, which holds
+  `.in` and not `.confirm`). The gateway's console adapter subscribes it beside `.in`. A
+  frame on `.in` never carries a confirm, whatever its `kind` says.
+
   **Amended 9/24:** the page is served by an operator-rendered console server
   (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
   `console` password from the creds Secret, and proxies the page's websocket to 9222. It is
@@ -810,7 +838,7 @@ Layout:
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
 
-- **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
+- **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
   publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
@@ -934,14 +962,19 @@ pod may publish, the consumers it may create over `.in`, and its capability veri
 reply subjects on that name, so a pod named after another addressee would be handed that
 addressee's task subjects. The gateway never mints such a name, but anyone who can create a
 pod under a narrowed ServiceAccount can, so the same check refuses a narrowed pod whose name
-is a fixed-name addressee. Today that is `platform`: the gateway's default addressee, which
-the operator leaves unset so the gateway keeps its own default, and the only addressee the
-bridge's grants name. The operator renders the list into the callout's
+is a fixed-name addressee. Today that is `platform` and `session`. `platform` is the only
+addressee the bridge's grants name, and the gateway's default addressee unless the
+PlatformAgent's `spec.harness.tuning.defaultRoute` says `session`; the operator renders that
+default as `A2A_DEFAULT_ADDRESSEE`. `session` is the gateway's session route: a sentinel it
+routes on rather than an addressee it publishes to, reserved so nothing holds the name. The
+operator renders the list into the callout's
 `A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
 labels. Session addressees need no entry, since each is the name of the pod that is that
-addressee. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
+addressee. The callout also refuses the pod name `p`, the marker of a profile task's six-token
+supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`, #5301), as defence in depth:
+no session grant reaches a six-token subject today, and gateway-minted names carry hyphens. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
 sets, which leaves the bridge unable to publish its own events because its grants still
 name `platform`. The other is `AgentProfile` addressees, which come and go with their CRs:
 a narrowed pod named after a profile would be handed that profile's task subjects, so
@@ -1046,9 +1079,8 @@ no current-template replica serving, and a gateway let through beside a `False` 
 has a serving replica to mint against. The stale-true paragraph above no longer applies
 to the gate: it reads the Deployment from the informer rather than a condition written a
 pass earlier, and the `Generation` check is what keeps a stale informer copy from
-standing in for a stale condition; the live read for "already there" is unchanged. The
-delay also stopped being invisible. Under
-`mode: next` the A2A gateway is one of the workloads `Ready` is computed from
+standing in for a stale condition; the live read for "already there" is unchanged. The delay also stopped being invisible. The A2A
+gateway is one of the workloads `Ready` is computed from
 (`readSplitWorkloads`), so an install held at the gate reads `Provisioning` with a
 message naming the Deployment - rather than a `Ready: True` sitting above an absent
 dispatcher.
@@ -1151,16 +1183,13 @@ route, leaves the cheap ones, and names the class while doing it.
 Two layers, and they are not the same layer. The admission refusal is unconditional, is
 the only one that tells the CR's author why, and covers mounts as well as volumes:
 `extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
-against the reserved names. The render strip is gated on the A2A surface, so it runs
-under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
-recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
-on that function). On the mounts it goes further than admission does: besides the
+against the reserved names. The render strip runs on every CR, since every install renders the A2A stack. On the mounts it goes further than admission does: besides the
 reserved names it drops any mount naming a volume it has just dropped by source, because
 a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
 layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
 at all; that is deliberate, because it is the supported route for a CR-declared Hermes
 bridge sidecar, which is meant to hold `bridge-password`. The bridge the operator renders
-under `next` gets the same key as a `secretKeyRef` the operator writes itself.
+gets the same key as a `secretKeyRef` the operator writes itself.
 
 Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
 pod-scoped and the callout cannot see which container presented one, so this is a guard
@@ -1296,7 +1325,7 @@ already published, stays, and a removed profile keeps its deny while it drains, 
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
-`PlatformAgent` and removed with the stack on a flip to `today`:
+`PlatformAgent`:
 
 | Object                                             | Holds                                                  |
 | -------------------------------------------------- | ------------------------------------------------------ |
