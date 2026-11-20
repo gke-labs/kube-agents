@@ -498,7 +498,9 @@ if [ "$STATUS" = "ok" ]; then
             REMEDIATION_5="$SCOPE_UNREADABLE_REMEDIATION"
         elif grep -Eq "$SCOPE_HOLD_REFUSAL_RE" <<<"$ERR"; then
             REASON_5="The target cluster is on hold by the platform's operators (spec.hold): kube-proxy and the credential broker refuse its API to every agent."
-            HOLD_REASON="$(printf '%s' "$ERR_ONE" | sed -n "$SCOPE_HOLD_REASON_SED" | head -n 1 | cut -c1-"$SCOPE_HOLD_REASON_MAX_CHARS")"
+            # From the whole message, not ERR_ONE: its 500-character cut can fall
+            # inside a long reason, past which the pattern's anchor is lost.
+            HOLD_REASON="$(printf '%s' "$ERR" | tr '\n' ' ' | sed 's/  */ /g' | sed -n "$SCOPE_HOLD_REASON_SED" | head -n 1 | cut -c1-"$SCOPE_HOLD_REASON_MAX_CHARS")"
             [ -n "$HOLD_REASON" ] && REASON_5="$REASON_5 Reason given: $HOLD_REASON."
             REMEDIATION_5="$SCOPE_HOLD_REMEDIATION"
         elif grep -Eq "$SCOPE_EXCLUDE_REFUSAL_RE" <<<"$ERR"; then
