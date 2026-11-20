@@ -1,4 +1,4 @@
-"""The replay lane's verdict comparison: per case beside the nightly, and per served conversation."""
+"""The replay lane's verdict comparison: per case, and per served conversation."""
 
 import json
 import os
@@ -43,6 +43,12 @@ class LaneReportTest(unittest.TestCase):
             json.dump(nightly_runs, handle)
         named = getattr(self, "report_commit", None)
         commit = {"commit": named[0], "commit_source": named[1]} if named else {}
+        newest = getattr(self, "newest_night", None)
+        if newest is not None:
+            path = os.path.join(self.keep, "newest-night.json")
+            with open(path, "w") as handle:
+                json.dump(newest, handle)
+            commit["newest_night_path"] = path
         summary = lane_report.write_report(self.keep, self.world.verdicts, self.nightly, self.out, **commit)
         with open(os.path.join(self.out, "verdicts.json")) as handle:
             return json.load(handle), summary
@@ -108,6 +114,69 @@ class LaneReportTest(unittest.TestCase):
         report, _ = self.report({NIGHT: [], old_night: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
         self.assertEqual(report["served_conversations"], {"match": 1, "mismatch": 0, "unknown": 0})
         self.assertEqual(report["cases"]["case-a"]["nightly"], {old_night: {"passes": 1, "scored": 1, "outcomes": ["pass"]}})
+
+    def test_a_case_is_graded_against_the_newest_night_on_the_commit_not_the_night_that_wrote_its_answers(self):
+        # 2026-11-18: answers first written by an older night on another commit,
+        # which passed the case; the newest night on the replayed commit failed it.
+        old_night, shard_a, shard_b = "1780000000000000000", "1790000000000000001", "1790000000000000002"
+        commit = "ab" * 20
+        self.report_commit = (commit, "recording")
+        self.newest_night = {"builds": [shard_a, shard_b], "commit_builds": {commit: [shard_a, shard_b]}}
+        for rep in (1, 2, 3):
+            self.world.run("case-a", rep, "fail", [f"t_0000000{rep}"])
+            self.conversation(f"t_0000000{rep}", (True, False), recorded_from=old_night)
+        report, summary = self.report({
+            old_night: [{"case": "case-a", "rep": r, "outcome": "pass"} for r in (1, 2, 3)],
+            shard_a: [{"case": "case-b", "rep": 1, "outcome": "pass"}],
+            shard_b: [{"case": "case-a", "rep": r, "outcome": "fail"} for r in (1, 2, 3)]})
+        case = report["cases"]["case-a"]
+        self.assertEqual(case["newest_night"], {"passes": 0, "scored": 3, "outcomes": ["fail"] * 3,
+                                                "builds": [shard_b]})
+        self.assertEqual(report["newest_night"], {"builds": [shard_a, shard_b]})
+        # Where the answers came from is kept, under its own label.
+        self.assertEqual(case["nightly"][old_night]["passes"], 3)
+        self.assertIn(f"newest recording night on {commit}: builds {shard_a}, {shard_b}", summary)
+        self.assertIn(f"case-a: lane 0/3 (rep 1 fail 50.0%, rep 2 fail 50.0%, rep 3 fail 50.0%); newest night as of fetch: 0/3;"
+                      f" answers served from {old_night} (ran it 3/3)\n", summary)
+        self.assertNotIn("nightly", summary)
+
+    def test_a_case_the_newest_night_did_not_run_says_so_and_never_falls_back_to_an_older_night(self):
+        old_night, shard = "1780000000000000000", "1790000000000000001"
+        commit = "ab" * 20
+        self.report_commit = (commit, "recording")
+        self.newest_night = {"builds": [shard], "commit_builds": {commit: [shard]}}
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.conversation("t_00000001", (True, True), recorded_from=old_night)
+        report, summary = self.report({old_night: [{"case": "case-a", "rep": 1, "outcome": "pass"}],
+                                       shard: [{"case": "case-b", "rep": 1, "outcome": "pass"}]})
+        self.assertEqual(report["cases"]["case-a"]["newest_night"], "not_graded_at_fetch")
+        self.assertIn("case-a: lane 1/1 (rep 1 pass 100.0%); newest night not graded on the replayed commit's night"
+                      " by the time the lane fetched;", summary)
+
+    def test_a_served_from_build_whose_runs_were_never_read_stays_unknown(self):
+        read, unread = "1790000000000000001", "1780000000000000000"
+        for card, build in (("t_00000001", read), ("t_00000002", unread)):
+            self.world.run("case-a", int(card[-1]), "pass", [card])
+            self.conversation(card, (True, True), recorded_from=build)
+        report, summary = self.report({read: [{"case": "case-b", "rep": 1, "outcome": "pass"}]})
+        self.assertEqual(report["cases"]["case-a"]["nightly"], {read: "not_run", unread: "unknown"})
+        self.assertIn(f"answers served from {unread} (unknown); {read} (no run of it)", summary)
+
+    def test_without_a_night_on_the_replayed_commit_no_case_is_graded_against_one(self):
+        shard = "1790000000000000001"
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.conversation("t_00000001", (True, True), recorded_from=shard)
+        runs = {shard: [{"case": "case-a", "rep": 1, "outcome": "pass"}]}
+        night = {"builds": [shard], "commit_builds": {"cd" * 20: [shard]}}
+        # No night file; one whose night ran another commit (the lane fell back to main); no commit named.
+        for named, newest in ((("ab" * 20, "recording"), None), (("ab" * 20, "main"), night), (("", ""), night)):
+            with self.subTest(commit=named[0], newest=newest is not None):
+                self.report_commit, self.newest_night = named, newest
+                report, summary = self.report(runs)
+                self.assertEqual(report["cases"]["case-a"]["newest_night"], "no_night_on_commit")
+                self.assertEqual(report["newest_night"], {"builds": []})
+                self.assertIn("none known, so no case is graded against one", summary)
+                self.assertIn("newest night no night on the replayed commit;", summary)
 
     def test_a_front_doors_opening_counts_for_the_run_its_conversation_names(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
