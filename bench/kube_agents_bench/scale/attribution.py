@@ -77,7 +77,7 @@ FRONT_DOOR_PROFILE = "default"
 PLATFORM_PROFILE = "platform"
 CLUSTER_PROFILE_PREFIX = "cluster-"
 CLUSTER_AGENTS = "cluster-agents"
-# The first-run flow's cards carry these idempotency keys (agents/chat/scripts/oobe.py's scan).
+# The first-run flow's cards carry these idempotency keys (agents/chat/scripts/bootstrap_scan_gate.py).
 FIRST_RUN_KEY_PREFIX = "bootstrap-"
 # A run that ended blocked or failed keeps no worker session id; its worker session starts
 # within this many seconds after the run does.
