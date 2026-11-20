@@ -123,13 +123,16 @@ A reference Microsoft Teams app manifest template is included at [`docs/samples/
 
 ## Step 6: Receive Messages from Teams (the inbound receiver)
 
-Turn the receiver on in the CR (or `platformAgent.integration.teams.inbound.enabled: true` in Helm values). It needs `tenantId`; the CRD refuses the combination without it.
+Add `inbound.enabled: true` to the Teams block from Step 3 (or `platformAgent.integration.teams.inbound.enabled: true` in Helm values). It needs `tenantId` and the Secret references from Step 3; the CRD refuses the combination without them.
 
 ```yaml
 spec:
   integration:
     teams:
       enabled: true
+      appIdSecretRef: { name: platform-agent-secrets, key: TEAMS_APP_ID }
+      appPasswordSecretRef:
+        { name: platform-agent-secrets, key: TEAMS_APP_PASSWORD }
       tenantId: "<your tenant id>"
       inbound:
         enabled: true

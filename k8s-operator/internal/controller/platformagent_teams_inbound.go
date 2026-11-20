@@ -56,8 +56,10 @@ const (
 	teamsInboundHTTPSPort int32 = 443
 	// teamsInboundAnyIPv4 is the egress peer for that fetch. Microsoft
 	// publishes no stable address for its key endpoint, so the rule is the
-	// internet on 443 less the metadata server; the FQDN policy, where the
-	// cluster has one, narrows it further.
+	// internet on 443 less the private, carrier-grade and link-local
+	// ranges (teamsInboundEgressExcept), the same list the agent's egress
+	// policy carries; the FQDN policy, where the cluster has one, narrows it
+	// further.
 	teamsInboundAnyIPv4 = "0.0.0.0/0"
 
 	// The receiver's environment, as a2a/teamsinbound reads it.
@@ -106,6 +108,11 @@ const (
 	// is never unfenced.
 	teamsInboundFenceIndex = 3
 )
+
+// teamsInboundEgressExcept keeps the receiver's internet rule off every
+// in-cluster and private address: the API server's ClusterIP, the pods, the
+// nodes, the metadata server. Not a const: Go has no constant slices.
+var teamsInboundEgressExcept = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"}
 
 // teamsInboundEnabled reports whether the receiver is on: Teams enabled, the
 // inbound half enabled, and a tenant to pin (the CRD rule requires it; this
@@ -286,9 +293,9 @@ func buildTeamsInboundService(agent *agentv1alpha1.PlatformAgent) *corev1.Servic
 // public port from anywhere, since the Ingress controller or load balancer
 // that fronts it is the cluster owner's and has no label this policy can
 // name; and the status port from the collector's namespace. Egress: the
-// cluster's DNS, the broker's port, and 443 to the internet less the
-// metadata server, for Microsoft's key endpoint. Nothing else: not the bus,
-// not the gateway, not the API server.
+// cluster's DNS, the broker's port, and 443 to the internet less every
+// private range, for Microsoft's key endpoint. Nothing else: not the bus,
+// not the gateway, and nothing in-cluster on 443, the API server included.
 func buildTeamsInboundNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -322,7 +329,7 @@ func buildTeamsInboundNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClust
 					Ports: []networkingv1.NetworkPolicyPort{tcpPort(teamsInboundHTTPSPort)},
 					To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{
 						CIDR:   teamsInboundAnyIPv4,
-						Except: []string{metadataResolverCIDR},
+						Except: teamsInboundEgressExcept,
 					}}},
 				},
 			},

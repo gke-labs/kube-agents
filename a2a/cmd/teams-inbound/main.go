@@ -23,8 +23,9 @@ const (
 	shutdownGrace = 10 * time.Second
 	// headerTimeout bounds a slow client's headers on the public listener.
 	headerTimeout = 10 * time.Second
-	// warmTimeout bounds the startup read of Microsoft's signing keys; a
-	// failure is logged and the first request fetches again.
+	// warmTimeout bounds the startup read of Microsoft's signing keys
+	// (Verifier.Warm runs its fetch on this context); a failure is logged
+	// and the first request fetches again.
 	warmTimeout = 15 * time.Second
 )
 
@@ -53,15 +54,21 @@ func main() {
 	go func() { errs <- status.ListenAndServe() }()
 	log.Info("teams inbound: listening", "public", cfg.Listen, "status", cfg.StatusListen, "relay", cfg.RelayURL)
 
+	failed := false
 	select {
 	case <-ctx.Done():
 	case err := <-errs:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("teams inbound: a listener failed", "err", err)
+			failed = true
 		}
 	}
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancelShutdown()
 	_ = public.Shutdown(shutdownCtx)
 	_ = status.Shutdown(shutdownCtx)
+	if failed {
+		// A listener that could not bind is a crashed pod, not a completed one.
+		os.Exit(1)
+	}
 }

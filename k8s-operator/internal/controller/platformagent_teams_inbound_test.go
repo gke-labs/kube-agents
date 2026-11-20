@@ -178,14 +178,14 @@ func TestBuildTeamsInboundServiceAndNetworkPolicy(t *testing.T) {
 			case credentialProxyPort:
 				brokerRule = len(rule.To) == 1 && rule.To[0].PodSelector != nil
 			case teamsInboundHTTPSPort:
-				internetRule = len(rule.To) == 1 && rule.To[0].IPBlock != nil && rule.To[0].IPBlock.CIDR == teamsInboundAnyIPv4 && rule.To[0].IPBlock.Except[0] == metadataResolverCIDR
+				internetRule = len(rule.To) == 1 && rule.To[0].IPBlock != nil && rule.To[0].IPBlock.CIDR == teamsInboundAnyIPv4 && len(rule.To[0].IPBlock.Except) == 5 && rule.To[0].IPBlock.Except[0] == "10.0.0.0/8"
 			case a2aDNSPort:
 				dnsRule = len(rule.To) > 0
 			}
 		}
 	}
 	if !brokerRule || !internetRule || !dnsRule {
-		t.Fatalf("egress must be DNS, the broker and 443 to the internet less the metadata server: broker=%v internet=%v dns=%v", brokerRule, internetRule, dnsRule)
+		t.Fatalf("egress must be DNS, the broker and 443 to the internet less the private ranges: broker=%v internet=%v dns=%v", brokerRule, internetRule, dnsRule)
 	}
 	for _, rule := range np.Spec.Egress {
 		for _, to := range rule.To {
