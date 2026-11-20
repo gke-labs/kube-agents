@@ -5788,7 +5788,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-e607ac3d
+  name: platformagent-a2a-provision-e2279e6d
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6022,29 +6022,29 @@ spec:
               so a restarted one can still read\n# every lease it has to re-adopt or fail.\n$NATS
               kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1
               --replicas=\"${STREAM_REPLICAS}\" --storage=file --max-bucket-size=67108864\n\n#
-          SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the\n#
-          report and whether and where it was posted (a2a/gateway/scheduled_reports.go;\n#
-          docs/designs/scheduling-on-profiles.md section 4). Written only by the\n#
-          gateway, before any post, so a run is on record whether it posts or not.\n#
-          History 1: each record moves through its statuses in place, and only the\n#
-          last is read. It is the durable record later readers enumerate, so the max\n#
-          age is long, 90 days, rather than none: KV is discard=new, and a bucket
-          with\n# no age would fill and refuse every later run's record, which posts
-          nothing.\n# The gateway cuts a report at 24KiB, and a value is capped at
-          256KiB, room\n# for that report's JSON escaping at its worst; a full-size
-          record is about\n# 25KB, so 256MiB holds about ten thousand, over a hundred
-          runs a day for the\n# 90 days.\n$NATS kv info SCHEDULED_REPORTS >/dev/null
-          2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas=\"${STREAM_REPLICAS}\"
-          --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h\n\n#
-          SCHEDULE_THREADS: the home-channel thread each schedule posts into for one\n#
-          UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;\n#
-          docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read\n#
-          only by the gateway, so a failover keeps posting into the day's thread.\n#
-          History 1; a 48h max age keeps a day's entry past its day and then drops\n#
-          it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a\n#
-          value is capped at 4KiB.\n$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1
-          || $NATS kv add SCHEDULE_THREADS --history=1 --replicas=\"${STREAM_REPLICAS}\"
-          --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h\n\n#
+              SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the\n#
+              report and whether and where it was posted (a2a/gateway/scheduled_reports.go;\n#
+              docs/designs/scheduling-on-profiles.md section 4). Written only by the\n#
+              gateway, before any post, so a run is on record whether it posts or not.\n#
+              History 1: each record moves through its statuses in place, and only the\n#
+              last is read. It is the durable record later readers enumerate, so the max\n#
+              age is long, 90 days, rather than none: KV is discard=new, and a bucket
+              with\n# no age would fill and refuse every later run's record, which posts
+              nothing.\n# The gateway cuts a report at 24KiB, and a value is capped at
+              256KiB, room\n# for that report's JSON escaping at its worst; a full-size
+              record is about\n# 25KB, so 256MiB holds about ten thousand, over a hundred
+              runs a day for the\n# 90 days.\n$NATS kv info SCHEDULED_REPORTS >/dev/null
+              2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+              --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h\n\n#
+              SCHEDULE_THREADS: the home-channel thread each schedule posts into for one\n#
+              UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;\n#
+              docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read\n#
+              only by the gateway, so a failover keeps posting into the day's thread.\n#
+              History 1; a 48h max age keeps a day's entry past its day and then drops\n#
+              it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a\n#
+              value is capped at 4KiB.\n$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1
+              || $NATS kv add SCHEDULE_THREADS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+              --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h\n\n#
               PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task\n# (a2a.submit.<profile>.<tier>.<kind>.<task>),
               published by the gateway and\n# held by the dispatcher on the operator's
               durables (contract on #3655). It is\n# its own stream so that the operator
@@ -6302,8 +6302,13 @@ spec:
               the bridge sidecar with fewer workers where\n  # it declared more than the
               default, or recreates the stream, and\n  # provisioning does none of those.
               Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              which is\n  # usually not 2, so an unexpected failure stays on the retry
+              budget. The\n  # bus reshape treats a Job failed on this exit as provisioned
+              for a\n  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth),
+              and\n  # checks the bus holds every stream besides, since a shell error
+              can exit\n  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate
+              keeps this the\n  # script's only explicit exit 2.\n  exit 2\nfi\n\necho
+              \"a2a provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp

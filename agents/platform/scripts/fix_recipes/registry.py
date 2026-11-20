@@ -5,9 +5,11 @@ the fleet-audit check that finds the problem (`no-pdb/recipe.yaml`). The
 rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
 (`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
+A recipe's safety checks are its `checks.py`, which the broker's label gate
+loads through :func:`checks_module`.
 Those are the lists; the code that handles one kind's fix is still per kind
 (`automerge_eligibility.FIX_TYPE`, `post_merge_check.DIRECT_OBJECTS`,
-`audit_report.GENERATED_FIX_CHECK`, `recheck.RECHECKS`), so a recipe alone
+`audit_report.GENERATED_FIX_CHECK`), so a recipe alone
 gets a dial row and post-merge records but no broker label.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
@@ -19,27 +21,37 @@ rather than a kind that silently drops out.
 
 Fields: `kind` (the directory's name), `name` (what text kube-agents writes
 calls the fixes), `title` and `dial_environment` (the dial's row), and the
-optional `owner` and `eval_case` (the end-to-end case that grades the fix on
-the cluster after merge).
+optional `owner`, `eval_case` (the end-to-end case that grades the fix on the
+cluster after merge), and `recheck_kinds` and `recheck_siblings`: the kubectl
+kinds the one-finding re-check reads in the target namespace (separated by
+commas, as `kubectl get` takes them), and the collector checks a fix could
+trip (separated by spaces); `recheck.py` builds its
+`RECHECKS` from them.
 """
 
 from __future__ import annotations
 
 import functools
+import importlib.util
 import json
 import re
+from types import ModuleType
 from pathlib import Path
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 RECIPE_FILE = "recipe.yaml"
+#: A recipe's safety checks: `read_kinds` (one namespace read) and
+#: `checks(change, live)`, each result named and `pass`, `fail` or `unknown`.
+CHECKS_FILE = "checks.py"
 # Larger than any recipe; a cap so a stray file costs a glance to refuse.
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
-OPTIONAL = ("owner", "eval_case")
+OPTIONAL = ("owner", "eval_case", "recheck_kinds", "recheck_siblings")
 # The same shapes `automation_rules` accepts for a rule's `fix` and `environments`.
 KIND_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ENVIRONMENT_RE = re.compile(r"[a-z0-9]([-_a-z0-9]{0,61}[a-z0-9])?")
+_KUBECTL_KIND_RE = re.compile(r"[a-z][a-z0-9]*(\.[a-z0-9.-]+)?")
 _LINE_RE = re.compile(r"([a-z_]+):[ \t]+(.*)")
 # Plain values YAML reads as something other than a string: refused rather
 # than kept as text a YAML reader would disagree with.
@@ -57,6 +69,12 @@ class Recipe(NamedTuple):
     dial_environment: str
     owner: str = ""
     eval_case: str = ""
+    recheck_kinds: str = ""
+    recheck_siblings: str = ""
+
+    def siblings(self) -> tuple[str, ...]:
+        """The collector checks the fix could trip, in the order the re-check runs them."""
+        return tuple(self.recheck_siblings.split())
 
 
 def _value(raw: str, where: str) -> str:
@@ -105,6 +123,12 @@ def parse(text: str, where: str = RECIPE_FILE) -> Recipe:
         raise RecipeError(f"{where}: missing `{missing[0]}`")
     if not KIND_RE.fullmatch(fields["kind"]):
         raise RecipeError(f"{where}: `kind` must be a check id such as `no-pdb`")
+    if fields.get("recheck_siblings") and not fields.get("recheck_kinds"):
+        raise RecipeError(f"{where}: `recheck_siblings` needs `recheck_kinds`")
+    if not all(KIND_RE.fullmatch(s) for s in fields.get("recheck_siblings", "").split()):
+        raise RecipeError(f"{where}: `recheck_siblings` must be check ids separated by spaces")
+    if not all(_KUBECTL_KIND_RE.fullmatch(k) for k in fields.get("recheck_kinds", "").split(",") if fields.get("recheck_kinds")):
+        raise RecipeError(f"{where}: `recheck_kinds` must be kubectl resource names separated by commas")
     if not ENVIRONMENT_RE.fullmatch(fields["dial_environment"]):
         raise RecipeError(f"{where}: `dial_environment` must be an environment label value such as `dev`")
     return Recipe(**fields)
@@ -131,3 +155,26 @@ def recipes() -> tuple[Recipe, ...]:
 
 def kinds() -> frozenset[str]:
     return frozenset(recipe.kind for recipe in recipes())
+
+
+@functools.lru_cache(maxsize=None)
+def checks_module(kind: str) -> ModuleType | None:
+    """The `checks.py` of a known kind, imported once; None for a kind whose recipe ships none.
+
+    Loaded from its file rather than imported by name, because a kind is a
+    directory named like `no-pdb`, which no `import` statement can name.
+    """
+    if kind not in kinds():
+        raise RecipeError(f"{kind!r} is not a known kind of fix")
+    path = HERE / kind / CHECKS_FILE
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(f"fix_recipes.{kind.replace('-', '_')}.checks", path)
+    if spec is None or spec.loader is None:
+        raise RecipeError(f"{kind}/{CHECKS_FILE} cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in ("read_kinds", "checks"):
+        if not hasattr(module, name):
+            raise RecipeError(f"{kind}/{CHECKS_FILE} has no `{name}`")
+    return module

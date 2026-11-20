@@ -272,6 +272,18 @@ def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck,
     return seen
 
 
+#: What each step was doing, in the words the chat failure line uses (never the step's internal name).
+STEP_TASKS = {
+    "notice": "checking which fixes merged",
+    "edited": "checking who edited each fix",
+    "health": "reading the clusters",
+    "outcomes": "deciding the outcomes",
+    "environments": "reading each fix's environment",
+    "reports": "commenting the outcomes",
+    "followups": "following up on the outcomes",
+    "reverts": "watching for reverts",
+}
+
 #: A step run on the connection alone, so a caller can replace one.
 Step = Callable[[sqlite3.Connection], dict]
 
@@ -298,8 +310,10 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
     When the install's declared scope cannot be read, no step that reads a
     cluster runs, and nothing is decided or followed up; merges are still
     noticed and outcomes already reached are still reported. A step that
-    raises is kept under its name as ``{"errors": [...]}`` and the steps after
-    it still run. Each step reads at most ``limit`` records,
+    raises is kept under its name as ``{"errors": [<what it was doing>],
+    "fault": <the exception>}``: the error names the task in plain words
+    (:data:`STEP_TASKS`) for the chat line, and only the run's log carries the
+    fault. The steps after it still run. Each step reads at most ``limit`` records,
     ``post_merge_check.reads_per_tick()`` when not given.
 
     The run stops starting work once ``budget`` (:data:`RUN_BUDGET`) has passed
@@ -341,7 +355,9 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
             seen[name] = run()
         except Exception as exc:  # noqa: BLE001 — one step's fault must not stop the others
             logger.warning("post-merge check: the %s step failed: %r", name, exc)
-            seen[name] = {"errors": [f"{type(exc).__name__}: {exc}"[:300]]}
+            # The chat line names the step, never the exception's text (no plumbing in chat, and a
+            # text that varies between runs would get past the once-a-day limit); the run's log keeps it.
+            seen[name] = {"errors": [STEP_TASKS.get(name, name)], "fault": f"{type(exc).__name__}: {exc}"[:300]}
 
     step("notice", lambda: post_merge_check.notice_merges(conn, view, now, limit))
     step("edited", lambda: fill_edited(conn))
@@ -355,7 +371,8 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
             recheck = recheck or post_merge_scope.sandbox_recheck(scope, kubeconfigs)
         except Exception as exc:  # noqa: BLE001 — an unknown scope reads no cluster
             logger.warning("post-merge check: the install's scope could not be read; no cluster is read: %r", exc)
-            seen["scope"] = {"errors": [f"the install's scope could not be read: {exc}"[:300]]}
+            seen["scope"] = {"errors": ["reading this install's declared scope"],
+                             "fault": f"{type(exc).__name__}: {exc}"[:300]}
             scope_read = False
     if scope_read:
         refusal, rechecker = scope_refusal, recheck
