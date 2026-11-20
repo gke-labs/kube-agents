@@ -376,6 +376,19 @@ func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *
 	}
 }
 
+// inferencePairUnchanged reports whether a write held by the pruning record would change
+// nothing the served CRD keeps. With the whole block pruned the served value is absent or
+// empty, so nothing stale can stand and the hold is safe. With the effort alone pruned
+// the served value still carries the pair, so the hold is safe only while that pair is
+// the new value's: a provider or model change, or a negative, writes at once, and only
+// the effort waits for the reprobe.
+func inferencePairUnchanged(served, next *agentv1alpha1.InferenceStatus) bool {
+	if served == nil || *served == (agentv1alpha1.InferenceStatus{}) {
+		return true
+	}
+	return next != nil && served.Provider == next.Provider && served.Model == next.Model
+}
+
 // inferenceStatusEqual reports whether two status.inference values serialise the same:
 // both absent, or both present with the same pair.
 func inferenceStatusEqual(a, b *agentv1alpha1.InferenceStatus) bool {

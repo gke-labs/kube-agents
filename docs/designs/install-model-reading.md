@@ -208,9 +208,12 @@ first-qualified scan answered the model, whose entry that reader does not know.
 
 A served CRD from before the field keeps the pair and prunes the effort, so the Ready writer's
 echo rule gains a case: a pair that comes back as written with the effort alone dropped is pruning,
-recorded under the block's one record, and the five-minute reprobe holds as for the block. Without
-it an operator newer than its CRD would write the status on every reconcile. Under that skew the
-summary prints `unset` for the install; it makes no extra ConfigMap read to tell the two apart.
+recorded under the block's one record. Without it an operator newer than its CRD would write the
+status on every reconcile. The record holds a write only while it would change nothing the served
+CRD keeps: with the block pruned nothing is served, so the five-minute reprobe holds as before; with
+the effort alone pruned the pair is served, so a provider or model change, or a negative, writes at
+once and only the effort waits for the reprobe. Under that skew the summary prints `unset` for the
+install; it makes no extra ConfigMap read to tell the two apart.
 
 Out of scope, as for the pair: the fallback alias's own effort, `max_tokens`, a request's own
 `reasoning_effort` (which wins over the configured one), and what each provider maps the value to.

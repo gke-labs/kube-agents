@@ -731,3 +731,51 @@ func TestUpdateStatusReadyRecordsAPrunedReasoningEffort(t *testing.T) {
 		t.Errorf("%d writes on an unchanged pass, want 3", counter.writes)
 	}
 }
+
+// Under an effort-only record the served status still carries the pair, so a pair change
+// (and a negative) must write at once; only the effort waits for the reprobe.
+func TestUpdateStatusReadyWritesAPairChangeUnderAnEffortOnlyRecord(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	counter := &statusWriteCounter{}
+	funcs := counter.interceptors()
+	persist := funcs.SubResourceUpdate
+	funcs.SubResourceUpdate = func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && pa.Status.Inference != nil {
+			pa.Status.Inference.ReasoningEffort = ""
+		}
+		return persist(ctx, cl, subResourceName, obj, opts...)
+	}
+	cm := litellmConfigMap("litellm-config", time.Now(), "gemini/gemini-3.5-flash")
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "gemini/gemini-3.5-flash", "reasoning_effort: high")
+	r := inferenceReconciler(t, &funcs, agent, cm)
+
+	settleReady(t, r, agent)
+	if !r.inferencePruned(agent) || counter.writes != 1 {
+		t.Fatalf("fixture: pruned=%v writes=%d, want true and 1", r.inferencePruned(agent), counter.writes)
+	}
+
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "anthropic/claude-opus-5", "reasoning_effort: high")
+	if err := r.Update(context.Background(), cm); err != nil {
+		t.Fatal(err)
+	}
+	settleReady(t, r, agent)
+	want := &agentv1alpha1.InferenceStatus{Provider: "anthropic", Model: "claude-opus-5"}
+	if counter.writes != 2 || !inferenceStatusEqual(agent.Status.Inference, want) {
+		t.Fatalf("after the pair changed under an effort-only record: %d writes, status.inference=%+v; want 2 and %+v", counter.writes, agent.Status.Inference, want)
+	}
+	if !r.inferencePruned(agent) {
+		t.Error("the effort is still pruned and the record was dropped")
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 2 {
+		t.Errorf("%d writes on an unchanged pass under the record, want 2", counter.writes)
+	}
+
+	if err := r.Delete(context.Background(), cm); err != nil {
+		t.Fatal(err)
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 3 || !inferenceStatusEqual(agent.Status.Inference, &agentv1alpha1.InferenceStatus{}) {
+		t.Fatalf("after the ConfigMap was deleted under the record: %d writes, status.inference=%+v; want 3 and the empty object", counter.writes, agent.Status.Inference)
+	}
+}

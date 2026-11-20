@@ -5451,8 +5451,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The install's default model, read from its LiteLLM config, with the reasoning
 	// effort its entry states (empty on a found read when it states none). A negative
 	// clears every field; a failed read keeps what the status carries, so a transient
-	// error never blanks it. Gated like activeInterfaces while the served CRD
-	// prunes the block or the effort.
+	// error never blanks it. While the served CRD prunes the block the write is held
+	// like activeInterfaces; while it prunes the effort alone, only a write that would
+	// change nothing the CRD keeps is held (inferencePairUnchanged).
 	newInference := agent.Status.Inference
 	switch model, read := r.readInferenceModel(ctx, agent); read {
 	case inferenceReadFound:
@@ -5460,7 +5461,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	case inferenceReadNegative:
 		newInference = &agentv1alpha1.InferenceStatus{}
 	}
-	inferenceUnchanged := r.inferencePruned(agent) || inferenceStatusEqual(agent.Status.Inference, newInference)
+	inferenceUnchanged := inferenceStatusEqual(agent.Status.Inference, newInference) ||
+		(r.inferencePruned(agent) && inferencePairUnchanged(agent.Status.Inference, newInference))
 
 	resolvedUniverseDomain, universeDomainSource := r.resolvedUniverseDomainPair(ctx, agent)
 	universeDomainUnchanged := r.universeDomainPruned(agent) ||
