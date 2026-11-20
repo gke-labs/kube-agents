@@ -573,18 +573,6 @@ func fnmatchRegexp(pattern string) string {
 	return b.String()
 }
 
-// requesterTier is the tier a profile task runs at for this requester, until
-// the PlatformAgent's membership mapping exists (the contract on #3655,
-// addendum 1): read for a person at any door, and a refusal for a requester
-// with no attested identity. Unattended is a named trigger's tier, and no
-// trigger submits through the gateway yet.
-func requesterTier(r TaskRequester) (capability.Tier, error) {
-	if strings.TrimSpace(r.Subject) == "" {
-		return "", refused(noticeProfileNoIdentity)
-	}
-	return capability.TierRead, nil
-}
-
 // profileRouteFor resolves addressee and params to the route a task takes:
 // the resolved profile, the target checked against the install's scope, and
 // the grant's scope (spec-profiles-dispatch.md, "Addressing", steps 1 to 3).

@@ -372,7 +372,7 @@ func (m *migrationRig) snapshotKept() {
 	if err := m.cl.Status().Update(ctx, pvc); err != nil {
 		m.t.Fatal(err)
 	}
-	digests, _ := parseBusDigests(validDigests())
+	digests, _ := parseBusDigests(validDigests(), a2aBusMigrationStreams())
 	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(m.agent, 1)})
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}, Data: map[string][]byte{busMigrationRunKey: body}}
 	m.own(sec)
@@ -474,7 +474,7 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	if err := json.Unmarshal(secret.Data[busMigrationRunKey], &run); err != nil {
 		t.Fatal(err)
 	}
-	wantDigests, _ := parseBusDigests(validDigests())
+	wantDigests, _ := parseBusDigests(validDigests(), a2aBusMigrationStreams())
 	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(m.agent, 1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
 		t.Errorf("run Secret %+v, owners %v", run, secret.OwnerReferences)
 	}
@@ -658,7 +658,7 @@ func TestAFailedRestoreRollsBackNamingItsError(t *testing.T) {
 }
 
 func TestTheHashingReportIsReadStrictly(t *testing.T) {
-	good, refused := parseBusDigests(validDigests())
+	good, refused := parseBusDigests(validDigests(), a2aBusMigrationStreams())
 	if refused != "" || len(good) != len(a2aProvisionedStreams) {
 		t.Fatalf("a valid report refused: %s", refused)
 	}
@@ -690,7 +690,7 @@ func TestTheHashingReportIsReadStrictly(t *testing.T) {
 			c["TASKS"] = busmigrate.StagedDigest{Data: c["TASKS"].Data}
 		}),
 	} {
-		if _, refused := parseBusDigests(msg); refused == "" {
+		if _, refused := parseBusDigests(msg, a2aBusMigrationStreams()); refused == "" {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -1362,7 +1362,13 @@ func TestAStepsJobStopsBeforeItsCredentialExpires(t *testing.T) {
 // provision script, continuations joined, keyed by stream name, as flag maps.
 func provisionCreateLines(t *testing.T) map[string]map[string]string {
 	t.Helper()
-	script := buildA2AProvisionJob(a2aTestAgent()).Spec.Template.Spec.Containers[0].Command[2]
+	return provisionCreateLinesFor(t, a2aTestAgent())
+}
+
+// provisionCreateLinesFor is provisionCreateLines for agent's script.
+func provisionCreateLinesFor(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]map[string]string {
+	t.Helper()
+	script := buildA2AProvisionJob(agent).Spec.Template.Spec.Containers[0].Command[2]
 	script = strings.ReplaceAll(script, "\\\n", " ")
 	lines := map[string]map[string]string{}
 	for _, line := range strings.Split(script, "\n") {
@@ -1454,6 +1460,34 @@ func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 		if !reflect.DeepEqual(p, want) {
 			t.Errorf("%s: policy\n %+v\nscript\n %+v", p.Name, p, want)
 		}
+	}
+}
+
+// TASKS's policy width is the CR's, not the fresh install's: with
+// maxSessions raised it is a2aTasksMaxConsumers(agent), the width the
+// provision script creates TASKS with for that CR, which is the width a
+// one to three restore widens to.
+func TestTheTasksPolicyWidthFollowsTheCR(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: ptr.To(20)}}
+	want := a2aTasksMaxConsumers(agent)
+	if want == a2aTasksMaxConsumers(a2aTestAgent()) {
+		t.Fatalf("maxSessions 20 renders the default width %d; the test can't tell them apart", want)
+	}
+	found := false
+	for _, p := range a2aStreamPolicies(agent, 1) {
+		if p.Name == "TASKS" {
+			found = true
+			if p.MaxConsumers != want {
+				t.Errorf("TASKS policy max_consumers %d, want the CR's %d", p.MaxConsumers, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no TASKS policy")
+	}
+	if got := provisionCreateLinesFor(t, agent)["TASKS"]["max-consumers"]; got != strconv.Itoa(want) {
+		t.Errorf("provision script --max-consumers %q, want %d: the policy and the script disagree", got, want)
 	}
 }
 
@@ -2632,7 +2666,7 @@ func TestAClearFailingPartwayIsRetriedToTheEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.pass(busMigrationRollingBack, 1)
-	if !busMigrationClearedAll(m.agent.Status.BusMigration) {
+	if !busMigrationClearedAll(m.agent.Status.BusMigration, busMigrationGrow) {
 		t.Error("the retried clear did not record every stream")
 	}
 }
@@ -2675,7 +2709,7 @@ func TestEachClearingStartsItsOwnRecord(t *testing.T) {
 	m.agent.Status.BusMigration.Cleared = a2aProvisionedStreams // the forward clear's
 	m.finishPod("restore", corev1.PodFailed, `{"error":"boom"}`, "")
 	m.pass(busMigrationClearing, 3)
-	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration) {
+	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration, busMigrationGrow) {
 		t.Errorf("the way back's Clearing starts with %v cleared", m.agent.Status.BusMigration.Cleared)
 	}
 }

@@ -180,7 +180,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -2819,6 +2819,34 @@ def expand_fleet_cluster_placeholders(prompt: str) -> tuple[str, str | None]:
     return _FLEET_CLUSTER_PLACEHOLDER.sub(value, prompt), None
 
 
+# The job's GitOps repository, for a prompt that has to name it: the
+# version-control skill writes only to the repository its task names, and the
+# repository differs per pool project. Read from BENCH_GITOPS_REPO, which
+# hack/ci-eval-pr.sh exports and the forge checks read (github_writes), so the
+# prompt names the repository the checks grade. Not {{GITOPS_REPO}}: that one
+# is bench/hack/run-gitops-pilot.sh's, rendered into its own task copies.
+GITOPS_REPO_PLACEHOLDER = "{{BENCH_GITOPS_REPO}}"
+
+
+def expand_gitops_repo_placeholder(prompt: str) -> tuple[str, str | None]:
+    """``prompt`` with the job's GitOps repository written in, and the setup
+    problem, if any.
+
+    A prompt that doesn't name the placeholder is returned as it is. One that
+    does needs ``BENCH_GITOPS_REPO``; without it the run is a setup failure the
+    caller records as infrastructure, never the model's.
+    """
+    if GITOPS_REPO_PLACEHOLDER not in prompt:
+        return prompt, None
+    repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
+    if not repo or any(ch.isspace() for ch in repo):
+        return prompt, (
+            f"the case prompt names the job's GitOps repository ({GITOPS_REPO_PLACEHOLDER}), but "
+            f"{github_writes.GITOPS_REPO_ENV_VAR} is {'unset' if not repo else repr(repo)}"
+        )
+    return prompt.replace(GITOPS_REPO_PLACEHOLDER, repo), None
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run where no answer can be graded, recorded as infrastructure.
 
@@ -3192,6 +3220,8 @@ class KubeAgentsHarness(AgentHarness):
         prompt, setup_problem = expand_agent_cluster_placeholders(prompt, os.environ.get("AGENT_CLUSTER_CONTEXT"))
         if setup_problem is None:
             prompt, setup_problem = expand_fleet_cluster_placeholders(prompt)
+        if setup_problem is None:
+            prompt, setup_problem = expand_gitops_repo_placeholder(prompt)
         if setup_problem is not None:
             transcript.set("", [], prompt=prompt, started_at=started_at)
             return _infra_failure(setup_problem)
@@ -4310,8 +4340,14 @@ class KubeAgentsHarness(AgentHarness):
             return "no cancel was published (see the log), so it may still be running"
 
         # The profile fields go only on a turn addressed to a profile, so every
-        # other turn is built exactly as it was before #5945.
-        addressed = {"profile": target.name, "parameters": target.parameters} if target is not None else {}
+        # other turn is built exactly as it was before #5945. The intent goes
+        # only when the directive names it (intent=confirm), so a profile turn
+        # without it is built as it was before too.
+        addressed: dict[str, Any] = (
+            {"profile": target.name, "parameters": target.parameters} if target is not None else {}
+        )
+        if target is not None and target.intent:
+            addressed["intent"] = target.intent
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,

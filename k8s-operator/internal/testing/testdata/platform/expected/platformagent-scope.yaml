@@ -2052,6 +2052,9 @@ spec:
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
               readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
+              readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
               readOnly: true
@@ -2329,6 +2332,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2628,6 +2634,11 @@ spec:
                   audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
         - name: a2a-bus-token
           projected:
             sources:
@@ -5728,6 +5739,7 @@ metadata:
 ---
 apiVersion: v1
 data:
+  gchat_home: ""
   slack_home: ""
 kind: ConfigMap
 metadata:

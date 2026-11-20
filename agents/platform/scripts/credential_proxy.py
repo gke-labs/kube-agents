@@ -3261,6 +3261,27 @@ RULE_REPORT_A2A_REPORTS_KEY = "audit-report.a2a-reports-key"
 # holds none.
 REPORT_A2A_PUBLISH_KEY = "publish"
 
+# Who wrote a stored run (docs/designs/fleet-audit-report-store.md §3). On the
+# PUT of a ring entry the broker relays, it sets REPORT_WRITER_HEADER from the
+# caller it verified (report_writer_for), and the listener keeps it beside the
+# envelope; GET latest and GET runs/<stamp> answer it back, and the broker
+# passes that one header on to the caller. A caller's own header of the name,
+# in any case, is stripped before anything is relayed and never sent on: the
+# relay builds the listener's headers itself. Mirrored from
+# audit_report_store.REPORT_WRITER_*, which a test holds equal.
+REPORT_WRITER_HEADER = "X-Report-Writer"
+REPORT_WRITER_SHELL = "shell"
+REPORT_WRITER_BUILTIN = "builtin-schedule"
+_REPORT_WRITER_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+# Matched whole (fullmatch): `shell`, or `builtin-schedule:<audit id>:<task id>`.
+REPORT_WRITER_RE = re.compile(
+    rf"(?:{REPORT_WRITER_SHELL}|{REPORT_WRITER_BUILTIN}:{_REPORT_WRITER_LABEL}:{_REPORT_WRITER_LABEL})"
+)
+# A write of a ring entry the broker cannot stamp: a profile task whose task id
+# makes no writer. The verifier admits only a DNS-1123 label, so this is a
+# stand-in's claim, refused rather than relayed unstamped.
+RULE_REPORT_WRITER = "audit-report.writer"
+
 # What a store path asks for, by its shape under REPORT_CREDENTIAL_ROUTES:
 # the stream list, one stream's latest, its run index, or one run.
 REPORT_ROUTE_LIST = "list"
@@ -3436,6 +3457,26 @@ def report_write_permitted(
     return RULE_REPORT_REPOSITORY_KEY
 
 
+def report_writer_for(role: Any, task: Any, audit_id: Any) -> str | None:
+    """The writer stamp for a permitted PUT of a ring entry, or None when none can be made.
+
+    From the verified caller alone, never the request's headers: the shell is
+    REPORT_WRITER_SHELL; a profile caller is
+    `builtin-schedule:<audit_id>:<task id>`, with the task id the verified task
+    credential's `task` claim (report_write_permitted has already held its
+    trigger to `audit_id`'s builtin schedule). Every other role is None.
+    """
+    if role == CALLER_ROLE_SHELL:
+        return REPORT_WRITER_SHELL
+    if role == CALLER_ROLE_PROFILE:
+        task_id = getattr(task, "task", None)
+        if isinstance(task_id, str) and isinstance(audit_id, str):
+            writer = f"{REPORT_WRITER_BUILTIN}:{audit_id}:{task_id}"
+            if REPORT_WRITER_RE.fullmatch(writer):
+                return writer
+    return None
+
+
 class ReportStoreUnavailable(Exception):
     """The store, or what a write is checked against, cannot be used now: a 503."""
 
@@ -3599,8 +3640,16 @@ class ReportStoreRelay:
             raise ReportStoreUnavailable("the store token file holds no token")
         return token
 
-    def relay(self, method: str, path: str, body: bytes | None) -> tuple[int, bytes]:
-        """Send one request on and return the listener's (status, body).
+    def relay(
+        self, method: str, path: str, body: bytes | None, writer: str | None = None
+    ) -> tuple[int, bytes, str | None]:
+        """Send one request on and return the listener's (status, body, writer).
+
+        ``writer``, when given, is sent as REPORT_WRITER_HEADER: the stamp the
+        handler made from the verified caller (report_writer_for). The headers
+        sent are built here, so nothing of the caller's request reaches the
+        listener. The writer returned is the listener's REPORT_WRITER_HEADER
+        answer when it is a well-formed writer, else None.
 
         Raises ReportStoreUnavailable when the token cannot be read;
         ReportStoreTimeout when a read times out or the whole exchange outlasts
@@ -3610,11 +3659,15 @@ class ReportStoreRelay:
         those are the listener refusing the broker, not the caller, and are not
         the caller's to read as its own.
         """
+        if writer is not None and not REPORT_WRITER_RE.fullmatch(writer):
+            raise ValueError("not a report writer")
         token = self._token()
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(body))
+        if writer is not None:
+            headers[REPORT_WRITER_HEADER] = writer
         connection_class = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
         connection = connection_class(self.host, self.port, timeout=min(self.timeout, self.deadline))
         expired = threading.Event()
@@ -3636,6 +3689,8 @@ class ReportStoreRelay:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             status = response.status
+            # getheader joins repeats with ", ", which is no writer.
+            answered = response.getheader(REPORT_WRITER_HEADER)
             while len(payload) <= AUDIT_REPORT_MAX_BYTES:
                 chunk = response.read1(65536)
                 if not chunk:
@@ -3661,7 +3716,10 @@ class ReportStoreRelay:
             raise ReportStoreCredentialRefused(f"status {status}")
         if not 200 <= status <= 599:
             raise ReportStoreFault(f"the store answered status {status}")
-        return status, payload
+        if answered is not None and not REPORT_WRITER_RE.fullmatch(answered):
+            LOGGER.warning("the audit-report store answered a %s that is not a writer; not passed on", REPORT_WRITER_HEADER)
+            answered = None
+        return status, payload, answered
 
 
 def report_store_from_env(role: str) -> ReportStoreRelay | None:
@@ -7519,6 +7577,19 @@ class SlackRelay:
         return {"receipt": receipt, **event}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled event: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the event too, and spends the
+        receipt. Nothing retries a failed nack: the gateway nacks once and
+        moves on, and ``pull`` hands out queue entries only, so an event held
+        back here would sit in the receipt table until the pod restarts,
+        never delivered, and the table would grow by one each time. Dropping
+        it loses the same message and leaves nothing behind. The case needs
+        the slot the pull freed to be refilled before the nack: one arrival
+        if the queue was already full, SLACK_EVENT_QUEUE_MAXSIZE if it was
+        empty. A gateway that keeps pulling makes either rare; the warning
+        is the record when it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7527,8 +7598,9 @@ class SlackRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Slack event queue is full; cannot requeue event")
-                    return False
+                    LOGGER.warning(
+                        "Slack event queue is full; the nacked event is dropped, not requeued"
+                    )
             del self._receipts[receipt]
             return True
 
@@ -7896,6 +7968,21 @@ class TeamsRelay:
         return {"event": event, "receipt": receipt}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled activity: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the activity and its attempt
+        count, and spends the receipt, as a nack past
+        TEAMS_MAX_DELIVERY_ATTEMPTS does. Nothing retries a failed nack: the
+        gateway nacks once and moves on, and ``pull`` hands out queue entries
+        only, so an activity held back here would sit in the receipt table
+        until the pod restarts, never delivered, and the table and the
+        attempt map would grow by one each time. Dropping it loses the same
+        message and leaves nothing behind. The case needs the slot the pull
+        freed to be refilled before the nack: one arrival if the queue was
+        already full, TEAMS_EVENT_QUEUE_MAXSIZE if it was empty. A gateway
+        that keeps pulling makes either rare; the warning is the record when
+        it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7914,9 +8001,12 @@ class TeamsRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Teams event queue is full; cannot requeue activity")
-                    return False
-                self._attempts[event_key] = attempts + 1
+                    self._attempts.pop(event_key, None)
+                    LOGGER.warning(
+                        "Teams event queue is full; the nacked activity is dropped, not requeued"
+                    )
+                else:
+                    self._attempts[event_key] = attempts + 1
             else:
                 self._attempts.pop(event_key, None)
             del self._receipts[receipt]
@@ -15186,6 +15276,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         come back. Nothing is relayed on any refusal.
         """
         method, path = self.command, self.path
+        # A caller's own writer header, in any case, is never the stamp: it is
+        # dropped here, and the relay sends only the one made below.
+        caller_headers = getattr(self, "headers", None)
+        if caller_headers is not None:
+            del caller_headers[REPORT_WRITER_HEADER]
         if not report_credential_permits(method, path):
             self._log_audit_report(HTTPStatus.NOT_FOUND, "no-such-route")
             self._refuse_audit_report(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -15196,6 +15291,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         profile = getattr(task, "profile", None) if task is not None else None
         segments = path.split("/")
         write = method in ("PUT", "DELETE")
+        writer: str | None = None
         if write:
             # The install's key is read only for a caller that could pass: a
             # role refused anyway is refused without the ConfigMap read.
@@ -15225,6 +15321,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self.report_profiles,
                 registered,
             )
+            # The PUT of a ring entry carries the writer stamp, made from the
+            # verified caller and nothing the request says.
+            if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN:
+                writer = report_writer_for(role, task, segments[3])
+                if writer is None:
+                    rule = RULE_REPORT_WRITER
         else:
             route = report_route_kind(path)
             key = segments[REPORT_STORE_KEY_SEGMENT] if len(segments) > REPORT_STORE_KEY_SEGMENT else None
@@ -15275,7 +15377,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             if body is None:
                 return
         try:
-            status, payload = store.relay(method, path, body)
+            status, payload, answered_writer = store.relay(method, path, body, writer=writer)
         except ReportStoreUnavailable as exc:
             LOGGER.warning("audit-report store unavailable: %s", exc)
             self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "store-unavailable")
@@ -15317,7 +15419,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return
         self._log_audit_report(status, "relayed")
-        self._write_audit_report_answer(status, payload)
+        self._write_audit_report_answer(status, payload, answered_writer)
 
     def _read_audit_report_body(self) -> bytes | None:
         """A PUT's body, whole and within AUDIT_REPORT_MAX_BYTES, or None once answered."""
@@ -15344,11 +15446,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self._json(status, {"error": message, "code": "AUDIT_REPORT_BODY_REFUSED"})
         return None
 
-    def _write_audit_report_answer(self, status: int, payload: bytes) -> None:
-        """The listener's status and body, framed here: no header of the listener's is passed on."""
+    def _write_audit_report_answer(self, status: int, payload: bytes, writer: str | None = None) -> None:
+        """The listener's status and body, framed here.
+
+        Of the listener's headers only REPORT_WRITER_HEADER is passed on, as
+        ``writer`` (the relay has checked it is a writer); nothing else is.
+        """
         self.connection.settimeout(RESPONSE_WRITE_TIMEOUT_SECONDS)
         try:
             self.send_response(status)
+            if writer is not None:
+                self.send_header(REPORT_WRITER_HEADER, writer)
             # A 204 carries neither a body nor a Content-Length (RFC 9110 §8.6).
             if status != HTTPStatus.NO_CONTENT:
                 if payload:
