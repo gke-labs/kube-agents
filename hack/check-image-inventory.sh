@@ -210,6 +210,8 @@ check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
 check_base_image node a2a/Dockerfile.console NODE_IMAGE NODE_VERSION
 check_base_image golang a2a/Dockerfile.console GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.teams-inbound GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.teams-inbound DISTROLESS_IMAGE DISTROLESS_VERSION
 # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
 # builder base to compare: its runtime base is the platform-agent image of the
 # same build, passed as a build arg with no default, so there is no runtime

@@ -8,7 +8,7 @@ This guide covers configuring the **Microsoft Teams Bot Framework relay** (`spec
 
 The Microsoft Teams integration connects a consumer to the credential broker's Teams relay (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`): the Planning Agent's adapter (`agents/platform/scripts/teams_relay_patch.py` and `agents/chat/plugins/platforms/teams/`) by default, or the A2A chat gateway's `teams` backend when the operator arms it (the bullet below).
 
-### What Ships Today vs. Current Limitations
+### What ships
 
 - **Outbound Bot Framework Relay (Shipped)**: The `credential-proxy` sidecar holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, exchanges them for Microsoft Entra OAuth 2.0 `client_credentials` tokens (`https://api.botframework.com/.default`), caches the token in memory, and forwards outbound activity posts through `POST /v1/chat/teams/api`.
 - **Outbound Egress & Method Guards (Shipped)**: `/v1/chat/teams/api` permits only `POST v3/conversations/<id>/activities` (and activity reply subpaths, excluding `/activities/history`), plus `PUT` on one activity's own path for the gateway's status-line edits, to official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`). Service URLs containing query strings (`?`) or fragments (`#`) are rejected, and HTTP `3xx` redirects are refused so the bot's Bearer token is never forwarded off-host.
@@ -163,4 +163,4 @@ spec:
 
 Then, in the Azure Bot resource, set **Configuration -> Messaging endpoint** to `https://teams.example.com/api/v1/teams/events`. A message typed to the bot in Teams now arrives at the receiver, is verified, and reaches the agent through the broker's queue; the reply comes back the way outbound messages always did. If your ingress can restrict sources, Microsoft publishes the Bot Framework address ranges under the `AzureBotService` service tag.
 
-What the receiver refuses, and with which status: no bearer or a token Microsoft did not sign for this bot (401), a request not from Microsoft Teams or not from the configured tenant (403), an oversized body (413). A request it could not check, because Microsoft's key endpoint did not answer, is a 503 and Bot Framework retries. It counts refusals by reason under `kubeagents_teams_inbound_refusals_total` on its status port.
+What the receiver refuses, and with which status: no bearer or a token Microsoft did not sign for this bot (401), a request not from Microsoft Teams or not from the configured tenant (403), an oversized body (413). A request it could not check, because Microsoft's key endpoint did not answer, is a 503 and Bot Framework retries, as is a request that arrives while the install's Teams queue is full; anything but a POST is a 405, a body that is not a JSON object a 400, and a broker fault a 502. It counts requests by outcome and refusals by reason (`kubeagents_teams_inbound_requests_total`, `kubeagents_teams_inbound_refusals_total`) on its status port, which nothing scrapes by default.

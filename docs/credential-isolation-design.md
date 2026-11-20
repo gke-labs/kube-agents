@@ -262,7 +262,7 @@ for the A2A gateway, and, when the Teams inbound receiver is enabled, `kubeagent
 for that receiver, which reaches one route by one method) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
-install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience
