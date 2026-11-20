@@ -108,7 +108,10 @@ or an alert into the home channel): the transport waits for the bot's newest top
 `<marker>` since the case started, replies under it with the reply, and grades that turn
 ([`bench/kube_agents_bench/slack_transport.py`](../../bench/kube_agents_bench/slack_transport.py)).
 The marker ends at the directive's own `]`, and nothing else may follow on that line. Give each such
-case a marker no other case's post holds. Slack transport only: the other transports refuse it, so
+case a marker no other case's post holds. Only top-level posts are searched, and a scheduled job's
+later reports on a UTC day reply inside its first report's thread (one thread per job per day), so
+mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
+own. Slack transport only: the other transports refuse it, so
 such a case runs on the Slack lane alone and keeps no inject record.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it

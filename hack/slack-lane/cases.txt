@@ -22,6 +22,9 @@
 # prompt, and grades that turn (bench/kube_agents_bench/slack_transport.py,
 # HOME_POST_DIRECTIVE). Give each such case a marker no other case's post
 # holds: the search is bounded by the case's start, not by which case posted.
+# Only top-level posts are searched, and a scheduled job's later reports on a
+# UTC day reply in its first report's thread, so mark a post that opens its
+# thread: the job's first report of the day, or a run under its own job key.
 # Such a case takes no "then:" reply, and keeps no inject record, since only
 # this transport takes the directive. It reads the
 # channel's history with the test user's token, the same scope the thread
