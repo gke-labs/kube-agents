@@ -306,8 +306,9 @@ def local_imports(path: Path, universe: set[str]) -> set[str]:
     """
     if path.is_dir():
         # A package: what its modules import, so a sibling import inside it is
-        # held to the allowlist like a top-level script's.
-        return set().union(*(local_imports(p, universe) for p in sorted(path.glob("*.py"))))
+        # held to the allowlist like a top-level script's. Recursive, so a
+        # recipe's own module (`fix_recipes/<kind>/checks.py`) counts too.
+        return set().union(*(local_imports(p, universe) for p in sorted(path.rglob("*.py"))))
     if path.suffix != ".py":
         return set()
     found = set()

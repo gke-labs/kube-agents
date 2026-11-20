@@ -229,6 +229,53 @@ The broker serves the same seven routes under `/v1/audit-reports` and relays eac
 
 Each stored run records who wrote it. On a `PUT .../runs/{ts}` the broker sets `X-Report-Writer` from the caller it verified: `shell` for the shell, and `builtin-schedule:<audit_id>:<task_id>` for a profile task, the task id being the verified task credential's `task` claim. It strips any `X-Report-Writer` a caller sends, in any case and on every route, and sets that header on nothing else. The listener refuses a run `PUT` with a malformed writer or a builtin writer for another audit (400). A run `PUT` with no writer at all comes from a broker older than this change (the broker and the listener roll independently); it's written with no sidecar, and any old sidecar is dropped, so it reads back unstamped. Otherwise the listener keeps the value beside the envelope as `runs/<ts>.writer`, a small JSON object holding the writer and the SHA-256 of the exact envelope bytes, written inside the same lock with the same fd-relative, no-symlink, atomic discipline and 0644 mode, and pruned with its envelope. `PUT latest` copies the matched run's sidecar to `latest.writer`: the bytes are identical, so the hash is too. `DELETE latest` drops `latest.writer` with it, under the same lock. `GET latest` and `GET runs/{ts}` read the envelope and its sidecar under the store's lock and answer the stored writer as `X-Report-Writer` only when the sidecar's hash is that of the bytes returned, and the broker passes that one header on to the shell, a profile worker or the `a2a-reports` reader, and none of the listener's other headers. So a sidecar never vouches for another envelope. There's no header when the hash doesn't match (a write that landed between the two reads, or an envelope a listener without sidecars rewrote after a rollback), or when there's no readable sidecar: an envelope written before this change, one `finish` wrote to the file store directly, or a sidecar that's a symlink or not a regular file, which is never followed and doesn't fail the envelope's read. The run index and the stream list don't include sidecars, and an envelope's bytes are never changed. A seeded envelope comes in through the shell, so it's stamped `shell`. The A2A gateway's relay (#6133) trusts a report only when the writer is `builtin-schedule:<audit_id>:<task_id>` naming its own task. The stamp records what the broker verified. It doesn't defend against the `platform-agent` container, which writes this volume as the same user and could write a sidecar as easily as an envelope.
 
+The fleet-audit scripts use that broker store when `FLEET_AUDIT_REPORT_STORE` is `broker`, and the
+file store above otherwise, as before the switch existed. No install sets it yet: the operator change
+that renders `broker` on the shell sandbox's `shell` container and on every profile worker, never on
+the gateway's `platform-agent` container (whose shell writes the file store on the volume the
+listener serves), is a separate change (#6110), which also moves the evaluation cases that plant
+into the sandbox's local store. `audit_report.py`,
+`report_status.py` and `report_query.py` read and write the same names (`latest.json` and the ring's
+`<stamp>.json`) by the key `report_store_key` gives, which a test holds equal to the scripts' own.
+The client is `report_status.py`'s, standard library only, so the status view can still stream it
+into a pod. It sends each request to `CREDENTIAL_PROXY_URL` with the bearer from `CREDENTIAL_PROXY_TOKEN_FILE`, read
+fresh per call, and the task credential from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` when there is one,
+under `credential_proxy_client`'s rule. Each script logs one line on stderr naming the store and
+why (`report store: broker <url> (FLEET_AUDIT_REPORT_STORE=broker)`), and never a token;
+`audit_report.py` stays silent with the switch unset, so `finish`'s output is unchanged there.
+Everything in §2 holds through it: the ring entry is written first and `latest` as its byte copy,
+the listener prunes, `finish` drops `latest` before each ledger rewrite and after a failed write,
+and the readers flag a missing `latest` or a newer ring entry. A 404 is a missing file only when its body is the listener's `{"error": "not found"}`, which the
+broker relays whole. Any other 404 (the broker's own `not_found`, as a broker that predates the
+routes answers every one, or the listener's `no such route`), a 3xx, a 502, 503 or 504, or no answer
+is a store that cannot be used now, which a write logs as a warning without
+changing the exit code and a read treats as unreadable, so a run over it has a lost memory rather
+than a first run. That includes a ring whose listing fails, or whose entries all fail to read, behind a
+missing or marked `latest`. The in-flight notes and the precheck digest stay in the pod's scratch directory.
+
+The sandbox's own file store holds every run from before the switch, and the broker store starts
+empty. So the first time a script touches a stream through the broker (a read, or a write) while the
+pod's local root holds it with no `.seeded-to-broker` marker, the script copies it in. It holds an
+flock on the local stream directory throughout, and looks for the marker again once it has it, so two
+seeds on the pod, or a seed and a `finish` there (whose writes seed first), take turns. When the
+broker's ring is empty, or holds only stamps the local ring holds (a seed that stopped part way), the
+local entries it lacks and that are newer than its newest go oldest first. Then `latest.json` goes,
+only when it is a byte copy of the newest local entry and, checked again just before the write, the
+broker's newest ring entry is that same run and it has no other `latest`: a run that landed through
+the broker meanwhile (a profile worker takes no local lock) keeps its own, so a seed never rolls
+`latest` back. Then the script leaves the marker so the copy never repeats, and logs one line for the
+stream. When the broker's ring holds a run the local one does not, a run has written the stream since:
+nothing is copied, and the marker is left only when every local entry is already in the broker. A
+stream the broker refuses to take (a 403: a repository the install does not register) is skipped and
+logged with no marker, so a later registration can still seed it. A store that cannot be used now
+fails the read or write that started the seed, as an outage, and the next touch in the same process
+seeds again: a run's write never lands on a stream half copied, where the broker's ring would then hold
+a stamp the local one lacks and the rest of the local history would never be copied. Any other
+failure leaves no marker, so the next run resumes where it stopped. The copy is idempotent and never deletes or changes
+a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
+worker has no local store, so nothing is seeded there. The known limit: the copied envelopes are as
+trustworthy as today's file store, which the agent can write; the seed is not attested.
+
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it
 creates to the owner of the nearest directory that already existed. Mode alone would not do: the
