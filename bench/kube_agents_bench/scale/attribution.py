@@ -364,25 +364,45 @@ def join(stores: dict[str, Any], caps: tuple[str, ...]) -> Join:
     return result
 
 
+def call_sessions(stores: dict[str, Any]) -> set[str]:
+    """The sessions whose span calls stand in for their state.db row.
+
+    The span store is a rolling buffer, so a read after a long run has lost the oldest calls. A
+    session's calls stand in only when they hold at least its row's tokens, or when it has no row
+    because it never reached state.db; every other session keeps its row.
+    """
+    held: dict[str, int] = {}
+    for _profile, sid, _minute, _n, input_all, _cached, output in stores.get("calls") or []:
+        if sid:
+            held[sid] = held.get(sid, 0) + input_all + output
+    rows = {s["id"]: s for s in stores.get("sessions", [])}
+    return {sid for sid, total in held.items()
+            if sid not in rows or total >= sum(v for k, v in tokens(rows[sid]).items() if k != "reasoning")}
+
+
 def attribute(stores: dict[str, Any], start: float, end: float, litellm: dict[str, float] | None = None,
               caps: tuple[str, ...] | None = None) -> dict[str, Any]:
     """One window's tokens by capability, the overview rows, and the two checks.
 
-    With the span store's calls (``stores["calls"]``), each call counts in the minute it was
-    made; without them, a session counts in the window it started in. ``litellm`` is the window's
-    counter growth (``tokens_input`` including cached input, ``tokens_cached``,
-    ``tokens_output``), as the sized run's measurements record it.
+    A session whose calls the span store (``stores["calls"]``) still holds counts call by call, in
+    the minute each was made; any other session counts in the window it started in, from its
+    state.db row (``call_sessions``). ``litellm`` is the window's counter growth
+    (``tokens_input`` including cached input, ``tokens_cached``, ``tokens_output``), as the sized
+    run's measurements record it.
     """
     caps = caps or capabilities()
     joined = join(stores, caps)
     rows: dict[str, dict[str, int]] = {}
     unattributed_rules: dict[str, int] = {}
+    by_calls = call_sessions(stores)
+    used: set[str] = set()
     if stores.get("calls"):
         # Each model call counts in the minute it was made, from the span store's exact usage.
         seen: dict[str, set] = {}
         for profile, sid, minute, n, input_all, cached, output in stores["calls"]:
-            if not start <= minute * 60 < end:
+            if not start <= minute * 60 < end or (sid and sid not in by_calls):
                 continue
+            used.add("calls")
             cap = joined.capability.get(sid, UNATTRIBUTED) if sid else UNATTRIBUTED
             row = rows.setdefault(cap, {**dict.fromkeys(TOKEN_FIELDS, 0), "sessions": 0, "by_profile": {},
                                         "calls": 0})
@@ -398,10 +418,11 @@ def attribute(stores: dict[str, Any], start: float, end: float, litellm: dict[st
                 if cap == UNATTRIBUTED:
                     rule = joined.rules.get(sid, "call with no session id") if sid else "call with no session id"
                     unattributed_rules[rule] = unattributed_rules.get(rule, 0) + 1
-    for session in ([] if stores.get("calls") else stores.get("sessions", [])):
+    for session in stores.get("sessions", []):
         started = float(session.get("started_at") or 0)
-        if not start <= started < end:
+        if session["id"] in by_calls or not start <= started < end:
             continue
+        used.add("sessions")
         cap = joined.capability[session["id"]]
         row = rows.setdefault(cap, {**dict.fromkeys(TOKEN_FIELDS, 0), "sessions": 0, "by_profile": {}})
         kind = profile_kind(session.get("profile"))
@@ -417,7 +438,7 @@ def attribute(stores: dict[str, Any], start: float, end: float, litellm: dict[st
     # What the install's own records hold, before any LiteLLM-only tokens are added below.
     recorded = {"input": sum(r["input"] + r["cached"] for r in rows.values()),
                 "output": sum(r["output"] for r in rows.values()),
-                "source": "calls" if stores.get("calls") else "sessions"}
+                "source": " and ".join(sorted(used)) or "sessions"}
     sum_check = sum_against_litellm(rows, litellm)
     # Model calls made outside any Hermes session (the memory service's, for one) appear in
     # LiteLLM's counters only; the design counts them in Unattributed.
@@ -516,23 +537,25 @@ def memory_by_capability(series: dict[str, list[tuple[float, float]]], stores: d
 
     ``series`` is each container's memory in bytes per sample, ``(time, bytes)``. A container's
     memory above its base is split, sample by sample, among the sessions active in that minute,
-    weighted by their messages in it; live sessions with no message in the minute share it
+    weighted by their model calls in it, or their messages for a session whose calls the span
+    store no longer holds (``call_sessions``); live sessions with no activity in the minute share it
     equally; with no live session it is Unattributed. ``base`` is each container's idle memory,
     held fixed for the period; by default its first sample in the period.
     """
     caps = caps or capabilities()
     joined = join(stores, caps)
     sessions = {s["id"]: s for s in stores.get("sessions", [])}
+    by_calls = call_sessions(stores)
     activity: dict[int, dict[str, float]] = {}
-    if stores.get("calls"):
-        # A minute's excess goes to the sessions that called the model in it, by their calls.
-        for _profile, sid, minute, n, *_usage in stores["calls"]:
-            if sid:
-                activity.setdefault(int(minute), {})[sid] = activity.get(int(minute), {}).get(sid, 0.0) + float(n)
-        sessions = {**{sid: {"id": sid} for m in activity.values() for sid in m}, **sessions}
-    else:
-        for sid, minute, messages, _tokens in stores.get("activity", []):
+    # A minute's excess goes to the sessions active in it: by their model calls where the span store
+    # still holds them (call_sessions), by their messages otherwise.
+    for _profile, sid, minute, n, *_usage in stores.get("calls") or []:
+        if sid in by_calls:
+            activity.setdefault(int(minute), {})[sid] = activity.get(int(minute), {}).get(sid, 0.0) + float(n)
+    for sid, minute, messages, _tokens in stores.get("activity", []):
+        if sid not in by_calls:
             activity.setdefault(int(minute), {})[sid] = activity.get(int(minute), {}).get(sid, 0.0) + float(messages)
+    sessions = {**{sid: {"id": sid} for sid in by_calls}, **sessions}
 
     def live(t: float) -> list[str]:
         return [sid for sid, s in sessions.items()
@@ -570,7 +593,7 @@ def memory_by_capability(series: dict[str, list[tuple[float, float]]], stores: d
     rows.append({"capability": PLATFORM_BASE, "gib_hours": round(base_gib_hours, 4),
                  "share": round(base_gib_hours / total, 4) if total else 0.0, "peak_gib": None})
     return {"rows": rows, "total_gib_hours": round(total, 4),
-            "method": "excess over each container's base, split each minute by the sessions' messages in it"}
+            "method": "excess over each container's base, split each minute by the sessions' model calls or messages in it"}
 
 
 def container_memory(install: Any, start: float, end: float) -> dict[str, list[tuple[float, float]]]:

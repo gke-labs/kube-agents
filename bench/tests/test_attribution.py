@@ -332,13 +332,34 @@ class CallsTest(unittest.TestCase):
         self.assertEqual((row["input"], row["cached"], row["output"]), (100 + 50, 200 + 50, 40))
         self.assertEqual(row["calls"], 5)
         self.assertEqual(row["sessions"], 2)
-        self.assertEqual(record["recorded"], {"input": 400, "output": 40, "source": "calls"})
+        # w-triage has no call in the span store, so its row (started at 130 s) counts as well.
+        self.assertEqual(record["recorded"], {"input": 400 + 90, "output": 40 + 10, "source": "calls and sessions"})
+
+    def test_a_session_whose_calls_the_span_store_lost_keeps_its_row(self):
+        data = self.data()
+        # The cron session's row holds more than its calls: the rolling span store dropped the older ones.
+        data["sessions"][0]["input_tokens"] = 1000
+        self.assertEqual(at.call_sessions(data), {"w-ghost"})
+        row = at.attribute(data, 60, 240, caps=CAPS)["capabilities"]["compliance-audit"]
+        # The cron session, w-audit and child by their rows; w-ghost, which has no row, by its calls.
+        self.assertEqual(row["input"], 1000 + 10 + 10 + (100 - 50))
 
     def test_memory_follows_the_minute_s_calls(self):
         series = {"agent": [(120.0, 2 * at.GIB)]}
         mem = at.memory_by_capability(series, self.data(), 120, 180, base={"agent": at.GIB}, caps=CAPS)
         rows = {r["capability"]: r for r in mem["rows"]}
         self.assertAlmostEqual(rows["compliance-audit"]["gib_hours"], 1 / 60, places=4)
+
+    def test_memory_weighs_a_session_the_span_store_lost_by_its_messages(self):
+        data = self.data()
+        data["sessions"][0]["input_tokens"] = 1000
+        data["activity"] = [["k8s-evt-3f9c88ce", 2, 1, 0], ["cron_compliance-audit_20261111_200909", 2, 4, 0]]
+        series = {"agent": [(120.0, 2 * at.GIB)]}
+        rows = {r["capability"]: r for r in at.memory_by_capability(series, data, 120, 180, base={"agent": at.GIB},
+                                                                     caps=CAPS)["rows"]}
+        # Minute 2 holds the cron session's 4 messages, not its 3 calls, beside the event session's 1 message.
+        self.assertAlmostEqual(rows[at.INCIDENT_TRIAGE]["gib_hours"], 1 / 60 / 5, places=4)
+        self.assertAlmostEqual(rows["compliance-audit"]["gib_hours"], 1 / 60 * 4 / 5, places=4)
 
     def test_the_read_script_takes_only_model_call_spans(self):
         import os
