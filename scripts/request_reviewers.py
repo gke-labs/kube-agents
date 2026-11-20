@@ -27,7 +27,7 @@ a choice it copies the action, including minimatch's rule that `*` and
 not implement raises rather than guessing -- see `validate_config` and
 `glob_to_regex`.
 
-Six things the action never did. A verdict counts as "already reviewed" only
+Seven things the action never did. A verdict counts as "already reviewed" only
 from someone whose approval finishes the pull request: an `OWNERS` approver for
 the changed files (`applicable_approvers`), since only that approval can produce
 the `approved` label, or, when the author's own approval already covers every
@@ -46,13 +46,15 @@ count, and a review request outstanding to one of them is not a reviewer
 already asked. And the bot's third round: a grey check at its third distinct reviewed
 commit (`HANDOFF_ROUNDS`) requests a reviewer anyway, once, and the first request on a pull
 request leaves one hand-off comment (`HANDOFF_MARKER`), the marker being what stops a later grey
-round asking again.
+round asking again. And a reviewer who is away is not drawn: the `REVIEWERS_AWAY` list (`AWAY_ENV`)
+says who and until when, and when it leaves nobody to ask, the one back soonest is asked.
 
 Run: python3 scripts/request_reviewers.py --pr 728 --dry-run
 Test: cd scripts && python3 -m unittest test_request_reviewers
 """
 
 import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -169,6 +171,21 @@ ACTIONS_ENV = "GITHUB_ACTIONS"
 # stdout) and the job's step summary, when Actions provides one.
 WORKFLOW_WARNING_PREFIX = "::warning::"
 STEP_SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
+
+# Reviewers who are away, so that a request is not left with someone who
+# cannot answer it. The workflow hands the list over in this environment
+# variable from the repository secret of the same name -- a secret and not a
+# variable because a step's `env:` is printed in the run log, which on a public
+# repository anyone can read, and a secret is masked there. The value is a JSON
+# list of objects: `login`, `back` (the first day the person reviews again) and
+# optionally `from` (the first day away; without it the person is away
+# already), both dates as `YYYY-MM-DD` and read in UTC. For the same reason
+# the log names who was passed over and never a date, and a warning about an
+# entry names its position in the list and nothing it holds.
+AWAY_ENV = "REVIEWERS_AWAY"
+AWAY_LOGIN_KEY = "login"
+AWAY_FROM_KEY = "from"
+AWAY_BACK_KEY = "back"
 
 # Config keys the action supports and this port does not. Silently ignoring one
 # would hand the reviewer selection a rule nobody applied, so they are refused.
@@ -472,6 +489,72 @@ def matches_any(pattern, paths):
 # --------------------------------------------------------------------------- #
 
 
+def _away_date(entry, key):
+    """The date under `key` of an away-list entry, or None when it is not one."""
+    value = entry.get(key)
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def parse_away(raw, today):
+    """Who the away list says is away on `today`: {lower-cased login: the day they are back}.
+
+    `raw` is the list as `AWAY_ENV` carries it. Everything that goes wrong
+    reads as nobody away, never as a failure: an unset or blank list, one that
+    is not a JSON list, an entry of the wrong shape. A reviewer drawn while
+    away costs a slow review; a run that dies on a typo in the list costs
+    every pull request its reviewer. The malformed cases leave a warning on
+    the run. An entry whose `back` has passed is the list's ordinary state
+    the week after a holiday and is dropped without one. Of two entries for
+    one login that both cover today, the later return stands.
+    """
+    if raw is None or not raw.strip():
+        return {}
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        entries = None
+    if not isinstance(entries, list):
+        log(f"{WORKFLOW_WARNING_PREFIX}{AWAY_ENV} is not a JSON list; treating nobody as away")
+        return {}
+
+    away = {}
+    for position, entry in enumerate(entries, start=1):
+        problem = None
+        if not isinstance(entry, dict):
+            problem = "is not an object"
+        elif not isinstance(entry.get(AWAY_LOGIN_KEY), str) or not is_github_login(entry[AWAY_LOGIN_KEY]):
+            problem = f"has no GitHub login under `{AWAY_LOGIN_KEY}`"
+        else:
+            back = _away_date(entry, AWAY_BACK_KEY)
+            start = _away_date(entry, AWAY_FROM_KEY) if AWAY_FROM_KEY in entry else None
+            if back is None:
+                problem = f"has no YYYY-MM-DD date under `{AWAY_BACK_KEY}`"
+            elif AWAY_FROM_KEY in entry and start is None:
+                problem = f"has no YYYY-MM-DD date under `{AWAY_FROM_KEY}`"
+            elif start is not None and start >= back:
+                problem = f"has a `{AWAY_FROM_KEY}` that is not before its `{AWAY_BACK_KEY}`"
+        if problem:
+            log(f"{WORKFLOW_WARNING_PREFIX}entry {position} of {AWAY_ENV} {problem}; ignoring it")
+            continue
+        if today >= back or (start is not None and today < start):
+            continue
+        login = entry[AWAY_LOGIN_KEY].lower()
+        away[login] = max(back, away.get(login, back))
+    return away
+
+
+def split_away(names, away):
+    """`names` as those who are here and those who are away, the away ones soonest back first."""
+    here = [name for name in names if name.lower() not in away]
+    gone = sorted((name for name in names if name.lower() in away), key=lambda name: away[name.lower()])
+    return here, gone
+
+
 def _expand_groups(names, config):
     """Replace group names with their members. Single level, as the action does."""
     groups = (config.get("reviewers") or {}).get("groups") or {}
@@ -527,7 +610,7 @@ def uncovered_files(approvers_by_file, logins):
     return {path: approvers for path, approvers in approvers_by_file.items() if approvers and not approvers & logins}
 
 
-def draw_covering(pool, approvers_by_file, author, rng=random, fallback=()):
+def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last_resort=()):
     """Approvers drawn from `pool` until every changed file has one asked.
 
     Prow's `approved` is per file, so a reviewer drawn from the union of the
@@ -540,7 +623,10 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=()):
     approves is drawn for from `fallback`, the default reviewers: a change to
     a roster file routes to eval-crew alone, and its root-owned half would
     otherwise get a root approver only while some member happens to be one.
-    A file neither approves is a config shape, logged and left out.
+    A file neither approves is drawn for from `last_resort`, its approvers who
+    are away, soonest back first: the first of them is asked, since a request
+    that waits for a return beats one made of nobody. A file none of the three
+    approves is a config shape, logged and left out.
     """
     uncovered = list(uncovered_files(approvers_by_file, {author.lower()}).values())
     picked = []
@@ -551,6 +637,10 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=()):
             candidates = [name for name in fallback if name.lower() in narrowest]
             if candidates:
                 log(f"Nobody in the pool approves a file only {', '.join(sorted(narrowest))} can; drawing from the default reviewers")
+        if not candidates:
+            candidates = [name for name in last_resort if name.lower() in narrowest][:1]
+            if candidates:
+                log(f"Everyone here who approves a file is away; drawing {candidates[0]}, back soonest")
         if not candidates:
             log(f"Nobody in the pool or the defaults approves a file only {', '.join(sorted(narrowest))} can; not drawing for it")
             uncovered = [logins for logins in uncovered if logins != narrowest]
@@ -563,7 +653,7 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=()):
     return picked
 
 
-def select_reviewers(config, changed_files, author, rng=random, approvers_by_file=None):
+def select_reviewers(config, changed_files, author, rng=random, approvers_by_file=None, away=None):
     """The full selection: globs, then defaults as fallback, then sampling.
 
     `approvers_by_file`, {changed file: lower-cased logins}, is the OWNERS
@@ -579,34 +669,52 @@ def select_reviewers(config, changed_files, author, rng=random, approvers_by_fil
     asking someone who can `lgtm` beats asking nobody, and the log says so.
     `main` declines before the draw when the approver set itself is empty, as
     it is for a pull request with no changed files.
-    """
-    reviewers = reviewers_by_changed_files(config, changed_files, author)
 
-    if not reviewers:
-        reviewers = default_reviewers(config, author)
-        if reviewers:
+    `away`, {lower-cased login: the day they are back} from `parse_away`, is
+    who not to ask today. They leave the pool and the defaults before any
+    draw. Where that leaves nobody -- for the whole pool, or for a file only
+    they approve -- the one back soonest is asked, since a pull request with
+    nobody requested waits on its author and tells nobody.
+    """
+    away = away or {}
+    pool = reviewers_by_changed_files(config, changed_files, author)
+
+    if not pool:
+        pool = default_reviewers(config, author)
+        if pool:
             log("No glob matched; falling back to the default reviewers")
 
+    reviewers, gone = split_away(pool, away)
+    if gone:
+        # In the pool's order, not `gone`'s: the order of return is a date of a kind.
+        log(f"Not drawing {', '.join(name for name in pool if name in gone)}: away")
+    defaults_here, defaults_gone = split_away(default_reviewers(config, author), away)
+
     covering = []
-    if approvers_by_file is not None and reviewers:
+    if approvers_by_file is not None and pool:
         approvers = set().union(*approvers_by_file.values())
         narrowed = [name for name in reviewers if name.lower() in approvers]
-        fallback = [name for name in default_reviewers(config, author) if name.lower() in approvers]
+        fallback = [name for name in defaults_here if name.lower() in approvers]
+        last_resort = split_away(_dedupe(gone + defaults_gone, None), away)[1]
         if narrowed:
             dropped = [name for name in reviewers if name not in narrowed]
             if dropped:
                 log(f"Not drawing {', '.join(dropped)}: not an OWNERS approver for the change")
             reviewers = narrowed
-            covering = draw_covering(reviewers, approvers_by_file, author, rng, fallback)
+            covering = draw_covering(reviewers, approvers_by_file, author, rng, fallback, last_resort)
         else:
             # The glob pool approves none of the files still owed -- after a
             # partial approval, say -- so the defaults are tried before it is
             # drawn from whole.
-            covering = draw_covering([], approvers_by_file, author, rng, fallback)
+            covering = draw_covering([], approvers_by_file, author, rng, fallback, last_resort)
             if covering:
                 reviewers = covering
-            else:
+            elif reviewers:
                 log(f"The pool is {', '.join(reviewers)} and none of them is an OWNERS approver for the change; drawing from it anyway")
+
+    if not reviewers and gone:
+        reviewers = gone[:1]
+        log(f"Everyone in the pool is away; drawing {reviewers[0]}, back soonest")
 
     number = (config.get("options") or {}).get("number_of_reviewers")
     if number is not None and reviewers:
@@ -1149,7 +1257,10 @@ def main(argv=None):
             return 0
 
     rng = random.Random(args.seed) if args.seed is not None else random
-    reviewers = select_reviewers(config, changed_files, author, rng=rng, approvers_by_file=None if self_approved else by_file)
+    away = parse_away(os.environ.get(AWAY_ENV), datetime.datetime.now(datetime.timezone.utc).date())
+    reviewers = select_reviewers(
+        config, changed_files, author, rng=rng, approvers_by_file=None if self_approved else by_file, away=away
+    )
 
     if not reviewers:
         decline(api, args, "no reviewer matched")

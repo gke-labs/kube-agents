@@ -17,6 +17,7 @@ to stop.
 """
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -113,6 +114,10 @@ OWNERS_TREE = {
         "  no_parent_owners: true\n"
     ),
 }
+# The away list's fixtures: a day inside the holidays, and two return dates.
+AWAY_TODAY = datetime.date(2026, 12, 24)
+AWAY_BACK = datetime.date(2027, 1, 5)
+AWAY_BACK_SOONER = datetime.date(2026, 12, 29)
 ROOT_APPROVERS = {"antontyb", "bradhoekstra", "jayantid"}
 ROOT_REVIEWERS = {"bradhoekstra", "lapis2002", "stalhaali"}
 
@@ -556,10 +561,141 @@ class SelectionTest(unittest.TestCase):
             self.assertEqual(len(picked), 1, seed)
             self.assertIn(picked[0], OWNERS, seed)
 
+    def test_a_reviewer_who_is_away_is_never_drawn(self):
+        away = {"bradhoekstra": AWAY_BACK, "fuxiao-gao": AWAY_BACK}
+        for seed in range(60):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(seed), away=away)
+            self.assertNotIn(picked[0], ["bradhoekstra", "Fuxiao-Gao"], seed)
+
+    def test_the_run_log_names_who_is_away_and_never_a_date(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(0), away={"bradhoekstra": AWAY_BACK})
+        self.assertIn("Not drawing bradhoekstra: away", stderr.getvalue())
+        self.assertNotIn(AWAY_BACK.isoformat(), stderr.getvalue())
+
+    def test_an_away_approver_is_not_drawn_for_a_change_that_needs_an_approver(self):
+        approvers = {name.lower() for name in OWNERS}
+        away = {name.lower(): AWAY_BACK for name in OWNERS if name != "haoxuw"}
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(
+                    CONFIG, ["README.md"], "author", rng=random.Random(seed), approvers_by_file={"README.md": approvers}, away=away
+                )
+            self.assertEqual(picked, ["haoxuw"], seed)
+
+    def test_a_pool_that_is_all_away_draws_the_one_back_soonest(self):
+        away = {name.lower(): AWAY_BACK for name in POOL}
+        away["dshnayder"] = AWAY_BACK_SOONER
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                picked = rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(seed), away=away)
+            self.assertEqual(picked, ["dshnayder"], seed)
+        self.assertIn("back soonest", stderr.getvalue())
+        self.assertNotIn(AWAY_BACK_SOONER.isoformat(), stderr.getvalue())
+
+    def test_approvers_who_are_all_away_draw_the_one_back_soonest(self):
+        # eval-crew is two people and only they approve the roster: with both
+        # away, asking the one back first beats asking nobody.
+        by_file = {"hack/eval/presubmit-cases.txt": set(EVAL_CREW)}
+        away = {"jayantid": AWAY_BACK, "lapis2002": AWAY_BACK_SOONER}
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(CONFIG, list(by_file), "author", rng=random.Random(seed), approvers_by_file=by_file, away=away)
+            self.assertEqual(picked, ["lapis2002"], seed)
+
+    def test_an_away_approver_of_one_file_leaves_the_other_file_to_someone_present(self):
+        # The roster half goes to the eval-crew member who is here; the doc
+        # half is hers too only if she approves it, and jayantid, away, is not
+        # asked for either.
+        by_file = {"README.md": {name.lower() for name in OWNERS}, "hack/eval/presubmit-cases.txt": set(EVAL_CREW)}
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(
+                    CONFIG, list(by_file), "author", rng=random.Random(seed), approvers_by_file=by_file, away={"jayantid": AWAY_BACK}
+                )
+            self.assertEqual(picked[0], "lapis2002", seed)
+            self.assertEqual(len(picked), 2, seed)
+            self.assertIn(picked[1], set(OWNERS) - {"jayantid"}, seed)
+
+    def test_no_away_list_draws_as_before(self):
+        for seed in range(20):
+            self.assertEqual(
+                rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(seed), away={}),
+                rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(seed)),
+            )
+
     def test_teams_are_split_from_users(self):
         users, teams = rr.split_teams(["bradhoekstra", "team:sre"])
         self.assertEqual(users, ["bradhoekstra"])
         self.assertEqual(teams, ["sre"])
+
+
+class AwayListTest(unittest.TestCase):
+    """`parse_away`: who the away list says is away on a given day."""
+
+    def parse(self, entries, today=AWAY_TODAY):
+        raw = entries if isinstance(entries, str) else json.dumps(entries)
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            away = rr.parse_away(raw, today)
+        self.log = stderr.getvalue()
+        return away
+
+    def test_an_entry_covering_today_is_away_until_its_back_date(self):
+        away = self.parse([{"login": "BradHoekstra", "from": "2026-12-21", "back": "2027-01-05"}])
+        self.assertEqual(away, {"bradhoekstra": datetime.date(2027, 1, 5)})
+        self.assertEqual(self.log, "")
+
+    def test_an_entry_without_from_is_away_already(self):
+        self.assertEqual(self.parse([{"login": "jayantid", "back": "2027-01-05"}]), {"jayantid": datetime.date(2027, 1, 5)})
+
+    def test_an_entry_that_has_not_started_is_not_away(self):
+        self.assertEqual(self.parse([{"login": "jayantid", "from": "2026-12-25", "back": "2027-01-05"}]), {})
+
+    def test_the_first_day_away_and_the_day_back_are_the_edges(self):
+        entry = [{"login": "jayantid", "from": "2026-12-24", "back": "2026-12-25"}]
+        self.assertEqual(self.parse(entry), {"jayantid": datetime.date(2026, 12, 25)})
+        self.assertEqual(self.parse(entry, today=datetime.date(2026, 12, 25)), {})
+
+    def test_an_entry_whose_back_date_has_passed_is_ignored_quietly(self):
+        self.assertEqual(self.parse([{"login": "jayantid", "back": "2026-12-01"}]), {})
+        self.assertEqual(self.log, "")
+
+    def test_two_entries_for_one_login_keep_the_later_return(self):
+        away = self.parse([{"login": "jayantid", "back": "2027-01-05"}, {"login": "jayantid", "back": "2026-12-29"}])
+        self.assertEqual(away, {"jayantid": datetime.date(2027, 1, 5)})
+
+    def test_an_unset_or_blank_list_is_nobody_away(self):
+        for raw in (None, "", "  \n"):
+            self.assertEqual(self.parse(raw) if raw is not None else rr.parse_away(None, AWAY_TODAY), {})
+
+    def test_a_list_that_does_not_parse_is_nobody_away_and_a_warning(self):
+        for raw in ("{not json", '{"login": "jayantid"}', '"jayantid"'):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.parse(raw), {})
+                self.assertIn(rr.WORKFLOW_WARNING_PREFIX, self.log)
+
+    def test_a_malformed_entry_is_dropped_with_a_warning_and_the_rest_stand(self):
+        good = {"login": "jayantid", "back": "2027-01-05"}
+        for bad in (
+            "jayantid",
+            {"back": "2027-01-05"},
+            {"login": "@jayantid", "back": "2027-01-05"},
+            {"login": "bnaylor"},
+            {"login": "bnaylor", "back": "January"},
+            {"login": "bnaylor", "back": 20270105},
+            {"login": "bnaylor", "from": "soon", "back": "2027-01-05"},
+            {"login": "bnaylor", "from": "2027-01-05", "back": "2027-01-05"},
+        ):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.parse([bad, good]), {"jayantid": datetime.date(2027, 1, 5)})
+                self.assertIn(f"{rr.WORKFLOW_WARNING_PREFIX}entry 1 of", self.log)
+
+    def test_a_warning_never_repeats_what_the_list_holds(self):
+        # The run log is public and the list is not.
+        self.parse([{"login": "bnaylor", "from": "2026-12-21", "back": "2026-12-21"}, {"login": "x y", "back": "2027-01-05"}])
+        for held in ("bnaylor", "2026-12-21", "x y", "2027-01-05"):
+            self.assertNotIn(held, self.log)
 
 
 class OwnersTest(unittest.TestCase):
@@ -1118,6 +1254,44 @@ class MainTest(_MainHarness):
     def test_the_check_run_path_never_reacts(self):
         posts = self.run_main(pull_request(requested_reviewers=[{"login": "jayantid"}]), [])
         self.assertEqual(posts, [])
+
+
+class AwayMainTest(_MainHarness):
+    """`main` with the away list in the environment, on both of the workflow's paths."""
+
+    FAR_BACK = "9999-12-31"
+
+    def away(self, *logins):
+        patcher = mock.patch.dict(os.environ, {rr.AWAY_ENV: json.dumps([{"login": login, "back": self.FAR_BACK} for login in logins])})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_check_run_path_does_not_ask_an_approver_who_is_away(self):
+        # The fixture tree's root approvers are AntonTyb, bradhoekstra and
+        # jayantid, and the live roster holds the last two.
+        self.away("bradhoekstra")
+        self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
+        self.assertEqual(self.requested(), ["jayantid"])
+        self.assertNotIn(self.FAR_BACK, self.stderr.getvalue() + self.stdout.getvalue())
+
+    def test_the_override_does_not_ask_an_approver_who_is_away(self):
+        self.away("jayantid")
+        self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID))
+        self.assertEqual(self.requested(), ["bradhoekstra"])
+        self.assertEqual(self.reaction(), [rr.REACTION_ACKNOWLEDGED])
+
+    def test_the_hand_off_comment_says_nothing_of_who_is_away(self):
+        self.away("bradhoekstra")
+        self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
+        (body,) = [payload["body"] for path, payload in self.api.posts if path == self.HANDOFF]
+        self.assertNotIn("away", body)
+        self.assertNotIn("bradhoekstra", body)
+
+    def test_a_list_that_does_not_parse_requests_as_if_there_were_none(self):
+        with mock.patch.dict(os.environ, {rr.AWAY_ENV: "{not json"}):
+            posts = self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        self.assertIn(rr.WORKFLOW_WARNING_PREFIX, self.stderr.getvalue())
 
 
 class HandoffTest(unittest.TestCase):

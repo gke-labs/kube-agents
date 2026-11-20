@@ -1035,7 +1035,26 @@ who can `/approve`. Of these reasons, `/request-review`
 skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
-naming the reason. A periodic
+naming the reason.
+
+Neither path asks a reviewer who is away. The `REVIEWERS_AWAY` repository secret holds a JSON list
+of who is away and until when, and the script leaves them out of the draw. When everyone who could
+be asked is away, it asks the one back soonest, so a pull request is never left with nobody. A
+request already made stays with its reviewer. A maintainer sets the list, and each set replaces all
+of it:
+
+```bash
+# `back` is the first day the person reviews again; `from` is optional. Dates are UTC.
+gh secret set REVIEWERS_AWAY --repo gke-labs/kube-agents \
+  --body '[{"login":"<login>","from":"2026-12-21","back":"2027-01-05"}]'
+# Nobody away: delete it. A list that is empty or does not parse also reads as nobody away.
+gh secret delete REVIEWERS_AWAY --repo gke-labs/kube-agents
+```
+
+GitHub does not show a secret back, so keep the list you set. The run log names who was passed over
+and never a date.
+
+A periodic
 triage sweep applies the wider rule and messages whoever owns each pull request, both parties on
 one they share; it runs outside this repository (`triage/` in the internal `gke-labs/kube-agents-bot`,
 with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above

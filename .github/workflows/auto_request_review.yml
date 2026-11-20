@@ -12,6 +12,11 @@ name: Auto Request Review
 # none, and the marker in that comment is what keeps the grey-check request
 # from firing again.
 #
+# A reviewer who is away is not drawn. The `REVIEWERS_AWAY` repository secret
+# lists who and until when (the format is beside `AWAY_ENV` in the script);
+# unset, or unreadable, nobody is away. It is a secret because the log of this
+# run is public and prints a step's `env:`, which a secret is masked in.
+#
 # Neither trigger can be a `pull_request` one. Every pull request here comes
 # from a fork, and on a fork pull request `pull_request` and
 # `pull_request_review` hand the workflow a read-only `GITHUB_TOKEN` that
@@ -95,6 +100,7 @@ jobs:
           # Through the environment, not interpolated into the script: event
           # fields are attacker-controlled input on a pull-request trigger.
           CHECK_RUN_ID: ${{ github.event.check_run.id }}
+          REVIEWERS_AWAY: ${{ secrets.REVIEWERS_AWAY }}
         run: |
           python3 scripts/request_reviewers.py --check-run-id "$CHECK_RUN_ID" --require-ai-review-pass
 
@@ -106,5 +112,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.issue.number }}
           COMMENT_ID: ${{ github.event.comment.id }}
+          REVIEWERS_AWAY: ${{ secrets.REVIEWERS_AWAY }}
         run: |
           python3 scripts/request_reviewers.py --pr "$PR_NUMBER" --react-to "$COMMENT_ID"
