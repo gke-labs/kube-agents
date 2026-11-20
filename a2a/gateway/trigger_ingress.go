@@ -313,7 +313,7 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 		Audience: AuthorityAudience{Conversation: rec.Key, Kind: triggerAudienceKind},
 		Trigger:  trigger,
 	}
-	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route)
+	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route, false)
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the task's message could not be built")
 	}
