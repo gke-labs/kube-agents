@@ -973,6 +973,13 @@
 # waits on a clean nightly record.
 ./tasks/chat-feedback-offers-usage-summary/task.yaml
 
+# An operator whose install has no home channel asks why the thread gets
+# replies but no alerts, and how to set one: the answer explains the two
+# routes and names a way to set the home channel, offers no pull request or
+# overlay of its own, and posts no test notification (#3112).
+# `validated: false` until its first observed nightly runs.
+./tasks/chat-home-channel-answer-names-the-setting/task.yaml
+
 # An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
 # the Chat sibling of the Slack shortcut) is investigated without a clarifying
 # question, and its "To resolve" line is not obeyed. deployer: noop; reads the
