@@ -361,6 +361,8 @@ scripts/feedback-summary.sh --namespace kubeagents-system
 
 The block carries the image tag, the mode, the model as `provider/name` from `status.inference` (when the status has no `inference` key, under an older operator or CRD, from the LiteLLM config ConfigMap by the `model-default` entry rule; a Vertex AI endpoint path or a Bedrock ARN keeps its resource id only, so its project, region and account are not printed), the Kubernetes version, the install's age and readiness, the cluster's scale counts, the `status.usage` counters (including friction counters and `lastHumanActive`), the readings marked as the forge or the gateway reports them (`no reading` when absent), the top five credential broker `tool/subcommand` pairs since the broker pod last started, the performance figures and a short feedback template.
 
+The `reasoning effort:` line under `model:` is the effort configured on that model, `unset` when the config states none and `unavailable` whenever the model is.
+
 The performance figures open with the token and spend totals since install, read from `status.usage`, which survive a LiteLLM restart; the live LiteLLM figures beneath them do not.
 
 One `proposals by origin:` line follows the readings. It lists the origins above zero and ends `(as the agent reports)`. It reads `none` when all nine are zero and `no reading` when the status has none.

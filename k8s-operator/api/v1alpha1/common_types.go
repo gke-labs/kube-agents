@@ -2841,9 +2841,9 @@ type InferenceStatus struct {
 	Model string `json:"model,omitempty"`
 
 	// ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
-	// the default model's entry (low, medium or high from the chart; a vLLM template's
-	// own words through hosted_vllm), as typed. Absent when the entry states none, so
-	// the model thinks at its own default, and absent while the served CRD predates it.
+	// the default model's entry, as typed: low, medium or high from the chart, or
+	// whatever a hand-edited config says. Absent when the entry states none, so the
+	// model thinks at its own default, and absent while the served CRD predates it.
 	// +optional
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
