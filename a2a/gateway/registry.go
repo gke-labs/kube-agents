@@ -182,6 +182,31 @@ type SessionRecord struct {
 	// task and starts nothing, since a second mint would overwrite the grant
 	// revision the first task's envelope pins.
 	TriggerRuns []TriggerRun `json:"triggerRuns,omitempty"`
+	// TriggerPending holds, per idempotency key, the mint attempt a
+	// submission is on before its run is recorded: written before each mint,
+	// so a record-write failure or a restart resumes at that attempt rather
+	// than deriving task ids again from the first (#5923). An entry leaves
+	// once its run is recorded in TriggerRuns. An older gateway doesn't read
+	// it, so it never takes one for a run.
+	TriggerPending map[string]TriggerPendingRun `json:"triggerPending,omitempty"`
+	// TriggerKeys answers a published run's key with its task for 24 hours
+	// (triggerKeyTTL), after the run has left TriggerRuns, so a late repeat
+	// never starts a second task (#5617).
+	TriggerKeys map[string]TriggerKeyRecord `json:"triggerKeys,omitempty"`
+}
+
+// TriggerPendingRun is a submission's mint attempt before its run is
+// recorded: the attempt, and the task id it derives.
+type TriggerPendingRun struct {
+	Attempt int    `json:"attempt"`
+	Task    string `json:"task"`
+}
+
+// TriggerKeyRecord is a published run's task under its key, and when it was
+// published.
+type TriggerKeyRecord struct {
+	Task string    `json:"task"`
+	At   time.Time `json:"at"`
 }
 
 // TriggerRun is one run the trigger ingress started: its idempotency key and
@@ -940,6 +965,9 @@ type Registry struct {
 	// afterTermRead, when set, runs between a fenced write's counter read
 	// and its record read (tests).
 	afterTermRead func()
+	// beforePut, when set, runs at the start of each Put, and an error it
+	// returns is Put's (tests: a record write that fails).
+	beforePut func(*SessionRecord) error
 	// onFenced, when set, runs each time a write is refused because a newer
 	// term has started; SetOnFenced says which refusals don't run it.
 	onFenced atomic.Pointer[func()]
@@ -1216,6 +1244,11 @@ func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
 // one epoch the last write wins, as it always has with one active replica.
 // At term 0 it's the unconditional put it always was (unfenced).
 func (r *Registry) Put(ctx context.Context, rec *SessionRecord) error {
+	if r.beforePut != nil {
+		if err := r.beforePut(rec); err != nil {
+			return err
+		}
+	}
 	kv, err := r.kv(ctx)
 	if err != nil {
 		return err

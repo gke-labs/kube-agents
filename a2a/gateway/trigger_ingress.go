@@ -215,6 +215,14 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if run := rec.triggerRun(s.IdempotencyKey); run != nil && run.Published {
 		return lib.TriggerSubmitReply{TaskID: run.Task}
 	}
+	// So is one published within the key record's 24 hours whose run has
+	// since left TriggerRuns. A run still in TriggerRuns, pending, is
+	// published again below instead.
+	if rec.triggerRun(s.IdempotencyKey) == nil {
+		if task, ok := rec.triggerKeyTask(s.IdempotencyKey, time.Now()); ok {
+			return lib.TriggerSubmitReply{TaskID: task}
+		}
+	}
 	card, ok := g.profiles.lookup(s.Profile)
 	if !ok {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedProfileUnknown, "no profile "+s.Profile+" in the directory")
@@ -243,18 +251,51 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.publishTriggerRun(ctx, rec, s, route, *run)
 	}
 
-	if !g.triggerLimiter().allow(key, time.Now()) {
+	limiter := g.triggerLimiter()
+	if !limiter.allow(key, time.Now()) {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedRateLimited, "the trigger is over its rate cap")
 	}
-	// The cap bucket's writes are create-only, so a key a failed attempt
-	// minted can't be minted again. Such an attempt was never recorded, so
-	// never published (the run is recorded before its publish): the next
-	// attempt's task id is safe to use.
+	// Every failure from here until the run is recorded hands the token back:
+	// the attempt count, not the rate budget, is what bounds the retries of
+	// one key (#5923), and it is kept in the record.
+	refuse := func(reason, detail string) lib.TriggerSubmitReply {
+		limiter.refund(key, time.Now())
+		return g.triggerRefused(s.Trigger.Name, reason, detail)
+	}
+	if rec == nil {
+		rec = &SessionRecord{Key: key, ContextID: "ctx-" + randHex(contextIDHexWidth), Kind: triggerAudienceKind, LastActivity: time.Now().UTC()}
+		if err := g.reg.Create(ctx, rec); err != nil {
+			if !errors.Is(err, ErrSessionExists) {
+				return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
+			}
+			if rec, err = g.reg.Get(ctx, key); err != nil || rec == nil {
+				return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
+			}
+		}
+	}
+	// The cap bucket's writes are create-only, so a key an earlier attempt
+	// minted can't be minted again. The attempt is recorded before each mint
+	// (TriggerPending), so a retry after a record-write failure or a restart
+	// resumes there, and each failure costs one attempt. An attempt that was
+	// never recorded as a run was never published (the run is recorded before
+	// its publish), so the next attempt's task id is safe to use.
 	trigger := &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream, Script: s.Trigger.Script}
+	attempt := rec.TriggerPending[s.IdempotencyKey].Attempt
 	var run TriggerRun
-	for attempt := 0; ; attempt++ {
+	for {
+		if attempt >= triggerMintAttempts {
+			g.log.Error("trigger run out of mint attempts", "trigger", s.Trigger.Name, "idempotencyKey", s.IdempotencyKey, "attempts", attempt)
+			return refuse(lib.TriggerRefusedUnavailable, "the run's task grants could not be minted")
+		}
 		taskID := triggerTaskID(s.IdempotencyKey, attempt)
-		minted, err := capability.NewMinter(g.client.JetStream()).Mint(ctx, taskID, capability.Entry{
+		if p, ok := rec.TriggerPending[s.IdempotencyKey]; !ok || p.Attempt != attempt {
+			rec.setTriggerPending(s.IdempotencyKey, TriggerPendingRun{Attempt: attempt, Task: taskID})
+			if err := g.reg.Put(ctx, rec); err != nil {
+				g.log.Error("trigger attempt write failed", "conversation", rec.Key, "taskId", taskID, "err", err)
+				return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
+			}
+		}
+		minted, err := g.mintTriggerGrant(ctx, taskID, capability.Entry{
 			Tier:     capability.TierUnattended,
 			Scope:    route.Scope,
 			Profile:  route.Profile,
@@ -265,31 +306,29 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 			run = TriggerRun{Key: s.IdempotencyKey, Task: taskID, Capability: &minted, CorrelationID: "corr-" + randHex(contextIDHexWidth), Trigger: trigger}
 			break
 		}
-		if isMintedAlready(err) && attempt+1 < triggerMintAttempts {
+		if isMintedAlready(err) {
+			// The next attempt is recorded before anything else, so a retry
+			// never mints this one again, even once the cap is reached.
 			g.log.Warn("trigger task grant already minted by an unrecorded attempt; minting the next", "trigger", s.Trigger.Name, "taskId", taskID)
+			attempt++
+			rec.setTriggerPending(s.IdempotencyKey, TriggerPendingRun{Attempt: attempt, Task: triggerTaskID(s.IdempotencyKey, attempt)})
+			if err := g.reg.Put(ctx, rec); err != nil {
+				g.log.Error("trigger attempt write failed", "conversation", rec.Key, "taskId", taskID, "err", err)
+				return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
+			}
 			continue
 		}
 		g.log.Error("trigger task capability mint failed", "trigger", s.Trigger.Name, "taskId", taskID, "err", err)
-		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the task's grant could not be minted")
+		return refuse(lib.TriggerRefusedUnavailable, "the task's grant could not be minted")
 	}
 
-	if rec == nil {
-		rec = &SessionRecord{Key: key, ContextID: "ctx-" + randHex(contextIDHexWidth), Kind: triggerAudienceKind, LastActivity: time.Now().UTC()}
-		if err := g.reg.Create(ctx, rec); err != nil {
-			if !errors.Is(err, ErrSessionExists) {
-				return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
-			}
-			if rec, err = g.reg.Get(ctx, key); err != nil || rec == nil {
-				return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
-			}
-		}
-	}
 	// Recorded, pending, before its publish: a retry after anything below
 	// fails publishes this run again rather than minting another.
+	delete(rec.TriggerPending, s.IdempotencyKey)
 	rec.addTriggerRun(run)
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("trigger record write failed", "conversation", rec.Key, "taskId", run.Task, "err", err)
-		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
+		return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
 	}
 	return g.publishTriggerRun(ctx, rec, s, route, run)
 }
@@ -378,6 +417,7 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	// it under the same envelope id, which the stream dedupes inside its
 	// window; the task id still goes back, so the reconciler holds it.
 	rec.markTriggerRunPublished(run.Key)
+	rec.recordTriggerKey(run.Key, taskID, time.Now())
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("trigger run write failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}
@@ -470,9 +510,74 @@ func (g *Gateway) unpostableTrigger(conversation string) bool {
 // there would answer "submitted" until the reconciler gave it up as lost.
 const triggerRunsKept = taskHistoryCap
 
-// triggerMintAttempts bounds the task ids one run may try when an earlier,
-// unrecorded attempt left its grant key taken.
-const triggerMintAttempts = 4
+// triggerMintAttempts bounds the task ids one run may try, counting every
+// attempt the record holds (TriggerPending), refunded or not: an earlier,
+// unrecorded attempt leaves its grant key taken. Sixteen covers the
+// reconciler's retries across one slot's starting deadline.
+const triggerMintAttempts = 16
+
+// triggerKeyTTL is how long a published run's key is answered with its task
+// after the run has left TriggerRuns: longer than any reconciler's retries of
+// one slot (#5617 asks for 24 hours).
+const triggerKeyTTL = 24 * time.Hour
+
+// triggerKeysKept bounds TriggerKeys whatever the clock does: the rate cap
+// admits at most DefaultTriggerRatePerHour runs an hour, so a day's keys
+// stay well under it.
+const triggerKeysKept = 512
+
+// mintTriggerGrant mints a trigger run's grant: triggerMint when a test sets
+// it, the cap bucket's minter otherwise.
+func (g *Gateway) mintTriggerGrant(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error) {
+	if g.triggerMint != nil {
+		return g.triggerMint(ctx, taskID, e)
+	}
+	return capability.NewMinter(g.client.JetStream()).Mint(ctx, taskID, e)
+}
+
+// setTriggerPending records key's mint attempt.
+func (rec *SessionRecord) setTriggerPending(key string, p TriggerPendingRun) {
+	if rec.TriggerPending == nil {
+		rec.TriggerPending = map[string]TriggerPendingRun{}
+	}
+	rec.TriggerPending[key] = p
+}
+
+// triggerKeyTask is the task a run published under key within triggerKeyTTL
+// started.
+func (rec *SessionRecord) triggerKeyTask(key string, now time.Time) (string, bool) {
+	if rec == nil {
+		return "", false
+	}
+	k, ok := rec.TriggerKeys[key]
+	if !ok || now.Sub(k.At) > triggerKeyTTL {
+		return "", false
+	}
+	return k.Task, true
+}
+
+// recordTriggerKey records a published run's key, dropping keys older than
+// triggerKeyTTL, then the oldest past triggerKeysKept.
+func (rec *SessionRecord) recordTriggerKey(key, task string, now time.Time) {
+	if rec.TriggerKeys == nil {
+		rec.TriggerKeys = map[string]TriggerKeyRecord{}
+	}
+	rec.TriggerKeys[key] = TriggerKeyRecord{Task: task, At: now.UTC()}
+	for k, v := range rec.TriggerKeys {
+		if now.Sub(v.At) > triggerKeyTTL {
+			delete(rec.TriggerKeys, k)
+		}
+	}
+	for len(rec.TriggerKeys) > triggerKeysKept {
+		oldest := ""
+		for k, v := range rec.TriggerKeys {
+			if oldest == "" || v.At.Before(rec.TriggerKeys[oldest].At) {
+				oldest = k
+			}
+		}
+		delete(rec.TriggerKeys, oldest)
+	}
+}
 
 // isMintedAlready reports whether a mint failed because the grant's key
 // already holds an entry (the bucket's writes are create-only).
@@ -601,6 +706,19 @@ func (l *triggerRateLimiter) allow(name string, now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// refund gives name back the token a submission spent and didn't use (it
+// failed before its run was recorded), never beyond the bucket's size.
+func (l *triggerRateLimiter) refund(name string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[name]
+	if !ok {
+		return
+	}
+	b.tokens = min(l.perHour, b.tokens+now.Sub(b.at).Hours()*l.perHour+1)
+	b.at = now
 }
 
 // dropFullLocked forgets every bucket that would be full by now.

@@ -699,3 +699,198 @@ func TestAPublishedRunsRetryNeedsNoDirectory(t *testing.T) {
 		t.Fatalf("a new key with the profile gone = %+v, want profile_unknown", r)
 	}
 }
+
+// failingMint makes the gateway's trigger mints fail with err while fail is
+// above zero, counting each down, and mint for real after.
+func failingMint(tr *triggerRig, fail *int, err error) {
+	tr.g.triggerMint = func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error) {
+		if *fail > 0 {
+			*fail--
+			return capability.Ref{}, err
+		}
+		return capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, taskID, e)
+	}
+}
+
+// A mint that fails hands its rate token back (#5923): more failed retries
+// of one slot than the hourly cap admits are each refused unavailable, never
+// rate_limited, and the slot then runs.
+func TestAFailedMintSpendsNoRateToken(t *testing.T) {
+	tr := startTriggerRig(t, func(c *Config) { c.TriggerRatePerHour = 3 })
+	s := goodScheduleSubmit()
+	fail := 5
+	failingMint(tr, &fail, errors.New("cap bucket unavailable"))
+	for i := 0; i < 5; i++ {
+		if r := tr.submit(t, "schedule", s); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedUnavailable {
+			t.Fatalf("failed attempt %d = %+v, want unavailable", i+1, r)
+		}
+	}
+	r := tr.submit(t, "schedule", s)
+	if r.Refused != nil || r.TaskID != triggerTaskID(s.IdempotencyKey, 0) {
+		t.Fatalf("after the failures = %+v, want the first attempt's task", r)
+	}
+}
+
+// A record write that fails after the mint costs exactly one attempt, and
+// the attempt survives a restart (a fresh rate limiter, the same record): the
+// retry resumes at the next task id instead of walking from the first, and
+// still runs after more failures than the old cap of four allowed.
+func TestARecordWriteFailureCostsOneAttemptAcrossARestart(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	failRuns := 6
+	tr.g.reg.beforePut = func(rec *SessionRecord) error {
+		if failRuns > 0 && rec.triggerRun(s.IdempotencyKey) != nil && !rec.TriggerRuns[len(rec.TriggerRuns)-1].Published {
+			failRuns--
+			return errors.New("kv write failed")
+		}
+		return nil
+	}
+	mints := 0
+	tr.g.triggerMint = func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error) {
+		mints++
+		return capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, taskID, e)
+	}
+	for i := 0; i < 6; i++ {
+		if r := tr.submit(t, "schedule", s); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedUnavailable {
+			t.Fatalf("failed attempt %d = %+v, want unavailable", i+1, r)
+		}
+		// A restart between retries: the limiter is new, the record isn't.
+		tr.g.triggerLimits = newTriggerRateLimiter(DefaultTriggerRatePerHour)
+	}
+	r := tr.submit(t, "schedule", s)
+	if r.Refused != nil || r.TaskID != triggerTaskID(s.IdempotencyKey, 6) {
+		t.Fatalf("after six failed record writes = %+v, want attempt 6's task %s", r, triggerTaskID(s.IdempotencyKey, 6))
+	}
+	// Each retry mints the recorded attempt (refused: minted already) and
+	// then the next one; none walks from the first again.
+	if want := 1 + 2*6; mints != want {
+		t.Fatalf("%d mints, want %d: a retry walked from an earlier attempt", mints, want)
+	}
+	rec, err := tr.g.reg.Get(context.Background(), "trigger:schedule/kubeagents-system/compliance-audit")
+	if err != nil || rec == nil || len(rec.TriggerPending) != 0 {
+		t.Fatalf("the pending attempt outlived the recorded run: %+v, %v", rec, err)
+	}
+}
+
+// A pending attempt whose grant an earlier try minted moves to the next
+// attempt from where it was, never from the first.
+func TestAPendingAttemptMintedAlreadyMovesToTheNextFromWhereItWas(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	ctx := context.Background()
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	rec := &SessionRecord{Key: key, ContextID: "ctx-pending", Kind: triggerAudienceKind, LastActivity: time.Now().UTC(),
+		TriggerPending: map[string]TriggerPendingRun{s.IdempotencyKey: {Attempt: 9, Task: triggerTaskID(s.IdempotencyKey, 9)}}}
+	if err := tr.g.reg.Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, triggerTaskID(s.IdempotencyKey, 9), capability.Entry{
+		Tier: capability.TierUnattended, Scope: capability.NamespaceScope("kubeagents-system"), Profile: "fleet-audit", Delegate: profileGrantDelegate,
+		Trigger: &capability.Trigger{Name: s.Trigger.Name, Origin: "builtin", Stream: s.Trigger.Stream},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused != nil || r.TaskID != triggerTaskID(s.IdempotencyKey, 10) {
+		t.Fatalf("reply = %+v, want attempt 10's task", r)
+	}
+}
+
+// Every attempt counts toward the cap, refunded or not: with the first
+// sixteen task ids already minted, the run is refused unavailable without a
+// seventeenth mint.
+func TestARunIsRefusedOnceItsSixteenAttemptsAreSpent(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	ctx := context.Background()
+	for n := 0; n < triggerMintAttempts; n++ {
+		if _, err := capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, triggerTaskID(s.IdempotencyKey, n), capability.Entry{
+			Tier: capability.TierUnattended, Scope: capability.NamespaceScope("kubeagents-system"), Profile: "fleet-audit", Delegate: profileGrantDelegate,
+			Trigger: &capability.Trigger{Name: s.Trigger.Name, Origin: "builtin", Stream: s.Trigger.Stream},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mints int
+	tr.g.triggerMint = func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error) {
+		mints++
+		return capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, taskID, e)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedUnavailable {
+		t.Fatalf("reply = %+v, want unavailable", r)
+	}
+	if mints != triggerMintAttempts {
+		t.Fatalf("%d mints, want %d and none past the cap", mints, triggerMintAttempts)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused == nil || mints != triggerMintAttempts {
+		t.Fatalf("a retry past the cap = %+v after %d mints, want refused without minting", r, mints)
+	}
+}
+
+// A key whose run has left TriggerRuns is answered with its task from the
+// 24-hour key record; past 24 hours it is forgotten.
+func TestAKeyOlderThanTheKeptRunsIsStillItsTask(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	ctx := context.Background()
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	rec := &SessionRecord{Key: key, ContextID: "ctx-keys", Kind: triggerAudienceKind, LastActivity: time.Now().UTC(),
+		TriggerKeys: map[string]TriggerKeyRecord{s.IdempotencyKey: {Task: "task-from-yesterday", At: time.Now().Add(-23 * time.Hour)}}}
+	if err := tr.g.reg.Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused != nil || r.TaskID != "task-from-yesterday" {
+		t.Fatalf("reply = %+v, want the recorded task", r)
+	}
+	if len(tr.submissions()) != 0 {
+		t.Fatalf("the repeat started a task: %d submissions", len(tr.submissions()))
+	}
+	rec.TriggerKeys = map[string]TriggerKeyRecord{"old": {Task: "t-old", At: time.Now().Add(-25 * time.Hour)}}
+	rec.recordTriggerKey("new", "t-new", time.Now())
+	if _, ok := rec.TriggerKeys["old"]; ok {
+		t.Error("a key past 24 hours wasn't pruned")
+	}
+	if _, ok := rec.triggerKeyTask("old", time.Now()); ok {
+		t.Error("a key past 24 hours was answered")
+	}
+}
+
+// A refund never fills a bucket past its size.
+func TestARefundNeverExceedsTheBucket(t *testing.T) {
+	l := newTriggerRateLimiter(2)
+	now := time.Now()
+	if !l.allow("t", now) {
+		t.Fatal("a full bucket refused")
+	}
+	l.refund("t", now)
+	l.refund("t", now)
+	l.refund("t", now)
+	for i := 0; i < 2; i++ {
+		if !l.allow("t", now) {
+			t.Fatalf("token %d refused", i+1)
+		}
+	}
+	if l.allow("t", now) {
+		t.Fatal("refunds filled the bucket past its size")
+	}
+}
+
+// An older gateway, which reads the record without TriggerPending, sees no
+// run for a key that only has a pending attempt, so never takes one for a
+// granted or publishable run.
+func TestAPendingAttemptIsNoRunToAnOlderGateway(t *testing.T) {
+	rec := &SessionRecord{Key: "k", TriggerPending: map[string]TriggerPendingRun{"key": {Attempt: 2, Task: "task-x"}}}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var older struct {
+		TriggerRuns []TriggerRun `json:"triggerRuns,omitempty"`
+	}
+	if err := json.Unmarshal(data, &older); err != nil {
+		t.Fatal(err)
+	}
+	if len(older.TriggerRuns) != 0 {
+		t.Fatalf("an older reader sees runs: %+v", older.TriggerRuns)
+	}
+}
