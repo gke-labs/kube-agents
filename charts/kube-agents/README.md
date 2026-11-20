@@ -885,7 +885,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `appIdSecretRef` and `appPasswordSecretRef` (`name` and `key`). Optional
   single-tenant lock-down is set via `tenantId`, and user authorization is
   configured via `allowedUsers` (or `allowAllUsers: true`). Supports Microsoft
-  Adaptive Cards v1.5 with markdown fallback. Custom refs can likewise be
+  Adaptive Cards v1.5 with markdown fallback. `inbound.enabled: true` (with
+  `tenantId`) runs the receiver that accepts the messages Microsoft delivers for
+  the bot; expose its Service with your own Ingress. Custom refs can likewise be
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
