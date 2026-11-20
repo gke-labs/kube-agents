@@ -42,9 +42,10 @@ rejects `task_id:` in a case here.
 
 The value must equal the directory name. The directory name is what
 `hack/ci-eval-pr.sh` derives `TASK_NAME` from, what the results file is copied to, and
-what every lint and every table in `bench/tasks/DRAFTS.md` keys on. An id that disagrees
-with its directory means two names for one case and a search that finds half the
-references.
+what every lint and every table in `bench/tasks/DRAFTS.md` keys on. The `Eval-Case:` line
+of an overlay patch names it too, and `make skills-check` fails a line that names no
+directory here. An id that disagrees with its directory means two names for one case and a
+search that finds half the references.
 
 ## The fields, and what each one is for
 
@@ -108,6 +109,17 @@ into a Slack or Google Chat gateway conversation, then sends the reply as a seco
 ([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
 the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
 for the plant. Inject transport only, as the stop directives are.
+A first line of `[bench:reply-under-home-post: <marker>]`, with the reply on the lines under it,
+grades a reply to a post the agent made on its own (its setup has the agent post a scheduled report
+or an alert into the home channel): the transport waits for the bot's newest top-level post holding
+`<marker>` since the case started, replies under it with the reply, and grades that turn
+([`bench/kube_agents_bench/slack_transport.py`](../../bench/kube_agents_bench/slack_transport.py)).
+The marker ends at the directive's own `]`, and nothing else may follow on that line. Give each such
+case a marker no other case's post holds. Only top-level posts are searched, and a scheduled job's
+later reports on a UTC day reply inside its first report's thread (one thread per job per day), so
+mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
+own. Slack transport only: the other transports refuse it, so
+such a case runs on the Slack lane alone and keeps no inject record.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
 carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which

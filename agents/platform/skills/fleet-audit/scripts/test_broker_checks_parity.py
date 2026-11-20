@@ -1,4 +1,4 @@
-"""The credential broker re-checks a no-pdb fix with `automerge_checks` (stdlib
+"""The credential broker re-checks a no-pdb fix with the recipe's `checks.py` (stdlib
 only, no fleet-audit import); its verdicts and its copies of the audit's scope
 rules must stay the sandbox's own (`pdb_safety.judge`, `collect`)."""
 
@@ -9,14 +9,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit_report  # puts the shared scripts directory on the path
-import automerge_checks
+from fix_recipes import registry
 import pdb_safety
 from test_pdb_safety import BUDGET_TEXT, finding, ready
 from test_recheck import CTX, LABELS, NS, FakeRun, deployment, hpa, pdb
 
 
 class BrokerChecksParityTest(unittest.TestCase):
-    ac = automerge_checks
+    ac = registry.checks_module("no-pdb")
 
     def test_the_brokers_copies_of_the_audits_rules_are_the_audits(self):
         import collect
