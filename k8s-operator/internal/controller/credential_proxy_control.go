@@ -128,7 +128,7 @@ func credentialProxyControlFilePath() string {
 
 const (
 	credentialProxyHealthzPath         = "/healthz"
-	credentialProxyPeerHealthURLFormat = "http://%s.%s.svc.cluster.local:%d%s"
+	credentialProxyPeerHealthURLFormat = "http://%s.%s.svc.cluster.local:%d%s" // #nosec G101 -- Cluster-local Service URL template, not a credential.
 )
 
 func credentialProxyPeerHealthURL(agent *agentv1alpha1.PlatformAgent) string {
