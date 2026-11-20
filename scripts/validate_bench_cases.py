@@ -376,6 +376,13 @@ FIXTURE_NOT_READY = {
         "#4896: needs two clusters of more than 100,000 Pods (KWOK) on the pool; "
         "no pool project carries one"
     ),
+    # Asks the fleet question of the install that watches the sized test fleet
+    # (bench/tf/sized-fleet/). The fleet is in its own project, not on the eval
+    # pool; the sized fleet's nightly runs the case from
+    # hack/eval/sized-fleet-cases.txt until the pool carries it.
+    "chat-routing-fleet-question-sized": (
+        "#3753: needs the sized test fleet, which runs in its own project and is not on the eval pool"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
