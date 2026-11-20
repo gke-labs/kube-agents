@@ -913,6 +913,9 @@ INJECT_LANE_REQUESTING = [
     # objective's pull_request_opened leaf allows one.
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
+    # post-merge-verified-fixed: the post-merge check's case (#6343); its
+    # objective's pull_request_opened leaf allows the fix it opens.
+    "post-merge-verified-fixed",
     "rca-remediation-pr",
     # scale-request-proposes-pr: asked to scale a Deployment, it may propose
     # the change as a pull request; its objective's pull_request_opened leaf

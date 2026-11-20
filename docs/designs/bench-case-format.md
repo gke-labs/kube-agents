@@ -149,7 +149,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `gateway_plugins_as_shipped`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -437,7 +437,13 @@ holds a name for) against the gateway's platform profile copy, the one `skill_ma
 authored under a new name) are reported, not failed, and no lane sets either target aside. A stack that runs Python in the sandbox does it as
 root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
 no `__pycache__` in the reference tree for this check to read as an edit. The check
-still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
+still flags a cache file that appears anyway, since a `.pyc` is code. `gateway_plugins_as_shipped` execs into the
+same agent container and requires each plugin directory the image ships under `/opt/defaults/plugins` to be on the
+agent's data volume at `/opt/data/plugins`, a real directory owned by the agent's user and (outside the pinned
+`hermes_otel`, whose directory carries its own state) matching the image; a missing, symlinked, differing or
+foreign-owned plugin fails (an entry beside the image's that the image does not ship is reported, not failed: the
+entrypoint copies without pruning, so an image change leaves one on an older volume), and the script's own count of
+the image's plugin directories must match the units it read. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
@@ -694,6 +700,8 @@ or on the dev install, and the case cites the run by its directory name or build
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.
+One rule is outside that: the parser rule ("What it does not catch", below) runs only where
+the bench package is installed, which the lint's job does not do, so a bench test gates it.
 That whole-set assertion is the load-bearing half, not the shared module. The lint spent
 one commit asserting only on a hand-listed set of substrings, and every rule whose
 wording was not on the list — a missing `id:`, a duplicate verification entry name, an
@@ -707,7 +715,9 @@ The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` in the `Ma
 `.github/workflows/python-tests.yml`, so a separate job running the target would re-derive
 findings CI already has, on a second checkout, for nothing. The target is the pre-push
 copy of the gate rather than the gate; a rule that has to be enforced goes in the
-validator, where both reach it. Nothing should be added to the target alone.
+validator, where both reach it. Nothing should be added to the target alone. The parser
+rule is in the validator too, and `bench/tests/test_case_entries_load.py` calls the same
+`validate_all()` for it in the job that has the parser.
 
 "Carries no assertion" is stricter than "the field is present". `required_phrases: [""]`
 is a populated list, and the empty string is in every text there has ever been, so the
@@ -721,17 +731,45 @@ no longer exists fails the lint.
 ### What it does not catch
 
 A green `make bench-case-check` is not a promise that devops-bench will load the case. The
-validator checks the rules above; it does not reimplement the harness's schema, and three
-classes of mistake get through it and fail at spec-load, after a cluster lease is spent:
+validator checks the rules above; it does not reimplement the harness's schema. Two classes
+of mistake are caught only where the bench package is installed (`make test-bench-deps`),
+because the rule that catches them reads each entry with the harness's own YAML reader and
+loads it with the harness's own parser (`parse_entries`, with this repository's check types
+registered). It runs last, and only on a case that no other rule faults, so one defect is one
+finding; a field defect of a case with another finding shows after that finding is corrected:
 
 - **An extra or misspelled key on a verification entry or a check node.** The compound
   nodes in `devops_bench/verification/spec.py` are `ConfigDict(extra="forbid")`, so
-  `requried_phrases:` is a hard rejection there and merely an unrecognised key here.
+  `requried_phrases:` is a hard rejection there. The harness does not stop on it: it drops
+  the entry and runs the case without that check. The gate turns a repetition with such a
+  parse error red, but only after a cluster lease is spent.
 - **A missing required field on a check.** That surfaces as pydantic's `Field required`
-  against the verifier's own model, which this validator does not have.
+  against the verifier's own model.
+
+The rule reads with the harness's reader because of the YAML split described below: PyYAML
+would hand the parser `required_phrases: [no]` as a boolean, and the rule would then refuse
+an entry that a run loads. The rule reads an entry as the file has it; the harness
+substitutes its placeholders first, so a field whose whole value is a placeholder can be
+refused here and load in a run. No case in the tree has one.
+
+Without the package the rule does not run, and the target's last line, on stderr, says so.
+The same holds when the installed package is another checkout's, or a copy that an install
+made: the line then says that the package is installed, but behind the tree. Only an editable
+install of this checkout counts. The rule knows the check types and the fields of the
+installed package and of the installed devops-bench, so after a pull that changes
+`bench/pyproject.toml`, install again: `make test-bench-deps` brings the package's entry
+points up to date; for a new devops-bench pin use `uv sync` in `bench/` or a new environment,
+because pip can keep the old commit when the version did not change.
+The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
+the rule in the job that does, over every case in the tree.
+
+A third class gets through in both places and fails at spec-load, after a cluster lease is
+spent:
+
 - **`critical: yes`.** This one the validator structurally cannot catch, and the reason is
-  worth knowing. It reads cases with PyYAML, which is YAML 1.1 and parses the bare `yes`
-  into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
+  worth knowing. The parser rule above reads `verification_spec` with the harness's reader
+  and nothing else of the case; every other rule reads the case with PyYAML, which is YAML
+  1.1 and parses the bare `yes` into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
   the validator sees the field, the trap has already been parsed away. The same split hides
@@ -742,11 +780,11 @@ A fourth divergence is caught: PyYAML's `safe_load` keeps the last of two equal 
 silently, where `YAML(typ="safe")` raises `DuplicateKeyError`, so the validator loads with
 a `SafeLoader` subclass that refuses a key written twice in one mapping.
 
-The gap is deliberate rather than pending. `make bench-case-check` depends on PyYAML alone,
-so it runs in a checkout with no `bench/` virtualenv and no harness install, which is what
-makes it cheap enough to run on every edit. Importing devops-bench to close these three
-would trade that for a second copy of a schema that already exists. Note the divergence
-when writing a case; do not add the dependency.
+`make bench-case-check` needs PyYAML alone, so it runs in a checkout with no `bench/`
+virtualenv and no harness install, which is what makes it cheap enough to run on every
+edit. The parser rule keeps that: it uses the harness when the harness is there and is
+skipped when it is not, so it adds no second copy of the schema and no required
+dependency. Do not make the dependency required.
 
 ## Changing the format
 
