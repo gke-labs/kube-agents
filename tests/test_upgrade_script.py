@@ -4781,6 +4781,34 @@ class KanbanAdmissionPreflightTest(unittest.TestCase):
         self.assertLess(call_idx, main.index('print_step "4. Planning (read-only)"'))
         self.assertLess(call_idx, main.index('case "$PARAM_UPGRADE_MODE" in', main.index('exit "$plan_status"')))
 
+    def test_sourcing_upgrade_and_installer_common_has_no_readonly_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            env_file = tmp_path / "install.env"
+            env_file.write_text('PROJECT_ID="ci-test-project"\nCLUSTER_NAME="ci-test-cluster"\nREGION="us-central1"\n')
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            for cmd in ("gcloud", "kubectl"):
+                stub = bin_dir / cmd
+                stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+                stub.chmod(0o755)
+            sha = subprocess.check_output(["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True).strip()
+            env = get_isolated_test_env(bin_dir=str(bin_dir))
+            env["KUBE_AGENTS_INSTALL_ENV"] = str(env_file)
+            proc = subprocess.run(
+                [
+                    str(_UPGRADE_SH),
+                    "--dry-run",
+                    "-y",
+                    "--upgrade-mode=full",
+                    "--gcp-project-id=ci-test-project",
+                    f"--image-tag={sha}",
+                ],
+                capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Dry-Run Upgrade Plan Preview", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

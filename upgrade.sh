@@ -100,7 +100,6 @@ readonly DOWNGRADE_OPERATOR_CONTAINER="manager"
 readonly ADMISSION_DEFAULT_MEMORY_BUDGET_MIB=4096
 readonly ADMISSION_DEFAULT_WORKER_RSS_CAP_MIB=1536
 readonly ADMISSION_MEMORY_BUDGET_FLOOR_MIB=512
-readonly PLATFORM_AGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
 readonly DEFAULT_PLATFORM_AGENT_CR_NAME="platform-agent"
 readonly ADMISSION_BYTES_PER_MIB=$((1024 * 1024))
 readonly ADMISSION_QTY_RE='^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)\s*$'
@@ -1315,7 +1314,7 @@ warn_live_cr_kanban_admission() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
   local cr_json="${PLATFORM_AGENT_CR_JSON:-}"
   if [ -z "$cr_json" ]; then
-    cr_json="$(trap - ERR; kubectl get "$PLATFORM_AGENT_CRD_NAME" -n "$namespace" -o json 2>/dev/null)" || cr_json=""
+    cr_json="$(trap - ERR; kubectl get "${PLATFORM_AGENT_CRD_NAME:-$UPGRADE_PLATFORM_AGENT_CRD_NAME}" -n "$namespace" -o json 2>/dev/null)" || cr_json=""
   fi
   [ -n "$cr_json" ] || return 0
 
@@ -2361,6 +2360,8 @@ main() {
     KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"
 
+  warn_live_cr_kanban_admission "$target_namespace"
+
   if command -v gcloud >/dev/null 2>&1; then
     local resolved_project_number=""
     resolved_project_number="$(trap - ERR; gcloud projects describe "$target_project" --format='value(projectNumber)' 2>/dev/null || true)"
@@ -2376,7 +2377,6 @@ main() {
       print_info "Note: --upgrade-mode=operator only applies CRDs and re-tags the operator image; run --upgrade-mode=harness or --upgrade-mode=full to apply spec.deployment.sizingProfile='${effective_operator_sizing}'."
     fi
   fi
-  warn_live_cr_kanban_admission "$target_namespace"
 
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"
