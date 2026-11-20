@@ -876,9 +876,9 @@ class BrokerReportStore(str):
     `latest` that is not a byte copy of a ring entry.
 
     `local_root` is a file store on this pod, if there is one (the shell
-    sandbox's, from before the switch). A stream it holds that the broker
-    store does not is copied in once, the first time this client touches that
-    stream (`_maybe_seed`).
+    sandbox's, from before the switch). The entries of a stream it holds that
+    the broker store lacks are copied in once, the first time this client
+    touches that stream (`_maybe_seed`).
     """
 
     url: str
@@ -1064,8 +1064,8 @@ class BrokerReportStore(str):
         raises out of here, and the stream is not counted as checked: the read
         or write that touched it fails as an outage, rather than read a stream
         part copied as a first run, and the next touch in this process tries
-        again. Any other failure (a refusal other than the per-entry 400, 409
-        or 413, a local file that cannot be read) is logged with no marker, and
+        again. Any other failure (a refusal other than the per-entry 400 or
+        413, a local file that cannot be read) is logged with no marker, and
         the touch goes on; the next process's seed resumes and finishes it,
         whatever the broker was written in between.
         """
