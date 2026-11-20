@@ -472,6 +472,17 @@ AUDITS: dict[str, AuditSpec] = {
                 ),
             ),
         ),
+        # §2a of the SOP: the one check that compares two values an owner
+        # sets, each peered network's MTU, and reads nothing live, so the only
+        # one a repository declaration may keep off the ledger (a jumbo-frame
+        # network peered with a 1460 one on purpose). One arm, one object kind
+        # (`NetworkPeering/<a>--<b>`), so no arm rule. The other six are
+        # faults no declaration excuses: a range under 15% free, a VM at its
+        # NAT port ceiling, a rejected PSC connection, a preview or duplicate
+        # Cloud Armor rule on a production backend, a management port open to
+        # the internet on a live external address, a Standard cluster without
+        # NodeLocal DNSCache.
+        declarable=("mtu-packet-fragmentation",),
     ),
     "gce-compute-fleet-audit": AuditSpec(
         "GCE Compute Engine and MIG Fleet Audit",
@@ -2089,15 +2100,25 @@ ORPHANED_SNAPSHOT_CHECK = "orphaned-snapshots"
 COMPUTE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     ORPHANED_SNAPSHOT_CHECK: frozenset({"snapshot"}),
 }
+# The networking stream's one declarable check, 2.4 `mtu-packet-fragmentation`,
+# names the peering and nothing else: the collector files
+# `NetworkPeering/<a>--<b>` (the two network names sorted), and a `Network/`
+# or a `Project/` covers no pair. One arm: the excerpt carries nothing live,
+# so the join needs no arm rule and the plain `_declaration_covers` path moves it.
+MTU_PEERING_CHECK = "mtu-packet-fragmentation"
+NETWORKING_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    MTU_PEERING_CHECK: frozenset({"networkpeering"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
-# reads it for the measured-size title, which a stockout or a compute row
+# reads it for the measured-size title, which a stockout, a compute or a networking row
 # does not carry.
 DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **COST_DECLARABLE_OBJECT_KINDS,
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
     **COMPUTE_DECLARABLE_OBJECT_KINDS,
+    **NETWORKING_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
@@ -2119,9 +2140,10 @@ COST_DECLARED_MINOR = "minor"
 # namespace on the finding would give the pool an identity no declaration and
 # no candidate matches. So does the compute snapshot check
 # (`ORPHANED_SNAPSHOT_CHECK`), filed on a `project/<id>` target with no
-# namespace. Every slug here belongs to one stream, so no stream test is
-# needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK})
+# namespace, and so does the networking peering check (`MTU_PEERING_CHECK`),
+# filed the same way. Every slug here belongs to one stream, so no stream
+# test is needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK, MTU_PEERING_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -9740,7 +9762,8 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
 
     A check with fixed object kinds accepts only those
     (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check and
-    the compute snapshot check). The two controller checks file whatever
+    the compute snapshot check and the networking peering check). The two
+    controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5

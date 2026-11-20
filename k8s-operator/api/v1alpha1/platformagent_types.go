@@ -67,6 +67,55 @@ type PlatformAgentSpec struct {
 	// volume.
 	// +optional
 	Storage *PlatformAgentStorageSpec `json:"storage,omitempty"`
+
+	// Tiers says which tier each person's profile tasks run at.
+	// +optional
+	Tiers *PlatformAgentTiersSpec `json:"tiers,omitempty"`
+}
+
+// PlatformAgentTiersSpec maps people to tiers (#3659).
+type PlatformAgentTiersSpec struct {
+	// Membership lists the people whose profile tasks run at a tier other
+	// than read. Anyone not listed runs at read, and the console runs at
+	// read whatever this says, since everyone on it shares one principal. A
+	// thread whose authors are at different tiers can't start a profile task,
+	// and a steer from an author at another tier than the running task's is
+	// refused. A member whose tier no Tier defines is refused profile tasks
+	// until one does; they don't fall back to read. The tier must be
+	// interactive: the admission webhook refuses an unattended-mode Tier.
+	// +listType=map
+	// +listMapKey=backend
+	// +listMapKey=user
+	// At most 200 entries, so the list fits the one environment variable the
+	// gateway reads it from (TestTheLargestMembershipFitsOneEnvString).
+	// +kubebuilder:validation:MaxItems=200
+	// +optional
+	Membership []TierMember `json:"membership,omitempty"`
+}
+
+// TierMember maps one person on one chat backend to a tier.
+type TierMember struct {
+	// Backend is the surface the person writes from: one whose requester is
+	// one verified person. The a2a door isn't one: its callers name
+	// themselves under a shared token.
+	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a-google
+	// +required
+	Backend string `json:"backend"`
+
+	// User is the person's id on that backend: their email on Google Chat
+	// (compared without case) and on a2a-google (as their Google token
+	// carries it), their user id on Slack or Discord.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[^,=\s]+$`
+	// +required
+	User string `json:"user"`
+
+	// Tier is the name of an interactive-mode Tier.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +required
+	Tier string `json:"tier"`
 }
 
 // PlatformAgentStorageSpec sizes the agent's persistent data volumes.

@@ -1158,8 +1158,10 @@ resource "google_compute_firewall" "world_open_deny_remote" {
 # `NetworkPeering/default--mtu-peer-declared`. Both one-way halves are
 # needed: a peering with one half is INACTIVE, which the check skips. No
 # `labels`: a VPC network and a peering take none, so neither carries
-# fleet_labels. Until the stream's declared-intent slice lands, the finding
-# publishes and no case grades it. Catalogue role: declared-mtu-peering.
+# fleet_labels. The pool project's GitOps repository declares the pair on
+# purpose in knowledge/notification-relay-no-pdb.md, so the networking audit
+# lists it under Declared intent, not as a finding. Catalogue role:
+# declared-mtu-peering.
 resource "google_compute_network" "mtu_peer_declared" {
   name                    = "mtu-peer-declared"
   auto_create_subnetworks = false

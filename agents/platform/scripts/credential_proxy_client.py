@@ -260,6 +260,15 @@ _EXEC_EXIT_CODE_FIELD = "exitCode"
 _FIELD_NOT_A_STRING_TEXT = "the response's {field} is of type {type}, not a string"
 _EXIT_CODE_NOT_AN_INTEGER_TEXT = "the response's exitCode is of type {type}, not an integer"
 _NO_EXIT_CODE_TEXT = "the response has no exitCode"
+# The broker sends the command's return code as `exitCode`. A process status is
+# 0 to 255. A command that a signal ended has the signal's negative number
+# there, and a shell reports that death as 128 plus the number, so the least
+# value with a status is 128 - 255. A value outside the two bounds is no
+# command's result, and `sys.exit` would wrap it: 256 would read as success.
+_MAX_EXIT_STATUS = 255
+_SIGNAL_EXIT_BASE = 128
+_MIN_EXIT_CODE = _SIGNAL_EXIT_BASE - _MAX_EXIT_STATUS
+_EXIT_CODE_OUT_OF_RANGE_TEXT = f"the response's exitCode is outside {_MIN_EXIT_CODE} to {_MAX_EXIT_STATUS}"
 # The least read time a relay fallback is worth sending with; less, and the
 # caller's budget is already spent, so the error is raised instead.
 RELAY_FALLBACK_MIN_SECONDS = 1.0
@@ -866,13 +875,17 @@ def read_current_context(text: str) -> str | None:
 
     Anything else — a syntax error, several documents, a top level that is not a
     mapping, a non-string `current-context` — reads as absent, and the caller
-    turns that into a rejection.
+    turns that into a rejection. So does a scalar that PyYAML cannot build. For
+    that it raises a plain exception, not a `yaml.YAMLError`: a `ValueError`
+    for a date that does not exist or an `!!int` tag on text, a `KeyError` for
+    an `!!bool` tag on text, an `IndexError` for an `!!int` tag on nothing, an
+    `AttributeError` for an `!!timestamp` tag on text.
     """
     import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
 
     try:
         document = yaml.safe_load(text)
-    except (yaml.YAMLError, RecursionError):
+    except (yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError):
         return None
     if not isinstance(document, dict):
         return None
@@ -1876,8 +1889,9 @@ def _unusable_exec_answer(payload: dict) -> str | None:
     `stdout` and `stderr` are strings when present, and `kubeconfig` is a string
     or null. `exitCode` is an integer and is not optional: without it the
     command's result is not known. A boolean is not an integer here, and a
-    number in a string is not one either. The value of an integer is not
-    checked.
+    number in a string is not one either. An integer that is no command's
+    result, above the greatest status or below the least signal's number, is
+    not usable either.
     """
     for field in _EXEC_OUTPUT_FIELDS:
         if field in payload and not isinstance(payload[field], str):
@@ -1890,7 +1904,18 @@ def _unusable_exec_answer(payload: dict) -> str | None:
     exit_code = payload[_EXEC_EXIT_CODE_FIELD]
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
         return _EXIT_CODE_NOT_AN_INTEGER_TEXT.format(type=type(exit_code).__name__)
+    if not _MIN_EXIT_CODE <= exit_code <= _MAX_EXIT_STATUS:
+        return _EXIT_CODE_OUT_OF_RANGE_TEXT
     return None
+
+
+def _exit_status(exit_code: int) -> int:
+    """The status to exit with for a command's return code from the broker.
+
+    A negative code is the number of the signal that ended the command; the
+    status is 128 plus that number, as a shell reports it.
+    """
+    return _SIGNAL_EXIT_BASE - exit_code if exit_code < 0 else exit_code
 
 
 def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
@@ -2322,7 +2347,7 @@ def execute(
         # Whatever the command itself exited: a cut payload is not the
         # command's answer, and exit 0 on one is what a caller reads as success.
         return EXIT_OUTPUT_TRUNCATED
-    return payload[_EXEC_EXIT_CODE_FIELD]
+    return _exit_status(payload[_EXEC_EXIT_CODE_FIELD])
 
 
 def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
