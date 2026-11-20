@@ -285,20 +285,18 @@ C_QUOTED_RE = re.compile(r"\\([0-7]{3}|.)")
 
 
 def _unquote(text: str) -> str:
-    """git's C-quoted path body as text: octal escapes are bytes, and raw UTF-8 is left as it is."""
-    def byte(match: re.Match) -> str:
+    """git's C-quoted path body as text: each escape is one byte (or its own text when it names none),
+    and everything else, raw UTF-8 included, is kept as it is."""
+    out = bytearray()
+    position = 0
+    for match in C_QUOTED_RE.finditer(text):
+        out += text[position:match.start()].encode("utf-8")
         code = match.group(1)
         value = int(code, 8) if len(code) == 3 else C_ESCAPES.get(code)
-        return match.group(0) if value is None else chr(value)
-
-    try:
-        return C_QUOTED_RE.sub(byte, text).encode("latin-1").decode("utf-8")
-    except UnicodeError:
-        # Raw UTF-8 beside the escapes: decode the escapes as bytes one run at a time.
-        out = bytearray()
-        for part in re.split(r"((?:\\(?:[0-7]{3}|.))+)", text):
-            out += C_QUOTED_RE.sub(byte, part).encode("latin-1") if part.startswith("\\") else part.encode("utf-8")
-        return out.decode("utf-8", "replace")
+        out += bytes([value]) if value is not None and value <= 0xFF else match.group(0).encode("utf-8")
+        position = match.end()
+    out += text[position:].encode("utf-8")
+    return out.decode("utf-8", "replace")
 
 
 def _names(text: str, name: str) -> bool:
@@ -599,9 +597,20 @@ def _healthy_samples(detail: object) -> int:
 HEALTHY, UNSETTLED, RED = "healthy", "unsettled", "red"
 
 
+#: ``health_baseline`` keys with this prefix hold the restart counts of a pod that was not Ready at the
+#: apply: its restarts from before the apply are not counted, but it is not a known pod, so it may still
+#: be starting (NotReady) without failing the window.
+STARTING_PREFIX = "~"
+
+
 def _known_pods(baseline: dict[str, int]) -> set[str]:
-    """The pods the baseline holds: there at the apply, or seen Ready on a later reading."""
-    return {key.split("/", 1)[0] for key in baseline}
+    """The pods the baseline holds as Ready: there at the apply, or seen Ready on a later reading."""
+    return {key.split("/", 1)[0] for key in baseline if not key.startswith(STARTING_PREFIX)}
+
+
+def _restarts_before(baseline: dict[str, int], key: str) -> int:
+    """A container's restart count at the apply (or when it joined), whether its pod was Ready then or not."""
+    return max(baseline.get(key, 0), baseline.get(STARTING_PREFIX + key, 0))
 
 
 def assess_health(workload: dict, pods: dict, baseline: dict[str, int], since: datetime) -> tuple[str, str]:
@@ -623,7 +632,7 @@ def assess_health(workload: dict, pods: dict, baseline: dict[str, int], since: d
             return RED, f"pod {name} is not Ready"
         for container in _container_statuses(pod):
             key = f"{meta.get('uid') or name}/{container.get('name')}"
-            if int(container.get("restartCount") or 0) > baseline.get(key, 0):
+            if int(container.get("restartCount") or 0) > _restarts_before(baseline, key):
                 return RED, f"container {container.get('name')} in pod {name} restarted"
             for current, state in ((False, container.get("lastState") or {}), (True, container.get("state") or {})):
                 ended = state.get("terminated") or {}
@@ -743,8 +752,13 @@ def watch_health(
     contains: Contains = forge_contains,
     paths: Paths = None,
     scope_refusal: Callable[[dict], str | None] | None = None,
+    stop: Callable[[], bool] | None = None,
 ) -> dict[str, list[str]]:
     """Steps 3 and 4 for each merged record: wait for the apply, then hold the health window.
+
+    ``stop()`` true (the cron run's time budget, ``post_merge_outcome.RUN_BUDGET``)
+    starts no further record: the rest wait for the next run, least recently read
+    first as always, and the count of them goes under ``not_reached``.
 
     ``scope_refusal(record)`` (``post_merge_scope.scope_refusal_for``) names
     why the install's declared scope leaves the record's cluster out, or None.
@@ -793,6 +807,9 @@ def watch_health(
     for values in conn.execute(HEALTH_SQL, (-1,)).fetchall():
         if reads >= limit:
             break
+        if stop is not None and stop():
+            seen["not_reached"] = seen.get("not_reached", []) + [values[0]]
+            continue
         record = dict(zip(HEALTH_COLUMNS, values))
         url = record["url"]
         updates: dict[str, object] = {"health_checked_at": stamp}
@@ -862,10 +879,15 @@ def watch_health(
                 updates["sync_state"] = f"{state}: {detail}"[:500]
                 if applied:
                     updates["applied_at"] = stamp
-                    # Ready pods only, as _join_baseline adds later ones: a pod still starting at the apply
-                    # (a scale-up, a drain) is waited for rather than judged NotReady on the next reading.
-                    ready = [pod for pod in _owned_pods(workload, pods) if _is_ready(pod)]
-                    updates["health_baseline"] = json.dumps(restart_baseline({"items": ready}), sort_keys=True)
+                    # Ready pods as known pods, as _join_baseline adds later ones: a pod still starting at the
+                    # apply (a scale-up, a drain) is waited for rather than judged NotReady on the next reading.
+                    # Its restart counts are kept too, under STARTING_PREFIX, so a restart from before the
+                    # apply never reads as one after it.
+                    owned = _owned_pods(workload, pods)
+                    baseline = restart_baseline({"items": [pod for pod in owned if _is_ready(pod)]})
+                    starting = restart_baseline({"items": [pod for pod in owned if not _is_ready(pod)]})
+                    baseline.update({STARTING_PREFIX + key: count for key, count in starting.items()})
+                    updates["health_baseline"] = json.dumps(baseline, sort_keys=True)
                     bucket = "applied"
                 else:
                     bucket = "waiting"
@@ -966,9 +988,20 @@ def reads_per_tick() -> int:
     return value
 
 
-def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None) -> int:
-    """``post_merge_check.py notice|health``: one tick of the merge step, or of the apply and health
-    steps; prints what it saw as JSON.
+#: The cron run's summary, in the agent's shipped logs (``script_log``).
+LOG_FILE = "post_merge_check.log"
+
+
+def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None,
+         **tick_overrides) -> int:
+    """With no arguments, the ``post-merge-check`` cron job: one ``post_merge_outcome.tick``, printing
+    nothing to stdout. The summary goes to ``logs/post_merge_check.log``. A run in which any record or
+    step errored prints one line on stdout naming them, which chat posts, and still exits 0, since the
+    scheduler's own line for a non-zero exit says the check did not run; a failure already reported in
+    the last day (``post_merge_outcome.failures_to_report``) is not said again. A clean run prints
+    nothing and the scheduler relays nothing. A run that cannot start (an unreadable database) raises. ``notice``, ``health`` and ``report``
+    run one step by hand (``report`` in the switch's mode, through ``post_merge_report``) and print
+    what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
 
@@ -978,24 +1011,21 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     from contextlib import closing
 
     argv = sys.argv[1:] if argv is None else argv
-    if argv not in (["notice"], ["health"], ["report"]):
-        print("usage: post_merge_check.py notice|health|report", file=sys.stderr)
+    if argv not in ([], ["notice"], ["health"], ["report"]):
+        print("usage: post_merge_check.py [notice|health|report]", file=sys.stderr)
         return 2
     import kubeagents_switches
 
     mode = kubeagents_switches.switch(SWITCH)
     if mode == kubeagents_switches.OFF:
-        print(json.dumps({"switch": kubeagents_switches.OFF}))
+        if argv:
+            print(json.dumps({"switch": kubeagents_switches.OFF}))
         return 0
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DB_DEFAULT
     with closing(sqlite3.connect(path, timeout=5.0)) as conn:
         if argv == ["notice"]:
             print(json.dumps(notice_merges(conn, view, limit=reads_per_tick())))
-        elif argv == ["report"]:
-            import post_merge_report
-
-            print(json.dumps(post_merge_report.report_outcomes(conn, mode, limit=reads_per_tick())))
-        else:
+        elif argv == ["health"]:
             import post_merge_scope
 
             try:
@@ -1004,6 +1034,30 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
                 print(json.dumps({"scope": "unreadable", "error": str(exc)[:300]}))
                 return 1
             print(json.dumps(watch_health(conn, kubectl_json, limit=reads_per_tick(), scope_refusal=refusal)))
+        elif argv == ["report"]:
+            import post_merge_report
+
+            print(json.dumps(post_merge_report.report_outcomes(conn, mode, limit=reads_per_tick())))
+        else:
+            import post_merge_outcome
+
+            seen = post_merge_outcome.tick(conn, mode, view=view, kubectl_json=kubectl_json, **tick_overrides)
+            summary = f"post-merge check ({mode}): {json.dumps(seen)}"
+            early = post_merge_outcome.stopped_early(seen)
+            try:
+                import script_log
+
+                script_log.append(LOG_FILE, [summary] + ([early] if early else []))
+            except Exception as exc:  # noqa: BLE001 — the log is best effort
+                print(f"post-merge check: could not write {LOG_FILE}: {exc!r}", file=sys.stderr)
+            failures = post_merge_outcome.failures_to_report(post_merge_outcome.errored(seen),
+                                                             datetime.now(timezone.utc))
+            if failures:
+                # One line on stdout, which chat posts, and exit 0: a non-zero exit makes the scheduler post
+                # that the check "didn't run" and will retry, where it did run and did the other records.
+                print(f"The post-merge check ran, but {len(failures)} record(s) or step(s) failed: "
+                      f"{', '.join(failures)[:1500]}. Details are in logs/{LOG_FILE} on the agent; "
+                      "each is said once a day while it keeps failing.")
     return 0
 
 

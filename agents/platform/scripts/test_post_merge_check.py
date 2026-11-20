@@ -271,6 +271,24 @@ class WatchHealthTest(unittest.TestCase):
         self.assertIsNone(row["applied_at"])
         self.assertTrue(row["sync_state"].startswith("pending"), row["sync_state"])
 
+    def test_a_restart_from_before_the_apply_on_a_pod_still_starting_is_not_a_restart(self):
+        # checkout-2 has one old restart and is not Ready at the apply reading; later all three are Ready
+        # and no count has moved: the window passes, it does not fail on the old restart.
+        self.cluster.apps = [argo_app()]
+        starting = pods(restarts=(0, 0, 1))
+        starting["items"][2]["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+        self.cluster.pod_list = starting
+        self.assertEqual(self.tick(1)["applied"], [f"{REPO}/pull/1"])
+        baseline = json.loads(self.row()["health_baseline"])
+        self.assertEqual(baseline, {"u0/web": 0, "u1/web": 0, "~u2/web": 1})
+        self.cluster.pod_list = pods(restarts=(0, 0, 1))
+        self.tick(4)
+        self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
+        # A restart after the apply on that pod still fails it.
+        self.conn.execute("UPDATE post_merge_records SET health_result = NULL, health_detail = NULL")
+        self.cluster.pod_list = pods(restarts=(0, 0, 2))
+        self.assertEqual(self.tick(8)["failed"], [f"{REPO}/pull/1"])
+
     def test_applied_records_the_baseline_then_passes_after_the_window(self):
         self.cluster.apps = [argo_app()]
         self.cluster.pod_list = pods(restarts=(2, 0, 0))
@@ -957,6 +975,9 @@ class ReconcilersForTest(unittest.TestCase):
     def test_diff_paths_unquotes_escapes_beside_raw_utf8(self):
         diff = 'diff --git "a/caf\u00e9/\\"q\\".yaml" "b/caf\u00e9/\\"q\\".yaml"\n--- "a/caf\u00e9/\\"q\\".yaml"\n'
         self.assertEqual(post_merge_check.diff_paths(diff), ['caf\u00e9/"q".yaml'])
+        # Raw Latin-1-range text that happens to spell valid UTF-8 is kept, never decoded a second time.
+        mojibake = 'diff --git "a/\u00c3\u00a9/\\"q\\".yaml" "b/\u00c3\u00a9/\\"q\\".yaml"\n--- "a/\u00c3\u00a9/\\"q\\".yaml"\n'
+        self.assertEqual(post_merge_check.diff_paths(mojibake), ['\u00c3\u00a9/"q".yaml'])
 
     def test_diff_paths_with_a_name_keeps_only_the_files_that_name_it(self):
         diff = ("diff --git a/platform/x.yaml b/platform/x.yaml\n--- a/platform/x.yaml\n+++ b/platform/x.yaml\n"
@@ -975,13 +996,14 @@ class ReconcilersForTest(unittest.TestCase):
                 "+x\rdiff --git a/clusters/prod/p.yaml b/clusters/prod/p.yaml\n+y\u2028diff --git a/c/q b/c/q\n")
         self.assertEqual(post_merge_check.diff_paths(diff), ["a.yaml"])
 
-    def test_forge_paths_reads_an_undecodable_escape_as_unknown(self):
+    def test_an_escape_that_names_no_byte_is_kept_as_text_never_a_crash(self):
         from unittest import mock
 
         diff = 'diff --git "a/\\400/p.yaml" "b/\\400/p.yaml"\n--- "a/\\400/p.yaml"\n'
         forge = mock.Mock(call=lambda *a, **k: {"diff": diff})
-        with mock.patch.dict(sys.modules, {"forge": forge}), self.assertLogs("post_merge_check", level="WARNING"):
-            self.assertIsNone(post_merge_check.forge_paths(REPO, 7))
+        with mock.patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(post_merge_check.forge_paths(REPO, 7), ["\\400/p.yaml"])
+        self.assertEqual(post_merge_check._unquote("\\\u20acx"), "\\\u20acx")
 
     def test_diff_paths_reads_renames_and_binary_files(self):
         diff = ("diff --git a/old/pdb.yaml b/clusters/dev/pdb.yaml\nsimilarity index 100%\n"

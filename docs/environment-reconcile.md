@@ -225,7 +225,7 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `SLACK_HOME_CHANNEL_NAME`, `SLACK_HOME_CHANNEL_POLICY`, `PLATFORM_AGENT_CUSTOM_ROLES`,
 `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
 `KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`,
-`HELM_UPGRADE_INSTALL`. Secrets: `GH_APP_ID`,
+`HELM_UPGRADE_INSTALL`, `CARD_STOP_ENABLED`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.
 
@@ -250,6 +250,13 @@ where `false` fails loudly instead. Turning it on for a running install is an
 in-place change that runs one `helm upgrade` (a new release revision). It does not
 recover a release left in a `pending-install` or `pending-upgrade` state; Helm still
 refuses those with "another operation is in progress".
+
+`CARD_STOP_ENABLED=true` makes a chat `stop`, or Slack's Stop button, also stop the
+kanban cards the conversation filed: the composition's `card_stop_enabled`, the chart's
+`operator.cardStop.enabled`, and `A2A_CARD_STOP=true` on the operator, which renders it
+onto the A2A gateway. Absent, or a value other than `true`, `yes`, `y`, `1` or `on` (any case), means `false`, the
+reply a stop has always had. Set it only on an environment whose images answer the stop;
+an older hermes-bridge answers that it couldn't confirm the cards stopped.
 
 `PLATFORM_AGENT_MODE` is no longer read: every install runs the A2A stack, the renderer
 writes no key for it, and `deploy-environment.yml` has no `mode` input. A variable of that
