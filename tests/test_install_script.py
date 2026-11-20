@@ -6721,6 +6721,414 @@ class PlatformAgentStorageSizePersistsThroughInstallEnvTest(unittest.TestCase):
             self.assertIn("SIZE=[]", proc.stdout)
 
 
+class PlatformAgentSizingProfilePersistsThroughInstallEnvTest(unittest.TestCase):
+    """PLATFORM_AGENT_SIZING_PROFILE persistence, flag validation, and fleet Standard wiring."""
+
+    @staticmethod
+    def _env(overrides=None):
+        env = get_isolated_test_env(overrides=overrides or {})
+        env.pop("PLATFORM_AGENT_SIZING_PROFILE", None)
+        env.pop("TF_VAR_sizing_profile", None)
+        if overrides:
+            env.update(overrides)
+        return env
+
+    def _bootstrap_with_export(self, tmp, export_line):
+        dest = pathlib.Path(tmp) / "new.install.env"
+        loaded = pathlib.Path(tmp) / "loaded.install.env"
+        loaded.write_text("")
+        loaded.chmod(0o600)
+        proc = _run_installer_bash(
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'source scripts/installer/installer_common.sh\n'
+            'resolve_shared_defaults\n'
+            'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+            f'{export_line}\n'
+            f'bootstrap_install_env_file "{dest}" some-tag >/dev/null',
+            env=self._env({
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            }),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+        return dest
+
+    def test_an_inherited_sizing_profile_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export PLATFORM_AGENT_SIZING_PROFILE="medium"')
+            self.assertIn("PLATFORM_AGENT_SIZING_PROFILE=medium\n", dest.read_text())
+
+    def test_an_unset_sizing_profile_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for export_line in ("unset PLATFORM_AGENT_SIZING_PROFILE", 'export PLATFORM_AGENT_SIZING_PROFILE=""'):
+                with self.subTest(export_line=export_line):
+                    dest = self._bootstrap_with_export(tmp, export_line)
+                    self.assertNotIn("PLATFORM_AGENT_SIZING_PROFILE", dest.read_text())
+                    dest.unlink()
+
+    def test_a_later_run_drops_an_inherited_sizing_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("PROJECT_ID=p\n")
+            loaded.chmod(0o600)
+            proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'echo "PROFILE=[${PLATFORM_AGENT_SIZING_PROFILE:-}]"',
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(loaded), "PLATFORM_AGENT_SIZING_PROFILE": "fleet"}),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("PROFILE=[]", proc.stdout)
+
+    def test_sizing_profile_flag_and_help(self):
+        help_proc = subprocess.run(
+            ["bash", str(_INSTALL_SH), "--help"],
+            capture_output=True, text=True, env=self._env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
+        self.assertIn("--sizing-profile=PROFILE", help_proc.stdout)
+
+        parse_proc = _run_installer_bash(
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'source scripts/installer/installer_common.sh\n'
+            'parse_args --sizing-profile=fleet\n'
+            'is_valid_platform_agent_sizing_profile "$PARAM_PLATFORM_AGENT_SIZING_PROFILE"\n'
+            'echo "PROFILE=[$PARAM_PLATFORM_AGENT_SIZING_PROFILE] PASSED=[$PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED]"\n'
+            'echo "TYPED=[$INSTALL_ENV_FLAGS_TYPED]"',
+            env=self._env(),
+        )
+        self.assertEqual(parse_proc.returncode, 0, parse_proc.stderr + parse_proc.stdout)
+        self.assertIn("PROFILE=[fleet] PASSED=[true]", parse_proc.stdout)
+        self.assertNotIn("PLATFORM_AGENT_SIZING_PROFILE", parse_proc.stdout.split("TYPED=[", 1)[1])
+
+        # --menu rejects --sizing-profile with its own message (never as a "chat flag").
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = pathlib.Path(tmp) / "install.env"
+            loaded.write_text("PROJECT_ID=p\n")
+            menu_proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'run_menu_system() { echo "MENU"; }\n'
+                'print_banner() { :; }\n'
+                'parse_args --menu --sizing-profile=fleet\n'
+                'main\n',
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(loaded)}),
+            )
+            self.assertEqual(menu_proc.returncode, 1)
+            self.assertIn("--menu takes no --sizing-profile", menu_proc.stdout + menu_proc.stderr)
+            self.assertNotIn("chat flag", menu_proc.stdout + menu_proc.stderr)
+
+    def test_fleet_scan_on_new_standard_cluster_sets_and_persists_tf_var_sizing_profile(self):
+        # Extract the exact scan+Standard auto-sizing snippet from install.sh main() so we
+        # verify the production wiring against 26 stubbed clusters, interactive prompt_read,
+        # pre-existing install.env queueing, and generate-only handoff.
+        text = _INSTALL_SH.read_text(encoding="utf-8")
+        self.assertNotIn("prompt_yes_no", text)
+        marker = '  # Scan visible clusters in scope to report runtime/host/storage sizing\n'
+        end_marker = '  # Written once, and only when there is nothing there.'
+        block = text[text.index(marker) : text.index(end_marker, text.index(marker))]
+        lines = "\\n".join(f"cluster-{i}\\tus-central1" for i in range(1, 27))
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            g = bin_dir / "gcloud"
+            g.write_text(
+                f'#!/usr/bin/env bash\nif [ "${{1:-}}" = "container" ] && [ "${{2:-}}" = "clusters" ] && [ "${{3:-}}" = "list" ]; then printf "{lines}\\n"; exit 0; fi\nexit 1\n'
+            )
+            g.chmod(g.stat().st_mode | stat.S_IEXEC)
+            dest = pathlib.Path(tmp) / "install.env"
+            loaded = pathlib.Path(tmp) / "loaded.env"
+            loaded.write_text("")
+            proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                f'bootstrap_install_env_file "{dest}" v1.2.3 >/dev/null\n'
+                'print_generate_only_handoff "." "p" "c" "us-central1" "terraform.tfvars"\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            out = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, out)
+            self.assertIn("TFVAR=[fleet]", out)
+            self.assertNotIn("GKE Standard host recommendation:", out)
+            self.assertIn("TF_VAR_sizing_profile=fleet ./lifecycle.sh apply", out)
+            self.assertIn("TF_VAR_sizing_profile=fleet\n", dest.read_text())
+
+            # When install.env already exists without TF_VAR_sizing_profile, record_flags_into_install_env persists it on commit.
+            existing = pathlib.Path(tmp) / "existing.env"
+            existing.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+            existing.chmod(0o600)
+            proc_existing = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'INSTALL_ENV_FILE="' + str(existing) + '"\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'record_flags_into_install_env\n',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(existing),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_existing.returncode, 0, proc_existing.stdout + proc_existing.stderr)
+            self.assertIn("TF_VAR_sizing_profile=fleet\n", existing.read_text())
+
+            # Existing Terraform-managed Standard cluster (TFVARS_CLUSTER_EXISTS=true, even though
+            # TFVARS_CREATE_CLUSTER=true) MUST NOT auto-select/persist TF_VAR_sizing_profile=fleet
+            # and MUST inspect the live CR.
+            tf_managed = pathlib.Path(tmp) / "tf-managed.env"
+            tf_managed.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+            tf_managed.chmod(0o600)
+            k = bin_dir / "kubectl"
+            cr_json = '{"items":[{"spec":{"deployment":{"sizingProfile":"auto"}},"status":{"usage":{"clustersRegistered":26,"clustersMonitored":26}}}]}'
+            k.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "${1:-}" = "config" ] && [ "${2:-}" = "get-contexts" ]; then exit 0; fi\n'
+                'if [ "${1:-}" = "--context" ]; then shift 2; fi\n'
+                'if [ "${1:-}" = "get" ] && [ "${2:-}" = "crd" ]; then exit 0; fi\n'
+                f"printf '%s' {shlex.quote(cr_json)}\n"
+            )
+            k.chmod(k.stat().st_mode | stat.S_IEXEC)
+            proc_managed = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'INSTALL_ENV_FILE="' + str(tf_managed) + '"\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_EXISTS="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n'
+                'echo "INC=[$sizing_include_cr] CREATE=[$sizing_is_create_cluster]"\n'
+                '}\n_test_scan_block\n'
+                'record_flags_into_install_env\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(tf_managed),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            out_managed = proc_managed.stdout + proc_managed.stderr
+            self.assertEqual(proc_managed.returncode, 0, out_managed)
+            self.assertIn("INC=[true] CREATE=[false]", out_managed)
+            self.assertIn("TFVAR=[]", out_managed)
+            self.assertIn("26 visible via gcloud, 26 in live PlatformAgent status.usage", out_managed)
+            self.assertIn("GKE Standard fleet host note:", out_managed)
+            self.assertNotIn("Setting TF_VAR_sizing_profile=fleet", out_managed)
+            self.assertNotIn("TF_VAR_sizing_profile", tf_managed.read_text())
+
+            # Finding 1: TF_VAR_gvisor_machine_type alone MUST NOT suppress default-pool TF_VAR_sizing_profile=fleet.
+            proc_gvisor_only = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                'export TF_VAR_gvisor_machine_type="n2-standard-8"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_gvisor_only.returncode, 0, proc_gvisor_only.stdout + proc_gvisor_only.stderr)
+            self.assertIn("TFVAR=[fleet]", proc_gvisor_only.stdout)
+
+            # Finding 3: explicit PLATFORM_AGENT_SIZING_PROFILE=small keeps runtime below fleet, so do not auto-select TF_VAR_sizing_profile=fleet.
+            proc_pinned_small = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'export PLATFORM_AGENT_SIZING_PROFILE="small"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_pinned_small.returncode, 0, proc_pinned_small.stdout + proc_pinned_small.stderr)
+            self.assertIn("TFVAR=[]", proc_pinned_small.stdout)
+            self.assertNotIn("Setting TF_VAR_sizing_profile=fleet", proc_pinned_small.stdout)
+
+            # Finding 4: read-only install.env missing TF_VAR_sizing_profile fails early in apply mode and succeeds in dry-run.
+            if os.geteuid() != 0:
+                ro_env = pathlib.Path(tmp) / "readonly.env"
+                ro_env.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+                ro_env.chmod(0o400)
+                try:
+                    for dry_run, non_interactive, want_rc in (
+                        ("false", "true", 1),
+                        ("false", "false", 1),
+                        ("true", "true", 0),
+                    ):
+                        with self.subTest(read_only_dry_run=dry_run, non_interactive=non_interactive):
+                            tfvars_stub = pathlib.Path(tmp) / f"ro-{dry_run}-{non_interactive}.tfvars"
+                            tfvars_stub.write_text("# stale tfvars\n")
+                            tty_stub = ""
+                            if non_interactive == "false":
+                                tty_stub = (
+                                    'has_controlling_tty() { return 0; }\n'
+                                    'prompt_read() { echo "PROMPT_CALLED"; return 1; }\n'
+                                )
+                            proc_ro = _run_installer_bash(
+                                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                                'source scripts/installer/installer_common.sh\n'
+                                'resolve_shared_defaults\n'
+                                f'{tty_stub}'
+                                f'INSTALL_ENV_FILE="{ro_env}"\n'
+                                f'tfvars_file="{tfvars_stub}"\n'
+                                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                                f'PARAM_NON_INTERACTIVE="{non_interactive}"; PARAM_DRY_RUN="{dry_run}"; PARAM_MEMORY="file"\n'
+                                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                                'echo "KEYS=[$INSTALL_ENV_KEYS_TO_RECORD]"',
+                                env=self._env({
+                                    "KUBE_AGENTS_INSTALL_ENV": str(ro_env),
+                                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                                }),
+                            )
+                            self.assertEqual(proc_ro.returncode, want_rc, proc_ro.stdout + proc_ro.stderr)
+                            self.assertNotIn("PROMPT_CALLED", proc_ro.stdout + proc_ro.stderr)
+                            if want_rc == 1:
+                                self.assertIn("not writable", proc_ro.stdout + proc_ro.stderr)
+                                self.assertFalse(tfvars_stub.exists())
+                            else:
+                                self.assertIn("KEYS=[]", proc_ro.stdout)
+                                self.assertTrue(tfvars_stub.exists())
+                finally:
+                    ro_env.chmod(0o600)
+
+            # Explicit TF_VAR_sizing_profile="" in install.env intentionally pins Standard node pools
+            # to small and MUST NOT be overridden to fleet by Step 11.
+            explicit_small_env = pathlib.Path(tmp) / "explicit-small.env"
+            explicit_small_env.write_text('PROJECT_ID=p\nCLUSTER_NAME=c\nTF_VAR_sizing_profile=""\n')
+            explicit_small_env.chmod(0o600)
+            proc_explicit_small = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                f'INSTALL_ENV_FILE="{explicit_small_env}"\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"\n',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(explicit_small_env),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_explicit_small.returncode, 0, proc_explicit_small.stdout + proc_explicit_small.stderr)
+            self.assertIn("TFVAR=[]", proc_explicit_small.stdout)
+            self.assertNotIn("Setting TF_VAR_sizing_profile=fleet", proc_explicit_small.stdout)
+
+            # Interactive prompt_read branches (both y accept and n decline) under tty.
+            for ans, want_fleet in (("y", True), ("n", False)):
+                with self.subTest(interactive_ans=ans):
+                    prompt_env = pathlib.Path(tmp) / f"interactive-{ans}.env"
+                    prompt_env.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+                    prompt_env.chmod(0o600)
+                    proc_interactive = _run_installer_bash(
+                        f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                        'source scripts/installer/installer_common.sh\n'
+                        'resolve_shared_defaults\n'
+                        'has_controlling_tty() { return 0; }\n'
+                        f'prompt_read() {{ printf -v "$2" "%s" "{ans}"; echo "PROMPT:$1"; }}\n'
+                        f'INSTALL_ENV_FILE="{prompt_env}"\n'
+                        'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                        'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                        'PARAM_NON_INTERACTIVE="false"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                        'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                        f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                        'record_flags_into_install_env\n'
+                        'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"\n',
+                        env=self._env({
+                            "KUBE_AGENTS_INSTALL_ENV": str(prompt_env),
+                            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                        }),
+                    )
+                    out_i = proc_interactive.stdout + proc_interactive.stderr
+                    self.assertEqual(proc_interactive.returncode, 0, out_i)
+                    self.assertIn("PROMPT:Set TF_VAR_sizing_profile=fleet for the new Standard node pools", out_i)
+                    if want_fleet:
+                        self.assertIn("Set TF_VAR_sizing_profile=fleet for the new Standard cluster.", out_i)
+                        self.assertIn("TFVAR=[fleet]", out_i)
+                        self.assertIn("TF_VAR_sizing_profile=fleet\n", prompt_env.read_text())
+                    else:
+                        self.assertIn("Leaving Standard node pools at default machine types", out_i)
+                        self.assertIn("TFVAR=[]", out_i)
+                        self.assertNotIn("TF_VAR_sizing_profile", prompt_env.read_text())
+
+            # Paused Step 11 handoff command preserves TF_VAR_sizing_profile=fleet when chosen.
+            pause_start = text.index('        print_info "To launch provisioning later, run:')
+            pause_line_start = text.rindex('        local paused_sizing_prefix=""\n', 0, pause_start)
+            pause_end = text.index("\n", pause_start)
+            pause_block = text[pause_line_start:pause_end]
+            proc_pause = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'TF_VAR_sizing_profile="fleet"\n'
+                f'_test_pause() {{\n{pause_block}\n}}\n_test_pause\n',
+                env=self._env(),
+            )
+            self.assertEqual(proc_pause.returncode, 0, proc_pause.stdout + proc_pause.stderr)
+            self.assertIn("TF_VAR_sizing_profile=fleet ./lifecycle.sh apply", proc_pause.stdout)
+
+    def test_validation_override_warning_and_summary_survive_older_defaults_under_set_u(self):
+        text = _INSTALL_SH.read_text(encoding="utf-8")
+        val_start = text.index("  _install_is_valid_sizing_profile() {\n")
+        val_end = text.index("  # The chat flags against an existing install.env", val_start)
+        val_block = text[val_start:val_end]
+        sum_start = text.index('  local summary_sizing_profile="${PLATFORM_AGENT_SIZING_PROFILE:-')
+        sum_end = text.index('  echo -e "  • ${C_CYAN}Cluster Footprint', sum_start)
+        sum_block = text[sum_start:sum_end]
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\nPLATFORM_AGENT_SIZING_PROFILE=small\n")
+            env_file.chmod(0o600)
+            proc = _run_installer_bash(
+                f'set -u\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'unset DEFAULT_PLATFORM_AGENT_SIZING_PROFILE\n'
+                'INSTALL_ENV_FILE="' + str(env_file) + '"\n'
+                'PLATFORM_AGENT_SIZING_PROFILE="medium"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE="fleet"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"\n'
+                f'_test_val() {{\n{val_block}\n}}\n_test_val\n'
+                'unset PLATFORM_AGENT_SIZING_PROFILE\n'
+                f'_test_sum() {{\n{sum_block}\n}}\n_test_sum\n',
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+            )
+            out = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, out)
+            self.assertIn("overrides PLATFORM_AGENT_SIZING_PROFILE='small'", out)
+            self.assertNotIn("medium", out)
+            self.assertIn("Runtime Sizing Profile:", out)
+            self.assertIn("auto", out)
+
+
 class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
     """The flag on the first run, the file on every later one.
 

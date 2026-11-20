@@ -117,6 +117,12 @@ readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
 readonly STOCKOUT_INVESTIGATOR_PROMPT_DESC="GKE Stockout Investigator watches cluster-autoscaler noScaleUp Cloud Logging events for capacity or quota failures, diagnoses the root cause, and opens a GitOps remediation PR or posts diagnostics to your chat channel."
 readonly STOCKOUT_INVESTIGATOR_NO_HOME_CHANNEL_NOTE="No Google Chat or Slack home channel is configured yet, so proactive stockout alerts cannot be delivered immediately (they stay queued in HomeChannelUnset until a home channel is set); defaulting to No."
 readonly STOCKOUT_INVESTIGATOR_PROMPT_LABEL="Enable GKE Stockout Investigator for automated scale-up failure diagnostics?"
+readonly INSTALL_SIZING_PROFILE_DEFAULT="auto"
+readonly INSTALL_SIZING_PROFILE_VALUES="small medium fleet auto"
+readonly INSTALL_SIZING_PROFILE_CHOICES="small | medium | fleet | auto"
+readonly INSTALL_GKE_CLUSTER_MODE_STANDARD="standard"
+readonly INSTALL_GKE_SIZING_PROFILE_FLEET="fleet"
+readonly INSTALL_DEFAULT_SIZING_FLEET_CLUSTER_THRESHOLD=25
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -357,6 +363,9 @@ bootstrap_install_env() {
   # grow both data claims for one run, and the next run from a clean shell
   # would drop the field again, leaving claims larger than the CR says.
   unset PLATFORM_AGENT_STORAGE_SIZE
+  # The runtime sizing profile too: once install.env exists, only install.env
+  # (or --sizing-profile) sets it.
+  unset PLATFORM_AGENT_SIZING_PROFILE
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
@@ -799,6 +808,8 @@ PARAM_SLACK_HOME_CHANNEL_POLICY="${SLACK_HOME_CHANNEL_POLICY:-}"
 # install.env, so this seeds from the file alone; --agent-namespace is the
 # other way in.
 PARAM_AGENT_NAMESPACE="${NAMESPACE:-}"
+PARAM_PLATFORM_AGENT_SIZING_PROFILE="${PLATFORM_AGENT_SIZING_PROFILE:-}"
+PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="false"
 
 show_help() {
   cat << EOF
@@ -829,6 +840,10 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
                                 namespace, so changing it is for CI and second installs
+  --sizing-profile=PROFILE      PlatformAgent spec.deployment.sizingProfile preset:
+                                auto | small | medium | fleet (default: auto, which
+                                promotes at 10 and 25 clusters when namespace quota
+                                allows)
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
                                 openai_compatible (a server speaking the OpenAI chat
                                 completions API: vLLM, TGI, an internal gateway) |
@@ -1228,6 +1243,11 @@ parse_args() {
       --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
+      --sizing-profile=*)
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE="${1#*=}"
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_PLATFORM_AGENT_SIZING_PROFILE"
+        shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; PARAM_MODEL_DEFAULT_NAME_PASSED="true"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
@@ -3090,6 +3110,12 @@ bootstrap_install_env_file() {
   if [ -n "${PLATFORM_AGENT_STORAGE_SIZE:-}" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
   fi
+  if [ -n "${PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_SIZING_PROFILE "$PLATFORM_AGENT_SIZING_PROFILE"
+  fi
+  if [ -n "${TF_VAR_sizing_profile:-}" ]; then
+    write_env_var "$tmp" TF_VAR_sizing_profile "$TF_VAR_sizing_profile"
+  fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
@@ -4278,7 +4304,11 @@ print_generate_only_handoff() {
     echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
   fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
-  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  local sizing_prefix=""
+  if [ -n "${TF_VAR_sizing_profile:-}" ]; then
+    sizing_prefix="TF_VAR_sizing_profile=$(printf '%q' "$TF_VAR_sizing_profile") "
+  fi
+  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ${sizing_prefix}./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
   echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
   echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions)"
@@ -7387,6 +7417,10 @@ main() {
       print_error "--menu takes no --enable-stockout-investigator: toggle GKE Stockout Investigator inside the menu (Option 4 -> Option 3), or pass the flag to a plain install.sh run."
       exit 1
     fi
+    if [ "${PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED:-false}" = "true" ]; then
+      print_error "--menu takes no --sizing-profile: edit PLATFORM_AGENT_SIZING_PROFILE in install.env or pass --sizing-profile to a plain install.sh or upgrade.sh run."
+      exit 1
+    fi
     run_menu_system
     print_gateway_home_channel_unset_summary
     exit 0
@@ -7494,6 +7528,38 @@ main() {
   # refuse the disagreement, so that value is sent back to the file.
   require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
     "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
+  _install_is_valid_sizing_profile() {
+    local val="${1:-}" item
+    if declare -F is_valid_platform_agent_sizing_profile >/dev/null; then
+      is_valid_platform_agent_sizing_profile "$val"
+      return $?
+    fi
+    for item in $INSTALL_SIZING_PROFILE_VALUES; do
+      [ "$val" = "$item" ] && return 0
+    done
+    return 1
+  }
+  local default_sizing_profile="${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$INSTALL_SIZING_PROFILE_DEFAULT}"
+  if [ -n "${PARAM_PLATFORM_AGENT_SIZING_PROFILE:-}" ] && ! _install_is_valid_sizing_profile "$PARAM_PLATFORM_AGENT_SIZING_PROFILE"; then
+    if [ "${PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED:-false}" = "true" ]; then
+      print_error "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' is not valid; use ${INSTALL_SIZING_PROFILE_CHOICES}."
+    else
+      print_error "PLATFORM_AGENT_SIZING_PROFILE='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' is not valid; use ${INSTALL_SIZING_PROFILE_CHOICES} (or empty for '${default_sizing_profile}')."
+    fi
+    exit 1
+  fi
+  if [ "${PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED:-false}" = "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+    local recorded_sizing_profile=""
+    if install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_SIZING_PROFILE; then
+      recorded_sizing_profile="$(recorded_install_env_value "$INSTALL_ENV_FILE" PLATFORM_AGENT_SIZING_PROFILE)"
+      if [ "${recorded_sizing_profile:-$default_sizing_profile}" != "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" ]; then
+        print_warning "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' overrides PLATFORM_AGENT_SIZING_PROFILE='${recorded_sizing_profile:-$default_sizing_profile}' in ${INSTALL_ENV_FILE} for this run only."
+        print_info "Update PLATFORM_AGENT_SIZING_PROFILE=${PARAM_PLATFORM_AGENT_SIZING_PROFILE} in ${INSTALL_ENV_FILE} so future upgrade.sh runs keep it."
+      fi
+    elif [ -n "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" ] && [ "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" != "$default_sizing_profile" ]; then
+      print_warning "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' applies for this run only (${INSTALL_ENV_FILE} has no PLATFORM_AGENT_SIZING_PROFILE, so future upgrades default to '${default_sizing_profile}')."
+    fi
+  fi
   # The chat flags against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
@@ -8906,6 +8972,9 @@ main() {
   if [ -n "${PARAM_ENABLE_WEB_CONSOLE:-}" ]; then
     export WEB_CONSOLE_ENABLED="$PARAM_ENABLE_WEB_CONSOLE"
   fi
+  if [ -n "${PARAM_PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+    export PLATFORM_AGENT_SIZING_PROFILE="$PARAM_PLATFORM_AGENT_SIZING_PROFILE"
+  fi
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
   # Conditional, like ENABLE_DRIFT_DETECTOR below: a run that did not say
@@ -9056,6 +9125,64 @@ main() {
     settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"
   fi
 
+  # Scan visible clusters in scope to report runtime/host/storage sizing
+  # guidance and size new fleet Standard node pools before writing install.env.
+  local sizing_include_cr="false" sizing_is_create_cluster="true"
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
+    sizing_include_cr="true"
+    sizing_is_create_cluster="false"
+  fi
+  if declare -F scan_visible_clusters_in_scope >/dev/null; then
+    scan_visible_clusters_in_scope "$project_id" "$sizing_include_cr"
+  fi
+  local configured_runtime_profile="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$INSTALL_SIZING_PROFILE_DEFAULT}}"
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" != "true" ] && \
+     [ "${TFVARS_CREATE_CLUSTER:-true}" = "true" ] && \
+     [ "${TFVARS_CLUSTER_MODE:-$cluster_mode}" = "$INSTALL_GKE_CLUSTER_MODE_STANDARD" ] && \
+     { [ "$configured_runtime_profile" = "$INSTALL_SIZING_PROFILE_DEFAULT" ] || [ "$configured_runtime_profile" = "$INSTALL_GKE_SIZING_PROFILE_FLEET" ]; } && \
+     [ -n "${SIZING_SCAN_CLUSTER_COUNT:-}" ] && \
+     [ "${SIZING_SCAN_CLUSTER_COUNT}" -ge "${SIZING_FLEET_CLUSTER_THRESHOLD:-$INSTALL_DEFAULT_SIZING_FLEET_CLUSTER_THRESHOLD}" ] && \
+     [ -z "${TF_VAR_sizing_profile:-}" ] && \
+     ! install_env_records_key "${INSTALL_ENV_FILE:-}" TF_VAR_sizing_profile && \
+     [ -z "${TF_VAR_standard_machine_type:-}" ]; then
+    if [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ] && [ ! -w "$INSTALL_ENV_FILE" ]; then
+      if [ -n "${tfvars_file:-}" ]; then
+        rm -f "$tfvars_file"
+      fi
+      print_error "${INSTALL_ENV_FILE} assigns no TF_VAR_sizing_profile, which this run would record there, and it is not writable."
+      print_info "Make it writable, or add TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} to it yourself, and re-run."
+      exit 1
+    fi
+    local fleet_nodes_chosen="false"
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "$PARAM_DRY_RUN" = "true" ] || ! has_controlling_tty; then
+      fleet_nodes_chosen="true"
+      export TF_VAR_sizing_profile="$INSTALL_GKE_SIZING_PROFILE_FLEET"
+      print_info "Setting TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} for this new Standard cluster (${SIZING_SCAN_CLUSTER_COUNT} clusters in scope require >= 8 vCPU nodes for the fleet broker's 4 vCPU request)."
+    else
+      local sizing_prompt_ans=""
+      prompt_read "Set TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} for the new Standard node pools (${SIZING_SCAN_CLUSTER_COUNT} clusters detected; fits 4 vCPU fleet broker)? (Y/n)" sizing_prompt_ans "y"
+      case "$sizing_prompt_ans" in
+        [Yy]|[Yy][Ee][Ss])
+          fleet_nodes_chosen="true"
+          export TF_VAR_sizing_profile="$INSTALL_GKE_SIZING_PROFILE_FLEET"
+          print_success "Set TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} for the new Standard cluster."
+          ;;
+        *)
+          print_warning "Leaving Standard node pools at default machine types; set TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} before applying if needed."
+          ;;
+      esac
+    fi
+    if [ "$fleet_nodes_chosen" = "true" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+      case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+        *" TF_VAR_sizing_profile "*) ;;
+        *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD:+${INSTALL_ENV_KEYS_TO_RECORD} }TF_VAR_sizing_profile" ;;
+      esac
+    fi
+  fi
+  if declare -F report_cluster_sizing_guidance >/dev/null; then
+    report_cluster_sizing_guidance "$SIZING_SCAN_CONTEXT_INSTALL" "$project_id" "${TFVARS_CLUSTER_MODE:-$cluster_mode}" "$sizing_is_create_cluster" "$SIZING_SCAN_SKIP_FLAG"
+  fi
+
   # Written once, and only when there is nothing there. The probed cluster
   # shape is deliberately NOT recorded: a file that is read as configuration
   # and also written as findings has two answers for one question. The probe is
@@ -9119,6 +9246,12 @@ main() {
   # no notes, so this is where the front door prints them; `helm get notes`
   # does after the apply. On the dry run too: the number is the point of
   # previewing.
+  local summary_sizing_profile="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$INSTALL_SIZING_PROFILE_DEFAULT}}"
+  if [ -n "${SIZING_SCAN_CLUSTER_COUNT:-}" ]; then
+    echo -e "  • ${C_CYAN}Runtime Sizing Profile:${C_RESET} ${summary_sizing_profile} (${SIZING_SCAN_CLUSTER_COUNT} cluster(s) in scope -> recommended '${SIZING_SCAN_TIER}')"
+  else
+    echo -e "  • ${C_CYAN}Runtime Sizing Profile:${C_RESET} ${summary_sizing_profile}"
+  fi
   echo -e "  • ${C_CYAN}Cluster Footprint & Modeled Cost:${C_RESET}"
   print_footprint_summary "$repo_dir" "$tfvars_file"
   echo -e "${C_CYAN}${C_BOLD}"
@@ -9258,7 +9391,11 @@ main() {
         # needs in install.env.
         warn_install_env_keys_not_recorded
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
-        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        local paused_sizing_prefix=""
+        if [ -n "${TF_VAR_sizing_profile:-}" ]; then
+          paused_sizing_prefix="TF_VAR_sizing_profile=$(printf '%q' "$TF_VAR_sizing_profile") "
+        fi
+        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ${paused_sizing_prefix}./lifecycle.sh apply${C_RESET}"
         # After the lines above: the printers read the chat toggles from
         # install.env, which this route leaves as it found it.
         if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
