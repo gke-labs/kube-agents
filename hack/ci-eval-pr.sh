@@ -21,6 +21,9 @@
 # ==============================================================================
 
 set -euo pipefail
+# DO NOT MERGE: the session-mode smoke twin of #6677 exports the session front
+# door so the gate keys this run under next-session.
+export EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-session}"
 
 # The eval rosters, four files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, what
