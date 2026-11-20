@@ -421,14 +421,18 @@ REGISTRATION_ROWS = "{findings} didn't arrive."
 REGISTRATION_CLAIMS = "{clusters} {verb} last week's findings as they were."
 KEEP_FORMS = ("keeps", "keep")
 REGISTRATION_IN_REPORT_LINE = "The weekly report has them, and the weekly brief says so."
+# With the copy failed too, the brief reads an older copy that does not have them.
+REGISTRATION_IN_REPORT_ONLY_LINE = "The weekly report has them."
+REGISTRATION_IN_REPORT_ONLY = "the findings are in the report, not on the queue, and the brief reads an older copy"
 REGISTRATION_NO_RECORD_LINE = "The weekly report couldn't be saved either."
 FINDING_FORMS = ("finding", "findings")
 # The copy is retried by the next review, which copies afresh; until then the
-# agent's answers and the weekly brief read whatever copy is there.
-COPY_FAILED_LINE = (
-    "**The weekly upgrade readiness review couldn't copy this week's report for the agent.** "
-    "The agent reads the previous copy, if there is one, until the next review copies again. " + watch.DETAILS_IN_LOG
-)
+# agent's answers read whatever copy is there. What still works: the brief
+# finds the copy stale and composes what needs a decision from the queue
+# (its SOP's step 1.2), so with every finding on the queue the line says so.
+COPY_FAILED_HEADLINE = "**The weekly upgrade readiness review couldn't copy this week's report for the agent.**"
+COPY_FAILED_PREVIOUS = "Until the next review copies it, the agent reads the previous copy, if there is one."
+COPY_FAILED_QUEUE = "This week's findings are on the findings queue, so the weekly brief still lists what needs a decision."
 # A failure is announced once per distinct cause: the marker keeps the failure's text
 # with every number replaced, so a timeout that reads 1187s one week and 1203s the
 # next is the same failure.
@@ -1526,7 +1530,8 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str]]:
         # member projects out of the roster: the week is partial, said as such,
         # not a complete review of the live projects alone.
         failures[str(gap[watch.MEMBER_ID_KEYS[0]])] = str(gap[watch.MESSAGE_KEY])
-        # As the watch says it: a resolved scope the install cannot use needs a person.
+        # A resolved scope the install cannot use needs a person, as the watch's
+        # partial line says it; here too whether the other projects were read or not.
         if watch.errors_need_admin([gap]):
             needs_admin.add(str(gap[watch.MEMBER_ID_KEYS[0]]))
     if failures and not read_ids:
@@ -1574,10 +1579,13 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str]]:
         lines = [WRITE_FAILED_LINE.format(reason=watch.FAILED_REASON_WRITE, next=watch.FAILED_NEEDS_ADMIN), *registration, *partial_lines]
         return lines, [failed, *registration_log, *partial_log]
     copy_error = copy_to_sandbox(report_md, summary_doc)
-    lines, log = registration_lines(REGISTRATION_IN_REPORT_LINE, REGISTRATION_IN_REPORT)
     if copy_error:
-        lines.append(COPY_FAILED_LINE)
+        lines, log = registration_lines(REGISTRATION_IN_REPORT_ONLY_LINE, REGISTRATION_IN_REPORT_ONLY)
+        queue = [] if problems else [COPY_FAILED_QUEUE]
+        lines.append(watch.SENTENCE_SEPARATOR.join([COPY_FAILED_HEADLINE, COPY_FAILED_PREVIOUS, *queue, watch.DETAILS_IN_LOG]))
         log.append(COPY_FAILED_LOG_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
+    else:
+        lines, log = registration_lines(REGISTRATION_IN_REPORT_LINE, REGISTRATION_IN_REPORT)
     lines += partial_lines
     log += partial_log
     # The recovery is a notice: after what this run found, never ahead of it.

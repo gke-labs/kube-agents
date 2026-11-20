@@ -3429,8 +3429,12 @@ class ChatWording(Base):
             "results until it reads them again. It will try again at its next scheduled run. The details are in the agent's log.\n",
         )
         self.assert_plain(chat)
-        self.assertIn("p1: get-server-config failed: 503", log)
+        self.assertIn("p1 in europe-west1: get-server-config failed: 503", log)
         self.assertEqual(watch.unread_places(errors + [{"project": "p1", "message": "clusters list failed"}]), ["p1"], "a project not read covers its locations")
+        # Each place chat names has its reason in the log line, a second location of one project included.
+        two = errors + [{"project": "p1", "location": "us-east1", "message": "get-server-config failed: RESOURCE_EXHAUSTED"}]
+        self.assertEqual(watch.unread_places(two), ["p1 in europe-west1", "p1 in us-east1"])
+        self.assertEqual(watch.error_reasons(two), "p1 in europe-west1: get-server-config failed: 503; p1 in us-east1: get-server-config failed: RESOURCE_EXHAUSTED")
 
     def test_the_post_s_ceiling_is_the_gateway_s(self) -> None:
         # The gateway posts a notify longer than its chunk in pieces (a2a/gateway/relay.go); the watch fits its post to the same figure.

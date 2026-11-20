@@ -755,9 +755,10 @@ PARTIAL_LOG_LINE = (
     "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}): {reasons}; a version is retired only once "
     "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it"
 )
-# One reason per project the read errors name, so the log line says what went
-# wrong where; the announcement stays keyed on the kinds (and, for a refusal, on
-# the project and its cause), so the other reasons are the day's.
+# One reason per place the read errors name (a project, or a location of one
+# whose server config failed), so the log line says what went wrong where; the
+# announcement stays keyed on the kinds (and, for a refusal, on the project and
+# its cause), so the other reasons are the day's.
 PARTIAL_REASON = "{project}: {message}"
 REASONS_SEPARATOR = "; "
 PARTIAL_CLEARED_LOG_LINE = "{prefix} watch: the version table reads every project again"
@@ -769,7 +770,8 @@ PARTIAL_LINE = (
     "The clusters there keep any earlier results until it reads them again. {next}"
 )
 PARTIAL_SCOPE_GAP_NAME = "the install's declared scope"
-# A read error with a location is that location's, not the whole project's.
+# A read error with a location is that location's, not the whole project's
+# (`place_of`), in chat and in the log line alike.
 PARTIAL_LOCATION_NAME = "{project} in {location}"
 PARTIAL_CLEARED_LINE = "**The upgrade readiness check can read the whole fleet again.**"
 # What happens after a read that failed: a person acts first, for a refusal no
@@ -2105,14 +2107,21 @@ def cluster_names(clusters: list[str]) -> str:
     return shown_names([key.rsplit(MEMBER_KEY_SEPARATOR, 1)[-1] for key in clusters])
 
 
+def place_of(error: dict) -> str:
+    """Where a read error is: its project, or a location of it when the read
+    that failed was the location's (a server config)."""
+    project = str(error.get(MEMBER_ID_KEYS[0]) or NONE_WORD)
+    location = error.get(MEMBER_ID_KEYS[1])
+    return PARTIAL_LOCATION_NAME.format(project=project, location=location) if location else project
+
+
 def error_reasons(read_errors: list) -> str:
-    """One reason per project the read errors name, the first recorded, in
-    project order: what the partial log line says went wrong where."""
+    """One reason per place the read errors name, the first recorded, in
+    order: what the partial log line says went wrong where."""
     reasons: dict[str, str] = {}
     for error in read_errors:
-        project = str(error.get(MEMBER_ID_KEYS[0]) or NONE_WORD)
-        reasons.setdefault(project, str(error.get(MESSAGE_KEY) or error_kind(error)))
-    return shown_names([PARTIAL_REASON.format(project=project, message=reasons[project]) for project in sorted(reasons)], REASONS_SEPARATOR)
+        reasons.setdefault(place_of(error), str(error.get(MESSAGE_KEY) or error_kind(error)))
+    return shown_names([PARTIAL_REASON.format(project=place, message=reasons[place]) for place in sorted(reasons)], REASONS_SEPARATOR)
 
 
 # --- what chat reads ---------------------------------------------------------
@@ -2164,12 +2173,8 @@ def unread_places(read_errors: list) -> list[str]:
     a read error of its own, then each location of another project whose read
     failed (a server config), in project order; the scope's gap is named as
     the scope (`chat_project_names`)."""
-    whole = {str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors if not e.get(MEMBER_ID_KEYS[1])}
-    located = {
-        PARTIAL_LOCATION_NAME.format(project=e.get(MEMBER_ID_KEYS[0]), location=e.get(MEMBER_ID_KEYS[1]))
-        for e in read_errors
-        if e.get(MEMBER_ID_KEYS[1]) and str(e.get(MEMBER_ID_KEYS[0])) not in whole
-    }
+    whole = {place_of(e) for e in read_errors if not e.get(MEMBER_ID_KEYS[1])}
+    located = {place_of(e) for e in read_errors if e.get(MEMBER_ID_KEYS[1]) and str(e.get(MEMBER_ID_KEYS[0])) not in whole}
     return sorted(whole) + sorted(located)
 
 
@@ -2604,9 +2609,9 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> tuple[list
     signature = partial_signature(read_errors) if not complete else None
     already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
     if signature and signature != already:
-        # Counted by project, as the key and the reasons are: both spellings of one project,
-        # run on the tick its id is learned, are one read error.
-        errors = len({str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors})
+        # Counted by place, as the reasons are: both spellings of one project, run on the
+        # tick its id is learned, are one read error.
+        errors = len({place_of(e) for e in read_errors})
         failed_reads.append(PARTIAL_LINE.format(names=chat_project_names(unread_places(read_errors)), next=failure_next(errors_need_admin(read_errors))))
         log.append(PARTIAL_LOG_LINE.format(prefix=LINE_PREFIX, errors=errors, code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
     elif complete and already:

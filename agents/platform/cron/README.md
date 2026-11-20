@@ -298,8 +298,8 @@ hour Hermes gives a `no_agent` script: the version table and the readiness
 runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
-line names the projects, or the locations in them, with a read error (six, then a count), and its log line the reason (the budget, the
-sandbox's error, a failed listing, an unresolved project number, a refusal under the
+line names the projects, or the locations in them, with a read error (six, then a count), and its log line the reason for each (the budget, the
+sandbox's error, a failed listing or a location's server config, an unresolved project number, a refusal under the
 declared scope with the install's remedy), the
 ledger's `table_errors` keeps the last tick's, and a version's own line, or its log line, names
 the project whose readiness run was not started or was cut short (a version

@@ -1457,7 +1457,8 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(review, "copy_to_sandbox", return_value="the sandbox exited 1"):
             code, chat, log = self.run_main_split()
         self.assertEqual(code, 0)
-        self.assertEqual(chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR), [review.COPY_FAILED_LINE, review.RECOVERED_LINE])
+        self.assertEqual(chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR)[-1], review.RECOVERED_LINE)
+        self.assertTrue(chat.startswith(review.COPY_FAILED_HEADLINE), chat)
         self.assert_plain(chat)
 
     def test_one_cluster_s_claim_is_said_in_the_singular(self):
@@ -1475,14 +1476,48 @@ class TheTick(unittest.TestCase):
             "findings as they were. The weekly report has them, and the weekly brief says so. The details are in the agent's log.\n",
         )
 
+    def test_a_copy_that_failed_beside_findings_off_the_queue_promises_neither_the_brief_nor_the_queue(self):
+        with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")), \
+                mock.patch.object(review, "copy_to_sandbox", return_value="the sandbox exited 1"):
+            code, chat, log = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**Part of this week's upgrade readiness review didn't reach the findings queue.** 5 findings didn't arrive. 2 clusters keep last week's "
+            "findings as they were. The weekly report has them. The details are in the agent's log.\n\n"
+            "**The weekly upgrade readiness review couldn't copy this week's report for the agent.** Until the next review copies it, the agent reads the "
+            "previous copy, if there is one. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn(review.REGISTRATION_IN_REPORT_ONLY, log)
+
+    def test_an_unusable_resolved_scope_beside_every_failed_project_asks_for_an_admin(self):
+        fst = watch.fleet_scope_targets
+        unusable = fst.ScopeClusters(
+            source=fst.SOURCE_RESOLVED_SCOPE,
+            projects=(fst.ProjectClusters(PROJECT, fst.STATUS_LIST_LIVE), fst.ProjectClusters(fst.UNRESOLVED_SCOPE_ROW, fst.STATUS_UNREAD, reason="too-large")),
+            note="the resolved scope at /r.json is in state 'too-large', so no member project's clusters are known",
+        )
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: PROJECT}), mock.patch.object(
+            fst, "list_scope_clusters", return_value=unusable
+        ), mock.patch.object(watch, "run_report", side_effect=RuntimeError("sandbox exited 255 without a report")):
+            code, chat, _ = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review didn't run.** It couldn't read any project. An admin needs to fix this before it can run; "
+            "the details are in the agent's log.\n",
+        )
+
     def test_a_copy_that_failed_says_the_agent_reads_the_previous_copy(self):
         with mock.patch.object(review, "copy_to_sandbox", return_value="the sandbox exited 1: /opt/data/upgrade-readiness/weekly is read-only"):
             code, chat, log = self.run_main_split()
         self.assertEqual(code, 0)
         self.assertEqual(
             chat,
-            "**The weekly upgrade readiness review couldn't copy this week's report for the agent.** The agent reads the previous copy, if there is "
-            "one, until the next review copies again. The details are in the agent's log.\n",
+            "**The weekly upgrade readiness review couldn't copy this week's report for the agent.** Until the next review copies it, the agent reads the "
+            "previous copy, if there is one. This week's findings are on the findings queue, so the weekly brief still lists what needs a decision. "
+            "The details are in the agent's log." + "\n",
         )
         self.assert_plain(chat)
         self.assertIn("the sandbox copy failed: the sandbox exited 1: /opt/data/upgrade-readiness/weekly is read-only", log)
