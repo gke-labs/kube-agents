@@ -71,8 +71,8 @@ MASTER_KEY_ENV = "LITELLM_MASTER_KEY"
 # api_key: a fixed word, so the label and the rate-limit bucket are one.
 KEYLESS_CLASS = "keyless"
 # What callers send today because their client wants a non-empty key:
-# Hindsight's, the curator's and decision memory's "none" (hindsight.yaml,
-# a2a/memory/llm.go, decision_memory.py); the worker adapter's "a2a-playground"
+# Hindsight's, the curator's and decision memory's "none" (the Hindsight chart
+# template, a2a/memory/llm.go, decision_memory.py); the worker adapter's "a2a-playground"
 # (a2a/cmd/worker-adapter/main.go); and Hermes's "no-key-required". The agents'
 # config says api_key "none" (deploy/shared/defaults/config.yaml,
 # platformagent_manifests.go), but Hermes's provider resolver replaces it with
