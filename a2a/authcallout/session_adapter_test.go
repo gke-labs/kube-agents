@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -118,7 +119,7 @@ echo '{"type":"result","subtype":"success","result":"the thing is done"}'
 		}
 	}
 	for _, n := range names {
-		if !strings.HasPrefix(n, podA+"-") && n != relayDurable && n != "test-reader" {
+		if !strings.HasPrefix(n, podA+"-") && n != relayDurable && n != testReaderName {
 			t.Errorf("consumer %q is not this session's, the gateway's relay, or the provisioner's; a session created something outside its naming contract", n)
 		}
 	}
@@ -761,6 +762,9 @@ func publishInboundAs(t *testing.T, h *harness, addressee, taskID, correlationID
 	return ack.Sequence
 }
 
+// testReaderName is the consumer readEventsOn reads through.
+const testReaderName = "test-reader"
+
 // readEvents drains a task's events subject as the gateway, which may read
 // what the session may only write.
 func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envelope {
@@ -774,7 +778,9 @@ func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envel
 
 // readEventsOn is readEvents over a gateway connection the caller holds. A
 // read that fails is returned rather than ending the test, for a caller that
-// reads again.
+// reads again. Each read starts from the subject's first event: the reader
+// consumer is dropped first, because a durable keeps its position, and a read
+// whose reply was lost would otherwise have taken those events for good.
 func readEventsOn(t *testing.T, nc *nats.Conn, addressee, taskID string) ([]*lib.Envelope, error) {
 	t.Helper()
 	js, err := jetstream.New(nc)
@@ -783,10 +789,13 @@ func readEventsOn(t *testing.T, nc *nats.Conn, addressee, taskID string) ([]*lib
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if err := js.DeleteConsumer(ctx, lib.TasksStream, testReaderName); err != nil && !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		return nil, fmt.Errorf("drop the reader consumer: %w", err)
+	}
 	cons, err := js.CreateOrUpdateConsumer(ctx, lib.TasksStream, jetstream.ConsumerConfig{
 		// Named, so the consumer-naming assertion above can tell the test's
 		// own reader from something the session created.
-		Name:          "test-reader",
+		Name:          testReaderName,
 		FilterSubject: lib.TaskEventsSubject(addressee, taskID),
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		AckPolicy:     jetstream.AckNonePolicy,
@@ -806,6 +815,9 @@ func readEventsOn(t *testing.T, nc *nats.Conn, addressee, taskID string) ([]*lib
 			continue
 		}
 		out = append(out, env)
+	}
+	if err := batch.Error(); err != nil {
+		return out, fmt.Errorf("fetch: %w", err)
 	}
 	return out, nil
 }
