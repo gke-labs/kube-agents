@@ -661,6 +661,29 @@ class SelectionTest(unittest.TestCase):
                 picked = rr.select_reviewers(config, list(by_file), "author", rng=random.Random(seed), approvers_by_file=by_file, away=away)
             self.assertEqual(picked, ["lapis2002", "dshnayder"], seed)
 
+    def test_an_away_pick_does_not_stand_in_for_a_file_someone_here_approves(self):
+        # Both eval-crew members are away and jayantid, back first, is a root
+        # approver too. He is asked for the roster half only he and lapis2002
+        # approve; the README half still goes to a root approver who is here.
+        by_file = {"README.md": {name.lower() for name in OWNERS}, "hack/eval/presubmit-cases.txt": set(EVAL_CREW)}
+        away = {"jayantid": AWAY_BACK_SOONER, "lapis2002": AWAY_BACK}
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(CONFIG, list(by_file), "author", rng=random.Random(seed), approvers_by_file=by_file, away=away)
+            self.assertEqual(picked[0], "jayantid", seed)
+            self.assertEqual(len(picked), 2, seed)
+            self.assertIn(picked[1], set(OWNERS) - {"jayantid"}, seed)
+
+    def test_with_everyone_away_the_one_back_soonest_may_be_a_default_reviewer(self):
+        # jayantid's own roster change routes to lapis2002, away like every
+        # default reviewer. dshnayder is back first and can give the lgtm.
+        away = {name.lower(): AWAY_BACK for name in POOL}
+        away["dshnayder"] = AWAY_BACK_SOONER
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(CONFIG, ["hack/eval/presubmit-cases.txt"], "jayantid", rng=random.Random(seed), away=away)
+            self.assertEqual(picked, ["dshnayder"], seed)
+
     def test_no_away_list_draws_as_before(self):
         for seed in range(20):
             self.assertEqual(
@@ -1304,6 +1327,22 @@ class MainTest(_MainHarness):
     def test_the_check_run_path_never_reacts(self):
         posts = self.run_main(pull_request(requested_reviewers=[{"login": "jayantid"}]), [])
         self.assertEqual(posts, [])
+
+
+class AwayWorkflowTest(unittest.TestCase):
+    """The workflow hands the list to every step that runs the script, under the name the script reads."""
+
+    def test_every_step_that_runs_the_script_passes_the_away_list(self):
+        workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "auto_request_review.yml").read_text())
+        steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if "scripts/request_reviewers.py" in (step.get("run") or "")
+        ]
+        self.assertEqual(len(steps), 2)
+        for step in steps:
+            self.assertEqual(step["env"].get(rr.AWAY_ENV), "${{ secrets.%s }}" % rr.AWAY_ENV, step["name"])
 
 
 class AwayMainTest(_MainHarness):

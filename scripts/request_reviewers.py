@@ -27,7 +27,7 @@ a choice it copies the action, including minimatch's rule that `*` and
 not implement raises rather than guessing -- see `validate_config` and
 `glob_to_regex`.
 
-Seven things the action never did. A verdict counts as "already reviewed" only
+What the action never did. A verdict counts as "already reviewed" only
 from someone whose approval finishes the pull request: an `OWNERS` approver for
 the changed files (`applicable_approvers`), since only that approval can produce
 the `approved` label, or, when the author's own approval already covers every
@@ -46,8 +46,9 @@ count, and a review request outstanding to one of them is not a reviewer
 already asked. And the bot's third round: a grey check at its third distinct reviewed
 commit (`HANDOFF_ROUNDS`) requests a reviewer anyway, once, and the first request on a pull
 request leaves one hand-off comment (`HANDOFF_MARKER`), the marker being what stops a later grey
-round asking again. And a reviewer who is away is not drawn: the `REVIEWERS_AWAY` list (`AWAY_ENV`)
-says who and until when, and when it leaves nobody to ask, the one back soonest is asked.
+round asking again. And a reviewer who is away is passed over while someone here can do what the
+request is for: the `REVIEWERS_AWAY` list (`AWAY_ENV`) says who and until when, and where nobody here
+can approve a file, or give the `lgtm` that is all a change needs, the one back soonest is asked.
 
 Run: python3 scripts/request_reviewers.py --pr 728 --dry-run
 Test: cd scripts && python3 -m unittest test_request_reviewers
@@ -640,8 +641,10 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last
     otherwise get a root approver only while some member happens to be one.
     A file neither approves is drawn for from `last_resort`, its approvers who
     are away (`away` holds the day each is back): the one back soonest is
-    asked, since a request that waits for a return beats one made of nobody.
-    A file none of the three approves is a config shape, logged and left out.
+    asked, since a request that waits for a return beats one made of nobody,
+    and is counted for those files alone, so that a file an approver who is
+    here covers still gets one. A file none of the three approves is a config
+    shape, logged and left out.
     """
     uncovered = list(uncovered_files(approvers_by_file, {author.lower()}).values())
     picked = []
@@ -654,9 +657,14 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last
                 log(f"Nobody in the pool approves a file only {', '.join(sorted(narrowest))} can; drawing from the default reviewers")
         if not candidates:
             waited_for = back_soonest([name for name in last_resort if name.lower() in narrowest], away, rng)
-            candidates = [waited_for] if waited_for else []
-            if candidates:
-                log(f"Everyone here who approves a file is away; drawing {candidates[0]}, back soonest")
+            if waited_for:
+                log(f"Everyone here who approves a file is away; drawing {waited_for}, back soonest")
+                picked.append(waited_for)
+                # Someone away stands in only where nobody here can: a file
+                # an approver who is here covers is still drawn for below.
+                here = {name.lower() for name in [*pool, *fallback]}
+                uncovered = [logins for logins in uncovered if logins & here or waited_for.lower() not in logins]
+                continue
         if not candidates:
             log(f"Nobody in the pool or the defaults approves a file only {', '.join(sorted(narrowest))} can; not drawing for it")
             uncovered = [logins for logins in uncovered if logins != narrowest]

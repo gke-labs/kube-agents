@@ -716,8 +716,9 @@ only `lgtm`, so the draw is the whole pool at equal weight; any other change sti
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files, and
 `approved` is per file, so it takes as many of them as it needs to cover every file: first one for
 the file with the fewest approvers, then one more for whatever that person cannot approve, from
-the default reviewers when nobody the glob matched can approve it. Neither draw takes a reviewer
-who is away ([who owns an open pull request](#who-owns-an-open-pull-request)). A change
+the default reviewers when nobody the glob matched can approve it. Both draws pass over a
+reviewer who is away while someone here can do the same job
+([who owns an open pull request](#who-owns-an-open-pull-request)). A change
 to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
 unless that member is one. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
@@ -1042,12 +1043,14 @@ one they share; it runs outside this repository (`triage/` in the internal `gke-
 with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above
 is all this page can state about it.
 
-Neither path asks a reviewer who is away. The `REVIEWERS_AWAY` repository secret holds a JSON list
-of who is away and until when, and the script leaves them out of the draw. When everyone the
-change routes to is away, it draws from the default reviewers who are not. When they are away too,
-it asks whoever is back soonest, so a pull request is never left with nobody. A request already
-made stays with its reviewer. A maintainer sets the list, on one line, and each set replaces all of
-it:
+The script passes over a reviewer who is away, on the check-run path and on `/request-review`. The
+`REVIEWERS_AWAY` repository secret holds a JSON list of who is away and until when, and those people
+leave the draw. A change that needs only `lgtm`, with everyone it routes to away, draws from the
+default reviewers who are here. Where nobody here can approve a file, or nobody is here at all, the
+script asks the person back soonest, at random among those back the same day, so a pull request is
+never left with nobody; a file someone here can approve still gets that person. A request already
+made stays with its reviewer. A maintainer sets the list, and each set replaces all of it. Keep the
+value on one line: GitHub masks a secret in the log one line at a time.
 
 ```bash
 # `back` is the first day the person reviews again; `from` is optional. Dates are UTC.
