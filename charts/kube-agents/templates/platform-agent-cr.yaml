@@ -362,6 +362,19 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with $tuning.admission }}
+      {{- $defaultBudgetMiB := 4096 -}}
+      {{- $defaultRssCapMiB := 1536 -}}
+      {{- $budgetMiB := $defaultBudgetMiB -}}
+      {{- if and (hasKey . "memoryBudgetMiB") (not (kindIs "invalid" .memoryBudgetMiB)) -}}
+      {{- $budgetMiB = int .memoryBudgetMiB -}}
+      {{- end -}}
+      {{- $rssCapMiB := $defaultRssCapMiB -}}
+      {{- if and (hasKey . "workerRssCapMiB") (not (kindIs "invalid" .workerRssCapMiB)) -}}
+      {{- $rssCapMiB = int .workerRssCapMiB -}}
+      {{- end -}}
+      {{- if lt $budgetMiB $rssCapMiB -}}
+      {{- fail (printf "platformAgent.harness.tuning.admission sets effective memoryBudgetMiB (%d) below workerRssCapMiB (%d), so a single worker's RSS cap exceeds the pod's admission budget; raise memoryBudgetMiB to at least %d or lower workerRssCapMiB" $budgetMiB $rssCapMiB $rssCapMiB) -}}
+      {{- end -}}
       {{- /*
         The same CRD guard as retention's above, one level down: an installed CRD
         that predates spec.harness.tuning.admission prunes the block silently while

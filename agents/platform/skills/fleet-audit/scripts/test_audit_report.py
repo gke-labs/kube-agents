@@ -2920,6 +2920,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
                 "stall-watch",
+                "post-merge-check",
                 "kanban-workspace-gc",
                 "session-retention",
                 "kanban-board-health",
