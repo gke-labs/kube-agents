@@ -166,6 +166,7 @@ type sessionTrace struct {
 	plannedTitles        map[string]string // tool call id -> the step title it was planned under
 	sessionCards         map[string]string // worker sessionID -> cardID
 	cardTitles           map[string]string // cardID -> short cluster/card title
+	filedCards           map[string]bool   // cardID -> made by this task's kanban_create, title or not
 	claimedSessions      map[string]bool   // worker sessionID claimed by this task
 	reportedSettledCards map[string]bool   // cardID -> KindSubtask step already emitted for this task
 }
@@ -201,6 +202,7 @@ func (a *activityState) initSessionTraceLocked() {
 	if a.trace.sessionCards == nil {
 		a.trace.sessionCards = make(map[string]string)
 		a.trace.cardTitles = make(map[string]string)
+		a.trace.filedCards = make(map[string]bool)
 		a.trace.claimedSessions = make(map[string]bool)
 		a.trace.plannedTitles = make(map[string]string)
 		a.trace.reportedSettledCards = make(map[string]bool)
@@ -293,8 +295,15 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	}
 	effectiveTool, parsed := unwrapHermesToolCall(d.ToolName, rawInput)
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
-		if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
-			a.trace.cardTitles[createdCardID] = short
+		// A card is recorded only from an id the create's result reports in a
+		// JSON field without error: free text or error text may name another
+		// task's card (#6430). A filed card claims its workers' deliveries even
+		// with no title.
+		if kanbanCardIDFromJSON(d.Extra.Result) == createdCardID {
+			a.trace.filedCards[createdCardID] = true
+			if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
+				a.trace.cardTitles[createdCardID] = short
+			}
 		}
 	}
 	if strings.HasPrefix(effectiveTool, "kanban_") && sessID != "" && sessID != a.sessionID {
@@ -503,7 +512,7 @@ func (a *activityState) hasCardID(cardID string) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.trace.cardTitles[cardID] != ""
+	return a.trace.filedCards[cardID] || a.trace.cardTitles[cardID] != ""
 }
 
 // buildAPIRequestSteps reads one post_api_request delivery into the step
@@ -2642,6 +2651,23 @@ func findUnescapedEscapedQuote(s string, q byte) int {
 // is the one thing read out of a tool result: an identifier with the card
 // token's shape, which the task's own subtask steps name again.
 func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
+	if id := kanbanCardIDFromJSON(rawResult); id != "" {
+		return id
+	}
+	if toolName == kanbanCreateTool {
+		if m := kanbanCardIDPattern.FindStringSubmatch(strings.TrimSpace(string(rawResult))); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// kanbanCardIDFromJSON is the card id a result names in a JSON field (id,
+// card_id or task_id, at the top level or in a JSON string holding an
+// object), or "" when the call named none or carried an error. Unlike
+// createdKanbanCardID it never reads an id out of free text, which can be an
+// error message naming some other card (#6430).
+func kanbanCardIDFromJSON(rawResult json.RawMessage) string {
 	trimmed := strings.TrimSpace(string(rawResult))
 	if trimmed == "" || trimmed == "null" {
 		return ""
@@ -2664,15 +2690,18 @@ func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
 		}
 	}
 	if m, ok := decoded.(map[string]any); ok {
+		if errVal, hasErr := m["error"]; hasErr && errVal != nil && errVal != false && errVal != "" {
+			return ""
+		}
+		if okVal, hasOk := m["ok"]; hasOk {
+			if b, isBool := okVal.(bool); isBool && !b {
+				return ""
+			}
+		}
 		for _, k := range []string{"id", "card_id", "task_id"} {
 			if v, ok := m[k].(string); ok && isCardID(v) {
 				return strings.TrimSpace(v)
 			}
-		}
-	}
-	if toolName == kanbanCreateTool {
-		if m := kanbanCardIDPattern.FindStringSubmatch(trimmed); len(m) > 1 {
-			return m[1]
 		}
 	}
 	return ""

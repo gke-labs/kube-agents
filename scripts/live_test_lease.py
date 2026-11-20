@@ -40,8 +40,9 @@ Usage:
   live_test_lease.py status  [--env NAME] [--json]
   live_test_lease.py acquire [--env NAME] [--pr N] [--note TEXT] [--ttl MINUTES]
   live_test_lease.py renew   [--env NAME] [--ttl MINUTES]
-  live_test_lease.py release [--env NAME] [--all]
+  live_test_lease.py release [--env NAME] [--all] [--attempts N] [--backoff SECONDS]
   live_test_lease.py steal   [--env NAME] [--force]
+  live_test_lease.py takeover [--env NAME] --if-session gha-<run id> --if-note TEXT [--ttl MINUTES]
   live_test_lease.py hook-pretooluse   # reads hook JSON on stdin
   live_test_lease.py hook-sessionend   # reads hook JSON on stdin
 
@@ -56,6 +57,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -745,23 +747,107 @@ def do_renew(install, ttl=DEFAULT_TTL_MIN):
     return True, describe(data)
 
 
-def do_release(install):
+def do_release(install, attempts=1, backoff=0.0, sleep=time.sleep, log=None):
+    """Releases this session's lease. With attempts > 1, an unreachable cluster or a
+    failed delete is tried again, and the local token is kept between tries: it is
+    the only proof that this session holds the lease, and dropping it after the
+    first timeout made any retry impossible (#6381). After the last failed attempt
+    the token is cleared, as a single attempt always has. Each failed attempt is
+    written to `log` (stderr by default), so a release that needed retries shows."""
+    log = log if log is not None else (lambda m: print(m, file=sys.stderr))
+    attempts = max(1, int(attempts))
+    for n in range(1, attempts + 1):
+        ok, msg, retryable = _release_once(install)
+        if ok or not retryable or n == attempts:
+            if not ok and retryable:
+                clear_local_token(install)
+                msg = "%s; cleared the local token only" % msg
+                if attempts > 1:
+                    msg = "%s (after %d attempts)" % (msg, attempts)
+            return ok, msg
+        log("release attempt %d/%d failed: %s; retrying in %gs" % (n, attempts, msg, backoff))
+        sleep(backoff)
+    return False, "unreachable"  # not reached
+
+
+def _release_once(install):
+    """One release attempt: (ok, message, retryable). Clears the token on every
+    final outcome except a retryable failure, which the caller decides on."""
     mine = read_local_token(install)
     try:
         data, _ = get_lease(install)
     except Unreachable as exc:
-        clear_local_token(install)
-        return False, "cluster unreachable (%s); cleared the local token only" % exc
+        return False, "cluster unreachable (%s)" % exc, True
     if not data:
         clear_local_token(install)
-        return True, "already free"
+        return True, "already free", False
     if not mine or data.get("token") != mine:
-        return False, "not yours to release: %s" % describe(data)
+        return False, "not yours to release: %s" % describe(data), False
     rc, _, err = kubectl(install, ["delete", "configmap", CM_NAME, "--ignore-not-found"])
-    clear_local_token(install)
     if rc != 0:
-        return False, "delete failed: %s" % err.strip()
-    return True, "released"
+        return False, "delete failed: %s" % err.strip(), True
+    clear_local_token(install)
+    return True, "released", False
+
+
+# A workflow run's session, as reconcile_environment.sh sets it. The only shape a
+# takeover may replace: a person's or an agent's session never matches.
+GHA_SESSION_RE = re.compile(r"^gha-[0-9]+$")
+
+
+# How many takeovers a lease remembers (takeoverHistory, newest last).
+TAKEOVER_HISTORY_KEEP = 5
+
+
+def _takeover_history(data):
+    """The takeovers recorded on a lease, oldest first: its takeoverHistory, or,
+    for a lease that has only the single fields, those. Unreadable history is
+    dropped rather than failing the takeover."""
+    try:
+        history = json.loads(data.get("takeoverHistory") or "[]")
+    except ValueError:
+        history = []
+    if not isinstance(history, list):
+        history = []
+    history = [h for h in history if isinstance(h, dict)]
+    if not history and data.get("takenOverFrom"):
+        history = [{"from": data["takenOverFrom"], "at": data.get("takenOverAt", "")}]
+    return history
+
+
+def do_takeover(install, if_session, if_note, ttl=DEFAULT_TTL_MIN, note=None):
+    """Replaces a lease still held by one named workflow run's session -- a
+    compare-and-swap, not a steal (#6381). The caller has already established that
+    the run has finished; this refuses unless the lease's session is exactly
+    `if_session`, that session is a workflow run's (gha-<id>), and its note is
+    exactly `if_note`. The replace carries the resourceVersion that was read, so a
+    claim made in between conflicts and the takeover is refused, never retried.
+    The new lease records whose it replaced (takenOverFrom, takenOverAt)."""
+    if not GHA_SESSION_RE.match(if_session or ""):
+        return False, "refused: %r is not a workflow run's session" % if_session
+    data, rv = get_lease(install)
+    if not data:
+        return False, "refused: no lease to take over"
+    if data.get("session") != if_session:
+        return False, "refused: held by another session: %s" % describe(data)
+    if data.get("note") != if_note:
+        return False, "refused: the lease's note is not %r: %s" % (if_note, describe(data))
+    fresh = context_fields(note=note if note is not None else if_note, ttl=ttl)
+    fresh["takenOverFrom"] = if_session
+    fresh["takenOverAt"] = fresh["acquiredAt"]
+    # Earlier takeovers stay visible: two in a row (a deploy that leaked behind a
+    # deploy that leaked) would otherwise show only the last.
+    fresh["takeoverHistory"] = json.dumps(
+        (_takeover_history(data) + [{"from": if_session, "at": fresh["takenOverAt"]}])
+        [-TAKEOVER_HISTORY_KEEP:])
+    rc, _, err = kubectl(install, ["replace", "-f", "-"],
+                         stdin=build_manifest(install, fresh, rv))
+    if rc != 0:
+        if "Conflict" in err or "conflict" in err:
+            return False, "refused: the lease changed since it was read: %s" % err.strip()
+        return False, "takeover failed: %s" % err.strip()
+    write_local_token(install, fresh["token"])
+    return True, "took over from %s -- %s" % (if_session, describe(fresh))
 
 
 def do_steal(install, force=False):
@@ -1869,7 +1955,11 @@ def status_json(installs):
             entry.update(state="held", detail=describe(data),
                          holder=data.get("holder", ""),
                          expiresAt=data.get("expiresAt", ""),
-                         pr=data.get("pr", ""))
+                         pr=data.get("pr", ""),
+                         # For a workflow run's takeover of its own predecessor
+                         # (reconcile_lease_predecessor.py, #6381).
+                         session=data.get("session", ""),
+                         note=data.get("note", ""))
         out.append(entry)
     print(json.dumps(out, indent=2))
 
@@ -1879,7 +1969,7 @@ def main():
         prog="live_test_lease.py", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("action", choices=[
-        "status", "acquire", "renew", "release", "steal",
+        "status", "acquire", "renew", "release", "steal", "takeover",
         "hook-pretooluse", "hook-sessionend",
     ])
     ap.add_argument("--env", help="which install, when more than one is protected")
@@ -1890,6 +1980,14 @@ def main():
     ap.add_argument("--force", action="store_true", help="steal even a live lease")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable `status` output")
+    ap.add_argument("--attempts", type=int, default=1,
+                    help="`release`: tries before giving up, keeping the token between them")
+    ap.add_argument("--backoff", type=float, default=10.0,
+                    help="`release`: seconds between attempts")
+    ap.add_argument("--if-session",
+                    help="`takeover`: the workflow run session (gha-<id>) the lease must still be held by")
+    ap.add_argument("--if-note",
+                    help="`takeover`: the note the lease must carry")
     args = ap.parse_args()
 
     if args.action == "hook-pretooluse":
@@ -1930,10 +2028,16 @@ def main():
             ok = True
             msgs = []
             for install in targets:
-                good, m = do_release(install)
+                good, m = do_release(install, args.attempts, args.backoff)
                 ok = ok and good
                 msgs.append("%s: %s" % (install.name, m))
             msg = "\n".join(msgs) or "nothing held"
+        elif args.action == "takeover":
+            if not args.if_session or args.if_note is None:
+                print("takeover needs --if-session and --if-note", file=sys.stderr)
+                return 2
+            ok, msg = do_takeover(pick(installs, args.env), args.if_session,
+                                  args.if_note, args.ttl, args.note)
         else:
             ok, msg = do_steal(pick(installs, args.env), args.force)
     except Unreachable as exc:

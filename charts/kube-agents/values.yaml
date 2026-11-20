@@ -185,6 +185,14 @@ operator:
   # so in the PlatformAgent's DispatcherCeiling condition.
   profileDispatcher:
     enabled: true
+  # Whether a chat `stop`, or Slack's Stop button, also stops the kanban cards
+  # the conversation filed. true sets A2A_CARD_STOP=true on the controller
+  # manager, which renders it onto the A2A gateway. Off by default: the stop
+  # needs a hermes-bridge sidecar and agent image that answer it, and an older
+  # pair answers that it couldn't confirm the cards stopped. An A2A_CARD_STOP
+  # entry in extraEnv wins.
+  cardStop:
+    enabled: false
   # Slack member ids of end-to-end test users, meant for CI and eval installs;
   # integration.slack.allowedUsers is still the gate on who is served.
   # A post such a user makes with a user token through an app carries the
@@ -1403,6 +1411,14 @@ platformAgent:
       #   requests:
       #     cpu: 150m
       #     memory: 384Mi
+      # defaultRoute is where the A2A gateway sends a plain conversation's first
+      # message: platform to the Platform Agent, session to a session pod of the
+      # conversation's own. Unset means platform; a later release flips the
+      # default to session. The Platform Agent stays reachable by handle either
+      # way. A change rolls the gateway and the Platform Agent pod. Against a
+      # PlatformAgent CRD that predates the field the chart fails; apply crds/
+      # first (upgrade.sh does).
+      # defaultRoute: platform
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
@@ -1417,7 +1433,11 @@ platformAgent:
       # thread. memoryBudgetMiB defaults to the agent container's memory request
       # in MiB (4096 at the default 4Gi), workerRssCapMiB to 1536,
       # queueBoundSeconds to 600 and failClosed to true; the operator renders
-      # the block with those defaults when nothing is set here.
+      # the block with those defaults when nothing is set here. Effective
+      # memoryBudgetMiB must be at least workerRssCapMiB regardless of
+      # failClosed: Helm template rendering refuses invalid admission blocks,
+      # the validating webhook refuses them where enabled, and the operator
+      # reports Degraded (InvalidKanbanAdmission).
       # admission:
       #   memoryBudgetMiB: 3072
       #   workerRssCapMiB: 1536
@@ -1545,6 +1565,14 @@ platformAgent:
     # while this key is above 0. The site's chatops page, "Limiting the open
     # triage pull requests", has the rules.
     incidentMaxOpenPullRequests: 0
+    # Eval installs only: true renders KUBEAGENTS_EVAL_RUN_TAGS=1 into
+    # spec.deployment.env. The agent then tags each model request with the eval
+    # run, case and repetition it serves, in HTTP headers the replay proxy logs
+    # and strips; nothing the model reads changes. Leave it false anywhere a
+    # replay proxy is not in front of LiteLLM. A literal entry with the same
+    # name in env above wins; a valueFrom entry with this key true fails the
+    # render, since the operator drops valueFrom entries.
+    evalRunTags: false
     # The event watcher's tuning settings. Each key that you set becomes one
     # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
     # the agent-api-auth container, which runs the watcher. A key that you do
@@ -2026,6 +2054,11 @@ platformAgent:
       # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
       # false hides the buttons and keeps nothing.
       answerFeedback: true
+      # "auto" (also empty) or "manual". With homeChannel empty, "auto" lets
+      # the A2A gateway make the space of the first top-level mention of the
+      # agent in a named space the home channel; "manual" leaves homeChannel
+      # alone to decide. A set homeChannel wins under either.
+      homeChannelPolicy: ""
     slack:
       # Bot/app tokens are read from credentials.secretName under the
       # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.
@@ -2251,12 +2284,13 @@ profiles:
   cluster:
     enabled: false
     description: >-
-      Read-only SRE for one GKE cluster, named per task: live runtime state and
-      workload debugging (crash loops, OOMKills, pending pods, image-pull and
-      mount errors, connectivity and DNS timeouts, autoscaling, storage binding,
-      silent reconciliation stalls, observability gaps). Returns a grounded root
-      cause analysis and a proposed manifest patch; never mutates cluster state
-      and never opens pull requests.
+      SRE for one GKE cluster, named per task, read-only on that cluster: live
+      runtime state and workload debugging (crash loops, OOMKills, pending pods,
+      image-pull and mount errors, connectivity and DNS timeouts, autoscaling,
+      storage binding, silent reconciliation stalls, observability gaps).
+      Returns a grounded root cause analysis and a proposed manifest patch;
+      never mutates cluster state. Opens a pull request on the install's managed
+      repository only when the task asks for that change.
     persona:
       image:
         repository: ghcr.io/gke-labs/kube-agents/persona-cluster
@@ -2268,7 +2302,9 @@ profiles:
       model: model-default
       maxTurns: 90
     # Tier is authority, so it lives here and never in the persona. The cluster
-    # agent is read-only; unattended runs it as a Job per task.
+    # agent is read-only on its cluster; unattended runs it as a Job per task,
+    # and so does a task that asks for a change, whose pull request the broker
+    # admits only under that task's permit.
     allowedTiers:
       - read
     lifecycle:

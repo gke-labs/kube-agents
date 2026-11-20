@@ -59,6 +59,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_INJECT_LISTEN", "")
 	t.Setenv("A2A_INJECT_TOKEN", "")
 	t.Setenv("A2A_INJECT_PRINCIPAL_MAP", "")
+	t.Setenv("A2A_INJECT_CONFIRM", "")
 	t.Setenv("A2A_DOOR_LISTEN", "")
 	t.Setenv("A2A_DOOR_TOKEN", "")
 	t.Setenv("A2A_DOOR_PRINCIPAL_MAP", "")
@@ -1302,5 +1303,28 @@ func TestHomeLearnArmedWithChatBesideSlack(t *testing.T) {
 	cfg.SlackBotToken, cfg.SlackAppToken = "", ""
 	if cfg.HomeLearnArmed() {
 		t.Fatal("the learn armed with no Slack backend")
+	}
+}
+
+// A2A_TRIGGER_EVENT_KINDS is empty by default, which admits no event
+// trigger (#6572), lists the <source>/<kind> entries it names, and refuses
+// an entry that isn't one, or whose source is schedule or run-now, the two
+// words a schedule's keys open with.
+func TestFromEnvTriggerEventKinds(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_TRIGGER_EVENT_KINDS", "")
+	cfg, err := FromEnv()
+	if err != nil || len(cfg.TriggerEventKinds) != 0 {
+		t.Fatalf("unset: %v, %v", cfg.TriggerEventKinds, err)
+	}
+	t.Setenv("A2A_TRIGGER_EVENT_KINDS", " triage/k8s-event, triage/gitops-drift ,")
+	if cfg, err = FromEnv(); err != nil || !slices.Equal(cfg.TriggerEventKinds, []string{"triage/k8s-event", "triage/gitops-drift"}) {
+		t.Fatalf("listed: %v, %v", cfg.TriggerEventKinds, err)
+	}
+	for _, bad := range []string{"triage", "schedule/k8s-event", "run-now/kubeagents-system", "Triage/k8s-event", "triage/k8s.event", "triage/a/b", "triage/", "triage/k8s-event,schedule/x"} {
+		t.Setenv("A2A_TRIGGER_EVENT_KINDS", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }

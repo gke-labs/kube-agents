@@ -10,7 +10,11 @@ because ``verifiers`` imports ``github_writes``.
 
 The agent images copy this one file beside
 ``agents/platform/scripts/worker_transcript.py``, which loads it by path. So
-it imports only the standard library and nothing from this package.
+it imports only the standard library and nothing from this package. That
+module's secret-read detector reads command lines with
+``_shell_words_and_spans``, ``_ShellOperator``, ``_is_redirect`` and
+``_substitution_commands``, so a change to one of them also changes which
+tool results the detector withholds.
 """
 
 from __future__ import annotations
@@ -30,6 +34,12 @@ _SHELL_OPERATOR_CHARS = frozenset("&|;()")
 # `>&`, `|&`); `(` and `)` are operators of one character each.
 _SHELL_OPERATOR_RUN_CHARS = frozenset("&|;<>")
 _SHELL_PARENS = frozenset("()")
+# The reader puts its marks inside the line's own text, between two of this character. A mark
+# character that the line itself holds is written as the literal mark, so each mark character
+# in the marked text opens or closes a mark that the reader wrote, and no text of the line reads
+# as an operator mark or a substitution mark.
+_MARK_CHAR = "\x00"
+_LITERAL_MARK = "\x00N\x00"
 _OPERATOR_MARK = "\x00O{index}\x00"
 _OPERATOR_MARK_RE = re.compile(r"^\x00O(\d+)\x00$")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
@@ -75,7 +85,8 @@ _SHELL_QUOTED_SUBSTITUTION_OPENERS = ("$((", "$(")
 _SHELL_ARITHMETIC_OPENER = "$(("
 _SHELL_BACKTICK = "`"
 _SUBSTITUTION_MARK = "\x00S{index}\x00"
-_SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
+# The marks a word can hold: a literal mark, or a substitution mark with its index.
+_WORD_MARK_RE = re.compile(r"\x00(?:N|S(\d+))\x00")
 # After an exec wrapper, only the wrapper's own words are transparent: a flag, the word after a
 # flag (its value, as in `-u hermes` or `-s KILL`, unless that word is a flag itself; which flags take one is not tabled), a
 # duration or count (`timeout 600`, `timeout infinity`), an expansion the reader never resolves
@@ -139,7 +150,8 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
     command as ``;`` does) is one only outside quotes, which is
     known here and not after the quotes come off: a quoted ``">"`` or ``';'`` stays a word of
     text. A span left open at the line's end is kept as it stands. Read before the quotes come
-    off, because afterwards a quoted ``#1.json`` and a bare one look the same."""
+    off, because afterwards a quoted ``#1.json`` and a bare one look the same. A mark character
+    of the line itself is written as the literal mark (:func:`_with_literal_marks`)."""
     spans: list[str] = []
     operators: list[str] = []
     out: list[str] = []
@@ -164,7 +176,7 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 # command typed across continued lines is the same line.
                 i += 2
                 continue
-            out.append(command[i:i + 2])
+            out.append(_with_literal_marks(command[i:i + 2]))
             previous = _SHELL_ESCAPE_CHAR
             i += 2
             continue
@@ -182,7 +194,7 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 close = _backtick_end(command, i + 1)
             if opener is not None or (char == _SHELL_BACKTICK and quote != _SHELL_SINGLE_QUOTE):
                 if close is None:
-                    out.append(command[i:])
+                    out.append(_with_literal_marks(command[i:]))
                     break
                 spans.append(command[i:close])
                 out.append(_SUBSTITUTION_MARK.format(index=len(spans) - 1))
@@ -200,10 +212,16 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 previous = command[end - 1]
                 i = end
                 continue
-        out.append(char)
+        out.append(_with_literal_marks(char))
         previous = char
         i += 1
     return "".join(out), spans, operators
+
+
+def _with_literal_marks(text: str) -> str:
+    """``text`` as :func:`_read_shell_line` keeps the line's own text: each mark character is
+    the literal mark."""
+    return text.replace(_MARK_CHAR, _LITERAL_MARK)
 
 
 def _backtick_end(command: str, start: int) -> int | None:
@@ -254,8 +272,10 @@ def _substitution_end(command: str, start: int, depth: int) -> int | None:
     return None if depth > 0 else j
 
 
-def _unfold_substitutions(word: str, spans: list[str]) -> str:
-    return _SUBSTITUTION_MARK_RE.sub(lambda m: spans[int(m.group(1))], word)
+def _unfold_marks(word: str, spans: list[str]) -> str:
+    """``word`` with each substitution mark replaced by its span and each literal mark by the
+    mark character. One pass from the left, so the text of a span is not read for marks."""
+    return _WORD_MARK_RE.sub(lambda m: _MARK_CHAR if m.group(1) is None else spans[int(m.group(1))], word)
 
 
 class _ShellOperator(str):
@@ -284,7 +304,7 @@ def _shell_words_and_spans(command: str) -> tuple[list[str], list[str]]:
     words: list[str] = []
     for word in raw:
         mark = _OPERATOR_MARK_RE.match(word)
-        words.append(_ShellOperator(operators[int(mark.group(1))]) if mark else _unfold_substitutions(word, spans))
+        words.append(_ShellOperator(operators[int(mark.group(1))]) if mark else _unfold_marks(word, spans))
     # A redirect that ends a segment with no target (`>#log` once its comment is off) is a line
     # bash refuses, so nothing on it runs.
     for index, word in enumerate(words):
