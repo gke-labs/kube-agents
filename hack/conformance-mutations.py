@@ -180,6 +180,15 @@ MUTATIONS: list[Mutation] = [
         "the permit, which names no proposal, to keep it off a person's",
     ),
     Mutation(
+        "A3-profile-write-any-tasks",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)\n",
+         "                    refusal, fresh_branch = None, None\n"),
+        "test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work",
+        "let a confirmed task write on any open proposal the install owns, since "
+        "the permit says a change was asked for -- though not which one",
+    ),
+    Mutation(
         "A3-report-credential-any-route",
         "agents/platform/scripts/credential_proxy.py",
         ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",

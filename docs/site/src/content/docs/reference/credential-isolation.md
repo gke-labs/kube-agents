@@ -112,6 +112,8 @@ The profile role also reaches the version-control routes, and every verb there n
 
 It may push a branch and open or update a pull request only when the credential carries the `vcs:proposal-create` permit. The dispatcher grants that permit only to a request that asked for a change through a structured confirm. Even then it opens or updates only a pull request from the install's own branch in that repository, and pushes only to the install's own branch namespace, never onto a branch that carries somebody else's pull request. It may change a pull request's title and description, but never its labels. The managed-repository list bounds both, and no other write is open to it.
 
+Within that, a task writes only on what it made itself: a branch it pushed while the name was free, and a pull request it opened. A later task can't continue an earlier task's branch or pull request.
+
 While the scope publisher's Job may run, on the condition the audience table gives, it names the publisher's ServiceAccount too, bound both ways to `kubeagents-credential-proxy-scope` through `CREDENTIAL_PROXY_SCOPE_CALLERS`; that role reaches `gcloud` alone.
 
 **Nothing crosses as a path.** No filesystem is common to the sandbox and the broker, so a directory name sent from one means nothing in the other — or, worse, names a same-named directory of the broker's. The working directory is therefore not sent at all, and every proxied command runs at the broker's own workspace root. Four things cross instead: a document on stdin, a kubeconfig as a **context name**, a change as a **bundle of revisions**, and a read as a **tar of one revision**.

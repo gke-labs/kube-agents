@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
+import json
 import dataclasses
 import email.message
 import io
@@ -555,14 +557,21 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             ),
             proposal_update=lambda payload: ran.append(payload) or {"proposal": proposals[payload["number"]]},
         )
-        permitted = types.SimpleNamespace(permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        permitted = types.SimpleNamespace(
+            task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})
+        )
         principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
         principal = dataclasses.replace(principal, task=permitted)
+        # Every proposal here is this task's own (#6400), so only the ownership read can refuse one.
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(Forge(), repo)
+        for number in proposals:
+            record.record_proposal("task-1", 4_000_000_000, key, number)
 
         def update(number: int) -> list:
             body = json.dumps({"repository": f"https://github.com/{repo}", "number": number, "title": "t"}).encode()
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
-            handler.principal, handler.vcs = principal, vcs
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
             handler.headers = email.message.Message()
             handler.headers["Content-Length"] = str(len(body))
             handler.rfile = io.BytesIO(body)
@@ -582,6 +591,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 replies = update(number)
                 self.assertEqual(403, replies[0][0], replies)
                 self.assertEqual(cp.RULE_CALLER_VCS_OWNERSHIP, replies[0][1]["rule"])
+                self.assertNotEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1].get("code"), replies)
         self.assertEqual(1, len(ran), "a refused update reached the forge")
 
     def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
@@ -639,6 +649,68 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         self.assertIsNotNone(cp.report_write_permitted(
             cp.CALLER_ROLE_PROFILE, "fleet-audit", trigger(), audit, "acme%2Fterraform", key, allowlist, registered
         ))
+
+    def test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work(self) -> None:
+        # #6400: the permit is per task, so under it a profile worker writes only
+        # on what that task made. Another open proposal of the install's, one
+        # the ownership check admits, is refused when a different task opened
+        # it. Driven through the handler's own dispatch, so a dispatch that
+        # stops asking the task bar is red, not only the record.
+        cp = h.credential_proxy
+        repo = "acme/infra"
+        ran: list = []
+
+        class Vcs(types.SimpleNamespace):
+            def __getattr__(self, name):
+                return lambda payload: {}
+
+        vcs = Vcs(
+            registry=types.SimpleNamespace(resolve=lambda named: (types.SimpleNamespace(name="github"), repo)),
+            snapshot_source=lambda named: (named, None),
+            require_agent_proposal=lambda verb, payload: None,  # the install's own: the ownership bar passes
+            proposal_update=lambda payload: ran.append(payload) or {"proposal": {"number": payload["number"]}},
+        )
+        task = types.SimpleNamespace(task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        principal = dataclasses.replace(
+            cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u"), task=task
+        )
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(types.SimpleNamespace(name="github"), repo)
+        record.record_proposal("task-1", 4_000_000_000, key, 7)
+        record.record_proposal("task-2", 4_000_000_000, key, 8)
+
+        def update(number: int) -> list:
+            return write("proposal-update", {"number": number, "title": "t"})
+
+        def write(verb: str, fields: dict) -> list:
+            body = json.dumps({"repository": f"https://github.com/{repo}", **fields}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda role: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler._repository_is_permitted = lambda repository, forge: True
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._dispatch_vcs_post(verb)
+            return replies
+
+        self.assertEqual(200, update(7)[0][0], "the task's own proposal must stay updatable")
+        replies = update(8)
+        self.assertEqual(403, replies[0][0], replies)
+        self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
+        self.assertEqual([7], [payload["number"] for payload in ran], "another task's proposal reached the forge")
+        # And the other two writes: a publish to, and a proposal from, another task's branch.
+        allowed, _ = record.claim_branch("task-2", 4_000_000_000, key, "platform-agent/theirs", lambda: False)
+        self.assertTrue(allowed)
+        for verb, field in (("publish", "branch"), ("proposal-create", "source")):
+            with self.subTest(verb=verb):
+                replies = write(verb, {field: "platform-agent/theirs", "title": "t", "target": "main"})
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
 
     def test_A3_only_a_profile_learns_the_managed_list_from_identity(self) -> None:
         # #6389: a profile task that names no repository may ask `identity` with
