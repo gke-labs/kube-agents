@@ -223,8 +223,9 @@ def _admin() -> UserAPIKeyAuth:
 
 
 def _authenticate(request: Any, api_key: str | None) -> UserAPIKeyAuth:
-    master_key = os.environ.get(MASTER_KEY_ENV, "")
-    if api_key and master_key and secrets.compare_digest(api_key.encode(), master_key.encode()):
+    # Named so CodeQL's credential heuristic (api...key) watches it.
+    master_api_key = os.environ.get(MASTER_KEY_ENV, "")
+    if api_key and master_api_key and secrets.compare_digest(api_key.encode(), master_api_key.encode()):
         return _admin()
     if not api_key or api_key in PLACEHOLDER_KEYS:
         token = _caller(KEYLESS_CLASS, KEYLESS_CLASS)
