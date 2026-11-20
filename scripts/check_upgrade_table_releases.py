@@ -28,7 +28,9 @@ on any other change.
 
 A `pending` row passes while no release contains it, and fails once one does (its tag contains the
 commit that added the row, or its own copy of the table holds the row), naming the first such release
-to relabel it with. A reworded row traces to the rewording commit, so a change that removes the text of
+to relabel it with. On a push to main, or a local run with no base to compare with, a row whose first
+such release was tagged less than PENDING_GRACE_HOURS ago is a warning instead, while the release job's
+relabel pull request is in review; once the window passes it fails. A reworded row traces to the rewording commit, so a change that removes the text of
 a `pending` row a release already contains fails: to reword it, label the new text with the release
 and name its shipped commit in TRACES_FILE; to drop it, relabel it first and remove it in a later
 change. A push to main has no base to compare with, so this part runs on pull requests, merge groups
@@ -63,6 +65,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -119,6 +122,13 @@ PENDING_REWORD_NOTE = (f" To reword a {PENDING} row after its release, label the
                        f"its shipped commit in {TRACES_FILE}.")
 TRACE_HINT = (f" If this row was reworded after its release shipped, or added after its release was tagged, "
               f"name the commit that shipped it in {TRACES_FILE} instead.")
+# A release's relabel pull request needs /ok-to-test, CLA and a reviewer, so a `pending` row a release
+# tagged this recently warns a run with no base rather than failing it: a review day, plus the next release.
+PENDING_GRACE_HOURS = 48
+SECONDS_PER_HOUR = 3600
+GRACE_NOTE = (f"warning: a release tagged under {PENDING_GRACE_HOURS} hours ago contains these {PENDING} rows; "
+              "the release job's relabel pull request is expected to relabel them, and they fail once that "
+              "window passes.")
 UNTAGGED_NOTE = ("note: rows labelled {releases} are not checked: no such tag is here. If a release is out, "
                  "run `git fetch --tags` and check again.")
 
@@ -304,6 +314,14 @@ def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str
     if commit is None:
         return f"{where}: no commit in this history adds the row \"{row.change}\", so its {PENDING} label cannot be checked"
     return None
+
+
+def in_grace(row: Row, traced: dict[str, str]) -> bool:
+    """Whether `row` is `pending` and the first release containing it was tagged under PENDING_GRACE_HOURS ago."""
+    if row.release != PENDING:
+        return False
+    shipping = pending_row_release(row, release_tags(), traced)
+    return shipping is not None and time.time() - tag_time(shipping[0]) < PENDING_GRACE_HOURS * SECONDS_PER_HOUR
 
 
 def table_lines(lines: list[str]) -> tuple[int | None, list[int]]:
@@ -545,12 +563,19 @@ def main() -> int:
     for row, _ in found:
         if base_entries.get(row.change.strip(), (0, ""))[1] != entries.get(row.change.strip(), (0, ""))[1]:
             untouched.discard((row.release, row.change))
+    # With no base, a `pending` row a fresh release shipped warns while its relabel pull request is in review.
+    graced = [problem for row, problem in found if base is None and in_grace(row, traced)]
     warned = [problem for row, problem in found if (row.release, row.change) in untouched]
-    failed = [problem for row, problem in found if (row.release, row.change) not in untouched]
+    failed = [problem for row, problem in found
+              if (row.release, row.change) not in untouched and problem not in graced]
     for problem in warned:
         print(WARNING_PREFIX + problem, file=sys.stderr)
     if warned:
         print(WARNING_NOTE, file=sys.stderr)
+    for problem in graced:
+        print(WARNING_PREFIX + problem, file=sys.stderr)
+    if graced:
+        print(GRACE_NOTE, file=sys.stderr)
     # A broken entry fails a push to main and a change that edits the page or the file, and warns on any other.
     if base is not None and (page_at(base), file_at(base, TRACES_FILE)) == (working_file(UPGRADE_PAGE),
                                                                              working_file(TRACES_FILE)):

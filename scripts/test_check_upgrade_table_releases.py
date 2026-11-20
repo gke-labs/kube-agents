@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,9 @@ SCRIPT = Path(__file__).resolve().with_name("check_upgrade_table_releases.py")
 PAGE = "docs/site/src/content/docs/install/upgrade.md"
 TRACES = "scripts/upgrade_table_traces.txt"
 HEADING = "### Breaking changes in recent releases\n\n"
+# A tag time inside and outside the check's 48-hour grace window for a freshly shipped `pending` row.
+FRESH_TAG_AGE = 3600
+STALE_TAG_AGE = 72 * 3600
 HEADER = "| Release | Change | What an existing install meets |\n| --- | --- | --- |\n"
 
 
@@ -682,6 +686,47 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
         self.assertIn("labelled pending, but 1.0.0 contains", err)
+
+    def _pending_row_tagged(self, age: int) -> str:
+        """A `pending` row "change p" that 1.0.0, tagged `age` seconds ago, contains; returns its commit."""
+        added = self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.git("tag", "-a", "1.0.0", "-m", "1.0.0", at=int(time.time()) - age)
+        return added
+
+    def test_a_pending_row_a_fresh_release_contains_warns_a_push(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 0)
+        self.assertIn(f'warning: {PAGE}', err)
+        self.assertIn(f"labelled pending, but 1.0.0 contains {added[:12]}", err)
+        self.assertIn("the release job's relabel pull request is expected to relabel them", err)
+
+    def test_a_pending_row_a_release_tagged_past_the_grace_window_contains_fails_a_push(self):
+        self._pending_row_tagged(STALE_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn("Relabel it as 1.0.0.", err)
+
+    def test_a_pull_request_that_touches_a_freshly_shipped_pending_row_fails(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        self.repo.trace(f"{added} change p")  # the pull request edits the row's trace entry
+        self.repo.commit("docs: trace p", code=False)
+        event = Path(self.tmp.name) / "event.json"
+        event.write_text(json.dumps({"pull_request": {"base": {"sha": added}}}), encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request", GITHUB_EVENT_PATH=str(event))
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn("labelled pending, but 1.0.0 contains", err)
+
+    def test_a_wrong_release_label_gets_no_grace(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("fix: b", row=row("1.0.0", "change b"))
+        self.repo.git("tag", "-a", "1.0.0", "-m", "1.0.0", base, at=int(time.time()) - FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn('the row "change b" is labelled 1.0.0, but 1.0.0 does not contain', err)
 
     def test_a_relabelled_row_passes(self):
         base = self.repo.commit("feat: before the branch point")
