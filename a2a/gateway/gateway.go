@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -234,6 +235,9 @@ type Gateway struct {
 	// first use (triggerLimiter).
 	triggerLimiterOnce sync.Once
 	triggerLimits      *triggerRateLimiter
+	// triggerMint, when set, mints trigger run grants in place of the cap
+	// bucket's minter (tests: a mint that fails).
+	triggerMint func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error)
 	// reports keeps the notify route's posts into conversations for the
 	// replies under them (reports.go).
 	reports pushedReports
