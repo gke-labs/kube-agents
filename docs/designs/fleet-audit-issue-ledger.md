@@ -551,7 +551,7 @@ the `repo`, `path` and `excerpt` of the declaration — validated for scope, a n
 identity, a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
 beside the roster; a fault check or a stream with no declared-intent step is rejected), and an
 `object` of a kind the check files where the check fixes one (`DECLARABLE_OBJECT_KINDS`: the cost
-checks' kinds, `NodePool/` for the stockout pool check and `Snapshot/` for the compute snapshot check), and never
+checks' kinds, `NodePool/` for the stockout pool check, `Snapshot/` for the compute snapshot check and `NetworkPeering/` for the networking peering check), and never
 given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
 the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
 the list's length as `declared`.
@@ -1620,7 +1620,7 @@ the channel. An id that a scheduled run already reported under a gap (`scheduled
 is not a difference. Its `new` and `resolved` then can be 0, so the JSON line also carries
 `since_last_scheduled`, the ids new and resolved since the last scheduled run, and the text chat
 report says them on a line of its own ("Changed since the last scheduled run: 1 resolved (…)."), with
-no count of zero. A card built from the ledger issue (`KAGE_SLACK_UX` on; Slack, and Google Chat under `spec.mode: next`) replaces the text and
+no count of zero. A card built from the ledger issue (`KAGE_SLACK_UX` on; Slack, and Google Chat) replaces the text and
 does not show this line. The card of a run with no ledger issue is built from its summary, which puts
 the line under the finding rows, so that card shows it. When no record shows
 the ids, or the record was written under another finding id scheme, the value is `null` and the
@@ -1670,7 +1670,7 @@ Agent profile holds no chat destination either — it ships no `platforms:` sect
 fleet-management profile should not acquire one — so the Platform Agent's own delivery leg has no
 destination. The channel is the Chat Agent's, which owns ingress: the cron report relay
 ([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
-ledger URL. In Slack with `KAGE_SLACK_UX` on, and in Google Chat under `spec.mode: next`, that line becomes a card built from the ledger issue:
+ledger URL. In Slack with `KAGE_SLACK_UX` on, and in Google Chat, that line becomes a card built from the ledger issue:
 a headline carrying the count of the most severe findings present, up to ten critical findings or
 the top two of a lower severity when there are none (tagged new where the body marks it so), a
 count of the rest, any clusters the run did not scan, and a link to the issue; the

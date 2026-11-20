@@ -823,7 +823,8 @@ class EvalRunTagTest(ProxyTestCase):
         body = chat("t_11111111", stream=False)
         self.tagged(body, run=None, agent=None)
         self.tagged(body)
-        untagged, tagged = self.lines(2)
+        # The proxy writes each request's line in the background, so the two can land in either order.
+        untagged, tagged = sorted(self.lines(2), key=lambda line: line["eval_run"] is not None)
         self.assertIsNone(untagged["eval_run"])
         self.assertIsNone(untagged["eval_agent"])
         self.assertEqual(tagged["eval_run"], TAG)

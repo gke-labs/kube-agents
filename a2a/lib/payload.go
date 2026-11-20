@@ -295,8 +295,7 @@ type TaskParameters struct {
 	// from free text or from a delegation's arguments, which are the
 	// model's; a child carries its parent's value from the gateway's own
 	// record. Both rules are the gateway's to keep (#4457): the dispatcher
-	// can't tell a parent's value from a raised one. Until the gateway sets
-	// it, nothing does. Absent means false.
+	// can't tell a parent's value from a raised one. Absent means false.
 	ChangeRequested bool `json:"changeRequested,omitempty"`
 }
 

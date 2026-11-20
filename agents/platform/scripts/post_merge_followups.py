@@ -23,7 +23,8 @@ treats the fix as handled. A record needs its ``environment`` first; one
 without it waits.
 
 :func:`notice_reverts` stamps ``reverted_at`` once the revert a step-down
-opened has merged. Nothing schedules either function yet. No model is involved.
+opened has merged. The ``post-merge-check`` cron job runs both
+(``post_merge_outcome.tick``). No model is involved.
 """
 
 from __future__ import annotations

@@ -707,6 +707,52 @@ func TestNoHomeChannelIsLoggedAsAWarning(t *testing.T) {
 	}
 }
 
+// TestARouteArmedToLearnIsLoggedAsWaiting: with no home channel and the learn
+// armed, the startup line says the route waits for a mention, at Info, and
+// the "not armed" warning is absent: the gateway will get a home without a
+// configuration change.
+func TestARouteArmedToLearnIsLoggedAsWaiting(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		cfg     *gateway.Config
+	}{
+		{"chat", gchat, &gateway.Config{GchatRelayURL: "http://relay.invalid", HomeChannelRecord: "agent-home-channel", HomeChannelLearn: true}},
+		{"slack", slackBackend, &gateway.Config{SlackBotToken: "xoxb-stub", HomeChannelRecord: "agent-home-channel", HomeChannelLearn: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged syncBuffer
+			chatNotifier(tc.cfg, tc.backend, conversations, slog.New(slog.NewJSONHandler(&logged, nil)))
+			waiting := false
+			for _, line := range strings.Split(strings.TrimSpace(logged.buf.String()), "\n") {
+				var rec map[string]any
+				if json.Unmarshal([]byte(line), &rec) != nil {
+					continue
+				}
+				msg := fmt.Sprint(rec["msg"])
+				if strings.HasPrefix(msg, "chat.notify home posts not armed") {
+					t.Fatalf("logged %v for a route armed to learn", rec)
+				}
+				if strings.HasPrefix(msg, "chat.notify home posts use a learned home channel") {
+					waiting = rec["level"] == "INFO"
+				}
+			}
+			if !waiting {
+				t.Fatalf("no Info \"home posts wait\" line; log: %s", logged.buf.String())
+			}
+		})
+	}
+}
+
 // The chat.notify route arms for a Google Chat or Slack backend with or without a home
 // channel, always with the gateway's conversations behind it (a kanban
 // card's report back to its conversation needs them, and with no home channel
@@ -791,6 +837,22 @@ func TestTheStandbyAnswersOnEveryArmedDoor(t *testing.T) {
 	got := standbyListens(&gateway.Config{InjectListen: "127.0.0.1:8099", InjectToken: "t", A2ADoorListen: "127.0.0.1:8100", A2ADoorToken: "u"})
 	if strings.Join(got, ",") != "127.0.0.1:8099,127.0.0.1:8100" {
 		t.Fatalf("standby listens %v", got)
+	}
+}
+
+// The inject door takes intent "confirm" exactly when the config says so:
+// realMain builds it through newInjectDoor, which must arm AllowConfirm for
+// A2A_INJECT_CONFIRM=true and leave it off otherwise.
+func TestNewInjectDoorArmsConfirmOnlyUnderItsFlag(t *testing.T) {
+	for _, confirm := range []bool{false, true} {
+		cfg := &gateway.Config{InjectListen: "127.0.0.1:0", InjectToken: "tok", InjectConfirm: confirm}
+		door, err := newInjectDoor(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("InjectConfirm=%v: %v", confirm, err)
+		}
+		if got := door.ConfirmAllowed(); got != confirm {
+			t.Errorf("InjectConfirm=%v: door ConfirmAllowed = %v, want %v", confirm, got, confirm)
+		}
 	}
 }
 

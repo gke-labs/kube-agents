@@ -1535,6 +1535,56 @@ func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesLeewayWatchThresholds(t *testing.T) {
+	// leeway-watch reads its alert thresholds from the environment on every
+	// daily sweep. Off the allowlist, a threshold set on the CR renders and
+	// never reaches the script. The neighbours that choose what the sweep
+	// reads, or where it keeps its state, must not pass.
+	custom := []corev1.EnvVar{
+		{Name: "LEEWAY_WATCH_MIN_SEVERITY", Value: "critical"},
+		{Name: "LEEWAY_WATCH_MIN_DRIFT", Value: "0.3"},
+		{Name: "LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE", Value: "0.8"},
+		{Name: "LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR", Value: "0"},
+		{Name: "LEEWAY_WATCH_REFRESH_DAYS", Value: "3"},
+		{Name: "LEEWAY_WATCH_CLUSTERS", Value: "p/l/c"},
+		{Name: "LEEWAY_WATCH_PROJECTS", Value: "other-project"},
+		{Name: "LEEWAY_WATCH_HOME", Value: "/tmp/elsewhere"},
+		{
+			Name: "LEEWAY_WATCH_MIN_DRIFT",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	for name, want := range map[string]string{
+		"LEEWAY_WATCH_MIN_SEVERITY":          "critical",
+		"LEEWAY_WATCH_MIN_DRIFT":             "0.3",
+		"LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE":  "0.8",
+		"LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR": "0",
+		"LEEWAY_WATCH_REFRESH_DAYS":          "3",
+	} {
+		if v, ok := values[name]; !ok || v != want {
+			t.Errorf("expected %s=%q to pass, got %q (present=%v)", name, want, v, ok)
+		}
+	}
+	for _, name := range []string{"LEEWAY_WATCH_CLUSTERS", "LEEWAY_WATCH_PROJECTS", "LEEWAY_WATCH_HOME"} {
+		if _, ok := values[name]; ok {
+			t.Errorf("%s must not pass, got %#v", name, got)
+		}
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
 	// The findings queue's pacing limits are read from the environment on
 	// every nudge run. Off the allowlist, the documented override renders on
@@ -7018,7 +7068,7 @@ func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
 	// the platform on the auto-generated `hermes-google_chat` composite and unions in every
 	// enabled MCP server, which is broader than the worker surface this pins, not narrower.
 	toolsets, _ := overlay["platform_toolsets"].(map[string]any)
-	for _, platform := range []string{"google_chat", "slack"} {
+	for _, platform := range []string{"google_chat", "slack", "teams"} {
 		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
 		want := slices.Sorted(slices.Values(frontDoorToolsets))
 		if !slices.Equal(got, want) {

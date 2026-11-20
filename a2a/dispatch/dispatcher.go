@@ -125,8 +125,13 @@ type holding struct {
 	changeRequested bool
 	// trigger is the trigger the verifier found equal to the grant's, nil
 	// when the submission names none: its credential-proxy token carries it
-	// (#4685).
+	// (#4685), and with no cluster at the unattended tier it is what makes
+	// that token a report credential (#5619).
 	trigger *taskcred.Trigger
+	// script is the helper script the task runs, resolved at admission from
+	// the profile's spec.scripts (#5622), nil for a model task. The confirm
+	// carries it.
+	script *lib.DispatchScript
 
 	// Guarded by Dispatcher.mu. pod is set from the offer on, so a pod
 	// with an offer out is busy before anything is written; confirmed is
@@ -868,6 +873,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.offeringWaiting(hk)
 	h.cluster, h.changeRequested = adm.cluster, adm.changeRequested
 	h.trigger = adm.trigger
+	h.script = adm.script
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the task goes to the (profile,
@@ -1267,7 +1273,7 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		// can't be minted (the pod's UID changed, or the signer failed)
 		// is an offer withdrawn, as a declined one is: nothing is
 		// written, and the next pod is tried.
-		confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}
+		confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID, Script: h.script}
 		if d.mint != nil {
 			var err error
 			confirm.TaskCredential, confirm.ProxyToken, err = d.taskCredentials(log, h, pod, uid, deadline)
@@ -1317,9 +1323,12 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 
 // taskCredentials mints the task credential (audience nats) and, when the
 // task names a cluster, the credential-proxy token for the pod being
-// confirmed (#3889). A checked trigger on a task with no cluster is logged
-// as dropped. Both name the task, its profile and tier, the pod and
-// the UID it had at the offer; a pod whose UID has changed since (deleted
+// confirmed (#3889). A task that names no cluster gets a credential-proxy
+// token only as a report credential (#5619): at the unattended tier with a
+// checked trigger, and then with no target, which the broker holds to the
+// audit-report routes. Any other checked trigger on a task with no cluster
+// is logged as dropped, and nothing is minted for it. Both name the task,
+// its profile and tier, the pod and the UID it had at the offer; a pod whose UID has changed since (deleted
 // and re-created under its name) is not the pod that accepted, and gets
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
 // allowance, capped at the max lifetime from now so the callout never
@@ -1359,11 +1368,21 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 		if err != nil {
 			return "", "", err
 		}
+	} else if h.trigger != nil && h.tier == taskcred.ReportTier {
+		// A report credential (#5619): an unattended task a trigger started,
+		// naming no cluster, so there is nothing to confine it to. The
+		// broker takes it on the audit-report routes alone. The tier is the
+		// literal one taskcred and the broker require, not any
+		// unattended-mode tier: a grant binds a trigger only at it.
+		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, nil, h.trigger, now)
+		if err != nil {
+			return "", "", err
+		}
 	} else if h.trigger != nil {
-		// Admission checked the trigger, but only the credential-proxy token
-		// carries one, and a task that names no cluster gets none. Said, not
-		// silent, until a cluster-less report credential exists (#5619).
-		log.Warn("trigger dropped: the task names no cluster, so no credential-proxy token carries it", "trigger", h.trigger.Name, "pod", pod)
+		// Admission checked the trigger, but a grant binds one only at the
+		// unattended tier, so this shouldn't happen. Said, not silent, and
+		// nothing is minted: a credential with no target confines nothing.
+		log.Warn("trigger dropped: the task names no cluster and is not at the unattended tier, so no credential-proxy token carries it", "trigger", h.trigger.Name, "tier", h.tier, "pod", pod)
 	}
 	return natsToken, proxyToken, nil
 }

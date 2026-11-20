@@ -277,3 +277,36 @@ func StartTierFile(ctx context.Context, getenv func(string) string, log *slog.Lo
 	}
 	go WatchTierFile(ctx, path, tierPollInterval, log)
 }
+
+// IsInteractiveProfileTier reports whether tier is a profile tier a person
+// may run at in the table in force: a built-in or loaded tier whose verbs
+// include task.execute, which the interactive mode gives and the unattended
+// mode doesn't (#3659, Tier 2c).
+func IsInteractiveProfileTier(tier Tier) bool {
+	t := tiers()
+	return t.profile[tier] && t.verbs[tier].has(VerbTaskExecute)
+}
+
+// OutsideCeiling is the verbs tier carries, profile.run aside, that ceiling
+// doesn't, sorted; empty when tier fits under it. The ceiling is the
+// gateway's install-wide AuthorityTier, a legacy tier that no profile tier
+// nests under because none holds profile.run, which is deliberate
+// (tierVerbs); so the comparison leaves profile.run out and holds everything
+// else a profile tier carries inside the ceiling (Brian's decision on #3659,
+// 2026-11-16). An unknown tier or ceiling is entirely outside.
+func OutsideCeiling(tier, ceiling Tier) []Verb {
+	t := tiers()
+	set, ok := t.verbs[tier]
+	if !ok {
+		return []Verb{Verb("unknown tier " + string(tier))}
+	}
+	top := t.verbs[ceiling]
+	var out []Verb
+	for v := range set {
+		if v != VerbProfileRun && !top.has(v) {
+			out = append(out, v)
+		}
+	}
+	sortVerbs(out)
+	return out
+}

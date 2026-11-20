@@ -183,6 +183,7 @@ AUDITS: dict[str, AuditSpec] = {
             "configsync-reconciler-stalled",
             "webhook-backend-unreachable",
             "serviceentry-host-collision",
+            "webhook-ca-bundle-expired",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -451,10 +452,11 @@ AUDITS: dict[str, AuditSpec] = {
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
             "firewall-world-open-ingress",
+            "missing-nodelocal-dnscache",
         ),
         # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
         # subnet for the IPAM check, one `project/<id>` entry for the other
-        # five. This stream enumerates no clusters.
+        # six. This stream enumerates no clusters.
         scopes=(
             ("subnet", ("subnet-ip-exhaustion",)),
             (
@@ -465,9 +467,21 @@ AUDITS: dict[str, AuditSpec] = {
                     "mtu-packet-fragmentation",
                     "cloud-armor-false-positive",
                     "firewall-world-open-ingress",
+                    "missing-nodelocal-dnscache",
                 ),
             ),
         ),
+        # §2a of the SOP: the one check that compares two values an owner
+        # sets, each peered network's MTU, and reads nothing live, so the only
+        # one a repository declaration may keep off the ledger (a jumbo-frame
+        # network peered with a 1460 one on purpose). One arm, one object kind
+        # (`NetworkPeering/<a>--<b>`), so no arm rule. The other six are
+        # faults no declaration excuses: a range under 15% free, a VM at its
+        # NAT port ceiling, a rejected PSC connection, a preview or duplicate
+        # Cloud Armor rule on a production backend, a management port open to
+        # the internet on a live external address, a Standard cluster without
+        # NodeLocal DNSCache.
+        declarable=("mtu-packet-fragmentation",),
     ),
     "gce-compute-fleet-audit": AuditSpec(
         "GCE Compute Engine and MIG Fleet Audit",
@@ -1237,6 +1251,7 @@ CHECK_PHRASES = {
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
     "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
     "serviceentry-host-collision": "{object} is routed by Istio's pick in namespaces that declare none of its entries",
+    "webhook-ca-bundle-expired": "{object} has an expired or expiring webhook CA bundle",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -1332,7 +1347,7 @@ CHECK_PHRASES = {
     "single-zone-nodepool": "{object} node pool sits in one zone",
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
-    "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
+    "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -1340,6 +1355,7 @@ CHECK_PHRASES = {
     "mtu-packet-fragmentation": "MTU settings fragment packets",
     "cloud-armor-false-positive": "Cloud Armor blocks legitimate traffic",
     "firewall-world-open-ingress": "{object} firewall rule is open to the internet",
+    "missing-nodelocal-dnscache": "{object} cluster runs without NodeLocal DNSCache",
     # GCE Compute Engine and MIG Fleet Audit
     "gce-startup-script-status": "{object} startup script failed",
     "mig-convergence-stalled": "{object} instance group isn't converging",
@@ -2083,15 +2099,25 @@ ORPHANED_SNAPSHOT_CHECK = "orphaned-snapshots"
 COMPUTE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     ORPHANED_SNAPSHOT_CHECK: frozenset({"snapshot"}),
 }
+# The networking stream's one declarable check, 2.4 `mtu-packet-fragmentation`,
+# names the peering and nothing else: the collector files
+# `NetworkPeering/<a>--<b>` (the two network names sorted), and a `Network/`
+# or a `Project/` covers no pair. One arm: the excerpt carries nothing live,
+# so the join needs no arm rule and the plain `_declaration_covers` path moves it.
+MTU_PEERING_CHECK = "mtu-packet-fragmentation"
+NETWORKING_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    MTU_PEERING_CHECK: frozenset({"networkpeering"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
-# reads it for the measured-size title, which a stockout or a compute row
+# reads it for the measured-size title, which a stockout, a compute or a networking row
 # does not carry.
 DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **COST_DECLARABLE_OBJECT_KINDS,
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
     **COMPUTE_DECLARABLE_OBJECT_KINDS,
+    **NETWORKING_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
@@ -2113,9 +2139,10 @@ COST_DECLARED_MINOR = "minor"
 # namespace on the finding would give the pool an identity no declaration and
 # no candidate matches. So does the compute snapshot check
 # (`ORPHANED_SNAPSHOT_CHECK`), filed on a `project/<id>` target with no
-# namespace. Every slug here belongs to one stream, so no stream test is
-# needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK})
+# namespace, and so does the networking peering check (`MTU_PEERING_CHECK`),
+# filed the same way. Every slug here belongs to one stream, so no stream
+# test is needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK, MTU_PEERING_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -3202,6 +3229,9 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # whose request is its limit, so a number sized from an idle week becomes an
 # enforcement ceiling; the SOP has that finding published as `manual`, and the
 # marker keeps a `manifest` the model wrote anyway out of the sweep. The
+# stockout collector also sets `class-status` on a §3.12(b) finding, a
+# ComputeClass that GKE reports misconfigured: the fix taints or relabels a
+# node pool, which decides where every other Pod on it can schedule. The
 # compliance collector sets `default-deny` on every §2.6 finding: each arm's
 # fix leaves the namespace denying ingress by default, which drops every
 # connection no allow rule names until the team writes those rules. The
@@ -3214,6 +3244,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 TRIAGE_REASONS = {
     "service-fronted": "stands down a controller a Service routes to",
     "new-computeclass": "needs a new ComputeClass and a workload that selects it",
+    "class-status": "changes a node pool or a ComputeClass, and the audit did not read what else runs on that pool",
     "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",
@@ -9724,7 +9755,8 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
 
     A check with fixed object kinds accepts only those
     (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check and
-    the compute snapshot check). The two controller checks file whatever
+    the compute snapshot check and the networking peering check). The two
+    controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5

@@ -202,6 +202,17 @@ class PrOpenedTest(unittest.TestCase):
              "thread_platform": "slack", "thread_chat_id": "C123", "thread_id": "1700000000.1"},
         )
 
+    def test_unreadable_fix_recipes_record_nothing_and_still_claim(self):
+        from fix_recipes import registry
+
+        with mock.patch.object(plugin, "post_merge_check_on", return_value=True), \
+                mock.patch.object(plugin, "card_thread", return_value=plugin.NO_THREAD), \
+                mock.patch.object(registry, "recipes", side_effect=registry.RecipeError("unreadable")), \
+                self.assertLogs(plugin.logger, "WARNING"):
+            broker = _Broker()
+            self.run_hook(broker.line(target=TARGET), _Kanban(), broker=broker)
+        self.assertEqual([path for path, _ in self.ledger], ["/v1/proposals/opened"])
+
     def test_a_proposal_with_no_known_finding_is_not_recorded_for_the_post_merge_check(self):
         with mock.patch.object(plugin, "post_merge_check_on", return_value=True), \
                 mock.patch.object(plugin, "card_thread", return_value=plugin.NO_THREAD):

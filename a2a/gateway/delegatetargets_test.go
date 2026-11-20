@@ -3,11 +3,13 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -19,10 +21,16 @@ func targetNames(t lib.DelegateTargets) []string {
 	return out
 }
 
+// targetsGateway is a gateway with what delegateTargets reads: the install's
+// authority tier, which tierFor holds a profile's tier under.
+func targetsGateway() *Gateway {
+	return &Gateway{cfg: &Config{AuthorityTier: capability.TierDeveloperTeam}, log: slog.New(slog.DiscardHandler)}
+}
+
 // A session turn names platform and every profile its requester may use, in
 // name order, with each card's blurb folded to one line.
 func TestDelegateTargetsNamePlatformThenEachProfile(t *testing.T) {
-	g := &Gateway{}
+	g := targetsGateway()
 	d := newProfileDirectory()
 	d.put("e2e5", &lib.AgentCard{Name: "e2e5", Description: "reads one\ncluster's workloads"})
 	d.put("cluster", &lib.AgentCard{Name: "cluster", Tiers: []string{"read"}})
@@ -48,10 +56,11 @@ func TestDelegateTargetsLeaveOutWhatTheDelegationWouldRefuse(t *testing.T) {
 	d.put("open", &lib.AgentCard{Name: "open"})
 	d.put("listed", &lib.AgentCard{Name: "listed"})
 	d.put("writers", &lib.AgentCard{Name: "writers", Tiers: []string{"write"}})
-	g := &Gateway{targetAllowed: map[string]map[string]map[string]bool{
+	g := targetsGateway()
+	g.targetAllowed = map[string]map[string]map[string]bool{
 		"listed":   {"discord": {"u2": true}},
 		"platform": {"discord": {"u2": true}},
-	}}
+	}
 	got := g.delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	if want := []string{"open"}; !reflect.DeepEqual(targetNames(got), want) {
 		t.Fatalf("u1's targets = %v, want %v (listed and platform hold only u2; writers is write-tier)", targetNames(got), want)
@@ -66,7 +75,7 @@ func TestDelegateTargetsLeaveOutWhatTheDelegationWouldRefuse(t *testing.T) {
 		t.Fatalf("door caller's targets = %v, want none", targetNames(got))
 	}
 	// No attested identity reaches no profile.
-	got = (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord"}, nil, false, d)
+	got = targetsGateway().delegateTargets(TaskRequester{Backend: "discord"}, nil, false, d)
 	if want := []string{"platform"}; !reflect.DeepEqual(targetNames(got), want) {
 		t.Fatalf("no-identity targets = %v, want %v", targetNames(got), want)
 	}
@@ -82,7 +91,7 @@ func TestDelegateTargetsSkipBadNamesAndStopAtTheCap(t *testing.T) {
 		name := "p" + string(rune('a'+i%26)) + string(rune('a'+i/26))
 		d.put(name, &lib.AgentCard{Name: name})
 	}
-	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
+	got := targetsGateway().delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	if len(got.Targets) != lib.DelegateTargetsMax || !got.Truncated {
 		t.Fatalf("%d targets, truncated=%v; want the cap %d, truncated", len(got.Targets), got.Truncated, lib.DelegateTargetsMax)
 	}
@@ -132,7 +141,7 @@ func TestDelegateTargetsCarryParametersAndStayInsideTheBytes(t *testing.T) {
 	d.put("a-cluster", &lib.AgentCard{Name: "a-cluster", Parameters: clusterParams})
 	d.put("b-bad", &lib.AgentCard{Name: "b-bad", Parameters: []lib.ProfileParameter{{Name: "Not-An-Identifier"}}})
 	d.put("c-open", &lib.AgentCard{Name: "c-open"})
-	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
+	got := targetsGateway().delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	if want := []string{"platform", "a-cluster", "c-open"}; !reflect.DeepEqual(targetNames(got), want) || got.Truncated {
 		t.Fatalf("targets = %v truncated=%v, want %v untruncated", targetNames(got), got.Truncated, want)
 	}
@@ -150,7 +159,7 @@ func TestDelegateTargetsCarryParametersAndStayInsideTheBytes(t *testing.T) {
 		}
 		big.put(name, &lib.AgentCard{Name: name, Description: blurb, Parameters: params})
 	}
-	got = (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, big)
+	got = targetsGateway().delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, big)
 	if !got.Truncated || len(got.Targets) >= lib.DelegateTargetsMax {
 		t.Fatalf("%d targets, truncated=%v; want fewer than the cap, truncated by bytes", len(got.Targets), got.Truncated)
 	}
@@ -167,7 +176,7 @@ func TestAPinnedProfileOffersNoTargetParameters(t *testing.T) {
 	d.put("pinned", &lib.AgentCard{Name: "pinned", ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "web-1"},
 		Parameters: append(append([]lib.ProfileParameter{}, clusterParams...), extra)})
 	d.put("unpinned", &lib.AgentCard{Name: "unpinned", Parameters: clusterParams})
-	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
+	got := targetsGateway().delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	params := map[string][]lib.ProfileParameter{}
 	for _, target := range got.Targets {
 		params[target.Name] = target.Parameters
@@ -187,7 +196,8 @@ func TestDelegateTargetsHoldEveryoneInTheSession(t *testing.T) {
 	d := newProfileDirectory()
 	d.put("listed", &lib.AgentCard{Name: "listed"})
 	d.put("open", &lib.AgentCard{Name: "open"})
-	g := &Gateway{targetAllowed: map[string]map[string]map[string]bool{"listed": {"discord": {"u1": true}}}}
+	g := targetsGateway()
+	g.targetAllowed = map[string]map[string]map[string]bool{"listed": {"discord": {"u1": true}}}
 	u1 := TaskRequester{Backend: "discord", Subject: "u1"}
 	u3 := TaskRequester{Backend: "discord", Subject: "u3"}
 	if got := g.delegateTargets(u1, []TaskRequester{u1}, false, d); !reflect.DeepEqual(targetNames(got), []string{"platform", "listed", "open"}) {
@@ -285,7 +295,7 @@ func TestEveryDelegateTargetsListBuildsAPart(t *testing.T) {
 			name := fmt.Sprintf("p%02d", i)
 			d.put(name, &lib.AgentCard{Name: name, Description: strings.Repeat("x", blurb), Parameters: params})
 		}
-		got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
+		got := targetsGateway().delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 		if _, err := lib.DelegateTargetsPart(got); err != nil {
 			t.Fatalf("blurb of %d bytes: %d targets, truncated=%v, and no part: %v", blurb, len(got.Targets), got.Truncated, err)
 		}
@@ -353,7 +363,8 @@ func TestDelegateTargetsAdvertiseAWidthOverOne(t *testing.T) {
 	d := newProfileDirectory()
 	r := TaskRequester{Backend: "discord", Subject: "u1"}
 	for _, tc := range []struct{ width, want int }{{0, 0}, {1, 0}, {10, 10}} {
-		g := &Gateway{cfg: &Config{DelegationWidthMax: tc.width}}
+		g := targetsGateway()
+		g.cfg.DelegationWidthMax = tc.width
 		got := g.delegateTargets(r, nil, false, d)
 		if got.WidthMax != tc.want {
 			t.Errorf("width %d: advertised %d, want %d", tc.width, got.WidthMax, tc.want)

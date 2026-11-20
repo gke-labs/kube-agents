@@ -63,6 +63,11 @@ class ScopeRefusalTest(unittest.TestCase):
         self.assertIn("excluded", refused({"project": "", "location": "", "cluster": "p1/l/skip"}))
         self.assertIsNone(refused({"project": "", "location": "", "cluster": "p1/l/keep"}))
 
+    def test_a_project_number_is_unknown_never_out_of_scope(self):
+        reason = post_merge_scope.scope_refusal_for(declared("other"))({"project": "123456789012", "location": "l",
+                                                                         "cluster": "c"})
+        self.assertTrue(reason.startswith(post_merge_scope.UNKNOWN_PREFIX), reason)
+
     def test_a_project_outside_the_declared_scope_is_out_of_scope(self):
         reason = post_merge_scope.scope_refusal_for(declared("other"))({"project": "p", "location": "l", "cluster": "c"})
         self.assertFalse(reason.startswith(post_merge_scope.UNKNOWN_PREFIX), reason)

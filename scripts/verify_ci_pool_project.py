@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 # The seeded files' content, shared with hack/fleet-fixture-state.py through a
 # module of its own; this script's directory is not on sys.path when another
@@ -605,6 +605,7 @@ GITOPS_INTENT_NOTE_CASES = (
     "cost-declared-intent-no-finding",
     "stockout-declared-intent-no-finding",
     "compute-declared-intent-no-finding",
+    "networking-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
@@ -614,6 +615,7 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
     ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
     ("gce-compute-fleet-audit", {"check": "orphaned-snapshots", "namespace": "", "object": "Snapshot/declared-orphan-snap-seeded"}),
+    ("gcp-networking-fabric-audit", {"check": "mtu-packet-fragmentation", "namespace": "", "object": "NetworkPeering/default--mtu-peer-declared"}),
 )
 # The key the audit's index (collect.py workload_declarations) must hold for
 # the seeded file: cluster off the path's second segment, then kind, namespace
@@ -673,15 +675,57 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 # is what makes it a usable identity probe rather than just a reachability test.
 GITHUB_APP_URL = "https://api.github.com/app"
 
-# The App the EVAL RUNNER grades ledger issues with (a mint pinned to reads; its
-# installation also holds issues, pull_requests and contents write, for
-# hack/ci-eval-pr.sh's ledger reset and repository reset),
-# which is not the minter App above. hack/ci-eval-pr.sh mints an installation
-# token from it into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
-# test pins these two to that script, so changing the App there cannot leave
-# this check attesting a credential CI no longer uses.
-LEDGER_APP_ID = 4739812
-LEDGER_INSTALLATION_ID = 157029058
+# The Apps the EVAL RUNNER grades ledger issues with (a mint pinned to reads;
+# each installation also holds issues, pull_requests and contents write, for
+# hack/ci-eval-pr.sh's ledger reset and repository reset), which are not the
+# minter App above. There are several since gke-labs/kube-agents#6240, one per
+# shard of the pool, so concurrent runs on different projects draw on
+# different hourly budgets: hack/eval/ledger-reader-apps.txt lists them in
+# shard order (App id, installation id, the build-cluster Secret holding its
+# key), LEDGER_READER_SHARD_SIZE projects per App in number order
+# (ledger_reader_for). hack/ci-eval-pr.sh mints from the same file by the
+# same rule into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
+# test holds this parse, that rule and the size to the script's, so changing
+# the Apps there cannot leave this check attesting a credential CI no longer
+# uses.
+_LEDGER_READER_APPS_FILE = _ROOT / "hack" / "eval" / "ledger-reader-apps.txt"
+# key_holder is the NAME of the build-cluster Secret holding the App's key,
+# never the key: the name says so (core_engineering.md, "Name identifiers for
+# what they hold").
+LedgerReader = NamedTuple("LedgerReader", [("app_id", int), ("installation_id", int), ("key_holder", str)])
+LEDGER_READER_ROW_FIELDS = 3
+LEDGER_READER_ROW_SHAPE = "<App id> <installation id> <Secret holding its key>"
+
+
+def _parse_ledger_readers(path: Path) -> Tuple[LedgerReader, ...]:
+    """The table's rows, with the line that breaks the shape named: this runs
+    at import, in the fixture scan as well as here, so a bad row has to say
+    where it is rather than raise an IndexError."""
+    rows = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        fields = raw.split("#", 1)[0].split()
+        if not fields:
+            continue
+        if len(fields) != LEDGER_READER_ROW_FIELDS or not (fields[0].isdigit() and fields[1].isdigit()):
+            raise ValueError(f"{path}:{number}: expected `{LEDGER_READER_ROW_SHAPE}`, got {raw!r}")
+        rows.append(LedgerReader(int(fields[0]), int(fields[1]), fields[2]))
+    return tuple(rows)
+
+
+LEDGER_READERS = _parse_ledger_readers(_LEDGER_READER_APPS_FILE)
+# The project's number as the shard rule reads it: the N of kube-agents-evals-N,
+# BARE_POOL_PROJECT_NUMBER for the bare kube-agents-evals, the pool's first.
+POOL_PROJECT_NUMBER_RE = re.compile(r"-(\d+)$")
+BARE_POOL_PROJECT_NUMBER = 1
+# Projects per App, in number order: numbers 1-10 on the first row, 11-20 on
+# the second. The same value as LEDGER_READER_SHARD_SIZE in hack/ci-eval-pr.sh
+# and scripts/provision_ci_pool_project.sh.
+LEDGER_READER_SHARD_SIZE = 10
+# Shard 0 is the App of before the split: the smoke test's step 0 mints from
+# it ahead of any lease (hack/ledger_token_mint.py's defaults; a test holds
+# them equal), and the messages about a failure that is pool-wide name it.
+LEDGER_APP_ID = LEDGER_READERS[0].app_id
+LEDGER_INSTALLATION_ID = LEDGER_READERS[0].installation_id
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
@@ -698,10 +742,10 @@ LEDGER_READ_PERMISSIONS = {
     "metadata": "read",
 }
 
-# Its private key, read from the cluster rather than the operator's disk: a
+# Shard 0's private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
 # cluster ALIAS the prowjob names, not a GKE cluster.
-LEDGER_KEY_SECRET = "kube-agents-evals-ledger-app-key"
+LEDGER_KEY_SECRET = LEDGER_READERS[0].key_holder
 LEDGER_KEY_SECRET_ENTRY = "key.pem"
 LEDGER_KEY_NAMESPACE = "test-pods"
 PROW_BUILD_CLUSTER = "kube-agents-prow"
@@ -2949,6 +2993,25 @@ def _gitops_repo_slug(project_id: str) -> str:
     return f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
 
 
+def pool_project_number(project_id: str) -> int:
+    """kube-agents-evals-N -> N; the bare kube-agents-evals, the pool's first project, is 1."""
+    found = POOL_PROJECT_NUMBER_RE.search(project_id)
+    # Never below the bare project's number: bash's integer division in
+    # hack/ci-eval-pr.sh truncates toward zero, and the two rules are held
+    # equal, so a number 0 (which no pool project has) lands on the first row.
+    return max(BARE_POOL_PROJECT_NUMBER, int(found.group(1))) if found else BARE_POOL_PROJECT_NUMBER
+
+
+def ledger_reader_for(project_id: str) -> Tuple[int, Optional[LedgerReader]]:
+    """The shard a pool project's repository sits in, and the App that reads it:
+    LEDGER_READER_SHARD_SIZE projects per App in number order, the rule
+    hack/ci-eval-pr.sh's ledger_reader_shard applies when it mints for the
+    project it leased. None for the App when the table has no row for the
+    shard yet: the project cannot be graded until that App is registered."""
+    shard = (pool_project_number(project_id) - 1) // LEDGER_READER_SHARD_SIZE
+    return shard, LEDGER_READERS[shard] if shard < len(LEDGER_READERS) else None
+
+
 def _load_audit_report():
     """The fleet-audit script as a module, proven able to run its note parser here.
 
@@ -4115,12 +4178,13 @@ def check_gitops_default_branch(project_id: str) -> CheckResult:
     return CheckResult(name, False, f"{repo_slug} does not default to {GITOPS_DEFAULT_BRANCH}", details=details, findings=findings)
 
 
-def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
-    """The ledger App's PEM, read out of the build cluster. Returns (pem, reason).
+def _read_ledger_app_key(timeout: int = 30, key_holder: str = LEDGER_KEY_SECRET) -> Tuple[Optional[str], str]:
+    """A ledger App's PEM, read out of the build cluster. Returns (pem, reason).
 
     A None pem always carries a reason. Read from the cluster rather than from a
     file the operator supplies: the question is whether the key CI mounts can see
-    the repository, and a local copy cannot answer it.
+    the repository, and a local copy cannot answer it. key_holder names the App's
+    Secret (hack/eval/ledger-reader-apps.txt); the first App's by default.
     """
     context = f"gke_{PROW_BUILD_CLUSTER_PROJECT}_{PROW_BUILD_CLUSTER_ZONE}_{PROW_BUILD_CLUSTER}"
     credentials = (
@@ -4134,7 +4198,7 @@ def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
         [
             "kubectl", "--context", context,
             "-n", LEDGER_KEY_NAMESPACE,
-            "get", "secret", LEDGER_KEY_SECRET,
+            "get", "secret", key_holder,
             "-o", f"jsonpath={{.data.{LEDGER_KEY_SECRET_ENTRY.replace('.', chr(92) + '.')}}}",
         ],
         timeout=timeout,
@@ -4150,7 +4214,7 @@ def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
         # The secret exists and the entry does not, which kubectl reports as an
         # empty jsonpath rather than an error.
         return None, (
-            f"secret {LEDGER_KEY_SECRET} in {LEDGER_KEY_NAMESPACE} has no "
+            f"secret {key_holder} in {LEDGER_KEY_NAMESPACE} has no "
             f"{LEDGER_KEY_SECRET_ENTRY} entry"
         )
     try:
@@ -4167,15 +4231,18 @@ def _net_timeout(default: float) -> float:
     return max(NET_TIMEOUT_FLOOR_SECONDS, min(default, _RUN_DEADLINE - time.monotonic()))
 
 
-def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str, str]:
-    """Trade the App key for an installation token. Returns (token, status, message).
+def _mint_ledger_token(
+    pem: str, timeout: int = 15, reader: LedgerReader = LEDGER_READERS[0]
+) -> Tuple[Optional[str], str, str]:
+    """Trade an App key for an installation token. Returns (token, status, message).
 
     status is one of {"ok", "failed", "unverified"}, and the token is only ever
     returned, never logged: it is a live credential for every repository in the
     installation.
 
     The token is narrowed to LEDGER_READ_PERMISSIONS, the four reads grading
-    pins, whatever the App is granted.
+    pins, whatever the App is granted. reader is the shard's App (ledger_reader_for);
+    shard 0's by default.
     """
 
     def _b64(raw: bytes) -> bytes:
@@ -4188,7 +4255,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             {
                 "iat": now - JWT_BACKDATE_SECONDS,
                 "exp": now + JWT_LIFETIME_SECONDS,
-                "iss": str(LEDGER_APP_ID),
+                "iss": str(reader.app_id),
             },
             separators=(",", ":"),
         ).encode()
@@ -4212,14 +4279,14 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             return None, "unverified", "openssl is not on PATH, so no JWT could be signed"
         if rc != 0:
             return None, "failed", (
-                f"the key in secret {LEDGER_KEY_SECRET} would not sign a JWT: {err.strip()[:200]}"
+                f"the key in secret {reader.key_holder} would not sign a JWT: {err.strip()[:200]}"
             )
         with open(sig_path, "rb") as fh:
             signature = fh.read()
 
     jwt = (signing_input + b"." + _b64(signature)).decode("ascii")
     request = urllib.request.Request(
-        GITHUB_INSTALLATION_TOKEN_URL.format(installation=LEDGER_INSTALLATION_ID),
+        GITHUB_INSTALLATION_TOKEN_URL.format(installation=reader.installation_id),
         method="POST",
         headers={
             "Authorization": f"Bearer {jwt}",
@@ -4235,13 +4302,13 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             return None, "failed", (
-                f"GitHub rejected a JWT signed by secret {LEDGER_KEY_SECRET} (401). The stored key "
-                f"is not App {LEDGER_APP_ID}'s, which breaks ledger grading on every pool project"
+                f"GitHub rejected a JWT signed by secret {reader.key_holder} (401). The stored key "
+                f"is not App {reader.app_id}'s, which breaks ledger grading on every pool project of its shard"
             )
         if exc.code == 404:
             return None, "failed", (
-                f"App {LEDGER_APP_ID} has no installation {LEDGER_INSTALLATION_ID} (404). It was "
-                "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
+                f"App {reader.app_id} has no installation {reader.installation_id} (404). It was "
+                "uninstalled from gke-agentic, or the id moved; ledger grading is broken on every pool project of its shard"
             )
         if exc.code == 422:
             # The body asked for a permission the installation does not hold.
@@ -4249,10 +4316,10 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             # on this answer, so every run on every pool project would stop.
             wanted = ", ".join(f"{k}: {v}" for k, v in LEDGER_READ_PERMISSIONS.items())
             return None, "failed", (
-                f"GitHub refused to mint {wanted} for App {LEDGER_APP_ID}'s installation "
-                f"{LEDGER_INSTALLATION_ID} (422): the installation no longer holds one of them. "
+                f"GitHub refused to mint {wanted} for App {reader.app_id}'s installation "
+                f"{reader.installation_id} (422): the installation no longer holds one of them. "
                 "hack/ci-eval-pr.sh's preflight mint asks for exactly these and stops the run on "
-                "this answer, so ledger grading is broken pool-wide until an organisation owner "
+                "this answer, so ledger grading is broken on every pool project of its shard until an organisation owner "
                 "restores the permission (or accepts a pending permission change) on the installation"
             )
         return None, "unverified", (
@@ -4275,9 +4342,9 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     # `all` fails: an absent key is GitHub changing its response, not a flip.
     if body.get("repository_selection") == "all":
         return None, "failed", (
-            f"App {LEDGER_APP_ID}'s installation {LEDGER_INSTALLATION_ID} is "
+            f"App {reader.app_id}'s installation {reader.installation_id} is "
             "repository_selection: all, so it reads every gke-agentic repository rather than the "
-            "pool's. Set it back to `selected` with the -infra repositories listed"
+            "pool's. Set it back to `selected` with its shard's -infra repositories listed"
         )
 
     token = body.get("token")
@@ -4312,21 +4379,41 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     """
     name = "Ledger Read Credential"
     repo_slug = _gitops_repo_slug(project_id)
+    # The App whose installation must hold this repository: the project's
+    # shard, which is where hack/ci-eval-pr.sh will mint from on a lease. A
+    # repository added to another shard's App reads as a 404 below.
+    shard, reader = ledger_reader_for(project_id)
+    # Messages count Apps from 1, as the App names and the table's rows do.
+    number = shard + 1
+    warnings: List[str] = []
+    if reader is None:
+        # No row for the shard yet: hack/ci-eval-pr.sh reads such a project
+        # through the first App with a warning, so that is what is checked,
+        # and the warning here says what the rollout still owes.
+        warnings.append(
+            f"{project_id} is on reader App {number} ({LEDGER_READER_SHARD_SIZE} projects per App, in "
+            f"number order) and hack/eval/ledger-reader-apps.txt has {len(LEDGER_READERS)} row(s), so the "
+            f"eval reads {repo_slug} through reader App 1 until the row exists. Register App {number} with "
+            "the same grants, install it on its ten repositories, mount its key, and append its row -- "
+            "see section 5.4 of docs/ci-pool-projects.md"
+        )
+        shard, reader = 0, LEDGER_READERS[0]
+    where = f"App {reader.app_id} (reader App {shard + 1} of {len(LEDGER_READERS)}, by the project's number)"
 
-    pem, reason = _read_ledger_app_key()
+    pem, reason = _read_ledger_app_key(key_holder=reader.key_holder)
     if pem is None:
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"Not checked: {reason}, so nothing here says whether the eval runner can read "
             f"{repo_slug}'s issues -- the read that failed on kube-agents-evals-6's first lease. "
-            f"The key is secret {LEDGER_KEY_SECRET} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
+            f"The key is secret {reader.key_holder} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
             f"{LEDGER_KEY_NAMESPACE} on cluster {PROW_BUILD_CLUSTER}"
         )])
 
-    token, status, message = _mint_ledger_token(pem, timeout=timeout)
+    token, status, message = _mint_ledger_token(pem, timeout=timeout, reader=reader)
     if status == "failed":
-        return CheckResult(name, False, "Ledger issues not readable", details=[message])
+        return CheckResult(name, False, "Ledger issues not readable", details=[message], warnings=warnings)
     if token is None:
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"{message}, so the eval runner's access to {repo_slug}'s issues is unknown"
         )])
 
@@ -4352,27 +4439,29 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
                 name,
                 True,
                 "Not checked",
-                warnings=[Unread(
+                warnings=[*warnings, Unread(
                     f"GitHub rate-limited the read of {repo_slug}'s issues, so the eval runner's "
                     "access to them was never established. Re-run when the limit resets"
                 )],
             )
         if exc.code == 403:
-            return CheckResult(name, False, "Ledger issues not readable", details=[
-                f"App {LEDGER_APP_ID} reaches {repo_slug} but is refused its issues "
+            return CheckResult(name, False, "Ledger issues not readable", warnings=warnings, details=[
+                f"{where} reaches {repo_slug} but is refused its issues "
                 f"(403 {exc.reason}). The token was just minted with `issues: read`, so this is "
                 "not a missing permission: the installation is suspended, or an organisation "
-                "IP allow list or SAML setting blocks App tokens from here. Pool-wide rather than "
+                "IP allow list or SAML setting blocks App tokens from here. App-wide rather than "
                 f"anything about {project_id}; clear it and re-run"
             ])
         if exc.code == 404:
             return CheckResult(name, False, "Ledger issues not readable", details=[
-                f"App {LEDGER_APP_ID} cannot see {repo_slug} at all (404). Its installation is "
-                "repository_selection: selected, so add this repository to it -- see section 5.4 "
-                "of docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
+                f"{where} cannot see {repo_slug} at all (404). Its installation "
+                f"{reader.installation_id} is repository_selection: selected, so add this repository "
+                "to it (and, until the Prow job mounts this App's key, keep it on reader App 1's "
+                "installation as well, which is where the eval reads it meanwhile); see section 5.4 of "
+                "docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
                 "exist; the check above settles which.)"
-            ])
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+            ], warnings=warnings)
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of allowing or refusing the "
             f"read of {repo_slug}'s issues, so the eval runner's access is unknown. Re-run when "
             "it clears"
@@ -4383,12 +4472,12 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             if "CERTIFICATE_VERIFY_FAILED" in str(exc)
             else "re-run from somewhere with egress to api.github.com"
         )
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"Could not reach api.github.com to read {repo_slug}'s issues "
             f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
         )])
 
-    return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
+    return CheckResult(name, True, f"{where} can read {repo_slug}'s issues", warnings=warnings)
 
 
 def check_gemini_api_key(project_id: str) -> CheckResult:

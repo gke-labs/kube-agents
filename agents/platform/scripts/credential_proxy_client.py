@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -259,6 +260,15 @@ _EXEC_EXIT_CODE_FIELD = "exitCode"
 _FIELD_NOT_A_STRING_TEXT = "the response's {field} is of type {type}, not a string"
 _EXIT_CODE_NOT_AN_INTEGER_TEXT = "the response's exitCode is of type {type}, not an integer"
 _NO_EXIT_CODE_TEXT = "the response has no exitCode"
+# The broker sends the command's return code as `exitCode`. A process status is
+# 0 to 255. A command that a signal ended has the signal's negative number
+# there, and a shell reports that death as 128 plus the number, so the least
+# value with a status is 128 - 255. A value outside the two bounds is no
+# command's result, and `sys.exit` would wrap it: 256 would read as success.
+_MAX_EXIT_STATUS = 255
+_SIGNAL_EXIT_BASE = 128
+_MIN_EXIT_CODE = _SIGNAL_EXIT_BASE - _MAX_EXIT_STATUS
+_EXIT_CODE_OUT_OF_RANGE_TEXT = f"the response's exitCode is outside {_MIN_EXIT_CODE} to {_MAX_EXIT_STATUS}"
 # The least read time a relay fallback is worth sending with; less, and the
 # caller's budget is already spent, so the error is raised instead.
 RELAY_FALLBACK_MIN_SECONDS = 1.0
@@ -617,11 +627,11 @@ def authorization_headers() -> dict[str, str]:
 
 # A profile worker's task credential (#3889): the dispatcher's proxyToken, which
 # the worker adapter writes to a tmpfs file on the task's confirm and removes at
-# the task's end. Sent in this header on every exec and version-control call,
-# re-read on every call, so a warm pod's next task presents its own. The broker
-# confines an exec to the cluster the credential names, and admits a
-# version-control write only under its permit
-# (credential_proxy.TASK_CREDENTIAL_HEADER).
+# the task's end. Sent in this header on every exec and version-control call
+# (a report credential only on the audit-report routes), re-read on every call,
+# so a warm pod's next task presents its own. The broker confines an exec to the
+# cluster the credential names, and admits a version-control write only under
+# its permit (credential_proxy.TASK_CREDENTIAL_HEADER).
 TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
 TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
 # The broker's own ceiling on the value (task_credential.MAX_TOKEN_BYTES).
@@ -656,8 +666,43 @@ def task_mode() -> bool:
     return bool(os.environ.get(TASK_TOKEN_FILE_ENV, "").strip())
 
 
-def task_credential_headers() -> dict[str, str]:
-    """The task credential header, or nothing when there is no task.
+# The broker routes a report credential (one naming no target cluster:
+# task_credential.REPORT_TIER) is admitted on, and refused on every other,
+# /v1/exec included (credential_proxy.REPORT_CREDENTIAL_ROUTES).
+AUDIT_REPORTS_ROUTE = "/v1/audit-reports"
+
+
+def _is_report_credential(token: str) -> bool:
+    """Whether a task credential names no target cluster, read unverified.
+
+    This only decides whether to send it; the broker verifies whatever is
+    sent. A token whose claims can't be read is not called a report
+    credential, so it is sent as before and the broker refuses it loudly.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    segment = parts[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, RecursionError):
+        return False
+    nats = claims.get("nats") if isinstance(claims, dict) else None
+    return isinstance(nats, dict) and "target" not in nats
+
+
+def _audit_reports_path(path: str) -> bool:
+    path = urllib.parse.urlsplit(path).path
+    return path == AUDIT_REPORTS_ROUTE or path.startswith(AUDIT_REPORTS_ROUTE + "/")
+
+
+def task_credential_headers(path: str) -> dict[str, str]:
+    """The task credential header for a broker request to `path`, or nothing.
+
+    A report credential is sent only on the audit-report routes, the only
+    ones the broker admits it on: on any other call the task goes without
+    it and keeps the local-only commands a task with no credential gets.
+    A credential that names a target is sent on every call.
 
     Read per call. A missing file is no task, not an error: the adapter
     removes it when the task ends, and the broker then runs local-only
@@ -679,6 +724,8 @@ def task_credential_headers() -> dict[str, str]:
         return {}
     if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
         raise TokenUnavailable(f"{token_file} does not hold a task credential")
+    if _is_report_credential(token) and not _audit_reports_path(path):
+        return {}
     return {TASK_CREDENTIAL_HEADER: token}
 
 
@@ -828,13 +875,17 @@ def read_current_context(text: str) -> str | None:
 
     Anything else — a syntax error, several documents, a top level that is not a
     mapping, a non-string `current-context` — reads as absent, and the caller
-    turns that into a rejection.
+    turns that into a rejection. So does a scalar that PyYAML cannot build. For
+    that it raises a plain exception, not a `yaml.YAMLError`: a `ValueError`
+    for a date that does not exist or an `!!int` tag on text, a `KeyError` for
+    an `!!bool` tag on text, an `IndexError` for an `!!int` tag on nothing, an
+    `AttributeError` for an `!!timestamp` tag on text.
     """
     import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
 
     try:
         document = yaml.safe_load(text)
-    except (yaml.YAMLError, RecursionError):
+    except (yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError):
         return None
     if not isinstance(document, dict):
         return None
@@ -1838,8 +1889,9 @@ def _unusable_exec_answer(payload: dict) -> str | None:
     `stdout` and `stderr` are strings when present, and `kubeconfig` is a string
     or null. `exitCode` is an integer and is not optional: without it the
     command's result is not known. A boolean is not an integer here, and a
-    number in a string is not one either. The value of an integer is not
-    checked.
+    number in a string is not one either. An integer that is no command's
+    result, above the greatest status or below the least signal's number, is
+    not usable either.
     """
     for field in _EXEC_OUTPUT_FIELDS:
         if field in payload and not isinstance(payload[field], str):
@@ -1852,7 +1904,18 @@ def _unusable_exec_answer(payload: dict) -> str | None:
     exit_code = payload[_EXEC_EXIT_CODE_FIELD]
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
         return _EXIT_CODE_NOT_AN_INTEGER_TEXT.format(type=type(exit_code).__name__)
+    if not _MIN_EXIT_CODE <= exit_code <= _MAX_EXIT_STATUS:
+        return _EXIT_CODE_OUT_OF_RANGE_TEXT
     return None
+
+
+def _exit_status(exit_code: int) -> int:
+    """The status to exit with for a command's return code from the broker.
+
+    A negative code is the number of the signal that ended the command; the
+    status is 128 plus that number, as a shell reports it.
+    """
+    return _SIGNAL_EXIT_BASE - exit_code if exit_code < 0 else exit_code
 
 
 def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
@@ -2149,7 +2212,7 @@ def execute(
     headers = {"Content-Type": "application/json"}
     try:
         headers.update(authorization_headers())
-        headers.update(task_credential_headers())
+        headers.update(task_credential_headers(EXEC_ROUTE))
     except TokenUnavailable as exc:
         # Sending the request anyway would earn an undifferentiated 401 and
         # hide the real fault, which is a broken token projection.
@@ -2284,7 +2347,7 @@ def execute(
         # Whatever the command itself exited: a cut payload is not the
         # command's answer, and exit 0 on one is what a caller reads as success.
         return EXIT_OUTPUT_TRUNCATED
-    return payload[_EXEC_EXIT_CODE_FIELD]
+    return _exit_status(payload[_EXEC_EXIT_CODE_FIELD])
 
 
 def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
@@ -2422,9 +2485,10 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
     # A profile worker's task credential, as `execute` sends it: the broker
     # refuses a profile caller's version-control verbs without one, and its
     # permit is what admits the writes (#3993). Nothing outside task mode.
-    headers.update(task_credential_headers())
+    route = f"/v1/vcs/{verb}"
+    headers.update(task_credential_headers(route))
     request = urllib.request.Request(
-        endpoint.rstrip("/") + f"/v1/vcs/{verb}",
+        endpoint.rstrip("/") + route,
         data=body,
         headers=headers,
         method="POST",
@@ -2507,11 +2571,13 @@ class ApiSession:
     arrives as a 403 whose JSON body carries `rule` and `message`, the same
     shape `/v1/exec` uses.
 
-    The URL a caller writes stays the real endpoint, so a collector's evidence
-    label still names it, and `.get(url, params=, timeout=)` is what a
+    The URL a caller writes stays as written, so a collector's evidence label
+    still names the Google endpoint it reads, in its commercial form: when the
+    caller's environment names a custom universe domain, `relay_url` puts the
+    host in that domain. `.get(url, params=, timeout=)` is what a
     `requests.Session` offers, so code written against one runs against this
-    unchanged. `requests` is imported here and not at module scope: it is in the
-    sandbox image, where this class runs, and nowhere else this module is
+    unchanged. `requests` is imported here and not at module scope: it is in
+    the sandbox image, where this class runs, and nowhere else this module is
     imported needs it. `http` is injectable for tests and for a caller that
     already holds a configured session.
     """
@@ -2611,7 +2677,8 @@ class ApiSession:
     def _json_body(response):
         try:
             return response.json()
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, RecursionError):
+            # RecursionError: a body nested deeper than the parser goes.
             return None
 
     def _refused_admission(self, response) -> bool:

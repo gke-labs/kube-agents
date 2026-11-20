@@ -15,8 +15,9 @@ relabel.
 The release job runs it after cutting a tag (scripts/release/open_upgrade_relabel_pr.sh), so main's
 `make docs-check-upgrade-releases` is not left failing until someone relabels the rows by hand.
 
-The table is prettier-aligned. The new label is padded to the cell's existing width; a label longer
-than that width is written as is, and the caller runs prettier on the page.
+The new label is padded to the cell's existing width; a label longer than that width is written as
+is. The table is out of Prettier (`prettier-ignore`, #6286), so its columns need not line up, and the
+`pending` rows left behind stay in the order of their change text.
 """
 
 from __future__ import annotations

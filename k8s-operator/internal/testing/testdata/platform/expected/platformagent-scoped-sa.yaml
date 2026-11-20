@@ -1968,6 +1968,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -2047,6 +2049,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2243,6 +2248,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
             - name: NATS_URL
@@ -2323,6 +2330,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2622,6 +2632,11 @@ spec:
                   audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
         - name: a2a-bus-token
           projected:
             sources:
@@ -3067,7 +3082,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "85ca76c94916249c",
+      "version": "e659f58d74177b7a",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3193,6 +3208,7 @@ data:
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
               "chat.board",
+              "a2a.trigger.reply.>",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.CONSUMER.CREATE.TASKS.>",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3231,6 +3247,8 @@ data:
               "chat.notify.slack",
               "chat.notify.console",
               "chat.board.reply.gateway.>",
+              "a2a.trigger.*.submit",
+              "a2a.trigger.*.status",
               "_INBOX.gateway.>"
             ],
             "denyPublish": [
@@ -3284,7 +3302,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 85ca76c94916249c
+    kubeagents.x-k8s.io/a2a-authmap-version: e659f58d74177b7a
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3486,7 +3504,7 @@ spec:
             - name: A2A_RESERVED_PRINCIPALS
               value: callout,gateway,bridge,seed,web,console,console-mcp,sys
             - name: A2A_RESERVED_ADDRESSEES
-              value: platform
+              value: platform,session
             - name: A2A_TASK_SIGNING_PUBLIC_KEYS
               value: <GENERATED_FOR_TESTS>
             - name: A2A_ISSUER_SEED
@@ -3901,6 +3919,7 @@ stringData:
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
                   "chat.board",
+                  "a2a.trigger.reply.>",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
                   "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3955,6 +3974,8 @@ stringData:
                   "chat.notify.slack",
                   "chat.notify.console",
                   "chat.board.reply.gateway.>",
+                  "a2a.trigger.*.submit",
+                  "a2a.trigger.*.status",
                   "_INBOX.gateway.>"
                 ]
                 deny = [
@@ -5714,6 +5735,7 @@ metadata:
 ---
 apiVersion: v1
 data:
+  gchat_home: ""
   slack_home: ""
 kind: ConfigMap
 metadata:
