@@ -24,8 +24,8 @@ import (
 // published signing keys; the token's object id is the principal. It is
 // built on the Google class's shape (a2adoor_google.go) and sits beside it
 // and the eval class: a bearer that is the door's static token is the eval
-// class as before, a bearer shaped like a Google access token goes to that
-// class, and a bearer shaped like a JWT reaches this verifier.
+// class as before, a bearer carrying Google's fixed prefix goes to that
+// class, and every other bearer reaches this verifier.
 //
 // Unlike a Google access token, an Entra token is a signed JWT, so nothing
 // is asked of Microsoft per request: the one outbound call is the fetch of
@@ -39,8 +39,8 @@ import (
 // principal: it is immutable for the account's life, while a user principal
 // name is renamed. It is the same string the Teams backend reads for the
 // same person (from.aadObjectId), so a person's Teams turns and API calls
-// share one principal. The preferred_username claim is read for one log
-// line, the refusal of an account off the allowlist, so an admin can tell
+// share one principal. The preferred_username claim (upn on a v1.0 access
+// token) is read for one log line, the refusal of an account off the allowlist, so an admin can tell
 // whose object id to add, and for nothing else.
 
 const (
@@ -175,7 +175,8 @@ type entraTokenVerifier struct {
 type entraIdentity struct {
 	// objectID is the principal, as Entra sent it.
 	objectID string
-	// username is the preferred_username claim, for the log alone.
+	// username is the preferred_username claim, or upn on a v1.0 access
+	// token, for the log alone.
 	username string
 }
 
@@ -526,8 +527,8 @@ func a2aEntraOpenIDConfigURL(tenantID string) string {
 	return fmt.Sprintf(a2aEntraOpenIDConfigFormat, tenantID)
 }
 
-// identifyEntra is identify's arm for a bearer shaped like a JWT when the
-// class is armed: the verified caller if its object id is on the door's
+// identifyEntra is identify's arm for a bearer without Google's prefix when
+// the class is armed: the verified caller if its object id is on the door's
 // allowlist, else the refusal. An account off the list is a 403 that signing
 // in again cannot help; every other refusal is refuseDoorBearer's split.
 func (d *A2ADoor) identifyEntra(w http.ResponseWriter, r *http.Request, presented string) (verified string, ok bool) {

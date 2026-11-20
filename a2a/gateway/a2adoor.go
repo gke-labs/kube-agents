@@ -383,8 +383,8 @@ type A2ADoorOptions struct {
 	// the caller. Empty admits nobody.
 	GoogleAllowedUsers []string
 	// EntraTenantID and EntraClientID arm the Microsoft Entra class
-	// (A2A_DOOR_ENTRA_TENANT_ID, A2A_DOOR_ENTRA_CLIENT_ID): a bearer shaped
-	// like a JWT is checked as a token the tenant issued for this
+	// (A2A_DOOR_ENTRA_TENANT_ID, A2A_DOOR_ENTRA_CLIENT_ID): a bearer without
+	// Google's ya29. prefix is checked as a token the tenant issued for this
 	// application. Both empty leaves the class off.
 	EntraTenantID string
 	EntraClientID string

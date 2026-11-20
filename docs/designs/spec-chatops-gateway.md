@@ -3202,9 +3202,10 @@ nothing is defaulted. `verifiedBy` is `a2a-bearer`, its own value, so an externa
 submission and an eval harness's are distinguishable downstream even though both resolve into
 the eval namespace today.
 
-**Identity, second class: a developer signed in with Google.** A bearer that is neither the door's
-static token nor, with the Entra class armed, shaped like a JWT is checked, when
-`A2A_DOOR_GOOGLE_CLIENT_ID` is set, as a Google OAuth access token:
+**Identity, second class: a developer signed in with Google.** A bearer that is not the door's
+static token is checked, when `A2A_DOOR_GOOGLE_CLIENT_ID` is set, as a Google OAuth access
+token (with the Entra class also armed, only a bearer carrying Google's `ya29.` prefix comes
+here; every other bearer goes to the Entra class):
 Google's tokeninfo endpoint must answer for it with the install's one pre-registered client as
 its audience or authorized party, a verified email, and an expiry still ahead. The email, as
 Google sent it, is the principal - the same string the Google Chat adapter carries for the same
@@ -3233,8 +3234,8 @@ unattended class (`verifiedBy: unattended-ksa`, a trigger's ServiceAccount bound
 is built as the trigger ingress (scheduling-on-profiles.md §3), dark until the callout grants a
 source its submit subject.
 
-**Identity, third class: a person signed in with Microsoft Entra ID.** A bearer shaped like a
-JWT is checked, when `A2A_DOOR_ENTRA_TENANT_ID` and `A2A_DOOR_ENTRA_CLIENT_ID` are both set, as a
+**Identity, third class: a person signed in with Microsoft Entra ID.** A bearer without Google's `ya29.` prefix is
+checked, when `A2A_DOOR_ENTRA_TENANT_ID` and `A2A_DOOR_ENTRA_CLIENT_ID` are both set, as a
 token the tenant issued for the install's one application registration. The check is local:
 the door reads the tenant's published signing keys once (refetched when a token names a key the
 cached set does not hold, at most once a minute, and daily otherwise), pins the algorithm to RS256
@@ -3249,8 +3250,9 @@ principal is the token's object id (`oid`), as Entra sent it and held to the GUI
 else is refused as not minted for a person), never the user principal name or the display name:
 the object id is immutable for the account's life, and it is the string the Teams backend reads
 for the same person (`from.aadObjectId`), so one person's Teams turns and API calls share one
-principal; `preferred_username` is logged only when the account is refused off the allowlist, so
-an admin can see whose object id to add, and goes nowhere else. It
+principal; `preferred_username` (or `upn`, which a v1.0 access token carries instead) is logged
+only when the account is refused off the allowlist, so an admin can see whose object id to add,
+and goes nowhere else. It
 is admitted only if it is on the class's own allowlist (`A2A_DOOR_ENTRA_ALLOWED_USERS`, object
 ids compared case-insensitively; empty admits nobody, no allow-all), checked at the door before
 it holds any state for the caller and again by the gateway before it resolves the principal. The

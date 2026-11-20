@@ -26,8 +26,9 @@ import (
 // Google Chat adapter carries for the same person (it keeps the case for the
 // audit join, and so does this). It sits beside the eval class, never instead of it: a request
 // whose bearer is the door's static token is the eval class exactly as
-// before, and a bearer that is neither that nor, with the Entra class armed,
-// shaped like a JWT (a2adoor_entra.go takes those) reaches this verifier.
+// before, and a bearer carrying Google's fixed prefix (or, with the Entra
+// class off, any other bearer) reaches this verifier; a2adoor_entra.go
+// takes the rest.
 //
 // A Google access token is opaque, so it is checked through the tokeninfo
 // endpoint rather than locally. Nothing here holds a refresh token, a client
@@ -458,9 +459,9 @@ func refuseDoorBearer(w http.ResponseWriter, err, root error, kind string) {
 
 // identify authenticates a request. The door's static token is the eval
 // class, as it always was: ok with no verified caller, and each method
-// names its caller (callerOf). A bearer shaped like a JWT, when the Entra
-// class is armed, goes to identifyEntra; any other bearer, when the Google
-// class is armed, is checked as a Google access token, and the verified
+// names its caller (callerOf). A bearer without Google's fixed prefix, when
+// the Entra class is armed, goes to identifyEntra; any other bearer, when the
+// Google class is armed, is checked as a Google access token, and the verified
 // caller is returned if its email is on the door's allowlist. Everything
 // else is the 401 it was before.
 //

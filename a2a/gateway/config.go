@@ -455,7 +455,7 @@ type Config struct {
 	A2ADoorAllowedUsers []string
 	// A2ADoorEntraTenantID and A2ADoorEntraClientID arm the door's
 	// Microsoft Entra class (A2A_DOOR_ENTRA_TENANT_ID,
-	// A2A_DOOR_ENTRA_CLIENT_ID): a bearer shaped like a JWT is checked,
+	// A2A_DOOR_ENTRA_CLIENT_ID): a bearer without Google's ya29. prefix is checked,
 	// against the tenant's published signing keys, as a token the tenant
 	// issued for this application registration. Both empty leaves the
 	// class off; one without the other is refused, as is either without
