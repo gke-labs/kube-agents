@@ -27,10 +27,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import eval_front_door_ab as ab
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
-
-from kube_agents_bench import scoring
-
 
 def write_case(directory: Path, case: str, passes: int, scored: int) -> None:
     (directory / f"case-{case}.json").write_text(
@@ -148,7 +144,9 @@ class CompareTest(unittest.TestCase):
 
     def test_booleans_are_not_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "case-x.json").write_text(json.dumps({"case": "x", "passes": True, "scored": 3}), encoding="utf-8")
+            Path(tmp, "case-x.json").write_text(
+                json.dumps({"case": "x", "passes": True, "scored": 3}), encoding="utf-8"
+            )
             with self.assertRaises(ab.UnreadableRun):
                 ab.read_run(Path(tmp))
 
@@ -159,27 +157,32 @@ class CompareTest(unittest.TestCase):
                 ab.read_run(Path(tmp))
 
     def test_it_reads_the_hand_off_bench_gate_writes(self) -> None:
-        """The two fields it reads are the ones CaseVerdict.to_dict writes, so
-        a rename on that side fails here, not on a lane."""
-        verdict = scoring.CaseVerdict(
-            case_id="chat-routing-fleet-question",
-            name="n",
-            domain=None,
-            rung=scoring.Rung.NOT_A_REAL_RUN,
-            blocking=False,
-            reason="",
-            reps=[],
-            admitted=False,
-            expected_fail=False,
+        """The fields it reads are the ones CaseVerdict.to_dict writes, so a
+        rename on that side fails here, not on a lane. Read from the source:
+        this job doesn't install the bench's dependencies."""
+        scoring = (
+            Path(__file__).resolve().parent.parent
+            / "bench"
+            / "kube_agents_bench"
+            / "scoring.py"
+        ).read_text(encoding="utf-8")
+        to_dict = scoring[
+            scoring.index(
+                '    def to_dict(self) -> dict[str, Any]:\n        """The hand-off the shell writes per case'
+            ) :
+        ]
+        for field in (
+            '"case": self.case_id',
+            '"passes": self.passes',
+            '"scored": len(self.scored_reps)',
+        ):
+            self.assertIn(field, to_dict[:2000])
+        self.assertIn(
+            '--json-out "${ARTIFACT_DIR}/case-${name}.json"',
+            (
+                Path(__file__).resolve().parent.parent / "hack" / "ci-eval-pr.sh"
+            ).read_text(encoding="utf-8"),
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "case-chat-routing-fleet-question.json").write_text(
-                json.dumps(verdict.to_dict()), encoding="utf-8"
-            )
-            self.assertEqual(
-                ab.read_run(Path(tmp)),
-                {"chat-routing-fleet-question": ab.Side(passes=0, scored=0)},
-            )
 
 
 if __name__ == "__main__":
