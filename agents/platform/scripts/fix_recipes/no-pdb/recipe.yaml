@@ -9,6 +9,13 @@ name: disruption-budget fixes
 title: Disruption budgets
 dial_environment: dev
 owner: platform
+# The one-finding re-check after merge: the kinds it reads in the target
+# namespace (an autoscaler, because `blocking-pdb` compares against its floor),
+# and the checks a new budget can trip there, run after `no-pdb` itself: a
+# second budget over the same pods (`pdb-overlapping`), and a budget that
+# permits no eviction (`blocking-pdb`).
+recheck_kinds: deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers
+recheck_siblings: pdb-overlapping blocking-pdb
 # The end-to-end case that grades the fix on the cluster after it merges; empty
 # until that case exists.
 eval_case: ""
