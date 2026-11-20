@@ -896,6 +896,14 @@
 # ai-security-planted-model-audit's 1450s hint.
 ./tasks/ai-security-manual-names-reconciler/task.yaml
 
+# "What alerts fired overnight?" answered from the event ledger through the
+# `get_alert_history` tool (#4056): prebuilt/alert-history-ledger posts two
+# Info events to the daemon (two `filtered` rows, no card, no chat post), and
+# the case grades the worker's tool call and both workload names in the
+# reply. A stack, so it takes lock-infra; the plant is two loopback posts,
+# priced at the 200s default. Nightly from its first merge.
+./tasks/alert-history-overnight-from-ledger/task.yaml
+
 # A crash loop that outlasts the settle period is forwarded, the pod recovers,
 # and 15m after its last event the watcher's quiet follow-up lands on the
 # alert's thread and card ("Quiet since HH:MM UTC", #612). deployer: tofu, the
