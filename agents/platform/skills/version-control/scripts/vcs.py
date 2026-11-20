@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -394,7 +393,7 @@ def verb_label_ensure(arguments) -> dict:
 
 def verb_identity(arguments) -> dict:
     payload = {"login": arguments.login, "bot": True if arguments.bot else None}
-    if not arguments.repo and os.environ.get(credential_proxy_client.TASK_TOKEN_FILE_ENV) and not client.all_sessions():
+    if not arguments.repo and credential_proxy_client.task_mode() and not client.all_sessions():
         # A profile worker with nothing named and nothing cloned: ask with no
         # repository, and the broker answers the install's managed
         # repositories, the ones it may use (#6389). Elsewhere (the shell) the

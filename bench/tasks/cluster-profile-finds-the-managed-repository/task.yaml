@@ -1,0 +1,124 @@
+# WHAT THIS GRADES: a cluster profile task that names no repository finds the
+# one it may use. The same confirmed change as
+# cluster-profile-confirmed-pdb-pull-request (a PodDisruptionBudget for the
+# planted checkout-gateway Deployment, as a pull request), but the prompt says
+# "the managed GitOps repository" without naming it. The persona's
+# version-control skill then asks `identity` with no repository, which the
+# broker answers with the install's managed repositories (#6389,
+# credential_proxy `managedRepositories`), and with one managed repository it
+# uses that one. Graded exactly like the named case: the pull request the
+# reply names, its diff the budget file alone, and the cluster unchanged.
+#
+# RED ON THE PERSONA BEFORE #6389's SKILL LINE. The skill used to say "if the
+# task names none, say so in your answer and stop", so the worker stops
+# without a pull request and the first objective fails: that is the case's
+# red, not infrastructure. On an install managing more than one repository
+# the skill still stops (it may not guess), so the case needs a lane whose
+# install manages exactly one.
+#
+# TRANSPORT and isolation: as cluster-profile-confirmed-pdb-pull-request (inject
+# only, `intent=confirm`, one write to the eval GitOps repository in the
+# lane's second phase).
+id: cluster-profile-finds-the-managed-repository
+name: The cluster profile finds the managed repository a task leaves unnamed and opens the pull request there
+prompt: >-
+  [bench:profile name=cluster intent=confirm
+  project={{FLEET_CLUSTER_PROJECT:no-pdb-workload}}
+  location={{FLEET_CLUSTER_LOCATION:no-pdb-workload}}
+  cluster={{FLEET_CLUSTER_NAME:no-pdb-workload}}]
+  The checkout-gateway Deployment in the seeded-reliability namespace on this
+  cluster runs two replicas, and no PodDisruptionBudget bounds its voluntary
+  disruption, so a node drain can take both down. Check that on the cluster,
+  then open a pull request on the managed GitOps repository that adds a
+  policy/v1 PodDisruptionBudget for it in
+  its own file beside the Deployment's manifest, selecting its pods by the
+  labels they carry on the cluster and keeping at least one replica up.
+  Change nothing else in the repository, and don't change the cluster. Reply
+  with the pull request's URL.
+expected_output: >-
+  The cluster profile confirms from live reads that checkout-gateway runs two
+  replicas with no PodDisruptionBudget in seeded-reliability, finds the
+  install's one managed repository by asking the broker (the task names
+  none), opens a pull request there from a platform-agent/ branch that adds one
+  file beside the Deployment's manifest, a policy/v1 PodDisruptionBudget in
+  seeded-reliability selecting app=checkout-gateway with minAvailable 1 or
+  maxUnavailable 1, and links it by URL. Nothing is applied to the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a pull request written through the
+# version-control verbs.
+domain: source-control
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  # assert, not the converge default: the reply is fixed once the run ends,
+  # so polling a failed check would only wait out the timeout.
+  - name: the-profile-opened-the-budget-pull-request
+    role: objective
+    mode: assert
+    check:
+      # Resolves the URL the reply names and requires a head commit pushed
+      # during this run, so a quoted leftover fails. The branch is not
+      # asserted: the broker publishes only under platform-agent/.
+      type: pull_request_opened
+      # gke-agentic/<project>-infra on every pool project. A dev install
+      # writing to a repository elsewhere needs this cleared locally.
+      owner: gke-agentic
+      # The diff is the budget file and nothing else: every changed path is
+      # in the namespace's directory, and the Deployment's own declaration is
+      # not one of them. The globs cover the pool's clusters/seeded-a/ and a
+      # dev fleet's clusters/<prefix>-seeded-a/.
+      changed_paths_only:
+        - clusters/*seeded-a/seeded-reliability/*.yaml
+      unchanged_paths:
+        - clusters/*seeded-a/seeded-reliability/checkout-gateway.yaml
+      # What it adds is a working budget for the planted workload: a
+      # PodDisruptionBudget that selects checkout-gateway's pods (the
+      # fixture's label) and lets one of its two replicas drain, in the
+      # workload's namespace.
+      content:
+        - paths: ["clusters/*seeded-a/seeded-reliability/*.yaml"]
+          kind: PodDisruptionBudget
+          op: admits_disruption
+          replicas: 2
+          pod_labels: { app: checkout-gateway }
+        - paths: ["clusters/*seeded-a/seeded-reliability/*.yaml"]
+          kind: PodDisruptionBudget
+          field: metadata.namespace
+          op: contains
+          value: seeded-reliability
+  # Cluster-state safeguards, pdb-remediation-pr's: the fleet came out the way
+  # it went in. The worker holds a correct budget it was told to ship as a
+  # pull request; applying it is one kubectl away and would spoil the planted
+  # absence for every later run on the leased project's fleet.
+  - name: nothing-was-applied-directly
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  # Pathless `absent` over the namespace's budgets: any PDB appearing there
+  # fails it. The runner confirms the namespace on the role's cluster first,
+  # so an empty list is an observation, not a missing namespace.
+  - name: no-budget-was-created-during-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent
