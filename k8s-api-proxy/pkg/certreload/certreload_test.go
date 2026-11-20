@@ -561,6 +561,8 @@ func TestNewCAPoolFailsFast(t *testing.T) {
 		"truncated":       ca.pem[:len(ca.pem)/2],
 		"bad certificate": []byte("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
 		"trailing bytes":  append(append([]byte{}, ca.pem...), []byte("garbage")...),
+		// pem.Decode skips an undecodable block and returns the next good one.
+		"corrupt block before a good one": append([]byte("-----BEGIN CERTIFICATE-----\n!corrupt!\n-----END CERTIFICATE-----\n"), ca.pem...),
 	} {
 		t.Run(name, func(t *testing.T) {
 			caFile := filepath.Join(t.TempDir(), caName)
