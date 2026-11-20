@@ -1167,6 +1167,15 @@
 # never in front of the answer. Same seam, variant filed; no fixture.
 ./tasks/first-install-hello-filed/task.yaml
 
+# "What did onboarding find?" answered from the first-run report through the
+# `get_first_run_report` tool (#4056): prebuilt/first-run-report plants a
+# fixed INVENTORY.delivered.md on the shell sandbox (backing up and restoring
+# a real one; no agent-pod marker touched), and the case grades the worker's
+# tool call, both planted workload names in the reply, and no terminal read
+# of the file. A stack, so it takes lock-infra; the plant is one kubectl exec,
+# priced at the 200s default. Nightly from its first merge.
+./tasks/first-run-report-on-demand/task.yaml
+
 # A fleet audit on an install whose scope excludes as many clusters as it
 # manages runs, rather than cancelling with "every managed cluster is
 # excluded" (#3933). The runner excludes slots b and d plus one cluster that
@@ -1353,6 +1362,18 @@
 # no pool fixture: its first nightly run is the pool proof of the plant and
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
+
+# The front door is running the plugins its image ships: an exec into the
+# agent container reads each plugin directory under /opt/defaults/plugins
+# against /opt/data/plugins (agent-owned, every shipped file present and
+# unchanged; an entry only the volume has is reported), after one front-door
+# turn that the roster block should answer without a card. Written for
+# #6279, where a root-owned /opt/data/plugins on a new data volume left the
+# front door with none of its plugins while the gate stayed green; the fix
+# (the agent Pod's first init container makes the directory) is #6357's.
+# deployer: noop, no fixtures, one model turn and one exec. Nightly from its
+# first merge; a presubmit seat waits on its record.
+./tasks/platform-agent-shipped-plugins-loaded/task.yaml
 
 # A card that asks only for the install's usage summary is answered by the
 # kube-agents-feedback skill's summary subcommand (docs/designs/

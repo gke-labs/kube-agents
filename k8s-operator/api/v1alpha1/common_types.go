@@ -1123,6 +1123,26 @@ type TuningSpec struct {
 	// +optional
 	SessionResources *corev1.ResourceRequirements `json:"sessionResources,omitempty"`
 
+	// DefaultRoute is the addressee the A2A gateway sends a plain
+	// conversation's first message to: `session` opens a session pod of the
+	// conversation's own, `platform` hands it to the platform agent. Unset
+	// means `platform` for now; a later change flips the default to
+	// `session`. `platform` stays reachable by handle either way, and a
+	// `delegate:` still opens a session pod on either route. The operator
+	// renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
+	// on the platform agent container (which the hermes-bridge sidecar
+	// copies), so a change rolls the gateway and the platform agent pod.
+	//
+	// `session` widens the TASKS consumer budget: each session also counts
+	// the replays of its conversation's task, 7 consumers rather than 3, so
+	// 40 more at the default 10 sessions. TASKS cannot be widened once it
+	// exists, so on an install whose stream was created narrower the
+	// provision Job refuses until maxSessions is lowered to fit or TASKS is
+	// recreated; its message names both.
+	// +kubebuilder:validation:Enum=session;platform
+	// +optional
+	DefaultRoute *string `json:"defaultRoute,omitempty"`
+
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
 	// runs a cluster with R3 streams, which keeps the bus up through a node
@@ -1245,6 +1265,16 @@ type ProfileTuning struct {
 // streams. An existing bus keeps its own count.
 const DefaultBusReplicas = 3
 
+// The values spec.harness.tuning.defaultRoute takes. DefaultRouteSession is
+// the A2A gateway's session-route sentinel (RouteSession in a2a/gateway),
+// DefaultRoutePlatform the Hermes bridge's addressee. The Enum marker on
+// DefaultRoute spells the same two by hand, since a marker cannot name a
+// constant.
+const (
+	DefaultRouteSession  = "session"
+	DefaultRoutePlatform = "platform"
+)
+
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
 const MaxProfileCeiling = 1000
@@ -1281,7 +1311,10 @@ type AdmissionSpec struct {
 	// the inactive file cache, the figure the kubelet evicts on) and counts it
 	// against this figure. Absent means the agent container's resolved memory request
 	// in MiB (4096 at the operator's default resources), so a CR that raises
-	// the request raises the budget with it.
+	// the request raises the budget with it. Effective memoryBudgetMiB must
+	// be at least workerRssCapMiB regardless of failClosed (refused where the
+	// validating webhook is enabled, or reported as Degraded with reason
+	// InvalidKanbanAdmission).
 	//
 	// Two bounds act on the budget. Each tick admits one new worker per
 	// 512 MiB of headroom under it, so with the container's working set at W
@@ -1292,8 +1325,9 @@ type AdmissionSpec struct {
 	// 64 MiB. At the default budget the headroom bound acts first. A budget
 	// under the container's idle working set plus 512 MiB therefore admits
 	// no worker and refuses every card after QueueBoundSeconds; the schema's
-	// minimum of 512 is left there for a test install that wants exactly
-	// that, and a derived budget under it is clamped to it. A card the tick
+	// minimum of 512 is left there for a test install that sets memoryBudgetMiB
+	// to 512 and workerRssCapMiB to 512 or below, and a derived budget
+	// under it is clamped to it. A card the tick
 	// cannot spawn waits, and is refused after QueueBoundSeconds. Set the
 	// budget below the request to keep headroom for the gateway's own growth,
 	// or above it, up to the limit, on a node pool where eviction is not the
@@ -1555,7 +1589,10 @@ type DeploymentSpec struct {
 
 	// Resources specifies resource requests and limits for the main container.
 	// The memory request is also the dispatcher's default admission budget
-	// (spec.harness.tuning.admission.memoryBudgetMiB).
+	// (spec.harness.tuning.admission.memoryBudgetMiB), so setting it below
+	// workerRssCapMiB without raising memoryBudgetMiB or lowering
+	// workerRssCapMiB is refused where the validating webhook is enabled, or
+	// reported as Degraded (InvalidKanbanAdmission).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
@@ -3038,6 +3075,14 @@ type BusMigrationStatus struct {
 	// Message is the manual step a Failed migration names.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// SettleTime is how long the one to three restore waited, from raising
+	// the last restored stream to three replicas, for every stream's replicas
+	// to be current and every restored durable consumer to answer from its
+	// leader, as a Go duration ("1.2s"). Set when a restore that succeeded
+	// reports it.
+	// +optional
+	SettleTime string `json:"settleTime,omitempty"`
 
 	// Cause is why the run turned back: the phase that failed, and whether
 	// it was still running at Deadline. Set at the first failure and kept

@@ -378,12 +378,15 @@ images first with `INCLUDE=build-time`, and use `crane` or `skopeo` rather than 
 Hermes pin is by digest, and a `docker pull`/`push` round trip changes it. A mirrored `golang` copy
 is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`.
 A later bump of the `go` directive in `k8s-operator/go.mod` past that patch therefore fails the
-rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
+rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION` on
+the same `make` command, for a tag that the mirror holds.
 
 A rebuilt `platform-agent` image needs a `hermes-bridge` image at the same registry path and tag
 for the bridge sidecar. `make docker-build-hermes-bridge` with the same variables builds the agent
 image and the bridge image from it; otherwise set `A2A_BRIDGE_IMAGE` on the operator to a bridge
-image built another way.
+image built another way. The operator takes the `credential-proxy` image from the agent image in
+the same way: build it with `make docker-build-credential-proxy` and the same variables, or set
+`CREDENTIAL_PROXY_IMAGE` on the operator.
 
 ### Registry authentication
 

@@ -2620,6 +2620,19 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
             if seeded_by_provisioning(role, subject):
                 seen += 1
                 continue
+            if subject.startswith("reservation/"):
+                # The project's reservations, which no apply creates: the
+                # fixture is that the one a pool names is not there. So the
+                # assertion is that no reservation has exactly that name, and
+                # its tie to the Terraform is the name that the pool consumes.
+                seen += 1
+                name = subject[len("reservation/") :].rstrip("*")
+                assert (assertion["op"], assertion["path"], assertion["value"]) == ("none_eq", "name", name), (role, subject, assertion)
+                assert re.search(rf'values\s*=\s*\["{re.escape(name)}"\]', body), (
+                    f"role {role!r} asserts that no reservation {name!r} exists, but no pool in main.tf or "
+                    f"defects-{entry['cluster_slot']}.tf consumes a reservation of that name"
+                )
+                continue
             if "?" in subject:
                 selector = subject.split("?", 1)[1]
                 if not selector:

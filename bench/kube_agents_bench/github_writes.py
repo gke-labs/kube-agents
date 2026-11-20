@@ -105,6 +105,7 @@ from kube_agents_bench.shell_words import (
     _command_word_index,
     _read_shell_line,
     _shell_argvs,
+    _with_literal_marks,
 )
 
 __all__ = [
@@ -262,6 +263,8 @@ WRITING_TOOL_NAME = re.compile(r"(?i)(?:create|open)_?(?:pull|merge|branch|propo
 #: quotes, a comment or ``$((1<<2))``.
 HEREDOC_OPENER = re.compile(r"(?<!<)<<(?!<)-?[ \t]*\\?(['\"]?)([A-Za-z0-9_.-]+)\1")
 HEREDOC_RUNNERS = frozenset((*_SHELL_PROGRAMS_WITH_COMMAND_STRING, "ssh"))
+#: The operator that opens a heredoc, as the shell reader cuts it.
+HEREDOC_OPERATOR = "<<"
 #: The openers of a command substitution a line may leave open across a
 #: heredoc (``--body "$(cat <<'EOF'``); ``$((`` is arithmetic.
 OPEN_SUBSTITUTIONS = ("$(", "`")
@@ -891,12 +894,12 @@ def _opens_heredoc(head: str) -> bool:
     """Whether a ``<<`` right after ``head`` is one the shell reads as an
     operator: outside quotes and comments (:func:`_read_shell_line`), at the
     top of the line or inside a command substitution the line leaves open."""
-    text, _, operators = _read_shell_line(head + "<<")
-    if operators and operators[-1] == "<<" and text.rstrip().endswith(_OPERATOR_MARK.format(index=len(operators) - 1)):
+    text, _, operators = _read_shell_line(head + HEREDOC_OPERATOR)
+    if operators and operators[-1] == HEREDOC_OPERATOR and text.rstrip().endswith(_OPERATOR_MARK.format(index=len(operators) - 1)):
         return True
     for opener in OPEN_SUBSTITUTIONS:
         start = head.rfind(opener)
-        if start >= 0 and not head.startswith(ARITHMETIC_OPENER, start) and text.endswith(head[start:] + "<<"):
+        if start >= 0 and not head.startswith(ARITHMETIC_OPENER, start) and text.endswith(_with_literal_marks(head[start:] + HEREDOC_OPERATOR)):
             return _opens_heredoc(head[start + len(opener):])
     return False
 

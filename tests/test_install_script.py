@@ -5562,7 +5562,13 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     invocation, so dropping it again would look like nothing in a diff.
     """
 
-    def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
+    # The version of the `go` stub each run gets unless the test names one. No
+    # release of Go has it, so the line the installer prints for this version
+    # tells the stub from a host's own Go, and it is above each minimum the
+    # installer can ask for.
+    _STUB_GO_VERSION = "1.99.0"
+
+    def _run(self, creates_fail=False, describe_fails=True, go_version=_STUB_GO_VERSION, git_clone_fails=False,
              keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None,
              cluster=""):
         """import_github_pem against a stub gcloud that records every call.
@@ -5578,11 +5584,15 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         leaves it untested -- see the ERR-trap test below.
 
         describe_fails=False confirms the key instead, which is the only way
-        past that branch and into the import itself. go_version and
-        git_clone_fails plant the two tools the import shells out to: without
-        them the real ones on PATH decide the outcome, and a real `git clone`
-        would reach the network. Both stubs are deliberate, not incidental --
-        the paths below exist precisely for when those tools disappoint.
+        past that branch and into the import itself. The import shells out to
+        two tools. Each run gets a `go` stub, and go_version is the version it
+        prints: import_github_pem asks for `go` before it creates the key, so
+        without the stub the host's Go decides the outcome, and a host with
+        none gets auto_install_tool, which installs Go through Homebrew or apt
+        where it can. git_clone_fails plants a `git` whose clone fails: without
+        it a real `git clone` would reach the network. The too-old Go and the
+        failed clone are deliberate, not incidental -- the paths below exist
+        precisely for when those tools disappoint.
         """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -5644,14 +5654,13 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
-            if go_version is not None:
-                go = bin_dir / "go"
-                go.write_text(
-                    "#!/usr/bin/env bash\n"
-                    f'[ "$1" = version ] && echo "go version go{go_version} linux/amd64" && exit 0\n'
-                    "exit 0\n"
-                )
-                go.chmod(go.stat().st_mode | stat.S_IEXEC)
+            go = bin_dir / "go"
+            go.write_text(
+                "#!/usr/bin/env bash\n"
+                f'[ "$1" = version ] && echo "go version go{go_version} linux/amd64" && exit 0\n'
+                "exit 0\n"
+            )
+            go.chmod(go.stat().st_mode | stat.S_IEXEC)
             if git_clone_fails:
                 git = bin_dir / "git"
                 git.write_text(
@@ -5685,6 +5694,12 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
+
+    def test_the_go_the_import_asks_is_the_stub_whatever_the_host_has(self):
+        """A run asks the `go` stub, with Go on the host or without: the installer names the stub's version."""
+        proc, _ = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Go {self._STUB_GO_VERSION} meets the minimum", proc.stdout + proc.stderr)
 
     def test_the_key_is_created_with_this_installs_owner_labels(self):
         """The apply's adoption step refuses an unlabelled key it doesn't hold (#3504)."""

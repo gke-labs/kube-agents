@@ -95,6 +95,22 @@ readonly DOWNGRADE_AGENT_DEPLOYMENT_DEFAULT="platform-agent-gateway"
 readonly DOWNGRADE_AGENT_CONTAINER="platform-agent"
 readonly DOWNGRADE_OPERATOR_DEPLOYMENT_DEFAULT="kube-agents-controller-manager"
 readonly DOWNGRADE_OPERATOR_CONTAINER="manager"
+# Admission budget defaults matching the operator (platformagent_manifests.go);
+# used to flag live CRs whose overrides put memoryBudgetMiB below workerRssCapMiB.
+readonly ADMISSION_DEFAULT_MEMORY_BUDGET_MIB=4096
+readonly ADMISSION_DEFAULT_WORKER_RSS_CAP_MIB=1536
+readonly ADMISSION_MEMORY_BUDGET_FLOOR_MIB=512
+readonly PLATFORM_AGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
+readonly DEFAULT_PLATFORM_AGENT_CR_NAME="platform-agent"
+readonly ADMISSION_BYTES_PER_MIB=$((1024 * 1024))
+readonly ADMISSION_QTY_RE='^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)\s*$'
+readonly ADMISSION_QTY_BIN_BASE=1024
+readonly ADMISSION_QTY_DEC_BASE=1000
+readonly ADMISSION_QTY_MILLI_SCALE="0.001"
+readonly ADMISSION_BIN_SUFFIXES="Ki,Mi,Gi,Ti,Pi,Ei"
+readonly ADMISSION_DEC_SUFFIXES="k,M,G,T,P,E"
+readonly ADMISSION_DEC_UPPER_K="K"
+readonly ADMISSION_MILLI_SUFFIX="m"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -1290,6 +1306,172 @@ check_downgrade_for_mode() {
   fi
 }
 
+# Inspects live PlatformAgent CR(s) in $1 and warns with exact remediation when
+# effective kanban.admission settings resolve memoryBudgetMiB < workerRssCapMiB.
+# Spec overrides under spec.deployment.resources have no Helm chart value and
+# survive upgrades untouched. Fails open when CR state cannot be read so offline
+# or un-CRD'd runs proceed.
+warn_live_cr_kanban_admission() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+  local cr_json="${PLATFORM_AGENT_CR_JSON:-}"
+  if [ -z "$cr_json" ]; then
+    cr_json="$(trap - ERR; kubectl get "$PLATFORM_AGENT_CRD_NAME" -n "$namespace" -o json 2>/dev/null)" || cr_json=""
+  fi
+  [ -n "$cr_json" ] || return 0
+
+  local findings=""
+  findings="$(trap - ERR; printf '%s' "$cr_json" | python3 -c '
+from decimal import Decimal, InvalidOperation
+import json
+import re
+import sys
+
+default_budget_mib = int(sys.argv[1])
+default_rss_cap_mib = int(sys.argv[2])
+budget_floor_mib = int(sys.argv[3])
+default_cr_name = sys.argv[4]
+mib_bytes = int(sys.argv[5])
+qty_re = re.compile(sys.argv[6])
+bin_base = Decimal(sys.argv[7])
+dec_base = Decimal(sys.argv[8])
+milli_scale = Decimal(sys.argv[9])
+bin_suffixes = [s for s in sys.argv[10].split(",") if s]
+dec_suffixes = [s for s in sys.argv[11].split(",") if s]
+dec_upper_k = sys.argv[12]
+milli_suffix = sys.argv[13]
+
+bin_scales = {}
+acc = Decimal(1)
+for sfx in bin_suffixes:
+    acc *= bin_base
+    bin_scales[sfx] = acc
+
+dec_scales = {milli_suffix: milli_scale, "": Decimal(1)}
+acc = Decimal(1)
+for sfx in dec_suffixes:
+    acc *= dec_base
+    dec_scales[sfx] = acc
+dec_scales[dec_upper_k] = dec_base
+
+def parse_mib(raw):
+    if raw is None or not isinstance(raw, str):
+        return None
+    match = qty_re.match(raw)
+    if not match:
+        return None
+    num_str, suffix = match.group(1), match.group(2)
+    scale = bin_scales.get(suffix, dec_scales.get(suffix))
+    if scale is None:
+        return None
+    try:
+        total_bytes = int(Decimal(num_str) * scale)
+    except (InvalidOperation, ValueError):
+        return None
+    return total_bytes // mib_bytes
+
+try:
+    payload = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    sys.exit(0)
+if not isinstance(payload, dict):
+    sys.exit(0)
+items = payload.get("items") or []
+if not isinstance(items, list):
+    sys.exit(0)
+
+for cr in items:
+    if not isinstance(cr, dict):
+        continue
+    name = ((cr.get("metadata") or {}).get("name")) or default_cr_name
+    spec = cr.get("spec") or {}
+    deployment = spec.get("deployment") or {}
+    resources = deployment.get("resources") or {}
+    admission = ((spec.get("harness") or {}).get("tuning") or {}).get("admission") or {}
+    if not isinstance(admission, dict):
+        continue
+
+    try:
+        rss_cap_mib = default_rss_cap_mib if admission.get("workerRssCapMiB") is None else int(admission["workerRssCapMiB"])
+        explicit_budget = None if admission.get("memoryBudgetMiB") is None else int(admission["memoryBudgetMiB"])
+    except (TypeError, ValueError):
+        continue
+
+    req_mem = (resources.get("requests") or {}).get("memory")
+    lim_mem = (resources.get("limits") or {}).get("memory")
+    req_mib = parse_mib(str(req_mem)) if req_mem is not None else None
+    lim_mib = parse_mib(str(lim_mem)) if lim_mem is not None else None
+    if req_mib is not None:
+        res_budget_mib = max(budget_floor_mib, req_mib)
+        res_source_desc = f"spec.deployment.resources.requests.memory={req_mem}"
+    elif lim_mib is not None:
+        res_budget_mib = max(budget_floor_mib, lim_mib)
+        res_source_desc = f"spec.deployment.resources.limits.memory={lim_mem}"
+    else:
+        res_budget_mib = default_budget_mib
+        res_source_desc = f"default memoryBudgetMiB={default_budget_mib}"
+
+    if explicit_budget is not None:
+        budget_mib = explicit_budget
+        budget_source = "admission"
+        source_desc = f"spec.harness.tuning.admission.memoryBudgetMiB={budget_mib}"
+    else:
+        budget_mib = res_budget_mib
+        budget_source = "resources" if (req_mib is not None or lim_mib is not None) else "default"
+        source_desc = res_source_desc
+
+    if budget_mib < rss_cap_mib:
+        if budget_mib < default_rss_cap_mib:
+            blame = budget_source
+        elif budget_source == "admission":
+            blame = "cap-explicit-budget"
+        else:
+            blame = "cap"
+        if blame == "resources":
+            can_clear_override = default_budget_mib >= rss_cap_mib
+        else:
+            can_clear_override = res_budget_mib >= rss_cap_mib
+        has_admission = bool(admission)
+        print(f"{name}\t{budget_mib}\t{rss_cap_mib}\t{source_desc}\t{blame}\t{str(can_clear_override).lower()}\t{str(has_admission).lower()}")
+' "$ADMISSION_DEFAULT_MEMORY_BUDGET_MIB" "$ADMISSION_DEFAULT_WORKER_RSS_CAP_MIB" "$ADMISSION_MEMORY_BUDGET_FLOOR_MIB" "$DEFAULT_PLATFORM_AGENT_CR_NAME" "$ADMISSION_BYTES_PER_MIB" "$ADMISSION_QTY_RE" "$ADMISSION_QTY_BIN_BASE" "$ADMISSION_QTY_DEC_BASE" "$ADMISSION_QTY_MILLI_SCALE" "$ADMISSION_BIN_SUFFIXES" "$ADMISSION_DEC_SUFFIXES" "$ADMISSION_DEC_UPPER_K" "$ADMISSION_MILLI_SUFFIX" 2>/dev/null)" || return 0
+
+  [ -n "$findings" ] || return 0
+
+  local cr_name budget_mib cap_mib source blame can_clear_override has_admission
+  while IFS=$'\t' read -r cr_name budget_mib cap_mib source blame can_clear_override has_admission; do
+    [ -n "$cr_name" ] || continue
+    print_warning "PlatformAgent '${cr_name}' in '${namespace}' resolves kanban.admission to memoryBudgetMiB=${budget_mib}MiB < workerRssCapMiB=${cap_mib}MiB (${source}), so a single worker's RSS cap exceeds the pod's admission budget."
+    case "$blame" in
+      resources)
+        if [ "$can_clear_override" = "true" ]; then
+          print_info "Note: spec.deployment.resources has no Helm chart value, so Helm/Terraform upgrades preserve CR overrides untouched. Raise memory under spec.deployment.resources to at least ${cap_mib}Mi (or clear the sub-cap memory override, set spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib}, or lower workerRssCapMiB to at most ${budget_mib}) via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        else
+          print_info "Note: spec.deployment.resources has no Helm chart value, so Helm/Terraform upgrades preserve CR overrides untouched. Raise memory under spec.deployment.resources to at least ${cap_mib}Mi (or set spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib}, or lower workerRssCapMiB to at most ${budget_mib}) via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        fi
+        ;;
+      admission)
+        if [ "$can_clear_override" = "true" ]; then
+          print_info "Remediation: raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} (or clear it to follow container memory request), or lower workerRssCapMiB to at most ${budget_mib} via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        else
+          print_info "Remediation: raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} (and raise spec.deployment.resources memory to at least ${cap_mib}Mi if you want to clear admission), or lower workerRssCapMiB to at most ${budget_mib} via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        fi
+        ;;
+      cap-explicit-budget)
+        if [ "$can_clear_override" = "true" ]; then
+          print_info "Remediation: lower spec.harness.tuning.admission.workerRssCapMiB to at most ${budget_mib}, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} (or clear it to follow container memory request) via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        else
+          print_info "Remediation: lower spec.harness.tuning.admission.workerRssCapMiB to at most ${budget_mib}, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        fi
+        ;;
+      *)
+        print_info "Remediation: lower spec.harness.tuning.admission.workerRssCapMiB to at most ${budget_mib}, raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib}, or set spec.deployment.resources memory to at least ${cap_mib}Mi via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        ;;
+    esac
+    if [ "$blame" != "resources" ] || [ "$has_admission" = "true" ]; then
+      print_info "If platformAgent.harness.tuning.admission was set in Helm values or TF_VAR_extra_helm_values, update those values too (e.g., in install.env before --upgrade-mode=full; operator and harness modes replay recorded release values) so the upgrade does not fail template rendering or re-apply the old values."
+    fi
+  done <<< "$findings"
+}
+
 # Refuses a move that leaves behind a commit marked as a breaking change, naming
 # each one. A move is forward only when the installed commit is an ancestor of
 # the target; any other move between related commits leaves behind what the
@@ -2194,6 +2376,7 @@ main() {
       print_info "Note: --upgrade-mode=operator only applies CRDs and re-tags the operator image; run --upgrade-mode=harness or --upgrade-mode=full to apply spec.deployment.sizingProfile='${effective_operator_sizing}'."
     fi
   fi
+  warn_live_cr_kanban_admission "$target_namespace"
 
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"

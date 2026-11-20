@@ -7,7 +7,7 @@ sidebar:
 
 A `Tier` names what a task may do. An `AgentProfile` lists the tiers it allows in `allowedTiers`, and a task runs at its requester's tier.
 
-**Profiles can run at a `Tier`, but people can't be mapped to one yet.** Under `spec.mode: next`, the operator renders every `Tier` in the install's namespace into the ConfigMap `<agent>-a2a-tiers`. The capability verifier, the gateway and the auth callout read it and add each tier to their tier table, at the verb set its `mode` gives: `interactive` gets what `read` permits, and `unattended` what `unattended` permits.
+**Profiles can run at a `Tier`, but people can't be mapped to one yet.** The operator renders every `Tier` in the install's namespace into the ConfigMap `<agent>-a2a-tiers`. The capability verifier, the gateway and the auth callout read it and add each tier to their tier table, at the verb set its `mode` gives: `interactive` gets what `read` permits, and `unattended` what `unattended` permits.
 
 The built-in `read` and `unattended` tiers, and the legacy ones, are compiled in: a `Tier` with one of their names changes nothing, and a missing or unreadable file leaves the built-in set. A profile can list a tier in `allowedTiers` (see [AgentProfile](/kube-agents/operator/agentprofile-crd/)), and it renders worker pools for an `interactive` tier and Jobs for an `unattended` one. Every person still runs at `read`, so a task reaches a new tier only once people are mapped to tiers. (The full name is `tiers.kubeagents.x-k8s.io`, since Calico has a `tiers` resource of its own.) Later changes map people to tiers and enforce `writeMode`.
 

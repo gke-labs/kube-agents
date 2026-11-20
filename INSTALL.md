@@ -1421,6 +1421,10 @@ a delivery run the file is renamed `INVENTORY.delivered.md`.
 kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md
 ```
 
+Or ask the agent — in the [no-chat-platform session](#step-6-talk-to-the-agent-with-no-chat-platform), or in chat once a platform is on: `what did onboarding
+find?` reads the same report back through the Platform Agent, `show me the full inventory` reads
+the sweep's complete findings, and `was the first-run report delivered?` says where it went.
+
 To see how far onboarding has got:
 
 ```bash

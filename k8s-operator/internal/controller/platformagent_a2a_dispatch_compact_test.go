@@ -23,7 +23,7 @@ func TestTheDispatchConfigIsWrittenCompactWithNoDerivedFields(t *testing.T) {
 	profiles := []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 	})}
-	templates := dispatchJobTemplates(agent, profiles, false)
+	templates := dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder)
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestTheDispatchConfigFitsTwentyFiveHundredTwoTierProfiles(t *testing.T) {
 			p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 		}))
 	}
-	templates := dispatchJobTemplates(agent, profiles, false)
+	templates := dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder)
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -262,7 +262,7 @@ func TestTheDispatchConfigMeasureIsTheWrittenShape(t *testing.T) {
 			for _, imageVolumes := range []bool{true, false} {
 				var templates map[string]profileJobTemplates
 				if tc.jobMode {
-					templates = dispatchJobTemplates(agent, profiles, imageVolumes)
+					templates = dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder)
 				}
 				cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 				if err != nil {

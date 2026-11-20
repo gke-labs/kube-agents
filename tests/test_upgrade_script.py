@@ -4594,5 +4594,193 @@ class UpgradeSizingProfileAndScanTest(unittest.TestCase):
                     self.assertIn(want, p_note.stdout)
 
 
+class KanbanAdmissionPreflightTest(unittest.TestCase):
+    """Pre-upgrade detection of kanban.admission memoryBudgetMiB < workerRssCapMiB on live CRs."""
+
+    def _run_preflight(self, cr_json=None, extra_mock=""):
+        env = get_isolated_test_env()
+        assign = f"PLATFORM_AGENT_CR_JSON={shlex.quote(cr_json)}; " if cr_json is not None else ""
+        cmd = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"; '
+            f'DEFAULT_NAMESPACE="kubeagents-system"; '
+            f'{extra_mock}'
+            f'{assign}'
+            f'warn_live_cr_kanban_admission "kubeagents-system"'
+        )
+        return subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True, text=True, env=env,
+        )
+
+    def test_warns_when_deployment_resources_override_leaves_budget_below_cap(self):
+        import json
+
+        cr = {
+            "items": [{
+                "metadata": {"name": "platform-agent", "namespace": "kubeagents-system"},
+                "spec": {"deployment": {"resources": {"requests": {"memory": "512Mi"}}}},
+            }]
+        }
+        proc = self._run_preflight(json.dumps(cr))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("memoryBudgetMiB=512MiB < workerRssCapMiB=1536MiB", proc.stdout)
+        self.assertIn("spec.deployment.resources.requests.memory=512Mi", proc.stdout)
+        self.assertIn("has no Helm chart value", proc.stdout)
+        self.assertIn("at least 1536Mi", proc.stdout)
+        self.assertNotIn('"/spec/deployment/resources"', proc.stdout)
+        self.assertNotIn("failClosed: false", proc.stdout)
+
+    def test_reads_live_cr_via_kubectl_when_env_unset(self):
+        import json
+
+        cr = {
+            "items": [{
+                "metadata": {"name": "pa-live", "namespace": "kubeagents-system"},
+                "spec": {"deployment": {"resources": {"requests": {"memory": "512Mi"}}}},
+            }]
+        }
+        mock = f"kubectl() {{ printf '%s' {shlex.quote(json.dumps(cr))}; return 0; }}; export -f kubectl; "
+        proc = self._run_preflight(cr_json=None, extra_mock=mock)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("PlatformAgent 'pa-live'", proc.stdout)
+        self.assertIn("spec.deployment.resources.requests.memory=512Mi", proc.stdout)
+
+    def test_warns_on_limits_only_and_clamped_or_si_or_fail_open_or_cap_oversized(self):
+        import json
+
+        cases = (
+            (
+                {"deployment": {"resources": {"limits": {"memory": "1Gi"}}}},
+                "limits.memory=1Gi",
+                "has no Helm chart value",
+            ),
+            (
+                {"deployment": {"resources": {"requests": {"memory": "256Mi"}}}},
+                "memoryBudgetMiB=512MiB",
+                "at least 1536Mi",
+            ),
+            (
+                {"deployment": {"resources": {"requests": {"memory": "1.5G"}}}},
+                "memoryBudgetMiB=1430MiB",
+                "at least 1536Mi",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "4Gi"}, "limits": {"memory": "8Gi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 1024}}},
+                },
+                "spec.harness.tuning.admission.memoryBudgetMiB=1024",
+                "raise spec.harness.tuning.admission.memoryBudgetMiB to at least 1536 (or clear it to follow container memory request)",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "512Mi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 1024}}},
+                },
+                "spec.harness.tuning.admission.memoryBudgetMiB=1024",
+                "raise spec.harness.tuning.admission.memoryBudgetMiB to at least 1536 (and raise spec.deployment.resources memory to at least 1536Mi if you want to clear admission)",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "512Mi"}}},
+                    "harness": {"tuning": {"admission": {"failClosed": False}}},
+                },
+                "memoryBudgetMiB=512MiB < workerRssCapMiB=1536MiB",
+                "has no Helm chart value",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "4Gi"}}},
+                    "harness": {"tuning": {"admission": {"workerRssCapMiB": 5000}}},
+                },
+                "workerRssCapMiB=5000MiB",
+                "lower spec.harness.tuning.admission.workerRssCapMiB to at most 4096, raise spec.harness.tuning.admission.memoryBudgetMiB to at least 5000, or set spec.deployment.resources memory to at least 5000Mi",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "4Gi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 2048, "workerRssCapMiB": 4096}}},
+                },
+                "workerRssCapMiB=4096MiB",
+                "lower spec.harness.tuning.admission.workerRssCapMiB to at most 2048, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least 4096 (or clear it to follow container memory request)",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "2Gi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 2048, "workerRssCapMiB": 4096}}},
+                },
+                "workerRssCapMiB=4096MiB",
+                "lower spec.harness.tuning.admission.workerRssCapMiB to at most 2048, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least 4096 via kubectl",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "512Mi"}}},
+                    "harness": {"tuning": {"admission": {"workerRssCapMiB": 5000}}},
+                },
+                "workerRssCapMiB=5000MiB",
+                "Raise memory under spec.deployment.resources to at least 5000Mi (or set spec.harness.tuning.admission.memoryBudgetMiB to at least 5000, or lower workerRssCapMiB to at most 512)",
+            ),
+        )
+        for raw_spec, want_fragment, want_remedy in cases:
+            with self.subTest(want_fragment=want_fragment):
+                cr = {"items": [{"metadata": {"name": "pa", "namespace": "kubeagents-system"}, "spec": raw_spec}]}
+                proc = self._run_preflight(json.dumps(cr))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("exceeds the pod's admission budget", proc.stdout)
+                self.assertIn(want_fragment, proc.stdout)
+                self.assertIn(want_remedy, proc.stdout)
+                self.assertNotIn("failClosed: false", proc.stdout)
+                admission = raw_spec.get("harness", {}).get("tuning", {}).get("admission", {})
+                if admission.get("memoryBudgetMiB") == 2048:
+                    self.assertNotIn("spec.deployment.resources", proc.stdout)
+                if admission.get("workerRssCapMiB") == 5000:
+                    self.assertNotIn("clear the sub-cap memory override", proc.stdout)
+                if "Note: spec.deployment.resources has no Helm chart value" in proc.stdout and not admission:
+                    self.assertNotIn("TF_VAR_extra_helm_values", proc.stdout)
+                else:
+                    self.assertIn("platformAgent.harness.tuning.admission", proc.stdout)
+                    self.assertIn("TF_VAR_extra_helm_values", proc.stdout)
+
+        # Malformed non-integer admission fields on one CR must not abort warnings for remaining CRs.
+        mixed_cr = {
+            "items": [
+                {"metadata": {"name": "pa-malformed"}, "spec": {"harness": {"tuning": {"admission": {"workerRssCapMiB": "not-an-int"}}}}},
+                {"metadata": {"name": "pa-subcap"}, "spec": {"deployment": {"resources": {"requests": {"memory": "512Mi"}}}}},
+            ]
+        }
+        proc_mixed = self._run_preflight(json.dumps(mixed_cr))
+        self.assertEqual(proc_mixed.returncode, 0, proc_mixed.stderr)
+        self.assertIn("PlatformAgent 'pa-subcap'", proc_mixed.stdout)
+        self.assertNotIn("TF_VAR_extra_helm_values", proc_mixed.stdout)
+
+    def test_silent_when_valid_or_unreadable(self):
+        import json
+
+        for label, payload in (
+            ("defaults", {"items": [{"metadata": {"name": "pa"}, "spec": {}}]}),
+            ("equal boundary", {"items": [{"metadata": {"name": "pa"}, "spec": {"deployment": {"resources": {"requests": {"memory": "2Gi"}}}, "harness": {"tuning": {"admission": {"workerRssCapMiB": 2048}}}}}]}),
+            ("SI 2G >= 1536", {"items": [{"metadata": {"name": "pa"}, "spec": {"deployment": {"resources": {"requests": {"memory": "2G"}}}}}]}),
+            ("empty list", {"items": []}),
+        ):
+            with self.subTest(label=label):
+                proc = self._run_preflight(json.dumps(payload))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn("exceeds the pod's admission budget", proc.stdout)
+
+        # Missing/unreadable kubectl output fails open silently.
+        kubectl_fail = 'kubectl() { return 1; }; export -f kubectl; '
+        proc = self._run_preflight(cr_json=None, extra_mock=kubectl_fail)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_preflight_runs_in_main_before_plan_and_mode_dispatch(self):
+        text = _UPGRADE_SH.read_text()
+        main = text[text.index("main() {"):]
+        call_idx = main.index('warn_live_cr_kanban_admission "$target_namespace"')
+        self.assertLess(main.index("write_tfvars_from_state"), call_idx)
+        self.assertLess(call_idx, main.index('print_step "4. Planning (read-only)"'))
+        self.assertLess(call_idx, main.index('case "$PARAM_UPGRADE_MODE" in', main.index('exit "$plan_status"')))
+
+
 if __name__ == "__main__":
     unittest.main()
