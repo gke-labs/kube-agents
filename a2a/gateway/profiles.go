@@ -67,12 +67,28 @@ const (
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// The profile parent's chain and scope refusals (#5686). The chain and
+	// scope named are the parent's own.
+	noticeProfileCycle         = "%s is already working on this request above this task (%s), so it can't take it again"
+	noticeOutsideParentScope   = "%s is outside this task's %s; it delegates only within that cluster"
+	noticeChildWiderThanParent = "a task with no target cluster is wider than this task's %s; name a cluster inside it"
+	noticeParentScopeUnknown   = "this task started before its delegations were checked, so it can't delegate; ask again to start a new task"
+	noticeParentChainMismatch  = "this task's delegation history can't be verified, so it can't delegate; ask again to start a new task"
+	// noticeParentScopeStale: the parent's scope is neither a cluster nor this
+	// install's, as when the install's namespace changed under an open task.
+	noticeParentScopeStale = "this task's scope no longer matches this install, so it can't delegate; ask again to start a new task"
+	noticeUnattendedParent = "a task a trigger started can't delegate; ask in chat instead"
+	// noticeChainSeparator joins a chain's profiles in noticeProfileCycle.
+	noticeChainSeparator = " → "
 	// noticePlatformTakesNoParameters: platform takes its target from the text.
 	noticePlatformTakesNoParameters = "platform takes no parameters; put the target in the text"
 	// noticeProfileWhileRunning refuses a turn naming a profile while the
 	// conversation has a task running, which would otherwise be steered
 	// into that task with the profile dropped.
 	noticeProfileWhileRunning = "a task is still running here; stop it or wait for it before asking an agent profile"
+	// noticeConfirmWhileRunning refuses a confirm (IntentConfirm) while
+	// the conversation has a task running, which a steer can't grant.
+	noticeConfirmWhileRunning = "a task is still running here; stop it or wait for it before confirming a change"
 	// noticeProfileNoCapability refuses a profile task whose grant couldn't
 	// be minted: its grant carries the tier and target the dispatcher checks.
 	noticeProfileNoCapability = "⚠️ not started: could not mint this task's capability"
@@ -124,18 +140,40 @@ func (g *Gateway) mintTaskCapability(ctx context.Context, taskID, addressee stri
 }
 
 // submissionPayload is the submission's message: the text, for a profile
-// route with parameters the taskParameters part beside it, and any extra
-// parts after (a session turn's delegateTargets).
-func submissionPayload(text, taskID, contextID string, route *profileRoute, extra ...lib.Part) ([]byte, error) {
+// route with parameters or a change requested the taskParameters part
+// beside it, and any extra parts after (a session turn's delegateTargets).
+// A task addressed to platform or a session carries no taskParameters part:
+// the dispatcher is its only reader, and the entry keeps changeRequested for
+// the profile children such a task delegates.
+func submissionPayload(text, taskID, contextID string, route *profileRoute, changeRequested bool, extra ...lib.Part) ([]byte, error) {
 	parts := []lib.Part{{Kind: "text", Text: text}}
-	if route != nil && len(route.Params) > 0 {
-		params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params})
+	if route != nil && (len(route.Params) > 0 || changeRequested) {
+		params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params, ChangeRequested: changeRequested})
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, params)
 	}
 	return messagePayloadParts(append(parts, extra...), taskID, contextID)
+}
+
+// topProfile is the profile a top-level profile task was routed to, for its
+// status line (OutMessage.Profile), and "" for any other task.
+func topProfile(route *profileRoute) string {
+	if route == nil || route.Kind != lib.SubmitKindTop {
+		return ""
+	}
+	return route.Profile
+}
+
+// topInReplyTo is the message id of the turn that started a top-level
+// profile task, for its status line (OutMessage.InReplyTo), and "" for any
+// other task.
+func topInReplyTo(ts taskStart) string {
+	if topProfile(ts.Route) == "" {
+		return ""
+	}
+	return ts.MessageID
 }
 
 // submissionSubject is where a new task is published: a profile's submission

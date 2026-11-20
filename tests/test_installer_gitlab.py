@@ -142,10 +142,14 @@ class GitLabTfvarsTest(unittest.TestCase):
     # GitHub installs this change must leave byte-identical. The goldens were
     # rendered by this same harness at the commit before GitLab support
     # (0347c610), with GITLAB_GOLDEN_WRITE pointing at the testdata directory.
+    # ENABLE_GVISOR is pinned to what the generator rendered when these were
+    # written: with no key, an existing cluster's gVisor intent is now read from
+    # the live install (#5824), which these goldens are not about.
     _GOLDEN_CASES = {
-        "github_minter": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra", "GITHUB_APP_ID": "123"},
-        "github_repo_only": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra"},
-        "github_none": {},
+        "github_minter": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra", "GITHUB_APP_ID": "123",
+                          "ENABLE_GVISOR": "false"},
+        "github_repo_only": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra", "ENABLE_GVISOR": "false"},
+        "github_none": {"ENABLE_GVISOR": "false"},
     }
 
     def test_github_tfvars_match_the_pre_gitlab_rendering(self):
@@ -1042,6 +1046,19 @@ class GitLabThroughMainTest(unittest.TestCase):
         self.assertIn("starts with a host", out)
         self.assertNotIn("1. Checking Prerequisites", out)
 
+    def test_a_path_with_no_segment_is_refused_as_a_path(self):
+        # `/` and `.git` leave no segment once the trailing slash and the
+        # suffix are off. bash 3.2 reads the expansion of that empty array as an
+        # unbound variable under `set -u`; the refusal is the one any other
+        # malformed path gets.
+        for repo in ("/", ".git"):
+            with self.subTest(repo=repo):
+                proc = self._main("-y", "--image-tag=0.1.0", "--gitops-forge=gitlab", f"--gitops-repo={repo}")
+                out = proc.stdout + proc.stderr
+                self.assertNotIn("unbound variable", out)
+                self.assertIn("--gitops-repo must be the GitLab project's full path", out)
+                self.assertNotIn("1. Checking Prerequisites", out)
+
 
 class GitLabInstallEnvTest(unittest.TestCase):
     """The forge keys reach an install.env that already exists, and only from the file."""
@@ -1233,6 +1250,8 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
 
     def setUp(self):
         self.main = (_FULL_INSTALL / "main.tf").read_text()
+        # The checks the chart's values must pass sit on the values output.
+        self.outputs = (_FULL_INSTALL / "outputs.tf").read_text()
         self.variables = (_FULL_INSTALL / "variables.tf").read_text()
 
     def test_variables_exist_with_github_defaults(self):
@@ -1260,7 +1279,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertIn('role = "gitops"', self.main)
 
     def test_precondition_refuses_a_minter_on_gitlab(self):
-        self.assertIn("!var.enable_github_minter", self.main)
+        self.assertIn("!var.enable_github_minter", self.outputs)
 
 
 class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):

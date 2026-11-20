@@ -887,6 +887,65 @@ class RecentWorkTest(unittest.TestCase):
         self.assertEqual(norm(raw), '{"output": "x\\n\\nrest"')
 
 
+def runtime_environment(kernel, cwd="/opt/data/kanban/workspaces/t_defda7c5"):
+    """The end of a Hermes system prompt on the ssh backend, as recorded on Nov 18 (agent/prompt_builder.py `_format_backend_probe`)."""
+    return ("Conversation started: Wednesday, November 18, 2026 (UTC, UTC+00:00)\nModel: model-default\n\n"
+            "# Hermes runtime environment\n\nTerminal backend: ssh. Your `terminal` tools all operate inside this ssh "
+            "environment. Only the following backend state matters:\n"
+            f"  OS: Linux {kernel}\n  User: agent\n  Home: /home/agent\n  Working directory: {cwd}\n\n"
+            "<!-- End Hermes runtime environment -->")
+
+
+def system_request(system, *users):
+    return {"model": "model-default", "messages": [{"role": "system", "content": system}]
+            + [{"role": "user", "content": u} for u in users]}
+
+
+class RuntimeKernelTest(unittest.TestCase):
+    # Two nodes of the same pool on the Nov 18 recording night.
+    KERNELS = ("6.12.105+", "6.12.110+")
+
+    def test_the_system_prompts_kernel_does_not_change_the_key(self):
+        a, b = (system_request(runtime_environment(k), "work the card") for k in self.KERNELS)
+        self.assertEqual(fp(a), fp(b))
+        walked = [normalizer.normalize_request(r, NOW).messages[0]["content"] for r in (a, b)]
+        self.assertEqual(walked[0], walked[1])
+        self.assertIn("  OS: Linux ⟦KERNEL⟧\n  User: agent\n", walked[0])
+
+    def test_a_system_prompt_as_text_parts(self):
+        a, b = (system_request([{"type": "text", "text": runtime_environment(k)}]) for k in self.KERNELS)
+        self.assertEqual(fp(a), fp(b))
+
+    def test_the_rest_of_the_block_still_counts(self):
+        self.assertNotEqual(fp(system_request(runtime_environment(self.KERNELS[0]))),
+                            fp(system_request(runtime_environment(self.KERNELS[0], cwd="/home/agent"))))
+        self.assertNotEqual(fp(system_request(runtime_environment(self.KERNELS[0]))),
+                            fp(system_request(runtime_environment(self.KERNELS[0]).replace("Linux", "Darwin"))))
+
+    def test_prose_quoting_the_heading_before_the_block_is_left_alone(self):
+        quoted = "Notes: # Hermes runtime environment\n  OS: Linux 5.15.0-1\nmore notes\n\n"
+        walked = normalizer.normalize_request(system_request(quoted + runtime_environment(self.KERNELS[0])), NOW)
+        content = walked.messages[0]["content"]
+        self.assertIn("  OS: Linux 5.15.0-1\n", content)
+        self.assertIn("  OS: Linux ⟦KERNEL⟧\n  User: agent\n", content)
+
+    def test_a_kernel_anywhere_else_stays_literal(self):
+        # What the agent reads about a node it is debugging: `uname -r`, a KERNEL-VERSION column, a pasted block.
+        for kernel in self.KERNELS:
+            elsewhere = (f"  OS: Linux {kernel}",
+                         f"Kernel Version:             {kernel}",
+                         runtime_environment(kernel))
+            for text in elsewhere:
+                with self.subTest(kernel=kernel, text=text[:30]):
+                    walked = normalizer.normalize_request(system_request("system", text), NOW).messages[1]["content"]
+                    self.assertIn(kernel, walked)
+                    conversation = tool_conversation("terminal", text)
+                    self.assertIn(kernel, normalizer.normalize_request(conversation, NOW).messages[-1]["content"])
+            # Outside the block, a system prompt's line keeps its kernel too.
+            self.assertIn(kernel, normalizer.normalize_request(system_request(f"  OS: Linux {kernel}"), NOW).messages[0]["content"])
+        self.assertNotEqual(fp(system_request("s", "uname -r: 6.12.105+")), fp(system_request("s", "uname -r: 6.12.110+")))
+
+
 class EvalPoolProjectTest(unittest.TestCase):
     def test_the_project_is_an_identifier_wherever_the_pool_writes_it(self):
         cases = (
@@ -1022,6 +1081,328 @@ class RunNameTest(unittest.TestCase):
         # The operation's type and status are state and stay.
         self.assertNotEqual(norm(f"{op} (UPGRADE_NODES, DONE)"), norm(f"{op} (UPGRADE_NODES, RUNNING)"))
         self.assertEqual(norm("operation-999999999999-9f9999"), "operation-999999999999-9f9999")
+
+
+def not_found(path="/opt/data/AGENTS.md", similar=None, error=None):
+    """A read_file result for a missing file as Hermes writes one (tools/file_operations.py), `similar_files` left out when empty."""
+    result = {"content": "", "total_lines": 0, "file_size": 0, "truncated": False, "is_binary": False,
+              "is_image": False, "error": error or f"File not found: {path}"}
+    if similar:
+        result["similar_files"] = similar
+    return json.dumps(result)
+
+
+def read_file_conversation(content, tool_name="read_file", call_id="call_1__thought__QUJD", answered=None):
+    """A request whose last message is `content`, returned by a call to `tool_name` (answering `answered`, else that call)."""
+    call = {"id": call_id, "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps({"path": "/opt/data/AGENTS.md"})}}
+    return {"model": "m", "messages": [
+        {"role": "user", "content": "look at the inventory"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": answered or call_id, "content": content},
+    ]}
+
+
+class SimilarFilesTest(unittest.TestCase):
+    WITH_INVENTORY = ["/opt/data/INVENTORY.md", "/opt/data/INVENTORY.raw.md", "/opt/data/SETTINGS.md"]
+    WITHOUT_INVENTORY = ["/opt/data/INVENTORY.raw.md", "/opt/data/SETTINGS.md"]
+
+    def test_a_not_found_result_keys_alike_whatever_files_it_lists(self):
+        # Whether INVENTORY.md exists yet is another agent's timing; Hermes leaves the key out when nothing is like it.
+        keys = {fp(read_file_conversation(not_found(similar=similar)))
+                for similar in (self.WITH_INVENTORY, self.WITHOUT_INVENTORY, None)}
+        self.assertEqual(len(keys), 1)
+
+    def test_the_rest_of_the_result_still_counts(self):
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY))),
+                            fp(read_file_conversation(not_found("/opt/data/SOUL.md", similar=self.WITH_INVENTORY))))
+        walked = normalizer.normalize_request(read_file_conversation(not_found(similar=self.WITH_INVENTORY)), NOW)
+        self.assertEqual(json.loads(walked.messages[-1]["content"]), json.loads(not_found()))
+
+    def test_a_notice_hermes_appended_keeps_the_list_dropped(self):
+        notice = "\n\n[Tool loop warning: same_tool_failure_warning; count=3; read_file has failed 3 times this turn.]"
+        keys = {fp(read_file_conversation(not_found(similar=similar) + notice))
+                for similar in (self.WITH_INVENTORY, self.WITHOUT_INVENTORY, None)}
+        self.assertEqual(len(keys), 1)
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY) + notice)),
+                            fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY) + "\n\nanother notice")))
+
+    def test_a_successful_read_is_untouched(self):
+        content = json.dumps({"content": "1|# Inventory", "total_lines": 1, "file_size": 12, "truncated": False,
+                              "is_binary": False, "is_image": False})
+        self.assertEqual(normalizer.without_similar_files(content), (content, []))
+        self.assertIs(normalizer.without_similar_files(content)[0], content)
+
+    def test_an_error_other_than_not_found_keeps_its_list(self):
+        def denied(similar):
+            return not_found(similar=similar, error="Permission denied: /opt/data/AGENTS.md")
+        self.assertNotEqual(fp(read_file_conversation(denied(self.WITH_INVENTORY))),
+                            fp(read_file_conversation(denied(self.WITHOUT_INVENTORY))))
+
+    def test_another_tools_result_keeps_its_list(self):
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY), tool_name="terminal")),
+                            fp(read_file_conversation(not_found(similar=self.WITHOUT_INVENTORY), tool_name="terminal")))
+
+    def test_a_result_answering_no_read_file_call_keeps_its_list(self):
+        # The call is matched by id: a tool message naming another call is not read as read_file's.
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY), answered="call_2")),
+                            fp(read_file_conversation(not_found(similar=self.WITHOUT_INVENTORY), answered="call_2")))
+
+    def test_a_result_with_nothing_to_drop_keeps_its_text(self):
+        content = not_found()
+        message = {"role": "tool", "tool_call_id": "call_1", "content": content}
+        walker = normalizer.Normalizer(NOW, keep_ips=False)
+        walker.read_file_calls.add("call_1")
+        self.assertIs(walker.similar_files_dropped(message), message)
+        self.assertEqual(walker.mapping.dropped_files, set())
+        self.assertEqual(normalizer.without_similar_files("<persisted-output>"), ("<persisted-output>", []))
+
+    def test_a_dropped_file_counts_against_an_answer_by_its_name(self):
+        mapping = normalizer.normalize_request(read_file_conversation(not_found(similar=self.WITH_INVENTORY)), NOW).mapping
+        # A tool call's arguments are a JSON string: a name starting a line follows an escaped `\n`.
+        escaped = json.dumps({"content": "Files:\nINVENTORY.md lists the fleet\n\tSETTINGS.md\r\nINVENTORY.raw.md"})
+        for answer in ('{"path": "/opt/data/INVENTORY.md"}', "cd /opt/data && cat INVENTORY.md", "SETTINGS.md.",
+                       escaped, json.dumps({"content": "x\nINVENTORY.md"}), json.dumps({"content": "x\tSETTINGS.md"}),
+                       json.dumps({"content": "x\rSETTINGS.md"})):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_names_dropped_file(answer))
+        self.assertEqual(mapping.dropped_files, {"INVENTORY.md", "INVENTORY.raw.md", "SETTINGS.md"})
+        for answer in ('{"path": "/opt/data/AGENTS.md"}', "OLD_INVENTORY.md", "INVENTORY.mdx", "an inventory",
+                       "cp INVENTORY.md.bak /tmp"):
+            with self.subTest(answer=answer):
+                self.assertFalse(mapping.answer_names_dropped_file(answer))
+        # A name with no extension is not the start of a longer file name.
+        bare = normalizer.normalize_request(read_file_conversation(not_found(similar=["/opt/data/config"])), NOW).mapping
+        self.assertTrue(bare.answer_names_dropped_file("cat config."))
+        self.assertFalse(bare.answer_names_dropped_file("cat config.yaml"))
+        self.assertEqual(normalizer.normalize_request(
+            read_file_conversation(not_found(similar=self.WITH_INVENTORY), tool_name="terminal"), NOW).mapping.dropped_files,
+            set(), "nothing is dropped from another tool's result, so nothing counts")
+
+    def test_a_dropped_name_holding_a_bound_identifier_counts_as_written(self):
+        # Normalized, the name would read `⟦EVALPROJECT_1⟧-notes.md`; the answer is read as written.
+        body = read_file_conversation(not_found(similar=["/opt/data/kube-agents-evals-22-notes.md"]))
+        body["messages"][0]["content"] = "look at the inventory for kube-agents-evals-22"
+        mapping = normalizer.normalize_request(body, NOW).mapping
+        self.assertTrue(mapping.answer_names_dropped_file('{"path": "/opt/data/kube-agents-evals-22-notes.md"}'))
+        self.assertFalse(mapping.answer_names_dropped_file('{"path": "/opt/data/kube-agents-evals-21-notes.md"}'))
+
+
+def created(queued=None, running=5, limit=5, task_id="t_d07508c5"):
+    """The front door's kanban_create result as Hermes returns it: kanban_priority's queue fields when `queued` is True.
+
+    `queued` False writes a bare `"queued": false`, which queue_fields never does, to show it reads as no wait.
+    """
+    result = {"ok": True, "task_id": task_id, "status": "ready", "workspace_kind": "scratch", "workspace_path": None,
+              "project_id": None, "subscribed": True}
+    if queued is not None:
+        result["queued"] = queued
+    if queued:
+        result["queue"] = {"running": running, "limit": limit}
+    return json.dumps(result)
+
+
+def create_conversation(content, tool_name="kanban_create", call_id="call_1__thought__Y3Jl", answered=None):
+    """A front-door request whose last message is `content`, returned by a call to `tool_name`."""
+    call = {"id": call_id, "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps({"title": "triage seeded-a", "assignee": "platform"})}}
+    return {"model": "m", "messages": [
+        {"role": "user", "content": "triage seeded-a"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": answered or call_id, "content": content},
+    ]}
+
+
+class KanbanCreateQueueTest(unittest.TestCase):
+    NOTICE = "\n\n[Tool loop warning: same_tool_failure_warning; count=3; kanban_create has failed 3 times this turn.]"
+
+    def mapping(self, content, **kwargs):
+        return normalizer.normalize_request(create_conversation(content, **kwargs), NOW).mapping
+
+    def test_a_create_result_keys_alike_queued_or_not(self):
+        keys = {fp(create_conversation(created(queued))) for queued in (True, False, None)}
+        keys.add(fp(create_conversation(created(True, running=4))))
+        self.assertEqual(len(keys), 1)
+
+    def test_the_rest_of_the_result_still_counts(self):
+        self.assertNotEqual(fp(create_conversation(created(True))),
+                            fp(create_conversation(created(True).replace('"ready"', '"todo"'))))
+        walked = normalizer.normalize_request(create_conversation(created(True)), NOW)
+        self.assertNotIn("queue", walked.messages[-1]["content"])
+
+    def test_a_notice_hermes_appended_keeps_the_fields_dropped(self):
+        keys = {fp(create_conversation(created(queued) + self.NOTICE)) for queued in (True, None)}
+        self.assertEqual(len(keys), 1)
+        self.assertNotEqual(fp(create_conversation(created(True) + self.NOTICE)),
+                            fp(create_conversation(created(True) + "\n\nanother notice")))
+        self.assertTrue(self.mapping(created(True) + self.NOTICE).create_queued)
+
+    def test_a_later_create_with_a_free_slot_leaves_the_earlier_wait_on_record(self):
+        # The first card waited, the second didn't: an answer about the first card's wait must still not be saved.
+        first = {"id": "call_1", "type": "function",
+                 "function": {"name": "kanban_create", "arguments": json.dumps({"title": "triage seeded-a"})}}
+        second = {"id": "call_2", "type": "function",
+                  "function": {"name": "kanban_create", "arguments": json.dumps({"title": "triage seeded-b"})}}
+        body = {"model": "m", "messages": [
+            {"role": "user", "content": "triage seeded-a and seeded-b"},
+            {"role": "assistant", "content": "", "tool_calls": [first]},
+            {"role": "tool", "tool_call_id": "call_1", "content": created(True)},
+            {"role": "assistant", "content": "", "tool_calls": [second]},
+            {"role": "tool", "tool_call_id": "call_2", "content": created(None, task_id="t_e18619d6")},
+        ]}
+        mapping = normalizer.normalize_request(body, NOW).mapping
+        self.assertTrue(mapping.create_queued)
+        self.assertTrue(mapping.answer_talks_about_dropped_queue("seeded-a is queued and starts when a worker frees up."))
+
+    def test_another_tools_result_keeps_its_fields(self):
+        self.assertNotEqual(fp(create_conversation(created(True), tool_name="kanban_show")),
+                            fp(create_conversation(created(None), tool_name="kanban_show")))
+        self.assertFalse(self.mapping(created(True), tool_name="kanban_show").create_queued)
+
+    def test_a_result_answering_no_create_call_keeps_its_fields(self):
+        # The call is matched by id: a tool message naming another call is not read as kanban_create's.
+        self.assertNotEqual(fp(create_conversation(created(True), answered="call_2")),
+                            fp(create_conversation(created(None), answered="call_2")))
+        mapping = self.mapping(created(True), answered="call_2")
+        self.assertFalse(mapping.create_queued)
+        self.assertEqual(mapping.dropped_counts, set())
+
+    def test_a_result_that_is_no_create_result_keeps_its_fields(self):
+        other = {"ok": True, "task_id": "t_d07508c5", "queued": True, "queue": {"running": 5, "limit": 5}}
+        self.assertNotEqual(fp(create_conversation(json.dumps(other))),
+                            fp(create_conversation(json.dumps({"ok": True, "task_id": "t_d07508c5"}))))
+        self.assertEqual(normalizer.without_queue_fields(json.dumps(other)), (json.dumps(other), False, None))
+        self.assertFalse(self.mapping(json.dumps(other)).create_queued)
+
+    def test_a_result_with_nothing_to_drop_keeps_its_text(self):
+        content = created(None)
+        self.assertIs(normalizer.without_queue_fields(content)[0], content)
+        self.assertEqual(normalizer.without_queue_fields("<persisted-output>"), ("<persisted-output>", False, None))
+        mapping = self.mapping(content)
+        self.assertFalse(mapping.create_queued)
+        self.assertEqual(mapping.dropped_counts, set())
+
+    def test_only_a_queued_result_marks_the_request(self):
+        self.assertTrue(self.mapping(created(True)).create_queued)
+        self.assertFalse(self.mapping(created(False)).create_queued)
+        self.assertFalse(self.mapping(created(None)).create_queued)
+        # A queue block without `queued: true` is not what queue_fields writes; it is read as a wait.
+        for odd in ({"queue": {"running": 5, "limit": 5}}, {"queued": False, "queue": {"running": 5, "limit": 5}},
+                    {"queued": "yes"}):
+            with self.subTest(odd=odd):
+                self.assertTrue(normalizer.without_queue_fields(json.dumps(dict(odd, task_id="t_1", subscribed=True)))[1])
+
+    def test_the_dropped_counts_count_against_an_answer(self):
+        mapping = self.mapping(created(True, running=4, limit=5))
+        self.assertEqual(mapping.dropped_counts, {"4", "5"})
+        self.assertEqual(mapping.dropped_count_keys, {"running", "limit"})
+        for answer in ("queued behind 4 running", "running: 4", "limit 5"):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_repeats_bare_number(answer))
+        self.assertFalse(mapping.answer_repeats_bare_number("Checking all 5 clusters."))
+        self.assertFalse(self.mapping(created(None)).answer_repeats_bare_number("queued behind 4 running"))
+
+    def test_an_answer_talking_about_the_queue_counts_only_after_a_queued_create(self):
+        talks = ("It's queued and will start when a worker frees up.", "waiting for a slot (5 of 5 in use)",
+                 "queued behind 5 running", "The board is full right now.", "It is waiting for a worker.")
+        quiet = ("I'm checking all 3 clusters.", "Checking seeded-a now.", "[silent]")
+        queued, unqueued, absent = self.mapping(created(True)), self.mapping(created(False)), self.mapping(created(None))
+        for answer in talks:
+            with self.subTest(answer=answer):
+                self.assertTrue(queued.answer_talks_about_dropped_queue(answer))
+                self.assertFalse(unqueued.answer_talks_about_dropped_queue(answer))
+                self.assertFalse(absent.answer_talks_about_dropped_queue(answer))
+        for answer in quiet:
+            with self.subTest(answer=answer):
+                self.assertFalse(queued.answer_talks_about_dropped_queue(answer))
+
+    def test_the_mark_survives_a_copy(self):
+        self.assertTrue(self.mapping(created(True)).copy().create_queued)
+        self.assertTrue(normalizer.normalize_request(create_conversation(created(True)), NOW).history_mapping.create_queued)
+
+
+def spent_notice(number, revision, outcome="The repository no longer holds the branch, so the name is free."):
+    """submit_suggestion prepare's output after it found a spent proposal on the branch (`clear_spent_branch`)."""
+    return json.dumps({"output": (
+        "[2026-11-12 02:08:09] [SRE-AUTH] 'platform-agent/fix-payments-api' was the source of "
+        f"https://github.com/gke-agentic/kube-agents-evals-22-infra/pull/{number}, which is closed. That proposal's "
+        f"last revision, {revision}, is not in 'main', so it was squash-merged or closed rather than merged whole. "
+        f"{outcome}\n" + json.dumps({"branch": "platform-agent/fix-payments-api", "base": "main", "proposal": ""})),
+        "exit_code": 0, "error": None})
+
+
+class SpentProposalTest(unittest.TestCase):
+    def test_an_earlier_runs_proposal_keys_alike(self):
+        self.assertEqual(norm(spent_notice(1399, "3ef98c4e29cf")), norm(spent_notice(1398, "141a5bb53467")))
+        output = json.loads(norm(spent_notice(1399, "3ef98c4e29cf")))["output"]
+        self.assertIn("/⟦EVALPROJECT_1⟧-infra/pull/⟦PULL_1⟧, which is closed. That proposal's last revision, ⟦COMMIT_1⟧,",
+                      output)
+
+    def test_the_deleted_or_held_branch_revision(self):
+        deleted = "Deleted the spent branch at {}; the name is free."
+        self.assertEqual(norm(spent_notice(1385, "2d5fee9a5002", deleted.format("2d5fee9a5002"))),
+                         norm(spent_notice(1387, "4ce9be6a80ee", deleted.format("4ce9be6a80ee"))))
+        self.assertEqual(norm("The repository held the branch at 2d5fee9a5002, and deleting it did not complete"),
+                         "The repository held the branch at ⟦COMMIT_1⟧, and deleting it did not complete")
+        self.assertEqual(norm("The repository still holds the branch at 2d5fee9a5002, so"),
+                         "The repository still holds the branch at ⟦COMMIT_1⟧, so")
+
+    def test_a_gitlab_proposal(self):
+        def gitlab(number):
+            return spent_notice(number, "3ef98c4e29cf").replace(
+                f"github.com/gke-agentic/kube-agents-evals-22-infra/pull/{number}",
+                f"gitlab.com/grp/sub/kube-agents-evals-22-infra/-/merge_requests/{number}")
+        self.assertIn("/-/merge_requests/⟦PULL_1⟧, which is closed", json.loads(norm(gitlab(12)))["output"])
+        self.assertEqual(norm(gitlab(12)), norm(gitlab(31)))
+        self.assertEqual(normalizer.normalize_request(request(gitlab(12)), NOW).mapping.proposal_numbers, {"12"})
+        self.assertEqual(norm("https://gitlab.com/grp/x/-/merge_requests/12"), "https://gitlab.com/grp/x/-/merge_requests/12")
+
+    def test_a_proposal_number_only_a_recent_work_digest_holds_counts_against_an_answer(self):
+        # The digest is dropped from the key; its unrestorable values still count (merge_unrestorable).
+        card = ("card t_bbbbbbbb\n\n## Recent work by @platform\n- t_deadbeef — 'platform-agent/b' was the source of "
+                "https://github.com/gke-agentic/x/pull/1399, which is closed.")
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(card)
+        self.assertTrue(walker.mapping.answer_repeats_bare_number("vcs.py proposal view 1399"))
+        self.assertFalse(walker.mapping.answer_repeats_bare_number("vcs.py proposal view 1400"))
+        self.assertEqual(walker.mapping.counts, {"TASK": 1}, "nothing in the digest is keyed")
+
+    def test_the_proposals_state_still_counts(self):
+        self.assertNotEqual(norm(spent_notice(1399, "3ef98c4e29cf")),
+                            norm(spent_notice(1399, "3ef98c4e29cf").replace("which is closed", "which is merged")))
+
+    def test_numbers_and_hex_outside_the_notice_stay(self):
+        for raw in ("https://github.com/gke-agentic/x/pull/1399", "merge PR #1399", "number: 1399",
+                    "revision 3ef98c4e29cf", "busybox@sha256:3ef98c4e29cf0a1b", "last revision, 1.35.8, is",
+                    "was the source of https://github.com/gke-agentic/x/pull/1399 (closed)"):
+            with self.subTest(raw=raw):
+                self.assertEqual(norm(raw), raw)
+        # In the same request: the notice's number is bound, the same number elsewhere stays literal.
+        mixed = normalizer.Normalizer(NOW, False)
+        mixed.text(spent_notice(1399, "3ef98c4e29cf"))
+        self.assertEqual(mixed.text("see https://github.com/gke-agentic/x/pull/1399"),
+                         "see https://github.com/gke-agentic/x/pull/1399")
+
+    def test_an_answer_holding_the_number_is_not_saved_and_it_is_never_put_back(self):
+        mapping = normalizer.normalize_request(request(spent_notice(175, "3ef98c4e29cf")), NOW).mapping
+        for answer in ("vcs.py proposal view 175 --repo x", "closed [PR #175](https://github.com/x/y/pull/175)",
+                       "175 MiB"):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_repeats_bare_number(answer))
+                self.assertEqual(mapping.apply_to_answer(answer), answer, "a proposal number is never swapped in")
+        for answer in ("1750m CPU", "PR #176", "2175 restarts"):
+            with self.subTest(answer=answer):
+                self.assertFalse(mapping.answer_repeats_bare_number(answer))
+        self.assertEqual(mapping.proposal_numbers, {"175"})
+
+    def test_the_revision_is_served_with_this_runs_and_a_shortened_one_is_not_saved(self):
+        recorded = normalizer.normalize_request(request(spent_notice(1399, "3ef98c4e29cf")), NOW).mapping
+        replayed = normalizer.normalize_request(request(spent_notice(1398, "141a5bb53467")), NOW).mapping
+        stored = recorded.apply_to_answer("git show 3ef98c4e29cf")
+        self.assertEqual(stored, "git show ⟦COMMIT_1⟧")
+        self.assertEqual(replayed.restore(stored), ("git show 141a5bb53467", []))
+        self.assertTrue(recorded.identifier_left_literal(recorded.apply_to_answer("git show 3ef98c4")))
+        self.assertFalse(recorded.answer_repeats_bare_number("git show 3ef98c4e29cf"))
 
 
 class NestedJsonTest(unittest.TestCase):

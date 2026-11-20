@@ -33,8 +33,12 @@
 provider "kubernetes" {
   alias                  = "seeded_b"
   host                   = "https://${google_container_cluster.seeded_b.endpoint}"
-  token                  = data.google_client_config.default.access_token
   cluster_ca_certificate = base64decode(google_container_cluster.seeded_b.master_auth[0].cluster_ca_certificate)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "gke-gcloud-auth-plugin"
+  }
 }
 
 # Defect (upgrade readiness): a pool that upgrades in place. `max_surge = 0`
@@ -381,7 +385,7 @@ resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
   }
 }
 
-# Defect (upgrade readiness, certification): a fail-closed webhook whose dead
+# Defect (upgrade readiness, validated-capabilities): a fail-closed webhook whose dead
 # backend would refuse the writes GKE's control plane makes in the
 # autoscaling.x-k8s.io group after a 1.35+ upgrade, where it installs and
 # reconciles capacitybuffers.autoscaling.x-k8s.io and Cluster Autoscaler

@@ -49,6 +49,12 @@ const (
 	degradedLoopParkTimeout = 90 * time.Second
 	// degradedLoopPollInterval is how often the park wait re-reads the CR.
 	degradedLoopPollInterval = 250 * time.Millisecond
+	// degradedLoopQuiesce is how long the status-write counter has to stay
+	// still after the park before the window opens: the parking pass writes
+	// its deferred conditions on the way out, and a pass that read the cache
+	// between them sends one more no-op write, which is settling, not the
+	// loop this test guards. The window's baseline is read after this wait.
+	degradedLoopQuiesce = 5 * time.Second
 	// degradedLoopMeasureWindow is how long the counters run once the CR is
 	// parked. It covers one RequeueAfter tick (30s on this path), so the
 	// reconcile count on a fixed operator is the requeue's, not zero — proof
@@ -225,9 +231,14 @@ func TestAParkedRefusalDoesNotReconcileContinuouslyEnvtest(t *testing.T) {
 		}
 		return got
 	}
+	// Parked: the pass that parks also writes BusCredentialsReady and the
+	// conditions after it on its way out (the deferred syncs in Reconcile), at
+	// most one status write each. This only says that the park has begun to
+	// land; the window's baseline is read after those writes settle, below.
 	parked := func(pa *agentv1alpha1.PlatformAgent) bool {
 		cond := meta.FindStatusCondition(pa.Status.Conditions, "Ready")
-		return pa.Status.Phase == "Degraded" && cond != nil && cond.Reason == reasonShellSandboxKeysMissing
+		return pa.Status.Phase == "Degraded" && cond != nil && cond.Reason == reasonShellSandboxKeysMissing &&
+			meta.FindStatusCondition(pa.Status.Conditions, busCredentialsReadyCondition) != nil
 	}
 	deadline := time.Now().Add(degradedLoopParkTimeout)
 	waitForParked := func(reader client.Reader, label string) *agentv1alpha1.PlatformAgent {
@@ -255,11 +266,28 @@ func TestAParkedRefusalDoesNotReconcileContinuouslyEnvtest(t *testing.T) {
 	t.Logf("parked on %s after %s; resourceVersion=%s lastReconcileTime=%v",
 		reasonShellSandboxKeysMissing, degradedLoopParkTimeout-time.Until(deadline), current.ResourceVersion, current.Status.LastReconcileTime)
 
+	// Let the parking pass's deferred writes land (degradedLoopQuiesce).
+	for quiet := counting.writes.Load(); ; {
+		time.Sleep(degradedLoopQuiesce)
+		if now := counting.writes.Load(); now == quiet {
+			break
+		} else {
+			quiet = now
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status writes did not settle within %s of the park", degradedLoopParkTimeout)
+		}
+	}
+
 	// The window. Reconciles from the registry, status writes from the client
 	// wrapper, and the object's resourceVersion as the API server's own record
 	// of whether anything wrote it.
 	reconcilesBefore := platformAgentReconcileTotal(t)
 	writesBefore := counting.writes.Load()
+	// The baseline is read here, after the settle, and not taken from the read
+	// that first saw the park: that read can land between two of the parking
+	// pass's exit writes, and its resourceVersion is then one write old.
+	current = fetch()
 	rvBefore := current.ResourceVersion
 	time.Sleep(degradedLoopMeasureWindow)
 	reconciles := platformAgentReconcileTotal(t) - reconcilesBefore

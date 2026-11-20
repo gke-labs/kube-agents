@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"time"
 )
 
 // The bus principals, in one place, as data.
@@ -98,6 +99,12 @@ type a2aIdentity struct {
 	// sessionIdentity for why that is fail-closed rather than fussy.
 	narrowing string
 
+	// notAfter, when set, is the instant the callout stops authenticating
+	// this principal and the latest any JWT minted for it expires. Set on
+	// the bus migration's per-run principals at the run's deadline. Only
+	// for a2aAuthCallout, and never with narrowing.
+	notAfter *time.Time
+
 	publish   []string
 	subscribe []string
 
@@ -135,9 +142,13 @@ type a2aIdentity struct {
 	// its subscribe list is two exact prefixes, so it cannot read an entry
 	// with or without the deny.
 	//
-	// Rendered only for static principals. No callout principal needs one:
+	// Rendered into nats.conf for a static principal, and into the callout's
+	// identity map for a mapped one (its grants' denyPublish and
+	// denySubscribe, #5301), where the callout subtracts them in the minted
+	// JWT. No principal in a2aIdentities' callout set carries one today:
 	// provision's JetStream grants are enumerated the same way seed's are,
 	// the session's are derived at mint time, and the verifier is the reader.
+	// The gateway's map entry (gatewayCalloutEntry) carries its static user's.
 	denyPublish   []string
 	denySubscribe []string
 }
@@ -283,6 +294,20 @@ const (
 	// confirmation surface are distinct from the browser's.
 	a2aConsoleMCPUser = "console-mcp"
 
+	// a2aCuratorUser is the NATS user name for the OKF memory curator pod
+	// (a2a/cmd/curator), rendered under A2A_CURATOR=true.
+	a2aCuratorUser = "curator"
+
+	// The memory query and outcome subjects served by the curator pod under
+	// A2A_CURATOR=true. Replies ride their own namespace (a2a.memory.reply.>)
+	// for the same reason verifierIdentity answers on a2a.cap.reply.> and
+	// bridgeIdentity answers on chat.board.reply.gateway.>: the curator never
+	// holds a publish grant on _INBOX.agent.>.
+	a2aMemoryQuerySubject       = "a2a.memory.query"
+	a2aMemoryReplySubjects      = "a2a.memory.reply.>"
+	a2aMemoryReplyAgentSubjects = "a2a.memory.reply.agent.>"
+	a2aCuratorOutcomesSubject   = "a2a.topics.agent.platform.curator-outcomes"
+
 	// a2aConsoleConfirmSubject is the console confirmation subject: console
 	// alone may publish it and gateway alone may subscribe to it. Its
 	// publisher and subscriber land with #4457.
@@ -378,6 +403,23 @@ const a2aDispatchStopSubjects = "a2a.stop.*.*"
 // a2aGatewayUser is the gateway's NATS user.
 const a2aGatewayUser = "gateway"
 
+// The attested trigger ingress subjects (lib.TriggerSubmitSubject and its
+// kin, #5617), spelled here because this module can't import lib; the
+// rendered fixtures and the operator's submitter test hold them equal.
+const (
+	a2aTriggerSubmitWildcard  = "a2a.trigger.*.submit"
+	a2aTriggerStatusWildcard  = "a2a.trigger.*.status"
+	a2aTriggerReplySubjects   = "a2a.trigger.reply.>"
+	a2aTriggerScheduleSubmit  = "a2a.trigger." + triggerScheduleSource + ".submit"
+	a2aTriggerScheduleStatus  = "a2a.trigger." + triggerScheduleSource + ".status"
+	a2aTriggerScheduleReplies = "a2a.trigger.reply." + triggerScheduleSource + ".>"
+)
+
+// a2aAgentSchedulesEnabled reports whether the operator runs the
+// AgentSchedule reconciler (AgentSchedulesEnabled, the check cmd/main.go
+// registers it on), and so holds the schedule source's trigger grants.
+func a2aAgentSchedulesEnabled() bool { return AgentSchedulesEnabled() }
+
 // a2aProfileSupervisorPrefix and a2aProfileSupervisorSuffix spell a profile's
 // supervisor subjects, a2a.tasks.<profile>.*.supervisor: where the dispatcher
 // writes a profile task's terminal failures (lib.TaskSupervisorSubject). The
@@ -406,6 +448,15 @@ func gatewayProfileSupervisorDeny(profiles []string) []string {
 	}
 	sort.Strings(out)
 	return slices.Compact(out)
+}
+
+// withGatewayProfileDeny is id with gatewayProfileSupervisorDeny(profiles)
+// added to its publish deny, in a new slice. Both of the gateway's renders take
+// it from here, the static user in nats.conf and its callout map entry, so
+// neither can be granted a profile's supervisor subject the other is denied.
+func withGatewayProfileDeny(id a2aIdentity, profiles []string) a2aIdentity {
+	id.denyPublish = append(slices.Clone(id.denyPublish), gatewayProfileSupervisorDeny(profiles)...)
+	return id
 }
 
 // The operator's own bus principal: its NATS user and inbox owner, and the
@@ -446,6 +497,15 @@ func operatorIdentity() (a2aIdentity, bool) {
 			"$JS.API.DIRECT.GET." + a2aDirectoryStream + "." + a2aDirectorySubjectPrefix + "*",
 		},
 		subscribe: []string{"_INBOX." + a2aOperatorBusUser + ".>"},
+	}
+	// With schedules on (A2A_AGENT_SCHEDULES, the switch that registers the
+	// AgentSchedule reconciler), the operator is the schedule source on
+	// attested trigger ingress (#5617): it submits a due run and asks
+	// after the runs it started, and reads the gateway's answers in its
+	// source's reply namespace. Nothing else holds the schedule source.
+	if a2aAgentSchedulesEnabled() {
+		id.publish = append(id.publish, a2aTriggerScheduleSubmit, a2aTriggerScheduleStatus)
+		id.subscribe = append(id.subscribe, a2aTriggerScheduleReplies)
 	}
 	// With a dispatcher, the operator also makes and removes the profiles'
 	// shared durables on PROFILE_SUBMITS (agentprofile_durables.go), and it
@@ -494,6 +554,8 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	if op, ok := operatorIdentity(); ok {
 		ids = append(ids, op)
 	}
+	// The bus migration's principal for the step it is in, while it runs.
+	ids = append(ids, busMigrationIdentities(agent)...)
 	return append(ids,
 		seedIdentity(),
 		webIdentity(),
@@ -583,6 +645,13 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// session-kv. This grant being the gateway's alone is what keeps any
 		// other principal from asking the bridge to act.
 		a2aBoardSubject,
+		// The answers to trigger submissions and status queries, in the
+		// trigger reply namespace rather than a source's _INBOX, for the
+		// reason a2aNotifyReplySubjects gives: a grant reaching the
+		// source's inbox would let the gateway forge its JetStream replies.
+		// The gateway answers only on the asking source's own prefix
+		// (lib.ValidTriggerReplySubject).
+		a2aTriggerReplySubjects,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	// The profile cards' start-up read (a2a/gateway/profiledir.go): the
@@ -640,6 +709,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		subscribe: []string{
 			"a2a.tasks.*.*.events",
 			"a2a.tasks.*.*.supervisor",
+			// A profile task's supervisor subject in its profile form
+			// (lib.ProfileSupervisorSubject, #5301): read only. The
+			// gateway's publish grant stays five-token, so it can never
+			// write one.
+			"a2a.tasks.p.*.*.supervisor",
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
@@ -654,6 +728,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			a2aNotifySubjectConsole,
 			// The bridge's answer to a board request.
 			a2aBoardReplySubjects,
+			// Attested trigger ingress (#5617): every source's submissions
+			// and status queries. The callout binds a source's subject to
+			// its ServiceAccount, so the subject token names the caller.
+			a2aTriggerSubmitWildcard,
+			a2aTriggerStatusWildcard,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -949,6 +1028,36 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	}
 }
 
+// curatorIdentity returns the NATS auth-callout entry for the curator pod,
+// rendered when A2A_CURATOR=true. It holds no task-plane grants, no JetStream
+// consumer-create verbs, and no publish grant on _INBOX.agent.>; replies to
+// a2a.memory.query ride a2a.memory.reply.>.
+func curatorIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	publish := []string{
+		"a2a.topics.shared.annotations",
+		"a2a.topics.shared.blueprint",
+	}
+	publish = append(publish, a2aAgentJetStreamGrants()...)
+	publish = append(publish, a2aMemoryReplySubjects)
+	publish = append(publish, "_INBOX."+a2aCuratorUser+".>")
+
+	return a2aIdentity{
+		user:           a2aCuratorUser,
+		account:        a2aAccountApp,
+		comment:        "the OKF memory curator: indexes learning outcomes into Hindsight, publishes blueprint digests, and answers memory queries on a2a.memory.reply.> with no cluster or forge credentials",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aCuratorName(agent)),
+		publish:        publish,
+		subscribe: []string{
+			"a2a.topics.shared.annotations",
+			"a2a.topics.shared.blueprint",
+			a2aCuratorOutcomesSubject,
+			a2aMemoryQuerySubject,
+			"_INBOX." + a2aCuratorUser + ".>",
+		},
+	}
+}
+
 // bridge: the Hermes bridge sidecar, executor for the `platform` addressee.
 //
 // The other half of `worker`. The bridge is a passthrough that makes the
@@ -1013,11 +1122,11 @@ func bridgeIdentity() a2aIdentity {
 
 	// The capability path, and the reason this static principal has one.
 	//
-	// The operator renders A2A_SPAWN_SESSIONS=true and renders no
-	// A2A_DEFAULT_ADDRESSEE, so the gateway keeps its own default and every
-	// turn in a stock `mode: next` install is addressed to
-	// a2aBridgeAddressee and executed by the sidecar this principal
-	// belongs to. A session pod is reached only by an explicit `delegate:`.
+	// The operator renders A2A_SPAWN_SESSIONS=true and renders
+	// A2A_DEFAULT_ADDRESSEE as `platform` unless spec.harness.tuning.defaultRoute
+	// says `session` (resolveA2ADefaultRoute), so every turn in a stock install
+	// is addressed to a2aBridgeAddressee and executed by the sidecar this
+	// principal belongs to. A session pod is reached only by an explicit `delegate:`.
 	// Without these two subjects the capability the gateway mints for those
 	// tasks is read by nobody: minted, referenced, and never checked.
 	//
@@ -1088,8 +1197,8 @@ func bridgeIdentity() a2aIdentity {
 // STATIC, and it is the legacy twin of the provision principal above: the same
 // job, done by an object nothing in this repository renders. The darkness audit
 // records it as the artifact nobody owns — referenced by no chart, no kustomize
-// path, no Makefile target and no operator code, and it survives a flip to
-// today until someone deletes it by hand.
+// path, no Makefile target and no operator code, and it stays until someone
+// deletes it by hand.
 //
 // It keeps its password because it is APPLIED rather than rendered. It exists on
 // the demo install right now, so dropping its user from nats.conf would refuse
@@ -1383,6 +1492,41 @@ func calloutIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		}
 	}
 	return out
+}
+
+// mappedIdentities are the principals with an entry in the callout's identity
+// map, in render order: calloutIdentities, then the gateway's token entry.
+func mappedIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
+	return append(calloutIdentities(agent), gatewayCalloutEntry(agent))
+}
+
+// gatewayCalloutEntry is the gateway as the callout mints it, keyed on its
+// own ServiceAccount (#5301). It is the one principal rendered twice, on
+// purpose and for a bounded window: the static user stays in nats.conf (and in
+// auth_users) so that a gateway on A2A_GATEWAY_BUS_AUTH=password, the default,
+// connects exactly as before, and this entry is what a gateway on "token" is
+// minted from. Rollback across the flip is therefore the flag, not a bus roll.
+// The static user goes a release after the flip, and with it this exception.
+//
+// The grants are gatewayIdentity's, deny lists included: its consumer-create
+// wildcard on TASKS is held off the pre-created durables only by a publish
+// deny, and no narrower allow can say "any consumer name but these". The map
+// render adds nats.conf's per-profile supervisor deny to it
+// (withGatewayProfileDeny, from the same names), because the entry is live
+// the moment it renders: a bus token for the gateway's ServiceAccount is
+// minted from it whether or not the gateway presents one, and the dispatcher
+// still writes profile terminals on the five-token subject. A JWT carries the
+// deny of the map it was minted from, so a profile bound after a token-mode
+// gateway connected is not in its deny until it reconnects; that is why the
+// flip waits until no consumer folds the five-token profile form (the
+// rollout order on #5301).
+func gatewayCalloutEntry(agent *agentv1alpha1.PlatformAgent) a2aIdentity {
+	id := gatewayIdentity(agent, agent.Namespace)
+	id.auth = a2aAuthCallout
+	id.credsKey = ""
+	id.serviceAccount = a2aServiceAccountName(agent.Namespace, a2aGatewayName(agent))
+	id.comment = "the gateway on A2A_GATEWAY_BUS_AUTH=token; its static user stays until a release after the flip"
+	return id
 }
 
 // staticIdentities returns the principals that stay in nats.conf, in render

@@ -54,12 +54,13 @@ On a GitHub Enterprise Server run (``BENCH_FORGE=github`` with
 ``BENCH_GITHUB_API_ROOT`` when set, and a pull request the reply names is one
 whose URL is on ``BENCH_GITHUB_HOST``.
 
-What it cannot see, and says so: the branch listing wants ``contents: read``,
-which the grading credential does not carry today (docs/ci-pool-projects.md
-5.5), so a listing GitHub refuses leaves ``branches_observed`` false and a
-note in the report rather than an error. A pull request is the write a
+What it may not see, and says so: the branch listing wants ``contents: read``.
+The eval's grading mint asks for it (``LEDGER_GRADING_MINT_BODY`` in
+hack/ci-eval-pr.sh, since #5519; docs/ci-pool-projects.md 5.5). A credential
+without it, or a listing GitHub refuses, leaves ``branches_observed`` false
+and a note in the report rather than an error. A pull request is the write a
 branch exists for, and the pull-request listing needs only
-``pull_requests: read``; the branch half is best effort until the grant.
+``pull_requests: read``, so the branch half stays best effort.
 """
 
 from __future__ import annotations
@@ -104,6 +105,7 @@ from kube_agents_bench.shell_words import (
     _command_word_index,
     _read_shell_line,
     _shell_argvs,
+    _with_literal_marks,
 )
 
 __all__ = [
@@ -261,6 +263,8 @@ WRITING_TOOL_NAME = re.compile(r"(?i)(?:create|open)_?(?:pull|merge|branch|propo
 #: quotes, a comment or ``$((1<<2))``.
 HEREDOC_OPENER = re.compile(r"(?<!<)<<(?!<)-?[ \t]*\\?(['\"]?)([A-Za-z0-9_.-]+)\1")
 HEREDOC_RUNNERS = frozenset((*_SHELL_PROGRAMS_WITH_COMMAND_STRING, "ssh"))
+#: The operator that opens a heredoc, as the shell reader cuts it.
+HEREDOC_OPERATOR = "<<"
 #: The openers of a command substitution a line may leave open across a
 #: heredoc (``--body "$(cat <<'EOF'``); ``$((`` is arithmetic.
 OPEN_SUBSTITUTIONS = ("$(", "`")
@@ -289,6 +293,14 @@ def _read_handled(status: int) -> None:
     from kube_agents_bench import verifiers  # lazy: verifiers imports this module
 
     verifiers._forge_read_handled(status)
+
+
+def _is_rate_limit(status: int, payload: Any) -> bool:
+    from kube_agents_bench import verifiers  # lazy: verifiers imports this module
+
+    # The read's headers too (a Retry-After, no budget left), as the read
+    # path's wait judged it, so the two never disagree about one 403.
+    return verifiers.is_rate_limit_answer(status, payload, verifiers._last_forge_error_headers.get())
 
 
 class GitHubUnreadable(Exception):
@@ -412,7 +424,7 @@ class GitHubClient:
                 f"/repos/{repo}/pulls?state=all&sort=updated&direction=desc"
                 f"&per_page={PAGE_SIZE}&page={page}"
             )
-            self._refuse(status, repo, "the pull-request listing", "pull_requests: read")
+            self._refuse(status, repo, "the pull-request listing", "pull_requests: read", payload)
             if not isinstance(payload, list):
                 raise GitHubUnreadable(
                     f"GitHub answered the pull-request listing for {repo} with a body "
@@ -444,7 +456,7 @@ class GitHubClient:
         if status == STATUS_NOT_FOUND:
             _read_handled(status)
             return None
-        self._refuse(status, repo, f"pull request #{number}", "pull_requests: read")
+        self._refuse(status, repo, f"pull request #{number}", "pull_requests: read", payload)
         if not isinstance(payload, dict):
             return None
         total = payload.get("commits")
@@ -458,7 +470,7 @@ class GitHubClient:
         if status == STATUS_NOT_FOUND:
             _read_handled(status)
             return None
-        self._refuse(status, repo, f"pull request #{number}'s commits", "pull_requests: read")
+        self._refuse(status, repo, f"pull request #{number}'s commits", "pull_requests: read", commits)
         if not isinstance(commits, list):
             return None
         for entry in reversed(commits):
@@ -477,7 +489,7 @@ class GitHubClient:
             status, payload = self.get(
                 f"/repos/{repo}/pulls?state=all&per_page={PAGE_SIZE}&page={page}"
             )
-            self._refuse(status, repo, "the pull-request listing", "pull_requests: read")
+            self._refuse(status, repo, "the pull-request listing", "pull_requests: read", payload)
             if not isinstance(payload, list):
                 raise GitHubUnreadable(
                     f"GitHub answered the pull-request listing for {repo} with a body "
@@ -501,10 +513,14 @@ class GitHubClient:
         status, payload = self.get(
             f"/repos/{repo}/git/matching-refs/heads/{urllib.parse.quote(prefix, safe='/')}"
         )
+        # A rate limit is not "cannot list refs": it raises, named as the
+        # limit, rather than read as a missing grant (#6105).
+        if status == STATUS_FORBIDDEN and _is_rate_limit(status, payload):
+            self._refuse(status, repo, "the branch listing", "contents: read", payload)
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
             _read_handled(status)
             return None
-        self._refuse(status, repo, "the branch listing", "contents: read")
+        self._refuse(status, repo, "the branch listing", "contents: read", payload)
         if not isinstance(payload, list):
             raise GitHubUnreadable(
                 f"GitHub answered the branch listing for {repo} with a body that is "
@@ -523,17 +539,28 @@ class GitHubClient:
         status, payload = self.get(
             f"/repos/{repo}/branches/{urllib.parse.quote(branch, safe='/')}"
         )
+        # A rate limit is not "cannot list refs": it raises, named as the
+        # limit, rather than read as a missing grant (#6105).
+        if status == STATUS_FORBIDDEN and _is_rate_limit(status, payload):
+            self._refuse(status, repo, f"the branch {branch}", "contents: read", payload)
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
             _read_handled(status)
             return None
-        self._refuse(status, repo, f"the branch {branch}", "contents: read")
+        self._refuse(status, repo, f"the branch {branch}", "contents: read", payload)
         commit = ((payload or {}).get("commit") or {}) if isinstance(payload, dict) else {}
         inner = commit.get("commit") or {}
         committer = inner.get("committer") or {}
         return parse_github_time(committer.get("date"))
 
     @staticmethod
-    def _refuse(status: int, repo: str, what: str, permission: str) -> None:
+    def _refuse(status: int, repo: str, what: str, permission: str, payload: Any = None) -> None:
+        if _is_rate_limit(status, payload):
+            # A limit, not a permission: the grading App's installation is
+            # shared by every evals repository of its shard, so one hourly budget (#6105).
+            raise GitHubUnreadable(
+                f"GitHub rate-limited {what} on {repo} (answered {status}); the evals repositories of a shard "
+                "share one App installation's hourly budget, so this check could not be evaluated"
+            )
         if status == STATUS_UNAUTHORIZED:
             raise GitHubUnreadable(
                 f"GitHub answered 401 for {what} on {repo}: {token_source(FORGE_GITHUB)} is "
@@ -867,12 +894,12 @@ def _opens_heredoc(head: str) -> bool:
     """Whether a ``<<`` right after ``head`` is one the shell reads as an
     operator: outside quotes and comments (:func:`_read_shell_line`), at the
     top of the line or inside a command substitution the line leaves open."""
-    text, _, operators = _read_shell_line(head + "<<")
-    if operators and operators[-1] == "<<" and text.rstrip().endswith(_OPERATOR_MARK.format(index=len(operators) - 1)):
+    text, _, operators = _read_shell_line(head + HEREDOC_OPERATOR)
+    if operators and operators[-1] == HEREDOC_OPERATOR and text.rstrip().endswith(_OPERATOR_MARK.format(index=len(operators) - 1)):
         return True
     for opener in OPEN_SUBSTITUTIONS:
         start = head.rfind(opener)
-        if start >= 0 and not head.startswith(ARITHMETIC_OPENER, start) and text.endswith(head[start:] + "<<"):
+        if start >= 0 and not head.startswith(ARITHMETIC_OPENER, start) and text.endswith(_with_literal_marks(head[start:] + HEREDOC_OPERATOR)):
             return _opens_heredoc(head[start + len(opener):])
     return False
 

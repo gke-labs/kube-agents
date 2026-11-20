@@ -14,6 +14,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD_TRIAGE_SCRIPT = REPO_ROOT / "agents/platform/scripts/workload_triage.py"
 CLUSTER_WORKLOAD_SECURITY = REPO_ROOT / "agents/cluster/skills/gke-workload-security/SKILL.md"
@@ -356,6 +358,25 @@ class SessionShippedWorkloadSkillsTest(unittest.TestCase):
         self.assertIn('"check if there are any failing workloads"', section)
         self.assertNotIn("workload_triage.py", section)
 
+    def test_cluster_soul_status_answer_names_what_it_found_not_the_command(self):
+        soul = (REPO_ROOT / "agents/cluster/SOUL.md").read_text(encoding="utf-8")
+        section = soul[soul.index("## 4.") : soul.index("## 5.")]
+        self.assertIn(
+            'the evidence sentence states what you found ("no node has `MemoryPressure`"), naming no command, '
+            "script, kube context or the time you ran it",
+            section,
+        )
+        self.assertNotIn("the command named inside an evidence sentence", section)
+
+    def test_triage_scan_status_answer_keeps_run_details_out(self):
+        skills = REPO_ROOT / "agents/cluster"
+        for path in ("skills/workload-triage-scan/SKILL.md", "persona/skills/workload-triage-scan/SKILL.md"):
+            text = (skills / path).read_text(encoding="utf-8")
+            self.assertIn("The command, the kubeconfig context and the UTC time on the scan's first line stay out of the answer.", text, path)
+            self.assertNotIn("(kubeconfig context and UTC time), its summary line and the command", text, path)
+        reporting = (skills / "skills/workload-triage-scan/references/reporting.md").read_text(encoding="utf-8")
+        self.assertNotIn("Scanned <UTC time> on <context>", reporting)
+
 
 class RoutedSkillsExistTest(unittest.TestCase):
     def test_config_connector_skill_exists(self):
@@ -368,13 +389,16 @@ class RoutedSkillsExistTest(unittest.TestCase):
 
 
 def _description(skill):
-    """The frontmatter `description:` of a platform skill, which the router reads."""
+    """The frontmatter `description` of a platform skill, which the router reads.
+
+    Read with a YAML parser, as the router's loader reads it, so a description
+    in a folded block (`description: >-`) is read whole.
+    """
     text = (REPO_ROOT / "agents/platform/skills" / skill / "SKILL.md").read_text(encoding="utf-8")
-    front = text.split("---", 2)[1]
-    for line in front.splitlines():
-        if line.startswith("description:"):
-            return line
-    raise AssertionError(f"{skill} has no description line")
+    description = yaml.safe_load(text.split("---", 2)[1]).get("description")
+    if not description:
+        raise AssertionError(f"{skill} has no description")
+    return description
 
 
 class DeleteRequestsRouteToTheDeletionSectionTest(unittest.TestCase):

@@ -154,6 +154,9 @@ class GitLabForge(Forge):
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
     labels = True
+    # A `/label ~x` line in a note or a description is a quick action GitLab
+    # runs under the credential that posted it.
+    text_sets_labels = True
     whoami_route = ("user", "username")
     # What an install that has not configured GitLab answers for gitlab.com: a
     # named gap rather than "not a forge this install serves".

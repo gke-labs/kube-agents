@@ -17,7 +17,9 @@ The operator renders one `NetworkPolicy` over the agent Pod, `<agent-name>-gatew
 - **Control-plane egress** — the Kubernetes API server, at the endpoints the operator discovers.
 - **External egress** — HTTPS (`443`) to `0.0.0.0/0` minus the private ranges, unless FQDN filtering is on.
 
-[Security and IAM](/kube-agents/reference/security-and-iam/) is canonical for the full rule set and why each peer is there. `spec.networkPolicy.enabled: false` stops policy generation and deletes the policies the operator manages; [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for that field.
+The policy carries one more ingress rule, which renders with the A2A stack on every install: the credential broker's Pods, and nobody else, to the audit-report store listener on `8700`.
+
+[Security and IAM](/kube-agents/reference/security-and-iam/) is canonical for the full rule set and why each peer is there. `spec.networkPolicy.enabled: false` stops policy generation and deletes the policies the operator manages, the store's rule with the gateway policy. An install's own policies should then also admit TCP `8700` to the agent Pod from the credential broker's Pods alone. [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for that field.
 
 ### GKE Dataplane V2 & FQDN Network Policies
 
@@ -52,7 +54,8 @@ The exposed ports:
 `k8s-operator/config/` holds larger Kustomize bases the operator manager uses. Notable subtrees:
 
 - `config/crd/` — the `PlatformAgent`, `AgentPlugin`, `AgentProfile` and `Tier` CRDs.
-- `config/rbac/` — ClusterRoles + bindings for the manager.
+- `config/rbac/` — the manager's ClusterRole and its binding, and the namespaced Role (the write verbs on every kind the operator renders) with its binding in the install namespace.
+- `config/profiles/` — the profile namespace (`kubeagents-system-profiles`) with the operator's namespaced Role (a generated copy of the Role document in `config/rbac/role.yaml`) and its RoleBinding; `make deploy` applies it after `config/default`, and `make undeploy` deletes the namespace.
 - `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager, plus its `PodDisruptionBudget`.
 - `config/integrations/github/` — Minty deployment and its `PodDisruptionBudget`.
@@ -74,7 +77,7 @@ that). Deploy the dev copies via `make deploy-*`
 from `k8s-operator/`:
 
 ```bash
-make deploy IMG=<registry>/k8s-operator:$(git rev-parse HEAD)   # operator; refuses a floating tag
+make deploy IMG=<registry>/k8s-operator:$(git rev-parse HEAD)   # operator; refuses a floating tag; also applies config/profiles
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy

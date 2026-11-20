@@ -206,10 +206,12 @@ deploy: kustomize check-img ## Deploy controller to the K8s cluster specified in
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	cp -R config "$$tmp/config"; \
 	(cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=${IMG}); \
-	$(KUSTOMIZE) build "$$tmp/config/default" | kubectl apply --server-side -f -
+	$(KUSTOMIZE) build "$$tmp/config/default" | kubectl apply --server-side -f - && \
+	$(KUSTOMIZE) build "$$tmp/config/profiles" | kubectl apply --server-side -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(KUSTOMIZE) build config/profiles | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
 # The integration manifests carry `image: $${..._IMAGE}` so a mirrored install

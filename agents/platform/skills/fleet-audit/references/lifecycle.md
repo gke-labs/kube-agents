@@ -122,7 +122,7 @@ branch. It prints exactly one JSON line:
   "checks_contract": "Run every check above against every cluster you can read. …",
   "next_steps": [
     "Read the SOP at /opt/data/profiles/platform/governance/compliance_audit_sop.md in full, then …",
-    "Write the findings document at /opt/data/scratch/findings_compliance-audit.json, starting it with …/scripts/audit_report.py draft --audit compliance-audit --manifest-file /opt/data/scratch/manifest_compliance-audit.json. Its rules are in …/references/findings-document.md.",
+    "Run …/scripts/audit_report.py draft --audit compliance-audit --manifest-file /opt/data/scratch/manifest_compliance-audit.json: it writes the findings document to /opt/data/scratch/findings_compliance-audit.json. Fill each finding's `recommendation` and `remediation` in that file, in place: … Its rules are in …/references/findings-document.md.",
     "Run …/scripts/audit_report.py finish --audit compliance-audit --findings-file … --manifest-file /opt/data/scratch/manifest_compliance-audit.json. Its output and exit codes are in …/references/finish.md."
   ]
 }
@@ -170,7 +170,7 @@ and the issue has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
-whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a, `stockout-prevention` §4a) searches them before it
+whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a, `stockout-prevention` §4a, `gce-compute-fleet-audit` §2a) searches them before it
 reports a posture as a finding. The audit only reads them, and nothing writes them: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
@@ -284,12 +284,13 @@ All three exit 2 in directory mode, where the clone already holds the file.
 
 #### Between the collector and `finish`: `draft` and `precheck`
 
-`audit_report.py draft --audit <audit-id> --manifest-file <manifest> [--out <path>]` starts the
-findings document from the collector's manifest: `scope.clusters` with each collected target's
+`audit_report.py draft --audit <audit-id> --manifest-file <manifest> [--out <path>]` writes the
+findings document to the run's `findings_path` (or to `--out`) from the collector's manifest: `scope.clusters` with each collected target's
 `checks_run` copied from the commands it ran, `scope.skipped` for every target it could not read, and
 one finding per candidate carrying its evidence, impact and severity. It leaves each finding's
 `recommendation` empty and its `remediation` `manual`, because those are the judgement the collector
-cannot make: write them, and `finish` has nothing else to reject.
+cannot make: write them into the file in place, as step 3 of the skill says, and `finish` has nothing
+else to reject. A second `draft` refuses to replace a document you have changed in any field (`--overwrite` starts it again).
 
 `audit_report.py precheck --audit <audit-id> --manifest-file <manifest> [--repo "<owner>/<repo>"] [--scheduled]`
 runs after the collector command and before the drafting by hand, where the SOP puts it (two

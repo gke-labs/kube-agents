@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -167,6 +168,13 @@ type DispatchMessage struct {
 	// past the configured maximum lifetime.
 	TaskCredential string `json:"taskCredential,omitempty"`
 	ProxyToken     string `json:"proxyToken,omitempty"`
+	// Script is the helper script a script-run task runs (#5622): the entry
+	// of the profile's spec.scripts the task's trigger names, resolved at
+	// admission from the dispatch config the dispatcher checked it against.
+	// A confirm only. The worker runs it in place of the harness, only in
+	// Job mode, and only when the name equals the script in its verified
+	// ProxyToken. The path comes from here, never from the task.
+	Script *DispatchScript `json:"script,omitempty"`
 }
 
 // Validate reports the first way m is malformed, or nil.
@@ -176,6 +184,14 @@ func (m DispatchMessage) Validate() error {
 	}
 	if m.Type != DispatchConfirm && (m.TaskCredential != "" || m.ProxyToken != "") {
 		return fmt.Errorf("dispatch %s: task credentials ride on a confirm only", m.Type)
+	}
+	if m.Script != nil {
+		if m.Type != DispatchConfirm {
+			return fmt.Errorf("dispatch %s: a script rides on a confirm only", m.Type)
+		}
+		if err := m.Script.Validate(); err != nil {
+			return fmt.Errorf("dispatch confirm: %w", err)
+		}
 	}
 	switch m.Type {
 	case DispatchOffer:
@@ -275,6 +291,11 @@ type LeaseRecord struct {
 	// and acks it without running or failing it again. A tombstone holds no
 	// worker and is never re-adopted or renewed.
 	FinishedAt time.Time `json:"finishedAt,omitzero"`
+	// OnJob says the task was confirmed to the pod of a Job of its own, so a
+	// restarted dispatcher that re-adopts it deletes that Job when the task
+	// ends (#5646). A record from a dispatcher that predates the field
+	// leaves it unset; such a task ran on a Job only at an unattended tier.
+	OnJob bool `json:"onJob,omitempty"`
 }
 
 // Finished reports whether the record is a tombstone.
@@ -314,6 +335,19 @@ func (l LeaseRecord) Validate() error {
 // watches that one ConfigMap, the way the callout watches the identity map,
 // so a tuning or profile change applies without a restart.
 const DispatchConfigKey = "dispatch.json"
+
+// ProfileSupervisorFormProfile is DispatchConfig.ProfileSupervisorForm's one
+// value: a profile task's terminal goes on ProfileSupervisorSubject.
+const ProfileSupervisorFormProfile = "profile"
+
+// SupervisorSubjectFor is where a dispatcher under cfg writes profile's task's
+// terminal: the six-token form once cfg says so, else the five-token one.
+func (c DispatchConfig) SupervisorSubjectFor(profile, taskID string) string {
+	if c.ProfileSupervisorForm == ProfileSupervisorFormProfile {
+		return ProfileSupervisorSubject(profile, taskID)
+	}
+	return TaskSupervisorSubject(profile, taskID)
+}
 
 // DispatchConfig is everything the dispatcher reads about the install's
 // profiles: the shared caps and intervals and each bound profile's own
@@ -373,9 +407,17 @@ type DispatchConfig struct {
 	// tombstone at least this long. Zero is from an operator that predates
 	// the field; the dispatcher then uses ProfileSubmitRetention.
 	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
+	// ProfileSupervisorForm is the subject form the dispatcher writes a
+	// profile task's terminal on (#5301): empty for the five-token
+	// TaskSupervisorSubject, ProfileSupervisorFormProfile for the six-token
+	// ProfileSupervisorSubject. The operator sets it only once every reader
+	// that can run watches both forms. A dispatcher from before the field
+	// ignores it and keeps the five-token form, which readers still watch.
+	ProfileSupervisorForm string `json:"profileSupervisorForm,omitempty"`
 	// JobLabels go on every Job the dispatcher creates: the operator's
 	// agent labels, by which a teardown deletes only this install's Jobs,
-	// and DispatchJobLabel. Set when some profile has a JobTemplate.
+	// and DispatchJobLabel. Set when some profile has a Job template
+	// (HasJobTemplate).
 	JobLabels map[string]string `json:"jobLabels,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity, and those draining after they left it (DrainingUntil). A
@@ -383,18 +425,154 @@ type DispatchConfig struct {
 	Profiles []DispatchProfile `json:"profiles"`
 }
 
+// DispatchJobTemplateRef is where a profile's Job template is, and which
+// rendering of it this config means.
+type DispatchJobTemplateRef struct {
+	// Name is the DispatchJobTemplate's name in the profile namespace. An
+	// operator from #5479 on leaves it out: it is always the profile's own
+	// param, DispatchJobTemplateName (NameFor).
+	Name string `json:"name,omitempty"`
+	// Hash is the rendering's hash, as the object's
+	// DispatchJobTemplateHashAnnotation carries it. With PerTier it is one
+	// hash over every tier's rendering, stamped on each tier's param, so a
+	// change to any tier's template moves them all together.
+	Hash string `json:"hash"`
+	// PerTier says the profile has a template at each of its live tiers, not
+	// only at its unattended-mode one (#5646): permit-carrying tasks run in
+	// their own one-pod Job at whatever tier they were admitted at. The
+	// unattended-mode tier's param keeps the profile's own name
+	// (DispatchJobTemplateName), which a dispatcher that predates the field
+	// reads; every other tier's is DispatchJobTierTemplateName. Unset, the
+	// reference is to the unattended-mode tier's template alone.
+	PerTier bool `json:"perTier,omitempty"`
+}
+
+// dispatchJobTemplatePrefix is a profile's DispatchJobTemplate name, less the
+// profile's name: the operator's own dispatchJobTemplatePrefix
+// (agentprofile_job_template.go), which must stay the same string.
+const dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
+
+// DispatchJobTemplateName is the DispatchJobTemplate that holds profile's Job
+// template in the profile namespace: its unattended-mode tier's.
+func DispatchJobTemplateName(profile string) string { return dispatchJobTemplatePrefix + profile }
+
+// dispatchJobTierTemplatePrefix is a (profile, tier)'s DispatchJobTemplate
+// name, less "<profile>.<tier>": the operator's dispatchJobTierTemplatePrefix,
+// which must stay the same string. Not the profile prefix, so no tier's name
+// can be another profile's unattended-mode one; and a dot between the two,
+// which neither can hold (both are subject tokens), so no two pairs share a
+// name.
+const dispatchJobTierTemplatePrefix = "kube-agents-dispatch-job-tier-"
+
+// DispatchJobTierTemplateName is the DispatchJobTemplate that holds profile's
+// Job template at tier, for a tier other than its unattended-mode one, when
+// its reference is PerTier (#5646).
+func DispatchJobTierTemplateName(profile, tier string) string {
+	return dispatchJobTierTemplatePrefix + profile + "." + tier
+}
+
+// NameFor is the DispatchJobTemplate r names for profile: its Name when it
+// carries one, else the profile's own param.
+func (r *DispatchJobTemplateRef) NameFor(profile string) string {
+	if r.Name != "" {
+		return r.Name
+	}
+	return DispatchJobTemplateName(profile)
+}
+
+// DerivedDurables are the shared durables p is read on: one per kind for each
+// of its live tiers and each tier it drains, so what is queued at a draining
+// tier still reaches a terminal (tier-withdrawn). A draining profile has none.
+// The operator creates the same set (its profileDurableName over
+// AllowedTierList), pinned by the shared fixture testdata/rendered-dispatch-durables.json.
+func (p DispatchProfile) DerivedDurables() []DispatchDurable {
+	if p.Draining() {
+		return nil
+	}
+	tiers := append([]string(nil), p.Tiers...)
+	for _, d := range p.DrainingTiers {
+		tiers = append(tiers, d.Tier)
+	}
+	out := make([]DispatchDurable, 0, 2*len(tiers))
+	for _, tier := range tiers {
+		for _, kind := range []string{SubmitKindTop, SubmitKindChild} {
+			out = append(out, DispatchDurable{Tier: tier, Kind: kind, Name: ProfileDurableName(p.Name, tier, kind)})
+		}
+	}
+	return out
+}
+
+// sameDurables reports whether a and b name the same set of durables.
+func sameDurables(a, b []DispatchDurable) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := map[DispatchDurable]int{}
+	for _, d := range a {
+		set[d]++
+	}
+	for _, d := range b {
+		if set[d] == 0 {
+			return false
+		}
+		set[d]--
+	}
+	return true
+}
+
+// DispatchJobTemplateHashAnnotation is the annotation on a DispatchJobTemplate
+// that says which rendering of the profile's template it holds, matched
+// against DispatchJobTemplateRef.Hash.
+const DispatchJobTemplateHashAnnotation = "kubeagents.x-k8s.io/dispatch-template-hash"
+
+// HasJobTemplate says the config names a template a task of p's at tier can
+// run on as a Job. An inline template, or a reference that isn't PerTier, is
+// the unattended-mode tier's only: true for any tier, and the caller holds
+// the tier to the unattended side. A PerTier reference covers each live tier
+// (#5646), and no draining one, whose template the operator drops at once.
+func (p DispatchProfile) HasJobTemplate(tier string) bool {
+	switch {
+	case len(p.JobTemplate) > 0:
+		return true
+	case p.JobTemplateRef == nil:
+		return false
+	case !p.JobTemplateRef.PerTier:
+		return true
+	}
+	return slices.Contains(p.Tiers, tier)
+}
+
+// JobTemplatesPerTier says p's templates are per tier (#5646), so a task at
+// a tier that isn't unattended can still run as a Job.
+func (p DispatchProfile) JobTemplatesPerTier() bool {
+	return p.JobTemplateRef != nil && p.JobTemplateRef.PerTier && len(p.JobTemplate) == 0
+}
+
 // DispatchProfile is one profile's limits, from its AgentProfile.
 type DispatchProfile struct {
 	Name  string   `json:"name"`
 	Tiers []string `json:"tiers"`
+	// UnattendedTier names the profile's unattended-mode tier when it isn't
+	// the built-in unattended: a Tier resource of that mode (#3659). The
+	// dispatcher treats it as it treats unattended (Job mode, the
+	// unattended side of the interactive reserve). Empty for the built-in.
+	UnattendedTier string `json:"unattendedTier,omitempty"`
 	// Concurrency is the profile's own ceiling (spec.concurrency).
 	Concurrency           int                `json:"concurrency"`
 	QueueTimeoutSeconds   int                `json:"queueTimeoutSeconds"`
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []ProfileParameter `json:"parameters,omitempty"`
-	// Durables are the shared durables the operator created for it, one
-	// per (tier, kind). A draining profile has none.
-	Durables []DispatchDurable `json:"durables"`
+	// Scripts are the helper scripts the profile allowlists
+	// (spec.scripts, #5622). The dispatcher refuses a submission naming a
+	// script not listed here. A script-run task's path comes from here,
+	// never from the task.
+	Scripts []DispatchScript `json:"scripts,omitempty"`
+	// Durables, when listed, are the shared durables the operator created
+	// for it, one per (tier, kind). An operator from #5479 on no longer lists
+	// them: the dispatcher derives them (DerivedDurables). For one release a
+	// listed set is still accepted, and Validate holds it to exactly the
+	// derived one. A draining profile lists none.
+	Durables []DispatchDurable `json:"durables,omitempty"`
 	// JobTemplate is the pod template (a core/v1 PodTemplateSpec) the
 	// profile's unattended tasks run on as Jobs, rendered by the operator
 	// only where the chart installed the Job admission policy, which holds
@@ -403,11 +581,88 @@ type DispatchProfile struct {
 	// pools for the read tier only) and the dispatcher refuses them
 	// no-worker at admission.
 	JobTemplate json.RawMessage `json:"jobTemplate,omitempty"`
+	// JobTemplateRef names the DispatchJobTemplate in the profile namespace
+	// that holds the profile's Job template, in place of JobTemplate. The
+	// operator writes that object, the admission policy's param, before the
+	// config that names it. The dispatcher reads the template from there
+	// only when the object's DispatchJobTemplateHashAnnotation equals Hash,
+	// so it never builds a Job from a template the config has moved past.
+	// An operator that predates the field sends JobTemplate instead.
+	JobTemplateRef *DispatchJobTemplateRef `json:"jobTemplateRef,omitempty"`
 	// DrainingUntil, set, makes the profile draining (#5074): it has left
 	// the install, so it has no durables and nothing new is dispatched for
 	// it, but it stays listed, and keeps its .supervisor grant, until then,
 	// so the terminals of the tasks it still holds reach their requesters.
 	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
+	// DrainingTiers are tiers that left a live profile and still drain
+	// (#3659, 2b-ii): dropped from allowedTiers, or their Tier deleted. Their
+	// durables stay listed, so what is queued at them is read and refused
+	// tier-withdrawn rather than left with no terminal, and nothing new
+	// starts at them; a task already held at one runs to its end. Not in
+	// Tiers.
+	DrainingTiers []DrainingTier `json:"drainingTiers,omitempty"`
+}
+
+// ScriptRoot is the one directory helper scripts ship in, in the worker
+// image (#5622), and ScriptPath the shape of a script path under it: each
+// segment starts with a letter, digit or underscore and holds only those,
+// dots and hyphens, so there is no "." or ".." segment, no empty one, and no
+// shell metacharacter. Both are the AgentProfile CRD's (spec.scripts[].path),
+// which TestScriptPathIsTheCRDs holds them to.
+const ScriptRoot = "/opt/kube-agents/scripts/"
+
+var ScriptPath = regexp.MustCompile(`^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$`)
+
+// Validate reports the first way sc can't be run, or nil: a name that's a
+// subject token, a path of ScriptPath's shape, and a positive timeout.
+func (sc DispatchScript) Validate() error {
+	if !ValidSubjectToken(sc.Name) || !ScriptPath.MatchString(sc.Path) || sc.TimeoutSeconds < 1 || sc.TimeoutSeconds > MaxDispatchSeconds {
+		return fmt.Errorf("script %q: not a subject token, a path outside %s, or a timeout outside 1 to %ds", sc.Name, ScriptRoot, MaxDispatchSeconds)
+	}
+	return nil
+}
+
+// Script is the profile's allowlisted script named name, if it lists one.
+func (p DispatchProfile) Script(name string) (DispatchScript, bool) {
+	for _, sc := range p.Scripts {
+		if sc.Name == name {
+			return sc, true
+		}
+	}
+	return DispatchScript{}, false
+}
+
+// DispatchScript is one helper script a profile allowlists: its name, its
+// path in the worker image, and the bound on one run.
+type DispatchScript struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+}
+
+// DrainingTier is one tier a live profile drains, until Until.
+type DrainingTier struct {
+	Tier string `json:"tier"`
+	// Mode is the tier's mode when it left, interactive or unattended: what
+	// the operator keeps rendering for it while it drains.
+	Mode  string    `json:"mode"`
+	Until time.Time `json:"until"`
+	// Ending, set, is an administrator ending this drain now (#5850): the
+	// dispatcher ends every task it holds at the tier instead of letting it
+	// run to its end, and the operator tears the tier down at Until, which it
+	// has shortened to a grace. An older dispatcher ignores it; the teardown
+	// still ends the work, as lease-expired.
+	Ending bool `json:"ending,omitempty"`
+}
+
+// DrainsTier reports whether tier is one p drains (DrainingTiers).
+func (p DispatchProfile) DrainsTier(tier string) bool {
+	for _, d := range p.DrainingTiers {
+		if d.Tier == tier {
+			return true
+		}
+	}
+	return false
 }
 
 // Draining reports whether the profile is draining (DrainingUntil).
@@ -455,6 +710,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
 	case c.SubmitRetentionSeconds < 0 || c.SubmitRetentionSeconds > int(MaxSubmitRetention/time.Second):
 		return fmt.Errorf("dispatch config: submitRetentionSeconds %d is outside 0 to %d", c.SubmitRetentionSeconds, int(MaxSubmitRetention/time.Second))
+	case c.ProfileSupervisorForm != "" && c.ProfileSupervisorForm != ProfileSupervisorFormProfile:
+		return fmt.Errorf("dispatch config: profileSupervisorForm %q is not %q or empty", c.ProfileSupervisorForm, ProfileSupervisorFormProfile)
 	}
 	for k, v := range c.JobLabels {
 		if !validLabelKey(k) || !labelValue.MatchString(v) {
@@ -467,8 +724,11 @@ func (c DispatchConfig) Validate() error {
 			return fmt.Errorf("dispatch config: profile %q is not a subject token, or is listed twice", p.Name)
 		}
 		seen[p.Name] = true
-		if len(p.JobTemplate) > 0 && !podTemplateWithContainers(p.JobTemplate) {
+		if len(p.JobTemplate) > 0 && !PodTemplateWithContainers(p.JobTemplate) {
 			return fmt.Errorf("dispatch config: profile %s's jobTemplate is not a pod template with containers", p.Name)
+		}
+		if r := p.JobTemplateRef; r != nil && (len(p.JobTemplate) > 0 || (r.Name != "" && !objectName.MatchString(r.Name)) || r.Hash == "" || !labelValue.MatchString(r.Hash)) {
+			return fmt.Errorf("dispatch config: profile %s's jobTemplateRef needs a hash (and, if it names one, a valid name), and no inline jobTemplate beside it", p.Name)
 		}
 		if max(p.QueueTimeoutSeconds, p.ActiveDeadlineSeconds) > MaxDispatchSeconds {
 			return fmt.Errorf("dispatch config: profile %s has a second count over %d", p.Name, MaxDispatchSeconds)
@@ -476,13 +736,33 @@ func (c DispatchConfig) Validate() error {
 		if p.Concurrency < 1 || len(p.Tiers) == 0 {
 			return fmt.Errorf("dispatch config: profile %s needs a concurrency and a tier", p.Name)
 		}
-		if p.Draining() != (len(p.Durables) == 0) {
-			return fmt.Errorf("dispatch config: profile %s has %d durables; a live profile needs one, a draining one has none", p.Name, len(p.Durables))
+		if p.Draining() && len(p.Durables) > 0 {
+			return fmt.Errorf("dispatch config: draining profile %s lists %d durables; a draining one has none", p.Name, len(p.Durables))
+		}
+		drains := map[string]bool{}
+		for _, d := range p.DrainingTiers {
+			if !ValidSubjectToken(d.Tier) || drains[d.Tier] || slices.Contains(p.Tiers, d.Tier) || d.Until.IsZero() {
+				return fmt.Errorf("dispatch config: profile %s drains tier %q, which is not a subject token, is listed twice or live, or has no end", p.Name, d.Tier)
+			}
+			drains[d.Tier] = true
+		}
+		scripts := map[string]bool{}
+		for _, sc := range p.Scripts {
+			if sc.Validate() != nil || scripts[sc.Name] || sc.TimeoutSeconds > p.ActiveDeadlineSeconds {
+				return fmt.Errorf("dispatch config: profile %s script %q is not a subject token, is listed twice, has a path outside %s, or a timeout outside 1 to %ds",
+					p.Name, sc.Name, ScriptRoot, p.ActiveDeadlineSeconds)
+			}
+			scripts[sc.Name] = true
 		}
 		for _, d := range p.Durables {
 			if d.Name != ProfileDurableName(p.Name, d.Tier, d.Kind) {
 				return fmt.Errorf("dispatch config: profile %s durable %q is not %s", p.Name, d.Name, ProfileDurableName(p.Name, d.Tier, d.Kind))
 			}
+		}
+		// An entry that still lists its durables (an operator from before
+		// #5479) lists exactly the derived set; neither side is preferred.
+		if len(p.Durables) > 0 && !sameDurables(p.Durables, p.DerivedDurables()) {
+			return fmt.Errorf("dispatch config: profile %s lists durables that are not the ones its tiers derive", p.Name)
 		}
 	}
 	return nil
@@ -506,10 +786,10 @@ func ProfilePoolSelector(profile, tier string) string {
 	return fmt.Sprintf("%s=%s,%s=%s,%s=%s", ProfileComponentLabel, ProfileWorkerComponent, ProfileNameLabel, profile, ProfileTierLabel, tier)
 }
 
-// podTemplateWithContainers reports whether raw is a JSON pod template with
+// PodTemplateWithContainers reports whether raw is a JSON pod template with
 // at least one container: a null, an empty object or a scalar puts no
 // profile in Job mode.
-func podTemplateWithContainers(raw json.RawMessage) bool {
+func PodTemplateWithContainers(raw json.RawMessage) bool {
 	var t struct {
 		Spec *struct {
 			Containers []json.RawMessage `json:"containers"`
@@ -520,6 +800,8 @@ func podTemplateWithContainers(raw json.RawMessage) bool {
 
 // labelValue and labelName are Kubernetes' label value and name syntax.
 var (
+	// objectName is a DNS-1123 subdomain, an object's name.
+	objectName  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
 	labelValue  = regexp.MustCompile(`^(([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9])?$`)
 	labelName   = regexp.MustCompile(`^([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9]$`)
 	labelPrefix = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)

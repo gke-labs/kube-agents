@@ -22,6 +22,8 @@ steps:
       - "deploy/kube-proxy/Dockerfile"
       - "--build-arg"
       - "BUILDKIT_INLINE_CACHE=1"
+      - "--build-arg"
+      - "KUBE_AGENTS_VERSION=$_KUBE_AGENTS_VERSION"
       - "."
 images:
   - "$_IMAGE_URI"
@@ -29,3 +31,5 @@ images:
 substitutions:
   _IMAGE_URI: ""
   _IMAGE_URI_LATEST: ""
+  # The commit the image names in --version and its startup log; callers pass the SHA.
+  _KUBE_AGENTS_VERSION: "dev"

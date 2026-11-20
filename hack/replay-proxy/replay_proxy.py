@@ -29,8 +29,8 @@ size.
 All of that runs on one background thread fed by a bounded queue
 (ANALYSIS_QUEUE_SIZE); the handler enqueues, and drops the analysis (an
 `analysis_dropped` line) rather than wait when the queue is full. In replay
-mode the handler also, before forwarding, notes each message's first-seen
-time, normalizes and fingerprints the request, and looks it up (lookup); the
+mode the handler also, before forwarding, notes each message's and each
+prefix's first-seen time, normalizes and fingerprints the request, and looks it up (lookup); the
 analysis reuses that normalization and fingerprint. Memory is
 bounded: a request body over MAX_REQUEST_BYTES gets a 413, and the proxy stops
 observing a response after MAX_OBSERVED_BYTES (its bytes still flow).
@@ -141,11 +141,22 @@ SEGMENT_ROLL_CHECK_SECONDS = 1.0
 # remaining 15 with room for the interpreter to exit.
 SHUTDOWN_CLOSE_SECONDS = 10.0
 
-# Request headers not forwarded: hop-by-hop ones, and Accept-Encoding so the
-# upstream answers uncompressed and the usage block can be read.
+# The eval run tag headers the agent's eval_run_tag plugin adds
+# (deploy/docker/patches/eval_run_tag.py): logged on every request line as
+# eval_run and eval_agent, and never forwarded, so LiteLLM and the model
+# behind it see the request they saw before the tags existed. The key is the
+# body's alone (normalizer.py), so they cannot reach it either.
+EVAL_RUN_HEADER = "x-kube-agents-eval-run"
+EVAL_AGENT_HEADER = "x-kube-agents-eval-agent"
+EVAL_RUN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}")
+EVAL_AGENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63};[a-z]{1,16}")
+
+# Request headers not forwarded: hop-by-hop ones, Accept-Encoding so the
+# upstream answers uncompressed and the usage block can be read, and the eval
+# run tag headers above.
 DROPPED_REQUEST_HEADERS = {
     "host", "content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer",
-    "upgrade", "proxy-connection", "accept-encoding",
+    "upgrade", "proxy-connection", "accept-encoding", EVAL_RUN_HEADER, EVAL_AGENT_HEADER,
 }
 DROPPED_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade"}
 MODEL_GROUP_HEADER = "x-litellm-model-group"
@@ -515,6 +526,10 @@ def unstorable_reasons(
         reasons.append(F.UNSTORABLE_BOUND_VALUE_LEFT_LITERAL)
     if any(mapping.has_identifier(t) for t in normalized):
         reasons.append(F.UNSTORABLE_UNBOUND_IDENTIFIER)
+    if any(mapping.answer_names_dropped_file(t) for t in texts):
+        reasons.append(F.UNSTORABLE_NAMES_DROPPED_FILE)
+    if any(mapping.answer_talks_about_dropped_queue(t) for t in texts):
+        reasons.append(F.UNSTORABLE_TALKS_ABOUT_DROPPED_QUEUE)
     if any(mapping.has_timestamp(t) for t in normalized):
         reasons.append(F.UNSTORABLE_UNBOUND_TIMESTAMP)
     # Read after the swap: a timestamp the answer copied from the request is a
@@ -643,8 +658,9 @@ class ShadowProxy:
         messages = body.get(request_store.MESSAGES_KEY)
         messages = messages if isinstance(messages, list) else []
         # Noted now, not by the background analysis, so a later request's
-        # slots can normalize this one's messages as of when they arrived.
-        digests, first_seen = self.diagnosis.first_seen_with_digests(messages, received)
+        # slots can normalize this one's prefixes as of when they arrived.
+        digests, _ = self.diagnosis.first_seen_with_digests(messages, received)
+        prefix_seen = self.prefix_first_seen(body, digests, received)
         normalized, fingerprint = keyed or self.keyed(body, received)
         via = F.VIA_EXACT
         entry = self.cache.load(fingerprint)
@@ -656,7 +672,7 @@ class ShadowProxy:
             if recorded is None:
                 return None, None
             fingerprint, via, entry = recorded, F.VIA_ANSWER_SLOTS, self.cache.load(recorded)
-            if entry is not None and not self.answers_recorded(body, messages, digests, first_seen, received):
+            if entry is not None and not self.answers_recorded(body, messages, digests, prefix_seen, received):
                 return None, refusal(via, F.GUARD_ANSWER_NOT_RECORDED)
         if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
@@ -670,36 +686,62 @@ class ShadowProxy:
         answer, missing = replay_cache.restore_answer(entry[replay_cache.ENTRY_ANSWER], normalized.mapping)
         if missing:
             return None, refusal(via, F.GUARD_UNBOUND_PLACEHOLDER)
+        # The other direction of the record-time check: a file this run's
+        # dropped list names, which the recording's run may not have had.
+        if any(normalized.mapping.answer_names_dropped_file(t) for t in replay_cache.answer_texts(answer)):
+            return None, refusal(via, F.GUARD_NAMES_DROPPED_FILE)
         return (answer, entry, fingerprint, via), None
 
+    @staticmethod
+    def settings_chain(body: Dict[str, Any]) -> str:
+        """The root of a request's prefix chain: its settings, raw. Each prefix extends it by a message digest."""
+        settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
+        return normalizer.stable_hash(settings)
+
+    def prefix_first_seen(self, body: Dict[str, Any], digests: List[str], received: float) -> List[float]:
+        """When this proxy first saw each prefix of the request, noting `received` for new ones.
+
+        Element i is for the settings and the first i messages, so it is when
+        this conversation (or one identical up to there) sent the request
+        that message i answered. A message's own first sighting is not: a
+        static one, a skill's text, arrives in every conversation.
+        """
+        chain = self.settings_chain(body)
+        seen = [self.diagnosis.note(chain, received)]
+        for digest in digests:
+            chain = normalizer.stable_hash([chain, digest])
+            seen.append(self.diagnosis.note(chain, received))
+        return seen
+
     def answers_recorded(
-        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], prefix_seen: List[float], received: float,
     ) -> bool:
         """Whether each assistant message is an answer a recording stored for the request it replied to.
 
         Each is checked against that request: the messages before it, with the
-        settings, normalized on their own as of when the last of them arrived,
-        as record mode normalized the request when it noted the answer. That
-        pair depends only on the raw prefix and the answer (and, in this
-        process, on when the prefix arrived), so it is kept by their digests:
-        each turn normalizes only its new answer's prefix, not every earlier one.
+        settings, normalized on their own as of when that prefix first arrived
+        (prefix_first_seen), as record mode normalized the request when it
+        noted the answer. That pair depends only on the raw prefix and the
+        answer (and, in this process, on when the prefix arrived), so it is
+        kept by their digests: each turn normalizes only its new answer's
+        prefix, not every earlier one.
         """
-        for variant in self.history_variants(body, messages, digests, first_seen, received):
+        for variant in self.history_variants(body, messages, digests, prefix_seen, received):
             if not self.cache.has_variant(*variant):
                 return False
         return True
 
     def history_variants(
-        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], prefix_seen: List[float], received: float,
         last_only: bool = False,
     ):
         """(context, answer) of each assistant message, as record mode noted the answer to the request before it.
 
-        Memoized by the digests of the prefix, so each answer is normalized once
-        per process. With `last_only`, only the last assistant message's.
+        `prefix_seen` is prefix_first_seen's. Memoized by the digests of the
+        prefix, so each answer is normalized once per process. With
+        `last_only`, only the last assistant message's.
         """
-        settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
-        chain = normalizer.stable_hash(settings)
+        chain = self.settings_chain(body)
         indices = [i for i, m in enumerate(messages)
                    if isinstance(m, dict) and m.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE]
         wanted = set(indices[-1:] if last_only else indices)
@@ -711,7 +753,7 @@ class ShadowProxy:
                 if variant is None:
                     asked = dict(body)
                     asked[request_store.MESSAGES_KEY] = messages[:index]
-                    now = first_seen[index - 1] if index else received
+                    now = prefix_seen[index] if index else received
                     variant = normalizer.answer_variant(normalizer.normalize_request(asked, now), message, self.key_context)
                     with self._variant_lock:
                         self._variants[memo_key] = variant
@@ -735,7 +777,12 @@ class ShadowProxy:
             self.metrics.add("analysis_dropped")
             self.log({F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
                       F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: F.ERROR_ANALYSIS_DROPPED,
-                      **self.served_fields(served)})
+                      **self.served_fields(served), **self.eval_fields(upstream)})
+
+    @staticmethod
+    def eval_fields(upstream: Dict[str, Any]) -> Dict[str, Any]:
+        """The eval run tag fields every request line carries, even one whose analysis was lost."""
+        return {F.EVAL_RUN: upstream.get(F.EVAL_RUN), F.EVAL_AGENT: upstream.get(F.EVAL_AGENT)}
 
     def served_fields(self, served: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """The mode and served fields every request line carries, even one whose analysis was lost."""
@@ -799,7 +846,7 @@ class ShadowProxy:
                     # The type name only: an exception's message can quote request text.
                     entry = {F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
                              F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: type(exc).__name__,
-                             **self.served_fields(served)}
+                             **self.served_fields(served), **self.eval_fields(upstream)}
                 self.log(entry)
             except Exception:  # a failed write to stdout loses this line, not the worker
                 self.metrics.add("analysis_errors")
@@ -1040,6 +1087,7 @@ class ShadowProxy:
             F.LITELLM_MODEL_GROUP: upstream["headers"].get(MODEL_GROUP_HEADER),
             F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
             **self.served_fields(served),
+            **self.eval_fields(upstream),
         }
         if served is None:
             entry[F.LITELLM_MODEL_NAME] = upstream["headers"].get(MODEL_NAME_HEADER)
@@ -1096,8 +1144,9 @@ class ShadowProxy:
         if self.config.mode == F.MODE_RECORD:
             if upstream["message"]:
                 entry[F.ANSWER_VARIANT] = list(normalizer.answer_variant(normalized, upstream["message"], self.key_context))
-            digests, first_seen = self.diagnosis.first_seen_with_digests(raw_messages, received)
-            prior = list(self.history_variants(body, raw_messages, digests, first_seen, received, last_only=True))
+            digests, _ = self.diagnosis.first_seen_with_digests(raw_messages, received)
+            prefix_seen = self.prefix_first_seen(body, digests, received)
+            prior = list(self.history_variants(body, raw_messages, digests, prefix_seen, received, last_only=True))
             if prior:
                 entry[F.PRIOR_ANSWER] = list(prior[0])
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
@@ -1207,16 +1256,27 @@ class Handler(BaseHTTPRequestHandler):
                 answer, saved, fingerprint, via = hit
                 upstream = self._serve(body, answer, saved, fingerprint)
                 upstream["served_via"] = via
+                upstream.update(self._eval_tags())
                 self.proxy.submit(body, received, upstream, len(raw), served=saved, keyed=keyed)
                 return
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))
         if body is None:
             return
         upstream["refused"] = refused
+        upstream.update(self._eval_tags())
         self.proxy.metrics.add("completions")
         self.proxy.submit(body, received, upstream, len(raw), keyed=keyed)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
+
+    def _eval_tags(self) -> Dict[str, Optional[str]]:
+        """The request's eval run tag headers, each None when absent or malformed."""
+
+        def read(name: str, pattern: "re.Pattern[str]") -> Optional[str]:
+            value = (self.headers.get(name) or "").strip()
+            return value if pattern.fullmatch(value) else None
+
+        return {F.EVAL_RUN: read(EVAL_RUN_HEADER, EVAL_RUN_RE), F.EVAL_AGENT: read(EVAL_AGENT_HEADER, EVAL_AGENT_RE)}
 
     def _forward(self, raw: bytes, observe: bool, streaming: bool) -> Dict[str, Any]:
         """Send the request upstream and copy the response back byte for byte."""

@@ -1,5 +1,6 @@
 """Tests for post_merge_check.notice_merges: one forge read per waiting record, with a fake forge and clock."""
 
+import json
 import re
 import sqlite3
 import sys
@@ -177,6 +178,576 @@ class NoticeMergesTest(unittest.TestCase):
             post_merge_check.forge_view(REPO, 7)
 
 
+MERGE = "3d1a1b0bf1b13e4e40a0301114750aadf81bae38"
+OLDER = "1" * 40
+
+
+def argo_app(revision=MERGE, status="Synced", repo=REPO + ".git", namespace="shop"):
+    return {"apiVersion": "argoproj.io/v1alpha1", "kind": "Application", "metadata": {"name": "shop", "namespace": "argocd"},
+            "spec": {"source": {"repoURL": repo, "path": "clusters/prod/shop"}, "destination": {"namespace": namespace}},
+            "status": {"sync": {"status": status, "revision": revision}, "operationState": {"phase": "Succeeded"}}}
+
+
+def deployment(replicas=3, updated=3, available=3, ready=3, generation=2, observed=2):
+    return {"kind": "Deployment", "metadata": {"name": "checkout", "generation": generation},
+            "spec": {"replicas": replicas, "selector": {"matchLabels": {"app": "checkout"}},
+                     "template": {"metadata": {"labels": {"app": "checkout", "tier": "web"}}}},
+            "status": {"observedGeneration": observed, "updatedReplicas": updated, "availableReplicas": available,
+                       "readyReplicas": ready}}
+
+
+def pods(restarts=(0, 0, 0), ready=True):
+    items = []
+    for n, count in enumerate(restarts):
+        container = {"name": "web", "restartCount": count, "lastState": {}, "state": {"running": {}}}
+        items.append({"metadata": {"name": f"checkout-{n}", "uid": f"u{n}", "labels": {"pod-template-hash": "6d4f"},
+                                   "ownerReferences": [{"kind": "ReplicaSet", "name": "checkout-6d4f"}]},
+                      "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+                                 "containerStatuses": [container]}})
+    return {"items": items}
+
+
+class FakeCluster:
+    """``kubectl_json`` answered from a mutable table keyed by the resource asked for."""
+
+    def __init__(self):
+        self.apps = [argo_app(revision=OLDER, status="OutOfSync")]
+        self.workload = deployment()
+        self.pod_list = pods()
+        self.calls = []
+        self.fail = None
+        self.budgets = []
+        self.gone = False
+        self.lists = {}
+
+    def __call__(self, record, argv):
+        self.calls.append(argv)
+        if self.fail:
+            raise self.fail
+        resource = argv[1]
+        if self.gone and resource in ("deployments.apps", "statefulsets.apps"):
+            raise post_merge_check.WorkloadGone("deployments.apps \"checkout\" not found")
+        if resource == "poddisruptionbudgets.policy":
+            return {"items": self.budgets}
+        if resource == post_merge_check.ARGO_APPLICATIONS:
+            return {"items": self.apps}
+        if resource in post_merge_check.RECONCILER_RESOURCES:
+            return self.lists.get(resource, {"items": []})
+        if resource in ("deployments.apps", "statefulsets.apps"):
+            return self.workload
+        if resource == "pods":
+            self.selector = argv[argv.index("-l") + 1]
+            return self.pod_list
+        raise AssertionError(argv)
+
+
+class WatchHealthTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.execute(schema())
+        self.conn.execute(
+            "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, object, "
+            "opened_at, merged_at, merge_commit) VALUES (?, ?, 1, 'no-pdb', 'p', 'l', 'prod', 'shop', "
+            "'Deployment/checkout', ?, ?, ?)",
+            (f"{REPO}/pull/1", REPO, NOW.isoformat(), NOW.isoformat(), MERGE),
+        )
+        self.cluster = FakeCluster()
+
+    def row(self):
+        self.conn.row_factory = sqlite3.Row
+        found = dict(self.conn.execute("SELECT * FROM post_merge_records").fetchone())
+        self.conn.row_factory = None
+        return found
+
+    def tick(self, minutes):
+        return post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=minutes))
+
+    def test_waits_until_the_reconciler_applies_the_merge_commit(self):
+        self.assertEqual(self.tick(1)["waiting"], [f"{REPO}/pull/1"])
+        row = self.row()
+        self.assertIsNone(row["applied_at"])
+        self.assertTrue(row["sync_state"].startswith("pending"), row["sync_state"])
+
+    def test_applied_records_the_baseline_and_is_not_read_again(self):
+        self.cluster.apps = [argo_app()]
+        self.cluster.pod_list = pods(restarts=(2, 0, 0))
+        self.assertEqual(self.tick(1)["applied"], [f"{REPO}/pull/1"])
+        row = self.row()
+        self.assertEqual(row["applied_at"], (NOW + timedelta(minutes=1)).isoformat())
+        self.assertEqual(json.loads(row["health_baseline"]), {"u0/web": 2, "u1/web": 0, "u2/web": 0})
+        self.assertEqual(self.cluster.selector, "app=checkout")
+        # Applied: the apply step does not read it again.
+        self.cluster.calls.clear()
+        self.tick(10)
+        self.assertEqual(self.cluster.calls, [])
+
+    def test_an_unreadable_cluster_is_logged_and_retried(self):
+        self.cluster.fail = post_merge_check.ClusterReadError("connection refused")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(1)["unreadable"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["sync_state"].startswith("unreadable"))
+        self.cluster.fail = None
+        self.cluster.apps = [argo_app()]
+        self.assertEqual(self.tick(2)["applied"], [f"{REPO}/pull/1"])
+
+    def test_a_qualified_cluster_fills_the_coordinates_the_record_left_empty(self):
+        self.conn.execute("UPDATE post_merge_records SET project = '', location = '', cluster = 'p/l/prod'")
+        self.cluster.apps = [argo_app()]
+        self.assertEqual(self.tick(1)["applied"], [f"{REPO}/pull/1"])
+
+    def test_a_record_with_no_cluster_coordinates_is_not_read(self):
+        self.conn.execute("UPDATE post_merge_records SET project = ''")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(1)["unreadable"], [f"{REPO}/pull/1"])
+        self.assertEqual(self.cluster.calls, [])
+
+    def test_a_later_applied_commit_that_contains_the_merge_is_applied(self):
+        self.cluster.apps = [argo_app(revision=OLDER)]
+        asked = []
+
+        def contains(repo, ancestor, revision):
+            asked.append((repo, ancestor, revision))
+            return True
+
+        seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=1), contains=contains)
+        self.assertEqual(seen["applied"], [f"{REPO}/pull/1"])
+        self.assertEqual(asked, [(REPO, MERGE, OLDER)])
+
+    def test_a_later_commit_without_the_merge_or_unknown_ancestry_waits(self):
+        self.cluster.apps = [argo_app(revision=OLDER)]
+        for answer, state in ((False, "pending"), (None, "unconfirmed")):
+            with self.subTest(answer=answer):
+                post_merge_check.watch_health(self.conn, self.cluster, NOW, contains=lambda *a, answer=answer: answer)
+                self.assertTrue(self.row()["sync_state"].startswith(state), self.row()["sync_state"])
+                self.assertIsNone(self.row()["applied_at"])
+
+    def test_unknown_ancestry_falls_back_to_observing_the_budget(self):
+        self.cluster.apps = [argo_app(revision=OLDER)]
+        self.cluster.budgets = [{"metadata": {"name": "checkout-pdb"}, "spec": {"selector": {"matchLabels": {"app": "checkout"}}}}]
+        seen = post_merge_check.watch_health(self.conn, self.cluster, NOW, contains=lambda *a: None)
+        self.assertEqual(seen["applied"], [f"{REPO}/pull/1"])
+        state = self.row()["sync_state"]
+        self.assertTrue(state.startswith("observed"), state)
+        self.assertIn("could not be confirmed", state)
+        self.assertNotIn("no reconciler targets", state, "a reconciler does target the namespace")
+
+    def test_a_failed_reconciler_list_is_read_once_per_cluster(self):
+        self.conn.execute(
+            "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, object, "
+            "opened_at, merged_at, merge_commit) SELECT ?, repo, 2, kind, project, location, cluster, namespace, "
+            "object, opened_at, merged_at, merge_commit FROM post_merge_records WHERE number = 1",
+            (f"{REPO}/pull/2",),
+        )
+        self.cluster.fail = post_merge_check.ClusterReadError("connection refused")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            seen = self.tick(1)
+        self.assertEqual(sorted(seen["unreadable"]), [f"{REPO}/pull/1", f"{REPO}/pull/2"])
+        self.assertEqual(len(self.cluster.calls), 1, self.cluster.calls)
+
+    def test_a_record_whose_update_fails_is_reported_unreadable_not_applied(self):
+        real = self.conn
+        real.commit()  # the failed UPDATE rolls back; keep setUp's row
+
+        class Locked:
+            def execute(self, sql, params=()):
+                if sql.startswith("UPDATE"):
+                    raise sqlite3.OperationalError("database is locked")
+                return real.execute(sql, params)
+
+            def __enter__(self):
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+        self.cluster.apps = [argo_app()]
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            seen = post_merge_check.watch_health(Locked(), self.cluster, NOW + timedelta(minutes=1))
+        self.assertEqual((seen["applied"], seen["unreadable"]), ([], [f"{REPO}/pull/1"]))
+        self.assertIsNone(self.row()["applied_at"])
+
+    def test_a_root_sync_delivering_the_changed_file_is_read_and_others_are_not(self):
+        root = {"apiVersion": "configsync.gke.io/v1beta1", "kind": "RootSync",
+                "metadata": {"name": "root-sync", "namespace": "config-management-system"},
+                "spec": {"git": {"repo": REPO, "dir": "clusters/prod"}}, "status": {"lastSyncedCommit": MERGE}}
+        self.cluster.apps = []
+        self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+        asked = []
+
+        def paths(repo, number, name):
+            asked.append((repo, number, name))
+            return ["clusters/prod/shop/pdb.yaml"]
+
+        seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=1), paths=paths)
+        self.assertEqual(asked, [(REPO, 1, "checkout")])
+        self.assertEqual(seen["applied"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["sync_state"].startswith("applied"), self.row()["sync_state"])
+        # No reconciler names the repository: the files are not read at all.
+        self.conn.execute("UPDATE post_merge_records SET applied_at = NULL, sync_state = NULL")
+        root["spec"]["git"]["repo"] = "https://github.com/acme/other"
+        asked.clear()
+        post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=2), paths=paths)
+        self.assertEqual(asked, [])
+
+    def test_the_files_are_read_once_and_kept_on_the_row(self):
+        root = {"kind": "RootSync", "metadata": {"name": "root-sync", "namespace": "config-management-system"},
+                "spec": {"git": {"repo": REPO, "dir": "clusters/prod"}}, "status": {"lastSyncedCommit": OLDER}}
+        self.cluster.apps = []
+        self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+        asked = []
+
+        def paths(repo, number, name):
+            asked.append(number)
+            return ["clusters/prod/shop/pdb.yaml"]
+
+        for minutes in (1, 2, 3):
+            post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=minutes),
+                                          contains=lambda *a: False, paths=paths)
+        self.assertEqual(asked, [1])
+        self.assertEqual(json.loads(self.row()["changed_paths"]), ["clusters/prod/shop/pdb.yaml"])
+        self.assertNotIn("files unknown", self.row()["sync_state"])
+
+    def test_unknown_files_are_said_in_the_reading_and_read_again(self):
+        root = {"kind": "RootSync", "metadata": {"name": "root-sync", "namespace": "config-management-system"},
+                "spec": {"git": {"repo": REPO, "dir": "clusters/prod"}}, "status": {"lastSyncedCommit": MERGE}}
+        self.cluster.apps = []
+        self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+        asked = []
+
+        def unknown(repo, number, name):
+            asked.append(number)
+
+        for minutes in (1, 2):
+            seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=minutes), paths=unknown)
+            self.assertEqual(seen["waiting"], [f"{REPO}/pull/1"])
+        self.assertEqual(asked, [1, 1], "an unknown answer is not kept")
+        self.assertIsNone(self.row()["changed_paths"])
+        self.assertIn("files unknown", self.row()["sync_state"])
+
+    def test_a_root_sync_of_another_file_in_the_pull_request_never_marks_the_workload_applied(self):
+        from unittest import mock
+
+        # The pull request changes platform/x.yaml and the workload's own budget under apps/team; the
+        # RootSync on this cluster delivers platform/ and has synced past the merge.
+        diff = ("diff --git a/platform/x.yaml b/platform/x.yaml\n--- a/platform/x.yaml\n+++ b/platform/x.yaml\n"
+                "@@ -1 +1 @@\n-replicas: 1\n+replicas: 2\n"
+                "diff --git a/apps/team/pdb.yaml b/apps/team/pdb.yaml\n--- /dev/null\n+++ b/apps/team/pdb.yaml\n"
+                "@@ -0,0 +2 @@\n+  selector: {matchLabels: {app: checkout}}\n+  maxUnavailable: 1\n")
+        root = {"apiVersion": "configsync.gke.io/v1beta1", "kind": "RootSync",
+                "metadata": {"name": "root-sync", "namespace": "config-management-system"},
+                "spec": {"git": {"repo": REPO, "dir": "platform"}}, "status": {"lastSyncedCommit": MERGE}}
+        self.cluster.apps = []
+        self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+        forge = mock.Mock(call=lambda *a, **k: {"diff": diff})
+        with mock.patch.dict(sys.modules, {"forge": forge}):
+            seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=1))
+        self.assertEqual(seen["waiting"], [f"{REPO}/pull/1"], "observed directly, and no budget is live yet")
+        self.assertIn("no reconciler targets", self.row()["sync_state"])
+        self.assertEqual(json.loads(self.row()["changed_paths"]), ["apps/team/pdb.yaml"])
+        # Its own directory holding the workload's file does count.
+        root["spec"]["git"]["dir"] = "apps"
+        self.conn.execute("UPDATE post_merge_records SET sync_state = NULL")
+        with mock.patch.dict(sys.modules, {"forge": forge}):
+            seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=2))
+        self.assertEqual(seen["applied"], [f"{REPO}/pull/1"], self.row()["sync_state"])
+
+    def test_with_no_reconciler_for_the_namespace_the_budget_is_observed_directly(self):
+        self.cluster.apps = [argo_app(namespace="elsewhere")]
+        self.assertEqual(self.tick(1)["waiting"], [f"{REPO}/pull/1"])
+        self.assertIn("no budget selects the workload yet", self.row()["sync_state"])
+        self.cluster.budgets = [{"metadata": {"name": "checkout-pdb"}, "spec": {"selector": {"matchLabels": {"app": "checkout"}}}}]
+        self.assertEqual(self.tick(2)["applied"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["sync_state"].startswith("observed"), self.row()["sync_state"])
+
+    def test_records_are_read_least_recently_checked_first_whatever_their_state(self):
+        for n in range(2, 23):
+            self.conn.execute(
+                "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, "
+                "object, opened_at, merged_at, merge_commit) SELECT ?, repo, ?, kind, project, location, cluster, "
+                "namespace, object, opened_at, merged_at, merge_commit FROM post_merge_records WHERE number = 1",
+                (f"{REPO}/pull/{n}", n),
+            )
+        first = set(self.tick(1)["waiting"])
+        second = set(self.tick(2)["waiting"])
+        self.assertEqual(len(first), 20)
+        self.assertEqual(len(first | second), 22, "every record is read within two ticks")
+
+    def test_unmerged_closed_or_finished_records_are_not_read(self):
+        self.conn.execute("UPDATE post_merge_records SET outcome = 'verified_fixed'")
+        self.tick(1)
+        self.assertEqual(self.cluster.calls, [])
+
+
+class SelectorTest(unittest.TestCase):
+    def test_label_selector_renders_match_expressions(self):
+        selector = {"matchLabels": {"app": "web"}, "matchExpressions": [
+            {"key": "tier", "operator": "In", "values": ["a", "b"]}, {"key": "canary", "operator": "DoesNotExist"},
+            {"key": "zone", "operator": "Exists"}, {"key": "env", "operator": "NotIn", "values": ["dev"]}]}
+        self.assertEqual(post_merge_check.label_selector(selector), "app=web,tier in (a,b),!canary,zone,env notin (dev)")
+        with self.assertRaises(post_merge_check.WorkloadGone):
+            post_merge_check.label_selector({"matchExpressions": [{"key": "x", "operator": "Gt"}]})
+
+    def test_selects_matches_labels_and_expressions(self):
+        selector = {"matchLabels": {"app": "web"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["a"]}]}
+        self.assertTrue(post_merge_check.selects(selector, {"app": "web", "tier": "a"}))
+        self.assertFalse(post_merge_check.selects(selector, {"app": "web", "tier": "b"}))
+        self.assertFalse(post_merge_check.selects({}, {"app": "web"}))
+
+class SandboxKubectlTest(unittest.TestCase):
+    def run_with(self, returncode, stdout="", stderr=""):
+        import subprocess
+        import types
+        from unittest import mock
+
+        fake = types.ModuleType("stall_watch")
+        fake.fetch_credentials = lambda *key: "/home/hermes/.kubeconfigs/x.yaml"
+        fake.run_sandbox = lambda argv, timeout, kubeconfig: subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        fake.stderr_excerpt = lambda text: text
+        record = {"project": "p", "cluster": "c", "location": "l"}
+        with mock.patch.dict(sys.modules, {"stall_watch": fake}):
+            return post_merge_check.SandboxKubectl()(record, ["get", "x", "-o", "json"])
+
+    def test_answers_parse_and_errors_are_typed(self):
+        self.assertEqual(self.run_with(0, '{"items": [1]}'), {"items": [1]})
+        self.assertEqual(self.run_with(1, stderr="error: the server doesn't have a resource type \"x\""), {"items": []})
+        with self.assertRaises(post_merge_check.WorkloadGone):
+            self.run_with(1, stderr='Error from server (NotFound): deployments.apps "x" not found')
+        with self.assertRaises(post_merge_check.ClusterReadError):
+            self.run_with(1, stderr="dial tcp: i/o timeout")
+
+    def test_a_qualified_cluster_name_reaches_gcloud_as_its_parts(self):
+        import subprocess
+        import types
+        from unittest import mock
+
+        asked = []
+        fake = types.ModuleType("stall_watch")
+        fake.fetch_credentials = lambda *key: asked.append(key) or "/home/hermes/.kubeconfigs/x.yaml"
+        fake.run_sandbox = lambda argv, timeout, kubeconfig: subprocess.CompletedProcess(argv, 0, '{"items": []}', "")
+        fake.stderr_excerpt = lambda text: text
+        with mock.patch.dict(sys.modules, {"stall_watch": fake}):
+            post_merge_check.SandboxKubectl()({"project": "acme-prod", "cluster": "acme-prod/us-east1/shared",
+                                               "location": "us-east1"}, ["get", "x", "-o", "json"])
+            post_merge_check.SandboxKubectl()({"project": "", "cluster": "acme-dev/europe-west1/web",
+                                               "location": ""}, ["get", "x", "-o", "json"])
+            post_merge_check.SandboxKubectl()({"project": "p", "cluster": "bare", "location": "l"},
+                                              ["get", "x", "-o", "json"])
+        self.assertEqual(asked, [("acme-prod", "shared", "us-east1"), ("acme-dev", "web", "europe-west1"),
+                                 ("p", "bare", "l")])
+
+    def test_a_list_that_is_not_found_is_empty_not_a_gone_workload(self):
+        import subprocess
+        import types
+        from unittest import mock
+
+        fake = types.ModuleType("stall_watch")
+        fake.fetch_credentials = lambda *key: "/home/hermes/.kubeconfigs/x.yaml"
+        fake.run_sandbox = lambda argv, timeout, kubeconfig: subprocess.CompletedProcess(
+            argv, 1, "", "Error from server (NotFound): the server could not find the requested resource")
+        fake.stderr_excerpt = lambda text: text
+        record = {"project": "p", "cluster": "c", "location": "l"}
+        with mock.patch.dict(sys.modules, {"stall_watch": fake}):
+            self.assertEqual(post_merge_check.SandboxKubectl()(record, ["get", "kustomizations.x", "-A", "-o", "json"]),
+                             {"items": []})
+
+
+class ReconcilersForTest(unittest.TestCase):
+    def test_matches_the_repository_whatever_its_spelling(self):
+        for repo in (REPO, REPO + ".git", REPO + "/", "git@github.com:acme/fleet.git", "HTTPS://GitHub.com/acme/fleet",
+                     "ssh://git@github.com:22/acme/fleet.git", "github.com:acme/fleet.git", "https://www.github.com/acme/fleet"):
+            with self.subTest(repo=repo):
+                lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [argo_app(repo=repo)]}}
+                self.assertEqual(len(post_merge_check.reconcilers_for(REPO, "shop", lists)), 1)
+        lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [argo_app(repo="https://github.com/acme/other")]}}
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists), [])
+        # A record with no repository matches nothing, not every source with a missing url.
+        lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [argo_app(repo="")]}}
+        self.assertEqual(post_merge_check.reconcilers_for("", "shop", lists), [])
+
+    def test_only_objects_delivering_into_the_namespace_on_this_cluster_count(self):
+        elsewhere = argo_app()
+        elsewhere["spec"]["destination"]["server"] = "https://10.0.0.1"
+        lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [
+            argo_app(namespace="shop"), argo_app(namespace="other"), argo_app(namespace=""), elsewhere]}}
+        found = post_merge_check.reconcilers_for(REPO, "shop", lists)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["spec"]["destination"], {"namespace": "shop"})
+
+    def test_reads_flux_through_its_git_repository_and_config_sync(self):
+        lists = {
+            post_merge_check.FLUX_GIT_REPOSITORIES: {"items": [
+                {"metadata": {"name": "fleet", "namespace": "flux-system"}, "spec": {"url": REPO}}]},
+            post_merge_check.FLUX_KUSTOMIZATIONS: {"items": [
+                {"apiVersion": "kustomize.toolkit.fluxcd.io/v1", "kind": "Kustomization",
+                 "metadata": {"name": "shop", "namespace": "flux-system"},
+                 "spec": {"sourceRef": {"kind": "GitRepository", "name": "fleet"}, "targetNamespace": "shop"}}]},
+            post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [
+                {"kind": "RootSync", "metadata": {"name": "root-sync", "namespace": "config-management-system"},
+                 "spec": {"git": {"repo": REPO + ".git"}}}]},
+            post_merge_check.CONFIGSYNC_REPOSYNCS: {"items": [
+                {"kind": "RepoSync", "metadata": {"name": "repo-sync", "namespace": "shop"},
+                 "spec": {"git": {"repo": REPO + ".git"}}}]},
+        }
+        kinds = sorted(o["kind"] for o in post_merge_check.reconcilers_for(REPO, "shop", lists))
+        self.assertEqual(kinds, ["Kustomization", "RepoSync"])
+
+    def test_a_root_sync_counts_when_its_dir_holds_a_changed_file(self):
+        root = {"kind": "RootSync", "metadata": {"name": "root-sync", "namespace": "config-management-system"},
+                "spec": {"sourceType": "git", "git": {"repo": REPO + ".git", "dir": "clusters/dev"}}}
+        other_repo = {"kind": "RootSync", "metadata": {"name": "apps", "namespace": "config-management-system"},
+                      "spec": {"git": {"repo": "https://github.com/acme/apps", "dir": "/"}}}
+        lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root, other_repo]}}
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, ["clusters/dev/shop/pdb.yaml"]), [root])
+        for paths in (["clusters/devx/shop/pdb.yaml"], ["clusters/prod/shop/pdb.yaml"], None, []):
+            with self.subTest(paths=paths):
+                self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, paths), [])
+
+    def test_a_root_sync_dir_is_read_however_it_is_written(self):
+        for directory in ("clusters/dev", "/clusters/dev/", "./clusters/dev", "clusters/dev/", "/./clusters/dev",
+                          "clusters/dev/.", "clusters//dev", "././clusters/./dev"):
+            with self.subTest(dir=directory):
+                root = {"kind": "RootSync", "spec": {"git": {"repo": REPO, "dir": directory}}}
+                lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+                self.assertEqual(len(post_merge_check.reconcilers_for(REPO, "shop", lists, ["clusters/dev/a.yaml"])), 1)
+        for directory in (None, "", "/", ".", "./"):
+            with self.subTest(dir=directory):
+                root = {"kind": "RootSync", "spec": {"git": {"repo": REPO, "dir": directory}}}
+                lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+                self.assertEqual(len(post_merge_check.reconcilers_for(REPO, "shop", lists, ["any/where.yaml"])), 1)
+
+    def test_a_root_sync_from_an_oci_or_helm_source_never_counts(self):
+        root = {"kind": "RootSync", "spec": {"sourceType": "oci", "git": {"repo": REPO, "dir": "/"}}}
+        lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, ["a.yaml"]), [])
+
+    def test_a_path_narrows_argo_and_flux_and_never_empties_the_match(self):
+        dev, prod = argo_app(), argo_app()
+        dev["spec"]["source"]["path"] = "overlays/dev"
+        prod["spec"]["source"]["path"] = "overlays/prod"
+        lists = {post_merge_check.ARGO_APPLICATIONS: {"items": [dev, prod]}}
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, ["overlays/dev/pdb.yaml"]), [dev])
+        # A file outside every path (a shared base a kustomization reaches) keeps them all.
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, ["base/pdb.yaml"]), [dev, prod])
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, None), [dev, prod])
+        lists = {
+            post_merge_check.FLUX_GIT_REPOSITORIES: {"items": [
+                {"metadata": {"name": "fleet", "namespace": "flux-system"}, "spec": {"url": REPO}}]},
+            post_merge_check.FLUX_KUSTOMIZATIONS: {"items": [
+                {"kind": "Kustomization", "metadata": {"name": n, "namespace": "flux-system"},
+                 "spec": {"sourceRef": {"kind": "GitRepository", "name": "fleet"}, "targetNamespace": "shop",
+                          "path": f"./clusters/{n}"}} for n in ("dev", "prod")]},
+        }
+        found = post_merge_check.reconcilers_for(REPO, "shop", lists, ["clusters/prod/shop/pdb.yaml"])
+        self.assertEqual([o["metadata"]["name"] for o in found], ["prod"])
+
+    def test_diff_paths_reads_only_headers_and_unquotes(self):
+        diff = ("diff --git a/notes.patch b/notes.patch\n--- a/notes.patch\n+++ b/notes.patch\n@@ -1 +1,2 @@\n"
+                "--- a/clusters/prod/x.yaml\n+++ b/clusters/prod/x.yaml\n"
+                'diff --git "a/caf\\303\\251/p.yaml" "b/caf\\303\\251/p.yaml"\n'
+                '--- "a/caf\\303\\251/p.yaml"\n+++ "b/caf\\303\\251/p.yaml"\n@@ -1 +1 @@\n')
+        self.assertEqual(post_merge_check.diff_paths(diff), ["notes.patch", "caf\u00e9/p.yaml"])
+
+    def test_diff_paths_unquotes_escapes_beside_raw_utf8(self):
+        diff = 'diff --git "a/caf\u00e9/\\"q\\".yaml" "b/caf\u00e9/\\"q\\".yaml"\n--- "a/caf\u00e9/\\"q\\".yaml"\n'
+        self.assertEqual(post_merge_check.diff_paths(diff), ['caf\u00e9/"q".yaml'])
+
+    def test_diff_paths_with_a_name_keeps_only_the_files_that_name_it(self):
+        diff = ("diff --git a/platform/x.yaml b/platform/x.yaml\n--- a/platform/x.yaml\n+++ b/platform/x.yaml\n"
+                "@@ -1 +1 @@\n context checkout\n+replicas: 2\n"
+                "diff --git a/apps/checkout.yaml b/apps/checkout.yaml\n--- a/apps/checkout.yaml\n+++ b/apps/checkout.yaml\n"
+                "@@ -1 +1 @@\n+x: 1\n"
+                "diff --git a/apps/pdb.yaml b/apps/pdb.yaml\n--- /dev/null\n+++ b/apps/pdb.yaml\n@@ -0,0 +1 @@\n"
+                "+  name: checkout-pdb\n"
+                "diff --git a/apps/other.yaml b/apps/other.yaml\n--- a/apps/other.yaml\n+++ b/apps/other.yaml\n"
+                "@@ -1 +1 @@\n+app: checkout2\n")
+        self.assertEqual(post_merge_check.diff_paths(diff, "checkout"), ["apps/checkout.yaml", "apps/pdb.yaml"])
+        self.assertEqual(len(post_merge_check.diff_paths(diff)), 4)
+
+    def test_diff_paths_ends_lines_only_where_git_does(self):
+        diff = ("diff --git a/a.yaml b/a.yaml\r\n--- a/a.yaml\r\n+++ b/a.yaml\r\n@@ -1 +1 @@\r\n"
+                "+x\rdiff --git a/clusters/prod/p.yaml b/clusters/prod/p.yaml\n+y\u2028diff --git a/c/q b/c/q\n")
+        self.assertEqual(post_merge_check.diff_paths(diff), ["a.yaml"])
+
+    def test_forge_paths_reads_an_undecodable_escape_as_unknown(self):
+        from unittest import mock
+
+        diff = 'diff --git "a/\\400/p.yaml" "b/\\400/p.yaml"\n--- "a/\\400/p.yaml"\n'
+        forge = mock.Mock(call=lambda *a, **k: {"diff": diff})
+        with mock.patch.dict(sys.modules, {"forge": forge}), self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertIsNone(post_merge_check.forge_paths(REPO, 7))
+
+    def test_diff_paths_reads_renames_and_binary_files(self):
+        diff = ("diff --git a/old/pdb.yaml b/clusters/dev/pdb.yaml\nsimilarity index 100%\n"
+                "rename from old/pdb.yaml\nrename to clusters/dev/pdb.yaml\n"
+                "diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n")
+        self.assertEqual(post_merge_check.diff_paths(diff), ["old/pdb.yaml", "clusters/dev/pdb.yaml", "logo.png"])
+
+    def test_a_root_sync_with_no_git_section_never_breaks_the_match(self):
+        lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [{"kind": "RootSync", "spec": {}}]}}
+        self.assertEqual(post_merge_check.reconcilers_for("", "shop", lists, ["a.yaml"]), [])
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, ["a.yaml"]), [])
+
+    def test_the_files_are_read_only_when_they_can_change_the_match(self):
+        asked = []
+
+        def paths():
+            asked.append(1)
+            return ["overlays/dev/pdb.yaml"]
+
+        one = {post_merge_check.ARGO_APPLICATIONS: {"items": [argo_app()]}}
+        self.assertEqual(len(post_merge_check.reconcilers_for(REPO, "shop", one, paths)), 1)
+        self.assertEqual(asked, [])
+        dev, prod = argo_app(), argo_app()
+        dev["spec"]["source"]["path"], prod["spec"]["source"]["path"] = "overlays/dev", "overlays/prod"
+        two = {post_merge_check.ARGO_APPLICATIONS: {"items": [dev, prod]}}
+        self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", two, paths), [dev])
+        self.assertEqual(asked, [1])
+
+    def test_diff_paths_reads_old_and_new_names(self):
+        diff = ("diff --git a/clusters/dev/pdb.yaml b/clusters/dev/pdb.yaml\nnew file mode 100644\n"
+                "--- /dev/null\n+++ b/clusters/dev/pdb.yaml\n@@ -0,0 +1 @@\n+--- a/not/a/header\n"
+                "diff --git a/old.yaml b/new.yaml\n--- a/old.yaml\n+++ b/new.yaml\n")
+        self.assertEqual(post_merge_check.diff_paths(diff), ["clusters/dev/pdb.yaml", "old.yaml", "new.yaml"])
+
+    def test_forge_paths_reads_the_diff_and_says_unknown_when_it_cannot(self):
+        from unittest import mock
+
+        calls = []
+
+        def answering(answer):
+            def call(op, args, repo, **kwargs):
+                calls.append((op, args, repo, kwargs))
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            return mock.Mock(call=call)
+
+        diff = "diff --git a/clusters/dev/pdb.yaml b/clusters/dev/pdb.yaml\n--- a/clusters/dev/pdb.yaml\n+++ b/clusters/dev/pdb.yaml\n"
+        with mock.patch.dict(sys.modules, {"forge": answering({"diff": diff})}):
+            self.assertEqual(post_merge_check.forge_paths(REPO, 7), ["clusters/dev/pdb.yaml"])
+        self.assertEqual(calls[0][:3], ("proposal-view", {"number": 7, "diff": True}, REPO))
+        self.assertTrue(calls[0][3]["retry_transient"])
+        cut = {"diff": diff + "# diff cut short: only the first 1 files are shown\n"}
+        maybe = {"diff": diff + "# diff may be cut short: GitLab sent page 3 again\n"}
+        quoted = diff + "@@ -0,0 +1 @@\n+# diff cut short is just text in this file\n"
+        with mock.patch.dict(sys.modules, {"forge": answering({"diff": quoted})}):
+            self.assertEqual(post_merge_check.forge_paths(REPO, 7), ["clusters/dev/pdb.yaml"])
+        for answer in ({"diff": ""}, {"diff": None}, {}, ["not", "a", "dict"], cut, maybe, RuntimeError("forge down")):
+            with self.subTest(answer=answer), mock.patch.dict(sys.modules, {"forge": answering(answer)}):
+                if isinstance(answer, Exception):
+                    with self.assertLogs("post_merge_check", level="WARNING"):
+                        self.assertIsNone(post_merge_check.forge_paths(REPO, 7))
+                else:
+                    self.assertIsNone(post_merge_check.forge_paths(REPO, 7))
+
+    def test_combined_sync_is_applied_only_when_every_reconciler_is(self):
+        state, _ = post_merge_check.combined_sync([argo_app(), argo_app(revision=OLDER, status="OutOfSync")], MERGE)
+        self.assertNotEqual(state, "applied")
+        self.assertEqual(post_merge_check.combined_sync([argo_app()], MERGE)[0], "applied")
+        self.assertEqual(post_merge_check.combined_sync([], MERGE)[0], "unknown")
+
+
 class MainTest(unittest.TestCase):
     def test_off_reads_nothing_and_on_runs_one_tick(self):
         import io
@@ -210,6 +781,87 @@ class MainTest(unittest.TestCase):
                 else:
                     self.assertEqual(answer["merged"], [f"{REPO}/pull/1"])
         self.assertEqual(post_merge_check.main(["other"]), 2)
+
+    def test_health_runs_one_tick_under_the_switch(self):
+        import io
+        import kubeagents_switches
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kv.db")
+            with sqlite3.connect(db) as conn:
+                conn.execute(schema())
+            out = io.StringIO()
+            with mock.patch.dict("os.environ", {"KUBEAGENTS_POST_MERGE_CHECK": "report", "SESSION_KV_DB_PATH": db}), \
+                    mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", Path(tmp) / "no-env"), \
+                    mock.patch.object(kubeagents_switches, "SWITCH_DIR", Path(tmp) / "no-dir"), \
+                    redirect_stdout(out):
+                self.assertEqual(post_merge_check.main(["health"], kubectl_json=FakeCluster()), 0)
+            self.assertEqual(json.loads(out.getvalue())["applied"], [])
+
+    def test_the_install_sets_the_reads_per_tick(self):
+        from unittest import mock
+
+        for raw, expected in (("", 20), ("5", 5), ("25", 25), ("0", 20), ("-3", 20), ("26", 20), ("500", 20), ("ten", 20),
+                              (" 7 ", 7), ("1_0", 20), ("\u0663", 20), ("+5", 20), ("0025", 25),
+                              ("9" * 4301, 20)):
+            with self.subTest(raw=raw), mock.patch.dict("os.environ", {post_merge_check.READS_PER_TICK_ENV: raw}):
+                self.assertEqual(post_merge_check.reads_per_tick(), expected)
+
+    def test_a_tick_reads_no_more_than_the_install_s_limit(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        import kubeagents_switches
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kv.db")
+            with sqlite3.connect(db) as conn:
+                conn.execute(schema())
+                for number in range(1, 11):
+                    conn.execute("INSERT INTO post_merge_records (url, repo, number, kind, opened_at) "
+                                 "VALUES (?, ?, ?, 'no-pdb', ?)", (f"{REPO}/pull/{number}", REPO, number, NOW.isoformat()))
+            forge = FakeForge({n: {"state": "open"} for n in range(1, 11)})
+            with mock.patch.dict("os.environ", {"KUBEAGENTS_POST_MERGE_CHECK": "silent", "SESSION_KV_DB_PATH": db,
+                                                post_merge_check.READS_PER_TICK_ENV: "3"}), \
+                    mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", Path(tmp) / "no-env"), \
+                    mock.patch.object(kubeagents_switches, "SWITCH_DIR", Path(tmp) / "no-dir"), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(post_merge_check.main(["notice"], view=forge), 0)
+            self.assertEqual(len(forge.reads), 3)
+
+
+    def test_an_unreadable_scope_reads_no_cluster_and_exits_one(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        import kubeagents_switches
+        import post_merge_scope
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kv.db")
+            with sqlite3.connect(db) as conn:
+                conn.execute(schema())
+                conn.execute(
+                    "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, "
+                    "object, opened_at, merged_at, merge_commit) VALUES (?, ?, 1, 'no-pdb', 'p', 'l', 'prod', 'shop', "
+                    "'Deployment/checkout', ?, ?, ?)", (f"{REPO}/pull/1", REPO, NOW.isoformat(), NOW.isoformat(), MERGE))
+            cluster, out = FakeCluster(), io.StringIO()
+            with mock.patch.dict("os.environ", {"KUBEAGENTS_POST_MERGE_CHECK": "report", "SESSION_KV_DB_PATH": db}), \
+                    mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", Path(tmp) / "no-env"), \
+                    mock.patch.object(kubeagents_switches, "SWITCH_DIR", Path(tmp) / "no-dir"), \
+                    mock.patch.object(post_merge_scope, "install_scope", side_effect=RuntimeError("render unreadable")), \
+                    redirect_stdout(out):
+                self.assertEqual(post_merge_check.main(["health"], kubectl_json=cluster), 1)
+        self.assertEqual(cluster.calls, [], "an unreadable scope reads no cluster, never every cluster")
+        self.assertEqual(json.loads(out.getvalue())["scope"], "unreadable")
+
 
 if __name__ == "__main__":
     unittest.main()

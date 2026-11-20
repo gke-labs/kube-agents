@@ -2,8 +2,13 @@ package gateway
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +95,48 @@ func TestSpawnedSessionPodsSetNdots3(t *testing.T) {
 	if len(ndots) != 1 || ndots[0] != "3" {
 		t.Errorf("ndots options %v, want exactly one, 3", ndots)
 	}
+}
+
+// TestSessionPodNdotsIsTheOperators: the operator is a separate Go module,
+// so sessionPodNdots is a copy of its brokerCallerPodNdots
+// (k8s-operator/internal/controller/pod_dns.go). This reads that file, so a
+// change here that leaves the operator behind fails; the operator's
+// TestBrokerCallerPodNdotsIsTheGateways is the same check from the other
+// side, because each module's tests run only when that module changes.
+func TestSessionPodNdotsIsTheOperators(t *testing.T) {
+	const name = "brokerCallerPodNdots"
+	file := filepath.Join("..", "..", "k8s-operator", "internal", "controller", "pod_dns.go")
+	parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decl := range parsed.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			values := spec.(*ast.ValueSpec)
+			for i, ident := range values.Names {
+				if ident.Name != name || i >= len(values.Values) {
+					continue
+				}
+				lit, ok := values.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("%s: %s is not a string literal", file, name)
+				}
+				got, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != sessionPodNdots {
+					t.Errorf("the operator's %s is %q and sessionPodNdots is %q; change both together", name, got, sessionPodNdots)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("%s declares no constant %s", file, name)
 }
 
 // TestSpawnCarriesTheOriginSequence: the pod is told which message on its
@@ -692,5 +739,51 @@ func TestFromEnvReadsTheExecTierURL(t *testing.T) {
 	}
 	if cfg.CredentialProxyExecURL != "" {
 		t.Errorf("CredentialProxyExecURL = %q with the variable unset, want empty", cfg.CredentialProxyExecURL)
+	}
+}
+
+func TestSpawnPropagatesImagePullRefsAndUniverseDomain(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv(envImagePullRefs, " mirror-pull , extra-pull , mirror-pull , ")
+	t.Setenv(envGoogleCloudUniverseDomain, "universe.example.test")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cfg.ImagePullRefs, ",") != "mirror-pull,extra-pull" {
+		t.Fatalf("ImagePullRefs = %v, want [mirror-pull extra-pull]", cfg.ImagePullRefs)
+	}
+	if cfg.UniverseDomain != "universe.example.test" {
+		t.Fatalf("UniverseDomain = %q, want universe.example.test", cfg.UniverseDomain)
+	}
+
+	cs := k8sfake.NewSimpleClientset()
+	cfg.Namespace = "test-ns"
+	cfg.WorkerImage = "img"
+	cfg.SessionServiceAccount = "agent-a2a-session"
+	cfg.TaskDeadline = 15 * time.Minute
+	cfg.SessionClusterView = true
+	cfg.CredentialProxyURL = "http://proxy:8765"
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-pull", Addressee: "chat-otter-pull"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-pull", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pod.Spec.ImagePullSecrets) != 2 || pod.Spec.ImagePullSecrets[0].Name != "mirror-pull" || pod.Spec.ImagePullSecrets[1].Name != "extra-pull" {
+		t.Fatalf("spawned pod ImagePullSecrets = %v, want [mirror-pull extra-pull]", pod.Spec.ImagePullSecrets)
+	}
+	var gotUniverse string
+	for _, ev := range pod.Spec.Containers[0].Env {
+		if ev.Name == envGoogleCloudUniverseDomain {
+			gotUniverse = ev.Value
+		}
+	}
+	if gotUniverse != "universe.example.test" {
+		t.Fatalf("spawned pod %s = %q, want universe.example.test", envGoogleCloudUniverseDomain, gotUniverse)
 	}
 }

@@ -1608,7 +1608,7 @@ class TrackingIssue(RunHarness):
         graded = ["cluster-agent-crashloop-debug failed all graded reps on 4 runs from 3 PRs (#1, #2, #3)",
                   "these cases explain 4 of 5 red runs (5 of 6 concluded runs red) in the last 6h",
                   "PR-caused: upgrades-lagging-master-probe failing only on #7 (passing on 2 other PRs built on the same main commit)"]
-        periodic = "certification lane: build 2100000000000000001 failed at 2026-11-07T03:10:00Z (log `ERROR rca-remediation-pr: required phrases absent`)"
+        periodic = "validated-capabilities lane: build 2100000000000000001 failed at 2026-11-07T03:10:00Z (log `ERROR rca-remediation-pr: required phrases absent`)"
         foreign = [*graded, periodic]
         lost_line = "lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC"
         drift_line = f"{DRIFT_ROLE} drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"
@@ -1622,7 +1622,7 @@ class TrackingIssue(RunHarness):
         }
         for own_line, body in bodies.items():
             self.assertIn(f"- {own_line}", body)
-            for name in ("cluster-agent-crashloop-debug", "upgrades-lagging-master-probe", "these cases explain", "PR-caused", "certification lane", "rca-remediation-pr"):
+            for name in ("cluster-agent-crashloop-debug", "upgrades-lagging-master-probe", "these cases explain", "PR-caused", "validated-capabilities lane", "rca-remediation-pr"):
                 self.assertNotIn(name, body, own_line)
             self.assertIsNone(RESULTS_RE.search(body), body)
         # The drop regex alone takes the graded lines; the prefix layer is what keeps a periodic's line out.
@@ -2616,6 +2616,11 @@ class WatchedPeriodics(RunHarness):
         text = post_health.render_periodic_clear(doc, prev)
         self.assertIn("(build 9): 35 visited: 35 converged.", text)
         self.assertNotIn("3 refused", text)
+        # A recovery decided on a daily that failed elsewhere says so beside
+        # its summary, so the ✅ does not read as carrying a failure of its own.
+        doc["periodics_superseded"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "recovery": True, "by": {"build": "11", "finished_at": "2026-09-16T08:40:00+00:00", "summary": "35 visited: 1 failed, 34 applied", "passed": False}}}
+        self.assertEqual(post_health.periodic_clears(doc, prev), ["post-kube-agents-fleet-reconcile"])
+        self.assertIn(f"(build 11): 35 visited: 1 failed, 34 applied{post_health.CLEARED_BY_FAILED_RUN}.", post_health.render_periodic_clear(doc, prev))
 
     def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
         doc = health("GREEN")

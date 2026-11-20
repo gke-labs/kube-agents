@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The first-run audit starts read and the ``oobe_audits_started`` verifier.
+"""The first-run audit starts read, and the ``oobe_audits_started`` and ``oobe_audits_ended`` verifiers.
 
 The read command runs under ``sh`` with this interpreter standing in for the agent's,
 against the stack's state file and an ``executions`` table in a temporary directory,
@@ -62,6 +62,7 @@ CREATE TABLE executions (
 )
 """
 ARMED = datetime(2026, 10, 6, 20, 0, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _local_shell(script: str, timeout: float) -> str:
@@ -71,6 +72,7 @@ def _local_shell(script: str, timeout: float) -> str:
 class Store:
     def __init__(self, root: Path) -> None:
         self.state = root / ".bench-oobe.json"
+        self.own_state = root / ".bench-oobe-own.json"
         self.marker = root / ".oobe_audits_fired"
         self.db = root / "executions.db"
         with sqlite3.connect(self.db) as con:
@@ -87,17 +89,18 @@ class Store:
         self.marker.write_text(json.dumps(recorded))
 
     def run(
-        self, job: str, claimed: datetime, status: str = "running", finished: datetime | None = None, started: bool | None = None
+        self, job: str, claimed: datetime, status: str = "running", finished: datetime | None = None, started: bool | None = None,
+        error: str | None = None,
     ) -> None:
         """A run row; ``started_at`` is set as the ledger sets it, for a run that got going, unless told."""
         self.rows += 1
         began = status in oobe.STARTED_STATUSES if started is None else started
         with sqlite3.connect(self.db) as con:
             con.execute(
-                "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, finished_at, started_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, finished_at, started_at, error)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (f"{self.rows:032x}", job, "builtin", "p", 1, status, claimed.isoformat(),
-                 finished.isoformat() if finished else None, claimed.isoformat() if began else None),
+                 finished.isoformat() if finished else None, claimed.isoformat() if began else None, error),
             )
 
     def chain(self, start: datetime, last_status: str = "running") -> None:
@@ -114,6 +117,7 @@ class Store:
 def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Store:
     s = Store(tmp_path)
     monkeypatch.setattr(oobe, "STATE_FILE", str(s.state))
+    monkeypatch.setattr(oobe, "OWN_STATE_FILE", str(s.own_state))
     monkeypatch.setattr(oobe, "AUDITS_MARKER", str(s.marker))
     monkeypatch.setattr(oobe, "PLATFORM_EXECUTIONS_DB", str(s.db))
     monkeypatch.setattr(oobe, "HERMES_PYTHON", sys.executable)
@@ -169,9 +173,9 @@ def test_the_audit_list_matches_the_stage(store: Store) -> None:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "FIRST_RUN_AUDITS" for t in node.targets)
     )
     assert tuple(shipped) == oobe.FIRST_RUN_AUDITS
-    # The streams the case makes the runner lock: every audit the stage starts, and no other.
-    declared = yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])["audit_streams"]
-    assert sorted(declared) == sorted(shipped)
+    # On a lease the case starts no audit, so it locks no stream: the five would hold every
+    # audit case on them for the install's whole chain.
+    assert "audit_streams" not in yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])
 
 
 def test_a_run_from_before_the_arm_does_not_count(store: Store) -> None:
@@ -242,7 +246,7 @@ def test_a_run_that_did_not_get_going_does_not_count(store: Store, status: str) 
 
 @pytest.mark.parametrize("status", ["failed", "unknown"])
 def test_a_run_that_got_going_and_then_ended_badly_still_started(store: Store, status: str) -> None:
-    # How the run ended is the audit cases' to grade; a GitHub 500 in `finish` is not "did not start".
+    # How the run ended is the ended check's to grade; a GitHub 500 in `finish` is not "did not start".
     store.arm()
     store.chain(ARMED + timedelta(minutes=1))
     store.run(oobe.FIRST_RUN_AUDITS[0], ARMED + timedelta(seconds=30), status, ARMED + timedelta(seconds=50), started=True)
@@ -316,10 +320,60 @@ def test_another_jobs_run_does_not_count(store: Store) -> None:
     assert _verify().status == "fail"
 
 
-def test_no_state_file_is_an_error(store: Store) -> None:
+def test_no_state_file_and_no_own_choice_is_an_error(store: Store) -> None:
+    # The stack did not run, or ran nothing: even a recent chain is not graded without its choice.
+    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": NOW.timestamp()}))
+    store.chain(NOW - timedelta(minutes=30))
     result = _verify()
     assert result.status == "error"
-    assert "did not arm" in result.reason
+    assert "neither armed the stage nor chose the install's own first run" in result.reason
+
+
+# --- the install's own first run (no state file) ------------------------------
+
+
+
+def _own_record(store: Store, at: datetime, **extra) -> None:
+    """The stage's record as a fresh install's own first run leaves it, and the stack's choice of it."""
+    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": at.timestamp(), **extra}))
+    store.own_state.write_text(json.dumps({"first_run_at": at.timestamp()}))
+
+
+def test_a_fresh_installs_own_chain_is_graded_without_a_state_file(store: Store) -> None:
+    _own_record(store, NOW)
+    store.chain(NOW - timedelta(minutes=30))
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert result.reason.startswith("on the install's own first run, ")
+
+
+def test_a_fresh_install_whose_stage_skipped_is_a_red_that_says_so(store: Store) -> None:
+    store.marker.write_text(json.dumps({"done": True, "skipped": True, "reason": "no sweep", "at": NOW.timestamp()}))
+    store.own_state.write_text("{}")
+    result = _verify()
+    assert result.status == "fail"
+    assert "the stage skipped the first-run audits: no sweep" in result.reason
+
+
+def test_on_the_own_chain_a_run_before_its_mark_does_not_count(store: Store) -> None:
+    _own_record(store, NOW)
+    store.chain(NOW - timedelta(minutes=30))
+    # The last audit's only run was claimed before the stage marked it.
+    last = oobe.FIRST_RUN_AUDITS[-1]
+    store.mark(last, NOW)
+    result = _verify()
+    assert result.status == "fail"
+    assert last in result.reason
+
+
+def test_the_own_choice_file_is_the_one_the_stack_writes_and_the_disarm_removes() -> None:
+    name = Path(oobe.OWN_STATE_FILE).name
+    assert name == ".bench-oobe-own.json"
+    for script in ("own_stage.py", "disarm.py"):
+        assert f'OWN_STATE = os.path.join(home, "{name}")' in (ARM.parent / script).read_text(), script
+    # The stack's window for a recent first run is the stage's own idea of a new install.
+    assert "FRESH_SECONDS = 24 * 60 * 60" in (ARM.parent / "own_stage.py").read_text()
+    assert "NEW_INSTALL_SECONDS = 24 * 60 * 60" in STAGE.read_text()
 
 
 def test_an_unreadable_store_is_an_error(store: Store) -> None:
@@ -341,3 +395,112 @@ def test_no_store_yet_is_nothing_started(store: Store) -> None:
 def test_a_pod_that_does_not_answer_is_an_error(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(oobe, "agent_shell", lambda _script, _timeout: "")
     assert _verify().status == "error"
+
+
+# --- how the runs ended (oobe_audits_ended) --------------------------------------
+
+# What the runtime records when it gives up on a model call that was dropped five times, as far as
+# its first clause.
+STALL_ERROR = "RuntimeError: Provider has been unresponsive (no response received) for 5 consecutive stale attempts"
+
+
+def _verify_ended():
+    return oobe.OobeAuditsEndedVerifier(type="oobe_audits_ended").verify(0.0)
+
+
+def _chain_ending(store: Store, statuses: dict[str, str], error: str | None = None) -> None:
+    """The chain, each run after its mark and ended as told (completed unless named)."""
+    at = ARMED + timedelta(minutes=2)
+    for audit in oobe.FIRST_RUN_AUDITS:
+        status = statuses.get(audit, "completed")
+        store.mark(audit, at - timedelta(seconds=30))
+        ended = None if status in oobe.IN_FLIGHT_STATUSES else at + timedelta(minutes=3)
+        store.run(audit, at, status, ended, started=True, error=error if status not in ("completed", *oobe.IN_FLIGHT_STATUSES) else None)
+        at += timedelta(minutes=4)
+
+
+def test_the_case_names_the_ended_check_and_its_entry_point_is_registered() -> None:
+    spec = yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])["verification_spec"]
+    assert any(e["check"].get("type") == "oobe_audits_ended" and e.get("role") == "objective" for e in spec)
+    points = tomllib.loads((REPO / "bench" / "pyproject.toml").read_text())["project"]["entry-points"]
+    assert points["devops_bench.verifiers"]["oobe_audits_ended"] == "kube_agents_bench.oobe:OobeAuditsEndedVerifier"
+
+
+def test_runs_that_all_completed_pass(store: Store) -> None:
+    store.arm()
+    _chain_ending(store, {})
+    result = _verify_ended()
+    assert result.status == "pass", result.reason
+    assert "5 first-run audit run(s) ended as completed" in result.reason
+
+
+@pytest.mark.parametrize("status", ["failed", "unknown"])
+def test_a_run_that_ended_otherwise_is_named_with_its_state_and_error(store: Store, status: str) -> None:
+    # The chain still finished, so the started check passes over it.
+    store.arm()
+    stalled = oobe.FIRST_RUN_AUDITS[1]
+    _chain_ending(store, {stalled: status}, error=STALL_ERROR)
+    assert _verify().status == "pass"
+    result = _verify_ended()
+    assert result.status == "fail"
+    assert f"{stalled} ended as {status} ({STALL_ERROR})" in result.reason
+    assert oobe.FIRST_RUN_AUDITS[0] not in result.reason
+
+
+def test_a_long_error_is_cut(store: Store) -> None:
+    store.arm()
+    _chain_ending(store, {oobe.FIRST_RUN_AUDITS[0]: "failed"}, error="x" * (oobe.ERROR_SHOWN_CHARS * 2))
+    result = _verify_ended()
+    assert "x" * oobe.ERROR_SHOWN_CHARS in result.reason
+    assert "x" * (oobe.ERROR_SHOWN_CHARS + 1) not in result.reason
+
+
+@pytest.mark.parametrize("status", list(oobe.IN_FLIGHT_STATUSES))
+def test_a_run_that_has_not_ended_is_not_graded(store: Store, status: str) -> None:
+    # The stage is done once its last audit is running, so a repetition can read it mid-run.
+    store.arm()
+    last = oobe.FIRST_RUN_AUDITS[-1]
+    _chain_ending(store, {last: status})
+    result = _verify_ended()
+    assert result.status == "pass", result.reason
+    assert f"{last} had not ended and was not graded" in result.reason
+
+
+def test_no_run_of_the_stages_is_a_fail_that_says_nothing_was_graded(store: Store) -> None:
+    store.arm()
+    result = _verify_ended()
+    assert result.status == "fail"
+    assert "no run's end was graded" in result.reason
+
+
+def test_a_failed_run_the_stage_did_not_mark_is_not_graded(store: Store) -> None:
+    # A scheduled run that fell in the window is not the stage's.
+    store.arm(marked=oobe.FIRST_RUN_AUDITS[1:])
+    _chain_ending(store, {oobe.FIRST_RUN_AUDITS[0]: "failed"}, error=STALL_ERROR)
+    assert _verify_ended().status == "pass"
+
+
+def test_the_own_chain_is_graded_without_a_state_file(store: Store) -> None:
+    start = NOW - timedelta(minutes=40)
+    _own_record(store, start)
+    stalled = oobe.FIRST_RUN_AUDITS[2]
+    at = start
+    for audit in oobe.FIRST_RUN_AUDITS:
+        store.mark(audit, at - timedelta(seconds=30))
+        store.run(audit, at, "failed" if audit == stalled else "completed", at + timedelta(minutes=3), started=True)
+        at += timedelta(minutes=4)
+    result = _verify_ended()
+    assert result.status == "fail"
+    assert f"{stalled} ended as failed" in result.reason
+
+
+def test_the_ended_check_errors_where_the_started_check_does(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": NOW.timestamp()}))
+    assert "neither armed the stage nor chose the install's own first run" in _verify_ended().reason
+    assert _verify_ended().status == "error"
+    store.arm()
+    store.db.write_text("not a database")
+    assert _verify_ended().status == "error"
+    monkeypatch.setattr(oobe, "agent_shell", lambda _script, _timeout: "")
+    assert _verify_ended().status == "error"
+

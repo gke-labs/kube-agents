@@ -135,6 +135,7 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_enable_stockout="false",
                    tfvar_stockout_topic='"gke-stockout-alerts-topic"',
                    tfvar_stockout_sub='"gke-stockout-alerts-sub"',
+                   tfvar_stockout_sink='"gke-stockout-alerts-sink"',
                    tfvar_standard_node_count="1",
                    tfvar_sizing_profile="null",
                    tfvar_enable_gvisor="true",
@@ -152,7 +153,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    untaint_stub="exit 0",
                    stdout_path=None,
                    sigint_after=None,
-                   tee_fails=False):
+                   tee_fails=False,
+                   extra_env=None):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -366,6 +368,9 @@ EOF
     elif [[ "$expr" == *"stockout_pubsub_subscription"* ]]; then
         echo '{tfvar_stockout_sub}'
         exit 0
+    elif [[ "$expr" == *"stockout_pubsub_sink"* ]]; then
+        echo '{tfvar_stockout_sink}'
+        exit 0
     elif [[ "$expr" == *"standard_node_count"* ]]; then
         echo '{tfvar_standard_node_count}'
         exit 0
@@ -413,8 +418,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"
             # has been trying them out by hand.
             env = get_isolated_test_env(
                 bin_dir=str(bin_dir),
-                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS"],
+                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS",
+                        "KUBEAGENTS_ALLOW_NODE_POOL_DESTROY"],
             )
+            env.update(extra_env or {})
             cwd = str(_REPO_ROOT / "terraform" / "examples" / "full-install")
             if stdout_path is not None:
                 # stdout a regular file, as `./lifecycle.sh apply > apply.log`
@@ -794,16 +801,24 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_guard_release_namespace_refuses_a_release_move(self):
-        """helm_release.namespace is ForceNew: a changed NAMESPACE plans destroy-and-recreate."""
-        proc = self._run_guard(
-            "guard_release_namespace",
-            state_list="helm_release.kube_agents",
-            state_show='resource "helm_release" "kube_agents" {\n    name      = "kube-agents"\n    namespace = "kubeagents-system"\n}',
-            tfvar_namespace='"agents-two"',
-        )
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
-        self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
+        """helm_release.namespace is ForceNew: a changed NAMESPACE plans destroy-and-recreate.
+
+        The release has a count (install_helm_releases), so a state written since
+        holds it at [0]; a state from before holds the unindexed address until
+        the apply runs the moved block, and this guard runs before that apply.
+        Both must be refused."""
+        for address in ("helm_release.kube_agents[0]", "helm_release.kube_agents"):
+            with self.subTest(address=address):
+                proc = self._run_guard(
+                    "guard_release_namespace",
+                    state_list=address,
+                    state_show='resource "helm_release" "kube_agents" {\n    name      = "kube-agents"\n    namespace = "kubeagents-system"\n}',
+                    tfvar_namespace='"agents-two"',
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
+                self.assertIn(f"({address})", proc.stderr)
+                self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
 
     # terraform state show prints a number bare and the top-level attributes
     # before the nested blocks; the node_pool block repeats the name.
@@ -1119,6 +1134,40 @@ resource "google_service_account" "agent" {
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_no_op_without_a_pool_in_state(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list="", tfvar_enable_gvisor="false")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_gvisor_pool_teardown_passes_a_kept_pool(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_gvisor_pool_teardown_refuses_a_pool_the_flag_drops(self):
+        """The upgrade that read a missing ENABLE_GVISOR as false planned the pool's destroy."""
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="false")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("this state's cluster runs the gVisor pool", proc.stderr)
+        self.assertIn("would DESTROY that pool", proc.stderr)
+        self.assertIn('set ENABLE_GVISOR="true" in install.env', proc.stderr)
+        self.assertIn("--allow-node-pool-destroy", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_lets_a_confirmed_destroy_go(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="false",
+                               extra_env={"KUBEAGENTS_ALLOW_NODE_POOL_DESTROY": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("as KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true confirms", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_runs_on_apply(self):
+        text = (_REPO_ROOT / "terraform/examples/full-install/lifecycle.sh").read_text()
+        apply = text[text.index("  apply)\n"):]
+        apply = apply[: apply.index("log \"terraform apply\"")]
+        self.assertIn("guard_gvisor_pool_teardown", apply)
 
     def test_guard_node_pool_shape_lets_a_gvisor_pool_being_removed_go(self):
         """enable_gvisor_node_pool off with the pool still in state is the apply that destroys
@@ -1660,6 +1709,19 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("drift-audit", proc.stdout)
         self.assertNotIn("drift_pubsub", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
+
+    def test_adopt_kms_never_imports_the_stockout_pubsub_trio(self):
+        """Like the drift trio, the stockout trio is never imported by adopt_kms."""
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("stockout", proc.stdout)
         self.assertIn("resource adoption complete: 0 imported", proc.stdout)
 
     # A tainted KMS resource in state. Cloud KMS answers 403 "API has not been
@@ -2388,6 +2450,132 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("could not evaluate var.enable_drift_pubsub", proc.stderr)
 
+    def test_guard_stockout_adoption_refuses_a_trio_this_state_does_not_manage(self):
+        """A second install in the project reaches apply with the stockout trio already there."""
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Pub/Sub topic 'gke-stockout-alerts-topic' already exists", proc.stderr)
+        self.assertIn("Pub/Sub subscription 'gke-stockout-alerts-sub' already exists", proc.stderr)
+        self.assertIn("Log Router sink 'gke-stockout-alerts-sink' already exists", proc.stderr)
+
+    def test_guard_stockout_adoption_names_every_way_out(self):
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn('TF_VAR_stockout_pubsub_topic="<a-different-name>"', proc.stderr)
+        self.assertIn('TF_VAR_stockout_pubsub_subscription="<a-different-name>"', proc.stderr)
+        self.assertIn('TF_VAR_stockout_pubsub_sink="<a-different-name>"', proc.stderr)
+        self.assertIn("gcloud pubsub topics delete gke-stockout-alerts-topic --project test-project", proc.stderr)
+        self.assertIn("gcloud pubsub subscriptions delete gke-stockout-alerts-sub --project test-project", proc.stderr)
+        self.assertIn("gcloud logging sinks delete gke-stockout-alerts-sink --project test-project", proc.stderr)
+        self.assertIn(
+            "terraform import 'google_pubsub_topic.stockout_alerts[0]' "
+            "projects/test-project/topics/gke-stockout-alerts-topic",
+            proc.stderr,
+        )
+        self.assertIn(
+            "terraform import 'google_pubsub_subscription.stockout_alerts[0]' "
+            "projects/test-project/subscriptions/gke-stockout-alerts-sub",
+            proc.stderr,
+        )
+        self.assertIn(
+            "terraform import 'google_logging_project_sink.stockout_alerts[0]' "
+            "projects/test-project/sinks/gke-stockout-alerts-sink",
+            proc.stderr,
+        )
+        self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=false", proc.stderr)
+        self.assertNotIn("source_drift_audit", proc.stderr)
+
+    def test_guard_stockout_adoption_checks_the_names_this_state_would_create(self):
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            tfvar_stockout_topic='"second-stockout-alerts"',
+            tfvar_stockout_sub='"second-stockout-alerts-sub"',
+            tfvar_stockout_sink='"second-stockout-alerts-sink"',
+            gcloud_stub='if [[ "$*" == *"second-stockout-alerts"* ]]; then exit 1; fi; exit 0',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_stockout_adoption_passes_on_a_trio_already_in_state(self):
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="google_pubsub_topic.stockout_alerts[0]\n"
+                       "google_pubsub_subscription.stockout_alerts[0]\n"
+                       "google_logging_project_sink.stockout_alerts[0]",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_stockout_adoption_passes_on_a_first_install(self):
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            gcloud_stub="exit 1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_stockout_adoption_refuses_on_one_of_the_three(self):
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            gcloud_stub='if [[ "$*" == *"logging sinks"* ]]; then exit 0; fi; exit 1',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Log Router sink 'gke-stockout-alerts-sink' already exists", proc.stderr)
+        self.assertNotIn("Pub/Sub topic", proc.stderr)
+        self.assertIn(
+            "terraform import 'google_logging_project_sink.stockout_alerts[0]' "
+            "projects/test-project/sinks/gke-stockout-alerts-sink",
+            proc.stderr,
+        )
+        self.assertNotIn("google_pubsub_topic.stockout_alerts", proc.stderr)
+
+    def test_guard_stockout_adoption_is_a_no_op_when_the_flag_is_off(self):
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="false",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_stockout_adoption_refuses_when_the_console_cannot_answer(self):
+        proc = self._run_guard(
+            "guard_stockout_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_stockout="true",
+            gcloud_stub="exit 0",
+            console_fail_var="enable_stockout_investigator",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("could not evaluate var.enable_stockout_investigator", proc.stderr)
+
 
 
 class DeleteAgentCrEndpointTest(unittest.TestCase):
@@ -2594,7 +2782,10 @@ class UninstallHelmReleasesTest(unittest.TestCase):
     state installed with the helm CLI, and stops the destroy when it cannot.
     """
 
-    _KUBE_AGENTS = "helm_release.kube_agents"
+    # The release has a count (install_helm_releases); a state from before it
+    # holds the unindexed address until an apply runs the moved block.
+    _KUBE_AGENTS = "helm_release.kube_agents[0]"
+    _KUBE_AGENTS_LEGACY = "helm_release.kube_agents"
     _CERT_MANAGER = "helm_release.cert_manager[0]"
     _CONTEXT = "gke_test-project_us-central1_test-cluster"
 
@@ -2691,6 +2882,11 @@ exit 0
             # get-credentials sharing it can move mid-teardown.
             self.assertIn(f"--kube-context {self._CONTEXT}", " ".join(uninstall))
             self.assertIn("--wait", uninstall)
+
+    def test_a_state_from_before_the_count_still_uninstalls_kube_agents(self):
+        proc, calls = self._run(state=(self._CERT_MANAGER, self._KUBE_AGENTS_LEGACY))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([u[2] for u in self._uninstalls(calls)], ["kube-agents", "cert-manager"], calls)
 
     def test_a_cert_manager_this_state_did_not_install_is_left_alone(self):
         proc, calls = self._run(state=(self._KUBE_AGENTS,))
@@ -3181,6 +3377,9 @@ class RedactHelmReleaseMetadataTest(unittest.TestCase):
             "mawk": ["mawk"],
             "original-awk": ["original-awk"],
             "busybox": ["busybox", "awk"],
+            # The awk the system ships: on macOS the one true awk, and the
+            # only awk a stock Mac has.
+            "system": ["/usr/bin/awk"],
         }
         tested = 0
         for name, cmd in variants.items():
@@ -3478,7 +3677,7 @@ class ImportOverrideTest(unittest.TestCase):
     _IMPORT_ERROR_DETAIL = "on ../../modules/kube-agents-scope-resolver/main.tf line 249 (stub)"
     _IMPORT_FAILURE = [*_IMPORT_PREAMBLE, "|", f"| {_IMPORT_ERROR}", "|", f"|   {_IMPORT_ERROR_DETAIL}", "|"]
 
-    def _run(self, func_call, import_rc=0, enable_stockout="true", enable_chat="false", import_output=None):
+    def _run(self, func_call, import_rc=0, create_cluster="true", enable_chat="false", import_output=None):
         """Run one adoption function against stubs that record each import.
 
         Returns the process, one line per `terraform import` with its
@@ -3498,14 +3697,11 @@ class ImportOverrideTest(unittest.TestCase):
             failure.write_text("".join(f"{line}\n" for line in (import_output or self._IMPORT_FAILURE)))
             provider_override = comp / _PROVIDER_OVERRIDE
             scope_override = (comp / _scope_resolver_source() / _SCOPE_OVERRIDE).resolve()
-            # An empty state; a console that enables the stockout trio (three
-            # adopt_kms imports) or Chat (an adopt_pubsub import) and leaves
-            # every other flag at null; an import that records what it saw
-            # and exits as told. The stockout trio rather than the drift one
-            # because adopt_kms no longer adopts drift: the three resources
-            # take one fixed name per project and the detector is now on by
-            # default, so guard_drift_adoption refuses a second install in a
-            # project where adoption would once have silently taken them.
+            # An empty state; a console that enables cluster KMS (two
+            # adopt_kms imports: keyring and key) or Chat (an adopt_pubsub
+            # import) and leaves every other flag at null; an import that
+            # records what it saw and exits as told. Both drift and stockout
+            # trios stay guarded rather than adopted.
             (bin_dir / "terraform").write_text(
                 f"#!{bash}\n"
                 'case "$1" in\n'
@@ -3514,11 +3710,10 @@ class ImportOverrideTest(unittest.TestCase):
                 '    case "${expr#var.}" in\n'
                 "      project_id) echo '\"test-project\"' ;;\n"
                 "      location) echo '\"us-central1\"' ;;\n"
-                "      create_cluster) echo '\"false\"' ;;\n"
-                f"      enable_stockout_investigator) echo '{enable_stockout}' ;;\n"
-                "      stockout_pubsub_topic) echo '\"gke-stockout-alerts-topic\"' ;;\n"
-                "      stockout_pubsub_subscription) echo '\"gke-stockout-alerts-sub\"' ;;\n"
-                "      stockout_pubsub_sink) echo '\"gke-stockout-alerts-sink\"' ;;\n"
+                f"      create_cluster) echo '\"{create_cluster}\"' ;;\n"
+                "      enable_database_encryption) echo '\"true\"' ;;\n"
+                "      kms_keyring_name) echo '\"platform-agent-keyring\"' ;;\n"
+                "      kms_key_name) echo '\"k8s-secret-encryption-key\"' ;;\n"
                 f"      enable_google_chat) echo '{enable_chat}' ;;\n"
                 "      chat_topic_name) echo '\"platform-agent-chat-events\"' ;;\n"
                 "      chat_subscription_name) echo '\"platform-agent-chat-events-sub\"' ;;\n"
@@ -3554,12 +3749,12 @@ class ImportOverrideTest(unittest.TestCase):
 
     def test_both_overrides_exist_for_every_import_and_neither_survives_it(self):
         for func_call, expected_imports, summary in (
-            ("adopt_kms", 3, "resource adoption complete: 3 imported"),
+            ("adopt_kms", 2, "resource adoption complete: 2 imported"),
             ("adopt_pubsub", 1, "Pub/Sub adoption complete: 1 imported"),
         ):
             with self.subTest(func_call=func_call):
                 proc, seen, _, left = self._run(
-                    func_call, enable_stockout="true", enable_chat="true",
+                    func_call, create_cluster="true", enable_chat="true",
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(len(seen), expected_imports, seen)
@@ -3582,16 +3777,16 @@ class ImportOverrideTest(unittest.TestCase):
         for func_call in ("adopt_kms", "adopt_pubsub"):
             with self.subTest(func_call=func_call):
                 proc, seen, _, left = self._run(
-                    func_call, import_rc=1, enable_stockout="true", enable_chat="true",
+                    func_call, import_rc=1, create_cluster="true", enable_chat="true",
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertGreater(len(seen), 0)
                 for line in seen:
                     self.assertIn("provider=yes scope=yes", line)
                 self.assertEqual(left, [])
-                # The address, not a prefix of it: adopt_kms's stockout trio
-                # sits at the root and adopt_pubsub's subscription inside a
-                # module, so only "could not import " is common to both.
+                # The address, not a prefix of it: adopt_kms's cluster KMS
+                # resources and adopt_pubsub's subscription share the failure
+                # prefix "could not import ".
                 self.assertIn("could not import ", proc.stderr)
                 self.assertIn("the apply will fail with a 409", proc.stderr)
                 self.assertIn("terraform import said:", proc.stderr)

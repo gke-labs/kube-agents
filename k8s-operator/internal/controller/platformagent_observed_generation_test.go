@@ -62,13 +62,14 @@ func (c *statusWriteCounter) interceptors() interceptor.Funcs {
 	return funcs
 }
 
-// observedGenerationReconciler holds the agent and all three workloads ready,
-// so the status under test is Ready and the only thing varying is the generation.
+// observedGenerationReconciler holds the agent and every workload ready, the
+// A2A stack included, so the status under test is Ready and the only thing
+// varying is the generation.
 func observedGenerationReconciler(agent *agentv1alpha1.PlatformAgent, counter *statusWriteCounter) *PlatformAgentReconciler {
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1)).
+		WithObjects(append(a2aStackUp(agent), agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))...).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(counter.interceptors()).
 		Build()
@@ -78,7 +79,7 @@ func observedGenerationReconciler(agent *agentv1alpha1.PlatformAgent, counter *s
 func settleReady(t *testing.T, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
 	ctx := context.Background()
-	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{})
+	phase, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}

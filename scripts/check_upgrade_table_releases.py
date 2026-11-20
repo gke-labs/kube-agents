@@ -6,7 +6,8 @@
 The "Breaking changes in recent releases" table labels each row with the release an operator
 first meets the change in. A label a pull request writes for the release its author expects next
 is often wrong, because a release can be cut from an earlier commit, so a new row says `pending`
-and is relabelled after its release ships. Once a
+and is relabelled after its release ships: the release job opens the pull request that does it
+(scripts/release/open_upgrade_relabel_pr.sh), by pending_row_release and labelled_row_problem below. Once a
 release is tagged, this check finds the commit that added each row labelled with it (the oldest
 commit whose diff adds a release or `pending` row whose change cell is the change text, after the
 last commit that removed such a row) and requires the tag to contain that commit, or the tag's own copy of the table to hold the row (a change and its row cherry-picked
@@ -38,7 +39,9 @@ that removes a `pending` row such a candidate contains fails until that release 
 release will ship the old text, and no trace entry excuses it. If a release is cut from an older
 candidate than the one that holds the row, that change fails although the row does not ship. A
 `pending` row no commit can be found for is reported, as any row is. A Release cell that is neither a
-release number nor `pending` fails, so a misspelt label is not skipped.
+release number nor `pending` fails, so a misspelt label is not skipped. The table's released rows must
+run newest first: a row labelled a newer release than a released row above it is reported, since a reader
+upgrading reads the top of the table (`pending` rows are not placed).
 
 The check needs the history and the release tags, so it fails on a shallow clone or one with no
 release tag rather than pass with nothing to compare.
@@ -47,7 +50,8 @@ A wrong label fails only where it can be fixed: on a push to main, and on a pull
 merge-queue group that adds the row or changes its label or change text. A wrong label on a row the
 change did not touch is printed as a warning and the check passes, so a release cut that leaves out a
 labelled row does not turn every open pull request red, nor one that edits another part of the page;
-main's push run stays red until a pull request relabels the row. Run locally, the check compares the
+main's push run stays red until a pull request relabels the row. Rows out of newest-first order are
+treated the same way: they fail a push to main and a change that edits the page, and warn on any other. Run locally, the check compares the
 page with upstream/main or origin/main, whichever exists, and fails outright when neither does. A
 local run also notes the releases its rows name that have no local tag, which it cannot check.
 """
@@ -267,18 +271,31 @@ def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str],
     return found
 
 
-def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str | None:
-    """Why a `pending` row must be relabelled, or None while no release contains it.
+def pending_row_commit(row: Row, traced: dict[str, str]) -> str | None:
+    """The commit a `pending` row is traced to: the one TRACES_FILE names for it, or the one that added it."""
+    return traced.get(row.change) or row_commit(row.change)
+
+
+def pending_row_release(row: Row, tags: set[str], traced: dict[str, str]) -> tuple[str, bool] | None:
+    """The first release that contains a `pending` row, and whether it was by the row's commit; None while
+    no release does.
 
     A release contains the row when its tag contains the commit that added the row (or the commit
     TRACES_FILE names for it), or when its own copy of the table holds the row (a change and its row
     cherry-picked to the release branch). Every release tag is read, so a `pending` row never passes
-    once any release has shipped that commit.
+    once any release has shipped that commit. The release job's relabel
+    (relabel_upgrade_table_pending.py) calls this too, so the relabel and this check apply one rule.
     """
-    commit = traced.get(row.change) or row_commit(row.change)
+    return shipping_release(row.change, pending_row_commit(row, traced), tags)
+
+
+def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str | None:
+    """Why a `pending` row must be relabelled (pending_row_release names the release), or None while no
+    release contains it."""
+    commit = pending_row_commit(row, traced)
     named = f"the commit {TRACES_FILE} names for it" if row.change in traced else "the commit that added it"
     where = f"{UPGRADE_PAGE}:{row.line}"
-    shipping = shipping_release(row.change, commit, tags)
+    shipping = pending_row_release(row, tags, traced)
     if shipping is not None:
         tag, by_commit = shipping
         shipped = f"{commit[:12]}, {named}" if by_commit else "the row in its own copy of the table"
@@ -289,13 +306,12 @@ def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str
     return None
 
 
-def release_cell_problems() -> list[str]:
-    """The rows of the breaking-changes table whose Release cell is neither a release number nor `pending`."""
-    found = []
-    lines = working_file_lines()
+def table_lines(lines: list[str]) -> tuple[int | None, list[int]]:
+    """The breaking-changes table's heading line and its lines (header rows first), as indexes into `lines`;
+    (None, []) with no heading."""
     start = next((i for i, line in enumerate(lines) if line.strip() == TABLE_HEADING), None)
     if start is None:
-        return found
+        return None, []
     # The table starts at its header row (first cells "Release" and "Change") and ends at the first line
     # after it that does not start with `|`, so another table or `|` line under the same heading, before
     # or after it, is not read. A heading with no such table is reported, so a renamed header is not skipped.
@@ -312,6 +328,23 @@ def release_cell_problems() -> list[str]:
             table.append(number)
         else:
             break
+    return start, table
+
+
+def table_rows(text: str) -> list[Row]:
+    """rows() of the breaking-changes table alone: a `| x.y.z |` line in another table on the page is not one."""
+    _, table = table_lines(text.split("\n"))
+    body = {number + 1 for number in table[TABLE_HEADER_LINES:]}
+    return [row for row in rows(text) if row.line in body]
+
+
+def release_cell_problems() -> list[str]:
+    """The rows of the breaking-changes table whose Release cell is neither a release number nor `pending`."""
+    found = []
+    lines = working_file_lines()
+    start, table = table_lines(lines)
+    if start is None:
+        return found
     if len(table) < TABLE_HEADER_LINES:
         header = " | ".join(RELEASE_HEADER)
         return [f"{UPGRADE_PAGE}:{start + 1}: no table under \"{TABLE_HEADING}\" starts with the header "
@@ -321,6 +354,23 @@ def release_cell_problems() -> list[str]:
         if not (RELEASE_TAG.match(cell) or cell == PENDING):
             found.append(f"{UPGRADE_PAGE}:{number + 1}: the Release cell \"{cell}\" is neither a release number "
                          f"nor {PENDING}, so the row cannot be checked")
+    return found
+
+
+def order_problems(text: str) -> list[str]:
+    """Where the table's released rows stop running newest first: each released row labelled a newer
+    release than a released row above it. A reader upgrading to the newest release reads the top of the
+    table, so a newer row below an older one is one they miss. `pending` rows are not placed by this."""
+    found = []
+    above: Row | None = None
+    for row in table_rows(text):
+        if row.release == PENDING:
+            continue
+        if above is not None and version_key(row.release) > version_key(above.release):
+            found.append(f"{UPGRADE_PAGE}:{row.line}: the row \"{row.change}\" is labelled {row.release} but sits "
+                         f"below a {above.release} row (line {above.line}); the table runs newest first, so move it up")
+        if above is None or version_key(row.release) <= version_key(above.release):
+            above = row
     return found
 
 
@@ -416,28 +466,36 @@ def problems(traced: dict[str, str]) -> list[tuple[Row, str]]:
             continue
         if row.release not in tags or tag_time(row.release) < table_time:
             continue
-        where = f"{UPGRADE_PAGE}:{row.line}"
-        if row.change in traced:
-            if git_ok("merge-base", "--is-ancestor", traced[row.change], f"refs/tags/{row.release}"):
-                continue
-            found.append((row, f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
-                               f"does not contain {traced[row.change][:12]}, the commit {TRACES_FILE} names for it"))
-            continue
-        commit = row_commit(row.change)
-        if commit is None:
-            found.append((row, f"{where}: no commit in this history adds the row \"{row.change}\", so its "
-                               f"{row.release} label cannot be checked"))
-            continue
-        if git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{row.release}"):
-            continue
-        if any(tagged.change == row.change for tagged in rows(page_at(row.release))):
-            continue
-        first = first_release_containing(commit)
-        label = f"{first}, the first release that contains it" if first else f"{PENDING}: no release contains it yet"
-        found.append((row, f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
-                           f"does not contain {commit[:12]}, the commit that added it. Relabel it as {label}."
-                           + TRACE_HINT))
+        if problem := labelled_row_problem(row, traced):
+            found.append((row, problem))
     return found
+
+
+def labelled_row_problem(row: Row, traced: dict[str, str]) -> str | None:
+    """Why a row labelled with a tagged release is wrong, or None when that release contains it.
+
+    The release job's relabel (relabel_upgrade_table_pending.py) asks this of each label it would write,
+    and leaves a row `pending` rather than write one this rejects.
+    """
+    where = f"{UPGRADE_PAGE}:{row.line}"
+    if row.change in traced:
+        if git_ok("merge-base", "--is-ancestor", traced[row.change], f"refs/tags/{row.release}"):
+            return None
+        return (f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
+                f"does not contain {traced[row.change][:12]}, the commit {TRACES_FILE} names for it")
+    commit = row_commit(row.change)
+    if commit is None:
+        return (f"{where}: no commit in this history adds the row \"{row.change}\", so its "
+                f"{row.release} label cannot be checked")
+    if git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{row.release}"):
+        return None
+    if any(tagged.change == row.change for tagged in rows(page_at(row.release))):
+        return None
+    first = first_release_containing(commit)
+    label = f"{first}, the first release that contains it" if first else f"{PENDING}: no release contains it yet"
+    return (f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
+            f"does not contain {commit[:12]}, the commit that added it. Relabel it as {label}."
+            + TRACE_HINT)
 
 
 def comparison_base() -> str | None:
@@ -472,6 +530,13 @@ def main() -> int:
     found = problems(traced)
     cells = release_cell_problems()
     base = comparison_base()
+    # Rows out of newest-first order fail a push to main and a change that edits the page, and warn on any
+    # other: a disorder that reached main some other way doesn't turn every open pull request red.
+    order = order_problems(working_file(UPGRADE_PAGE))
+    if base is not None and page_at(base) == working_file(UPGRADE_PAGE):
+        warned_order, order = order, []
+    else:
+        warned_order = []
     # The rows the base already had, with the same label, change text and trace entry: this change did not
     # touch them.
     untouched = {(row.release, row.change) for row in rows(page_at(base))} if base is not None else set()
@@ -492,15 +557,15 @@ def main() -> int:
         warned_traces, failed_traces = trace_problems, []
     else:
         warned_traces, failed_traces = [], trace_problems
-    for problem in warned_traces:
+    for problem in warned_traces + warned_order:
         print(WARNING_PREFIX + problem, file=sys.stderr)
     # A change that removes the text of a `pending` row a release or an open candidate already contains
     # fails; a push has no base, so it is not read there.
     base_traced = {change: commit for change, (_, commit) in base_entries.items()}
     removed = removed_pending_problems(base, release_tags(), traced, base_traced) if base is not None else []
-    for problem in failed + failed_traces + cells + removed:
+    for problem in failed + failed_traces + cells + order + removed:
         print(problem, file=sys.stderr)
-    return EXIT_FAILED if failed or failed_traces or cells or removed else EXIT_OK
+    return EXIT_FAILED if failed or failed_traces or cells or order or removed else EXIT_OK
 
 
 if __name__ == "__main__":

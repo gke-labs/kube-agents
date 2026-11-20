@@ -62,16 +62,26 @@ forge shares and Gerrit's unit of review is a single revision.
 from __future__ import annotations
 
 import base64
+import functools
+import io
+import json
 import logging
 import os
 import re
 import subprocess
+import tarfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import yaml
+
+import automation_rules
+import automerge_checks
+import automerge_eligibility
+import okf_guard
 from providers import (
     CliTransport,
     HttpTransport,
@@ -134,10 +144,25 @@ _SHORT_REF_PREFIXES = ("refs/heads/", "heads/")
 # `refs/heads/` so nothing here can be confused with a branch, and so a publish
 # of a leftover ref cannot happen by naming a plausible branch.
 _INCOMING = "refs/vcs/incoming"
+DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
+DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
+DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_OVERRIDE_PREFIX = "decision-override:"
+FORBIDDEN_LABEL = "FORBIDDEN_LABEL"
+DM_MAX_GUARD_FILE_BYTES = 4 << 20  # 4 MiB ceiling per inspected text/YAML file
 
 # What `git ls-remote --exit-code` exits with when the remote answered and holds
 # no matching ref; any other failure is a remote it could not ask.
 LS_REMOTE_NO_MATCH_EXIT_CODE = 2
+
+# The fields every adapter's proposal-create reads, plus the repository it is
+# bound to. A profile caller's proposal-create may carry no other
+# (VcsBroker.require_agent_proposal): none names a source repository today, and
+# one that did would be a fork source this check had not read.
+PROFILE_PROPOSAL_CREATE_FIELDS = frozenset({"repository", "title", "body", "source", "target", "draft"})
+# The fields a profile caller's proposal-update may carry: which proposal, and
+# its text. No label field (labelsAdd, labelsRemove) and no target.
+PROFILE_PROPOSAL_UPDATE_FIELDS = frozenset({"repository", "number", "title", "body"})
 
 # The namespace every branch this install publishes is named under, and the only
 # one `branch-delete` will touch. Every shipped caller derives its branch as
@@ -195,6 +220,14 @@ ROLE_UNREGISTERED = "unregistered"
 # credential: a context repository's, and an unregistered one's.
 HELPER_CLEARED = (CREDENTIAL_HELPER_KEY, "")
 
+# What a git call carries when its working directory is a bare repository of
+# the broker's own (the snapshot clone, the `contains` scratch repository). It
+# names the repository: under `safe.bareRepository=explicit`, the default from
+# Git 3.0, git does not take a bare repository from the working directory. A
+# named repository also gets no ownership check (`safe.directory`) from git;
+# the broker makes each of these directories itself, in the same request.
+GIT_DIR_IS_CWD = "--git-dir=."
+
 # Where `snapshot` puts its two files inside its scratch directory: the bare
 # clone, and the tar `git archive` writes. The tar goes to a file and not to
 # stdout, because the git runner cuts stdout at its output ceiling.
@@ -206,6 +239,11 @@ SNAPSHOT_HISTORY = "none"
 MAX_SNAPSHOT_PATHS = 256
 # How often the snapshot clone's size is measured while it runs.
 CLONE_WATCH_SECONDS = 0.5
+#: `revision-contains`'s ancestor: a full or abbreviated SHA-1 commit id (the scratch repository is SHA-1).
+ANCESTOR_RE = re.compile(r"^[0-9a-f]{7,40}$")
+#: git's words, across server versions, for a fetch of a revision the remote does not have.
+MISSING_REVISION_MARKERS = ("not our ref", "couldn't find remote ref", "unadvertised object", "no such remote ref",
+                            "did not send all necessary objects")
 # A path entry, and all of them joined: well under the kernel's limits on one
 # argument (128 KiB) and on a command line, so git always starts.
 MAX_SNAPSHOT_PATH_BYTES = 4096
@@ -344,6 +382,21 @@ def _remove_tree(path: Path) -> None:
 _AUTOMATION_MARKING = re.compile(r"\[[^\]]*\]$")
 
 
+def _as_pull_request(agent_forge: Any, proposal: Mapping[str, Any]) -> Any:
+    """A translated proposal as `forge.PullRequest`, the fields its ownership test reads.
+
+    The same mapping `forge.ForgeProvider.list_open_prs` makes from the same
+    neutral proposal: `source` is the head ref, `sourceRepo` the repository it
+    lives in (empty for a deleted fork, which reads as not ours).
+    """
+    return agent_forge.PullRequest(
+        number=int(proposal.get("number") or 0),
+        head_ref=str(proposal.get("source") or ""),
+        author=str(proposal.get("author") or ""),
+        head_repo=str(proposal.get("sourceRepo") or ""),
+    )
+
+
 def _short_ref(branch: str) -> str:
     """`refs/heads/x` and `heads/x` name the branch `x`; compare them as `x`."""
     short = branch.strip()
@@ -424,6 +477,36 @@ def _age_seconds(created: Any, now: datetime) -> float | None:
     return (now - when).total_seconds()
 
 
+# A GKE cluster as the fleet audit names it, `<project>/<location>/<name>`,
+# each part as GKE allows it, so none can reach gcloud as a flag.
+_GKE_CLUSTER = re.compile(r"([a-z][a-z0-9-]{4,28}[a-z0-9])/([a-z]+-[a-z]+[0-9]+(?:-[a-z0-9]+)?)/([a-z](?:[-a-z0-9]{0,38}[a-z0-9])?)")
+_KUBERNETES_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
+
+
+def _gke_cluster(name: str) -> tuple[str, str, str] | None:
+    match = _GKE_CLUSTER.fullmatch(name)
+    return (match[1], match[2], match[3]) if match else None
+
+
+def _reserved_labels_on(proposal: Mapping[str, Any]) -> list[str]:
+    """The reserved auto-merge labels a proposal carries, in their own spelling."""
+    names = {str(label).casefold() for label in proposal.get("labels") or []}
+    return [label for label in automerge_eligibility.RESERVED_LABELS if label.casefold() in names]
+
+
+def _automerge_switch() -> str:
+    """The install's KUBEAGENTS_AUTOMERGE in this process; "off" where the
+    switch module is missing or fails."""
+    try:
+        from kubeagents_switches import (
+            switch,
+        )
+
+        return switch("AUTOMERGE")
+    except Exception:
+        return "off"
+
+
 def _login_key(login: str) -> str:
     """One spelling for two sources that mark an automation differently.
 
@@ -442,6 +525,55 @@ def _login_key(login: str) -> str:
     spelling is how the comparison broke in the first place.
     """
     return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
+
+
+class ProposalNotOurs(WorkspaceError):
+    """A profile caller's write names a proposal or branch this install does not own.
+
+    Raised only by `VcsBroker.require_agent_proposal`, which the credential
+    proxy calls for the profile role alone; the HTTP layer answers it 403 under
+    its own rule. Its own type so that layer can tell an ownership refusal from
+    a forge fault, which keeps the forge's own status.
+    """
+
+    code = "PROPOSAL_NOT_OURS"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status=403, code=self.code)
+
+
+class ProfileLabelsRefused(ProposalNotOurs):
+    """A profile caller's proposal-update carries a label edit.
+
+    Refused whoever owns the proposal: labels are where a person holds or
+    approves a change, so a worker that can edit them on its own proposal can
+    lift a hold or add an approval. The HTTP layer answers it under its own
+    rule, apart from the ownership one.
+    """
+
+    code = "PROFILE_LABELS_FORBIDDEN"
+
+
+def _canonical_branch(value: Any, field: str) -> str:
+    """A profile caller's branch name, refused unless it is already the short name.
+
+    `validate_branch` first (so `owner:branch` is refused, a colon being no
+    branch character), then `_short_ref` must leave it unchanged: `publish`
+    pushes `refs/heads/<name>` with the name as given, so a check made on the
+    shortened name would judge one branch and write another.
+    """
+    try:
+        name = validate_branch(value, field)
+    except WorkspaceError as refused:
+        raise ProposalNotOurs(
+            f"{refused} -- a profile task names a branch of this repository, bare."
+        ) from refused
+    if _short_ref(name) != name:
+        raise ProposalNotOurs(
+            f"{field} {name!r} is not a bare branch name; a profile task names "
+            f"{_short_ref(name)!r} as itself."
+        )
+    return name
 
 
 def _padded(size: int, unit: int) -> int:
@@ -758,8 +890,18 @@ class VcsBroker:
         mint: Callable[[str, str], str] | None = None,
         repository_role: Callable[[Forge, str], str] | None = None,
         bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
+        cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
+        automerge_switch: Callable[[], str] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
+        # or kubectl read the broker runs on its own behalf, through the same
+        # executor and cluster selection a caller's read takes. Only
+        # `proposal-practice-label` uses it; None, it labels nothing.
+        self._cluster_read = cluster_read
+        # The install's KUBEAGENTS_AUTOMERGE, read in this process, never
+        # taken from a caller.
+        self._automerge_switch = automerge_switch or _automerge_switch
         # Which list of the broker's ConfigMap names `repo` on `forge`: one of
         # the ROLE_* values, or a raise when the lists cannot be read. Only
         # `snapshot` asks. None answers ROLE_UNREGISTERED for every repository,
@@ -891,9 +1033,11 @@ class VcsBroker:
             lambda: tuple(forge.credential.git_config(repo)), forge.scheme == "http"
         )
 
-        def run(cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None):
+        def run(
+            cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None, bare: bool = False
+        ):
             try:
-                return runner(cwd, *args, check=check, stop=stop)
+                return runner(cwd, *args, check=check, stop=stop, bare=bare)
             except subprocess.CalledProcessError as exc:
                 # A forge whose git refusal means more than "the token is not
                 # valid" says what it means. Only the forge's own text goes
@@ -909,15 +1053,22 @@ class VcsBroker:
     def _git_with(
         self, config: Callable[[], tuple[tuple[str, str], ...]], allow_http: bool
     ) -> Callable[..., Any]:
-        """A git runner that puts `config()` on each invocation's config layer."""
+        """A git runner that puts `config()` on each invocation's config layer.
 
-        def run(cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None):
+        `bare` says that `cwd` is a bare repository; the call then names it
+        (`GIT_DIR_IS_CWD`).
+        """
+
+        def run(
+            cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None, bare: bool = False
+        ):
             extra: dict[str, Any] = {}
             if allow_http:
                 extra["allow_http"] = True
             if stop is not None:
                 extra["stop"] = stop
-            return self._git_runner(["git", *args], cwd, check, config(), **extra)
+            named = (GIT_DIR_IS_CWD,) if bare else ()
+            return self._git_runner(["git", *named, *args], cwd, check, config(), **extra)
 
         return run
 
@@ -1289,13 +1440,14 @@ class VcsBroker:
             if cloned.returncode != 0:
                 raise subprocess.CalledProcessError(cloned.returncode, argv, cloned.stdout, cloned.stderr)
             self._enforce_ceiling(clone_dir, repo, remedy=remedy)
+            in_clone = functools.partial(git, bare=True)
             if target is None:
-                target = self._default_branch(git, clone_dir)
-            revision = self._snapshot_revision(git, clone_dir, target)
+                target = self._default_branch(in_clone, clone_dir)
+            revision = self._snapshot_revision(in_clone, clone_dir, target)
             attributes = clone_dir / SNAPSHOT_ATTRIBUTES_FILE
             attributes.parent.mkdir(parents=True, exist_ok=True)
             attributes.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
-            self._measure_snapshot(git, clone_dir, revision, paths, repo, max_unpacked)
+            self._measure_snapshot(in_clone, clone_dir, revision, paths, repo, max_unpacked)
             # `--literal-pathspecs` is GIT_LITERAL_PATHSPECS as a flag: each
             # path is a name, never a glob or pathspec magic.
             argv = [
@@ -1304,7 +1456,7 @@ class VcsBroker:
             ]
             if paths:
                 argv += ["--", *paths]
-            written = git(clone_dir, *argv, check=False)
+            written = in_clone(clone_dir, *argv, check=False)
             if written.returncode != 0:
                 if paths and PATHSPEC_NO_MATCH in (written.stderr or ""):
                     # The revision goes with the refusal: a caller that asked
@@ -1750,11 +1902,292 @@ class VcsBroker:
                     status=409,
                     code="BRANCH_DIVERGED",
                 )
+            policy_branch = (
+                self._pinned_base(bound.forge, bound.repo)
+                or self._default_branch_of_remote(git, root, self._tls_refusal)
+            )
+            policy_branch = _short_ref(policy_branch) if policy_branch else ""
+            if not policy_branch:
+                raise WorkspaceError(
+                    f"could not resolve base branch for Decision Memory guard on {bound.repo}",
+                    status=502,
+                    code=DECISION_MEMORY_CHECK_FAILED,
+                )
+            if policy_branch == target:
+                policy_base_rev = remote_target
+            else:
+                fetched_policy = git(
+                    root, "fetch", "--quiet", "--no-tags", "origin", policy_branch, check=False,
+                )
+                rev_base = (
+                    git(root, "rev-parse", "FETCH_HEAD", check=False)
+                    if fetched_policy.returncode == 0
+                    else fetched_policy
+                )
+                policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
+                if not policy_base_rev:
+                    raise WorkspaceError(
+                        f"could not resolve base branch for Decision Memory guard on {bound.repo}",
+                        status=502,
+                        code=DECISION_MEMORY_CHECK_FAILED,
+                    )
+            dm_markdown = self._check_decision_memory_on_publish(
+                git,
+                root,
+                policy_base_rev,
+                tip,
+            )
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
-        return bound.stamp({"branch": branch, "revision": tip})
+        if existing_head:
+            self._drop_practice_label(bound, branch)
+        result: dict[str, Any] = {"branch": branch, "revision": tip}
+        if dm_markdown:
+            result["decisionMemoryMarkdown"] = dm_markdown
+        return bound.stamp(result)
+
+    @staticmethod
+    def _extract_revision_paths_to_dir(
+        git: Callable,
+        root: Path,
+        rev: str,
+        paths: list[str],
+        out_dir: Path | None,
+        scratch_dir: Path,
+        *,
+        oversize_out: set[str] | None = None,
+    ) -> dict[str, str]:
+        """Extract `paths` at `rev` with `git archive` without repository checkout.
+
+        Uses `git archive --output` instead of stdout capture so binary files and
+        non-UTF-8 bytes do not pass through the text-mode git runner. Writes
+        `SNAPSHOT_ATTRIBUTES` to `.git/info/attributes` so repository `.gitattributes`
+        rules (`export-ignore`, `export-subst`, `working-tree-encoding`) cannot hide
+        or alter guarded manifests.
+        """
+        extracted: dict[str, str] = {}
+        if not paths:
+            return extracted
+        attrs = root / ".git" / SNAPSHOT_ATTRIBUTES_FILE
+        attrs.parent.mkdir(parents=True, exist_ok=True)
+        attrs.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
+
+        tar_path = scratch_dir / "extract.tar"
+        for idx in range(0, len(paths), MAX_SNAPSHOT_PATHS):
+            chunk = paths[idx : idx + MAX_SNAPSHOT_PATHS]
+            tar_path.unlink(missing_ok=True)
+            written = git(
+                root,
+                "--literal-pathspecs",
+                "archive",
+                "--format=tar",
+                f"--output={tar_path}",
+                rev,
+                "--",
+                *chunk,
+                check=False,
+            )
+            if written.returncode != 0 or not tar_path.is_file():
+                tar_path.unlink(missing_ok=True)
+                continue
+            try:
+                with tarfile.open(tar_path, "r:") as tf:
+                    for member in tf:
+                        if not member.isfile():
+                            continue
+                        try:
+                            rel = validate_path(member.name)
+                        except WorkspaceError:
+                            continue
+                        if member.size > DM_MAX_GUARD_FILE_BYTES:
+                            if oversize_out is not None:
+                                oversize_out.add(rel)
+                                continue
+                            if out_dir is not None:
+                                dest = out_dir / rel
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                dest.write_bytes(b"")
+                            extracted[rel] = ""
+                            continue
+                        fobj = tf.extractfile(member)
+                        raw_bytes = fobj.read(DM_MAX_GUARD_FILE_BYTES) if fobj is not None else b""
+                        if out_dir is not None:
+                            dest = out_dir / rel
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            dest.write_bytes(raw_bytes)
+                        extracted[rel] = raw_bytes.decode("utf-8", errors="replace")
+            finally:
+                tar_path.unlink(missing_ok=True)
+        return extracted
+
+    def _check_decision_memory_on_publish(
+        self,
+        git: Callable,
+        root: Path,
+        policy_base_rev: str,
+        tip: str,
+    ) -> str:
+        """Run deterministic OKF `scope` and `guard.expect` checks against base `knowledge/`.
+
+        Reads `knowledge/` and `.kube-agents/intent.yaml` from `policy_base_rev` (the
+        operator-pinned `baseBranch` or `_default_branch_of_remote` on `origin`, never a
+        caller-supplied `target`) via `git ls-tree` and `git archive` without checkout.
+        Runs `okf_guard.check_changed_files` in-process with zero LLM calls, zero
+        subprocesses, and zero sandbox-supplied override flags.
+        """
+        tree_ls = git(
+            root, "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", policy_base_rev, "--",
+            "knowledge", ".kube-agents/intent.yaml", check=False,
+        )
+        if getattr(tree_ls, "truncated", False):
+            raise WorkspaceError(
+                "Decision Memory guard check failed against base branch: base tree listing was truncated",
+                status=409,
+                code=DECISION_MEMORY_CHECK_FAILED,
+            )
+        base_knowledge_files = [
+            validate_path(entry)
+            for entry in (tree_ls.stdout or "").split("\0")
+            if entry and entry.endswith((".md", ".yaml", ".yml"))
+        ]
+        if not base_knowledge_files:
+            return ""
+
+        mb_res = git(root, "merge-base", policy_base_rev, tip, check=False)
+        diff_base = (
+            (mb_res.stdout or "").strip()
+            if mb_res.returncode == 0 and (mb_res.stdout or "").strip()
+            else policy_base_rev
+        )
+        diff_ns = git(
+            root, "diff-tree", "-r", "--no-renames", "--name-status", "-z", diff_base, tip, check=False,
+        )
+        if diff_ns.returncode != 0 or getattr(diff_ns, "truncated", False):
+            raise WorkspaceError(
+                "Decision Memory guard check failed against base branch: diff-tree failed or was truncated",
+                status=409,
+                code=DECISION_MEMORY_CHECK_FAILED,
+            )
+        changed_paths: list[tuple[str, str]] = []
+        tokens = [t for t in (diff_ns.stdout or "").split("\0") if t]
+        idx = 0
+        while idx + 1 < len(tokens):
+            status = tokens[idx].strip()
+            if status.startswith(("R", "C")) and idx + 2 < len(tokens):
+                changed_paths.append((status, tokens[idx + 2]))
+                idx += 3
+            else:
+                changed_paths.append((status, tokens[idx + 1]))
+                idx += 2
+        if not changed_paths:
+            return ""
+
+        check_dir = self._scratch("dmcheck")
+        try:
+            k_root = check_dir / "base"
+            k_root.mkdir(parents=True, exist_ok=True)
+
+            self._extract_revision_paths_to_dir(
+                git, root, policy_base_rev, base_knowledge_files, k_root, check_dir,
+            )
+
+            intent_file = k_root / ".kube-agents" / "intent.yaml"
+            if intent_file.is_file():
+                try:
+                    intent_doc = yaml.safe_load(
+                        intent_file.read_text(encoding="utf-8", errors="replace")
+                    )
+                except yaml.YAMLError:
+                    intent_doc = None
+                raw_paths = intent_doc.get("paths") if isinstance(intent_doc, dict) else None
+                if isinstance(raw_paths, list):
+                    extra_files: list[str] = []
+                    for entry in raw_paths:
+                        cleaned = str(entry or "").strip().strip("/")
+                        if not cleaned:
+                            continue
+                        try:
+                            safe_prefix = validate_path(cleaned)
+                        except WorkspaceError:
+                            continue
+                        extra_ls = git(
+                            root, "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only",
+                            policy_base_rev, "--", safe_prefix, check=False,
+                        )
+                        if getattr(extra_ls, "truncated", False):
+                            raise WorkspaceError(
+                                "Decision Memory guard check failed against base branch: extra path listing was truncated",
+                                status=409,
+                                code=DECISION_MEMORY_CHECK_FAILED,
+                            )
+                        for erel in (extra_ls.stdout or "").split("\0"):
+                            if not erel or not erel.endswith((".md", ".yaml", ".yml")):
+                                continue
+                            try:
+                                extra_files.append(validate_path(erel))
+                            except WorkspaceError:
+                                continue
+                    if extra_files:
+                        self._extract_revision_paths_to_dir(
+                            git, root, policy_base_rev, extra_files, k_root, check_dir,
+                        )
+
+            rel_args: list[str] = []
+            non_deleted: list[str] = []
+            deleted_set: set[str] = set()
+            for status, raw_rel in changed_paths:
+                rel = validate_path(raw_rel)
+                rel_args.append(rel)
+                if status.startswith("D"):
+                    deleted_set.add(rel)
+                else:
+                    non_deleted.append(rel)
+
+            oversize_files: set[str] = set()
+            extracted_head = self._extract_revision_paths_to_dir(
+                git, root, tip, non_deleted, None, check_dir, oversize_out=oversize_files,
+            )
+            for rel in non_deleted:
+                if rel not in extracted_head:
+                    oversize_files.add(rel)
+            changed_map: dict[str, str | None] = {}
+            for rel in rel_args:
+                if rel in deleted_set:
+                    changed_map[rel] = None
+                else:
+                    changed_map[rel] = extracted_head.get(rel)
+
+            try:
+                out = okf_guard.check_changed_files(
+                    k_root, changed_map, oversize_files=oversize_files
+                )
+            except ValueError as exc:
+                raise WorkspaceError(
+                    f"Decision Memory guard check failed against base branch: {exc}",
+                    status=409,
+                    code=DECISION_MEMORY_CHECK_FAILED,
+                ) from exc
+
+            markdown = str(out.get("markdown") or "") if out.get("findings") else ""
+            if out.get("verdict") == "block":
+                msg = (
+                    "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
+                    f"{markdown}\n\n"
+                    "Do NOT open this Pull Request. In your final response, quote the "
+                    "record IDs (DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), "
+                    "Revert/Fix PR (#...), and the technical root-cause details verbatim."
+                )
+                raise WorkspaceError(
+                    msg,
+                    status=409,
+                    code=DECISION_MEMORY_BLOCKED,
+                    detail=markdown,
+                )
+            return markdown
+        finally:
+            self._discard_scratch(check_dir)
 
     def branch_view(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Whether `branch` exists on the remote, and at which revision.
@@ -1781,6 +2214,77 @@ class VcsBroker:
         return bound.stamp(
             {"branch": {"name": branch, "exists": bool(revision), "revision": revision or None}}
         )
+
+    def revision_contains(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Whether `revision` contains `ancestor` on the remote: `{"contains": bool}`.
+
+        The post-merge check's question when a GitOps tool applied a commit
+        other than the merge commit: reconcilers track a branch, so a later
+        merge carries this one. git against the remote, like `branch-view`:
+        `revision`'s commits are fetched into a scratch repository, never
+        checked out, and the fetch is stopped at the clone's size ceiling
+        (`CLONE_TOO_LARGE`). `revision` is a full id, since it is what is
+        fetched; `ancestor` may be abbreviated (a forge can report a
+        merge commit by a short id) and is resolved after the fetch. A
+        revision the remote does not have is `REVISION_NOT_FOUND`; an
+        untrusted certificate or a refused credential is answered by its
+        cause, and any other failed fetch is the retryable `FORGE_CALL_FAILED`.
+        A revision that starts with `ancestor` contains it without a fetch.
+        """
+        bound = self._bind(payload)
+        ancestor = payload.get("ancestor")
+        ancestor = ancestor.strip().lower() if isinstance(ancestor, str) else ""
+        if not ANCESTOR_RE.match(ancestor):
+            raise WorkspaceError("ancestor must be a hex revision id of 7 to 40 characters")
+        revision = validate_revision(payload.get("revision"), "revision")
+        if revision.lower().startswith(ancestor):
+            return bound.stamp({"contains": True})
+        bound.ensure()
+        git = bound.git
+        root = self._scratch("contains")
+        try:
+            git(root, "init", "--quiet", "--bare")
+            in_repo = functools.partial(git, bare=True)
+            last, stopped = [0.0], [False]
+
+            def over_ceiling() -> bool:
+                now = time.monotonic()
+                if now - last[0] < CLONE_WATCH_SECONDS:
+                    return False
+                last[0] = now
+                stopped[0] = _tree_bytes(root, self.max_clone_bytes) > self.max_clone_bytes
+                return stopped[0]
+
+            fetched = in_repo(
+                root, "fetch", "--quiet", "--no-tags", "--filter=tree:0", bound.forge.clone_url(bound.repo), revision,
+                check=False, stop=over_ceiling,
+            )
+            remedy = "The history of this one revision is over it; nothing in the request makes the fetch smaller."
+            if stopped[0]:
+                raise self._clone_too_large(bound.repo, remedy)
+            if fetched.returncode != 0:
+                stderr = fetched.stderr or ""
+                refusal = self._tls_refusal(stderr) or _git_refusal(bound.forge, bound.repo, stderr, "fetch")
+                if refusal is not None:
+                    raise refusal
+                if any(marker in stderr for marker in MISSING_REVISION_MARKERS):
+                    raise WorkspaceError(
+                        f"{bound.repo} has no revision {revision}",
+                        status=404,
+                        code="REVISION_NOT_FOUND",
+                    )
+                raise WorkspaceError(
+                    f"could not fetch {revision} from {bound.repo}: git exited {fetched.returncode}",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            self._enforce_ceiling(root, bound.repo, remedy=remedy)
+            present = in_repo(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
+            full = (present.stdout or "").strip()
+            contains = present.returncode == 0 and bool(full) and self._is_ancestor(in_repo, root, full, revision)
+        finally:
+            self._discard_scratch(root)
+        return bound.stamp({"contains": contains})
 
     def branch_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Delete a spent branch: one whose proposal is done with and whose tip it carried.
@@ -2262,6 +2766,150 @@ class VcsBroker:
                 code="CLONED_BRANCH",
             )
 
+    def require_agent_proposal(self, verb: str, payload: dict[str, Any]) -> None:
+        """Refuse a profile caller's write unless what it touches is this install's own.
+
+        Called by the credential proxy for the profile role only (#3993), after
+        the permit and the managed list and before the verb runs; the shell's
+        `publish` and `proposal-update` never come through here. The permit
+        says the requester asked for a change, not which proposal, so this
+        holds the change to proposals and branches the install itself made:
+
+          * `proposal-update`: the proposal must be the install's own by
+            `forge.is_agent_pull_request` -- opened by the credential's login,
+            from a branch under `AGENT_BRANCH_PREFIX`, in this repository rather
+            than a fork. Read through the forge's own proposal view, and the
+            login through `_viewer`. Without it a profile worker under the
+            permit could retitle a person's proposal or strip its hold label.
+          * `publish`: the branch must be under `AGENT_BRANCH_PREFIX`, the rule
+            `branch-delete` applies. Whenever the branch carries an open
+            proposal, every open proposal on it must pass the same
+            `is_agent_pull_request` bar, `advance` or not: a publish without it
+            still fast-forwards an existing remote branch, so keying the check
+            on the field would let a profile worker add commits to a person's
+            proposal by leaving it out. A list that came back full or truncated
+            is refused, since the proposals past it are unread. `advance` also
+            needs at least one open proposal, as it does for every caller. A
+            branch under the prefix with no open proposal stays publishable.
+            The bar `_require_open_proposal` keeps for the shell -- an open
+            proposal, the author compared only when the credential can name
+            itself -- is weaker on purpose there and is left as it is.
+          * `proposal-update` also carries no label field (`labelsAdd`,
+            `labelsRemove`, or any key naming labels) and nothing beyond
+            PROFILE_PROPOSAL_UPDATE_FIELDS: on an owned proposal it may change
+            the title and body, never add `lgtm` or remove a hold.
+          * Branch names are taken in their one canonical spelling: a `branch`
+            or `source` that `_short_ref` would shorten (`refs/heads/x`,
+            `heads/x`) is refused, because `publish` pushes the name as given
+            and `heads/platform-agent/x` would land as
+            `refs/heads/heads/platform-agent/x`.
+          * `proposal-create`: the source must be a branch under
+            `AGENT_BRANCH_PREFIX` in this repository. The adapters open a
+            proposal from the bound repository's own branch, and
+            `validate_branch` already refuses `owner:branch`; the payload may
+            carry no field beyond the ones every adapter reads
+            (PROFILE_PROPOSAL_CREATE_FIELDS), so a field naming another
+            repository is refused rather than left for a later adapter to
+            honour.
+
+        A credential that cannot name itself refuses: `is_agent_pull_request`
+        answers no for an empty viewer. A lookup that failed is the forge's
+        error, raised with its own status, never read as "not ours".
+        """
+        # Imported here: forge.py is the agent-side forge module, and this is
+        # the one place the broker borrows its ownership predicate, so the two
+        # sides share one definition of "the agent's own proposal".
+        import forge as agent_forge
+
+        bound = self._bind(payload)
+        if verb == "publish":
+            branch = _canonical_branch(payload.get("branch"), "branch")
+            if not branch.startswith(AGENT_BRANCH_PREFIX):
+                raise ProposalNotOurs(
+                    f"{branch} is not under {AGENT_BRANCH_PREFIX}, the namespace this "
+                    "install publishes in; a profile task publishes only a branch of "
+                    "its own there."
+                )
+            if "proposal-list" not in getattr(bound.forge, "verbs", ()):
+                raise ProposalNotOurs(
+                    f"{bound.forge.name} cannot list proposals here, so whether {branch} "
+                    "carries somebody else's proposal cannot be established."
+                )
+            answer = bound.forge.proposal_list(
+                bound.api,
+                bound.repo,
+                {"state": "open", "source": branch, "limit": OPEN_PROPOSALS_ON_A_BRANCH},
+            )
+            proposals = answer.get("proposals") or []
+            if answer.get("truncated") or len(proposals) >= OPEN_PROPOSALS_ON_A_BRANCH:
+                raise ProposalNotOurs(
+                    f"{branch} carries at least {len(proposals)} open proposals, a full page, "
+                    "so whether every one is this install's cannot be established."
+                )
+            if payload.get("advance") and not proposals:
+                raise ProposalNotOurs(
+                    f"`advance` says {branch} carries a proposal to add to, but no open "
+                    "proposal on this repository has it as its source."
+                )
+            if not proposals:
+                return
+            viewer = self._viewer(bound)
+            strangers = [
+                item for item in proposals
+                if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, item), bound.repo, viewer, hostless=True)
+            ]
+            if strangers:
+                named = strangers[0].get("url") or "#%s" % (strangers[0].get("number"),)
+                raise ProposalNotOurs(
+                    f"{branch} carries an open proposal that is not this install's own "
+                    f"({named}), so a profile task does not publish to it."
+                )
+            return
+        if verb == "proposal-create":
+            extra = sorted(set(payload) - PROFILE_PROPOSAL_CREATE_FIELDS)
+            if extra:
+                raise ProposalNotOurs(
+                    f"proposal-create from a profile task takes only "
+                    f"{', '.join(sorted(PROFILE_PROPOSAL_CREATE_FIELDS))}; {extra[0]!r} is refused, "
+                    "since a proposal opens only from this repository's own branch."
+                )
+            # `owner:branch`, the cross-repository head form, is refused here:
+            # a colon is no branch character.
+            source = _canonical_branch(payload.get("source"), "source")
+            if not source.startswith(AGENT_BRANCH_PREFIX):
+                raise ProposalNotOurs(
+                    f"{source} is not under {AGENT_BRANCH_PREFIX}, so a profile task does "
+                    "not open a proposal from it."
+                )
+            return
+        if verb == "proposal-update":
+            # Before the proposal is read: no label edit, and no field beyond
+            # the text, whoever owns the proposal (see ProfileLabelsRefused).
+            labelled = sorted(key for key in payload if "label" in str(key).casefold())
+            if labelled:
+                raise ProfileLabelsRefused(
+                    f"a profile task does not edit labels ({labelled[0]!r}); a hold or "
+                    "approval label is a person's call. Update the title or body only."
+                )
+            extra = sorted(set(payload) - PROFILE_PROPOSAL_UPDATE_FIELDS)
+            if extra:
+                raise ProposalNotOurs(
+                    f"proposal-update from a profile task takes only "
+                    f"{', '.join(sorted(PROFILE_PROPOSAL_UPDATE_FIELDS))}; {extra[0]!r} is refused."
+                )
+            number = validate_number(payload.get("number"))
+            viewer = self._viewer(bound)
+            view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number})
+            proposal = view.get("proposal") or {}
+            if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, proposal), bound.repo, viewer, hostless=True):
+                raise ProposalNotOurs(
+                    f"proposal #{number} is not this install's own (opened by its login, "
+                    f"from a branch under {AGENT_BRANCH_PREFIX}, in this repository), so a "
+                    "profile task does not update it."
+                )
+            return
+        raise ProposalNotOurs(f"{verb} is not a write this check knows, so it is refused")
+
     def _viewer(self, bound: Binding) -> str:
         """The login this credential authenticates as, or "" when it cannot say.
 
@@ -2290,7 +2938,14 @@ class VcsBroker:
         payload: dict[str, Any],
         pinned_target: bool = False,
     ) -> dict[str, Any]:
+        if verb in WRITE_VERBS:
+            refuse_dial_gated_labels(payload)
         bound = self._bind(payload)
+        # The broker's own label is no caller's to write, on any forge, and the
+        # refusal makes no call (`proposal_practice_label` writes it directly).
+        reserved = automerge_eligibility.reserved_label_refusal(verb, payload)
+        if reserved:
+            raise WorkspaceError(reserved, status=403, code="RESERVED_LABEL")
         # Before anything else that could spend a call: a forge with no labels
         # refuses a label field by name, so a filter is not silently ignored
         # and a label write does not look done. Only for a verb the forge
@@ -2308,7 +2963,26 @@ class VcsBroker:
         method = getattr(bound.forge, verb.replace("-", "_"))
         return bound.stamp(method(bound.api, bound.repo, payload))
 
+    @staticmethod
+    def _refuse_decision_override_labels(payload: dict[str, Any]) -> None:
+        """Refuse agent attempts to create or apply `decision-override:*` labels."""
+        candidates: list[Any] = []
+        if "name" in payload:
+            candidates.append(payload.get("name"))
+        for field in ("labels", "labelsAdd"):
+            vals = payload.get(field)
+            if isinstance(vals, list):
+                candidates.extend(vals)
+        for item in candidates:
+            if isinstance(item, str) and item.strip().casefold().startswith(DECISION_OVERRIDE_PREFIX):
+                raise WorkspaceError(
+                    f"label {item.strip()!r} is reserved for human reviewers on the forge and cannot be set by an agent.",
+                    status=403,
+                    code=FORBIDDEN_LABEL,
+                )
+
     def proposal_create(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("proposal-create", payload, pinned_target=True)
 
     def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2372,6 +3046,7 @@ class VcsBroker:
         return self._forge_verb("proposal-comment", payload)
 
     def issue_create(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("issue-create", payload)
 
     def issue_list(self, payload):
@@ -2388,6 +3063,7 @@ class VcsBroker:
         # `target` that reaches one is held to the same pinned base as
         # `proposal-create`, and the rule stays true the day an adapter learns
         # to retarget.
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb(
             "proposal-update", payload,
             pinned_target=payload.get("target") is not None,
@@ -2399,16 +3075,24 @@ class VcsBroker:
     def proposal_commits(self, payload):
         return self._forge_verb("proposal-commits", payload)
 
+    def proposal_reviews(self, payload):
+        # Every submitted review with its state, a bodiless approval included,
+        # for the post-merge check's change-request read. A library verb: no
+        # `vcs.py` command runs it.
+        return self._forge_verb("proposal-reviews", payload)
+
     def proposal_acknowledge(self, payload):
         return self._forge_verb("proposal-acknowledge", payload)
 
     def issue_update(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("issue-update", payload)
 
     def issue_close(self, payload):
         return self._forge_verb("issue-close", payload)
 
     def label_ensure(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("label-ensure", payload)
 
     def identity(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2448,6 +3132,238 @@ class VcsBroker:
         )
         return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
 
+    def proposal_practice_label(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Judge one proposal as an auto-merge candidate, and label it if it is one.
+
+        Everything is read here, never taken from the caller, which names only
+        the repository and the number. The switch's label
+        (`automerge_eligibility.LABEL_FOR_SWITCH`: `practice`'s, which nothing
+        acts on, or `on`'s, which a customer's pipeline may merge on) goes on
+        when every one of these holds; a reserved label the proposal carries
+        comes off when they do not, or when it is the other switch value's:
+
+        - `KUBEAGENTS_AUTOMERGE` is `practice` or `on` in this process;
+        - the proposal is open and this credential's own;
+        - its diff adds one file and changes nothing else, and that file is,
+          byte for byte, the PodDisruptionBudget the fleet audit generates
+          (`automerge_eligibility.parse_budget`);
+        - the rules file on the proposal's target branch allows the `no-pdb`
+          fix in the environment the cluster's own labels declare
+          (`automation_rules`);
+        - the three safety checks pass on the broker's own read of the
+          workload's namespace (`automerge_checks.judge`).
+
+        Off, it reads nothing and answers so. A failed read is a reason not to
+        label, never an error, except a forge read of the proposal itself.
+        """
+        number = validate_number(payload.get("number"))
+        bound = self._bind(payload)
+        switch = self._automerge_switch()
+        on = switch in automerge_eligibility.LABELLING_SWITCH_VALUES
+        view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": on}) or {}
+        proposal = view.get("proposal") or {}
+        checks: list[dict] = []
+        if on:
+            try:
+                viewer = self._viewer(bound)
+                reason = self._practice_refusal(bound, payload, viewer, proposal, view.get("diff"), checks)
+            except Exception as exc:  # noqa: BLE001 -- a failed read is a reason not to label
+                LOGGER.warning("practice label: a read failed repo=%s number=%s type=%s: %s",
+                               bound.repo, number, type(exc).__name__, str(exc)[:400])
+                reason, checks = "a read the judgement needs failed", []
+        else:
+            # Off reads no cluster and no rules; it only takes back a label an
+            # earlier `practice` or `on` left.
+            reason = "KUBEAGENTS_AUTOMERGE is off"
+        want = automerge_eligibility.LABEL_FOR_SWITCH.get(switch) if reason is None else None
+        if want == automerge_eligibility.AUTOMERGE_LABEL and not dial_allows_automerge():
+            # The dial below Auto-merge holds back the label a pipeline merges
+            # on, and takes a carried one off; `practice`'s label is unaffected.
+            reason, want = "the autonomy dial is below Auto-merge", None
+        carried = _reserved_labels_on(proposal)
+        after: dict[str, Any] | None = None
+        added = False
+        if want is not None and want not in carried:
+            # The judgement took time: label only the head it judged, still open.
+            fresh = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+            if fresh.get("state") != OPEN_PROPOSAL_STATE or fresh.get("sourceRevision") != proposal.get("sourceRevision"):
+                reason, want = "the proposal moved, merged or closed while it was judged", None
+        if want is not None:
+            if want not in carried:
+                bound.forge.label_ensure(
+                    bound.api,
+                    bound.repo,
+                    {
+                        "name": want,
+                        "color": automerge_eligibility.LABEL_COLOR,
+                        "description": automerge_eligibility.LABEL_DESCRIPTIONS[want],
+                    },
+                )
+                bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsAdd": [want]})
+                carried.append(want)
+                added = True
+            # The judgement was of the head read above. A push since then is
+            # a diff nobody judged, so the label comes off again.
+            after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+            if after.get("sourceRevision") != proposal.get("sourceRevision"):
+                reason, want = "the proposal's branch moved while it was judged", None
+        stale = [label for label in carried if label != want]
+        if stale and after is None:
+            # The judgement took time; a pull request that merged meanwhile
+            # keeps its label, which the post-merge step-down reads.
+            after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+        # A label this call just added was never earned by a head that moved,
+        # so it comes off whatever the state; an older one stays on a merge.
+        if stale and (added or (after or {}).get("state") == OPEN_PROPOSAL_STATE):
+            bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
+        LOGGER.info(
+            "practice label repo=%s number=%s switch=%s labelled=%s reason=%s checks=%s",
+            bound.repo, number, switch, reason is None, reason or "eligible",
+            json.dumps(checks, sort_keys=True),
+        )
+        # The caller learns which checks passed, not what the cluster read
+        # said: the details name workloads and budgets on whatever cluster the
+        # budget named, and stay in this log.
+        return bound.stamp(
+            {
+                "labelled": reason is None,
+                "label": want,
+                "switch": switch,
+                "reason": reason or "eligible",
+                "checks": [{"name": c["name"], "passed": c["passed"]} for c in checks],
+            }
+        )
+
+    def _practice_refusal(
+        self,
+        bound: Binding,
+        payload: dict[str, Any],
+        viewer: str,
+        proposal: dict[str, Any],
+        diff: Any,
+        checks: list[dict],
+    ) -> str | None:
+        """Why `proposal_practice_label` does not label, or None; `checks` gets
+        the safety checks once they ran."""
+        if not getattr(bound.forge, "labels", False):
+            return "this forge has no labels"
+        if bound.forge.text_sets_labels:
+            return "on this forge a comment or a description can set a label, so no label is the broker's alone"
+        if proposal.get("state") != OPEN_PROPOSAL_STATE:
+            return "the proposal is not open"
+        if not viewer or _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
+            return "the proposal is not this credential's own"
+        added = automerge_eligibility.added_file_from_diff(diff)
+        budget = automerge_eligibility.parse_budget(added[1]) if added else None
+        if budget is None:
+            return "the proposal does not add exactly one file that is the audit's generated PodDisruptionBudget"
+        if not automerge_eligibility.path_fits(added[0], budget):
+            return f"{added[0]} is not where the budget for {budget.cluster} goes"
+        target = _gke_cluster(budget.cluster)
+        if target is None or not _KUBERNETES_NAME.fullmatch(budget.namespace):
+            return f"the budget names no cluster or namespace this broker reads ({budget.cluster!r}, {budget.namespace!r})"
+        if self._cluster_read is None:
+            return "this broker has no cluster reader"
+        # The rules on the repository's own base, never on a target branch a
+        # caller could have published with a rules file of its own.
+        base = self._practice_base(bound)
+        if not base or proposal.get("target") != base:
+            return f"the proposal does not target the repository's base branch ({base or 'unknown'})"
+        rules = self._practice_rules(payload, base)
+        if rules.status != automation_rules.LOADED:
+            return f"{automation_rules.RULES_FILE} on {base} allows nothing ({rules.status})"
+        project, location, name = target
+        code, out, err = self._cluster_read(
+            ["gcloud", "container", "clusters", "describe", name, "--location", location,
+             "--project", project, "--format=json(resourceLabels)"],
+            "",
+        )
+        # Fixed words to the caller, who wrote the cluster's name: what the
+        # read said would tell it which clusters exist. The log keeps it.
+        if code != 0:
+            LOGGER.info("practice label: cluster labels not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            return "the cluster's labels could not be read"
+        try:
+            labels = (json.loads(out or "{}") or {}).get("resourceLabels") or {}
+        except (json.JSONDecodeError, AttributeError):
+            return "the cluster's labels could not be read"
+        environment = automation_rules.cluster_environment(labels)
+        decision = automation_rules.decide(rules, automerge_eligibility.FIX_TYPE, environment)
+        if not decision.allowed:
+            LOGGER.info("practice label: rules refuse cluster=%s: %s", budget.cluster, decision.reason)
+            return f"{automation_rules.RULES_FILE} does not allow this fix in this cluster's environment"
+        code, out, err = self._cluster_read(
+            ["kubectl", "get", automerge_checks.READ_KINDS, "-n", budget.namespace, "-o", "json"],
+            f"gke_{project}_{location}_{name}",
+        )
+        try:
+            dump = json.loads(out) if code == 0 else None
+        except json.JSONDecodeError:
+            dump = None
+        if not isinstance(dump, dict) or not isinstance(dump.get("items"), list):
+            LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            return "the workload's namespace could not be read"
+        checks += automerge_checks.judge(dump, budget.object, budget.namespace, budget.name, budget.selector)
+        failed = [check["name"] for check in checks if not check["passed"]]
+        return f"safety checks failed: {', '.join(failed)}" if failed else None
+
+    def _practice_base(self, bound: Binding) -> str:
+        """The branch a labelled proposal must target: the repository's pinned
+        base, else the branch the remote calls its default, else ""."""
+        pinned = self._pinned_base(bound.forge, bound.repo)
+        if pinned:
+            return pinned
+        bound.ensure()
+        root = self._scratch("practice")
+        try:
+            bound.git(root, "init", "--quiet")
+            bound.git(root, "remote", "add", "origin", bound.forge.clone_url(bound.repo))
+            return self._default_branch_of_remote(bound.git, root, self._tls_refusal)
+        finally:
+            self._discard_scratch(root)
+
+    def _drop_practice_label(self, bound: Binding, branch: str) -> None:
+        """Take the reserved label off any open proposal from `branch`, after
+        a push to it: the broker judged the diff before the push, not this one.
+        Logged and left on a forge that cannot be asked, rather than failing a
+        publish that has already landed."""
+        if not getattr(bound.forge, "labels", False):
+            return
+        try:
+            listed = bound.forge.proposal_list(bound.api, bound.repo, {"source": branch, "state": OPEN_PROPOSAL_STATE})
+            for proposal in listed.get("proposals") or []:
+                carried = _reserved_labels_on(proposal)
+                if carried:
+                    bound.forge.proposal_update(
+                        bound.api, bound.repo, {"number": proposal["number"], "labelsRemove": carried}
+                    )
+        except Exception as exc:  # noqa: BLE001 -- the push stands either way
+            LOGGER.warning("practice label not dropped after a push repo=%s branch=%s: %s", bound.repo, branch, exc)
+
+    def _practice_rules(self, payload: dict[str, Any], target: str) -> automation_rules.Rules:
+        """The rules file on `target`, as `automation_rules` reads it: absent
+        when the branch has none, refused for anything but one regular file."""
+        try:
+            snap = self.snapshot(
+                {"repository": payload.get("repository"), "ref": target or None, "paths": [automation_rules.RULES_FILE]}
+            )
+        except WorkspaceError as exc:
+            if exc.fields.get("code") == "PATH_NOT_FOUND":
+                return automation_rules.Rules(status=automation_rules.ABSENT)
+            return automation_rules.Rules(status=automation_rules.INVALID, error=f"not read ({exc})")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(base64.b64decode(snap["archiveBase64"]))) as tar:
+                members = [m for m in tar.getmembers() if not m.isdir()]
+                if len(members) != 1 or not members[0].isreg() or members[0].name != automation_rules.RULES_FILE:
+                    return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+                raw = tar.extractfile(members[0]).read(automation_rules.MAX_FILE_BYTES + 1)
+        except (tarfile.TarError, KeyError, ValueError) as exc:
+            return automation_rules.Rules(status=automation_rules.INVALID, error=f"not read ({exc})")
+        try:
+            return automation_rules.parse(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not UTF-8")
+
 
 # The verbs that leave a mark on the forge. Named beside the route table because
 # that is where a new verb gets added, and a verb added to one and not the other
@@ -2469,6 +3385,7 @@ WRITE_VERBS = frozenset(
         "issue-close",
         "label-ensure",
         "branch-delete",
+        "proposal-practice-label",
     }
 )
 
@@ -2479,9 +3396,9 @@ WRITE_VERBS = frozenset(
 # default, is today's behaviour. `none` is explain-only: the broker refuses
 # PROPOSE_VERBS, every verb that moves a branch or writes to a proposal. Issues
 # and labels stay open to it, because an issue is how an audit reports.
-# Read on every request through write_mode(), the one place a second source
-# (a runtime setting) can be added. Today its only source is the broker's env,
-# so on a pod a change applies once the operator has rolled the broker.
+# Read on every request through write_mode(), which takes the most restrictive
+# of the broker's env (applies once the operator has rolled the broker) and the
+# Slack autonomy dial (applies at once; see dial_level below).
 WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
 WRITE_MODE_PROPOSE = "propose"
 WRITE_MODE_NONE = "none"
@@ -2495,6 +3412,8 @@ PROPOSE_VERBS = frozenset(
         "proposal-update",
         "proposal-close",
         "proposal-acknowledge",
+        # Writes a proposal's labels, which a pipeline may merge on.
+        "proposal-practice-label",
     }
 )
 
@@ -2502,19 +3421,139 @@ PROPOSE_VERBS = frozenset(
 def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
     """The install's write mode and the raw value it was read from.
 
-    Unset or empty is `propose`. A value that is neither mode is `none`: a
-    setting someone wrote to restrict the agent must not lift the restriction
-    because it was misspelt.
+    The most restrictive of two sources: the broker's env, and the Slack
+    autonomy dial (`dial_level`), whose Explain is `none`. Unset or empty env
+    is `propose`. A value that is neither mode is `none`: a setting someone
+    wrote to restrict the agent must not lift the restriction because it was
+    misspelt. When the dial is what restricts, the raw value is
+    :data:`WRITE_MODE_DIAL_RAW`, so `write_mode_detail` names the dial rather
+    than the env.
     """
     raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
     value = raw.strip().lower()
     if not value:
-        return WRITE_MODE_PROPOSE, raw
-    return (value if value in WRITE_MODES else WRITE_MODE_NONE), raw
+        mode = WRITE_MODE_PROPOSE
+    else:
+        mode = value if value in WRITE_MODES else WRITE_MODE_NONE
+    if mode == WRITE_MODE_PROPOSE and dial_level(environ) == DIAL_EXPLAIN:
+        return WRITE_MODE_NONE, WRITE_MODE_DIAL_RAW
+    return mode, raw
+
+
+# The Slack autonomy dial's level, the runtime source write_mode() reads beside
+# the env, set through set_dial_level(), so a new level applies with no pod
+# restart. The credential proxy's dial route calls it when the Slack adapter
+# reports a level. Only while `KUBEAGENTS_DIAL` is `on` (the broker
+# gets spec.deployment.env); off, the dial is not a source at all. On, a broker
+# with no level set since it started reads the level it last stored on its
+# state emptyDir (kept across a container restart, not a new Pod), and with none
+# stored, Explain: it fails closed. The dial only ever restricts.
+DIAL_ENV = "KUBEAGENTS_DIAL"
+# On the broker's state emptyDir: it outlives a container restart, not the Pod.
+DIAL_STATE_FILE = "/var/lib/credential-proxy/dial-level"
+# write_mode()'s raw value when the dial, not the env, is what restricts. It
+# starts with a NUL, which no environment value can hold, so an env set to the
+# same visible text is still read (and explained) as a misspelt env.
+WRITE_MODE_DIAL_RAW = "\x00dial:explain"
+DIAL_EXPLAIN = "explain"
+DIAL_PROPOSE = "propose"
+DIAL_AUTOMERGE = "automerge"
+DIAL_LEVELS = (DIAL_EXPLAIN, DIAL_PROPOSE, DIAL_AUTOMERGE)
+_dial_lock = threading.Lock()
+_dial_level: str | None = None
+_dial_reported = False
+# The label the customer's pipeline merges on (automation_rules.AUTOMERGE_LABEL;
+# a test holds the two equal). Below Auto-merge no write verb may add it.
+DIAL_GATED_LABELS = frozenset({"kube-agents:auto-merge"})
+DIAL_ADDING_LABEL_FIELDS = ("labels", "labelsAdd")
+
+
+def dial_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return (os.environ if environ is None else environ).get(DIAL_ENV, "").strip().lower() == "on"
+
+
+def _dial_state_path() -> Path:
+    return Path(DIAL_STATE_FILE)
+
+
+def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
+    """The dial's level, or None while `KUBEAGENTS_DIAL` is not `on`."""
+    if not dial_enabled(environ):
+        return None
+    with _dial_lock:
+        if _dial_level is not None:
+            return _dial_level
+    try:
+        stored = _dial_state_path().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        stored = ""
+    return stored if stored in DIAL_LEVELS else DIAL_EXPLAIN
+
+
+def set_dial_level(level: str) -> None:
+    """Record the level the gateway reported; ValueError for anything but a level."""
+    global _dial_level, _dial_reported
+    if level not in DIAL_LEVELS:
+        raise ValueError(f"level must be one of {', '.join(DIAL_LEVELS)}")
+    path = _dial_state_path()
+    with _dial_lock:
+        _dial_level = level
+        _dial_reported = True
+        # Kept on the broker's own volume, so a restarted broker process keeps
+        # it; best effort, because the gateway reports it again within a minute.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(level + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            LOGGER.warning("could not store the dial level at %s: %s", path, exc)
+
+
+def dial_reported() -> bool:
+    """Whether the gateway has reported the dial's level to this broker process."""
+    with _dial_lock:
+        return _dial_reported
+
+
+def dial_allows_automerge(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the dial lets a fix carry the auto-merge label: off, or at Auto-merge."""
+    level = dial_level(environ)
+    return level is None or level == DIAL_AUTOMERGE
+
+
+def refuse_dial_gated_labels(payload: Mapping[str, Any], environ: Mapping[str, str] | None = None) -> None:
+    """Refuse a write that adds the auto-merge label while the dial is below Auto-merge.
+
+    Compared folded and stripped: a forge matches label names that way, so a
+    spelling that differs only in case is the same label to the pipeline. Each
+    value is also split on commas, because an adapter may join the list with
+    commas and its forge reads that as several labels. Removing it is always
+    allowed, and a read (a list filter) never comes here.
+    """
+    if dial_allows_automerge(environ):
+        return
+    for field in DIAL_ADDING_LABEL_FIELDS:
+        values = payload.get(field)
+        values = [values] if isinstance(values, str) else values if isinstance(values, (list, tuple)) else []
+        names = [part for v in values if isinstance(v, str) for part in v.split(",")]
+        if any(name.strip().casefold() in DIAL_GATED_LABELS for name in names):
+            raise WorkspaceError(
+                "the autonomy dial is not at Auto-merge proven fixes, so no pull request or issue may carry "
+                "the auto-merge label. Leave the label off; an install admin raises the dial on the Slack "
+                "app's Home tab.",
+                status=403,
+                code="DIAL_AUTOMERGE_OFF",
+            )
 
 
 def write_mode_detail(raw: str) -> str:
-    """Why `raw` reads as `none` when it is neither mode, or "" when it is one (or unset)."""
+    """Why `raw` reads as `none` when it is neither mode or the dial restricts, or "" when it is one (or unset)."""
+    if raw == WRITE_MODE_DIAL_RAW:
+        return (
+            f"{DIAL_ENV} is on and the autonomy dial is at Explain, which the broker treats as none; "
+            "with no level set since this broker Pod started it reads Explain"
+        )
     value = raw.strip().lower()
     if not value or value in WRITE_MODES:
         return ""
@@ -2565,6 +3604,7 @@ VCS_VERBS = frozenset(
         "proposal-update",
         "proposal-close",
         "proposal-commits",
+        "proposal-reviews",
         "proposal-acknowledge",
         "proposal-claim",
         "issue-update",
@@ -2573,6 +3613,8 @@ VCS_VERBS = frozenset(
         "identity",
         "branch-view",
         "branch-delete",
+        "revision-contains",
+        "proposal-practice-label",
     }
 )
 
@@ -2600,6 +3642,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-update": broker.proposal_update,
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
+        "proposal-reviews": broker.proposal_reviews,
         "proposal-acknowledge": broker.proposal_acknowledge,
         "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,
@@ -2608,6 +3651,8 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "identity": broker.identity,
         "branch-view": broker.branch_view,
         "branch-delete": broker.branch_delete,
+        "revision-contains": broker.revision_contains,
+        "proposal-practice-label": broker.proposal_practice_label,
     }
 
 
@@ -2616,6 +3661,8 @@ __all__ = [
     "VcsBroker",
     "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
+    "ProposalNotOurs",
+    "ProfileLabelsRefused",
     "ROLE_CONTEXT",
     "ROLE_MANAGED",
     "ROLE_SELECTED_VERBS",
@@ -2627,6 +3674,18 @@ __all__ = [
     "WRITE_MODE_PROPOSE",
     "WRITE_MODES",
     "WRITE_VERBS",
+    "DIAL_AUTOMERGE",
+    "DIAL_ENV",
+    "DIAL_EXPLAIN",
+    "DIAL_LEVELS",
+    "DIAL_PROPOSE",
+    "WRITE_MODE_DIAL_RAW",
+    "dial_enabled",
+    "dial_level",
+    "dial_reported",
+    "set_dial_level",
+    "dial_allows_automerge",
+    "refuse_dial_gated_labels",
     "write_mode",
     "write_mode_detail",
     "max_bundle_bytes",

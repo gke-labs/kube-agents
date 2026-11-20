@@ -90,7 +90,7 @@ const (
 	usageSummaryUnknown        = "unknown"
 	usageSummaryNever          = "never"
 	usageSummaryNone           = "none"
-	usageSummaryDefaultMode    = "today"
+	usageSummaryDefaultMode    = "next"
 	usageSummaryReadyCondition = "Ready"
 	usageSummaryMinIdentifier  = 3
 	usageSummaryDateLayout     = "2006-01-02"
@@ -161,11 +161,11 @@ var usageSummaryBrokerSubcommands = map[string][]string{
 	},
 	"git": {
 		"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-		"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
-		"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
-		"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
-		"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
-		"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
+		"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "diff-tree",
+		"fetch", "init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base",
+		"mv", "pull", "push", "rebase", "remote", "reset", "restore", "rev-list",
+		"rev-parse", "revert", "rm", "show", "sparse-checkout", "stash", "status",
+		"submodule", "switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
 	},
 	"gh": {
 		"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -689,7 +689,7 @@ func usageSummaryWithoutFixedLines(text string) string {
 }
 
 // auditUsageSummary returns the identifiers that appear in text as whole
-// tokens, skipping the template's own vocabulary (a cluster named "today" is
+// tokens, skipping the template's own vocabulary (a cluster named "next" is
 // not told apart from the mode line, and is not refused for it).
 func auditUsageSummary(text string, identifiers []string) []string {
 	var leaked []string

@@ -25,7 +25,7 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _lift_shell import lift_function  # noqa: E402
+from _lift_shell import lift_constant, lift_function  # noqa: E402
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_ENV = _ROOT / "hack" / "ci-env.sh"
@@ -445,6 +445,27 @@ class ReplayLaneResolveTest(unittest.TestCase):
         self.assertIn("EVAL_REPLAY_LANE=true", err)
 
 
+class EvalRunTagsHelmArgsTest(unittest.TestCase):
+    """eval_run_tags_helm_args: the tag switch rides the proxy, and EVAL_RUN_TAGS=false turns it off alone."""
+
+    def _args(self, **env):
+        script = ("set -euo pipefail\n" + _lifted("eval_run_tags_helm_args", constants=False)
+                  + "eval_run_tags_helm_args\n"
+                  + 'for a in ${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}; do echo "arg=$a"; done\n')
+        proc = subprocess.run([shutil.which("bash"), "-c", script], env={"PATH": os.environ.get("PATH", ""), **env},
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return [line.split("=", 1)[1] for line in proc.stdout.splitlines()]
+
+    def test_on_with_the_proxy(self):
+        self.assertEqual(self._args(REPLAY_SHADOW_ACTIVE="true"), ["--set", "platformAgent.deployment.evalRunTags=true"])
+
+    def test_off_without_the_proxy_or_when_turned_off(self):
+        for env in ({}, {"REPLAY_SHADOW_ACTIVE": "false"}, {"REPLAY_SHADOW_ACTIVE": "true", "EVAL_RUN_TAGS": "false"}):
+            with self.subTest(**env):
+                self.assertEqual(self._args(**env), [])
+
+
 class HelmArgsTest(unittest.TestCase):
     def _args(self, **overrides):
         script = ("set -euo pipefail\n" + _lifted(*_RESOLVE, "replay_shadow_helm_args")
@@ -519,15 +540,15 @@ class DeployWiringTest(unittest.TestCase):
                       self.text)
         self.assertIn('REPLAY_SHADOW_PROXY_URI="${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}:${TAG}"', self.text)
 
-    def test_the_install_expands_the_values_and_the_mode_flip_reuses_them(self):
+    def test_the_install_expands_the_values_and_is_the_only_upgrade(self):
         install = self.text[self.text.index('helm upgrade --install "${HELM_RELEASE_NAME}"'):]
         install = install[: install.index("--wait --timeout 15m")]
         self.assertIn('${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"}', install)
-        flip = self.text[self.text.index('| helm upgrade "${HELM_RELEASE_NAME}"'):]
-        flip = flip[: flip.index("--wait")]
-        self.assertIn("--reuse-values", flip)
-        # The flip is the only later upgrade, so nothing else can drop the values.
-        self.assertEqual(len(re.findall(r"^\s*[^#\n]*\bhelm upgrade\b", self.text, re.MULTILINE)), 2)
+        self.assertIn('${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}', install)
+        self.assertLess(self.text.index('  replay_shadow_helm_args "${AR_REPO}'),
+                        self.text.index("\neval_run_tags_helm_args\n"))
+        # No later upgrade, so nothing can drop the values.
+        self.assertEqual(len(re.findall(r"^\s*[^#\n]*\bhelm upgrade\b", self.text, re.MULTILINE)), 1)
 
 
 class CloudBuildStepTest(unittest.TestCase):
@@ -776,16 +797,15 @@ class ModeCollectorTest(_LifecycleBase):
         return proc
 
     def test_a_trusted_nightly_installed_in_record_mode_collects_and_publishes(self):
-        proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", JOB_NAME="ci-kube-agents-eval-nightly",
-                           EVAL_MODE_NEXT="1")
+        proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", JOB_NAME="ci-kube-agents-eval-nightly")
         argv, pairs = self._argv_pairs()
         self.assertEqual(pairs["--mode"], "record")
         self.assertEqual(pairs["--publish-bucket"], "kube-agents-replay-cache")
         self.assertEqual(pairs["--verdicts-dir"], str(self.artifacts))
         self.assertEqual(pairs["--cache-subdir"], "replay-cache")
         self.assertEqual(pairs["--final-deadline"], "240")
-        self.assertEqual((pairs["--job-name"], pairs["--eval-mode-next"], pairs["--forge"]),
-                         ("ci-kube-agents-eval-nightly", "1", ""))
+        self.assertEqual((pairs["--job-name"], pairs["--forge"]), ("ci-kube-agents-eval-nightly", ""))
+        self.assertNotIn("--eval-mode-next", pairs, "every install grades the A2A stack; the record's mode is not read from a flag")
         self.assertTrue(os.path.isdir(pairs["--keep-dir"]))
         self.assertNotIn(str(self.artifacts), pairs["--keep-dir"], "kept answers stay out of the public artifacts")
         self.assertIn("wait=255", proc.stdout)
@@ -895,7 +915,7 @@ class ModeCollectorTest(_LifecycleBase):
 
 
 class PrepareLaneCacheTest(_LifecycleBase):
-    """prepare_replay_lane_cache: fetch, then seed every pod, before any case; any failure stops the lane."""
+    """prepare_replay_lane_cache fetches before any case; seed_replay_lane_cache seeds every pod after the live arm."""
 
     def setUp(self):
         super().setUp()
@@ -912,12 +932,15 @@ class PrepareLaneCacheTest(_LifecycleBase):
             sys.exit(int(os.environ.get("FAKE_FETCH_RC", "0")))
         """))
 
-    def _prepare(self, **overrides):
+    def _prepare(self, seed=False, **overrides):
         script = self._script("") .replace("set -euo pipefail\n", "set -euo pipefail\n", 1)
         text = _CI_ENV.read_text()
         script += lift_function("prepare_replay_lane_cache", text, _CI_ENV)
+        script += lift_function("seed_replay_lane_cache", text, _CI_ENV)
         script += f"REPLAY_CACHE_FETCH_SCRIPT={str(self.fetch)!r}\n"
         script += 'rc=0\nprepare_replay_lane_cache || rc=$?\necho "rc=${rc}"\n'
+        if seed:
+            script += '[ "${rc}" != 0 ] || { seed_replay_lane_cache || rc=$?; echo "seed rc=${rc}"; }\n'
         overrides.setdefault("PATH", f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin")
         env = _env(ARTIFACTS=str(self.artifacts), TARGET_NAMESPACE="kubeagents-system",
                    AGENT_CLUSTER_CONTEXT="gke_p_us-central1_platform-agent-host", **overrides)
@@ -931,14 +954,30 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertIn("rc=0", proc.stdout)
         self.assertEqual(calls, [])
 
-    def test_it_fetches_then_seeds_every_pod(self):
-        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay", EVAL_MODE_NEXT="1", EVAL_FORGE="gitlab")
+    def test_it_fetches_and_seeds_no_pod(self):
+        # Until the seed, every replay proxy's cache is empty: the live arm's window.
+        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual([c.split()[0] for c in calls], ["fetch"])
+
+    def test_off_the_lane_or_with_nothing_fetched_the_seed_does_nothing(self):
+        for overrides in ({}, {"EVAL_REPLAY_LANE": "true", "FAKE_DEPLOYED": "replay", "EVAL_REPLAY_SHADOW_JOB_KIND": None,
+                               "JOB_TYPE": "presubmit"}):
+            with self.subTest(**overrides):
+                self.calls.unlink(missing_ok=True)
+                proc, calls = self._prepare(seed=True, **overrides)
+                self.assertNotIn("seed", [c.split()[0] for c in calls])
+
+    def test_it_fetches_then_the_seed_seeds_every_pod(self):
+        proc, calls = self._prepare(seed=True, EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay",
+                                    EVAL_FORGE="gitlab")
+        self.assertIn("seed rc=0", proc.stdout, proc.stderr)
         self.assertEqual([c.split()[0] for c in calls], ["fetch", "seed"])
         self.assertIn("--bucket kube-agents-replay-cache", calls[0])
         self.assertIn("--max-age-hours 30", calls[0])
         self.assertIn(f"--max-bytes {512 * 1024 * 1024}", calls[0])
-        self.assertIn("--eval-mode-next 1 --forge gitlab", calls[0], "the lane's own mode and forge pick the records")
+        self.assertIn("--forge gitlab", calls[0], "the lane's own forge picks the records")
+        self.assertNotIn("--eval-mode-next", calls[0])
         self.assertIn("--seed-once", calls[1])
         self.assertIn("--mode replay", calls[1])
 
@@ -953,7 +992,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         for overrides, expected in (({"FAKE_FETCH_RC": "1"}, ["fetch"]), ({"FAKE_SEED_RC": "1"}, ["fetch", "seed"])):
             with self.subTest(**overrides):
                 self.calls.unlink(missing_ok=True)
-                proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay",
+                proc, calls = self._prepare(seed=True, EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay",
                                             **overrides)
                 self.assertIn("rc=1", proc.stdout)
                 self.assertEqual([c.split()[0] for c in calls], expected)
@@ -965,16 +1004,65 @@ class EvalWiringTest(unittest.TestCase):
 
     def test_started_once_the_host_cluster_context_is_known(self):
         context = next(i for i, l in enumerate(self.lines) if l.startswith("export AGENT_CLUSTER_CONTEXT="))
-        start = self.lines.index("start_replay_shadow_collector")
+        start = self.lines.index('[ "${EVAL_REPLAY_LANE:-}" = "true" ] || start_replay_shadow_collector')
         self.assertLess(context, start)
 
-    def test_the_lane_seeds_before_the_collector_and_stops_when_it_cannot(self):
+    def test_the_lane_fetches_before_any_case_and_stops_when_it_cannot(self):
         context = next(i for i, l in enumerate(self.lines) if l.startswith("export AGENT_CLUSTER_CONTEXT="))
         prepare = self.lines.index("prepare_replay_lane_cache || exit 1")
         self.assertLess(context, prepare)
-        self.assertLess(prepare, self.lines.index("start_replay_shadow_collector"))
         fan_out = next(i for i, l in enumerate(self.lines) if l.startswith("launch_units() {"))
         self.assertLess(prepare, fan_out)
+
+    def test_the_lane_runs_its_live_arm_then_seeds_then_collects_then_replays(self):
+        # Every unit before the seed meets an empty cache, so it runs live.
+        def at(line):
+            return self.lines.index(line)
+        start = at("run_replay_lane_live_arm() {")
+        end = self.lines.index("}", start)
+        body = self.lines[start:end]
+        self.assertEqual(body[1], '  [ "${EVAL_REPLAY_LANE:-}" = "true" ] || return 0', "a no-op off the lane")
+        live = body.index('    launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
+        seed = body.index("  seed_replay_lane_cache || exit 1")
+        arms = body.index('  write_replay_lane_arms "$(date -u +%s)"')
+        collector = body.index("  start_replay_shadow_collector")
+        self.assertEqual(body[live + 1], "    wait", "the live arm finishes before the seed")
+        # Then every card it filed is archived, so the replayed arm cannot read the
+        # live arm's answers off the board (2122208205344870400).
+        clear = body.index('    fence_live_cards "replay lane live arm" "" "" arm')
+        self.assertLess(live + 1, clear)
+        self.assertLess(clear, seed)
+        self.assertLess(seed, arms)
+        self.assertLess(arms, collector)
+        # The fan-out calls it right before the main queue, which is then replayed,
+        # and right after taking the time the clear archives from.
+        replayed = at('launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
+        self.assertEqual(self.lines[replayed - 1], "run_replay_lane_live_arm")
+        self.assertEqual(self.lines[replayed - 2], 'EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"')
+        self.assertGreater(replayed, end, "defined before the fan-out calls it")
+        self.assertEqual(sum(1 for l in self.lines if l.strip() == "seed_replay_lane_cache || exit 1"), 1)
+
+    def _live_arm(self, lane: str) -> list[str]:
+        stubs = textwrap.dedent("""\
+            LIVE_TOTAL=2 UNIT_QUEUE_LIVE="1 0 0" EVAL_TASK_PARALLELISM=4 EVAL_UNIT_LAUNCH_STAGGER_SECONDS=0
+            REPLAY_LANE_SAFETY_NAMES=a
+            launch_units() { (sleep 1; echo "UNIT END") & }
+            fence_live_cards() { echo "CLEAR $*"; }
+            seed_replay_lane_cache() { echo SEED; }
+            write_replay_lane_arms() { echo ARMS; }
+            start_replay_shadow_collector() { echo COLLECTOR; }
+            """)
+        script = ("set -euo pipefail\n" + stubs + f"EVAL_REPLAY_LANE={lane}\n"
+                  + lift_function("run_replay_lane_live_arm", _CI_EVAL.read_text(), _CI_EVAL) + "run_replay_lane_live_arm\n")
+        proc = subprocess.run([shutil.which("bash"), "-c", script], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return [line for line in proc.stdout.splitlines() if not line.startswith(">>>")]
+
+    def test_the_live_arm_cards_are_archived_after_its_units_end_and_before_the_seed(self):
+        self.assertEqual(self._live_arm("true"),
+                         ["UNIT END", 'CLEAR replay lane live arm   arm', "SEED", "ARMS", "COLLECTOR"])
+        self.assertEqual(self._live_arm("false"), [], "nothing changes off the lane")
 
     # The script's decision on whether the run records, run as written: from
     # the JOB_TYPE case to the commit stamp that follows it.
@@ -1042,6 +1130,88 @@ class EvalWiringTest(unittest.TestCase):
         self.assertEqual(body[1:4], ["local exit_code=$?", "set +e", "signal_replay_shadow_collector"])
         self.assertLess(body.index("collect_credential_proxy_evidence"), body.index("wait_replay_shadow_collector"))
         self.assertLess(body.index("wait_replay_shadow_collector"), body.index("dump_prow_artifacts_on_failure"))
+
+
+class SafetyArmQueueTest(unittest.TestCase):
+    """The lane's safety cases: reps 1..R queued live, R+1..2R replayed, graded over all 2R."""
+
+    _QUEUE_START = "# A replay-lane safety case runs its live arm in the first phase's own queue,"
+    _QUEUE_END = "WRITER_TOTAL="
+
+    def _queues(self, safety, phases=None, reps=3):
+        text = _CI_EVAL.read_text()
+        start = text.index(self._QUEUE_START)
+        block = text[start:text.index(self._QUEUE_END, start)]
+        functions = "".join(lift_function(n, text, _CI_EVAL) for n in ("case_repetitions", "first_queued_rep"))
+        phases = phases or {}
+        script = ("set -euo pipefail\n" + lift_constant("REPLAY_LANE_SAFETY_ARMS", text, _CI_EVAL)
+                  + lift_constant("EVAL_REPLAY_LANE_SAFETY_CASES_FILE", text, _CI_EVAL)
+                  + f"EVAL_REPETITIONS={reps}\nREPLAY_LANE_SAFETY_NAMES={safety!r}\n"
+                  + "TASK_NAMES=(case-a case-b case-c)\nTASKS=(a b c)\n"
+                  + "unit_cost_hint() { echo 0; }\n"
+                  + "unit_phase() { case \"$1\" in " + "".join(f"{k}) echo {v} ;; " for k, v in phases.items())
+                  + "*) echo 0 ;; esac; }\n"
+                  + functions + block
+                  + 'printf "LIVE\\n%s\\nMAIN\\n%s\\nWRITERS\\n%s\\n" "${UNIT_QUEUE_LIVE}" "${UNIT_QUEUE}" "${UNIT_QUEUE_WRITERS}"\n'
+                  + 'for n in "${TASK_NAMES[@]}"; do echo "REPS $n $(case_repetitions "$n")"; done\n')
+        proc = subprocess.run([shutil.which("bash"), "-c", script], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"}, timeout=_WAIT_SECONDS)
+        return proc
+
+    @staticmethod
+    def _units(proc, section):
+        out = proc.stdout.split(section + "\n", 1)[1].split("\n")
+        units = set()
+        for line in out:
+            if line in ("MAIN", "WRITERS") or line.startswith("REPS"):
+                break
+            if line:
+                rep, _, idx = line.split()
+                units.add((int(idx), int(rep)))
+        return units
+
+    def test_a_safety_case_runs_its_live_reps_first_and_its_replayed_reps_after(self):
+        proc = self._queues("case-b")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._units(proc, "LIVE"), {(1, 1), (1, 2), (1, 3)})
+        self.assertEqual(self._units(proc, "MAIN"),
+                         {(0, 1), (0, 2), (0, 3), (1, 4), (1, 5), (1, 6), (2, 1), (2, 2), (2, 3)})
+        self.assertIn("REPS case-b 6", proc.stdout)
+        self.assertIn("REPS case-a 3", proc.stdout)
+
+    def test_off_the_lane_nothing_is_live_and_nothing_changes(self):
+        proc = self._queues("")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._units(proc, "LIVE"), set())
+        self.assertEqual(self._units(proc, "MAIN"), {(i, r) for i in range(3) for r in (1, 2, 3)})
+
+    def test_a_safety_case_outside_the_first_phase_stops_the_run(self):
+        proc = self._queues("case-b", phases={"case-b": 1})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("take it off the list", proc.stderr)
+
+    def test_every_count_of_finished_reps_reads_the_cases_own_repetitions(self):
+        text = _CI_EVAL.read_text()
+        self.assertNotRegex(text, r'_reps\}" -ge "\$\{EVAL_REPETITIONS\}"')
+        grade = text[text.index("grade_case() {"):]
+        self.assertIn('for rep in $(seq 1 "$(case_repetitions "${name}")"); do', grade[:grade.index("\n}\n")])
+        self.assertEqual(len(re.findall(r'_reps\}" -ge "\$\(case_repetitions "\$\{name\}"\)"', text)), 5)
+
+    def test_the_arms_note_is_what_lane_report_reads(self):
+        sys.path.insert(0, str(_ROOT / "hack" / "replay-proxy"))
+        import lane_report  # noqa: E402
+        text = _CI_EVAL.read_text()
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.assertIn(f'readonly REPLAY_LANE_ARMS_FILE="{lane_report.ARMS_FILE}"', text)
+        script = ("set -euo pipefail\n" + lift_constant("REPLAY_LANE_ARMS_FILE", text, _CI_EVAL)
+                  + f"ARTIFACT_DIR={str(tmp)!r}\nEVAL_REPETITIONS=3\nREPLAY_LANE_SAFETY_NAMES=case-a,case-b\n"
+                  + lift_function("write_replay_lane_arms", text, _CI_EVAL) + "write_replay_lane_arms 1800000000\n")
+        proc = subprocess.run([shutil.which("bash"), "-c", script], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, env={"PATH": f"{os.path.dirname(sys.executable)}:/usr/bin:/bin"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(lane_report.read_arms(str(tmp)),
+                         {"live_reps": 3, "replayed_from": 1800000000.0, "cases": ["case-a", "case-b"]})
 
 
 class LitellmLogLeavesTheProxyOutTest(unittest.TestCase):

@@ -1,6 +1,7 @@
 ---
 name: fleet-audit-reports
-description: Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran. Never the answer to a request to run an audit: a run collects, publishes and opens its fixes through the fleet-audit skill.
+description: >-
+  Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran. Never the answer to a request to run an audit: a run collects, publishes and opens its fixes through the fleet-audit skill.
 ---
 
 # fleet-audit-reports — Reading What the Audits Found
@@ -20,7 +21,7 @@ to uses `no_forge/local`:
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
   run-over-run history that exists anywhere: the ledger issue rewrites itself in place.
 
-An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
+An envelope carries `audit_id`, `repo`, `started_at`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `scheduled`, `scheduled_coverage_gaps`, `scheduled_published_ids`, `scheduled_reported_under_gap`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
@@ -58,6 +59,10 @@ forward.
 - `current_ids` is exactly what the body's hidden block published: the findings the body named, in
   full or on one line, the ids the collector held, and the ids under _Not re-checked this run_
   (previous findings on a target the run did not check). Derive this run's full set from `document`.
+- `started_at` is when the run that published this envelope started, or null when `finish` could
+  not read it. Envelopes written before the key existed lack it. `show` gives it; `streams` does
+  not carry it. It is not `running_since`, which `streams` takes from the lease of a run that
+  started and did not finish.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
   publish, and for the collector to run. An envelope has only the ones `finish` could measure.
   `show` gives them, with null for the others; `streams` does not carry them.
@@ -168,8 +173,9 @@ python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_qu
 python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
 ```
 
-The ledger names findings it has no room to show in full on one line each, as far as the room left
-after the criticals' full blocks allows, then drops the least-severe ones and its evidence table whole, to stay inside GitHub's
+The ledger names findings it has no room to show in full on one line each, trading full blocks past
+the first finding so names continue down every severity band as far as room allows, then drops the
+least-severe tail and its evidence table whole to stay inside GitHub's
 body limit, and says so in a notice that points here. `findings` lists every finding the run
 carried. `checks` is one row per check the run says it performed, with the command that performed
 it, plus each `checks_not_applicable` exclusion and its reason; filter by cluster or check — a

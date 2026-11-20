@@ -141,7 +141,7 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 				a.Action = canonical
 			}
 			if text, ok := controlTexts[a.Action]; ok {
-				return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, text, controlWait)
+				return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, text, TurnAddress{}, controlWait)
 			}
 			if msg, ok := droppedActions[a.Action]; ok {
 				return "", fmt.Errorf("%s: %s", a.Action, msg)

@@ -108,6 +108,15 @@ UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
 # Normalized, the answer still holds an identifier shape (a card, a pod, a
 # session) the request never bound, so it would be served as recorded.
 UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
+# The answer names a file the request's read_file `similar_files` listed, which
+# the key drops: served to a run whose list lacked it, it would act on a file
+# that run was never shown.
+UNSTORABLE_NAMES_DROPPED_FILE = "names_dropped_similar_file"
+# The answer talks about a queue or a slot (`queued`, `frees up`, `slot`, `in
+# use`) after a kanban_create result whose `queued` the key drops: served to a
+# run whose card had a free slot, it would tell the user of a wait that run
+# does not have.
+UNSTORABLE_TALKS_ABOUT_DROPPED_QUEUE = "talks_about_dropped_queue"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
@@ -134,6 +143,13 @@ SERVED = "served"
 SERVED_FROM = "served_from"
 # How a served answer matched: the exact key, or the answer-slot key.
 SERVED_VIA = "served_via"
+# On every request line: the eval run, case and repetition the request serves
+# (`<run>/<case>/<rep>`, from X-Kube-Agents-Eval-Run) and the agent that sent
+# it (`<profile>;<source>`, from X-Kube-Agents-Eval-Agent), as the agent's
+# eval_run_tag plugin set them; null when the request carried none or a
+# malformed one. Neither is forwarded upstream or read by the key.
+EVAL_RUN = "eval_run"
+EVAL_AGENT = "eval_agent"
 VIA_EXACT = "exact"
 VIA_ANSWER_SLOTS = "answer_slots"
 # In record mode: whether this request's answer was saved (false when the key
@@ -175,6 +191,10 @@ GUARD_VALUE_ONLY_IN_ANSWERS = "value_only_in_answers"
 GUARD_UNBOUND_PLACEHOLDER = "unbound_placeholder"
 # The saved answer is missing or not an answer.
 GUARD_UNREADABLE_ENTRY = "unreadable_entry"
+# The saved answer names a file this request's read_file `similar_files`
+# listed, which the key drops: the recording may have acted on that file not
+# being there (written it, reported it missing).
+GUARD_NAMES_DROPPED_FILE = "names_dropped_similar_file"
 # Where the first difference is when it is not a message.
 MISS_ROLE_SETTINGS = "settings"
 MISS_ROLE_NONE = "none"

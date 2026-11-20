@@ -199,7 +199,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 		t.Fatal("embedded nats-server did not come up")
 	}
 	// The evidence names the server it came from: the module pin here and
-	// the image tag the operator deploys are independent, and the tag floats.
+	// the image the operator deploys (pinned by tag and digest) are
+	// independent, so their server versions can differ.
 	t.Logf("embedded nats-server %s (the operator deploys %s)", natsserver.VERSION, defaultA2ANATSImage)
 	return s, log
 }
@@ -246,7 +247,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 	return []jetstream.StreamConfig{
 		{Name: "TASKS", Subjects: []string{"a2a.tasks.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
-			MaxAge: 72 * time.Hour, MaxBytes: 21474836480, Replicas: 1,
+			MaxAge: 72 * time.Hour, MaxBytes: a2aTasksMaxBytes, Replicas: 1,
 			MaxConsumers:      a2aTasksMaxConsumers(a2aTestAgent()),
 			MaxMsgsPerSubject: a2aTasksMaxMsgsPerSubject, AllowDirect: true},
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
@@ -257,7 +258,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
-			MaxAge: 720 * time.Hour, MaxBytes: 5368709120, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
+			MaxAge: 720 * time.Hour, MaxBytes: a2aTopicsJournalMaxBytes, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 	}
 }
 
@@ -403,13 +404,22 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$JS.ACK TASKS (msg.Ack)", delivered.Ack())
 	// The ack landed, read from web's side, the observer for every consumer
-	// in this test.
+	// in this test. Ack is fire-and-forget, as it is in the bridge, so the
+	// server may not have processed it yet: wait for the floor to move rather
+	// than read it once (#5860).
 	relayView, err := webJS.Consumer(ctx, "TASKS", "bridge-platform")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info, err := relayView.Info(ctx); err != nil || info.AckFloor.Consumer != 1 {
-		t.Fatalf("ack floor after the bridge's ack: %+v (%v)", info, err)
+	var info *jetstream.ConsumerInfo
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		info, err = relayView.Info(ctx)
+		if err == nil && info.AckFloor.Consumer == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ack floor after the bridge's ack: %+v (%v)", info, err)
+		}
 	}
 
 	_, err = js.Publish(ctx, eventsSubject, []byte(`{"kind":"status-update"}`), jetstream.WithMsgID("e1"))

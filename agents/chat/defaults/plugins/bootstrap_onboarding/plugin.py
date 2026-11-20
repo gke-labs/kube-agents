@@ -40,7 +40,7 @@ DELIVERY_JOB_IDS = ("oobe", "bootstrap-inventory-delivery")
 # positive allowlist so new local or request/response surfaces fail closed until
 # they explicitly implement durable delivery.
 DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
-# Under spec.mode next every chat turn reaches Hermes through the API server,
+# A chat turn the gateway holds reaches Hermes through the API server,
 # relayed by the hermes-bridge, so the session names no chat. Such a turn is a
 # chat turn only when the bridge recorded a durable platform's conversation for
 # its session (_prime_conversation); any other API-server turn (the bench, curl,
@@ -162,11 +162,13 @@ REPORT_CHECK_TIMEOUT_SECONDS = 5
 # and knows which platform's conversations the gateway serves.
 CHAT_NOTIFY_PATH = Path("/opt/defaults/scripts/chat_notify.py")
 CHAT_NOTIFY_MODULE = "_kube_agents_chat_notify"
+# What a log line prints for an empty served-platform list.
+UNSET_LABEL = "<unset>"
 # The image's hand-off module, whose read_scan_marker is the one reader of the
 # sweep marker's filing time that oobe and the hand-off share.
 BOOTSTRAP_HANDOFF_PATH = Path("/opt/defaults/scripts/bootstrap_handoff.py")
 BOOTSTRAP_HANDOFF_MODULE = "_kube_agents_bootstrap_handoff"
-# The conversation the report goes to under next, read by bootstrap_delivery.py
+# The conversation the report goes to on the conversation path, read by bootstrap_delivery.py
 # (CONVERSATION_FILE there) and kept after delivery as onboarding's destination.
 # The jobs stay ``deliver: local``: the scheduler cannot post to a gateway
 # conversation, and a job origin naming one would print the report to nobody.
@@ -176,7 +178,7 @@ CONVERSATION_FILE = "onboarding_conversation.json"
 # path never reads it, so a rollback leaves the report waiting, not printed.
 CONVERSATION_ALIGNED_MARKER = ".user_aligned_conversation"
 # Taken with O_EXCL for the length of one priming: each top-level message is
-# its own first turn under next, so two quick messages could otherwise both
+# its own first turn through the gateway, so two quick messages could otherwise both
 # greet and bind. One older than PRIMING_STALE_SECONDS is a priming that died.
 PRIMING_MARKER = ".bootstrap_priming"
 PRIMING_STALE_SECONDS = 120
@@ -559,26 +561,27 @@ def _prime_conversation(data_dir: Path, session_id: str, turn_id: str = "") -> O
     The report goes to the bridge's recorded conversation through the gateway
     (bootstrap_delivery.py, ``a2a notify --conversation``), so nothing here
     touches a cron job's origin, ``.user_aligned`` or a Hermes home channel,
-    which under next drives nothing. Returns None, with every marker left as
+    which drives nothing on the conversation path. Returns None, with every marker left as
     it was, for a turn with no durable conversation or a gateway that does not
     serve its platform's conversations.
     """
     try:
         chat_notify = _load_chat_notify()
         route = chat_notify.conversation_route(session_id)
-        served = chat_notify.gateway_platform()
+        served = chat_notify.gateway_platforms()
     except Exception as e:
         logger.warning("Could not read the conversation route for %s: %s", session_id, e)
         return None
     if not route or route["platform"] not in DURABLE_CHAT_PLATFORMS:
         return None
-    if served != route["platform"]:
+    if route["platform"] not in served:
         if route["platform"] in _unserved_warned:
             return None
         _unserved_warned.add(route["platform"])
         logger.warning(
-            "The gateway does not serve %s conversations here (%s=%r); leaving onboarding unprimed.",
-            route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV, served,
+            "The gateway does not serve %s conversations here (%s=%s); leaving onboarding unprimed.",
+            route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV,
+            chat_notify.PLATFORM_LIST_SEPARATOR.join(served) or UNSET_LABEL,
         )
         return None
     if _scan_too_old(data_dir):
@@ -701,8 +704,8 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Prime first-time onboarding on the opening interactive user turn.
 
     Runs at most ONCE per deployment, the eval seam below aside: an API-server
-    turn naming a live eval request is greeted every time. Under spec.mode
-    next a chat turn arrives as an API-server turn and is primed by
+    turn naming a live eval request is greeted every time. A chat turn the
+    gateway relays arrives as an API-server turn and is primed by
     _prime_conversation instead of the steps below. On the one human turn that
     primes it on a chat platform, this:
       1. binds the delivery job to this chat and, only if that succeeded,

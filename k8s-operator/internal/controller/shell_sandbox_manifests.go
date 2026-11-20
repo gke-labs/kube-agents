@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -64,7 +65,8 @@ const (
 	// deploy/sandbox/sshd_config. Above 1024 so the daemon does not need
 	// CAP_NET_BIND_SERVICE, and not 22 so nothing in the cluster mistakes it for
 	// a node.
-	shellSandboxPort = 2222
+	shellSandboxPort      = 2222
+	shellSandboxComponent = "shell-sandbox"
 
 	// Operator-level override for installs mirroring images into a private
 	// registry, matching the "override" field of the agent-sandbox entry in
@@ -91,6 +93,9 @@ const (
 	shellSandboxSshdVolume     = "sshd"
 	shellSandboxKeysVolume     = "authorized-keys"
 	shellSandboxSettingsVolume = "settings"
+	// Hyperdisk Balanced (hyperdisk-balanced) rejects disks under 4 GB with HTTP 400
+	// InvalidArgument instead of rounding up; shares systemMetadataStorageSize.
+	shellSandboxSshdStorageSize = systemMetadataStorageSize
 
 	// The token the shell presents to the credential runtime. It mounts at
 	// credentialProxyTokenMountPath, the same path the agent pod uses, because a
@@ -125,6 +130,11 @@ const (
 	envPostMergeCheck = "KUBEAGENTS_POST_MERGE_CHECK"
 	envAutomerge      = "KUBEAGENTS_AUTOMERGE"
 	envDial           = "KUBEAGENTS_DIAL"
+	// The sizing tier whose column of deploy/sandbox/kubectl-costs.json the shell's
+	// kubectl admission charges ("default" when unset). An operator sets it in
+	// spec.deployment.env; deploy/sandbox/entrypoint.sh writes it to a root-owned
+	// file the admission reads, so a session cannot pick a lighter tier.
+	envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -241,6 +251,9 @@ const (
 	shellSandboxMemoryRequest = "512Mi"
 	shellSandboxCPULimit      = "2"
 	shellSandboxMemoryLimit   = "2Gi"
+	// The variable that carries the shell container's memory limit, in bytes,
+	// to the memory guard the entrypoint starts.
+	shellSandboxMemoryLimitEnvVar = "SANDBOX_MEMORY_LIMIT_BYTES"
 
 	// The shell container's name, which the sizing step-up check reads the
 	// StatefulSet's template by (sizing_profile.go) and the eval harness execs
@@ -262,6 +275,10 @@ const (
 	// from one place, and so the chart can render the sandbox's Secret from it.
 	shellSandboxPrivateKeySecretKey = "SANDBOX_SSH_PRIVATE_KEY" // #nosec G101 -- Secret key name, not a credential
 )
+
+// kubectlCostTierPattern is a tier name the entrypoint will write: a short
+// lowercase word, as the cost table's tier keys are.
+var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
 var (
 	// The /opt/defaults trees deploy/sandbox/Dockerfile ships and the
@@ -582,6 +599,9 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			corev1.EnvVar{Name: envKubeContextName, Value: hostClusterContextName(agent)},
 		)
 	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+	}
 
 	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
 	// Normalised to the two words the script reads, so the bytes on the pod
@@ -593,6 +613,16 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			if v.Name == envAuditAutoPromote && v.ValueFrom == nil {
 				off := strings.EqualFold(strings.TrimSpace(v.Value), "false")
 				env = append(env, corev1.EnvVar{Name: envAuditAutoPromote, Value: strconv.FormatBool(!off)})
+				break
+			}
+		}
+		// The tier the same way: a literal only, and only a plain lowercase name,
+		// since the entrypoint writes it to a file the admission opens by name.
+		for _, v := range agent.Spec.Deployment.Env {
+			if v.Name == envKubectlCostTier && v.ValueFrom == nil {
+				if tier := strings.ToLower(strings.TrimSpace(v.Value)); kubectlCostTierPattern.MatchString(tier) {
+					env = append(env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
+				}
 				break
 			}
 		}
@@ -616,6 +646,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	for k, v := range labels {
 		podLabels[k] = v
 	}
+	podLabels["kubeagents.x-k8s.io/component"] = shellSandboxComponent
 	return &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -737,15 +768,15 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					},
 				},
 				{
-					// Two host keys and nothing else, so this is a minimum-size
-					// request rather than a sized one; the CSI driver rounds it up
-					// to whatever the storage class's disk type allows.
+					// Two host keys and nothing else, sized at the 4Gi Hyperdisk Balanced
+					// minimum because pd.csi.storage.gke.io rejects smaller hyperdisk-balanced
+					// claims with InvalidArgument rather than rounding them up.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxSshdVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse("1Gi"),
+								corev1.ResourceStorage: resource.MustParse(shellSandboxSshdStorageSize),
 							},
 						},
 					},
@@ -980,6 +1011,16 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 	env = append(slices.Clone(env),
 		corev1.EnvVar{Name: shellSandboxImageTreesEnvVar, Value: shellSandboxImageTreesMode},
 		corev1.EnvVar{Name: shellSandboxHomeRootsEnvVar, Value: shellSandboxHomeRoots()},
+		// The memory guard's limit (deploy/sandbox/shell-memory-guard.py). Under
+		// gVisor the container's cgroup v1 limit is the sandbox's virtual memory,
+		// not this container's limit, so the guard reads the figure from here.
+		corev1.EnvVar{Name: shellSandboxMemoryLimitEnvVar, ValueFrom: &corev1.EnvVarSource{
+			ResourceFieldRef: &corev1.ResourceFieldSelector{
+				ContainerName: shellSandboxContainerName,
+				Resource:      containerMemoryLimitResource,
+				Divisor:       resource.MustParse("1"),
+			},
+		}},
 	)
 	container := corev1.Container{
 		Name:  shellSandboxContainerName,

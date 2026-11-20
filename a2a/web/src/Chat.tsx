@@ -12,11 +12,12 @@
  * page's own command words are never published; any other line, `/session`
  * included, is sent to the gateway.
  */
-import { useState, type KeyboardEvent } from "react";
+import { useRef, useState, type KeyboardEvent } from "react";
 import type { ChatEntry, ProbeResult } from "./model.ts";
 import { READ_ONLY_USER } from "./config.ts";
 import { classifyInput, tooBigText, type Command } from "./commands.ts";
-import Transcript from "./Transcript.tsx";
+import Transcript, { replyLabel } from "./Transcript.tsx";
+import { turnFate } from "./console.ts";
 
 const EMPTY_READ_ONLY = "watching the bus - ask the agent something in chat";
 const EMPTY_CONSOLE = "watching the bus - type below to ask the agent something, or /help";
@@ -38,6 +39,26 @@ const USAGE_SUMMARY_TITLE =
  * the fallback check for those.
  */
 const IME_COMMIT_KEYCODE = 229;
+/**
+ * The chip over the box while a reply is aimed under a card's report. It names
+ * the report by its first line (replyLabel), never by the task id the frame
+ * carries: the id is plumbing. A button turn (the usage summary) neither
+ * carries the reply nor consumes it: the reply is for the next typed turn.
+ */
+const REPLY_CHIP_TEXT = "replying under the report";
+const REPLY_CLEAR_GLYPH = "×";
+const REPLY_CLEAR_LABEL = "stop replying under the report";
+
+/**
+ * Where the pane's next typed turn goes: under the report entry `entryId` of
+ * `conversation`. The task and the label are read off the entry at render, so
+ * an in-place edit of the report shows through and a report that left the
+ * transcript (/clear) or a conversation that changed (/new) disarms it.
+ */
+interface ReplyTarget {
+  entryId: string;
+  conversation: string;
+}
 
 interface ChatProps {
   entries: ChatEntry[];
@@ -48,8 +69,12 @@ interface ChatProps {
   probe?: ProbeResult;
   probePending?: boolean;
   onProbe: () => void;
-  /** True if the turn was accepted; the box is cleared only then. */
-  onSend?: (text: string) => boolean;
+  /**
+   * True if the turn was accepted; the box is cleared only then. `replyTo` is
+   * the root task of the card's report the turn answers, when the user aimed
+   * it there with the report's reply button.
+   */
+  onSend?: (text: string, replyTo?: string) => boolean;
   onCommand?: (command: Command) => void;
 }
 
@@ -75,7 +100,21 @@ export default function Chat({
   onCommand,
 }: ChatProps) {
   const [draft, setDraft] = useState("");
+  const [reply, setReply] = useState<ReplyTarget | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const canSend = onSend !== undefined && user !== READ_ONLY_USER;
+  const target =
+    reply !== null && reply.conversation === conversation ? entries.find((e) => e.id === reply.entryId) : undefined;
+  const armed = target?.replyTo !== undefined ? { replyTo: target.replyTo, label: replyLabel(target.text) } : null;
+
+  const armReply = (entry: ChatEntry) => {
+    setReply({ entryId: entry.id, conversation: entry.correlationId });
+    inputRef.current?.focus();
+  };
+  const clearReply = () => {
+    setReply(null);
+    inputRef.current?.focus();
+  };
 
   const submit = () => {
     const c = classifyInput(draft);
@@ -90,13 +129,25 @@ export default function Chat({
         onCommand?.(c.command);
         // A usage error keeps its text so it can be fixed.
         if (c.command.name !== "error") setDraft("");
+        // A cleared transcript forgets the reply too: the report's next edit
+        // would otherwise bring the entry, and the chip, back.
+        if (c.command.name === "clear") setReply(null);
         return;
-      case "send":
+      case "send": {
+        // A settled line (stop, a bare /session or /session off, a bare
+        // /feedback or its summary) opens no turn, so it can carry no reply:
+        // it goes out without the report and the chip waits for the next
+        // typed turn, as it does across the usage summary button.
+        const settled = turnFate(c.text).kind === "settled";
         // Only clear the box once the turn was actually accepted - refused
         // (the link is down) or not, the caller decides, and a refused turn
         // must stay in the box rather than vanish.
-        if (onSend?.(c.text) === true) setDraft("");
+        if (onSend?.(c.text, settled ? undefined : armed?.replyTo) === true) {
+          setDraft("");
+          if (!settled) setReply(null);
+        }
         return;
+      }
     }
   };
 
@@ -111,7 +162,28 @@ export default function Chat({
 
   return (
     <div className="chat-pane">
-      <Transcript entries={entries} empty={canSend ? EMPTY_CONSOLE : EMPTY_READ_ONLY} />
+      <Transcript
+        entries={entries}
+        empty={canSend ? EMPTY_CONSOLE : EMPTY_READ_ONLY}
+        reply={canSend && conversation !== undefined ? { conversation, onReply: armReply } : undefined}
+      />
+      {canSend && armed !== null && (
+        <div className="chat-reply-chip" role="status">
+          <span className="chat-reply-text">
+            {REPLY_CHIP_TEXT}
+            {armed.label !== "" ? `: ${armed.label}` : ""}
+          </span>
+          <button
+            type="button"
+            className="probe-button chat-reply-clear"
+            aria-label={REPLY_CLEAR_LABEL}
+            title={REPLY_CLEAR_LABEL}
+            onClick={clearReply}
+          >
+            {REPLY_CLEAR_GLYPH}
+          </button>
+        </div>
+      )}
       {canSend && (
         <textarea
           className="chat-input"
@@ -119,6 +191,7 @@ export default function Chat({
           value={draft}
           placeholder="ask the agent, or /help"
           aria-label="message"
+          ref={inputRef}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={handleKey}
         />

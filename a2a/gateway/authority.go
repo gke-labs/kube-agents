@@ -58,6 +58,14 @@ type AuthorityAudience struct {
 type AuthorityVia struct {
 	TaskID  string `json:"taskId"`
 	Session string `json:"session"`
+	// ProfileChain and Scope are set on a child whose parent is an
+	// AgentProfile task (#5686): the parent's carried chain (the waiting
+	// profile tasks above the parent, nearest last) and the parent's own
+	// scope. The dispatcher re-checks the chain and scope rules from them, and
+	// refuses a profile parent's child that lacks Scope, which is what an
+	// older gateway (one that never ran the checks) sends.
+	ProfileChain []string `json:"profileChain,omitempty"`
+	Scope        string   `json:"scope,omitempty"`
 }
 
 // AuthorityGrants is what `grants` carries: a reference and nothing else.
@@ -77,7 +85,13 @@ type Authority struct {
 	Requester AuthorityRequester `json:"requester"`
 	Audience  AuthorityAudience  `json:"audience"`
 	Via       *AuthorityVia      `json:"via,omitempty"`
-	Grants    json.RawMessage    `json:"grants"`
+	// Trigger is the unattended trigger a trigger's submission claims
+	// (trigger_ingress.go): the one the task's grant binds, which the
+	// dispatcher reads back (capability.TriggerFromAuthority) and the
+	// verifier holds equal to the grant's. Only the trigger ingress sets it,
+	// and Attribution leaves it out, so no later task inherits it.
+	Trigger *capability.Trigger `json:"trigger,omitempty"`
+	Grants  json.RawMessage     `json:"grants"`
 }
 
 // Render marshals the block for one envelope. A nil ref renders `grants: null`,

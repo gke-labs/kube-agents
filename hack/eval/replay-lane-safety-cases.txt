@@ -1,0 +1,21 @@
+# The replay lane's safety cases: flaky cases hack/ci-eval-pr.sh runs under
+# EVAL_REPLAY_LANE=true twice in one run, on the same commit and install. The
+# first EVAL_REPETITIONS repetitions run live, before the cache is seeded into
+# the proxy (an empty replay cache misses every request, so each goes to the
+# model); the next EVAL_REPETITIONS run replayed. lane_report.py sets the two
+# pass rates side by side, to show whether replay, which only ever serves a
+# passing run's answers, pushes a flaky case toward passing
+# (hack/replay-proxy/README.md, "In CI").
+#
+# Same format and rules as replay-lane-cases.txt, and no case in both:
+# registered, on the inject lane, requesting no pull request
+# (tests/test_replay_lane_roster.py), and running in the fan-out's first phase
+# (no stopped ask, no writes_alone, no scope exclusion), which the script checks.
+#
+# Each forked between a passing and a failing run at a published answer in
+# the 2026-11-11..13 records.
+./tasks/upgrades-fleet-rollout-stall/task.yaml
+./tasks/obtainability-pdb-semantics/task.yaml
+./tasks/alert-config-terraform-promql-probe/task.yaml
+./tasks/chat-voice-answer-first/task.yaml
+./tasks/obtainability-window-planning-probe/task.yaml

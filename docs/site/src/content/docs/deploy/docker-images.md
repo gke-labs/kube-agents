@@ -11,7 +11,7 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, its metrics exporter, the gateway, the session worker, the auth callout,
+The A2A stack pulls NATS, nats-box, the NATS config reloader, its metrics exporter, the gateway, the session worker, the auth callout,
 the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar. Each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
@@ -25,25 +25,38 @@ release and a mirrored install pulls them from the mirror. A `PlatformAgent`'s o
 `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE`, `A2A_CONSOLE_IMAGE` and `A2A_DISPATCHER_IMAGE` on the operator
 override one at a time.
 
-The AgentProfile dispatcher runs by default under `spec.mode: next`, from the release set's image, which on a mirror is the mirror's copy. `A2A_DISPATCHER_IMAGE` overrides the image, and the chart's `operator.profileDispatcher.enabled: false` switches the dispatcher off.
+The AgentProfile dispatcher runs by default, from the release set's image, which on a mirror is the mirror's copy. `A2A_DISPATCHER_IMAGE` overrides the image, and the chart's `operator.profileDispatcher.enabled: false` switches the dispatcher off.
 
-The Hermes bridge sidecar the operator renders into the agent pod under `next` is built from the
+The Hermes bridge sidecar the operator renders into the agent pod is built from the
 `platform-agent` image of the same commit. The operator therefore takes its registry and tag from
-the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent`
-that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
-resource names.
+the agent image instead when that is the release `platform-agent` image by tag, else from the
+operator's release set, and `A2A_BRIDGE_IMAGE` on the operator overrides it. The chart value
+`hermesBridge.image` (`repository`, `tag`) renders that override; empty, the default, renders
+nothing. A `PlatformAgent` that declares its own `hermes-bridge` sidecar keeps it, and that
+sidecar's image is whatever the resource names.
 
 NATS, nats-box, the NATS config reloader and its metrics exporter are ordinary third-party pins,
 in the table as `nats`, `nats-box`, `nats-server-config-reloader` and `prometheus-nats-exporter`,
-so `make mirror-images` copies them. The chart does not set their env vars, so a mirrored `next`
-install still points `A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_NATS_RELOADER_IMAGE` and
-`A2A_NATS_EXPORTER_IMAGE` at the copies itself, through the operator's environment
-([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
+so `make mirror-images` copies them. The chart sets their env vars (`A2A_NATS_IMAGE`,
+`A2A_PROVISION_IMAGE`, `A2A_NATS_RELOADER_IMAGE` and `A2A_NATS_EXPORTER_IMAGE`) from its
+`a2aBus.images` values, the same way it sets `FLUENT_BIT_IMAGE`. One exception: `operator.extraEnv` that sets `A2A_NATS_IMAGE` and not `A2A_NATS_EXPORTER_IMAGE` keeps the chart's exporter pin out of the operator's environment, so an install set up before the exporter existed stays without the sidecar (below). Under
+`global.thirdPartyImageRegistry` they render from the mirror, so a mirrored chart install pulls
+the four with nothing more to do. The two pinned by digest render under the prefix by tag alone,
+which is the copy `make mirror-images` pushes.
 
-If `A2A_NATS_IMAGE` is set and `A2A_NATS_EXPORTER_IMAGE` is not, as on a mirrored install set up
-before the exporter existed, the operator renders the NATS pods without the exporter. It records
-an `A2ABusMetricsExporterOmitted` Warning event on the `PlatformAgent`. The bus keeps running, and
-its metrics are absent until the variable names the mirrored copy.
+An upgrade with `helm upgrade --reuse-values` from a release before `a2aBus.images` existed
+renders without that key. The chart then takes the same pins from its own templates, so under
+`global.thirdPartyImageRegistry` the bus still pulls from the mirror.
+
+A kustomize install (`make deploy`) renders the operator without the chart, so there the operator
+runs on its compiled defaults, the same pins on Docker Hub, until the four env vars are set by
+hand on the controller manager.
+
+If `A2A_NATS_IMAGE` is set and `A2A_NATS_EXPORTER_IMAGE` is not, as on a kustomize install whose
+operator environment was written before the exporter existed, the operator renders the NATS pods
+without the exporter. It records an `A2ABusMetricsExporterOmitted` Warning event on the
+`PlatformAgent`. The bus keeps running, and its metrics are absent until the variable names the
+mirrored copy.
 `A2A_NATS_EXPORTER_IMAGE` has to name a copy of the upstream image, not a rebuild: the operator
 runs `/prometheus-nats-exporter` under the image's `/bin/sh`, in a loop that restarts the exporter
 if it exits.
@@ -54,9 +67,9 @@ The bases those images are built from are inventory entries too. `golang`, `node
 `a2a/Dockerfile.worker`, `a2a/Dockerfile.hermes-bridge` and `a2a/Dockerfile.web-console` alongside
 every other builder, so a build in a mirrored environment can resolve them like any other.
 
-Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
-`ARG` default, a compiled constant in the operator — and `make images-check` holds them in step with
-this file. How to bump a pin is in
+Several images keep a second copy of their pin elsewhere in the tree: a chart value, a Dockerfile
+`ARG` default, a compiled constant in the operator, or the chart's template default for the A2A bus.
+`make images-check` holds them in step with this file. How to bump a pin is in
 [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md#local-validation-before-committing).
 
 <!-- BEGIN GENERATED: container-images -->
@@ -77,14 +90,15 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
 | `pubsub-platform` | `ghcr.io/gke-labs/kube-agents/pubsub-platform` | release tag | — | The pubsub-platform AgentPlugin. |
 | `gke-stockout-investigator` | `ghcr.io/gke-labs/kube-agents/gke-stockout-investigator` | release tag | — | The gke-stockout-investigator AgentPlugin. |
-| `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way. |
-| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `&lt;name&gt;-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`. |
-| `persona-cluster` | `ghcr.io/gke-labs/kube-agents/persona-cluster` | release tag | — | The worker pods of the cluster AgentProfile under spec.mode: next, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
-| `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. |
-| `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. |
-| `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. It resolves the same way the gateway, the worker and the callout do. |
-| `a2a-dispatcher` | `ghcr.io/gke-labs/kube-agents/a2a-dispatcher` | release tag | `A2A_DISPATCHER_IMAGE` | The AgentProfile dispatcher Deployment the operator renders under spec.mode: next, unless `operator.profileDispatcher.enabled` is `false`. Nothing under spec.mode: today. |
-| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing under spec.mode: today. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
+| `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way. |
+| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `&lt;name&gt;-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`. |
+| `persona-cluster` | `ghcr.io/gke-labs/kube-agents/persona-cluster` | release tag | — | The worker pods of the cluster AgentProfile, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
+| `persona-tse` | `ghcr.io/gke-labs/kube-agents/persona-tse` | release tag | — | The worker pods of the tse AgentProfile, when the chart's profiles.tse.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
+| `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders. |
+| `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders (and the opt-in MCP server and OKF memory curator Deployments when A2A_MCP_DOOR or A2A_CURATOR is set). |
+| `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders. It resolves the same way the gateway, the worker and the callout do. |
+| `a2a-dispatcher` | `ghcr.io/gke-labs/kube-agents/a2a-dispatcher` | release tag | `A2A_DISPATCHER_IMAGE` | The AgentProfile dispatcher Deployment the operator renders unless `operator.profileDispatcher.enabled` is `false`. |
+| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) when that image is the release platform-agent image by tag, else from the operator's release set, unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
 | `web-console` | `ghcr.io/gke-labs/kube-agents/web-console` | release tag | — | The web console Deployment the chart renders when webConsole.enabled is true, and nothing on a default install. The chart takes the tag from webConsole.image.tag, else the agent image's tag, else the chart's appVersion. |
 
 ### Pulled by an install, built elsewhere
@@ -93,16 +107,16 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
-| `litellm` | `ghcr.io/berriai/litellm` | `v1.106.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
+| `litellm` | `ghcr.io/berriai/litellm` | `v1.108.6` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.5` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
-| `nats` | `docker.io/library/nats` | `2.10-alpine` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today. |
-| `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today. |
-| `nats-server-config-reloader` | `docker.io/natsio/nats-server-config-reloader` | `0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c` | `A2A_NATS_RELOADER_IMAGE` | A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today. |
-| `prometheus-nats-exporter` | `docker.io/natsio/prometheus-nats-exporter` | `0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255` | `A2A_NATS_EXPORTER_IMAGE` | The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today. |
+| `nats` | `docker.io/library/nats` | `2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders. A one-server bus also runs its `stale-cluster-meta` init step on this image, which needs a shell with `du` and `cut`: mirror an `-alpine` tag, not the scratch-based `nats` tags. |
+| `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS. |
+| `nats-server-config-reloader` | `docker.io/natsio/nats-server-config-reloader` | `0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c` | `A2A_NATS_RELOADER_IMAGE` | A sidecar in the NATS pod the operator renders. |
+| `prometheus-nats-exporter` | `docker.io/natsio/prometheus-nats-exporter` | `0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255` | `A2A_NATS_EXPORTER_IMAGE` | The metrics sidecar in each pod of that NATS StatefulSet. |
 | `k8s` | `docker.io/alpine/k8s` | `1.36.6` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
-| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
-| `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
+| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
+| `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
 | `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
@@ -118,10 +132,10 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.6` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
-| `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
+| `node` | `docker.io/library/node` | `24-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile, hack/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages. |
-| `busybox` | `docker.io/library/busybox` | `musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8` | — | agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images. |
+| `busybox` | `docker.io/library/busybox` | `musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6` | — | agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images. |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: container-images -->
@@ -280,7 +294,7 @@ one for the images it does not.
 The rows are one path in three coats: `install.sh` generates the Terraform composition's
 `terraform.tfvars` from its flags, and the composition passes both values to the chart's
 `global.*` keys. So "third party" covers the same set everywhere: LiteLLM, fluent-bit, the
-GitHub token minter, and Hindsight.
+NATS bus's four images, the GitHub token minter, and Hindsight.
 
 The chart row's exception is cert-manager: the chart never renders it, and expects one to be
 present already. The composition installs it as a separate
@@ -316,7 +330,7 @@ when a prefix is in effect:
 
 `CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing on a mirror. The operator derives
 the credential proxy from each agent's own image by swapping the trailing name (`platform-agent` to
-`credential-proxy`). It derives `kube-proxy`, and the A2A `next` images it renders (`a2a-gateway`,
+`credential-proxy`). It derives `kube-proxy`, and the A2A images it renders (`a2a-gateway`,
 `a2a-worker`, `a2a-authcallout`, `a2a-verifier`, `a2a-console`, `a2a-dispatcher`), from `OPERATOR_IMAGE`, else
 `PLATFORM_AGENT_IMAGE`, the same way. The sandbox follows `AGENT_SANDBOX_IMAGE`, else
 `OPERATOR_IMAGE` with the repository swapped to `agent-sandbox`, else the ghcr.io default; the
@@ -325,8 +339,23 @@ explicitly still wins, which is why `install.sh` leaves them unset: one explicit
 `CREDENTIAL_PROXY_IMAGE` pins the broker for every agent in the cluster, where the per-CR
 derivation keeps each broker in step with its own agent's image.
 
+The chart passes those three always, and `CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE` only
+when `credentialProxy.image` or `hermesBridge.image` (`repository`, `tag`) is set. Unset, the
+operator derives the broker from each agent's image, and the bridge from the agent image only when
+that is the release `platform-agent` image by tag, else from the operator's release set
+([hermes-bridge.md](https://github.com/gke-labs/kube-agents/blob/main/a2a/docs/hermes-bridge.md)).
+Set one for a tag the two images were never built for, or for a mirror or registry that holds them
+at a different tag than the agent image (set `tag`). For the broker alone, set it for a
+digest-pinned or custom-named agent image too.
+
+Under `global.imageRegistry` the rendered reference is `<prefix>/<trailing name>:<tag>`, so a
+different repository path needs the prefix empty. The pin applies to every `PlatformAgent` the
+operator manages; the chart's `values.yaml` has the rest of the contract. On an `install.sh` or
+Terraform install, pass the keys through `TF_VAR_extra_helm_values`.
+
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
-the above for that agent's containers — see the
+the above for that agent's containers, except these two pins, which the operator reads before the
+CR — see the
 [PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/). The sandbox has
 `spec.harness.experimental.shellSandbox.image`, which overrides `AGENT_SANDBOX_IMAGE` for that
 agent. The fluent-bit sidecar has no CR-level equivalent; `FLUENT_BIT_IMAGE` is its only override.
@@ -350,6 +379,11 @@ Hermes pin is by digest, and a `docker pull`/`push` round trip changes it. A mir
 is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`.
 A later bump of the `go` directive in `k8s-operator/go.mod` past that patch therefore fails the
 rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
+
+A rebuilt `platform-agent` image needs a `hermes-bridge` image at the same registry path and tag
+for the bridge sidecar. `make docker-build-hermes-bridge` with the same variables builds the agent
+image and the bridge image from it; otherwise set `A2A_BRIDGE_IMAGE` on the operator to a bridge
+image built another way.
 
 ### Registry authentication
 
@@ -396,4 +430,4 @@ yourself from the mirror and set `enable_cert_manager = false`.
 
 ## Local builds
 
-`make docker-build` at the repository root builds the agent, credential-proxy, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.
+`make docker-build` at the repository root builds the agent, credential-proxy, hermes-bridge, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one, and `make docker-build-hermes-bridge` builds the agent image and the bridge image from it. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.

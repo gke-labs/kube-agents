@@ -41,13 +41,13 @@ func TestSendMessageForwardsTheServersArgumentNames(t *testing.T) {
 	gw := startBlockingGateway(t, "")
 	srv := newStdioTestServer(t, gw)
 	res := srv.CallTool(context.Background(), ToolSendMessage,
-		json.RawMessage(`{"message":"hello","wait_timeout_seconds":30,"conversation":"c1"}`))
+		json.RawMessage(`{"message":"hello","wait_timeout_seconds":30,"conversation":"c1","reply_to":"task-7"}`))
 	if res.IsError {
 		t.Fatalf("send_message: %+v", res)
 	}
 	args := nextCallNamed(t, gw, ToolSendMessage)
-	if args["text"] != "hello" || args["wait_seconds"] != float64(30) || args["conversation"] != "c1" {
-		t.Fatalf("forwarded send_message arguments %v; want text, wait_seconds and conversation", args)
+	if args["text"] != "hello" || args["wait_seconds"] != float64(30) || args["conversation"] != "c1" || args["reply_to"] != "task-7" {
+		t.Fatalf("forwarded send_message arguments %v; want text, wait_seconds, conversation and reply_to", args)
 	}
 	for _, bridgeName := range []string{"message", "wait_timeout_seconds"} {
 		if _, ok := args[bridgeName]; ok {
@@ -471,5 +471,48 @@ func TestDebugIsNeitherAdvertisedNorForwarded(t *testing.T) {
 	}
 	if args := nextCallNamed(t, gw, ToolTaskControl); args["debug"] != nil {
 		t.Errorf("task_control forwarded debug: %v", args)
+	}
+}
+
+// send_message advertises addressee and parameters, so a host's client can
+// send a turn straight to an AgentProfile, and forwards both as given.
+func TestSendMessageAdvertisesAndForwardsAddressing(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	var def ToolDefinition
+	for _, d := range srv.toolDefinitions() {
+		if d.Name == ToolSendMessage {
+			def = d
+		}
+	}
+	props, _ := def.InputSchema["properties"].(map[string]any)
+	if a, ok := props["addressee"].(map[string]any); !ok || a["type"] != "string" {
+		t.Errorf("addressee = %#v; want a string property", props["addressee"])
+	}
+	p, ok := props["parameters"].(map[string]any)
+	if !ok || p["type"] != "object" {
+		t.Fatalf("parameters = %#v; want an object property", props["parameters"])
+	}
+	if ap, ok := p["additionalProperties"].(map[string]any); !ok || ap["type"] != "string" {
+		t.Errorf("parameters.additionalProperties = %#v; want string values", p["additionalProperties"])
+	}
+	for _, want := range []string{"addressee", "parameters", "read_topics", "cards"} {
+		if !strings.Contains(def.Description, want) {
+			t.Errorf("send_message description does not mention %q: %s", want, def.Description)
+		}
+	}
+
+	res := srv.CallTool(context.Background(), ToolSendMessage,
+		json.RawMessage(`{"message":"why is checkout crash-looping?","addressee":"cluster","parameters":{"project":"p1","location":"us-central1","cluster":"c1"}}`))
+	if res.IsError {
+		t.Fatalf("send_message: %+v", res)
+	}
+	args := nextCallNamed(t, gw, ToolSendMessage)
+	if args["addressee"] != "cluster" {
+		t.Errorf("forwarded addressee = %v; want cluster", args["addressee"])
+	}
+	params, _ := args["parameters"].(map[string]any)
+	if params["project"] != "p1" || params["location"] != "us-central1" || params["cluster"] != "c1" || len(params) != 3 {
+		t.Errorf("forwarded parameters = %v", args["parameters"])
 	}
 }

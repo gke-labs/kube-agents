@@ -10,8 +10,9 @@ The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
   ``BOOTSTRAP_ADMITTED``;
-- ``hack/eval/certification-cases.txt`` -- what ``EVAL_TIER=certification``
-  runs on its own, in ``# part N`` sections, one periodic each;
+- the validated-capabilities suite has no file: ``EVAL_TIER=validated-capabilities`` runs every
+  task file under ``bench/tasks/`` carrying the bare line ``suite: validated-capabilities``,
+  in sections by its ``suite_part: N`` line, one periodic each;
 - ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
   from the nightlies' recordings, registered cases, gating nothing.
 
@@ -52,23 +53,28 @@ GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
 # The GHES lane's matrix (kube-agents#3684): what EVAL_FORGE=ghes runs, the
 # same rules as the GitLab lane's.
 GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
-# The certification suite's file: what EVAL_TIER=certification runs alone,
-# never a presubmit or nightly case. `# part N` lines split it into the
-# sections the ci-kube-agents-certification periodics run one each.
-CERTIFICATION_CASES_FILE = EVAL_DIR / "certification-cases.txt"
-CERTIFICATION_SUITE = "certification"
+# The validated-capabilities suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: validated-capabilities`, and in section N
+# (one ci-kube-agents-validated-capabilities periodic each) when it carries
+# `suite_part: N`; no line is part 1. The two patterns are the
+# whole grammar, the twins of VALIDATED_CAPABILITIES_SUITE_LINE_RE and
+# VALIDATED_CAPABILITIES_PART_LINE_RE in hack/ci-eval-pr.sh; the validator refuses a
+# task file whose YAML says the suite or the part in any other spelling, so
+# what this module lists is what the shell runs.
+VALIDATED_CAPABILITIES_SUITE = "validated-capabilities"
 # The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
 # step 2): registered cases, replayed from the nightlies' recordings.
 REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
-# The inject lane's exclusions (#2039): case ids the script drops from TASKS
-# under AGENT_TRANSPORT=inject, each with its reason as the comment block
-# directly above it.
+VALIDATED_CAPABILITIES_SUITE_LINE_RE = re.compile(r"^suite: validated-capabilities$", re.M)
+VALIDATED_CAPABILITIES_PART_KEY = "suite_part"
+VALIDATED_CAPABILITIES_PART_LINE_RE = re.compile(r"^suite_part: ([1-9][0-9]*)$", re.M)
+VALIDATED_CAPABILITIES_DEFAULT_PART = 1
+# The inject lane's exclusions (#2039): case ids the script drops from TASKS,
+# each with its reason as the comment block directly above it; every matrix
+# goes through the inject door, so a listed case runs on no lane.
 INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
-# Its mirror (#3263): the cases every lane but the inject one drops, because
-# their premise needs the inject door. Same shape, same reason rule.
-API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
 # The lane safeguards (#2079): the verification_spec entries the script
-# appends to every case it runs, on the api and inject lanes alike (#2611;
+# appends to every case it runs (#2611;
 # the file keeps the inject lane's name). YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
 # reads it; scripts/test_eval_rosters.py pins its shape.
@@ -83,11 +89,6 @@ CASE_ENTRY_RE = re.compile(r"^\./tasks/([A-Za-z0-9_-]+)/task\.yaml$")
 # A case path anywhere on a line, comment or not: how the validator finds a
 # commented-out registration, the parking state that is retired.
 CASE_PATH_ANYWHERE_RE = re.compile(r"tasks/([A-Za-z0-9_-]+)/task\.yaml")
-# A `# part N` section marker in the certification file: the line on its
-# own, N from 1, the twin of the awk pattern in the script's
-# certification_part_entries(). `#part 2`, an indented marker and `# part 0`
-# are comments to both.
-PART_MARKER_RE = re.compile(r"^#\s+part\s+([1-9]\d*)\s*$")
 # The old script's default line, for text from before the split.
 SCRIPT_ROSTER_RE = re.compile(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}]*)\}"')
 # bench-gate accepts comma- or whitespace-separated ids in the variable.
@@ -182,35 +183,54 @@ def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
-def certification_cases(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> list[str]:
-    return case_names(path.read_text(encoding="utf-8"))
+def suite_part(text: str) -> int:
+    """The part a task file's text puts its case in: the N of its bare
+    ``suite_part: N`` line, VALIDATED_CAPABILITIES_DEFAULT_PART without one."""
+    match = VALIDATED_CAPABILITIES_PART_LINE_RE.search(text)
+    return int(match.group(1)) if match else VALIDATED_CAPABILITIES_DEFAULT_PART
 
 
 def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
-def parse_certification_parts(text: str) -> dict[int, list[str]]:
-    """Case ids of the certification file by ``# part N`` section, in file order.
+def validated_capabilities_cases(tasks_dir: pathlib.Path | None = None) -> list[str]:
+    """Case ids whose task file carries the bare suite line, in case-id order
+    (the order the shell's ``LC_ALL=C sort`` gives the same names). A task
+    file that cannot be read is left out here; the validator reports it."""
+    tasks_dir = TASKS_DIR if tasks_dir is None else tasks_dir
+    names = []
+    # Sorted by case id, the shell's `sort -t/ -k2,2`: sorting the paths
+    # would put `foo-bar` before `foo` (`-` sorts before `/`), the shell's
+    # field sort and this key agree. The text is read with newline="" so a
+    # CRLF file keeps its `\r` and the bare-line regex does not match it,
+    # as grep does not; the validator reports the spelling.
+    for task in sorted(tasks_dir.glob("*/task.yaml"), key=lambda path: path.parent.name):
+        text = _task_text(task)
+        if text is not None and VALIDATED_CAPABILITIES_SUITE_LINE_RE.search(text):
+            names.append(task.parent.name)
+    return names
 
-    An entry above the first marker is part 1, as in the script; a section
-    that names nothing is left out, since the script refuses to run it. The
-    marker is matched on the raw line, as the script's awk does.
-    """
+
+def _task_text(task: pathlib.Path) -> str | None:
+    """A task file's text as the shell sees it (line endings kept); None when
+    it cannot be read, which the validator reports on its own."""
+    try:
+        with task.open(encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def suite_parts(tasks_dir: pathlib.Path | None = None) -> dict[int, list[str]]:
+    """Case ids of the suite by part, each list in case-id order; a part
+    nobody names is absent, since the script refuses to run it."""
+    tasks_dir = TASKS_DIR if tasks_dir is None else tasks_dir
     parts: dict[int, list[str]] = {}
-    part = 1
-    for raw in text.splitlines():
-        marker = PART_MARKER_RE.match(raw)
-        if marker:
-            part = int(marker.group(1))
-            continue
-        for name in case_names(raw):
-            parts.setdefault(part, []).append(name)
+    for name in validated_capabilities_cases(tasks_dir):
+        part = suite_part(_task_text(tasks_dir / name / "task.yaml") or "")
+        parts.setdefault(part, []).append(name)
     return parts
-
-
-def certification_parts(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> dict[int, list[str]]:
-    return parse_certification_parts(path.read_text(encoding="utf-8"))
 
 
 def parse_lane_exclusions(text: str) -> dict[str, str]:
@@ -242,10 +262,6 @@ def parse_lane_exclusions(text: str) -> dict[str, str]:
 
 
 def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
-    return parse_lane_exclusions(path.read_text(encoding="utf-8"))
-
-
-def api_lane_exclusions(path: pathlib.Path = API_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
     return parse_lane_exclusions(path.read_text(encoding="utf-8"))
 
 
@@ -459,9 +475,8 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),
         "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
-        "api lane exclusions": len(api_lane_exclusions()),
-        "certification cases": len(certification_cases()),
-        "certification parts": len(certification_parts()),
+        "validated-capabilities cases": len(validated_capabilities_cases()),
+        "validated-capabilities parts": len(suite_parts()),
     }
 
 

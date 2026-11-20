@@ -110,7 +110,13 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
 //	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
 //	     refuses both
-const a2aIdentityMapSchema = "6"
+//	7 -> adds notAfter (the bus migration's per-run principals)
+//	8 -> adds denyPublish and denySubscribe to grants (the gateway's token
+//	     entry, #5301); a callout from before it refuses them
+//	9 -> adds held (the profiles the profile hold keeps out of the
+//	     dispatcher, which a bucket's grants skip; #5935); a callout from
+//	     before it refuses an entry that carries it
+const a2aIdentityMapSchema = "9"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
@@ -490,16 +496,24 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 // reply subjects. A pod named after an addressee is handed that addressee's
 // subjects, so it can read the prompts sent to it and publish its events.
 //
-// On this render the set is one name. The gateway's A2A_DEFAULT_ADDRESSEE is
-// not rendered, so it keeps its own default, and the bridge's grants name
-// a2aBridgeAddressee and nothing else, which is also the bridge's
-// BRIDGE_PROFILE default. TestTheCalloutReservesTheConfiguredAddressees holds
-// this list to every addressee the bridge's grants name and to both defaults in
-// the a2a module, so widening the grant means adding the name here. Session pods are addressees
-// too, but under gateway-minted names, which are not reserved because each is
-// the name of the pod that is that addressee.
+// On this render the set is two names. The gateway's A2A_DEFAULT_ADDRESSEE is
+// rendered from spec.harness.tuning.defaultRoute, a2aBridgeAddressee unless
+// the field says `session`, and the bridge's grants name a2aBridgeAddressee
+// and nothing else, which is also the bridge's BRIDGE_PROFILE default.
+// TestTheCalloutReservesTheConfiguredAddressees holds this list to every
+// addressee the bridge's grants name and to both defaults in the a2a module,
+// so widening the grant means adding the name here. Session pods are
+// addressees too, but under gateway-minted names, which are not reserved
+// because each is the name of the pod that is that addressee.
+//
+// The second name is the session route, DefaultRouteSession: a sentinel the
+// gateway routes on rather than an addressee it publishes to, reserved so that
+// nothing holds the name an A2A_DEFAULT_ADDRESSEE value means something else
+// by. A pod named `session` was already refused, as the identity map's
+// narrowed user; the AgentProfile CRD refuses a new profile of that name, and
+// a2aCanDrainAs keeps it out of the dispatcher's draining names.
 func a2aReservedAddressees() []string {
-	return []string{a2aBridgeAddressee}
+	return []string{a2aBridgeAddressee, agentv1alpha1.DefaultRouteSession}
 }
 
 // renderA2AReservedAddressees is the callout's A2A_RESERVED_ADDRESSEES value.
@@ -687,7 +701,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 		podLabels[k] = v
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -718,6 +732,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 					},
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:   resolveImagePullSecrets(agent.Spec.Deployment),
 					ServiceAccountName: name,
 					// Two replicas on two nodes, so that the drain the budget
 					// rate-limits is a drain of one of them. Advisory
@@ -865,6 +880,9 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, "callout")
+	busMigrationFreezeCallout(agent, dep)
+	return dep
 }
 
 // buildA2ACalloutService fronts the status endpoints. The bus reaches the
@@ -955,7 +973,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage
 	// collector, which deletes it immediately. It is reclaimed by name
-	// instead, from both the mode flip and the deletion path.
+	// instead, from the deletion path.
 	owned := []client.Object{
 		buildA2ACalloutServiceAccount(agent),
 		// The provision Job's identity, applied here so it exists before the
@@ -994,7 +1012,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 
 	// Cluster-scoped: no owner reference, because the garbage collector
 	// treats a cluster-scoped object owned by a namespaced one as an orphan
-	// and deletes it immediately. cleanupA2A removes it by name.
+	// and deletes it immediately. handleDeletion removes it by name.
 	for _, obj := range []client.Object{
 		buildA2ACalloutClusterRoleBinding(agent),
 	} {

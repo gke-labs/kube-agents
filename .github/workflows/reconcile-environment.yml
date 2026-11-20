@@ -6,8 +6,8 @@ name: "Shared: Reconcile Environment"
 # This is the in-place half of #1117. deploy-environment.yml is the other half:
 # it destroys the environment and builds it again, which is right for `rc` and
 # `nightly` — they exist to prove an install works from nothing — and wrong for
-# `autopush`, `autopush-next` and `staging`, which people live-test against and
-# which hold state nobody wants rebuilt nightly.
+# `autopush` and `staging`, which people live-test against and which hold
+# state nobody wants rebuilt nightly.
 #
 # In-place is also the only path that exercises what a real user upgrading an
 # existing install goes through. Nothing else in CI covers it.
@@ -45,8 +45,9 @@ on:
       # environment does not exist, or exists without GCP_PROJECT_ID, the run
       # posts a notice and reports `skipped` instead of failing on the strict
       # render. Off by default, because on an environment that should exist a
-      # missing one is the failure. A caller drops it once the environment is
-      # provisioned, so that clearing its variables reds the run again.
+      # missing one is the failure. No workflow passes it today; a caller that
+      # does should drop it once its environment is provisioned, so that
+      # clearing its variables reds the run again.
       skip_unconfigured:
         description: "Skip, rather than fail, when the GitHub environment or its GCP_PROJECT_ID is missing"
         required: false
@@ -68,7 +69,6 @@ on:
         type: choice
         options:
           - "autopush"
-          - "autopush-next"
           - "staging"
           - "rc"
           - "nightly"
@@ -338,13 +338,6 @@ jobs:
           VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
-          # The PlatformAgent's spec.mode. Unset or `today` renders no key, so
-          # an environment that does not set it renders the file it always
-          # did; anything but today or next is refused by the renderer. The
-          # installer reads the key, so a full upgrade renders the mode into
-          # the chart: this is how a long-lived environment's declared mode
-          # reaches its cluster, and how one a rebuild left on today returns.
-          PLATFORM_AGENT_MODE: ${{ vars.PLATFORM_AGENT_MODE }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}

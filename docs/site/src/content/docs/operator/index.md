@@ -28,12 +28,13 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
-- **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
-- **`Tier`** — names what a task may do at a tier. The operator only reports it `Accepted`; nothing enforces it yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
+- **`AgentProfile`** — declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
+- **`Tier`** — names what a task may do at a tier. The operator renders every `Tier` into the tiers file the capability verifier, the gateway and the auth callout load, and an `AgentProfile` lists the tiers it runs at in `allowedTiers`; people aren't mapped to tiers yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
+- **`AgentSchedule`** — runs a prompt on an `AgentProfile` on a cron schedule, each run an `Unattended` task. Off by default, and nothing fires yet. See [AgentSchedule CRD](/kube-agents/operator/agentschedule-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
-- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key, runs the `k8s-event-watcher`, and runs the `drift-detector` where an install has enabled it. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
+- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key, runs the `k8s-event-watcher`, runs the `drift-detector` where an install has enabled it, and runs the audit-report store listener on 8700, which renders with the A2A stack on every install. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `StatefulSet` (named `<name>-shell`) and its `Service`, the shell sandbox: `sshd` on `2222`, the durable `/opt/data`, and the wrappers that stand in for `gcloud` and `kubectl`. This is the pod that runs model-authored commands, and its ServiceAccount carries no Workload Identity annotation.
 - A `Deployment` (named `<name>-credential-proxy`), a `ClusterIP` `Service` on port `8765`, a `PodDisruptionBudget` (`maxUnavailable: 1`, which on its one replica refuses no eviction and blocks no drain), and a `NetworkPolicy` narrowing who may reach it (the sandbox and the gateway on `8765`; pods in `gke-gmp-system`, where the managed-Prometheus collector runs, and the operator's own pods on the metrics-only port `8766`) — the credential broker, which holds every credential in the install and executes the real CLIs on the sandbox's behalf. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `Service` fronting the gateway `Deployment` (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
@@ -43,7 +44,7 @@ The controller reconciles a `PlatformAgent` into:
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, the [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) declaration as `scope.json` mounted at `/etc/kube-agents/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - A `ConfigMap` (named `<name>-usage-counters`) holding the totals and per-pod baseline behind `status.usage`'s counters, owned by the CR, so it is collected with it, and written outside the reconcile loop; the operator writes it on the leader, at most once per five-minute poll, when a total or the per-pod baseline changed; a quiet poll writes nothing.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and version control (`forges` and the `repositories` on them — GitOps, managed and read-only context — with `github` as a deprecated alias).
-- Under `spec.mode: next`, additionally the A2A stack (NATS, bus provisioning, the auth callout, the capability verifier and the A2A gateway, on the console door alone until a chat backend is configured), and a `hermes-bridge` container in the agent pod, the bus's task executor, added once the bus is provisioned unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
+- The A2A stack (NATS, bus provisioning, the auth callout, the capability verifier and the A2A gateway, on the console door alone until a chat backend is configured), and a `hermes-bridge` container in the agent pod, the bus's task executor, from the first render unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
@@ -195,8 +196,9 @@ five minutes after, on its own ticker rather than on the reconcile worker. A den
 `RBAC self-check failed` line in the startup log naming the denied permissions
 (`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
 `RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
-`Degraded` for another reason. The Secret write verbs are also probed in the namespace of each
-`PlatformAgent` once the controller has reconciled it. A denial there is learned after startup,
+`Degraded` for another reason. The namespaced write verbs are also probed in the namespace of each
+`PlatformAgent` once the controller has reconciled it, and in its profile namespace once that
+namespace exists. A denial there is learned after startup,
 logged as `RBAC self-check result changed`, and written on that agent alone, with the namespace in
 the label. Reconciles continue; the steps that need the missing verb still fail
 until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and

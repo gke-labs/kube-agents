@@ -99,7 +99,24 @@ var reasonSentences = map[string]string{
 	"delegate-socket-failed":             "the agent's worker could not open its delegation channel",
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
-	"lease-expired":                      "the worker that took this request stopped responding; ask again",
+	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
+	// A confirmed change runs only in a one-pod Job of its own (#4458); the
+	// detail names the profile and tier, which are for an operator.
+	"change-needs-job": "this change has to run in a job of its own, which this agent can't start for this kind of request, so nothing was changed",
+	// The dispatcher's re-check of a profile task's child (#5686). The
+	// gateway refuses the same at mint, so these reach the room only from a
+	// child an older gateway sent, or one that broke a rule anyway.
+	"parent-unchecked":     "this delegated request wasn't checked against the task that asked for it, so it didn't run; ask again",
+	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
+	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
+	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A script-run task's worker (#5622): refused before the script ran,
+	// the script failed, or it ran past its bound.
+	"script-refused": "the worker refused to run this scheduled script, and its log says why",
+	"script-failed":  "the scheduled script ended with an error",
+	"script-timeout": "the scheduled script ran past its time limit and was stopped",
+	// A script-run task naming a script its profile doesn't list (#5622).
+	"script-not-allowed": "this agent isn't set up to run the script this schedule asked for, so it didn't run; whoever manages this agent can allow the script, or change the schedule",
 	// The agent ran and produced no answer.
 	"hermes-exited-nonzero":         "the agent stopped with an error before it answered",
 	"stream-ended-without-result":   "the agent stopped before it produced an answer",
@@ -441,6 +458,8 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
 	defer l.Unlock()
+	// A wake that took a cap slot ends it here, as a turn does (#6033).
+	defer g.releaseCapHold(sessionKey)
 
 	// A stopping gateway renders nothing new: its run context is done, so
 	// every read would fail, and the batch's deliveries are left for the
@@ -645,6 +664,14 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		if ask == "" {
 			ask = "the task needs input to continue"
 		}
+		// A child of a batch of two or more ends on its question, which
+		// goes back to the session with the batch's results, rather than
+		// pausing the conversation (batchChildAsks). Anything else asks the
+		// room.
+		if ref, ok := rec.TaskRefFor(taskID); ok && rec.fanOutChild(ref) {
+			g.batchChildAsks(ctx, rec, ref, ask)
+			return
+		}
 		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: layoutOf(question)})
 		g.markFrom(rec, taskID, question)
 		g.updateRollingLine(rec, taskID, rs)
@@ -812,7 +839,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// otherwise a restart may have lost some, and the stream has them all. A
 	// child its requester stopped wakes nothing, so it needs none.
 	turns := rs.turnAnswers
-	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local
+	// A fan-out child takes no steers (refuseFanOutSteer), so it has no
+	// turns to read.
+	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local && !rec.fanOutChild(ref)
 	turnsUnread := false
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
@@ -951,6 +980,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 		g.markFrom(rec, taskID, answerChat)
 	case lib.StateFailed, lib.StateCanceled:
+		if s.Status.State == lib.StateCanceled {
+			// The card-stop result of a cancel that stopped the turn's
+			// cards, to the adapter whose caller is a program, before the
+			// terminal (CardStopObserver); nothing else of a canceled
+			// result is handed over.
+			g.observeCardStop(rec, taskID, rs.result)
+		}
 		reason := ""
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
@@ -990,7 +1026,15 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
-		rec.ActiveTask = nil
+		if !active.Detached && rec.fanOutPending(taskID) {
+			// A turn whose batch is still running keeps the conversation
+			// until the last child ends (wakeBatch releases it): a stop
+			// reaches it, a steer is refused and a status lists the
+			// children. Its line is closed above.
+			active.StatusMsgID = ""
+		} else {
+			rec.ActiveTask = nil
+		}
 		// An executor's end of a live task is activity. The Slack adapter's
 		// session-thread rule (hasSession, through LastTaskActivity) counts
 		// from here, not from the ask that started the task; the reap does
@@ -1020,7 +1064,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, parent.StatusMsgID, doneTerminalLine(s.Status.State, progress, doneLine != ""), rs, "")
+			g.renderLine(rec.Key, parent.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), parent.LineNote), rs, "")
 		}
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
@@ -1076,11 +1120,21 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// wake runs) takes it in consoleFrame.
 		if isConsoleConversation(rec.Key) && handedOff(s.Status.State, rs.handoff) {
 			root, _ := rec.observedAs(taskID)
-			g.consoleCardsPending.put(root, "")
+			rec.markCardsPending(root)
 		}
 		g.observeEnded(rec, taskID, s.Status.State, source, reason)
 	}
 
+	// A fan-out child's end is kept until its last sibling's, which wakes
+	// the session once with all of them (batchChildEnded).
+	if ref, ok := rec.TaskRefFor(taskID); ok && rec.fanOutChild(ref) {
+		text := reason
+		if s.Status.State == lib.StateCompleted {
+			text = result
+		}
+		g.batchChildEnded(ctx, rec, ref, BatchEnd{State: s.Status.State, Text: text, Source: source, Cards: toCards}, reason)
+		return
+	}
 	// A delegated child's end wakes the session that asked, or reaches a
 	// parent addressed to an AgentProfile, which waits open, on its .in.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild && !g.deliverChildResult(ctx, rec, ref, s.Status.State, result, reason) {
@@ -1370,7 +1424,7 @@ func terminalLine(state lib.TaskState, progress string) string {
 // rather than failing the relay — chat delivery is best-effort; the stream
 // is the record.
 func (g *Gateway) post(conversation, text string) {
-	if strings.TrimSpace(text) == "" {
+	if strings.TrimSpace(text) == "" || g.unpostableTrigger(conversation) {
 		return
 	}
 	for _, chunk := range chatChunks(text, discordChunk) {

@@ -71,6 +71,7 @@ github_writes = "kube_agents_bench.verifiers:GitHubWritesVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
 notification_fell_back_to_home = "kube_agents_bench.notify_fallback:NotificationFellBackToHomeVerifier"
 oobe_audits_started = "kube_agents_bench.oobe:OobeAuditsStartedVerifier"
+oobe_audits_ended = "kube_agents_bench.oobe:OobeAuditsEndedVerifier"
 relay_posted_as_written = "kube_agents_bench.relay:RelayPostedAsWrittenVerifier"
 pull_request_opened = "kube_agents_bench.verifiers:PullRequestOpenedVerifier"
 replay_card = "kube_agents_bench.verifiers:ReplayCardVerifier"
@@ -85,6 +86,7 @@ worker_commands = "kube_agents_bench.verifiers:WorkerCommandsVerifier"
 worker_budget = "kube_agents_bench.verifiers:WorkerBudgetVerifier"
 tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
 workload_incident_folded = "kube_agents_bench.incidents:WorkloadIncidentFoldedVerifier"
+post_merge_outcome = "kube_agents_bench.post_merge:PostMergeOutcomeVerifier"
 
 # Required for the git-URL dependency pin above.
 [tool.hatch.metadata]

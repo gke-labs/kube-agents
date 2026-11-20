@@ -802,7 +802,7 @@ def blocks(report: str) -> tuple[list[dict], str] | None:
 
 
 def chat(report: str) -> tuple[dict, str] | None:
-    """The card as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+    """The card as a ``kube-agents.chat/v1`` message for the gateway: ``(chat, text)``, or None.
 
     The same headline, rows, fold and buttons as :func:`blocks`, composed by
     ``chat_message.report_message``; ``text`` is :func:`present`'s markdown,

@@ -2,6 +2,7 @@ Subject: Rejoin the large-shape bullet a blank line splits
 
 Why: Upstream puts a blank line inside the large-shape obtainability bullet, so the rest of its first sentence renders as a separate paragraph cut off from the bullet.
 Local-Issue: #2692
+Eval-Case: compute-class-canary-active-migration-pdb-probe
 Upstream-Issue: none filed yet
 Retire-When: upstream removes the blank line from the large-shape bullet
 

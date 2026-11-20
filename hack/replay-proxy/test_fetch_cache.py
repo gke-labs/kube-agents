@@ -332,7 +332,7 @@ class PrintCommitTest(FetchTest):
         job.update(overrides)
         return job
 
-    def main(self, *extra, mode_next="1"):
+    def main(self, *extra):
         import contextlib
         import io
         out, err = io.StringIO(), io.StringIO()
@@ -340,7 +340,7 @@ class PrintCommitTest(FetchTest):
         FC.default_run = self.bucket
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                status = FC.main(["--bucket", BUCKET, "--print-commit", "--eval-mode-next", mode_next, *extra])
+                status = FC.main(["--bucket", BUCKET, "--print-commit", *extra])
         finally:
             FC.default_run = original
         return status, out.getvalue(), err.getvalue()
@@ -420,7 +420,7 @@ class PrintCommitTest(FetchTest):
     def test_other_modes_and_forges_are_ignored(self):
         self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
         self.record("300", 1, {VERSION: [f"answers/{fp(2)}.json", f"answers/{fp(3)}.json"]}, created=NOW,
-                    job=self.job(COMMIT_C, name="ci-kube-agents-eval-nightly-gitlab", mode="today", forge="gitlab"))
+                    job=self.job(COMMIT_C, name="ci-kube-agents-eval-nightly-gitlab", forge="gitlab"))
         self.record("301", 1, {VERSION: [f"answers/{fp(4)}.json"]}, created=NOW,
                     job=self.job(COMMIT_A, mode="today"))
         self.record("302", 1, {VERSION: [f"answers/{fp(5)}.json"]}, created=NOW, job=None)
@@ -428,7 +428,7 @@ class PrintCommitTest(FetchTest):
         self.assertEqual((night.commit, night.builds, night.other_job_records), (COMMIT_B, ["200"], 3))
         status, out, _ = self.main()
         self.assertEqual((status, out), (0, COMMIT_B + "\n"))
-        status, out, _ = self.main("--forge", "gitlab", mode_next="")
+        status, out, _ = self.main("--forge", "gitlab")
         self.assertEqual((status, out), (0, COMMIT_C + "\n"), "the lane's own mode and forge pick the night")
 
     def test_records_without_a_commit_are_tolerated(self):

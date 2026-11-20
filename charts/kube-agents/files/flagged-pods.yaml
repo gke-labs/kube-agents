@@ -1,5 +1,5 @@
 # Standing pods the operator renders into the release namespace only while an
-# operator env flag is on, under platformAgent.mode: next. No golden sets those
+# operator env flag is on. No golden sets those
 # flags, so footprint.yaml has no entry for them, and the quota preflight adds
 # each one here when its flag is set: by operator.extraEnv, or for the MCP
 # server by operator.mcpServer.enabled.
@@ -29,3 +29,13 @@ pods:
     memoryBytesLimit: 268435456
     ephemeralStorageBytesRequest: 0
     ephemeralStorageBytesLimit: 0
+  - name: curator
+    env: A2A_CURATOR
+    enabledWhen: "true"
+    replicas: 1
+    cpuMillisRequest: 50
+    cpuMillisLimit: 500
+    memoryBytesRequest: 67108864
+    memoryBytesLimit: 268435456
+    ephemeralStorageBytesRequest: 134217728
+    ephemeralStorageBytesLimit: 134217728

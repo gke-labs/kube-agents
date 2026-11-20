@@ -1,6 +1,6 @@
 ---
 title: Using kube-agents from Antigravity
-description: Connect Google Antigravity to a spec.mode next install through the MCP server and the kube-agents-mcp bridge, send a first message, and fix the common connection errors.
+description: Connect Google Antigravity to an install through the MCP server and the kube-agents-mcp bridge, send a first message, and fix the common connection errors.
 ---
 
 This guide connects [Google Antigravity](https://antigravity.google) to a kube-agents install, so the agent in your editor can ask the install questions, hand it work and read the answers. The path has two pieces. The [MCP server](/kube-agents/reference/a2a-mcp/) runs in the cluster beside the A2A console. The `kube-agents-mcp` bridge runs on your workstation as a local MCP server that Antigravity starts. The bridge finds the install through your kubeconfig, reads the server's token and reaches it over a port-forward of its own, so the only Antigravity setting it needs is the path to the binary.
@@ -11,14 +11,14 @@ The steps work the same from any MCP host that starts local servers over standar
 
 You need four things:
 
-- **An install in `spec.mode: next`.** The MCP server is a client of the `next` message bus and renders nothing under `today`. Check with `kubectl get platformagent -A -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace,MODE:.spec.mode`.
+- **An installed `PlatformAgent`.** The MCP server is a client of the install's message bus. Check with `kubectl get platformagent -A`.
 - **The MCP server turned on.** It is off by default; the next section turns it on.
 - **A kubeconfig context for the cluster** the install runs on, which works from a terminal on the same machine (`kubectl --context <context> get pods -n kubeagents-system`).
 - **Go 1.27 or later**, to build the bridge.
 
 ## Turn on the MCP server
 
-The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, on top of `spec.mode: next`, and the chart value `operator.mcpServer.enabled: true` sets that variable. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
+The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, and the chart value `operator.mcpServer.enabled: true` sets that variable. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
 
 ```bash
 TF_VAR_extra_helm_values='{operator={mcpServer={enabled=true}}}'
@@ -97,7 +97,7 @@ The module needs Go 1.27; an older `go` command fetches the right toolchain by i
 kube-agents-mcp --version
 ```
 
-It prints `kube-agents` and the bridge's version. Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
+It prints `kube-agents-mcp` and a version: the release for a binary from a release archive, or for a build from source the module version Go recorded (a pseudo-version for `@main`; `dev` when it recorded none). Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
 
 ## Configure Antigravity
 
@@ -156,6 +156,8 @@ Use the kube-agents send_message tool to ask: Which GKE clusters do you manage, 
 
 The answer names the conversation and its token, quotes any gateway notices, and gives the turn's task and its answer. If the turn filed cards, the reports they posted while the call waited follow under **Card reports on this turn**. Each is quoted as the reporting agent's text. A later message on the same `conversation` continues it; the default conversation is `default`.
 
+To send the turn straight to an AgentProfile instead, name it in `addressee` and pass its task parameters in `parameters`, an object of string values. For the `cluster` profile, the parameters are `project`, `location` and `cluster`. `read_topics` with `action: cards` lists the profiles' agent cards. The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the answer.
+
 `wait_timeout_seconds` (default 150, at most 300) bounds the wait for the turn itself. When the wait ends first, the answer says the turn is still running and gives its task as `<addressee>/<task-id>`. Once the turn ends, the call keeps collecting card reports until none has arrived for 15 seconds or the wait runs out, whichever comes first, and returns at once when the turn handed no work to cards. A card that takes longer than that is not in the answer.
 
 **`task_control`** follows that task. `get` with `task_id` reads its state and answer, and `wait_timeout_seconds` waits for it to finish. `stop` stops a conversation's running task: pass `conversation`, or a `task_id` the bridge started in this session and is still running. A stop ends the turn; a card the turn already filed can still finish. If the host cancels a running `send_message` call, the bridge sends the stop for you.
@@ -163,6 +165,8 @@ The answer names the conversation and its token, quotes any gateway notices, and
 The other tools are `read_topics` (the install's standing topics and agent cards) and `manage_session` (named conversations and `/session` workers). There is also `discover_deployments`, which rescans your kubeconfig, and `connect_deployment`, which connects to a named install. `inspect_pr` fetches a pull request the agent filed and writes its diff to local files. The [MCP server reference](/kube-agents/reference/a2a-mcp/#the-tools) describes what each one does in the cluster.
 
 A question the install hands to a card, which is common for anything that reads a cluster, can come back first as a short acknowledgement such as "checking namespaces on the host cluster." The card's report arrives after `send_message` has returned. The answer ends with the `conversation_token` and `since` cursor to read it with: call `poll_events` with those two, and it returns the reports posted since that cursor. Set `wait_seconds` (60 at most) to have it wait for a report when none has arrived yet, and pass the cursor it returns on the next call. A `status` message on the same conversation lists the cards and whether each is done, but not what they found.
+
+To answer a report, send the next message with `reply_to` set to the task its heading gave as `on task`; the agent then reads that report before answering. That read happens on the [platform route](/kube-agents/concepts/chatops/#session), the install's default; a conversation on its own session pod does not read it yet.
 
 ## Troubleshooting
 
@@ -184,7 +188,7 @@ printf '%s\n' \
 
 ### Connected to the install, but the server is missing
 
-`fetching MCP token Secret <namespace>/<name>-a2a-mcp-token: ... not found` means the MCP server is not turned on for that install, or the operator has not rendered it yet. `... forbidden` means your account lacks `get` on the Secret. The bridge connects to any install it finds, including `today` installs and ones without the server, so with several installs make sure the one it picked is the one you turned on.
+`fetching MCP token Secret <namespace>/<name>-a2a-mcp-token: ... not found` means the MCP server is not turned on for that install, or the operator has not rendered it yet. `... forbidden` means your account lacks `get` on the Secret. The bridge connects to any install it finds, including ones without the server, so with several installs make sure the one it picked is the one you turned on.
 
 ### Port-forward errors
 
