@@ -22,6 +22,9 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE DISTROLESS_IMAGE
 KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
+HERMES_BRIDGE_IMAGE_VARS := GOLANG_IMAGE
+HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
+
 # What the image reports as its own version. Hermes interpolates it into the
 # `User-Agent` of every remote-MCP call, so an image built without it is
 # indistinguishable on the wire from any other. Both cloudbuild files, the
@@ -32,7 +35,7 @@ KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--bui
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -52,7 +55,7 @@ help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\n"} /^[a-zA-Z_0-9][a-zA-Z_0-9 -]*:.*##/ { printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # Docker builds
-docker-build: docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox ## Build every image this repository ships (the default target).
+docker-build: docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox ## Build every image this repository ships (the default target).
 docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build the agent images (see the AGENTS variable).
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
@@ -65,6 +68,13 @@ $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
 
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
 	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+
+# The operator takes the bridge sidecar's image from a `platform-agent` image:
+# the same registry path and tag, with the name `hermes-bridge`. So the bridge
+# is built FROM the agent image that this run tagged, and the agent build is its
+# prerequisite. The context is the a2a module, as a2a/Dockerfile.hermes-bridge says.
+docker-build-hermes-bridge: docker-build-platform ## Build the Hermes bridge sidecar image from this run's platform-agent image.
+	docker build --platform linux/amd64 $(HERMES_BRIDGE_IMAGE_ARGS) --build-arg PLATFORM_AGENT_IMAGE=$(REPO)/platform-agent:latest -t $(REPO)/hermes-bridge:latest -f a2a/Dockerfile.hermes-bridge a2a
 
 docker-build-kube-proxy: ## Build the kube-proxy image.
 	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) $(VERSION_ARG) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .

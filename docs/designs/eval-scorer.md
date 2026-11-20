@@ -98,13 +98,14 @@ behind the error, and neither are the reads of a candidate it rejected when none
 transient; a rejection beside a transient read keeps the error plain. Transient is a 5xx after
 the retries, a transport failure (a timeout, a reset, a dropped connection), or a 429 or a 403 whose
 message names a rate limit, the last two only on GitHub with the CI-minted grading token. That token
-is the ledger App's installation, which the agent under test cannot spend; a local token, or
+is the shard's ledger-reader App's installation, which the agent under test cannot spend; a local token, or
 GitLab's, where the agent's token and grading's belong to one user, can be the agent's. Any other
 errored leaf, a failed check, an errored catastrophic safeguard or a parse error keeps the repetition on rung 2,
 and the verdict gives each errored check's reason, not only its name.
 
 Before a rate-limited read under that token counts as transient, the grader waits for the limit to
-lift (#6105). The evals repositories share one App installation, so one hourly budget, and when
+lift (#6105). The evals repositories share one App installation per shard
+(`hack/eval/ledger-reader-apps.txt`), so one hourly budget per shard, and when
 concurrent runs spend it every read answers 403 until the reset GitHub names in `X-RateLimit-Reset`.
 The read waits the `Retry-After` it asks, else until that reset when the budget is spent, else a
 minute, at most five minutes at a time and `BENCH_FORGE_RATE_LIMIT_WAIT_SEC` (default ten minutes)

@@ -23,9 +23,9 @@ from kube_agents_bench.gate import (
 )
 
 #: What the fixture run's manifest.json names; the stamp must repeat it.
-FIXTURE_MODEL = "gemini-3.1-pro-preview"
+FIXTURE_MODEL = "model-x"
 PROVIDER = "openai_compatible"
-JUDGE = "gemini-3.1-pro-preview"
+JUDGE = "model-x"
 
 
 def _record(model: str | None) -> SimpleNamespace:
@@ -88,7 +88,7 @@ class TestCaseDocument:
         rc, doc = case_run({AGENT_PROVIDER_ENV: PROVIDER, REASONING_EFFORT_ENV: "high"})
         assert rc == 0
         assert doc[AGENT_STAMP_KEY] == {"provider": PROVIDER, "model": FIXTURE_MODEL, "reasoning_effort": "high"}
-        assert doc["version_key"]["setup_id"].startswith("gemini-3-1-pro-preview")
+        assert doc["version_key"]["setup_id"].startswith("setup-x")
 
     def test_the_model_default_run_carries_no_effort_field(self, case_run) -> None:
         rc, doc = case_run({AGENT_PROVIDER_ENV: PROVIDER, REASONING_EFFORT_ENV: ""})
@@ -109,7 +109,7 @@ class TestCaseDocument:
 
 #: A complete version key, the shape `bench-gate record` files a line under.
 RECORD_KEY = {
-    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "setup_id": "setup-x",
     "scoring_version": "v1",
     "judge_model": JUDGE,
     "fleet": 1,

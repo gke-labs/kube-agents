@@ -29,12 +29,26 @@ import time
 import urllib.error
 import urllib.request
 
-# The ledger-reader App and its installation on the infrastructure
-# organisation (docs/ci-pool-projects.md 5.4). hack/ci-eval-pr.sh exports the
-# same two values; step 0 relies on these.
+# The first ledger-reader App and its installation on the infrastructure
+# organisation: the first row (reader App 1) of hack/eval/ledger-reader-apps.txt
+# (docs/ci-pool-projects.md 5.4). hack/ci-eval-pr.sh exports the leased project's shard; step 0, which
+# runs before any lease, relies on these.
 DEFAULT_LEDGER_APP_ID = "4739812"
 DEFAULT_LEDGER_INSTALLATION_ID = "157029058"
 MINT_URL = "https://api.github.com/app/installations/%s/access_tokens"
+# Read with the fresh token after a mint, uncharged: the installation's
+# remaining hourly budget, which GitHub counts per installation across every
+# token minted from it.
+RATE_LIMIT_URL = "https://api.github.com/rate_limit"
+# The first word of the line that read puts on stderr; hack/ci-eval-pr.sh
+# lifts the line into the grading log by it (LEDGER_BUDGET_PREFIX there;
+# tests/test_ci_eval_ledger_mint.py holds the two equal), so a day of runs
+# shows what a run spends of its shard (gke-labs/kube-agents#6240).
+LEDGER_BUDGET_PREFIX = "budget:"
+BUDGET_RESET_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# The budget read's own timeout: a measurement, taken while a unit holds its
+# locks, is not worth the mint's thirty seconds.
+BUDGET_TIMEOUT_SECONDS = 5
 USER_AGENT = "kube-agents-ci-eval-pr"
 HTTP_TIMEOUT_SECONDS = 30
 # GitHub rejects an App JWT whose exp is more than ten minutes out; nine leaves
@@ -103,6 +117,30 @@ def b64(raw):
     return base64.urlsafe_b64encode(raw).rstrip(b"=")
 
 
+def report_budget(token):
+    """Writes the installation's remaining hourly budget to stderr, read with
+    the token just minted. Any failure writes nothing: the mint succeeded,
+    and this line is a measurement, never a reason to lose the unit."""
+    request = urllib.request.Request(
+        RATE_LIMIT_URL,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=BUDGET_TIMEOUT_SECONDS) as response:
+            core = json.load(response)["resources"]["core"]
+        resets = time.strftime(BUDGET_RESET_TIME_FORMAT, time.gmtime(int(core["reset"])))
+        sys.stderr.write(
+            "%s %d of %d requests left this hour on installation %s, resets %s\n"
+            % (LEDGER_BUDGET_PREFIX, int(core["remaining"]), int(core["limit"]), installation_id, resets)
+        )
+    except Exception:
+        return
+
+
 now = int(time.time())
 header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
 payload = b64(
@@ -168,3 +206,4 @@ except Exception as exc:
     )
 
 print(body["token"] + " " + body["expires_at"])
+report_budget(body["token"])
