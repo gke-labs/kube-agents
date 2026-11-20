@@ -27,7 +27,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -108,9 +107,9 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 		{"the CRD maximum", ptr.To(10000), 30032, 30032},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent := platformRouteAgent()
 			if tc.maxSessions != nil {
-				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: tc.maxSessions}}
+				agent.Spec.Harness.Tuning.MaxSessions = tc.maxSessions
 			}
 			if got := a2aTasksConsumerBudget(agent); got != tc.wantBudget {
 				t.Errorf("budget = %d, want %d", got, tc.wantBudget)
@@ -125,7 +124,7 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 	}
 	t.Run("the rendered bridge's default is above the floor", func(t *testing.T) {
 		t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "")
-		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+		agent := platformRouteAgent()
 		if got := a2aTasksConsumerBudget(agent); got != 110 {
 			t.Errorf("budget = %d, want 110: 10 sessions at 3, plus 20 and 6 a worker for the rendered bridge's 10", got)
 		}
@@ -198,7 +197,7 @@ func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
 			[]string{"required_consumers=110", "--max-consumers=110", "plus 80 reserved", "sized for 10 bridge workers"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent := platformRouteAgent()
 			agent.Spec.Deployment = tc.deployment
 			if got := a2aTasksConsumerBudget(agent); got != tc.wantBudget {
 				t.Errorf("budget = %d, want %d", got, tc.wantBudget)
@@ -224,7 +223,7 @@ func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
 	// install, so the difference between two installs is exactly the tail
 	// factor times the asks plus the look-ahead per worker times the workers.
 	at := func(c string) int {
-		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+		agent := platformRouteAgent()
 		agent.Spec.Deployment = bridge(lit(c))
 		return a2aTasksConsumerBudget(agent)
 	}
@@ -243,9 +242,9 @@ func TestProvisionRefusalNamesTheReserveItSizedFor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bash is required to execute the provision script: %v", err)
 	}
-	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	agent := platformRouteAgent()
 	sessions := 100
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent.Spec.Harness.Tuning.MaxSessions = &sessions
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
 		Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "6"}},
 	}}}
@@ -408,7 +407,7 @@ func TestProvisionSaysWhenABridgeCountWasNotRead(t *testing.T) {
 			nil, []string{"NOTE: a spec.deployment.sidecars"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent := platformRouteAgent()
 			agent.Spec.Deployment = tc.deployment
 			if got := a2aBridgeEnvFromUnread(agent); got != tc.wantEnvFromUnread {
 				t.Errorf("a2aBridgeEnvFromUnread = %v, want %v", got, tc.wantEnvFromUnread)
@@ -454,7 +453,7 @@ func TestProvisionSaysWhenABridgeCountWasNotRead(t *testing.T) {
 // maxSessions=10 a 64-wide stream has room for (64 - 30 - 20) / 6 = 2
 // workers. Executed, since the number comes out of the shell.
 func TestProvisionRefusalOffersFewerBridgeWorkers(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	agent := platformRouteAgent()
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
 		Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "4"}},
 	}}}
@@ -486,9 +485,9 @@ func TestProvisionRefusalOffersFewerBridgeWorkers(t *testing.T) {
 	// At the bridge's default, declared on the CR, there is no worker count
 	// to lower, and the refusal reads as it did: two ways out, no third
 	// lever, no worker arithmetic.
-	agent = &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	agent = platformRouteAgent()
 	sessions := 100
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent.Spec.Harness.Tuning.MaxSessions = &sessions
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
 		Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}},
 	}}}
@@ -513,7 +512,7 @@ func TestProvisionRefusalOffersFewerBridgeWorkers(t *testing.T) {
 	// a 64-wide stream, and the third lever is the operator's setting, not
 	// a sidecar entry: beside maxSessions=10 the stream has room for
 	// (64 - 30 - 20) / 6 = 2 workers.
-	agent = &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	agent = platformRouteAgent()
 	stderr = runProvisionRefusal(t, agent, 64)
 	for _, want := range []string{
 		"TASKS holds max_consumers=64 but this PlatformAgent needs 110:",
@@ -540,8 +539,8 @@ func TestProvisionRefusalOffersFewerBridgeWorkers(t *testing.T) {
 	// refusal says what one session beside one worker needs and that
 	// deleting is what is left below it -- not "That leaves deleting", which
 	// would skip the second input.
-	agent = &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent = platformRouteAgent()
+	agent.Spec.Harness.Tuning.MaxSessions = &sessions
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
 		Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "6"}},
 	}}}
@@ -591,7 +590,7 @@ func TestBridgeConcurrencyIsCappedBeforeTheArithmetic(t *testing.T) {
 		{"two sidecars each at MaxInt64, whose raw sum would wrap", bridge("9223372036854775807", "9223372036854775807"), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent := platformRouteAgent()
 			agent.Spec.Deployment = tc.deployment
 			if got := a2aBridgeConcurrency(agent); got != a2aBridgeConcurrencyMax {
 				t.Errorf("a2aBridgeConcurrency = %d, want the cap %d", got, a2aBridgeConcurrencyMax)
@@ -783,11 +782,11 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, tc.operator)
-			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent := platformRouteAgent()
 			agent.Spec.Deployment = tc.deployment
 			if tc.sessions != 0 {
 				sessions := tc.sessions
-				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+				agent.Spec.Harness.Tuning.MaxSessions = &sessions
 			}
 			msg := a2aProvisionRefusalStatus(agent)
 			for _, want := range tc.want {
@@ -811,6 +810,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 	// Through the reconcile, on the sidecar install: the helper is what the
 	// PodFailurePolicy branch appends, and only that branch.
 	agent := a2aTestAgent()
+	agent.Spec.Harness = platformRouteAgent().Spec.Harness
 	agent.Spec.Deployment = bridge("4")
 	job := buildA2AProvisionJob(agent)
 	withCommonLabels(job, agent)
@@ -845,9 +845,9 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 // anything. 40 sessions at 3, plus the 80 the rendered bridge's 10 workers
 // reserve, is 200.
 func TestTasksStreamCarriesItsLimits(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	agent := platformRouteAgent()
 	sessions := 40
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent.Spec.Harness.Tuning.MaxSessions = &sessions
 	script := a2aProvisionScript(agent)
 
 	add, ok := streamAddInvocation(script, "TASKS")
@@ -923,9 +923,9 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 	// literals below are the reserve table's row at 2 (32), and the third
 	// lever stays out of the way of the two branches under test.
 	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(a2aBridgeDefaultConcurrency))
-	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	agent := platformRouteAgent()
 	sessions := 100
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent.Spec.Harness.Tuning.MaxSessions = &sessions
 
 	for _, tc := range []struct {
 		name     string

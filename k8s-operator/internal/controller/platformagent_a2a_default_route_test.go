@@ -51,13 +51,14 @@ func TestResolveA2ADefaultRoute(t *testing.T) {
 		agent *agentv1alpha1.PlatformAgent
 		want  string
 	}{
-		{"no harness", a2aTestAgent(), agentv1alpha1.DefaultRoutePlatform},
+		// Unset is the session route: sessions are the default.
+		{"no harness", a2aTestAgent(), agentv1alpha1.DefaultRouteSession},
 		{"no tuning", func() *agentv1alpha1.PlatformAgent {
 			a := a2aTestAgent()
 			a.Spec.Harness = &agentv1alpha1.HarnessSpec{}
 			return a
-		}(), agentv1alpha1.DefaultRoutePlatform},
-		{"unset", defaultRouteAgent(nil), agentv1alpha1.DefaultRoutePlatform},
+		}(), agentv1alpha1.DefaultRouteSession},
+		{"unset", defaultRouteAgent(nil), agentv1alpha1.DefaultRouteSession},
 		{"platform", defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRoutePlatform)), agentv1alpha1.DefaultRoutePlatform},
 		{"session", defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession)), agentv1alpha1.DefaultRouteSession},
 		// Past the CRD's enum (an older CRD, a direct etcd write): never an
@@ -121,11 +122,11 @@ func TestTheGatewayAndThePlatformAgentCarryTheSameDefaultRoute(t *testing.T) {
 				ptr.Deref(route, "<unset>"), a2aDefaultAddresseeEnvVar, gateway, a2aDefaultAddresseeEnvVar, platformAgent, want)
 		}
 	}
-	// The flip is visible on both: unset and session render differently.
+	// The opt-out is visible on both: unset and platform render differently.
 	unsetGW, unsetPA := renderedDefaultRoutes(t, defaultRouteAgent(nil), nil)
-	sessGW, sessPA := renderedDefaultRoutes(t, defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession)), nil)
-	if unsetGW == sessGW || unsetPA == sessPA {
-		t.Errorf("unset renders (%q, %q) and session renders (%q, %q); the field moves neither side", unsetGW, unsetPA, sessGW, sessPA)
+	platGW, platPA := renderedDefaultRoutes(t, defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRoutePlatform)), nil)
+	if unsetGW == platGW || unsetPA == platPA {
+		t.Errorf("unset renders (%q, %q) and platform renders (%q, %q); the field moves neither side", unsetGW, unsetPA, platGW, platPA)
 	}
 }
 
@@ -188,7 +189,7 @@ func TestTheSessionRouteIsAReservedAddressee(t *testing.T) {
 func TestTheSessionRouteCountsTheAsksPerSession(t *testing.T) {
 	perSessionAsks := a2aTasksReplayTailFactor * a2aTasksReplayAsk
 	for _, sessions := range []int{1, defaultA2AMaxSessions, 11, 10000} {
-		platform := defaultRouteAgent(nil)
+		platform := defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRoutePlatform))
 		platform.Spec.Harness.Tuning.MaxSessions = ptr.To(sessions)
 		session := defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession))
 		session.Spec.Harness.Tuning.MaxSessions = ptr.To(sessions)
@@ -215,7 +216,7 @@ func TestTheSessionRouteCountsTheAsksPerSession(t *testing.T) {
 	}
 	// Pinned at the defaults, so the arithmetic above cannot drift together
 	// with the constants: 10 sessions at 3+2*2, plus the reserve of 80 at the
-	// rendered bridge's 10 workers; the platform route keeps its 110.
+	// rendered bridge's 10 workers; the platform route (the opt-out) keeps its 110.
 	def := defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession))
 	if got := a2aTasksConsumerBudget(def); got != 150 {
 		t.Errorf("session route at the defaults: budget %d, want 150", got)
@@ -223,7 +224,7 @@ func TestTheSessionRouteCountsTheAsksPerSession(t *testing.T) {
 	if got := a2aTasksMaxConsumers(def); got != 150 {
 		t.Errorf("session route at the defaults: TASKS renders at %d, want 150 (above the floor)", got)
 	}
-	if got := a2aTasksConsumerBudget(defaultRouteAgent(nil)); got != 110 {
+	if got := a2aTasksConsumerBudget(defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRoutePlatform))); got != 110 {
 		t.Errorf("platform route at the defaults: budget %d, want 110, the figure before the field", got)
 	}
 }
@@ -246,14 +247,14 @@ func TestTheProvisionRefusalReadsTheSessionRouteShare(t *testing.T) {
 			t.Errorf("the session route's provision script lacks %q", want)
 		}
 	}
-	platformScript := a2aProvisionScript(defaultRouteAgent(nil))
+	platformScript := a2aProvisionScript(defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRoutePlatform)))
 	if want := "each session creates " + strconv.Itoa(a2aSessionConsumersPerSession) + " consumers on TASKS"; !strings.Contains(platformScript, want) {
 		t.Errorf("the platform route's provision script lacks %q; its refusal must read as before", want)
 	}
 	if msg := a2aProvisionRefusalStatus(session); !strings.Contains(msg, "defaultRoute is "+agentv1alpha1.DefaultRouteSession) {
 		t.Errorf("the session route's refusal status does not name the route: %s", msg)
 	}
-	if msg := a2aProvisionRefusalStatus(defaultRouteAgent(nil)); strings.Contains(msg, "defaultRoute") {
+	if msg := a2aProvisionRefusalStatus(defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRoutePlatform))); strings.Contains(msg, "defaultRoute") {
 		t.Errorf("the platform route's refusal status names defaultRoute: %s", msg)
 	}
 }
