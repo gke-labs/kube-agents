@@ -229,8 +229,9 @@ jsonpath projection; StorageClasses and PersistentVolumes), plus
 `gcloud logging read` over the Admin Activity log when a registered rule reads
 it; the saved report names those objects, pods and nodes among them, and a
 fail-closed webhook with no reachable backend names its configuration and its
-Service, which is tenant-written text, so the entry declares `risk: high` as
-`stall-watch` does. A project
+Service, which is tenant-written text, and the chat message names the budget,
+webhook configuration, maintenance exclusion or node pool that blocks each
+cluster, so the entry declares `risk: high` as `stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -269,10 +270,17 @@ writes the files on this side, under `<agent home>/upgrade-readiness/`:
 `reports/<version>/`, with `latest.md` pointing at the newest, the ten newest
 kept per version and a retired version's directory removed with it. Each run starts
 from an empty rollout record, so a saved report's progress table is a
-first-run baseline, not a week-over-week comparison. Its stdout, one line per
-report with the pending clusters, the blocked ones, and the file's path on the
-gateway pod, is what `deliver: "chat"` posts; the agent's own tools run in the
-sandbox and cannot open that path, which is why the line carries the verdicts.
+first-run baseline, not a week-over-week comparison. Its stdout is what
+`deliver: "chat"` posts, in plain words: per report, a bold headline that
+counts the clusters that cannot upgrade to the version yet, one line per
+blocked cluster (five, then a count) naming the first thing that blocks it
+and the fix where its kind has one, how many more are ready or could not be
+fully checked, and the date of the next report. The agent's own tools run in
+the sandbox and cannot open the saved report, which is why the message
+carries the verdicts and the reasons. Each line's technical twin, with the
+pending clusters, the reasons and remedies per project and the report's path
+on the gateway pod, goes to `logs/upgrade_readiness_watch.log` under the agent
+home.
 `--dry-run` prints what a tick would do and changes nothing, the failure
 marker included.
 
@@ -286,10 +294,10 @@ hour Hermes gives a `no_agent` script: the version table and the readiness
 runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
-line names each project with a read error and its reason (the budget, the
+line names each project with a read error, and its log line the reason (the budget, the
 sandbox's error, a failed listing, an unresolved project number, a refusal under the
 declared scope with the install's remedy), the
-ledger's `table_errors` keeps the last tick's, and a version's own line names
+ledger's `table_errors` keeps the last tick's, and a version's own line, or its log line, names
 the project whose readiness run was not started or was cut short (a version
 none of whose projects ran is not recorded and is retried tomorrow),
 and each sweep runs the projects least recently run first, so a budget that
@@ -301,7 +309,7 @@ that still pended it and none does, or a readiness run (which lists every
 cluster of its project, reached by the table or not) showed every cluster
 pending it as no longer below it, a report that
 graded none of a version's pending clusters is written but not recorded (the
-chat line says "none graded" and the version is tried again tomorrow), and the
+chat line says the clusters could not be read and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
@@ -371,7 +379,8 @@ nothing on success: the brief speaks for the week and the queue for each finding
 not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
 is one line each, since both leave the week's findings where the brief cannot act on them; a
 failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
-on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
+on the next clean run. Each line is plain words; the reasons per project, the queue's refusals and
+the copy's error go to `logs/upgrade_readiness_review.log` under the agent home. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
 
 `upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
 budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric

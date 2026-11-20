@@ -102,15 +102,21 @@ login's home, where the model cannot read them. Each run starts from an empty
 rollout record, so the progress section of a saved report is a first-run
 baseline, not a comparison with last week.
 
-Stdout is the chat message (``deliver: "chat"``): one line per report
-produced, naming the target version, the clusters pending it, how many the
-report graded blocked, ready and not graded and which are blocked, where the
-report is on the gateway pod, and when the next refresh is due; one line per
-version retired; one line when the version table was partial, with the
-reason per project; and one line when a tick fails. A quiet tick prints nothing, and
-nothing reaches chat. A failed tick's line says what happens next and the
-detail goes to ``logs/upgrade_readiness_watch.log`` under the agent home. Exit
-code is 0 on every path, a ledger or report that cannot be written included: a
+Stdout is the chat message (``deliver: "chat"``), in plain words with no
+path, exit code or internal term: per report produced, a bold headline
+saying how many pending clusters cannot upgrade to the version yet (or how
+many are ready), one line per blocked cluster naming the first thing that
+blocks it and, where its kind has one, the fix, how many more are ready or
+could not be fully checked, and the date of the next report; per version
+retired, per version none of whose clusters could be read (or read in
+time), and when the version table was partial, a bold line saying so and
+what happens next; and one line when a tick fails. Every line that carries
+detail has a technical twin (``*_LOG_LINE``): the pending clusters, the
+reasons and remedies per project, and the report's path on the gateway pod,
+written to ``logs/upgrade_readiness_watch.log`` under the agent home, and to
+stderr for a person running the watch by hand. A quiet tick prints nothing,
+and nothing reaches chat. A failed tick's line says what happens next and
+the detail goes to the same log. Exit code is 0 on every path, a ledger or report that cannot be written included: a
 non-zero exit made the scheduler post its own failure line in place of the
 tick's, and that line promises a retry, where a tick whose ledger did not save
 needs a person (it would report the same version as new again tomorrow).
@@ -503,6 +509,55 @@ MEMBER_KEY_SEPARATOR = "/"
 # fleet_upgrade_report.VERSION_RE, which every target_version the report prints
 # has matched; a ledger key that does not is not a version and names no directory.
 VERSION_KEY_RE = re.compile(r"^\d+\.\d+\.\d+(?:-gke\.\d+)?$")
+# What blocks a member, under its `readiness` object, as the chat line names it.
+PDBS_KEY = "pdbs"
+WEBHOOKS_KEY = "webhooks"
+MAINTENANCE_KEY = "maintenance"
+EXCLUSIONS_KEY = "exclusions"
+SKEW_KEY = "skew"
+POOLS_KEY = "pools"
+BLOCKING_KEY = "blocking"
+RULE_BLOCKING_KEY = "rule_blocking"
+PDB_KEY = "pdb"
+CONFIG_KEY = "config"
+NAME_KEY = "name"
+BLOCKS_KEY = "blocks"
+END_TIME_KEY = "end_time"
+VERDICT_KEY = "verdict"
+POOL_VERSION_KEY = "version"
+ENTRY_KEY = "entry"
+SKEW_VERDICT_BLOCKS = "blocks"
+# The upgrade failure catalogue's entry titles (docs/designs/upgrade-failure-catalogue.md):
+# what the chat line says blocks a cluster when a readiness rule does, and the weekly
+# review's finding titles (`upgrade_readiness_review.ENTRY_TITLES` is this table).
+ENTRY_TITLES = {
+    1: "A PodDisruptionBudget forbids the eviction",
+    2: "No spare capacity for the displaced pods",
+    3: "Every replica in one zone or on one node",
+    4: "Data on the node is gone",
+    5: "Maintenance window too short, or an exclusion ends mid-roll",
+    6: "A served API version is removed",
+    7: "A fail-closed webhook whose backend is not up",
+    8: "A default changes in the new minor",
+    9: "A feature is deprecated but still served",
+    10: "Add-on and client skew",
+    11: "The control plane is unreachable for minutes on a zonal cluster",
+    12: "A node label is removed",
+    13: "The container runtime changes",
+    14: "cgroup v2 under a runtime that cannot read it",
+    15: "The OOM killer starts killing the whole container",
+    16: "The network dataplane changes",
+    17: "A node networking agent fails on the new image",
+    18: "GPU driver mismatch",
+    19: "In-tree volumes lose their CSI path",
+    20: "Images on a retired registry",
+    21: "The load balancer's connection drain outlasts the node's deregistration wait",
+    22: "A Node object outlives its virtual machine",
+    23: "A control-plane upgrade or resize fails on regional compute capacity",
+    24: "A cluster held in a long reconcile",
+    25: "The target patch is withdrawn before the window",
+    26: "A known issue in an add-on at the target version",
+}
 
 # Ledger vocabulary.
 TARGETS_KEY = "targets"
@@ -567,14 +622,63 @@ UNGRADED_KIND_READS_FAILED = "reads failed"
 REASON_NEW = "new target version"
 REASON_REFRESH = "scheduled refresh"
 
-# Output.
+# Output. Chat reads plain words: a bold headline saying what happened, then
+# what happens next, with no path, exit code or internal term
+# (`FAILED_TICK_LINE` is the model). A line that carries detail has a
+# technical twin, a `*_LOG_LINE`: the pending clusters, the reasons and
+# remedies per project, and the report's path on this pod, written to
+# `WATCH_LOG_FILE` under the agent home (`script_log`) and to stderr.
 LINE_PREFIX = "upgrade readiness"
-RETIRED_LINE = "{prefix}: {version} is no longer pending on any cluster; retired from the watch"
-REPORT_LINE = (
+RETIRED_LOG_LINE = "{prefix}: {version} is no longer pending on any cluster; retired from the watch"
+REPORT_LOG_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): {blocked} blocked{blocked_names}, "
     "{ready} ready{ungraded}; report on the gateway pod at {path}; next refresh after {next_date}"
 )
 BLOCKED_NAMES = " ({names})"
+RETIRED_LINE = "**No cluster is due for GKE {version} any more.** The upgrade readiness check stops tracking it."
+# A report in chat: what cannot upgrade, one line per blocked cluster, the rest
+# as counts, and the date of the next report. A cluster is named as the old
+# line named it, by its name alone.
+REPORT_BLOCKED_HEADLINE = "**{clusters} can't upgrade to GKE {version} yet.**"
+REPORT_READY_HEADLINE = "**{clusters} {verb} ready for GKE {version}.**"
+REPORT_UNCHECKED_HEADLINE = "**{clusters} couldn't be fully checked for GKE {version}.**"
+REPORT_MORE_READY = "{count} more {verb} ready."
+REPORT_UNCHECKED = "{clusters} couldn't be fully checked."
+REPORT_NEXT = "The next report is on {date}."
+# A blocked cluster's line names the first thing that blocks it, in the order
+# the report grades them (budgets, webhooks, exclusions, pool skew, the
+# readiness rules), with a short fix where the kind has one. A rule's blocker
+# is named by its catalogue entry's title; its fix depends on the finding,
+# which the saved report holds. A name a tenant wrote is put on one line and
+# cut to `CHAT_NAME_MAX_CHARS`.
+MAX_BLOCKED_CLUSTERS_SHOWN = 5
+BLOCKED_CLUSTER_LINE = "- {cluster}: {reason}"
+BLOCKED_CLUSTER_BARE = "- {cluster}"
+BLOCKED_CLUSTERS_MORE = "- and {count} more"
+BLOCKER_BUDGET = "PodDisruptionBudget {pdb} allows no evictions. Fix: let it evict at least one pod."
+BLOCKER_WEBHOOK = "admission webhook {config} fails closed and its backend is unreachable. Fix: restore the backend, or set its failurePolicy to Ignore."
+BLOCKER_EXCLUSION = "maintenance exclusion {name} holds upgrades{until}. Fix: end it early if the freeze is over."
+BLOCKER_EXCLUSION_UNTIL = " until {date}"
+BLOCKER_SKEW = "node pool {pool} ({version}) is too far behind. Fix: upgrade the node pool first."
+BLOCKER_RULE = "{title}."
+BLOCKER_RULE_UNTITLED = "a readiness rule blocks it."
+BLOCKER_MORE = " Plus {count} more {noun}."
+CHAT_NAME_MAX_CHARS = 60
+ELLIPSIS = "…"
+# Counted nouns, singular and plural, as chat reads them ("1 cluster", "3 clusters").
+COUNTED = "{count} {noun}"
+CLUSTER_FORMS = ("cluster", "clusters")
+PROBLEM_FORMS = ("problem", "problems")
+TIME_FORMS = ("time", "times")
+BE_FORMS = ("is", "are")
+# A date as chat reads it: the month's name and the day, and the year when it is not this one.
+PLAIN_DATE = "{month} {day}"
+PLAIN_DATE_WITH_YEAR = "{date}, {year}"
+MONTH_NAME_FORMAT = "%B"
+# The lines of one tick are one chat post; a blank line keeps each apart. A dry
+# run's lines are for the person running it, one per line, as before.
+CHAT_ITEM_SEPARATOR = "\n\n"
+DRY_RUN_LINE_SEPARATOR = "\n"
 # A failed tick posts one plain line: what did not happen, why, and what
 # happens next. The exception and its text go to `WATCH_LOG_FILE` under the
 # agent home (`script_log`), and to stderr for a person running it by hand;
@@ -616,25 +720,44 @@ FAILED_REASONS_NEED_ADMIN = frozenset(
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
-PARTIAL_LINE = (
+PARTIAL_LOG_LINE = (
     "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}): {reasons}; a version is retired only once "
     "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it"
 )
-# One reason per project the read errors name, so the line says what went
+# One reason per project the read errors name, so the log line says what went
 # wrong where; the announcement stays keyed on the kinds (and, for a refusal, on
 # the project and its cause), so the other reasons are the day's.
 PARTIAL_REASON = "{project}: {message}"
 REASONS_SEPARATOR = "; "
-PARTIAL_CLEARED_LINE = "{prefix} watch: the version table reads every project again"
+PARTIAL_CLEARED_LOG_LINE = "{prefix} watch: the version table reads every project again"
+# The partial table in chat names the projects it did not read; the read
+# under spec.mode: next that names no member project is the install's scope.
+PARTIAL_LINE = (
+    "**The upgrade readiness check couldn't read every project today.** Not read: {names}. "
+    "The clusters there keep their last results until it reads them again. {next}"
+)
+PARTIAL_SCOPE_GAP_NAME = "the install's declared scope"
+PARTIAL_CLEARED_LINE = "**The upgrade readiness check can read every project again.**"
+# What happens after a read that failed: a person acts first, for a refusal no
+# retry clears or a project number that does not resolve, else the watch
+# tries again (`next_attempt`); either way the log has the detail.
+DETAILS_IN_LOG = "The details are in the agent's log."
+NEEDS_ADMIN_FIRST = "An admin needs to fix this first; the details are in the agent's log."
+RETRY_THEN_LOG = "{next} " + DETAILS_IN_LOG
 DRY_RUN_WOULD_RETIRE = "dry run: would retire {version} (no cluster is pending it)"
-UNGRADED_LINE = (
+UNGRADED_LOG_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): none graded ({detail}); "
     "report on the gateway pod at {path}; retrying tomorrow"
 )
-NOT_RUN_LINE = (
+NOT_RUN_LOG_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): not run to completion; the tick budget "
     "was spent before {projects} finished; retried tomorrow, starting there"
 )
+CLUSTERS_DUE_ONE = "the cluster due for GKE {version}"
+CLUSTERS_DUE_MANY = "the {count} clusters due for GKE {version}"
+UNGRADED_LINE = "**The upgrade readiness check couldn't read {due}.** {next}"
+UNGRADED_PARKED_NEXT = "It has failed {times} in a row, so it waits until {date} to try again. " + DETAILS_IN_LOG
+NOT_RUN_LINE = "**The upgrade readiness check ran out of time before it read {due}.** {next} Next time it starts with {projects}."
 UNKNOWN_COUNT = ", {count} unknown"
 # The two lists under the Markdown's tables: reads whose member is not graded (the first read,
 # the credentials, a project or a location), and the webhook read's rows, whose member is graded
@@ -644,7 +767,7 @@ WEBHOOK_READ_ROWS_HEADING = "Webhook reads that failed during this run; each mem
 UNREAD_COUNT = ", {count} not read"
 READS_FAILED_DETAIL = "their kubectl read failed or the run returned nothing for them"
 UNGRADED_ATTEMPTS_BEFORE_WEEKLY = 3
-UNGRADED_PARKED_LINE = (
+UNGRADED_PARKED_LOG_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): none graded ({detail}); "
     "not graded on {attempts} consecutive attempt(s); report on the gateway pod at {path}; next attempt at the weekly refresh"
 )
@@ -1948,12 +2071,141 @@ def cluster_names(clusters: list[str]) -> str:
 
 def error_reasons(read_errors: list) -> str:
     """One reason per project the read errors name, the first recorded, in
-    project order: what the partial line says went wrong where."""
+    project order: what the partial log line says went wrong where."""
     reasons: dict[str, str] = {}
     for error in read_errors:
         project = str(error.get(MEMBER_ID_KEYS[0]) or NONE_WORD)
         reasons.setdefault(project, str(error.get(MESSAGE_KEY) or error_kind(error)))
     return shown_names([PARTIAL_REASON.format(project=project, message=reasons[project]) for project in sorted(reasons)], REASONS_SEPARATOR)
+
+
+# --- what chat reads ---------------------------------------------------------
+
+
+def plural(count: int, forms: tuple[str, str]) -> str:
+    return forms[0] if count == 1 else forms[1]
+
+
+def counted(count: int, forms: tuple[str, str]) -> str:
+    return COUNTED.format(count=count, noun=plural(count, forms))
+
+
+def plain_date(moment: datetime, now: datetime) -> str:
+    """A date as chat reads it, in UTC as the tick counts days: "November 27",
+    with the year when it is not this one."""
+    moment = moment.astimezone(timezone.utc)
+    text = PLAIN_DATE.format(month=moment.strftime(MONTH_NAME_FORMAT), day=moment.day)
+    return text if moment.year == now.year else PLAIN_DATE_WITH_YEAR.format(date=text, year=moment.year)
+
+
+def chat_name(value: object) -> str:
+    """A name the report carries, often one a tenant wrote, on one line and cut
+    to `CHAT_NAME_MAX_CHARS`, so it cannot break the message's lines."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= CHAT_NAME_MAX_CHARS else text[: CHAT_NAME_MAX_CHARS - len(ELLIPSIS)] + ELLIPSIS
+
+
+def clusters_due(count: int, version: str) -> str:
+    return CLUSTERS_DUE_ONE.format(version=version) if count == 1 else CLUSTERS_DUE_MANY.format(count=count, version=version)
+
+
+def chat_project_names(projects: list[str]) -> str:
+    """Projects as chat names them, the first few and a count of the rest; the
+    read that names no member project under spec.mode: next is the scope's."""
+    return shown_names([PARTIAL_SCOPE_GAP_NAME if p == fleet_scope_targets.UNRESOLVED_SCOPE_ROW else p for p in projects])
+
+
+def refusals_need_admin(causes) -> bool:
+    """Whether a refusal cause among ``causes`` waits on a person (`REFUSAL_CAUSES_THAT_CLEAR`)."""
+    return any(cause not in REFUSAL_CAUSES_THAT_CLEAR for cause in causes)
+
+
+def errors_need_admin(read_errors: list) -> bool:
+    """Whether a read error waits on a person: a refusal no retry clears, or a
+    project number that does not resolve, as the failed tick's line decides."""
+    refused_head = ERROR_KIND_REFUSED.format(cause="")
+    kinds = [error_kind(error) for error in read_errors]
+    causes = [kind[len(refused_head):] for kind in kinds if kind.startswith(refused_head)]
+    return ERROR_KIND_UNRESOLVED in kinds or refusals_need_admin(causes)
+
+
+def failure_next(admin: bool) -> str:
+    """What chat says follows a read that failed: a person acts, or the watch tries again."""
+    return NEEDS_ADMIN_FIRST if admin else RETRY_THEN_LOG.format(next=next_attempt(False))
+
+
+def dict_items(value: object) -> list[dict]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def dict_of(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def blocker_reasons(readiness: dict, now: datetime) -> list[str]:
+    """What blocks a member, as chat says it, in the order the report grades it."""
+    reasons = [BLOCKER_BUDGET.format(pdb=chat_name(budget.get(PDB_KEY))) for budget in dict_items(dict_of(readiness.get(PDBS_KEY)).get(BLOCKING_KEY))]
+    reasons += [
+        BLOCKER_WEBHOOK.format(config=chat_name(hook.get(CONFIG_KEY) or hook.get(NAME_KEY)))
+        for hook in dict_items(dict_of(readiness.get(WEBHOOKS_KEY)).get(BLOCKING_KEY))
+    ]
+    for exclusion in dict_items(dict_of(readiness.get(MAINTENANCE_KEY)).get(EXCLUSIONS_KEY)):
+        if exclusion.get(BLOCKS_KEY) is True:
+            end = parse_iso(exclusion.get(END_TIME_KEY))
+            until = BLOCKER_EXCLUSION_UNTIL.format(date=plain_date(end, now)) if end else ""
+            reasons.append(BLOCKER_EXCLUSION.format(name=chat_name(exclusion.get(NAME_KEY)), until=until))
+    reasons += [
+        BLOCKER_SKEW.format(pool=chat_name(pool.get(NAME_KEY)), version=chat_name(pool.get(POOL_VERSION_KEY)))
+        for pool in dict_items(dict_of(readiness.get(SKEW_KEY)).get(POOLS_KEY))
+        if pool.get(VERDICT_KEY) == SKEW_VERDICT_BLOCKS
+    ]
+    for item in dict_items(readiness.get(RULE_BLOCKING_KEY)):
+        entry = item.get(ENTRY_KEY)
+        title = ENTRY_TITLES.get(entry) if isinstance(entry, int) and not isinstance(entry, bool) else None
+        reasons.append(BLOCKER_RULE.format(title=title) if title else BLOCKER_RULE_UNTITLED)
+    return reasons
+
+
+def blocked_cluster_line(key: str, member: dict | None, now: datetime) -> str:
+    """A blocked cluster's chat line: its name, its first blocker with the fix,
+    and how many more block it."""
+    cluster = key.rsplit(MEMBER_KEY_SEPARATOR, 1)[-1]
+    reasons = blocker_reasons(dict_of(dict_of(member).get(READINESS_KEY)), now)
+    if not reasons:
+        return BLOCKED_CLUSTER_BARE.format(cluster=cluster)
+    more = len(reasons) - 1
+    reason = reasons[0] + (BLOCKER_MORE.format(count=more, noun=plural(more, PROBLEM_FORMS)) if more else "")
+    return BLOCKED_CLUSTER_LINE.format(cluster=cluster, reason=reason)
+
+
+def report_message(version: str, verdicts: tuple[list[str], list[str], list[str], list[str]], report: dict, next_report: datetime, now: datetime, failed: bool) -> str:
+    """A report's chat message: what cannot upgrade to ``version`` and why, the
+    rest as counts, and the date of the next report. ``verdicts`` is
+    `readiness_verdicts`' blocked, ready, unknown and unread; ``failed`` says a
+    project's readiness run failed, whose detail is in the log."""
+    blocked, ready, unknown, unread = verdicts
+    unchecked = len(unknown) + len(unread)
+    lines: list[str] = []
+    tail: list[str] = []
+    if blocked:
+        lines.append(REPORT_BLOCKED_HEADLINE.format(clusters=counted(len(blocked), CLUSTER_FORMS), version=version))
+        members = {member_key(m): m for m in dict_items(report.get(MEMBERS_KEY))}
+        lines += [blocked_cluster_line(key, members.get(key), now) for key in blocked[:MAX_BLOCKED_CLUSTERS_SHOWN]]
+        if len(blocked) > MAX_BLOCKED_CLUSTERS_SHOWN:
+            lines.append(BLOCKED_CLUSTERS_MORE.format(count=len(blocked) - MAX_BLOCKED_CLUSTERS_SHOWN))
+        if ready:
+            tail.append(REPORT_MORE_READY.format(count=len(ready), verb=plural(len(ready), BE_FORMS)))
+    elif ready:
+        lines.append(REPORT_READY_HEADLINE.format(clusters=counted(len(ready), CLUSTER_FORMS), verb=plural(len(ready), BE_FORMS), version=version))
+    else:
+        lines.append(REPORT_UNCHECKED_HEADLINE.format(clusters=counted(unchecked, CLUSTER_FORMS), version=version))
+        unchecked = 0
+    if unchecked:
+        tail.append(REPORT_UNCHECKED.format(clusters=counted(unchecked, CLUSTER_FORMS)))
+    tail.append(REPORT_NEXT.format(date=plain_date(next_report, now)))
+    if failed:
+        tail.append(DETAILS_IN_LOG)
+    return "\n".join(lines + [" ".join(tail)])
 
 
 def signature_pairs(kinds: dict[str, str]) -> list[list[str]]:
@@ -2177,11 +2429,12 @@ def clear_failure_marker(home: Path) -> bool:
 # --- the tick --------------------------------------------------------------
 
 
-def tick(dry_run: bool = False) -> list[str]:
+def tick(dry_run: bool = False) -> tuple[list[str], list[str]]:
     """One tick: the ledger loaded, the sweep run on it, and the standing-outside
     record and the ids it learned kept when the sweep fails (``keep_standing``),
     at whichever step it failed, since the hops file the record as they go and
-    a failed tick writes nothing else of the ledger. A dry run changes nothing."""
+    a failed tick writes nothing else of the ledger. Returns the chat lines and
+    their log lines (``sweep``). A dry run changes nothing."""
     started = time.monotonic()
     home = watch_home()
     ledger_path = home / LEDGER_FILE_NAME
@@ -2197,12 +2450,14 @@ def tick(dry_run: bool = False) -> list[str]:
         raise
 
 
-def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
+def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> tuple[list[str], list[str]]:
     """The tick's work on the ledger ``tick`` loaded: the version table, what
     is due, the readiness runs, the reports and the ledger's save. ``started``
     is the tick's first ``time.monotonic`` instant, which the budget counts
-    from. Raises out with the ledger unsaved when a step fails; ``tick`` keeps
-    the standing-outside record and the learned ids then."""
+    from. Returns what chat reads and the technical lines for the log, each
+    chat line that carries detail with its ``*_LOG_LINE``; a dry run's lines
+    are all chat's. Raises out with the ledger unsaved when a step fails;
+    ``tick`` keeps the standing-outside record and the learned ids then."""
     now = now_utc()
     days = refresh_days()
     ledger_path = home / LEDGER_FILE_NAME
@@ -2231,9 +2486,10 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
             lines.append(DRY_RUN_WOULD_REPORT.format(version=version, reason=reason, names=cluster_names(pending[version])))
         if not due:
             lines.append(DRY_RUN_NOTHING_DUE.format(versions=", ".join(sorted(pending)) or NONE_WORD))
-        return lines
+        return lines, []
     due, retired = decide(ledger, pending, now, days, retire=complete)
-    lines = [RETIRED_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
+    lines = [RETIRED_LINE.format(version=v) for v in retired]
+    log = [RETIRED_LOG_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
     for version in retired:
         remove_reports(home, version)
     signature = partial_signature(read_errors) if not complete else None
@@ -2241,10 +2497,12 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     if signature and signature != already:
         # Counted by project, as the key and the reasons are: both spellings of one project,
         # run on the tick its id is learned, are one read error.
-        errors = len({str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors})
-        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=errors, code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
+        unread_projects = sorted({str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors})
+        lines.append(PARTIAL_LINE.format(names=chat_project_names(unread_projects), next=failure_next(errors_need_admin(read_errors))))
+        log.append(PARTIAL_LOG_LINE.format(prefix=LINE_PREFIX, errors=len(unread_projects), code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
     elif complete and already:
-        lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
+        lines.append(PARTIAL_CLEARED_LINE)
+        log.append(PARTIAL_CLEARED_LOG_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     ledger[TABLE_ERRORS_KEY] = read_errors
     if due:
@@ -2256,10 +2514,12 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
                 due.pop(version)
                 retired.append(version)
                 remove_reports(home, version)
-                lines.append(RETIRED_LINE.format(prefix=LINE_PREFIX, version=version))
+                lines.append(RETIRED_LINE.format(version=version))
+                log.append(RETIRED_LOG_LINE.format(prefix=LINE_PREFIX, version=version))
         for version, reason in due.items():
             clusters = pending[version]
-            blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
+            verdicts = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
+            blocked, ready, unknown, unread = verdicts
             version_projects = {project_of(k) for k in clusters}
             failed_projects = sorted(version_projects & set(failures))
             refused_projects = {project: refused[project] for project in sorted(version_projects & set(refused))}
@@ -2268,8 +2528,9 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
                 # Nothing was attempted for this version: not a report, not an
                 # ungraded attempt, and not recorded, so it is due again tomorrow,
                 # when the sweep starts at the project the budget left.
-                lines.append(
-                    NOT_RUN_LINE.format(
+                lines.append(NOT_RUN_LINE.format(due=clusters_due(len(clusters), version), next=next_attempt(False), projects=", ".join(unrun_projects)))
+                log.append(
+                    NOT_RUN_LOG_LINE.format(
                         prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
                         names=cluster_names(clusters), projects=", ".join(unrun_projects),
                     )
@@ -2297,17 +2558,21 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
             except OSError as exc:
                 raise WriteFailed(str(exc)) from exc
             if not graded:
+                admin = refusals_need_admin(refused_projects.values())
                 if parked:
-                    lines.append(
-                        UNGRADED_PARKED_LINE.format(
+                    parked_next = UNGRADED_PARKED_NEXT.format(times=counted(attempts, TIME_FORMS), date=plain_date(now + timedelta(days=days), now))
+                    lines.append(UNGRADED_LINE.format(due=clusters_due(len(clusters), version), next=NEEDS_ADMIN_FIRST if admin else parked_next))
+                    log.append(
+                        UNGRADED_PARKED_LOG_LINE.format(
                             prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
                             names=cluster_names(clusters), detail=detail, attempts=attempts, path=path,
                         )
                     )
                     ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
                 elif not announced_as(previous, condition, detail):
-                    lines.append(
-                        UNGRADED_LINE.format(
+                    lines.append(UNGRADED_LINE.format(due=clusters_due(len(clusters), version), next=failure_next(admin)))
+                    log.append(
+                        UNGRADED_LOG_LINE.format(
                             prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
                             names=cluster_names(clusters), detail=detail, path=path,
                         )
@@ -2316,8 +2581,9 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
                 continue
             announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
             ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
-            lines.append(
-                REPORT_LINE.format(
+            lines.append(report_message(version, verdicts, readiness[ENVELOPE_REPORT_KEY], now + timedelta(days=days), now, bool(failure_text)))
+            log.append(
+                REPORT_LOG_LINE.format(
                     prefix=LINE_PREFIX,
                     reason=reason,
                     version=version,
@@ -2350,7 +2616,7 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
         raise WriteFailed(str(exc)) from exc
     if recovered:
         lines.insert(0, RECOVERED_LINE)
-    return lines
+    return lines, log
 
 
 def needs_admin(exc: Exception) -> bool:
@@ -2417,7 +2683,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Read the versions and the ledger, print what would be reported, change nothing.")
     args = parser.parse_args(argv)
     try:
-        lines = tick(dry_run=args.dry_run)
+        lines, log = tick(dry_run=args.dry_run)
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
         # Exit 0 for a write failure too: a non-zero exit makes the scheduler
         # post its own failure line in place of this one, and that line can
@@ -2439,8 +2705,12 @@ def main(argv: list[str] | None = None) -> int:
             print((FAILED_WRITE_LINE if write else FAILED_TICK_LINE).format(reason=reason, next=next_attempt(needs_admin(exc))))
             print(failed_line, file=sys.stderr)
         return 0
-    for line in lines:
-        print(line)
+    # The chat lines are one post, the technical lines its record (a dry run has none).
+    script_log.append(WATCH_LOG_FILE, log)
+    if lines:
+        print((DRY_RUN_LINE_SEPARATOR if args.dry_run else CHAT_ITEM_SEPARATOR).join(lines))
+    for line in log:
+        print(line, file=sys.stderr)
     return 0
 
 

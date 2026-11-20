@@ -61,7 +61,11 @@ not read, since the brief's counts cannot show them; a run whose findings the
 queue refused, or whose sandbox copy failed, prints one line for each, since
 both leave the week where the brief cannot act on it; a run that fails prints
 one line saying so, once per distinct failure, and the next clean run prints
-the recovery line; the exit is 0 throughout, and 1 only when the record could
+the recovery line. Each line is plain words, a bold headline and what
+happens next; its technical twin (the reasons per project, the queue's
+refusals, the copy's error, the record's path) goes to
+``logs/upgrade_readiness_review.log`` under the agent home, and to stderr
+for a person running it by hand. The exit is 0 throughout, and 1 only when the record could
 not be written, a failure said every time it happens, since the marker that
 holds a failure back sits beside the record it could not write. ``--dry-run`` runs the
 reports and prints the summary without registering or writing anything.
@@ -91,6 +95,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sandbox_exec  # noqa: E402
 import findings_queue  # noqa: E402
+import script_log  # noqa: E402
 import upgrade_readiness_watch as watch  # noqa: E402
 
 JOB_ID = "upgrade-readiness-weekly-review"
@@ -249,35 +254,9 @@ RUBRIC_KEYS = ("B", "L", "detect", "recover")
 CONFIDENCE_KEY = "C"
 
 # The catalogue's entries (docs/designs/upgrade-failure-catalogue.md): the
-# title, and the "mitigate before" line, shortened to the first action.
-ENTRY_TITLES = {
-    1: "A PodDisruptionBudget forbids the eviction",
-    2: "No spare capacity for the displaced pods",
-    3: "Every replica in one zone or on one node",
-    4: "Data on the node is gone",
-    5: "Maintenance window too short, or an exclusion ends mid-roll",
-    6: "A served API version is removed",
-    7: "A fail-closed webhook whose backend is not up",
-    8: "A default changes in the new minor",
-    9: "A feature is deprecated but still served",
-    10: "Add-on and client skew",
-    11: "The control plane is unreachable for minutes on a zonal cluster",
-    12: "A node label is removed",
-    13: "The container runtime changes",
-    14: "cgroup v2 under a runtime that cannot read it",
-    15: "The OOM killer starts killing the whole container",
-    16: "The network dataplane changes",
-    17: "A node networking agent fails on the new image",
-    18: "GPU driver mismatch",
-    19: "In-tree volumes lose their CSI path",
-    20: "Images on a retired registry",
-    21: "The load balancer's connection drain outlasts the node's deregistration wait",
-    22: "A Node object outlives its virtual machine",
-    23: "A control-plane upgrade or resize fails on regional compute capacity",
-    24: "A cluster held in a long reconcile",
-    25: "The target patch is withdrawn before the window",
-    26: "A known issue in an add-on at the target version",
-}
+# title, which the watch holds since its chat line names a rule's blocker by
+# it, and the "mitigate before" line, shortened to the first action.
+ENTRY_TITLES = watch.ENTRY_TITLES
 ENTRY_MITIGATIONS = {
     1: "Give the budget room: maxUnavailable at least 1 or minAvailable below the replica count, and a "
     "second replica so the budget can be honoured; for a true singleton, accept the outage inside a "
@@ -391,8 +370,8 @@ BUDGET_FAILURE_PREFIXES = (CUT_SHORT_PREFIX,)
 LISTING_FAILED_DETAIL = "the project's cluster listing failed"
 EXCLUSION_SURROGATE_OBJECT = "exclusion-{digest}"  # an exclusion name with no ASCII letter or digit
 EXCLUSION_DIGEST_CHARS = 8
-MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the chat line; the record has them all
-MAX_NAMES_IN_LINE = 6  # projects named in the partial line
+MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the log line; the record has them all
+MAX_NAMES_IN_LINE = 6  # projects named in the partial log line
 OVERFLOW_NOTE = "and {count} more in the record"
 OVERFLOW_NOTE_PLAIN = "and {count} more"  # for the line of a run that wrote no record
 CLAIM_FAILED_MARK = "the completeness claim did not reach the queue"
@@ -411,13 +390,38 @@ ANSWER_DOWNGRADED_KEY = "downgraded"
 DUPLICATE_DETAIL_SEPARATOR = " | also: "  # two rows of one member that derive one queue id
 SHARED_DETAIL_SEPARATOR = " | also on {member}: "  # two same-named clusters whose objects coincide
 TMP_SUFFIX = watch.LEDGER_TMP_SUFFIX  # a file is written beside its name and renamed over it
-FAILED_LINE = "{prefix}: failed: {detail}"
-RECOVERED_LINE = "{prefix}: runs again after a failure"
-PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
-REGISTRATION_FAILED_LINE = "{prefix}: {rows} finding(s) and {claims} completeness claim(s) did not reach the findings queue: {detail}; {where}; a cluster whose claim did not land keeps last week's rows at full confidence"
+# Chat reads plain words, as the daily watch's lines do (`watch.FAILED_TICK_LINE`
+# is the model): a bold headline, then what it means and what happens next.
+# Each line's technical twin, a `*_LOG_LINE` (the reasons per project, the
+# queue's refusals, the copy's error, the record's path), goes to
+# `REVIEW_LOG_FILE` under the agent home (`script_log`) and to stderr.
+REVIEW_LOG_FILE = "upgrade_readiness_review.log"
+FAILED_LOG_LINE = "{prefix}: failed: {detail}"
+RECOVERED_LOG_LINE = "{prefix}: runs again after a failure"
+PARTIAL_LOG_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
+REGISTRATION_FAILED_LOG_LINE = "{prefix}: {rows} finding(s) and {claims} completeness claim(s) did not reach the findings queue: {detail}; {where}; a cluster whose claim did not land keeps last week's rows at full confidence"
 REGISTRATION_IN_REPORT = "the findings are in the report, not on the queue, and the brief says so"
 REGISTRATION_NO_RECORD = "the record could not be written either, so this line is the one place they are said"
-COPY_FAILED_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads the previous copy until the next review"
+COPY_FAILED_LOG_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads the previous copy until the next review"
+FAILED_LINE = "**The weekly upgrade readiness review didn't run.** {reason}. {next}"
+WRITE_FAILED_LINE = "**The weekly upgrade readiness review didn't finish.** {reason}. {next}"
+# A run whose every project failed; any other failure is said as the watch says it (`watch.failure_reason`).
+FAILED_REASON_PROJECTS = "It couldn't read any project"
+RECOVERED_LINE = "**The weekly upgrade readiness review is running again.**"
+PARTIAL_LINE = (
+    "**The weekly upgrade readiness review couldn't read every project.** Not read: {names}. "
+    "The clusters there keep last week's findings, and this week's counts leave them out. " + watch.DETAILS_IN_LOG
+)
+REGISTRATION_LINE = "**Part of this week's upgrade readiness review didn't reach the findings queue.** {what}"
+REGISTRATION_ROWS = "{findings} didn't arrive."
+REGISTRATION_CLAIMS = "{clusters} keep last week's findings as they were."
+REGISTRATION_IN_REPORT_LINE = "The weekly report has them, and the weekly brief says so."
+REGISTRATION_NO_RECORD_LINE = "The weekly report couldn't be saved either."
+FINDING_FORMS = ("finding", "findings")
+COPY_FAILED_LINE = (
+    "**The agent can't read this week's upgrade readiness report.** Copying it for the agent failed, "
+    "so the agent reads last week's report until the next review. " + watch.DETAILS_IN_LOG
+)
 # A failure is announced once per distinct cause: the marker keeps the failure's text
 # with every number replaced, so a timeout that reads 1187s one week and 1203s the
 # next is the same failure.
@@ -1470,8 +1474,9 @@ def clear_failure_marker() -> bool:
     return False
 
 
-def review(dry_run: bool = False) -> tuple[list[str], int]:
-    """Run the review. Returns the lines to print and the exit code."""
+def review(dry_run: bool = False) -> tuple[list[str], list[str], int]:
+    """Run the review. Returns the chat lines, their technical lines for the
+    log (a dry run's lines are all chat's), and the exit code."""
     now = now_utc()
     stamp = now.strftime(STAMP_FORMAT)
     scope = watch.declared_scope()
@@ -1480,7 +1485,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     cluster_lists = watch.cluster_scope()
     names = watch.projects(cluster_lists)
     if not names:
-        raise RuntimeError(NO_PROJECTS_DETAIL)
+        raise watch.NoProject(NO_PROJECTS_DETAIL)
     home = weekly_home()
     previous = load_previous(home)
     findings: list[dict] = []
@@ -1521,37 +1526,54 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     if dry_run:
         lines = [DRY_RUN_HEADER, json.dumps({k: v for k, v in summary_doc.items() if k != "findings"}, indent=1, sort_keys=True)]
         lines += [f"- {r['severity']}: {r['id']}: {r['title']}" for r in summary_doc["findings"]]
-        return lines, 0
+        return lines, [], 0
     report_json = {"generated_at": iso(now), "projects": summary_doc["projects"], watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors, "project_failures": failures}
     findings_json = {"generated_at": iso(now), "findings": [payload(item) for item in findings], "outcomes": outcomes, "errors": problems}
-    # Said in chat, not on stderr, which the scheduler keeps nowhere for a
+    # Said in chat, not on stderr alone, which the scheduler keeps nowhere for a
     # zero-exit script: findings off the queue, a copy the brief cannot read and
     # projects not read are the week's failures whether or not the record is
-    # written, so a record that cannot be written does not silence them.
-    def registration_lines(where: str) -> list[str]:
+    # written, so a record that cannot be written does not silence them. The
+    # technical line beside each goes to the log.
+    def registration_lines(where: str, where_log: str) -> tuple[list[str], list[str]]:
         if not problems:
-            return []
+            return [], []
         failed_rows = sum(1 for outcome in outcomes.values() if outcome == REGISTRATION_FAILED)
         failed_claims = sum(1 for problem in problems if CLAIM_FAILED_MARK in problem)
-        return [REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, rows=failed_rows, claims=failed_claims, detail=shown(problems, MAX_PROBLEMS_IN_LINE), where=where)]
+        what = [REGISTRATION_ROWS.format(findings=watch.counted(failed_rows, FINDING_FORMS))] if failed_rows else []
+        what += [REGISTRATION_CLAIMS.format(clusters=watch.counted(failed_claims, watch.CLUSTER_FORMS))] if failed_claims else []
+        chat = REGISTRATION_LINE.format(what=" ".join([*what, where, watch.DETAILS_IN_LOG]))
+        return [chat], [REGISTRATION_FAILED_LOG_LINE.format(prefix=LOG_PREFIX, rows=failed_rows, claims=failed_claims, detail=shown(problems, MAX_PROBLEMS_IN_LINE), where=where_log)]
 
-    partial_lines = []
+    partial_lines, partial_log = [], []
     if failures:
         detail = shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE)
-        partial_lines.append(PARTIAL_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))
+        partial_lines.append(PARTIAL_LINE.format(names=watch.chat_project_names(list(failures))))
+        partial_log.append(PARTIAL_LOG_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))
     try:
         write_record(home, stamp, report_md, report_json, findings_json, summary_doc)
     except OSError as exc:
-        failed = FAILED_LINE.format(prefix=LOG_PREFIX, detail=f"could not write the record under {home}: {exc}")
-        return [failed, *registration_lines(REGISTRATION_NO_RECORD), *partial_lines], 1
+        failed = FAILED_LOG_LINE.format(prefix=LOG_PREFIX, detail=f"could not write the record under {home}: {exc}")
+        registration, registration_log = registration_lines(REGISTRATION_NO_RECORD_LINE, REGISTRATION_NO_RECORD)
+        lines = [WRITE_FAILED_LINE.format(reason=watch.FAILED_REASON_WRITE, next=watch.FAILED_NEEDS_ADMIN), *registration, *partial_lines]
+        return lines, [failed, *registration_log, *partial_log], 1
     copy_error = copy_to_sandbox(report_md, summary_doc)
-    lines = []
+    lines, log = [], []
     if clear_failure_marker():
-        lines.append(RECOVERED_LINE.format(prefix=LOG_PREFIX))
-    lines += registration_lines(REGISTRATION_IN_REPORT)
+        lines.append(RECOVERED_LINE)
+        log.append(RECOVERED_LOG_LINE.format(prefix=LOG_PREFIX))
+    registration, registration_log = registration_lines(REGISTRATION_IN_REPORT_LINE, REGISTRATION_IN_REPORT)
+    lines += registration
+    log += registration_log
     if copy_error:
-        lines.append(COPY_FAILED_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
-    return lines + partial_lines, 0
+        lines.append(COPY_FAILED_LINE)
+        log.append(COPY_FAILED_LOG_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
+    return lines + partial_lines, log + partial_log, 0
+
+
+def failure_reason(exc: Exception) -> str:
+    """Why a run failed, in the channel's words: every project failing is the
+    review's own kind; any other failure reads as the watch says it."""
+    return FAILED_REASON_PROJECTS if isinstance(exc, ProjectsFailed) else watch.failure_reason(exc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1559,14 +1581,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Run the reports and print what would be registered and written; change nothing.")
     args = parser.parse_args(argv)
     try:
-        lines, code = review(dry_run=args.dry_run)
+        lines, log, code = review(dry_run=args.dry_run)
     except Exception as exc:  # noqa: BLE001 - one line per distinct failure, then exit 0 so the schedule holds
         detail = str(exc) or exc.__class__.__name__
+        failed = FAILED_LOG_LINE.format(prefix=LOG_PREFIX, detail=detail)
+        # Every failed run is logged, posted or not; a dry run changes nothing, the log included.
+        if not args.dry_run:
+            script_log.append(REVIEW_LOG_FILE, [failed])
         if args.dry_run or announce_failure_once(detail, exc.failures if isinstance(exc, ProjectsFailed) else None):
-            print(FAILED_LINE.format(prefix=LOG_PREFIX, detail=detail))
+            print(FAILED_LINE.format(reason=failure_reason(exc), next=watch.FAILED_NEEDS_ADMIN if watch.needs_admin(exc) else watch.FAILED_NEXT_UNKNOWN))
+            print(failed, file=sys.stderr)
         return 0
-    for line in lines:
-        print(line)
+    script_log.append(REVIEW_LOG_FILE, log)
+    if lines:
+        print((watch.DRY_RUN_LINE_SEPARATOR if args.dry_run else watch.CHAT_ITEM_SEPARATOR).join(lines))
+    for line in log:
+        print(line, file=sys.stderr)
     return code
 
 

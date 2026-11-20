@@ -4,16 +4,18 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import chat_cases  # noqa: E402
 import findings_queue as fq  # noqa: E402
 import upgrade_readiness_review as review  # noqa: E402
 import upgrade_readiness_watch as watch  # noqa: E402
@@ -23,6 +25,9 @@ SOP = Path(__file__).resolve().parents[1] / "governance" / "upgrade_readiness_br
 NOW = datetime(2026, 10, 18, 6, 0, tzinfo=timezone.utc)
 PROJECT = "acme-prod"
 OTHER_PROJECT = "acme-dev"
+# What chat must not carry (.agents/rules/chat_ux.md, "No plumbing in user text"): a file path, an
+# ISO date, an exit code, and the internal terms the lines used to carry.
+CHAT_PLUMBING = re.compile(r"(?<![\w.-])/|\d{4}-\d{2}-\d{2}|\bexited? \d|upgrade readiness weekly review:|project\(s\)|finding\(s\)|completeness claim|sandbox|record")
 SCOPE = watch.fleet_scope_targets.ScopeTargets(projects=(PROJECT,), unread=(), resolved_at=None, path="fleet_scope.json", excluded=(), retiring=())
 
 
@@ -878,7 +883,11 @@ class TheTick(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / "upgrade-readiness"
-        self.env = mock.patch.dict(os.environ, {watch.WATCH_HOME_ENV: str(self.home), watch.PROJECTS_ENV: PROJECT, "SESSION_KV_API_KEY": "k"})
+        self.env = mock.patch.dict(
+            os.environ,
+            # The agent home holds the review's log (`script_log`), here the test's own directory.
+            {watch.WATCH_HOME_ENV: str(self.home), watch.PROJECTS_ENV: PROJECT, "SESSION_KV_API_KEY": "k", watch.fleet_scope_targets.AGENT_HOME_ENV: self.tmp.name},
+        )
         self.env.start()
         self.addCleanup(self.env.stop)
         self.registered = []
@@ -907,10 +916,28 @@ class TheTick(unittest.TestCase):
         return None
 
     def run_main(self, *argv):
+        """``main``'s exit code and what it printed, stdout and stderr in one buffer: the chat lines, then their log lines."""
         out = io.StringIO()
-        with redirect_stdout(out):
+        with redirect_stdout(out), redirect_stderr(out):
             code = review.main(list(argv))
         return code, out.getvalue()
+
+    def run_main_split(self, *argv):
+        """``main``'s exit code, what it posts to chat (stdout) and its log lines (stderr), apart."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = review.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def log(self) -> str:
+        return (Path(self.tmp.name) / "logs" / review.REVIEW_LOG_FILE).read_text(encoding="utf-8")
+
+    def assert_plain(self, chat):
+        """Each line a bold headline the chat UX lint passes, with no path, ISO date or internal term."""
+        for item in chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR):
+            self.assertTrue(item.startswith("**"), item)
+            self.assertEqual(chat_cases.lint({"schema": chat_cases.SCHEMA, "headline": item.splitlines()[0]}), [], item)
+            self.assertIsNone(CHAT_PLUMBING.search(item), item)
 
     def test_a_clean_run_registers_writes_copies_and_says_nothing(self):
         code, out = self.run_main()
@@ -938,13 +965,16 @@ class TheTick(unittest.TestCase):
 
     def test_a_failure_is_said_once_then_the_recovery(self):
         with mock.patch.object(watch, "run_report", side_effect=RuntimeError("sandbox exited 255 without a report")):
-            code, out = self.run_main()
+            code, chat, log = self.run_main_split()
             self.assertEqual(code, 0)
-            self.assertIn("failed: acme-prod: sandbox exited 255", out)
+            self.assertEqual(chat, "**The weekly upgrade readiness review didn't run.** It couldn't read any project. It will try again at its next scheduled run.\n")
+            self.assertIn("failed: acme-prod: sandbox exited 255", log)
             code, out = self.run_main()
             self.assertEqual(out, "")
-        code, out = self.run_main()
-        self.assertEqual(out.strip(), review.RECOVERED_LINE.format(prefix=review.LOG_PREFIX))
+        self.assertEqual(len(self.log().splitlines()), 2, "every failed run is logged, posted or not")
+        code, chat, log = self.run_main_split()
+        self.assertEqual(chat, "**The weekly upgrade readiness review is running again.**\n")
+        self.assertEqual(log, "upgrade readiness weekly review: runs again after a failure\n")
 
     def test_a_failure_that_differs_only_in_its_numbers_is_the_same_failure(self):
         with mock.patch.object(watch, "run_report", side_effect=RuntimeError("the sandbox run timed out after 1187s")):
@@ -957,11 +987,19 @@ class TheTick(unittest.TestCase):
 
     def test_findings_the_queue_refused_are_said_in_chat_not_on_stderr(self):
         with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")):
-            code, out = self.run_main()
+            code, chat, log = self.run_main_split()
         self.assertEqual(code, 0)
         # seeded-b's five rows and its claim failed; seeded-c's clean read sent a claim that failed.
-        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 2 completeness claim(s) did not reach the findings queue:", out)
-        self.assertIn("503", out)
+        self.assertEqual(
+            chat,
+            "**Part of this week's upgrade readiness review didn't reach the findings queue.** 5 findings didn't arrive. 2 clusters keep last week's "
+            "findings as they were. The weekly report has them, and the weekly brief says so. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        # The refusals themselves are the log's, where the line points.
+        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 2 completeness claim(s) did not reach the findings queue:", log)
+        self.assertIn("503", log)
+        self.assertIn(review.REGISTRATION_IN_REPORT, self.log())
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertEqual(len(latest["registration_errors"]), 2)
         self.assertTrue(all(r["outcome"] == review.REGISTRATION_FAILED for r in latest["findings"]))
@@ -969,12 +1007,21 @@ class TheTick(unittest.TestCase):
     def test_a_record_that_cannot_be_written_still_says_what_the_queue_refused(self):
         with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")), \
                 mock.patch.object(review, "write_record", side_effect=OSError("No space left on device")):
-            code, out = self.run_main()
+            code, chat, log = self.run_main_split()
         self.assertEqual(code, 1)
-        self.assertIn("could not write the record under", out)
-        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 2 completeness claim(s) did not reach the findings queue:", out)
-        self.assertIn(review.REGISTRATION_NO_RECORD, out)
-        self.assertNotIn(review.REGISTRATION_IN_REPORT, out)
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review didn't finish.** It couldn't save its report. An admin needs to fix this before it can run; "
+            "the details are in the agent's log.\n\n"
+            "**Part of this week's upgrade readiness review didn't reach the findings queue.** 5 findings didn't arrive. 2 clusters keep last week's "
+            "findings as they were. The weekly report couldn't be saved either. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn("could not write the record under", log)
+        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 2 completeness claim(s) did not reach the findings queue:", log)
+        self.assertIn(review.REGISTRATION_NO_RECORD, log)
+        self.assertNotIn(review.REGISTRATION_IN_REPORT, log)
+        self.assertIn("No space left on device", self.log())
 
     def test_the_registration_line_names_three_refusals_and_counts_the_rest(self):
         blocked = [member(f"c{i}", "blocked", pdbs={"blocking": [budget(name=f"b{i}")]}) for i in range(4)]
@@ -1031,9 +1078,16 @@ class TheTick(unittest.TestCase):
             return self.envelope
 
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report):
-            code, out = self.run_main()
+            code, chat, log = self.run_main_split()
         self.assertEqual(code, 0)
-        self.assertIn("1 project(s) not read this week: acme-dev: clusters list: PERMISSION_DENIED", out)
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review couldn't read every project.** Not read: acme-dev. The clusters there keep last week's findings, "
+            "and this week's counts leave them out. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn("1 project(s) not read this week: acme-dev: clusters list: PERMISSION_DENIED", log)
+        self.assertIn("clusters list: PERMISSION_DENIED", self.log())
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "clusters list: PERMISSION_DENIED"})
         self.assertEqual(len(self.registered), 2)  # the read project's two members, nothing for the unlisted one
@@ -1339,9 +1393,28 @@ class TheTick(unittest.TestCase):
 
     def test_no_project_is_a_failure_line(self):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ""}), mock.patch.object(watch, "projects", return_value=[]):
-            code, out = self.run_main()
+            code, chat, log = self.run_main_split()
         self.assertEqual(code, 0)
-        self.assertIn(review.NO_PROJECTS_DETAIL, out)
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review didn't run.** It has no GCP project to read. An admin needs to fix this before it can run; "
+            "the details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn(review.NO_PROJECTS_DETAIL, log)
+        self.assertIn(review.NO_PROJECTS_DETAIL, self.log(), "the remedy is in the agent's log, where the line points")
+
+    def test_a_copy_that_failed_says_the_agent_reads_last_week_s_report(self):
+        with mock.patch.object(review, "copy_to_sandbox", return_value="the sandbox exited 1: /opt/data/upgrade-readiness/weekly is read-only"):
+            code, chat, log = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The agent can't read this week's upgrade readiness report.** Copying it for the agent failed, so the agent reads last week's report "
+            "until the next review. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn("the sandbox copy failed: the sandbox exited 1: /opt/data/upgrade-readiness/weekly is read-only", log)
 
 
 class TheRoster(unittest.TestCase):
