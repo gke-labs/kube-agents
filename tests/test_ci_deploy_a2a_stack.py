@@ -981,16 +981,20 @@ class FrontDoorSwitchTest(unittest.TestCase):
                 self.assertIn("N=6 PER=3", result.stdout)
                 self.assertIn("SETS=--set platformAgent.harness.tuning.maxSessions=6 ROUTE=\n", result.stdout)
 
-    def test_a_fair_session_run_gets_one_session_per_parallel_conversation(self) -> None:
+    def test_a_fair_session_run_gets_a_session_per_parallel_conversation_and_headroom(self) -> None:
         """At the presubmit's 4 workers the floor fits only 2 sessions at 7
         consumers each, under the eval's 4 parallel conversations, so a fair
-        run sets the cap to 4 and TASKS is created at the budget."""
+        run sets the cap to the parallelism plus the headroom (the cap evicts
+        the longest-idle pod; nothing queues) and TASKS is created at the
+        budget."""
+        headroom = int(constants()["FRONT_DOOR_SESSION_HEADROOM"])
+        self.assertGreaterEqual(headroom, 1)
         for workers in (1, 4, 6):
             with self.subTest(workers=workers):
                 result = front_door_sizing(workers, "session")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f"N={workers} PER=7", result.stdout)
-                self.assertIn(f"SETS=--set platformAgent.harness.tuning.maxSessions={workers}", result.stdout)
+                self.assertIn(f"N={workers + headroom} PER=7", result.stdout)
+                self.assertIn(f"SETS=--set platformAgent.harness.tuning.maxSessions={workers + headroom}", result.stdout)
                 self.assertIn("ROUTE=--set-string platformAgent.harness.tuning.defaultRoute=session", result.stdout)
 
     def test_a_shipped_session_run_leaves_the_cap_at_the_install_default(self) -> None:

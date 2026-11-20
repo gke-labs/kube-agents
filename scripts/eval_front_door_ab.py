@@ -21,15 +21,22 @@ per case, the hand-off ``bench-gate case`` writes (scoring.CaseVerdict.to_dict).
 This reads both and puts every case in one class:
 
 - ``regression``: A passed at least once and B never did, both scored. The
-  finding the A/B exists to catch.
+  finding the A/B exists to catch, and the repository's collapse sense (every
+  repetition failed): so A 1/3 against B 0/3 is a regression, while A 3/3
+  against B 1/3 is only ``worse``. A ``worse`` row is read by a person, not
+  gated.
 - ``worse`` / ``better``: both passed at some rate, B's lower or higher.
 - ``same``: the same pass rate.
 - ``unscored``: a side has no scored repetition (infrastructure, or the inject
   lane set every repetition aside), so the case can't be compared.
 - ``a-only`` / ``b-only``: the case ran on one side.
 
-It prints a Markdown table, and exits 1 when any case regressed (0 otherwise,
-2 on a directory it can't read), so a lane can gate on it. It reads only;
+It prints a Markdown table and exits 1 when any case regressed, 0 otherwise.
+It exits 2 when the two runs can't be compared: a directory it can't read, a
+run with no case hand-offs (often a path one level too high), every case of B
+unscored or missing (the session route broke before any case could be graded,
+which the harness classes as infrastructure), or the runs' ``front-door.txt``
+(written by the deploy) naming the doors the other way round. It reads only;
 nothing is written.
 
 Usage: scripts/eval_front_door_ab.py <run A artifacts> <run B artifacts>
@@ -46,6 +53,9 @@ from pathlib import Path
 from typing import Any
 
 CASE_GLOB = "case-*.json"
+# The deploy writes the front door it chose here (hack/ci-deploy.sh); a run
+# without it predates the switch and is taken as platform.
+FRONT_DOOR_FILE = "front-door.txt"
 
 
 class UnreadableRun(Exception):
@@ -95,6 +105,8 @@ def read_run(directory: Path) -> dict[str, Side]:
         if (
             not isinstance(passes, int)
             or not isinstance(scored, int)
+            or isinstance(passes, bool)
+            or isinstance(scored, bool)
             or passes < 0
             or scored < passes
         ):
@@ -103,6 +115,37 @@ def read_run(directory: Path) -> dict[str, Side]:
             )
         cases[data["case"]] = Side(passes=passes, scored=scored)
     return cases
+
+
+def front_door(directory: Path) -> str:
+    """The front door a run's deploy recorded, platform when it recorded none."""
+    path = directory / FRONT_DOOR_FILE
+    try:
+        return path.read_text(encoding="utf-8").strip() or "platform"
+    except FileNotFoundError:
+        return "platform"
+    except OSError as err:
+        raise UnreadableRun(f"{path}: {err}") from err
+
+
+def check_comparable(
+    run_a: Path, run_b: Path, a_run: dict[str, Side], b_run: dict[str, Side]
+) -> None:
+    """Refuse a comparison that would pass for the wrong reason."""
+    for label, directory, cases in (("A", run_a, a_run), ("B", run_b, b_run)):
+        if not cases:
+            raise UnreadableRun(
+                f"run {label} ({directory}) has no {CASE_GLOB}; is it the artifact directory itself?"
+            )
+    doors = (front_door(run_a), front_door(run_b))
+    if doors != ("platform", "session"):
+        raise UnreadableRun(
+            f"run A deployed {doors[0]} and run B {doors[1]} ({FRONT_DOOR_FILE}); A is the platform run and B the session run"
+        )
+    if all(b_run.get(case) is None or b_run[case].rate is None for case in a_run):
+        raise UnreadableRun(
+            "no case of run A was graded on run B: every one is unscored or missing, so the session route never ran a case"
+        )
 
 
 def classify(a: Side | None, b: Side | None) -> str:
@@ -164,7 +207,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        rows = compare(read_run(args.run_a), read_run(args.run_b))
+        a_run, b_run = read_run(args.run_a), read_run(args.run_b)
+        check_comparable(args.run_a, args.run_b, a_run, b_run)
+        rows = compare(a_run, b_run)
     except UnreadableRun as err:
         print(f"ERROR: {err}", file=sys.stderr)
         return 2

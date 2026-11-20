@@ -50,6 +50,7 @@ class CompareTest(unittest.TestCase):
                 write_case(a, case, passes, scored)
             for case, (passes, scored) in b_cases.items():
                 write_case(b, case, passes, scored)
+            (b / ab.FRONT_DOOR_FILE).write_text("session\n", encoding="utf-8")
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
                 code = ab.main([str(a), str(b)])
@@ -120,6 +121,36 @@ class CompareTest(unittest.TestCase):
                 self.assertEqual(ab.main([str(a), str(a)]), 2)
                 self.assertEqual(ab.main([str(Path(tmp, "missing")), str(a)]), 2)
             self.assertIn("case-bad.json", err.getvalue())
+
+    def test_a_run_b_where_nothing_was_graded_cannot_pass(self) -> None:
+        """A session route that broke before any case ran leaves every B case
+        unscored, which must not read as no regression."""
+        code, _, err = self.run_ab({"held": (3, 3), "other": (2, 3)}, {"held": (0, 0)})
+        self.assertEqual(code, 2)
+        self.assertIn("never ran a case", err)
+
+    def test_an_empty_run_cannot_pass(self) -> None:
+        code, _, err = self.run_ab({}, {"held": (3, 3)})
+        self.assertEqual(code, 2)
+        self.assertIn("has no case-*.json", err)
+
+    def test_swapped_runs_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp, "a"), Path(tmp, "b")
+            for d, door in ((a, "session"), (b, "platform")):
+                d.mkdir()
+                write_case(d, "held", 3, 3)
+                (d / ab.FRONT_DOOR_FILE).write_text(door, encoding="utf-8")
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                self.assertEqual(ab.main([str(a), str(b)]), 2)
+            self.assertIn("run A deployed session and run B platform", err.getvalue())
+
+    def test_booleans_are_not_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "case-x.json").write_text(json.dumps({"case": "x", "passes": True, "scored": 3}), encoding="utf-8")
+            with self.assertRaises(ab.UnreadableRun):
+                ab.read_run(Path(tmp))
 
     def test_counts_that_do_not_add_up_are_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
