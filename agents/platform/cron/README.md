@@ -502,11 +502,14 @@ retires once that list was read.
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
 findings bypass the drift floor so single-zone node-pool confinement still
-alerts once per refresh window; `LEEWAY_WATCH_MIN_SEVERITY`,
+alerts once per refresh window. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
-`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
-runs started by hand in the pod with `--dry-run` (the operator's
-`spec.deployment.env` allowlist does not carry them). The report's
+`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` set the
+scheduled sweep's alert thresholds and re-post interval from the `PlatformAgent` CR's
+`spec.deployment.env` (the operator's allowlist carries them), and also work
+on runs started by hand in the pod with `--dry-run`. `LEEWAY_WATCH_CLUSTERS`,
+`LEEWAY_WATCH_PROJECTS` and `LEEWAY_WATCH_HOME` are not carried, so they apply
+only to runs started by hand. The report's
 topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
 `leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
 key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,

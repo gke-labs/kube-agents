@@ -5508,6 +5508,26 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
 		"FINDINGS_NONCRITICAL_MAX":        {},
 
+		// The daily `leeway-watch` sweep's alert thresholds (`leeway_watch.py`,
+		// a `no_agent` cron script): the lowest severity it reports, the
+		// lowest drift and fullest-zone share a topology finding needs, how far
+		// past its pigeonhole floor an unknown-cause skew must be, and how many
+		// days pass before an open finding is posted again. Each is a severity
+		// word or a number checked against a range, and a value that does not
+		// parse or is out of range means its default, so an arbitrary value
+		// only filters which findings the sweep posts and keeps in its report
+		// (and the `topology-skew` topic that carries the report), and how
+		// often it re-posts them, at most once per daily run. That is the
+		// point of setting them, and it reaches nothing else: no value names a
+		// cluster, a path or a credential. LEEWAY_WATCH_CLUSTERS and
+		// LEEWAY_WATCH_PROJECTS, which choose what the sweep reads, and
+		// LEEWAY_WATCH_HOME, a path, are deliberately not here.
+		"LEEWAY_WATCH_MIN_DRIFT":             {},
+		"LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR": {},
+		"LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE":  {},
+		"LEEWAY_WATCH_MIN_SEVERITY":          {},
+		"LEEWAY_WATCH_REFRESH_DAYS":          {},
+
 		// Seconds a workload's admitted event folds its later events into
 		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
 		// session_kv_server.py). The container carries the default
