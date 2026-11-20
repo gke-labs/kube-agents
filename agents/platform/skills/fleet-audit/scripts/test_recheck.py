@@ -367,10 +367,19 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(len(recheck.recheck_for(recipe).steps), 2)
         with self.assertRaises(KeyError):
             recheck.recheck_for(recipe._replace(recheck_siblings="no-such-sibling"))
-        # blocking-pdb judges against the autoscaler's floor, so the read must include autoscalers.
-        short = recipe._replace(recheck_kinds="deployments,poddisruptionbudgets", recheck_siblings="blocking-pdb")
-        with self.assertRaises(ValueError):
-            recheck.recheck_for(short)
+        full = "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers"
+        # Each PDB sibling refuses a read missing any kind it counts: the
+        # autoscaler floor, and every workload kind a budget can select (a
+        # DaemonSet under the budget makes it unscalable).
+        for sibling, missing in (("blocking-pdb", "horizontalpodautoscalers"), ("blocking-pdb", "daemonsets"),
+                                 ("blocking-pdb", "statefulsets"), ("pdb-overlapping", "daemonsets"),
+                                 ("pdb-overlapping", "poddisruptionbudgets")):
+            kinds = ",".join(k for k in full.split(",") if k != missing)
+            with self.subTest(sibling=sibling, missing=missing), self.assertRaises(ValueError):
+                recheck.recheck_for(recipe._replace(recheck_kinds=kinds, recheck_siblings=sibling))
+        # A group-qualified name reads the same kind.
+        qualified = full.replace("poddisruptionbudgets", "poddisruptionbudgets.policy")
+        recheck.recheck_for(recipe._replace(recheck_kinds=qualified, recheck_siblings="blocking-pdb pdb-overlapping"))
 
     def test_a_workload_step_runs_the_collectors_function_for_that_id(self):
         # The step is the collector's CheckSpec, not a copy of it.

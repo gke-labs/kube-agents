@@ -277,21 +277,27 @@ def narrowed_cluster_check(slug: str, context_key: str) -> Step:
 #: that selects what it may see, the context key that selection replaces, and
 #: the kinds the read must include for the check to judge rightly. A recipe
 #: naming a sibling not here, or reading too little for it, fails at import.
+#: Every workload kind a budget can select. Both PDB siblings count the
+#: namespace's workloads: `blocking-pdb` reads whether a budget also selects a
+#: DaemonSet (which makes it unscalable) and sums the floors of every workload
+#: it selects, and `pdb-overlapping` matches budgets against workloads.
+#: Leaving one out of the read turns a drain-blocking budget into `clean`.
+WORKLOAD_KINDS = frozenset({"deployments", "statefulsets", "daemonsets"})
 SIBLING_NARROWING: dict[str, tuple[Step, str, frozenset[str]]] = {
     # A second budget over the same pods makes the eviction API refuse them
     # all, so a fix that adds one beside another is not clean.
-    "pdb-overlapping": (select_target_workload, "workloads", frozenset({"poddisruptionbudgets"})),
+    "pdb-overlapping": (select_target_workload, "workloads", WORKLOAD_KINDS | {"poddisruptionbudgets"}),
     # Without autoscalers read, `blocking-pdb` compares against `spec.replicas`
-    # rather than the autoscaler's floor, and a budget that blocks every drain
-    # would read clean.
-    "blocking-pdb": (select_budgets, "pdbs", frozenset({"poddisruptionbudgets", "horizontalpodautoscalers"})),
+    # rather than the autoscaler's floor.
+    "blocking-pdb": (select_budgets, "pdbs", WORKLOAD_KINDS | {"poddisruptionbudgets", "horizontalpodautoscalers"}),
 }
 
 
 def recheck_for(recipe: registry.Recipe) -> Recheck:
     """A workload-scoped recipe's re-check: find the target, run its own check, then each sibling narrowed."""
     steps: list[Step] = [in_scope_workload, workload_check(recipe.kind)]
-    read = set(recipe.recheck_kinds.split(","))
+    # `poddisruptionbudgets.policy` reads the same kind as `poddisruptionbudgets`.
+    read = {kind.split(".", 1)[0] for kind in recipe.recheck_kinds.split(",")}
     for sibling in recipe.siblings():
         select, context_key, needs = SIBLING_NARROWING[sibling]
         if not needs <= read:
