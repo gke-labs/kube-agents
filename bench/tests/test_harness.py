@@ -1955,25 +1955,6 @@ def instant_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
 
 
-@pytest.fixture(autouse=True)
-def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Keep settling a card off whatever cluster kubectl is pointed at.
-
-    Settling reads the card's artifacts back and then deletes them, both by
-    exec-ing into the agent pod. Left live, the suite would issue a ``kubectl
-    exec`` per delegating test against the developer's current context -- slow,
-    and a delete aimed at a real pod. Returns the scripts that would have run.
-    """
-    scripts: list[str] = []
-
-    def _record(script: str, timeout: float) -> str:
-        scripts.append(script)
-        return ""
-
-    monkeypatch.setattr(harness, "_agent_shell", _record)
-    return scripts
-
-
 def _is_purge(script: str) -> bool:
     return harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script
 
@@ -6961,6 +6942,52 @@ def test_a_run_whose_prompt_names_the_agent_cluster_without_a_context_is_a_setup
     assert "AGENT_CLUSTER_CONTEXT" in result.errors[0]
     snap = transcript.get()
     assert snap is not None and snap.output == ""
+
+
+# ------------------------------------------------ the job's GitOps repository in a prompt
+
+
+def test_the_gitops_repo_placeholder_expands_from_bench_gitops_repo(monkeypatch):
+    monkeypatch.setenv("BENCH_GITOPS_REPO", "gke-agentic/evals-3-infra")
+    expanded, problem = harness.expand_gitops_repo_placeholder("open it on {{BENCH_GITOPS_REPO}}, beside the manifest")
+    assert problem is None
+    assert expanded == "open it on gke-agentic/evals-3-infra, beside the manifest"
+
+
+def test_a_prompt_without_the_gitops_repo_placeholder_needs_no_repository(monkeypatch):
+    monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+    assert harness.expand_gitops_repo_placeholder("list the pods") == ("list the pods", None)
+    # The pilot's own placeholder is not this one, and is left for its wrapper.
+    assert harness.expand_gitops_repo_placeholder("in {{GITOPS_REPO}}") == ("in {{GITOPS_REPO}}", None)
+
+
+def test_an_unset_gitops_repo_is_a_setup_problem_not_the_models(monkeypatch):
+    prompt = "open it on {{BENCH_GITOPS_REPO}}"
+    for value in (None, "", "  ", "gke-agentic/evals 3"):
+        if value is None:
+            monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+        else:
+            monkeypatch.setenv("BENCH_GITOPS_REPO", value)
+        expanded, problem = harness.expand_gitops_repo_placeholder(prompt)
+        assert problem is not None and "BENCH_GITOPS_REPO" in problem, value
+        assert expanded == prompt
+
+
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_a_run_whose_prompt_names_the_gitops_repo_without_one_is_a_setup_failure(monkeypatch, value):
+    # Infrastructure naming the variable, and nothing sent: an empty repository
+    # is never rendered into the prompt.
+    if value is None:
+        monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+    else:
+        monkeypatch.setenv("BENCH_GITOPS_REPO", value)
+    sent: list[str] = []
+    monkeypatch.setattr(harness.inject, "_request", lambda url, *a, **k: sent.append(url) or {})
+    result = harness.KubeAgentsHarness().run("open it on {{BENCH_GITOPS_REPO}}")
+    assert result.output == ""
+    assert result.errors and result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "BENCH_GITOPS_REPO" in result.errors[0]
+    assert sent == []
 
 
 # ------------------------------------------------ a fleet fixture's cluster in a prompt

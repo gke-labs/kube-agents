@@ -62,7 +62,7 @@ rows="$(printf '%s\n' "${relabelled}" | awk -F '\t' '{f = index($2, "`") ? "``" 
 # shipped, still pending because its relabel has not merged, takes that release.
 releases="$(printf '%s\n' "${relabelled}" | cut -f1 | sort -u -t. -k1,1n -k2,2n -k3,3n | paste -sd, - | sed 's/,/, /g')"
 commit_message="docs(upgrade): relabel the pending rows ${releases} shipped"
-pr_title="docs(upgrade): relabel the pending rows ${releases} shipped, fixing main's Documentation Checks"
+pr_title="docs(upgrade): relabel the pending rows ${releases} shipped"
 
 git switch -C "${RELABEL_BRANCH}"
 # Set GIT_AUTHOR_*/GIT_COMMITTER_* inline so caller env and author.*/committer.* git config cannot override.
@@ -86,11 +86,11 @@ git ${push_auth[@]+"${push_auth[@]}"} push --force origin "HEAD:refs/heads/${REL
 IFS= read -r -d '' body <<EOF || true
 ## Summary
 
-These rows of the upgrade page's breaking-changes table still said \`pending\`, though a release now contains each. This change relabels each with the first release that contains it. Approving it turns main's docs check green again.
+These rows of the upgrade page's breaking-changes table still said \`pending\`, though a release now contains each. This change relabels each with the first release that contains it. Merging it relabels the rows before main's Documentation Checks starts failing, 48 hours after the release.
 
 ## Why This Change
 
-Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main.
+Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main once the release is 48 hours old.
 
 ## What Changed
 

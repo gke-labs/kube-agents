@@ -54,8 +54,8 @@ references.
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
 than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner, and the
-harness fills in the cluster placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
-`{{FLEET_CLUSTER_*:<role>}}`).
+harness fills in the placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
+`{{FLEET_CLUSTER_*:<role>}}`, `{{BENCH_GITOPS_REPO}}`).
 A first line of `[bench:slack-question-wake]` makes the run a replay of the wake a card blocked
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
@@ -95,6 +95,12 @@ schedule a stopped ask or a replay read only a prompt's first line, so a combine
 the wrong phase; combining one is a later change.
 It runs only over the inject transport (the door's `profile` and `parameters`), which every CI
 lane uses; the api transport errors on it.
+One field is not a parameter: `intent=confirm` submits the ask as a structured confirm, the door's
+`"intent":"confirm"`, so the gateway sets the task's `changeRequested`, which a profile's write path
+(the `cluster` persona's version-control skill) needs. `confirm` is its only value, and the lint
+refuses any other; a directive without it sends a typed message. The door takes the confirm only
+where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
+which is infrastructure, since the agent never saw the ask.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -360,7 +366,7 @@ calls include one that may hold more than one line, which the row joins with a s
 with a clipped code-tool call, and a card whose calls did not reach the trajectory is read from its
 rows alone); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
-it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
+it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make (a logged row joins the lines of one call with a space, so a word of a later line counts for the command of the first), such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
@@ -372,10 +378,12 @@ which a kanban worker gets in its newest tool result at 90% of a finite cap and 
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
 the cap closes with `Iteration budget exhausted (N/M)`; `budget` is the `M` every such record must
 name; a worker that finishes inside 90% of its cap records neither, so the check is for a card
-written to outrun the cap; a run whose cards have no run rows, in which no attempt
-ran out and none completed either (the harness archives a card still running at its delegation
-ceiling, which closes the attempt `reclaimed`), or whose capture recorded gaps and no attempt ran
-out, is `status: "error"`),
+written to outrun the cap; a run with no worker capture to read, a run in which no record names a
+cap and no attempt has the outcome `completed` (no run rows, or the harness archives a card still
+running at its delegation ceiling, which closes the attempt `reclaimed`), or a run in which no
+record names a cap and either the capture recorded gaps or the workers' captured results, one or
+more, are all withheld or absent, is `status: "error"`; any other run in which no record names a
+cap is a fail),
 `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question
