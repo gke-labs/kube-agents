@@ -428,7 +428,11 @@ leave open:
   The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
   broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
   `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. Its bound is
-  its `timeoutSeconds` within the task's deadline, and its process group is killed at the bound. Its
+  its `timeoutSeconds` within the task's deadline. It starts in a session of its own, and its kill (at
+  the bound, on a cancel, abandon or SIGTERM, and once more after it exits) SIGKILLs its process group
+  and every process `/proc` lists in its session; where the worker is the container's pid 1, as the
+  worker image's entrypoint is, it also kills every other process in the pod's pid namespace, which
+  reaches a process that started a session of its own, and reaps them. Its
   stdout, capped at 64 KiB, is the text result. Its stderr is read, capped at 16 KiB, and only its size is logged: a script can print a credential, and the log is not where a redactor's misses should land. Exit 0
   completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
   A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose

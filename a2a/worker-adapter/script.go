@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -43,6 +44,14 @@ import (
 // capped, is the task's text result; its stderr is read, capped, and only its
 // size is logged.
 // Exit 0 completes the task, and anything else fails it.
+//
+// The script starts in its own session, so its session and process group ids
+// are its pid. Its kill (at its bound, at the worker's end, on abandon or
+// cancel, and once more after it exits) SIGKILLs its process group and every
+// process /proc lists in its session (no /proc, as on macOS, skips that
+// sweep); and where the worker is the container's init (pid 1), every other
+// process in the pid namespace too, which reaches a process that left the
+// session, after which the worker reaps what it killed.
 
 const (
 	// scriptStdoutCap bounds the text result; past it the output is cut and
@@ -53,12 +62,20 @@ const (
 	// scriptParamPrefix is the only way a task's input reaches a script's
 	// environment.
 	scriptParamPrefix = "KA_PARAM_"
-	// scriptKillGrace is how long a script's process group has between the
+	// scriptKillGrace is how long a script's processes have between the
 	// kill and the worker giving up on its pipes.
 	scriptKillGrace = 5 * time.Second
 	// scriptTruncated marks a result cut at scriptStdoutCap.
 	scriptTruncated = "\n[output truncated]"
+	// sessionSweepPasses bounds how many times killSession lists the
+	// session, and sessionSweepPoll is the pause between passes: a process
+	// can fork while a pass runs, and a killed one is listed until it dies.
+	sessionSweepPasses = 20
+	sessionSweepPoll   = 10 * time.Millisecond
 )
+
+// procRoot is where killSession lists processes.
+const procRoot = "/proc"
 
 // scriptParamName is a parameter's name as a script reads it, after
 // KA_PARAM_: upper case, at most 32 characters.
@@ -332,9 +349,77 @@ type scriptSignals struct {
 	cancel    <-chan struct{}
 }
 
-// execScript runs sr with no shell, in its own process group, which is
-// killed whole at its timeout, at ctx's end, on abandon or cancel, and once
-// more after the script exits, so nothing it started outlives it.
+// killSession SIGKILLs every process but the worker that procRoot lists in
+// session sid, pass after pass until a pass finds none. A session's id is
+// its leader's pid, and the kernel doesn't hand out a pid still in use as a
+// session's id, so while anything is left in the session this reaches only
+// that. Where procRoot can't be read it does nothing.
+func killSession(procRoot string, sid int) {
+	self := os.Getpid()
+	for range sessionSweepPasses {
+		found := false
+		for _, pid := range sessionMembers(procRoot, sid) {
+			if pid == self {
+				continue
+			}
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			found = true
+		}
+		if !found {
+			return
+		}
+		time.Sleep(sessionSweepPoll)
+	}
+}
+
+// sessionMembers is every live (not zombie) process procRoot lists whose
+// /proc/<pid>/stat session field (the sixth) is sid.
+func sessionMembers(procRoot string, sid int) []int {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "stat"))
+		if err != nil {
+			continue // it exited
+		}
+		if got, live, ok := statSession(string(b)); ok && live && got == sid {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// statSession is the session id in a /proc/<pid>/stat line, and whether the
+// process is live (neither zombie nor dead). The command name, in
+// parentheses, can hold spaces and parentheses itself, so the fields are
+// read after its last ")": state, ppid, pgrp, session.
+func statSession(stat string) (sid int, live, ok bool) {
+	i := strings.LastIndexByte(stat, ')')
+	if i < 0 {
+		return 0, false, false
+	}
+	f := strings.Fields(stat[i+1:])
+	if len(f) < 4 {
+		return 0, false, false
+	}
+	sid, err := strconv.Atoi(f[3])
+	if err != nil {
+		return 0, false, false
+	}
+	return sid, f[0] != "Z" && f[0] != "X", true
+}
+
+// execScript runs sr with no shell, in its own session, which is killed
+// whole at its timeout, at ctx's end, on abandon or cancel, and once more
+// after the script exits, so nothing it started outlives it (see the
+// comment at the top of this file for what the kill reaches).
 func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptResult {
 	runCtx, cancel := context.WithTimeout(ctx, sr.timeout)
 	defer cancel()
@@ -343,14 +428,21 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	if cmd.Env == nil {
 		cmd.Env = []string{}
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	killGroup := func() error {
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return err
+	// Setsid makes the script a session leader, so its session id and its
+	// process group id are both its pid.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	killAll := func() error {
+		groupErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		killSession(procRoot, cmd.Process.Pid)
+		if adapterPID() == containerInitPID {
+			killEveryoneButMe()
+		}
+		if groupErr != nil && !errors.Is(groupErr, syscall.ESRCH) {
+			return groupErr
 		}
 		return os.ErrProcessDone
 	}
-	cmd.Cancel = killGroup
+	cmd.Cancel = killAll
 	cmd.WaitDelay = scriptKillGrace
 	stdout := &cappedBuffer{max: scriptStdoutCap}
 	stderr := &tailBuffer{max: scriptStderrCap}
@@ -382,7 +474,13 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 		}
 	}()
 	err := cmd.Wait()
-	_ = killGroup()
+	_ = killAll()
+	if adapterPID() == containerInitPID {
+		// Only now, with the script itself reaped by Wait: as init the
+		// worker inherits every orphan the kill left, and an unreaped one
+		// stays a zombie.
+		reapKilledChildren(leftoverReapBound)
+	}
 	close(stopWatch)
 	<-watchDone
 	res.abandoned, res.canceled = watchedAbandon, watchedCancel
@@ -403,8 +501,8 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	case err == nil:
 	case errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil:
 		// The script exited, and something it started held its pipes
-		// past the grace: the exit is the script's, and the group is
-		// killed above.
+		// past the grace: the exit is the script's, and what it started
+		// is killed above.
 		res.exitCode = cmd.ProcessState.ExitCode()
 	case errors.As(err, &exitErr):
 		res.exitCode = exitErr.ExitCode()
