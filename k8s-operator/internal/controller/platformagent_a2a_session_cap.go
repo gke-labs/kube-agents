@@ -61,14 +61,17 @@ import (
 // maxSessions: the provision Job will create TASKS at the width maxSessions
 // needs (a2aTasksMaxConsumers), so there is
 // nothing to fit, and a fresh install renders the spec's route from its first
-// pass. Only a provisioned bus with no stored cap, an existing install's
-// first pass after it opts in, waits: it renders the session route at the
-// configured cap, holds the provision Job, and says so in the
-// SessionCapFitted condition; the reconcile's requeue for the held Job brings
-// the pass that reads it. "No TASKS stream" counts as a reading only on a bus
-// never provisioned. On a provisioned bus a missing TASKS is a server that has
-// not caught up, or a stream deleted for recreation, and the pass treats it as
-// unreadable.
+// pass. Only a provisioned bus with no stored cap whose width can't be read
+// (the monitoring endpoint doesn't answer, or a migration is under way),
+// an existing install's first pass after it opts in, waits: it renders the
+// session route at the configured cap, holds the provision Job, and says so
+// in the SessionCapFitted condition; the reconcile's requeue for the held
+// Job brings the pass that reads it. A bus that answers without TASKS, a
+// stream deleted for recreation or one a restarted server hasn't recovered
+// yet, keeps a stored cap. With nothing stored it is a reading of no
+// stream, as on a bus never provisioned: the Job runs and creates TASKS at
+// maxSessions' width, and its own check refuses a stream that turns out to
+// be there and narrower.
 //
 // A stored cap's reading is reused for sessionCapReadingTTL, so a settled
 // install does not make a blocking GET of the bus on every pass. A served CRD
@@ -133,7 +136,7 @@ const (
 	sessionCapPrunedMessage = "the served PlatformAgent CRD drops status.effectiveSessionCap, so the session route can't keep its fitted cap " +
 		"and plain conversations stay with platform; apply the chart's crds/ (upgrade.sh does) and the next probe engages the session route"
 	sessionCapWaitingMessage = "the session cap waits on the A2A bus's TASKS width, which could not be read yet; " +
-		"routing and the session cap stay as they were and the provision Job waits until it is read"
+		"until it is, plain conversations go to session pods at spec.harness.tuning.maxSessions and the provision Job waits"
 
 	// sessionCapEventFormat is the Warning recorded when the fit changes:
 	// the live width, what maxSessions needs on the session route, the
@@ -182,8 +185,11 @@ func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *
 	}
 	tasks, ok := streams[a2aTasksStream]
 	switch {
-	case !ok && a2aBusExisted(agent):
-		return 0, false, false
+	// A bus that answers without TASKS, provisioned or not and with no
+	// migration under way (busMigrationHoldsProvision, above), is a reading
+	// of no stream: the provision Job creates TASKS at maxSessions' width
+	// (a2aTasksMaxConsumers), so nothing waits on it. Waiting would hold the
+	// one Job that makes the stream.
 	case ok && tasks.MaxConsumers == 0:
 		// Unreported: the server sent no config for TASKS. A live stream
 		// reports -1 for no limit, never 0.
@@ -261,11 +267,12 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 		// cap the store can't keep.
 		logf.FromContext(ctx).Info("the served PlatformAgent CRD drops status.effectiveSessionCap; plain conversations stay with platform until the CRD is updated")
 		r.sessionCapPruned.Store(key, time.Now())
+		// Only the version is carried: the render copy holds status the
+		// store doesn't (resolvedUniverseDomain), and holdSessionCapPruned
+		// sets the cap and the condition.
 		agent.ResourceVersion = written.ResourceVersion
-		agent.Status = written.Status
 		if instance != nil {
 			instance.ResourceVersion = written.ResourceVersion
-			instance.Status = *written.Status.DeepCopy()
 		}
 		r.holdSessionCapPruned(ctx, agent, instance)
 		return
@@ -368,8 +375,14 @@ func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *a
 	stored := agent.Status.EffectiveSessionCap
 	configured := resolveA2AMaxSessions(agent)
 	width, present, known := r.a2aTasksLiveWidth(ctx, agent, stored != nil)
+	// A provisioned bus that answers without TASKS keeps a stored cap: the
+	// server may not have recovered a stream that is there and narrower.
+	// With nothing stored it waits on nothing: the provision Job creates
+	// TASKS at maxSessions' width, and holding it would hold the one Job
+	// that makes the stream.
+	absentOnExisting := known && !present && a2aBusExisted(agent)
 	switch {
-	case !known && stored != nil:
+	case (!known || absentOnExisting) && stored != nil:
 		kept := *stored
 		var cond *metav1.Condition
 		if existing := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType); existing != nil {

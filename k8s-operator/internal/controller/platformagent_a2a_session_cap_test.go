@@ -527,6 +527,58 @@ func TestTheSessionCapSignalIsGatedOnChange(t *testing.T) {
 // provision Job is not created and the gateway routes to session at
 // maxSessions; once the width reads, the Job is created at the fitted cap
 // and the gateway's cap follows it.
+// A provisioned bus that answers without TASKS (deleted for recreation, as
+// the provision Job's refusal tells an admin to do) and no stored cap: the
+// provision Job is the one thing that creates TASKS, so it is not held. The
+// cap is maxSessions, and the Job runs; on platform it runs as on main.
+func TestAProvisionedBusWithoutTasksRunsTheProvisionJob(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		route *string
+		want  string
+	}{
+		{"session route", ptr.To(agentv1alpha1.DefaultRouteSession), agentv1alpha1.DefaultRouteSession},
+		{"platform route", nil, agentv1alpha1.DefaultRoutePlatform},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := sessionRouteTestAgent()
+			agent.Spec.Harness.Tuning.DefaultRoute = tc.route
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+			r, cl, req := a2aGateTestReconciler(t, agent)
+			r.busStreamState = noTasks
+			ctx := context.Background()
+			for i := 0; i < 3; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d: %v", i+1, err)
+				}
+			}
+			letTheGatewayThrough(t, ctx, cl, r, req, agent)
+			stored := storedCapAgent(t, cl, agent)
+			if c := meta.FindStatusCondition(stored.Status.Conditions, sessionCapFittedConditionType); c != nil {
+				t.Errorf("SessionCapFitted = %s/%s on a bus that answers without TASKS, want none", c.Status, c.Reason)
+			}
+			jobs := &batchv1.JobList{}
+			if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs.Items) != 1 || jobs.Items[0].Name != buildA2AProvisionJob(stored).Name {
+				t.Fatalf("%d provision Jobs, want the one that creates TASKS", len(jobs.Items))
+			}
+			gw := &appsv1.Deployment{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, gw); err != nil {
+				t.Fatal(err)
+			}
+			env := gw.Spec.Template.Spec.Containers[0].Env
+			if v, _ := envValueCount(env, a2aDefaultAddresseeEnvVar); v != tc.want {
+				t.Errorf("the gateway routes to %q, want %q", v, tc.want)
+			}
+			if v, _ := envValueCount(env, "A2A_MAX_SESSIONS"); v != "10" {
+				t.Errorf("A2A_MAX_SESSIONS = %q, want maxSessions", v)
+			}
+		})
+	}
+}
+
 func TestTheProvisionJobWaitsForTheBusWidth(t *testing.T) {
 	agent := sessionRouteTestAgent()
 	// An existing install, provisioned before it opted in.
