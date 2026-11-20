@@ -1438,6 +1438,20 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
+# gitops-drift-own-release-digest (#3613): an upgrade's writes to its own Helm
+# release reach the detector while it is pulling, so they are live and the
+# backlog digest does not take them; the detector sends them to the digest by
+# what they name. The fixture names real objects of the install's release and
+# writes nothing to them. Graded on the fixture's read of the ledger and the
+# board: the release writes are digested once the same principal's Helm
+# release record says an upgrade is under way, and a kubectl write to a
+# kube-agents CRD with them, by the principal's count; a kubectl write to a
+# release object, a Helm write outside the release, a burst of three by a
+# principal with no upgrade, and a write after the upgrade's end are carded. Each repetition spends six drift alerts. Holds
+# the infra lock; 900s, the drift band; listed in nightly-main-b.txt to
+# balance the stack chains.
+./tasks/gitops-drift-own-release-digest/task.yaml
+
 # A drift to an object git does not declare (#3972): a namespace created by
 # hand, its Pod Security level loosened, and no GitOps marker on it. Every
 # sibling's object is GitOps-managed, so an agent that offers "revert to what

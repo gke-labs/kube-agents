@@ -4941,6 +4941,9 @@ unit_cost_hint() {
     # The same shape again, plus a detector stop and relaunch before the live
     # card wait. Unmeasured; priced with its siblings.
     gitops-drift-backlog-digest) echo 900 ;;
+    # The same shape with no detector stop: a publish, a card wait and the
+    # digest's settle. Unmeasured; priced with its siblings.
+    gitops-drift-own-release-digest) echo 900 ;;
     # The two CUJ 1 halves (#2889), registered 2026-10-20. Same shape as
     # gitops-drift-out-of-band-triage and gitops-drift-noise-filtered-triage
     # -- infra lock, a plant, an inject and a card wait -- and the band is a

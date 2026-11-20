@@ -6640,6 +6640,70 @@ func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
 	}
 }
 
+// The detector is told which Helm release is the install's own from the
+// annotations Helm stamps on the PlatformAgent, and is told nothing when the CR
+// does not carry both as names: the detector refuses to start on a malformed
+// --own-release, so a value it could not parse must never reach it.
+func TestCredentialProxyNamesTheOwnReleaseFromTheHelmAnnotations(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        string
+	}{
+		{
+			name: "both annotations",
+			annotations: map[string]string{
+				"meta.helm.sh/release-name":      "kube-agents",
+				"meta.helm.sh/release-namespace": "kubeagents-system",
+			},
+			want: "kubeagents-system/kube-agents",
+		},
+		{name: "no annotations", annotations: nil, want: ""},
+		{
+			name:        "the name alone",
+			annotations: map[string]string{"meta.helm.sh/release-name": "kube-agents"},
+			want:        "",
+		},
+		{
+			name:        "the namespace alone",
+			annotations: map[string]string{"meta.helm.sh/release-namespace": "kubeagents-system"},
+			want:        "",
+		},
+		{
+			name: "a name that would not parse as namespace/name",
+			annotations: map[string]string{
+				"meta.helm.sh/release-name":      "kube/agents",
+				"meta.helm.sh/release-namespace": "kubeagents-system",
+			},
+			want: "",
+		},
+		{
+			name: "a namespace that is not a name",
+			annotations: map[string]string{
+				"meta.helm.sh/release-name":      "kube-agents",
+				"meta.helm.sh/release-namespace": "kubeagents system",
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			agent.Annotations = tt.annotations
+
+			var got []string
+			for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+				if e.Name == "DRIFT_DETECTOR_OWN_RELEASE" {
+					got = append(got, e.Value)
+				}
+			}
+			if len(got) != 1 || got[0] != tt.want {
+				t.Errorf("DRIFT_DETECTOR_OWN_RELEASE = %q, want exactly one %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // An unconfigured detector still gets its switch, set to "false" rather than
 // left out, and gets none of its settings. Both halves matter. The switch is
 // there so that a Deployment says whether the detector is meant to be running;
@@ -6648,7 +6712,7 @@ func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
 // harness triple under five more names on every credential proxy in the fleet
 // for a process that is not started.
 //
-// The CR supplies all six here to make the second half a real assertion rather
+// The CR supplies all seven here to make the second half a real assertion rather
 // than an observation about a fixture: the names are reserved in
 // mergeCredentialProxyEnv whether or not the operator writes them, so an entry
 // the operator skips has to be dropped, not passed through.
@@ -6662,6 +6726,7 @@ func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
 			{Name: "DRIFT_DETECTOR_CLUSTER_NAME", Value: "cr-supplied"},
 			{Name: "DRIFT_DETECTOR_SUBSCRIPTION", Value: "cr-supplied"},
 			{Name: "DRIFT_DETECTOR_GITOPS_MANAGERS", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_OWN_RELEASE", Value: "cr-supplied"},
 		},
 	}
 
@@ -6686,7 +6751,7 @@ func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
 // Same property as the watcher's switch, and the same failure mode if it breaks:
 // `containers[].env` is a listType=map keyed on name, so a duplicate makes the
 // Deployment unappliable and the operator stops reconciling altogether. The
-// operator appends these six after mergeCredentialProxyEnv runs, so the only
+// operator appends these seven after mergeCredentialProxyEnv runs, so the only
 // thing standing between a CR naming one of them and a frozen reconcile is the
 // reserved list.
 func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
@@ -6697,6 +6762,7 @@ func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
 		"DRIFT_DETECTOR_CLUSTER_NAME",
 		"DRIFT_DETECTOR_SUBSCRIPTION",
 		"DRIFT_DETECTOR_GITOPS_MANAGERS",
+		"DRIFT_DETECTOR_OWN_RELEASE",
 	}
 
 	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})

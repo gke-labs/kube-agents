@@ -26,16 +26,16 @@ longer than 240 characters is cut there and ends in ` ... [truncated]`.
 Each row carries `id`, `timestamp` (UTC), `cluster`, `namespace`, `kind`, `name`, `reason`,
 `severity`, `message`, `session_id`, `pull_request`, `duplicate_of` and `status`:
 
-| `status`         | What became of the event                                                                      |
-| ---------------- | --------------------------------------------------------------------------------------------- |
-| `injected`       | posted to chat (or dispatched headless) and its triage queued or started                      |
-| `triage_aborted` | posted, but the triage turn never started                                                     |
-| `undelivered`    | admitted, but the chat post failed; it may not have been seen                                 |
-| `filtered`       | Info: held back by the severity gate, never offered to chat                                   |
-| `suppressed`     | Warning or Critical, not posted and not for any reason below: the daily alert ceiling, mostly |
-| `folded`         | a repeat of the row named in `duplicate_of`, no new alert                                     |
-| `backlog`        | a late drift change, digested or owed a digest (a card on a headless install), no triage turn |
-| `excluded`       | held back by an alert-exclude rule                                                            |
+| `status`         | What became of the event                                                                                                                                   |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `injected`       | posted to chat (or dispatched headless) and its triage queued or started                                                                                   |
+| `triage_aborted` | posted, but the triage turn never started                                                                                                                  |
+| `undelivered`    | admitted, but the chat post failed; it may not have been seen                                                                                              |
+| `filtered`       | Info: held back by the severity gate, never offered to chat                                                                                                |
+| `suppressed`     | Warning or Critical, not posted and not for any reason below: the daily alert ceiling, mostly                                                              |
+| `folded`         | a repeat of the row named in `duplicate_of`, no new alert                                                                                                  |
+| `backlog`        | a drift change sent to the digest (late, or a write to kube-agents' own objects), digested or owed a digest (a card on a headless install), no triage turn |
+| `excluded`       | held back by an alert-exclude rule                                                                                                                         |
 
 ## The questions this gets asked
 
