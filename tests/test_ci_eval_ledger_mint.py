@@ -35,10 +35,14 @@ import re
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 from tests.testing.common import (
     RENEWAL_AFTER_STALL_SECONDS,
+    RENEWAL_NAP_SETTLE_SECONDS,
+    RENEWAL_NAP_STOP_BOUND_SECONDS,
+    RENEWAL_NAP_TICK_SECONDS,
     RENEWAL_WRITE_STALL_SECONDS,
     STALLED_RENEWAL_WRITE,
     get_isolated_test_env,
@@ -378,9 +382,30 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertIn("UNSET=\n", out + "\n")
         self.assertNotIn("tok-renewed", proc.stderr, "a renewal never prints the token")
 
+    def test_a_stop_during_a_nap_returns_at_once_and_leaves_no_nap(self):
+        # With the real sleep and a long tick: a stop that waited the nap out,
+        # or a nap left running with the run's output open, takes the tick.
+        began = time.monotonic()
+        proc = self._run(
+            """\
+            unset -f sleep
+            LEDGER_TOKEN_RENEW_TICK_SECONDS="${NAP_TICK_SECONDS}"
+            start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+            sleep "${NAP_SETTLE_SECONDS}"
+            stop_ledger_token_renewal "${TOKEN_FILE}"
+            [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+            """,
+            NAP_TICK_SECONDS=str(RENEWAL_NAP_TICK_SECONDS),
+            NAP_SETTLE_SECONDS=str(RENEWAL_NAP_SETTLE_SECONDS),
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertLess(elapsed, RENEWAL_NAP_STOP_BOUND_SECONDS)
+
     def test_a_stop_during_a_renewal_write_leaves_no_token_behind(self):
         # The stop used to kill the renewer outright: its write went on without
-        # it and put a live token back after the stop's rm.
+        # it and left a live token in the .next file after the stop's rm.
         proc = self._run(
             STALLED_RENEWAL_WRITE
             + textwrap.dedent(

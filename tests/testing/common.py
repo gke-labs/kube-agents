@@ -176,6 +176,14 @@ umask() {
 }
 """
 
+# A renewer tick long enough to tell a stop that ends the nap from one that waits
+# it out or leaves it running, and the bound the whole run must finish inside:
+# a nap left behind holds the run's output open until the tick ends.
+RENEWAL_NAP_TICK_SECONDS = 20
+RENEWAL_NAP_STOP_BOUND_SECONDS = 10
+# How long the test waits before it stops, so the renewer is in its nap.
+RENEWAL_NAP_SETTLE_SECONDS = 0.5
+
 
 def installer_report_env():
     """The report file of each front-door script, in one folder of this test process.
