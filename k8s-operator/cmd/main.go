@@ -318,7 +318,7 @@ func main() {
 	// would record a Warning on every CR blaming a NetworkPolicy for the gap.
 	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
 	if operatorNamespace == "" {
-		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
+		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, credential-proxy falls back to Recreate without standby, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv)
 	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
 		// The value becomes kubernetes.io/metadata.name in the metrics rule's
@@ -328,7 +328,7 @@ func main() {
 		// would have the API server reject the policy on every reconcile. Clear
 		// it either way, so the rule is not rendered and the poller, which could
 		// reach no pod without it, is not started.
-		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, credential-proxy falls back to Recreate without standby, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
 		operatorNamespace = ""
 	}

@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -737,4 +738,117 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 			t.Fatalf("expected matching DRAINED pod %s with no candidate to be deleted", oldPod.Name)
 		}
 	})
+}
+
+func TestCredentialProxyOffClusterOperatorSkipsStandbyAndHandoff(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name              string
+		operatorNamespace string
+		wantStandby       bool
+	}{
+		{name: "unset operator namespace", operatorNamespace: "", wantStandby: false},
+		{name: "invalid DNS-1123 operator namespace", operatorNamespace: "Bad_Namespace", wantStandby: false},
+		{name: "valid in-cluster operator namespace", operatorNamespace: "kubeagents-system", wantStandby: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			scheme := setupScheme()
+			agent := sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil)
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{
+				Client:            cl,
+				APIReader:         cl,
+				Scheme:            scheme,
+				OperatorNamespace: tc.operatorNamespace,
+			}
+
+			req, err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned)
+			if err != nil {
+				t.Fatalf("reconcileCredentialProxy: %v", err)
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(context.Background(), types.NamespacedName{Name: credentialProxyName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("reading proxy Deployment: %v", err)
+			}
+			hasStandby := false
+			for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+				if env.Name == credentialProxyStandbyEnv && env.Value == credentialProxyStandbyEnabledValue {
+					hasStandby = true
+				}
+			}
+			if hasStandby != tc.wantStandby {
+				t.Fatalf("CREDENTIAL_PROXY_STANDBY=%v, want %v (Strategy=%s)", hasStandby, tc.wantStandby, dep.Spec.Strategy.Type)
+			}
+			wantStrategy := appsv1.RecreateDeploymentStrategyType
+			if tc.wantStandby {
+				wantStrategy = appsv1.RollingUpdateDeploymentStrategyType
+			}
+			if dep.Spec.Strategy.Type != wantStrategy {
+				t.Fatalf("Deployment strategy = %s, want %s", dep.Spec.Strategy.Type, wantStrategy)
+			}
+
+			// When off-cluster (!tc.wantStandby), even a live pod must not trigger
+			// 2s handoff requeues or standby probing; in-cluster with a valid
+			// namespace proceeds to probe the standby pod via BrokerControlClient.
+			livePod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        credentialProxyName(agent) + "-live",
+					Namespace:   agent.Namespace,
+					Labels:      credentialProxySelector(agent),
+					Annotations: maps.Clone(dep.Spec.Template.Annotations),
+				},
+				Spec:   *dep.Spec.Template.Spec.DeepCopy(),
+				Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.21"},
+			}
+			if err := cl.Create(context.Background(), livePod); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantStandby {
+				if !r.canControlBroker() {
+					t.Fatalf("expected canControlBroker() == true for valid operatorNamespace %q", tc.operatorNamespace)
+				}
+				bearer, _, err := r.readCredentialProxyControlBearer(context.Background(), agent)
+				if err != nil {
+					t.Fatal(err)
+				}
+				srv := newFakeBrokerPodServer(bearer, credentialProxyStateStandby, true, 0, false)
+				defer srv.close()
+				rt := roundTripFunc(func(httpReq *http.Request) (*http.Response, error) {
+					cloned := httpReq.Clone(httpReq.Context())
+					if httpReq.URL.Hostname() == "127.0.0.21" {
+						cloned.URL.Host = srv.host + ":" + srv.port
+					}
+					return http.DefaultTransport.RoundTrip(cloned)
+				})
+				r.BrokerControlClient = &http.Client{Transport: rt, Timeout: 5 * time.Second}
+				handoffReq, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, dep)
+				if err != nil {
+					t.Fatalf("reconcileCredentialProxyHandoff: %v", err)
+				}
+				if handoffReq != credentialProxyControlRequeueInterval {
+					t.Fatalf("handoff requeue = %v, want %v", handoffReq, credentialProxyControlRequeueInterval)
+				}
+				if srv.currentState() != credentialProxyStateActive {
+					t.Fatalf("in-cluster warm standby pod state = %q, want active", srv.currentState())
+				}
+			} else {
+				if r.canControlBroker() {
+					t.Fatalf("expected canControlBroker() == false for off-cluster operatorNamespace %q", tc.operatorNamespace)
+				}
+				handoffReq, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, dep)
+				if err != nil {
+					t.Fatalf("reconcileCredentialProxyHandoff: %v", err)
+				}
+				if handoffReq != 0 || req != 0 {
+					t.Fatalf("off-cluster requeues handoff=%v initial=%v, want 0", handoffReq, req)
+				}
+			}
+		})
+	}
 }

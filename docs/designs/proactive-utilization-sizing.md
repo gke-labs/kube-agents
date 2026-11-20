@@ -57,7 +57,7 @@ As documented in [`docs/designs/credential-proxy-single-pod.md`](credential-prox
 - Slack Socket Mode opens a per-process socket and holds `receipt -> event` in process memory.
 - `scope_policy.MemberWindow` records prior probe results in process memory.
 
-Therefore, `credential-proxy` preserves **`Replicas: 1` active** at all times, while switching `Deployment.Spec.Strategy` from `Recreate` to `RollingUpdate` (`MaxSurge: 1, MaxUnavailable: 0`) under operator-coordinated active-standby cutover.
+Therefore, `credential-proxy` preserves **`Replicas: 1` active** at all times, while switching `Deployment.Spec.Strategy` from `Recreate` to `RollingUpdate` (`MaxSurge: 1, MaxUnavailable: 0`) under operator-coordinated active-standby cutover when the operator can reach port `8766` (`OperatorNamespace` set to a valid DNS-1123 label; off-cluster `make run` with `POD_NAMESPACE` unset or invalid omits `CREDENTIAL_PROXY_STANDBY`, keeps `Recreate` with zero surge headroom, and skips handoff cutovers and `:8766` metrics scrapes).
 
 ### 3.2 Control Plane Protocol (Zero Hub API Token on `credential-proxy`)
 

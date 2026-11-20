@@ -228,7 +228,7 @@ func resolveSizing(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...cli
 		WithObjects(sizingFixtures(agent, objs...)...).
 		WithStatusSubresource(agent).Build()
 	recorder := record.NewFakeRecorder(8)
-	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 	if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 		t.Fatalf("resolveSizingTier: %v", err)
 	}
@@ -284,9 +284,9 @@ func TestResolveSizingTierLatchesUpwardOnly(t *testing.T) {
 
 func TestResolveSizingTierQuotaGate(t *testing.T) {
 	t.Parallel()
-	// The step from small to medium on a Standard cluster adds 3Gi of memory
-	// requests, all of it the broker's (1Gi to 4Gi); the sidecar and the
-	// shell keep their requests.
+	// The step from small to medium on a Standard cluster surges credential-proxy
+	// at 4Gi of memory requests alongside the running 1Gi pod (4Gi step cost);
+	// the sidecar and the shell keep their requests.
 	t.Run("a short quota keeps the lower tier and sets the condition", func(t *testing.T) {
 		t.Parallel()
 		stored, recorder := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil),
@@ -320,7 +320,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 	t.Run("a quota whose used total moves while still short writes nothing", func(t *testing.T) {
 		t.Parallel()
 		// The first pass caps the tier with 2Gi free; a session pod then
-		// returns 512Mi to the quota. Still short of the 3Gi the step adds, so
+		// returns 512Mi to the quota. Still short of the 4Gi the surge step adds, so
 		// the condition stands as written and the pass neither writes status
 		// nor records a second Warning.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
@@ -335,7 +335,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 				},
 			}).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("first pass: %v", err)
 		}
@@ -373,7 +373,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 				},
 			}).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("first pass: %v", err)
 		}
@@ -486,8 +486,8 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 	})
 	t.Run("a fleet step the quota refuses still takes the medium step it admits", func(t *testing.T) {
 		t.Parallel()
-		// Latched small at 25 clusters: the fleet step adds 7Gi of memory
-		// requests (the broker's 1Gi to 8Gi), the medium step 3Gi. A quota
+		// Latched small at 25 clusters: the fleet surge step adds 8Gi of memory
+		// requests (full replacement broker pod), the medium surge step 4Gi. A quota
 		// with 5Gi free refuses the first and admits the second, so the
 		// tier reaches medium rather than waiting at small for the whole
 		// fleet step, and the cap names fleet as earned, small as the tier
@@ -1541,7 +1541,7 @@ func TestResolveSizingTierCountsTheClampedLimitsOnAutopilot(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, quota()}, workloads...)...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, autopilot: autopilot, autopilotResolved: true}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system", autopilot: autopilot, autopilotResolved: true}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
@@ -1650,7 +1650,7 @@ func TestResolveSizingTierCountsTheBrokersEqualCPUPairAsWrittenUnderBursting(t *
 		WithObjects(append([]client.Object{agent, quota}, sizedWorkloadsOn(agent, sizingTierMedium, true)...)...).
 		WithStatusSubresource(agent).Build()
 	recorder := record.NewFakeRecorder(8)
-	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, autopilot: true, autopilotResolved: true}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system", autopilot: true, autopilotResolved: true}
 	if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 		t.Fatalf("resolveSizingTier: %v", err)
 	}
@@ -1717,7 +1717,7 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 			},
 		}).Build()
 	recorder := record.NewFakeRecorder(8)
-	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 	var logged strings.Builder
 	ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
 	pass := func(what string) {
@@ -2166,7 +2166,7 @@ func TestResolveSizingTierLimitRangeGate(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, podBound}, workloads...)...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
@@ -2373,7 +2373,7 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent}, workloads...), objs...)...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
@@ -2535,6 +2535,21 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 			t.Fatalf("SizingCappedByQuota = %+v, want none for gateway Recreate pods refusal", cond)
 		}
 	})
+	t.Run("an off-cluster operator uses Recreate so a pods count refusal does not step back", func(t *testing.T) {
+		t.Parallel()
+		proxyAgent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		proxyWorkloads := sizedWorkloadsAt(proxyAgent, sizingTierFleet)
+		refusedByQuotaOn(proxyWorkloads[0].(*appsv1.Deployment), credentialProxyName(proxyAgent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{proxyAgent}, proxyWorkloads...), sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))...).WithStatusSubresource(proxyAgent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		if err := r.resolveSizingTier(context.Background(), proxyAgent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if proxyAgent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: off-cluster Recreate has surgePods=0", proxyAgent.Status.EffectiveSizingTier)
+		}
+	})
 	t.Run("the row above's refusal lingering on the other Deployment after a step back is not stepped back from", func(t *testing.T) {
 		t.Parallel()
 		// Both Deployments were refused at fleet on a limits.memory quota:
@@ -2611,7 +2626,7 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent}, workloads...), sizingQuota("platform-baseline-quota", "20Gi", "7Gi"))...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		var logged strings.Builder
 		ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
 		if err := r.resolveSizingTier(ctx, agent); err != nil {
@@ -2928,8 +2943,16 @@ func TestSizingSurgeStepAndRollbackWithEqualizedProxyOverride(t *testing.T) {
 			t.Fatalf("same-tier limit %s = %s, want 0", k, qty.String())
 		}
 	}
-	if sf := sizingQuotaShortfall(equalOverride(sizingProfileSmall, 10), false, false, []corev1.ResourceQuota{*sizingQuotaOn("cpu-cap", corev1.ResourceRequestsCPU, "6", "4")}, nil, sizingTierSmall, sizingTierMedium); sf == nil || sf.key != corev1.ResourceRequestsCPU {
+	if sf := sizingQuotaShortfall(equalOverride(sizingProfileSmall, 10), false, false, true, []corev1.ResourceQuota{*sizingQuotaOn("cpu-cap", corev1.ResourceRequestsCPU, "6", "4")}, nil, sizingTierSmall, sizingTierMedium); sf == nil || sf.key != corev1.ResourceRequestsCPU {
 		t.Fatalf("shortfall = %+v, want requests.cpu refusal on equalized surge", sf)
+	}
+	// Off-cluster Recreate (!canSurge): equalized overrides charge 0 CPU delta and 0 surge pods,
+	// and step-down requires 0 proxy surge headroom.
+	if sf := sizingQuotaShortfall(equalOverride(sizingProfileSmall, 10), false, false, false, []corev1.ResourceQuota{*sizingQuotaOn("cpu-cap", corev1.ResourceRequestsCPU, "6", "4"), *sizingQuotaOn("pod-cap", corev1.ResourcePods, "3", "3")}, nil, sizingTierSmall, sizingTierMedium); sf != nil {
+		t.Fatalf("expected Recreate (!canSurge) equalized step to need 0 surge headroom, got %+v", sf)
+	}
+	if sf := sizingQuotaShortfall(sizingAgent(sizingProfileAuto, sizingProfileFleet, nil, nil), false, false, false, []corev1.ResourceQuota{*sizingQuotaOn("pod-cap", corev1.ResourcePods, "3", "3")}, nil, sizingTierFleet, sizingTierMedium); sf != nil {
+		t.Fatalf("expected Recreate (!canSurge) step-down to require 0 surge headroom, got %+v", sf)
 	}
 
 	// 2. Active pod with small slots (8) vs latched fleet (16): matches small,
@@ -2956,12 +2979,26 @@ func TestSizingSurgeStepAndRollbackWithEqualizedProxyOverride(t *testing.T) {
 	refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agentRefused)+"-7d9f8b6c4", "cpu-cap", corev1.ResourceRequestsCPU, "4")
 	objs := append([]client.Object{agentRefused, smallActivePod.DeepCopy()}, workloads...)
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).WithStatusSubresource(agentRefused).Build()
-	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), OperatorNamespace: "kubeagents-system"}
 	if err := r.resolveSizingTier(context.Background(), agentRefused); err != nil {
 		t.Fatal(err)
 	}
 	if agentRefused.Status.EffectiveSizingTier != sizingProfileSmall {
 		t.Fatalf("status.effectiveSizingTier = %q, want small rollback on equalized-resource ReplicaFailure", agentRefused.Status.EffectiveSizingTier)
+	}
+
+	// Off-cluster Recreate (OperatorNamespace unset): equalized CPU does not increase on Recreate (surgePods=0), so it does not roll back.
+	agentRecreateRefused := equalOverride(sizingProfileFleet, 25)
+	recreateWorkloads := sizedWorkloadsAt(agentRecreateRefused, sizingTierFleet)
+	refusedByQuotaOn(recreateWorkloads[0].(*appsv1.Deployment), credentialProxyName(agentRecreateRefused)+"-7d9f8b6c4", "cpu-cap", corev1.ResourceRequestsCPU, "4")
+	recreateObjs := append([]client.Object{agentRecreateRefused, smallActivePod.DeepCopy()}, recreateWorkloads...)
+	recreateCl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(recreateObjs...).WithStatusSubresource(agentRecreateRefused).Build()
+	rRecreate := &PlatformAgentReconciler{Client: recreateCl, APIReader: recreateCl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	if err := rRecreate.resolveSizingTier(context.Background(), agentRecreateRefused); err != nil {
+		t.Fatal(err)
+	}
+	if agentRecreateRefused.Status.EffectiveSizingTier != sizingProfileFleet {
+		t.Fatalf("status.effectiveSizingTier = %q, want fleet under off-cluster Recreate with equalized CPU", agentRecreateRefused.Status.EffectiveSizingTier)
 	}
 
 	// 3. Stalled pending fleet surge pod (16 slots) also rolls back directly to active small.
@@ -3000,13 +3037,44 @@ func TestSizingSurgeStepAndRollbackWithEqualizedProxyOverride(t *testing.T) {
 	stallCl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(stallObjs...).WithStatusSubresource(agentStall).Build()
 	rStall := &PlatformAgentReconciler{
 		Client: stallCl, APIReader: stallCl, Scheme: setupScheme(),
-		Recorder: record.NewFakeRecorder(8),
-		nowFn:    func() time.Time { return now },
+		Recorder:          record.NewFakeRecorder(8),
+		OperatorNamespace: "kubeagents-system",
+		nowFn:             func() time.Time { return now },
 	}
 	if err := rStall.resolveSizingTier(context.Background(), agentStall); err != nil {
 		t.Fatal(err)
 	}
 	if agentStall.Status.EffectiveSizingTier != sizingProfileSmall {
 		t.Fatalf("status.effectiveSizingTier = %q, want small rollback on stalled equalized-resource surge", agentStall.Status.EffectiveSizingTier)
+	}
+}
+
+func TestUsageStatusRequeueSchedulesSizingPrunedReprobeUnderManualProfiles(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	agent := sizingAgent(sizingProfileSmall, "", nil, nil)
+	r := &PlatformAgentReconciler{
+		nowFn: func() time.Time { return now },
+	}
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Fatalf("usageStatusRequeue before prune = %v, want %v", got, secretEnvReprobeInterval)
+	}
+
+	r.noteSizingStatusEcho(context.Background(), agent, &agentv1alpha1.SizingStatus{
+		ActiveTier:  sizingProfileSmall,
+		DesiredTier: sizingProfileSmall,
+		Trigger:     sizingTriggerManual,
+	})
+	if !r.sizingStatusPruned(agent) {
+		t.Fatal("expected sizingStatusPruned to record freshly pruned status.sizing")
+	}
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Fatalf("usageStatusRequeue while status.sizing pruned under manual profile = %v, want %v", got, usageStatusReprobeInterval)
+	}
+
+	now = now.Add(usageStatusReprobeInterval + time.Second)
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Fatalf("usageStatusRequeue after reprobe interval expiry = %v, want %v", got, secretEnvReprobeInterval)
 	}
 }

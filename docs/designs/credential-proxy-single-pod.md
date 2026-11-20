@@ -1,6 +1,6 @@
 # The Credential Proxy Runs as One Pod
 
-> **STATUS — updated by [`proactive-utilization-sizing.md`](proactive-utilization-sizing.md).** The credential proxy (the broker) remains a single active serving pod (`Replicas: 1`), now rolled with `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated active-standby handoff rather than `Recreate`. This document records why multiple active serving pods break stateful relays, the load measurement behind single-pod sizing, and the exec-tier split history.
+> **STATUS — updated by [`proactive-utilization-sizing.md`](proactive-utilization-sizing.md).** The credential proxy (the broker) remains a single active serving pod (`Replicas: 1`), rolled in-cluster with `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated active-standby handoff rather than `Recreate` (falling back to `Recreate` without standby when `POD_NAMESPACE` is unset/invalid off-cluster). This document records why multiple active serving pods break stateful relays, the load measurement behind single-pod sizing, and the exec-tier split history.
 >
 > **Proposed successor (draft, not decided):**
 > [`credential-broker-exec-tier.md`](credential-broker-exec-tier.md). This decision stands until

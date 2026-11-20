@@ -657,12 +657,19 @@ func sizingStepSurgeOnly(agent *agentv1alpha1.PlatformAgent, autopilot bool, cla
 	return step
 }
 
-func sizedContainerStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, name string, from, to sizingTier) sizingStep {
+// sizedContainerStepBetween computes the sizing step of one named container:
+// active-standby surge accounting on credential-proxy when canSurge is true, or
+// Recreate container deltas (0 surge pods) on step-up and an empty step on
+// step-down (to < from) when canSurge is false.
+func sizedContainerStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, canSurge bool, name string, from, to sizingTier) sizingStep {
+	if !canSurge && to < from {
+		return sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
+	}
 	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for i := range before {
 		if before[i].container == name {
-			if name == credentialProxyContainerName {
+			if canSurge && name == credentialProxyContainerName {
 				addSurgeStep(&step, before[i].resources, after[i].resources, clamped, from != to)
 			} else {
 				addRenderStep(&step, before[i].resources, after[i].resources, clamped)
@@ -1285,27 +1292,45 @@ func (r *PlatformAgentReconciler) sizingQuotaPriorityClasses(ctx context.Context
 	return nil, true
 }
 
+// sizingStepBetweenForRollout returns sizingStepBetween on step-up and
+// sizingStepSurgeOnly on step-down when canSurge is true (active-standby
+// RollingUpdate), or Recreate container deltas (0 surge pods) on step-up and
+// an empty step on step-down when the operator cannot reach port 8766 (off-cluster).
+func sizingStepBetweenForRollout(agent *agentv1alpha1.PlatformAgent, autopilot, clamped, canSurge bool, from, to sizingTier) sizingStep {
+	if canSurge {
+		if to < from {
+			return sizingStepSurgeOnly(agent, autopilot, clamped, from, to)
+		}
+		return sizingStepBetween(agent, autopilot, clamped, from, to)
+	}
+	if to < from {
+		return sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
+	}
+	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
+	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
+	for i := range before {
+		addRenderStep(&step, before[i].resources, after[i].resources, clamped)
+	}
+	return step
+}
+
 // sizingQuotaShortfall is nil when every quota in quotas (the namespace's
 // ResourceQuotas, in name order) that counts the sized pods has room for the
-// step from tier from to tier to, or the first quota and dimension that is
-// short, dimensions in sizingQuotaDimensions order so the condition message
-// is stable across passes. The hard figure is the spec's, the used figure the
-// quota controller's last accounting (zero on a quota it has not accounted
-// yet, which admission then settles). A quota whose scopes cannot select the
-// three pods (sizingQuotaBindsThePods, a PriorityClass scope read against
-// classes) is not read: admission would never evaluate them against it, so
-// it can neither refuse the step nor be raised to admit it. The step's limits
-// side is read through clamped (sizingRunningLimitsClamped).
-func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, quotas []corev1.ResourceQuota, classes []string, from, to sizingTier) *sizingShortfall {
+// step from tier from to tier to (read via sizingStepBetweenForRollout using
+// canSurge), or the first quota and dimension that is short, dimensions in
+// sizingQuotaDimensions order so the condition message is stable across passes.
+// The hard figure is the spec's, the used figure the quota controller's last
+// accounting (zero on a quota it has not accounted yet, which admission then
+// settles). A quota whose scopes cannot select the three pods
+// (sizingQuotaBindsThePods, a PriorityClass scope read against classes) is not
+// read: admission would never evaluate them against it, so it can neither
+// refuse the step nor be raised to admit it. The step's limits side is read
+// through clamped (sizingRunningLimitsClamped).
+func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, canSurge bool, quotas []corev1.ResourceQuota, classes []string, from, to sizingTier) *sizingShortfall {
 	if len(quotas) == 0 {
 		return nil
 	}
-	var step sizingStep
-	if to < from {
-		step = sizingStepSurgeOnly(agent, autopilot, clamped, from, to)
-	} else {
-		step = sizingStepBetween(agent, autopilot, clamped, from, to)
-	}
+	step := sizingStepBetweenForRollout(agent, autopilot, clamped, canSurge, from, to)
 	for i := range quotas {
 		quota := &quotas[i]
 		if !sizingQuotaBindsThePods(quota, classes) {
@@ -1670,6 +1695,7 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 		}{client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}, agentAPIAuthContainerName})
 	}
 	recorded := sizingCappedCondition(agent).message
+	canSurge := r.canControlBroker()
 	for _, workload := range sized {
 		dep := &appsv1.Deployment{}
 		if err := r.Get(ctx, workload.key, dep); err != nil {
@@ -1683,7 +1709,7 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 			if !named || strings.Contains(recorded, cond.Message) {
 				continue
 			}
-			if !sizingRefusalIsTheSteps(agent, autopilot, clamped, dep.Spec.Template, workload.container, from, tier, quotaRefusalRequested(cond.Message)) {
+			if !sizingRefusalIsTheSteps(agent, autopilot, clamped, canSurge, dep.Spec.Template, workload.container, from, tier, quotaRefusalRequested(cond.Message)) {
 				continue
 			}
 			return &sizingRefusal{workload: fmt.Sprintf(sizingUnsettledDeploymentFormat, workload.key.Name), quota: quota, message: cond.Message, rollbackTier: rollbackTier}
@@ -1694,12 +1720,13 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 
 // sizingRefusalIsTheSteps reports whether a quota refusal of the pod the
 // sized container named name runs in, read with the latch transitioning from
-// from to to, is a refusal of that transition's pod on a key the step moved.
-func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, template corev1.PodTemplateSpec, name string, from, to sizingTier, requested corev1.ResourceList) bool {
+// from to to under canSurge (active-standby RollingUpdate when true, Recreate
+// when false), is a refusal of that transition's pod on a key the step moved.
+func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, canSurge bool, template corev1.PodTemplateSpec, name string, from, to sizingTier, requested corev1.ResourceList) bool {
 	if (to == sizingTierSmall && from <= to) || len(requested) == 0 {
 		return false
 	}
-	step := sizedContainerStepBetween(agent, autopilot, clamped, name, from, to)
+	step := sizedContainerStepBetween(agent, autopilot, clamped, canSurge, name, from, to)
 	var atRequests, atLimits, aboveRequests, aboveLimits corev1.ResourceList
 	for _, rendered := range renderedSizedContainersAt(agent, autopilot, to) {
 		if rendered.container == name {
@@ -1825,49 +1852,8 @@ func sizingCappedCondition(agent *agentv1alpha1.PlatformAgent) sizingCap {
 	return sizingCap{reason: existing.Reason, message: existing.Message}
 }
 
-// resolveSizingTier decides the tier this pass renders and writes it to
-// status.effectiveSizingTier, with the SizingCappedByQuota condition, before
-// any builder reads renderedSizingTier, so the status is the record of what
-// the pods run even when a later step of the pass fails. An explicit profile
-// is its tier, applied as written. Under auto the tier is the latched status
-// tier, whatever profile wrote it (an explicit fleet switched to auto
-// continues at fleet; small first, then auto, restarts the latch), raised to
-// the highest tier, at or under what the cluster count earns, whose step from
-// the running tier every ResourceQuota that counts the pods has room for; a
-// quota short on every step keeps the running tier, and any refused step sets
-// the condition. A step the gate admitted whose recreated pod admission then
-// refused on a quota (sizingRefusedStep) is stepped back: the latch moves
-// down one tier and the condition names the quota and admission's message,
-// so the latch records what the pods run and the broker comes back at the
-// lower row. A step is also refused when a LimitRange in the namespace
-// bounds a figure the candidate's render, or the pod's sum with it, crosses
-// (sizingLimitRangeBound), since that admission plugin refuses the recreated
-// pod the way a short quota does; the LimitRange is read before the quota,
-// the order admission evaluates them in, so the condition names the LimitRange
-// when both refuse. With a quota or a LimitRange in the namespace, a step is
-// measured only once the running tier's workloads have settled
-// (sizingTierSettled): the used totals a quota is measured against do not
-// charge a step whose pods admission has not yet created, and a Pod-type
-// LimitRange item is measured against the running templates, which a
-// workload that is absent or still rolling does not supply; until then the
-// latch and the condition stay where they are, with no write and no event.
-// For sizingStepBackHoldInterval after a step back no step is measured
-// either (sizingStepBackHeld), so a namespace whose slack sits near a step's
-// size cycles at most once per interval. A count that falls leaves the latch where it is and clears the
-// condition, since it no longer earns the step; a pass with no reading (the
-// gauges absent before the first poll, or cleared after two polls that read
-// no gateway) leaves the latch and the condition both where they are, so a
-// gateway outage neither clears a cap the quota still imposes nor records it
-// again when the reading returns. The one no-reading state that is not an
-// outage, the event watcher switched off by spec, clears the condition
-// instead, since the gauges stay absent for as long as it is off and nothing
-// could lift the cap. The write is gated on a change, as the
-// other status writers' are, because the PlatformAgent watch has no predicate
-// and every write re-enqueues the object; under a served CRD that prunes
-// status.effectiveSizingTier the field reads "" after every write, so the
-// gate treats "" as settled while the echo record (prunedSizingTier) is fresh,
-// as the Ready writer does for status.usage, rather than writing and logging
-// on every pass.
+// sizingSurgeStall records a stalled Pending surge rollout to roll back once
+// sizingSurgePendingTimeout elapses.
 type sizingSurgeStall struct {
 	podName      string
 	reason       string
@@ -1875,6 +1861,9 @@ type sizingSurgeStall struct {
 }
 
 func (r *PlatformAgentReconciler) sizingSurgeStalled(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier, now time.Time) (*sizingSurgeStall, time.Duration) {
+	if !r.canControlBroker() {
+		return nil, 0
+	}
 	autopilot := r.sizingAutopilot(ctx, agent)
 	clamped := r.sizingRunningLimitsClamped(ctx, agent)
 	pods := &corev1.PodList{}
@@ -2058,6 +2047,20 @@ func (r *PlatformAgentReconciler) sizingAutoRequeue(agent *agentv1alpha1.Platfor
 	return sizingUtilizationPollInterval
 }
 
+// resolveSizingTier decides the tier this pass renders and writes it to
+// status.effectiveSizingTier, status.sizing, and the SizingCappedByQuota condition
+// before any builder reads renderedSizingTier,
+// so the status is the record of what the pods run even when a later step of
+// the pass fails. An explicit profile sets its tier and manual trigger state.
+// Under auto, tier selection starts from the active/latched tier, enforces the
+// cluster-count floor, promotes to the lowest relieving tier when sustained
+// utilization hits sizingStepUpThresholdPct, and steps down one tier at a time
+// after sizingTransitionCooldown when strictly shrinking observed dimensions
+// stay at or below sizingStepDownThresholdPct of tier - 1. Quota/LimitRange
+// gates charge the active-standby surge pod when the operator can control
+// standby cutovers (Recreate deltas otherwise), stalled or refused surges roll
+// back without deleting the healthy active broker, and pruned fields are
+// tolerated via echo records while settled.
 func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	profile := sizingProfileOf(agent.Spec.Deployment)
 	latched, _ := parseSizingTier(agent.Status.EffectiveSizingTier)
@@ -2249,6 +2252,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 							"name", agent.Name, "namespace", agent.Namespace, "tier", running.String(), "desired", desired.String(),
 							"clusters", count)
 					default:
+						canSurge := r.canControlBroker()
 						templates := map[string]corev1.PodTemplateSpec{}
 						if len(ranges) > 0 {
 							templates = r.sizedPodTemplates(ctx, agent)
@@ -2259,7 +2263,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 									bound, short = crossed, nil
 									continue
 								}
-								if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, candidate); shortfall != nil {
+								if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, canSurge, quotas, classes, running, candidate); shortfall != nil {
 									short, bound = shortfall, nil
 									continue
 								}
@@ -2284,7 +2288,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 							// Step-down: ensure Limits and credential-proxy surge fit quota/LimitRange before rolling.
 							if crossed := sizingLimitRangeBound(agent, autopilot, clamped, ranges, templates, desired); crossed != nil {
 								bound = crossed
-							} else if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, desired); shortfall != nil {
+							} else if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, canSurge, quotas, classes, running, desired); shortfall != nil {
 								short = shortfall
 							} else {
 								tier = desired

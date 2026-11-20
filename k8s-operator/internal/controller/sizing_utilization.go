@@ -266,6 +266,9 @@ func (r *PlatformAgentReconciler) collectPodMetricsSample(ctx context.Context, a
 }
 
 func (r *PlatformAgentReconciler) collectBrokerMetricsSample(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sample *SizingUtilizationSample) {
+	if !r.canControlBroker() {
+		return
+	}
 	pods := &corev1.PodList{}
 	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err != nil {
 		return

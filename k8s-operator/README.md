@@ -145,9 +145,10 @@ ENABLE_WEBHOOKS=false make run
 ```
 
 Off the cluster `POD_NAMESPACE` is unset, so the operator renders no NetworkPolicy rule admitting
-itself to the agent pods' metrics ports and does not start the poller behind `status.usage`'s
-counters; it says so in one start-up line, and the counters stay where they are until the operator
-runs in the cluster.
+itself to the agent pods' metrics ports, omits `CREDENTIAL_PROXY_STANDBY` (`credential-proxy`
+falls back to `Recreate` without handoff), and skips both the poller behind `status.usage`'s
+counters and broker `:8766` utilization scrapes; it says so in one start-up line, and those
+features stay inactive until the operator runs in the cluster.
 
 Or directly run the main entry point:
 

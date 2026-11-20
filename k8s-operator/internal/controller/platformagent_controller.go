@@ -1760,12 +1760,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
 // pruned-status probe: the interval while a record is held for this CR, the
-// whole usage block's, status.busReplicas', status.inference's, or
-// status.observedVersion's. With no record it returns the secret re-read's
-// interval, the ceiling the caller already applies, so the min it feeds leaves
-// the caller's value alone.
+// whole usage block's, status.busReplicas', status.inference's,
+// status.observedVersion's, status.universeDomain's, or status.sizing's. With no
+// record it returns the secret re-read's interval, the ceiling the caller
+// already applies, so the min it feeds leaves the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) || r.sizingStatusPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -3764,6 +3764,9 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// as fact.
 	if !recorded {
 		delete(proxy.Annotations, credentialProxyClusterTypeAnnotation)
+	}
+	if !r.canControlBroker() {
+		disableCredentialProxyStandby(proxy)
 	}
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return 0, err

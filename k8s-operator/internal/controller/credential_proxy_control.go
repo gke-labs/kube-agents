@@ -107,6 +107,43 @@ func credentialProxyControlEnv() []corev1.EnvVar {
 	}
 }
 
+// canControlBroker reports whether this operator can reach the broker's
+// control listener on port 8766. Off-cluster runs (POD_NAMESPACE unset or
+// invalid) omit the operator NetworkPolicy peer on 8766 and cannot reach pod
+// IPs, so standby mode is left off; tests inject BrokerControlClient directly.
+func (r *PlatformAgentReconciler) canControlBroker() bool {
+	if r.BrokerControlClient != nil {
+		return true
+	}
+	_, reachable := operatorMetricsIngressRule(r.OperatorNamespace, credentialProxyMetricsPort)
+	return reachable
+}
+
+// disableCredentialProxyStandby strips CREDENTIAL_PROXY_STANDBY and reverts the
+// Deployment strategy to Recreate when the operator cannot reach port 8766, so
+// the broker boots directly into active mode instead of stalling in standby.
+func disableCredentialProxyStandby(dep *appsv1.Deployment) {
+	if dep == nil {
+		return
+	}
+	dep.Spec.Strategy = appsv1.DeploymentStrategy{
+		Type: appsv1.RecreateDeploymentStrategyType,
+	}
+	for i := range dep.Spec.Template.Spec.Containers {
+		c := &dep.Spec.Template.Spec.Containers[i]
+		if c.Name != credentialProxyContainerName {
+			continue
+		}
+		filtered := make([]corev1.EnvVar, 0, len(c.Env))
+		for _, env := range c.Env {
+			if env.Name != credentialProxyStandbyEnv {
+				filtered = append(filtered, env)
+			}
+		}
+		c.Env = filtered
+	}
+}
+
 func credentialProxyControlVolumeSpec(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 	return corev1.Volume{
 		Name: credentialProxyControlVolume,
@@ -394,6 +431,9 @@ type brokerPodProbe struct {
 // for credential-proxy across surge rollouts and cold starts without giving
 // the broker pod Kubernetes API credentials.
 func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Context, agent *agentv1alpha1.PlatformAgent, proxyDep *appsv1.Deployment) (time.Duration, error) {
+	if !r.canControlBroker() {
+		return 0, nil
+	}
 	pods := &corev1.PodList{}
 	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err != nil {
 		return 0, fmt.Errorf("listing credential-proxy pods: %w", err)

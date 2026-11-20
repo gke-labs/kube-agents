@@ -381,11 +381,12 @@ func TestSizingUtilizationStepDownCooldownDeadbandAndFloor(t *testing.T) {
 
 		sample := idleSample(now) // <= 55% of medium and small across all dimensions
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 			UtilizationReader: func(context.Context, *agentv1alpha1.PlatformAgent) (SizingUtilizationSample, error) {
 				sample.ObservedAt = now
 				return sample, nil
@@ -766,7 +767,7 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		quota.Spec.Hard[corev1.ResourcePods] = resource.MustParse("4")
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sizingFixtures(stored, quota)...).WithStatusSubresource(stored).Build()
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), stored); err != nil {
 			t.Fatal(err)
 		}
@@ -819,11 +820,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		recorder := record.NewFakeRecorder(8)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, activePod, pendingPod).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  recorder,
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          recorder,
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 		}
 
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
@@ -851,6 +853,59 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		}
 		if stillRunning.DeletionTimestamp != nil {
 			t.Fatalf("active broker pod marked for deletion on surge rollback")
+		}
+	})
+
+	t.Run("off-cluster operator uses Recreate so concurrent running and pending pods do not trigger surge stall rollback", func(t *testing.T) {
+		t.Parallel()
+		now := time.Date(2026, 11, 18, 18, 0, 0, 0, time.UTC)
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		since := metav1.NewTime(now.Add(-sizingSurgePendingTimeout - time.Second))
+		activePod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              credentialProxyName(agent) + "-small-active",
+				Namespace:         agent.Namespace,
+				Labels:            credentialProxySelector(agent),
+				CreationTimestamp: metav1.NewTime(now.Add(-time.Hour)),
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		pendingPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              credentialProxyName(agent) + "-medium-pending",
+				Namespace:         agent.Namespace,
+				Labels:            credentialProxySelector(agent),
+				CreationTimestamp: since,
+			},
+			Spec: *buildCredentialProxyDeployment(agent, "test").Spec.Template.Spec.DeepCopy(),
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{{
+					Type:               corev1.PodScheduled,
+					Status:             corev1.ConditionFalse,
+					Reason:             string(corev1.PodReasonUnschedulable),
+					Message:            "0/3 nodes are available: Insufficient cpu",
+					LastTransitionTime: since,
+				}},
+			},
+		}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, activePod, pendingPod).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{
+			Client:    cl,
+			APIReader: cl,
+			Scheme:    scheme,
+			Recorder:  record.NewFakeRecorder(8),
+			nowFn:     func() time.Time { return now },
+		}
+		if stall, wait := r.sizingSurgeStalled(context.Background(), agent, sizingTierMedium, now); stall != nil || wait != 0 {
+			t.Fatalf("sizingSurgeStalled off-cluster = (%+v, %s), want (nil, 0)", stall, wait)
+		}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("tier = %q, want medium when off-cluster operator skips surge stall checks", agent.Status.EffectiveSizingTier)
 		}
 	})
 
@@ -898,11 +953,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, activePod, pendingFleetPod).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 		}
 
 		// Pass 1 rolls back fleet -> medium and sets SurgeUnschedulable.
@@ -975,11 +1031,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, activeMediumPod, pendingSmallPod).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 		}
 
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
@@ -1021,11 +1078,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		objs := append([]client.Object{agent, activeFleetPod}, workloads...)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 		}
 
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
@@ -1085,11 +1143,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, activeSmallPod, pendingBareMediumPod).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 		}
 
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
@@ -1151,6 +1210,7 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 			APIReader:         clUp,
 			Scheme:            scheme,
 			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
 			autopilot:         true,
 			autopilotResolved: true,
 			nowFn:             func() time.Time { return now },
@@ -1189,6 +1249,7 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 			APIReader:         clDown,
 			Scheme:            scheme,
 			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
 			autopilot:         true,
 			autopilotResolved: true,
 			nowFn:             func() time.Time { return now },
@@ -1262,8 +1323,9 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		clStall := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agentStall, activeSmallPod, pendingFleetPod).WithStatusSubresource(agentStall).Build()
 		rStall := &PlatformAgentReconciler{
 			Client: clStall, APIReader: clStall, Scheme: scheme,
-			Recorder: record.NewFakeRecorder(8),
-			nowFn:    func() time.Time { return later },
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return later },
 		}
 		// Seed a prior stepBackHold to confirm SurgeUnschedulable is never blinded for 10m on new surge pods.
 		rStall.steppedBackAt.Store(client.ObjectKeyFromObject(agentStall), later.Add(-time.Minute))
@@ -1287,6 +1349,7 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		rRefused := &PlatformAgentReconciler{
 			Client: clRefused, APIReader: clRefused, Scheme: scheme,
 			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
 			autopilot:         false,
 			autopilotResolved: true,
 			nowFn:             func() time.Time { return later },
@@ -1316,11 +1379,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, activeSmallPod).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 			UtilizationReader: func(context.Context, *agentv1alpha1.PlatformAgent) (SizingUtilizationSample, error) {
 				s := idleSample(now)
 				s.BrokerWatermarkMemoryRatio = 0.85
@@ -1387,11 +1451,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, activeMedPod, pendingBurstingFleetPod).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{
-			Client:    cl,
-			APIReader: cl,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 		}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatal(err)
@@ -1420,11 +1485,12 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		}
 		clJump := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agentJump, activeSmallPod).WithStatusSubresource(agentJump).Build()
 		rJump := &PlatformAgentReconciler{
-			Client:    clJump,
-			APIReader: clJump,
-			Scheme:    scheme,
-			Recorder:  record.NewFakeRecorder(8),
-			nowFn:     func() time.Time { return now },
+			Client:            clJump,
+			APIReader:         clJump,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
 		}
 		rJump.sizingUtilState.Store(client.ObjectKeyFromObject(agentJump), origStatus)
 		if err := rJump.resolveSizingTier(context.Background(), agentJump); err != nil {
@@ -1655,6 +1721,14 @@ func TestCollectLiveUtilizationPodMetricsAndScrape(t *testing.T) {
 	}
 	if !got.BrokerSlotsObserved || got.BrokerSlotsInUse != 6 || got.BrokerSlotCap != 8 {
 		t.Fatalf("Slots = %d/%d (%v), want 6/8", got.BrokerSlotsInUse, got.BrokerSlotCap, got.BrokerSlotsObserved)
+	}
+
+	// Off-cluster (OperatorNamespace unset and BrokerControlClient nil): must not dial :8766.
+	rOffCluster := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	var offSample SizingUtilizationSample
+	rOffCluster.collectBrokerMetricsSample(context.Background(), agent, &offSample)
+	if offSample.BrokerSlotsObserved || offSample.BrokerCgroupObserved || offSample.BrokerWatermarkMemoryObserved {
+		t.Fatalf("expected off-cluster collectBrokerMetricsSample to skip :8766 scrape, got %+v", offSample)
 	}
 }
 
