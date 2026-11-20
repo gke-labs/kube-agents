@@ -224,3 +224,39 @@ func TestModelsTestEndpoint(t *testing.T) {
 		t.Errorf("expected verified=false, got %v", failResp["verified"])
 	}
 }
+
+// The model probe calls the inference gateway keyless: the agent API key is not
+// a gateway key, and the gateway's caller-auth hook refuses a key it does not
+// know, which would mark every model unverified and refuse every switch.
+func TestModelsTestSendsTheGatewayNoAgentKey(t *testing.T) {
+	var auths []string
+	fakeGateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req["model"] == "working-model" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer fakeGateway.Close()
+
+	s := newServer(config{LiteLLMURL: fakeGateway.URL, APIServerKey: "agent-api-key-not-for-the-gateway"})
+	for _, model := range []string{"working-model", "failing-model"} {
+		rec := httptest.NewRecorder()
+		s.handleModelsTest(rec, httptest.NewRequest(http.MethodPost, "/api/models/test", strings.NewReader(`{"model":"`+model+`"}`)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code %d: %s", model, rec.Code, rec.Body.String())
+		}
+	}
+	if len(auths) == 0 {
+		t.Fatal("the probe never reached the gateway")
+	}
+	for i, a := range auths {
+		if a != "" {
+			t.Errorf("gateway request %d carried Authorization %q; want none", i, a)
+		}
+	}
+}
