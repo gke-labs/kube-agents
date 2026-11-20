@@ -112,8 +112,6 @@ PUSH_EVENT = "push"
 # Run outside CI, the page is compared with the first of these that exists.
 LOCAL_BASE_REFS = ("upstream/main", "origin/main")
 WARNING_PREFIX = "warning: "
-WARNING_NOTE = ("warning: this change does not add or relabel these rows, so they do not fail it; "
-                "main's push run fails until a pull request relabels them.")
 # One entry per line, `<full commit> <change text>`; a line whose first non-blank character is `#` is
 # a comment. Only a full commit is accepted: a tag name or `HEAD~1` would pass any label, and a short
 # hash can turn ambiguous.
@@ -132,6 +130,9 @@ SECONDS_PER_HOUR = 3600
 GRACE_NOTE = (f"warning: a release tagged under {PENDING_GRACE_HOURS} hours ago contains these {PENDING} rows; "
               "the release job's relabel pull request is expected to relabel them, and they fail once that "
               "window passes.")
+WARNING_NOTE = ("warning: this change does not add or relabel these rows, so they do not fail it; "
+                f"main's push run fails until a pull request relabels them ({PENDING} rows once their release "
+                f"is {PENDING_GRACE_HOURS} hours old).")
 UNTAGGED_NOTE = ("note: rows labelled {releases} are not checked: no such tag is here. If a release is out, "
                  "run `git fetch --tags` and check again.")
 
@@ -520,7 +521,8 @@ def labelled_row_problem(row: Row, traced: dict[str, str]) -> str | None:
 
 
 def comparison_base() -> str | None:
-    """The commit this run's page is compared with, or None when every wrong label fails the run."""
+    """The commit this run's page is compared with, or None when every wrong label fails the run (a
+    `pending` row a release tagged under PENDING_GRACE_HOURS ago contains only warns)."""
     event = os.environ.get(EVENT_NAME_ENV, "")
     if event == PUSH_EVENT:
         return None

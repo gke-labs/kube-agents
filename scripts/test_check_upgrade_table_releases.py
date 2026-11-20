@@ -938,7 +938,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
         self.assertEqual(code, 0)
         self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
-        self.assertIn("main's push run fails until a pull request relabels them", err)
+        self.assertIn("main's push run fails until a pull request relabels them (pending rows once their release is 48 hours old)", err)
 
     def test_a_push_to_main_fails_on_a_wrong_label(self):
         head = self.repo.mislabel()

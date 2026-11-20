@@ -61,7 +61,7 @@ rows="$(printf '%s\n' "${relabelled}" | awk -F '\t' '{f = index($2, "`") ? "``" 
 # shipped, still pending because its relabel has not merged, takes that release.
 releases="$(printf '%s\n' "${relabelled}" | cut -f1 | sort -u -t. -k1,1n -k2,2n -k3,3n | paste -sd, - | sed 's/,/, /g')"
 commit_message="docs(upgrade): relabel the pending rows ${releases} shipped"
-pr_title="docs(upgrade): relabel the pending rows ${releases} shipped, fixing main's Documentation Checks"
+pr_title="docs(upgrade): relabel the pending rows ${releases} shipped"
 
 git switch -C "${RELABEL_BRANCH}"
 # Set GIT_AUTHOR_*/GIT_COMMITTER_* inline so caller env and author.*/committer.* git config cannot override.
