@@ -10,10 +10,10 @@ import (
 // The bridge's half of the capability envelope, and the reason it exists
 // rather than the session executor's being enough.
 //
-// The operator renders A2A_SPAWN_SESSIONS=true and renders no
-// A2A_DEFAULT_ADDRESSEE at all, so a default `mode: next` install leaves the
-// gateway on its own default — `platform` — and every turn a user types is
-// executed HERE. A session pod is reached only by an explicit `delegate:`.
+// The operator renders A2A_SPAWN_SESSIONS=true and renders
+// A2A_DEFAULT_ADDRESSEE as `platform` unless the PlatformAgent's
+// spec.harness.tuning.defaultRoute says `session`, so on a default install
+// every turn a user types is executed HERE. A session pod is reached only by an explicit `delegate:`.
 // So for the shipped default, this file is the whole enforcement point: the
 // gateway was minting a capability for every one of those tasks and nothing
 // was reading it. A control that runs on the route nobody takes is a control

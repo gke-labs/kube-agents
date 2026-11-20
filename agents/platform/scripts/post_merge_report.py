@@ -23,8 +23,8 @@ tick. No model is involved.
 
 The outcome names and the reason categories ``outcome_detail`` starts with
 (``<category>: <detail>``) are defined here, since the comment is chosen by
-them; the step that reaches an outcome writes them. Nothing schedules this step
-yet, and no step writes ``outcome`` yet, so it reports nothing.
+them; ``post_merge_outcome.decide_outcomes`` writes them, and the ``post-merge-check``
+cron job runs both (``post_merge_outcome.tick``).
 """
 
 from __future__ import annotations

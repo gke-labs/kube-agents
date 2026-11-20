@@ -7,6 +7,7 @@ reaches the right cluster - or is rejected outright.
 Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
+import base64
 import contextlib
 import http.client
 import http.server
@@ -1411,6 +1412,54 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual(1, sent["exit_code"])
         self.assertNotIn("request", sent)
         self.assertIn("does not hold a task credential", sent["stderr"])
+
+    @staticmethod
+    def jwt_shaped(nats):
+        """An unsigned header.payload.sig string: the shim reads claims, never verifies."""
+
+        def segment(value):
+            return base64.urlsafe_b64encode(json.dumps(value).encode("utf-8")).rstrip(b"=").decode("ascii")
+
+        return f"{segment({'typ': 'JWT'})}.{segment({'jti': 'J', 'nats': nats})}.c2ln"
+
+    def headers_for(self, path):
+        with patch.dict("os.environ", self.task_env(), clear=False):
+            return credential_proxy_client.task_credential_headers(path)
+
+    def test_a_report_credential_is_sent_only_on_the_audit_report_routes(self):
+        # No target: the broker admits it on /v1/audit-reports alone, so on
+        # any other call the task goes without and keeps local-only commands.
+        token = self.jwt_shaped({"type": "task", "tier": "report", "trigger": {"name": "t"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reportsx", "/v1/audit", "/"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
+        for path in ("/v1/audit-reports", "/v1/audit-reports/fleet-audit/k/latest", "/v1/audit-reports?x=1"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+        sent = self.run_shim(["kubectl", "version", "--client"], self.task_env())
+        self.assertEqual(0, sent["exit_code"])
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
+
+    def test_a_targeted_credential_is_sent_on_every_route(self):
+        token = self.jwt_shaped({"type": "task", "target": {"cluster": "c"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+
+    def test_a_credential_whose_claims_cannot_be_read_is_sent_as_before(self):
+        # The broker refuses a bad one loudly; leaving it off would hide that.
+        for token in ("a.b.c", "a.-_-.c", "a." + base64.urlsafe_b64encode(b"[1]").decode().rstrip("=") + ".c", "abc"):
+            with self.subTest(token=token):
+                self.token_path.write_text(token, encoding="utf-8")
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for("/v1/exec"))
+
+    def test_no_token_file_sends_nothing_on_any_route(self):
+        self.token_path.unlink()
+        for path in ("/v1/exec", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
 
     def test_kubeconfig_does_not_choose_the_cluster_in_a_task(self):
         sent = self.run_shim(["kubectl", "get", "pods"], self.task_env(KUBECONFIG=str(self.kubeconfig)))
@@ -3596,6 +3645,44 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertGreaterEqual(self.sleeps[0], 2.0)
         self.assertLessEqual(self.sleeps[0], 4.0)
         self.assertEqual(2, len(err.getvalue().strip().splitlines()))
+
+    def test_a_refusal_whose_body_is_too_deep_for_the_parser_is_handed_back_as_one_with_no_json_body(self):
+        """`json()` raises RecursionError for a body nested very deep. The relay reads that as a
+        body that is not JSON: an upstream answer, handed back and not waited out."""
+
+        class TooDeep(self.Response):
+            def json(self):
+                raise RecursionError("maximum recursion depth exceeded")
+
+        for status in (503, 429):
+            with self.subTest(status=status):
+                self.sleeps.clear()
+                refused = TooDeep(status, None)
+                http_, session = self.session([refused, self.Response(200, {"timeSeries": []})])
+                self.assertIs(refused, session.get(self.URL, timeout=30))
+                self.assertEqual(1, len(http_.calls))
+                self.assertEqual([], self.sleeps)
+
+    def test_a_real_reply_with_a_document_that_the_parser_refuses_has_no_json_body(self):
+        """The same through a reply object of `requests` and a document that the parser of this run refuses."""
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is not installed here; the sandbox image has it")
+        depth = 1000
+        while depth <= 4_000_000:
+            document = "[" * depth + "]" * depth
+            try:
+                json.loads(document)
+            except RecursionError:
+                break
+            depth *= 2
+        else:
+            self.skipTest(f"json.loads parses {depth // 2} nested lists; no document is too deep here")
+        reply = requests.models.Response()
+        reply.status_code = 503
+        reply._content = document.encode("utf-8")
+        self.assertIsNone(credential_proxy_client.ApiSession._json_body(reply))
 
     def test_a_draining_refusal_drops_the_pooled_connections_before_the_retry(self):
         # A draining exec pod answers on the caller's keep-alive connection to

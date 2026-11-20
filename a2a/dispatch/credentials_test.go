@@ -22,7 +22,9 @@ import (
 // the dispatcher mints two credentials for the pod that accepted, before its
 // lease is recorded, and sends them on the confirm: a task credential for
 // the bus, and for a task that names a cluster a token for the credential
-// proxy carrying that cluster. Nothing else carries them, nothing else mints
+// proxy carrying that cluster, or for an unattended task a trigger started
+// that names none, a report credential with no target (#5619,
+// trigger_test.go). Nothing else carries them, nothing else mints
 // them, and without a key there are none.
 
 // clusterParams is a task naming a cluster target.

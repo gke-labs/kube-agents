@@ -62,7 +62,7 @@ _verifier = importlib.util.module_from_spec(_verifier_spec)
 _verifier_spec.loader.exec_module(_verifier)
 NOTE_PATH = _verifier.GITOPS_INTENT_NOTE_PATH
 SEEDED_NOTE_SHA = _verifier.gitops_seeded_blob_sha(NOTE_PATH)
-NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
+NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering", "declared-orphan-snapshot"}
 
 
 def pool_repo(project: str) -> str:
@@ -388,6 +388,9 @@ def healthy_world(*projects):
         # audit's 90-day gate, of a source disk the planter deleted.
         "snapshots": [_snapshot("declared-orphan-snap-seeded"), _snapshot("orphan-snap-seeded")],
         "disks": [],
+        # The reservation that missing-reservation-pool names is not there: that is
+        # the fixture. The reader can list the collection (roles/compute.viewer).
+        "reservations": [],
     }
     return {
         "clusters": {project: fleet for project in projects},
@@ -744,6 +747,19 @@ class Drift(ScanHarness):
         self.assertEqual(doc["summary"]["drifted_projects"], 1)
         self.assertIn(f"{PROJECT}: drifted: no-pdb-workload", err)
 
+    def test_a_reservation_with_the_fixtures_name_is_drifted_and_named(self):
+        """Someone created the reservation that the pool names: the defect is
+        gone, and nothing on the cluster shows it until the pool's first node."""
+        world = healthy_world(PROJECT)
+        world["compute"][PROJECT] = {**world["compute"][PROJECT], "reservations": [{"name": "seeded-absent-reservation"}]}
+        doc, err = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["missing-reservation-pool"], "drifted")
+        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
+        self.assertTrue(detail[0].startswith('reservation/seeded-absent-reservation* name none_eq "seeded-absent-reservation": observed "seeded-absent-reservation"'), detail)
+        self.assertIn(f"{PROJECT}: drifted: missing-reservation-pool", err)
+
     def test_two_projects_scan_independently(self):
         world = healthy_world(PROJECT, OTHER)
         world["kubectl_overrides"] = {OTHER: {"pod?app=payments-api": _pods(_pod(restarts=0, last_reason=None))}}
@@ -806,6 +822,19 @@ class NotChecked(ScanHarness):
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
         self.assertIn("could not list clusters", detail[0])
         self.assertNotIn("error", doc["projects"][PROJECT], "the runner ran and said why; that is not a scan error")
+
+    def test_a_reader_that_cannot_list_reservations_leaves_the_pool_role_not_checked(self):
+        """The scan's reader has `compute.reservations.list` through
+        roles/compute.viewer. Without it the role is not checked, never
+        drifted and never healthy, as a refused list is for the project roles."""
+        world = healthy_world(PROJECT)
+        world["compute"][PROJECT] = {k: v for k, v in world["compute"][PROJECT].items() if k != "reservations"}
+        doc, _ = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["missing-reservation-pool"], "not_checked")
+        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
+        self.assertIn("compute reservations list failed", detail[0])
 
     def test_an_unplanted_role_is_absent_with_the_runners_warning_naming_it(self):
         # Absent is a rollout state, not a failed read: the stack has not put

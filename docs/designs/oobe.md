@@ -76,22 +76,36 @@ per sweep, and Hermes retries that card in place; a re-run by hand uses a suffix
 (`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the
 report itself and files no ranking card. The ranking worker writes `/opt/data/INVENTORY.md`, on the
 sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
-(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or under `spec.mode: next`
-`.user_aligned_conversation`) and claims
+(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or `.user_aligned_conversation`
+for a conversation the gateway recorded) and claims
 `.bootstrap_completed` by an exclusive link; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
 later removes both jobs. When nobody has spoken a day after the sweep was filed
 (`UNSPOKEN_FILE_AFTER_SECONDS`), the report is filed as a dated ledger issue instead, in the GitOps
 repository when it is on GitHub or else in the install's one managed GitHub repository (so a
 GitOps repository on another forge still files into that one; several GitHub repositories with no
 GitOps role, or none on GitHub, files nothing; `ONBOARDING_LEDGER_REPO` names one outright), with one line linking it sent to the platform whose home posts route through
-the gateway (kept by the gateway for its digest when no home channel is set; a `spec.mode: today`
-install gets the issue and no line), and the same claim is taken; a week after the sweep
+the gateway (kept by the gateway for its digest when no home channel is set), and the same claim is taken; a week after the sweep
 (`UNDELIVERED_RETIRE_SECONDS`, the plugin's own priming limit) an undelivered report, whatever kept it
 from filing, has its findings registered, is claimed without a post, and the scheduled audits stand
 in for it. In between, a refused create releases the claim and is retried on the conversation path's
 waits, five tries in all; no repository, several, an unreadable mount or a body longer than an issue
 may be is recorded in the path's own attempts file and waits for the retire. A report retired that way leaves its items unmarked in the findings queue, so the nudge
 announces them later: nobody saw them.
+
+Whichever way it ended, the report is readable on demand afterwards. The `platform_control` tool
+`get_first_run_report` (`agents/platform/scripts/platform_mcp_server.py`) reads the ranked report
+(`INVENTORY.delivered.md`, else a pending `INVENTORY.md`) or the sweep's complete findings
+(`INVENTORY.raw.md`) from where onboarding left them, and the markers on the agent pod, and names
+the state: `delivered` with the path that took it (`origin`, the chat the onboarding job was linked
+to, or `conversation`, the conversation recorded under the gateway: both the chat the first person
+wrote in), `filed` with the issue's repository, number, link and time, `retired`,
+`pending` (written, not yet delivered) or `absent` (no report yet). The `first-run-report` skill is
+the route a chat question takes ("what did onboarding find?", "show me the full inventory", "was
+the first-run report delivered, and where did it go?"), and its red line is the tool: no terminal
+read of the files, no new sweep. The file names, markers and claim tags have one home for
+delivery, the scan gate and the on-demand read, `agents/platform/scripts/first_run_report.py`;
+the onboarding plugin, `board_snapshot.py` and `findings_nudge.py` keep their own copies, pinned
+equal by tests.
 
 ## 4. First-run audits
 
@@ -240,7 +254,7 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   `origin` from the old delivery job to `oobe` on any boot where `oobe` has no `origin` of its own.
   Without that, the report goes out with `deliver: local` and reaches nobody. The plugin binds
   every delivery job present, the old one included, so a rollback to an image from before the fold
-  finds the link where that image looks for it. Under `spec.mode: next` the link is not a job origin:
+  finds the link where that image looks for it. For a conversation the gateway recorded the link is not a job origin:
   the plugin records the conversation in `onboarding_conversation.json`, the jobs stay
   `deliver: local`, and delivery posts into that conversation through the gateway itself.
 - **An install with no `oobe`.** An image from before the fold removed `oobe` as soon as its
@@ -296,7 +310,7 @@ times. It rides with the audits stage, whose eval case covers both.
   report after all once the operator projects a Slack home channel into the pod, by asking the chat
   relay to post it as a scheduled delivery would, while the run's claim is under
   `RESEND_WINDOW_SECONDS` (the relay posts a record older than two hours as a "did not finish" notice).
-  An audit outside the chain, a first mention later than that, today mode and Google Chat keep the
+  An audit outside the chain, a first mention later than that, and Google Chat keep the
   request sentence.
 - **An install self-check.** Not asked for by any issue.
 

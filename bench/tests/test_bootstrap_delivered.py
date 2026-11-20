@@ -42,6 +42,8 @@ from kube_agents_bench.verifiers import BootstrapDeliveredVerifier
 REPO = Path(__file__).resolve().parents[2]
 TASK = REPO / "bench" / "tasks" / "bootstrap-inventory-ranking-delivery" / "task.yaml"
 DELIVERY = REPO / "agents" / "chat" / "scripts" / "bootstrap_delivery.py"
+# The marker names have one home, which the delivery script imports; the job id is its own.
+NAMES = REPO / "agents" / "platform" / "scripts" / "first_run_report.py"
 VALIDATOR = REPO / "scripts" / "validate_bench_cases.py"
 
 # Hermes' cron/executions.db, as the store creates it.
@@ -145,9 +147,12 @@ def _around(claim: datetime = CLAIM) -> tuple[datetime, datetime]:
 
 
 def test_the_job_and_marker_are_the_ones_the_delivery_script_uses() -> None:
+    # Two files: the job id is the delivery script's own; the marker name is
+    # declared in first_run_report.py, which the script aliases.
     script = DELIVERY.read_text()
     assert f'OOBE_JOB_ID = "{onboarding.DELIVERY_JOB_ID}"' in script
-    assert f'"{Path(onboarding.COMPLETED_MARKER).name}"' in script
+    assert "import first_run_report" in script
+    assert f'COMPLETED_FILE = "{Path(onboarding.COMPLETED_MARKER).name}"' in NAMES.read_text()
 
 
 # --- the read -------------------------------------------------------------

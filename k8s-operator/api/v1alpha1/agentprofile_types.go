@@ -436,6 +436,14 @@ type AgentProfileStatus struct {
 // `platform` is the Hermes bridge's addressee: a profile under that name would put a
 // second executor on a2a.tasks.platform.*. The platform persona as a profile is not a goal.
 // +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'",message="AgentProfile name 'platform' is reserved: the Hermes bridge is the executor for that addressee"
+// `session` is the A2A gateway's session route (spec.harness.tuning.defaultRoute
+// on the PlatformAgent): set as the default addressee it opens a session pod,
+// so a profile under that name would hold an addressee the gateway means
+// something else by. The rule refuses a create only. A name is immutable, so
+// oldSelf is present exactly on an update, and a profile created under the name
+// before the rule existed keeps taking writes (status and finalizer removal
+// included) rather than hanging on its next one.
+// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name != 'session'",optionalOldSelf=true,message="AgentProfile name 'session' is reserved: it is the A2A gateway's session route"
 // The name bound ratchets: it refuses a create, or an update that newly breaks
 // it, but not an update to a profile that already broke it. A profile named
 // under 0.19.0's flat 55 would otherwise be refused every write after the

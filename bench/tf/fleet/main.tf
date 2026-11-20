@@ -156,7 +156,8 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # every gcloud read as this account, so the presence probe and the state pass
 # list instances, firewall rules, networks and snapshots as it (#2483, #2682),
 # and the state pass reads the startup-fail VM's serial port output and lists
-# the snapshots' source disks as it.
+# the snapshots' source disks as it. It also lists the project's reservations
+# as it, for the missing-reservation-pool role (compute.reservations.list).
 # roles/compute.viewer is get and list on Compute Engine resources, with no
 # create, update or delete. It does show instance metadata and serial port
 # output (compute.instances.getSerialPortOutput), so no secret goes in this
@@ -982,9 +983,9 @@ resource "google_compute_disk" "orphan_pd" {
 # `sourceDisk` names no live disk, that no snapshot schedule took, and that is
 # more than 90 full days old. Its own exclusion names a legal hold or a
 # compliance retention the collector cannot read, which is why the check is
-# proposed as the stream's one declarable posture: once it is, the pool
-# project's GitOps knowledge/ note declares `declared-orphan-snap-<prefix>`
-# on purpose and the audit lists it under Declared intent, while
+# the stream's one declarable posture: the pool project's GitOps knowledge/
+# note declares `declared-orphan-snap-<prefix>` on purpose and the audit
+# lists it under Declared intent, while
 # `orphan-snap-<prefix>`, undeclared, stays a finding beside it (the control
 # that shows a declaration moved one snapshot and not the check). Catalogue
 # roles: declared-orphan-snapshot and orphan-snapshot.

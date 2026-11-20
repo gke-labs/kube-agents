@@ -387,7 +387,7 @@ Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback 
 
   A second `stop` before the task ends gets `🛑 cancel already sent — the task ends when the executor confirms`. With nothing running in the conversation, `stop` gets `🤷 nothing is running`. In a conversation that has run a task, the reply adds that if the agent filed a card for it, that card keeps working until it finishes. A card outlives the turn that filed it, and by default `stop` cannot reach it.
 
-  On an install whose operator sets `A2A_CARD_STOP=true`, `stop` stops the cards instead, except in a conversation whose tasks go to a session worker (the `/session` route below, or after `delegate`), which keeps the card notice. It posts `🛑 stopping this conversation's cards…`, which becomes `🛑 stopped 2 cards: <title>, <title>` naming up to five cards, with a note for anything it could not promise, such as cards that had already finished or a card that may still start.
+  On an install whose operator sets `A2A_CARD_STOP=true`, `stop` stops the cards instead, except in a conversation whose tasks go to a session worker (the `/session` route below, or after `delegate`), which keeps the card notice. It posts `🛑 stopping this conversation's cards…`, which becomes `🛑 stopped 2 cards: <title>, <title>` naming up to five cards, with a note for anything it could not promise, such as cards that had already finished or a card that may still start. `CARD_STOP_ENABLED=true` in `install.env`, or the chart's `operator.cardStop.enabled`, sets it.
 
   With no card open it answers `🤷 nothing is running`, or `🤷 no card was open in this conversation` if you've asked something new in the meantime. Card titles are shown as plain text, so a title can't mention anyone or add a link; dots and colons in a title show as look-alikes, so a URL in it isn't clickable.
 
@@ -598,7 +598,9 @@ The session pods that [Security and IAM](/kube-agents/reference/security-and-iam
 
 An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) connects the gateway (`agents/platform/scripts/teams_relay_patch.py` and `agents/chat/plugins/platforms/teams/`) to `/v1/chat/teams/*` on the credential broker (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`). The broker holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, mints and caches Microsoft Entra OAuth 2.0 `client_credentials` tokens, and enforces optional single-tenant isolation (`TEAMS_TENANT_ID`). Outbound calls on `/v1/chat/teams/api` are restricted to `POST v3/conversations/<id>/activities` (excluding `/activities/history`) on official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`, with query strings, fragments, and HTTP redirects refused).
 
-The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched. External inbound Bot Framework webhook ingress is not yet shipped in the operator: `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods. Proactive alerts and scheduled cron reports ([below](#proactive-alerts-both-channels)) are delivered only to Google Chat and Slack and are not sent to Microsoft Teams. See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
+The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched. External inbound Bot Framework webhook ingress is not yet shipped in the operator: `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods.
+
+Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`). See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
 
 ## Proactive alerts (both channels)
 
@@ -613,7 +615,7 @@ When no card can be built, the report is posted as text, reshaped with a headlin
 - **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL`.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
 
-An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. The agent picks one platform for the alert, Chat first, among the platforms that have a home channel. With none, the gateway keeps it for the digest on the first platform. A scheduled report has no such constraint and is posted to every enabled interactive platform (Google Chat and Slack; Microsoft Teams is not enumerated by the delivery resolver) — [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
+An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. The agent picks one platform for the alert, Chat first, among the platforms that have a home channel. With none, the gateway keeps it for the digest on the first platform. A scheduled report has no such constraint. The default jobs' `deliver: chat` relays it to every enabled platform among Google Chat and Slack; a job whose `deliver` names `teams` posts to the Teams home channel instead. [The relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
 
 A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
@@ -817,9 +819,13 @@ The [admin console](/kube-agents/reference/admin-console/), started from a repos
 
 Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither reaches a person as it happens. The audit reports stay in the report store on the data volume, the triage shows on the board, and other scheduled reports are not kept.
 
+What the alert path did is still readable. Ask the agent through any of these doors `what alerts fired overnight?` and it answers from its event ledger: the alerts it posted, and the events it held back from chat and why.
+
 The onboarding delivery stage waits a day for a human to connect over chat. Then it files the first-run inventory report as an issue labelled `agent:onboarding`, in the GitOps repository when it is on GitHub or else in the install's one managed GitHub repository. A report it could not file is retired a week after the sweep. For that first day the report sits at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume.
 
 Read it there with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md`, or in the issue afterwards. The file is renamed `INVENTORY.delivered.md` once filed or retired.
+
+Or ask through any of these doors. `what did onboarding find?` answers from that report, `show me the full inventory` from the sweep's complete findings, and `was the first-run report delivered?` says where it went: the chat where the first person wrote, the issue, or retired after a week with nobody arriving.
 
 ## Where to go next
 
