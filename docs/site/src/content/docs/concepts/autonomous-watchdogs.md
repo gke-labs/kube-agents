@@ -115,6 +115,7 @@ The entries that share the Platform Agent's roster without being audits. The tab
 | `feedback-prompt` | script, `feedback_prompt.py` | Daily 13:00 | Feedback Prompt |
 | `eod-event-watcher-daily-report` | script, `eod_report_generator.py` | Weekdays 21:00 | Event Watcher Daily Activity Recap |
 | `stall-watch` | script, `stall_watch.py` | Every 30 minutes | Controller Stall Watch |
+| `post-merge-check` | script, `post_merge_check.py` | Every 5 minutes | Post-Merge Check |
 | `upgrade-readiness-watch` | script, `upgrade_readiness_watch.py` | Daily 10:10 | Upgrade Readiness Watch |
 | `upgrade-readiness-weekly-review` | script, `upgrade_readiness_review.py` | Weekly, Saturday 06:00 | Upgrade Readiness Weekly Review |
 | `upgrade-readiness-weekly-brief` | prompt, after `upgrade_readiness_brief_queue.py` | Weekly, Saturday 07:00 | Upgrade Readiness Weekly Brief |
