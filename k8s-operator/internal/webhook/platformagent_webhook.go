@@ -400,6 +400,12 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	// 7. Leaving next while a bus migration holds the bus: the run's
 	// staging claim can hold the only copy of the bus's data.
 
+	// 8. Effective kanban.admission memoryBudgetMiB >= workerRssCapMiB so a
+	// single worker's RSS cap never exceeds the pod's memory admission budget.
+	admissionErrs, admissionWarnings := validateKanbanAdmission(oldObj, platformAgent)
+	allErrs = append(allErrs, admissionErrs...)
+	warnings = append(warnings, admissionWarnings...)
+
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -510,6 +516,23 @@ func storageSize(platformAgent *agentv1alpha1.PlatformAgent) *resource.Quantity 
 		return nil
 	}
 	return platformAgent.Spec.Storage.Size
+}
+
+// validateKanbanAdmission rejects creates or updates whose resolved
+// kanban.admission block sets memoryBudgetMiB below workerRssCapMiB. When
+// oldObj already carried a mismatched configuration and neither
+// spec.deployment.resources nor spec.harness.tuning.admission changed, the
+// update passes with a warning so unrelated edits to an existing CR are not
+// deadlocked.
+func validateKanbanAdmission(oldObj, platformAgent *agentv1alpha1.PlatformAgent) (field.ErrorList, admission.Warnings) {
+	errs := controller.ValidateKanbanAdmission(platformAgent)
+	if len(errs) == 0 {
+		return nil, nil
+	}
+	if oldObj != nil && controller.KanbanAdmissionInputsEqual(oldObj, platformAgent) && len(controller.ValidateKanbanAdmission(oldObj)) > 0 {
+		return nil, admission.Warnings{fmt.Sprintf("%s: %s", errs[0].Field, errs[0].Detail)}
+	}
+	return errs, nil
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a

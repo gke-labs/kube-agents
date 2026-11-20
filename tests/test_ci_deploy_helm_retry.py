@@ -233,11 +233,16 @@ sleep() {{
   fi
 }}
 """
+            # The block expands IMAGE_ARGS, GITHUB_MINTER_ARGS and FORGE_ARGS
+            # bare, and the script never has one of them empty. Each gets one
+            # pair as the script gives it: a bash before 4.4, such as the 3.2
+            # of macOS, takes an empty array's "[@]" for an unbound variable
+            # under `set -u` and stops the block there.
             preamble = f"""
 STEP_START=$SECONDS
-IMAGE_ARGS=()
-GITHUB_MINTER_ARGS=()
-FORGE_ARGS=()
+IMAGE_ARGS=(--set-string "operator.image.tag=test")
+GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
+FORGE_ARGS=(--set-string "platformAgent.integration.github.gitRepo=test-repo")
 A2A_OPERATOR_ENV_ARGS=()
 MODE_NEXT_MAX_SESSIONS=6
 {sleep_func}
