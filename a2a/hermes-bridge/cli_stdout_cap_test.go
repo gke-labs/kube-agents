@@ -127,6 +127,7 @@ func TestCLI_StdoutAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeWith(t, url, printingScript(t, atCapAnswerBytes), 0, func(b *Bridge) {
 		b.stdoutCap = atCapAnswerBytes
+		b.cfg.ResultChunkSize = atCapChunkBytes
 	})
 	c := gatewayClient(t, url)
 	submit(t, c, "task-cli-atcap", "write something large")
