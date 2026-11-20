@@ -360,7 +360,7 @@ func restoreAllDirected(ctx context.Context, nc *nats.Conn, streams []string, di
 			if forward {
 				restored, err = RestoreVerifiedCounting(ctx, nc, cfg, meta.State, meta.TakenAt, open, want.Data, policy)
 			} else {
-				err = RestoreAsItWas(ctx, nc, cfg, meta.State, open, want.Data, policy)
+				restored, err = RestoreAsItWasCounting(ctx, nc, cfg, meta.State, open, want.Data, policy)
 			}
 			if err == nil || errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrOutsidePolicy) || errors.Is(err, ErrOverRenderedLimits) || attempt == restoreRetries {
 				break

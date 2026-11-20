@@ -50,8 +50,13 @@ func busReshapeRunSuffix(nonce string) string {
 // both records keep it in.
 func busReshapeNonceHash(nonce string) string {
 	sum := sha256.Sum256([]byte(nonce))
-	return hex.EncodeToString(sum[:])[:8]
+	return hex.EncodeToString(sum[:])[:busReshapeNonceHashLength]
 }
+
+// busReshapeNonceHashLength is how many hex digits of the request's hash
+// the records keep: enough that two values an admin sets don't collide, and
+// short enough for the run ID, which names the run's objects.
+const busReshapeNonceHashLength = 8
 
 // busReshapeConsumed reports whether the bus StatefulSet records nonce as
 // already started (a2aBusReshapeConsumedAnnotation). A StatefulSet that
@@ -154,7 +159,7 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 	case tasks.MaxConsumers < 0 || tasks.MaxConsumers >= rendered:
 		return fmt.Sprintf("TASKS already holds max_consumers %d, at least the %d this PlatformAgent renders", tasks.MaxConsumers, rendered), "wide", false
 	}
-	if over := r.busMigrationStreamsOverCapIn(ctx, agent, []string{"TASKS"}); over != "" {
+	if over := busMigrationStreamsOverCapFrom(agent, streams, []string{"TASKS"}); over != "" {
 		return over, "over-cap", false
 	}
 	return "", "", false

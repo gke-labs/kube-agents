@@ -135,3 +135,58 @@ func TestAThreeReplicaSnapshotRestoresIntoThreeServersBothWays(t *testing.T) {
 		shutdown(s2, s1, s0)
 	}
 }
+
+// The way back into three servers (a reshape's rollback) waits for the
+// consumers it restored to be assigned before it raises the stream, as the
+// forward restore does: the server proposes them only after the restore
+// answers, and a raise before that would leave them out of the remap.
+func TestTheWayBackIntoThreeServersWaitsForItsConsumers(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+	defer shutdown(s2, s1, s0)
+	nc, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, _ := nc.JetStream()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+		if _, err := js.AccountInfo(); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("the cluster's JetStream never came up: %v", err)
+		}
+	}
+	seedBus(t, s1.ClientURL(), 3)
+	var buf bytes.Buffer
+	meta, err := Snapshot(ctx, nc, "TASKS", &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.DeleteStream("TASKS"); err != nil {
+		t.Fatal(err)
+	}
+	policy := policyOf(meta.Config)
+	policy.Replicas = 1
+	dir, run := stageTasks(t, meta, buf.Bytes(), policy)
+	const lagging = 4
+	reads := 0
+	defer func(l func(context.Context, *nats.Conn, string) ([]string, error)) { listAssigned = l }(listAssigned)
+	real := listAssigned
+	listAssigned = func(ctx context.Context, nc *nats.Conn, stream string) ([]string, error) {
+		reads++
+		if reads <= lagging {
+			return nil, nil // not assigned yet
+		}
+		return real(ctx, nc, stream)
+	}
+	if _, _, err := restoreAllDirected(ctx, nc, []string{"TASKS"}, dir, run, 3, false); err != nil {
+		t.Fatal(err)
+	}
+	if reads <= lagging {
+		t.Errorf("the way back read the consumer list %d times, want more than %d: it raised before its consumers were assigned", reads, lagging)
+	}
+}

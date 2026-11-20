@@ -1895,6 +1895,12 @@ func (r *PlatformAgentReconciler) busMigrationStreamsOverCapIn(ctx context.Conte
 	if err != nil {
 		return "the bus's stream sizes could not be read (" + err.Error() + "), and a stream over the limits the restore puts on it would fail the run with writes frozen"
 	}
+	return busMigrationStreamsOverCapFrom(agent, live, names)
+}
+
+// busMigrationStreamsOverCapFrom is the over-cap check against a stream
+// report already read, so a caller that read it once doesn't read it again.
+func busMigrationStreamsOverCapFrom(agent *agentv1alpha1.PlatformAgent, live map[string]a2aBusStream, names []string) string {
 	now := time.Now()
 	var over []string
 	listed := 0
