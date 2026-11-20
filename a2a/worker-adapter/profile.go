@@ -30,6 +30,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/render"
@@ -592,13 +593,14 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
 	cfg.TaskDeadline = time.Until(h.offer.Deadline) - w.pw.deadlineMargin
-	if h.script == nil && h.proxyToken != "" {
-		// A credential naming a script is a script task's, whatever the
-		// confirm says: one never runs as a model turn. Read unverified,
-		// which can only make the worker refuse more.
-		if tr, err := taskcred.UnverifiedTrigger(h.proxyToken); err == nil && tr != nil && tr.Script != "" {
-			plan.scriptRefusal = fmt.Sprintf("the task credential names script %q but the confirm carries none, and a script task never runs as a model turn", tr.Script)
-			cfg.Logger.Warn("refusing a model turn for a script task", "task", cfg.TaskID, "script", tr.Script)
+	if h.script == nil {
+		// A credential, or the submission's own trigger, naming a script is
+		// a script task's, whatever the confirm says: one never runs as a
+		// model turn. Both are read unverified, which can only make the
+		// worker refuse more.
+		if from, script := scriptMarker(h); script != "" {
+			plan.scriptRefusal = fmt.Sprintf("the %s names script %q but the confirm carries none, and a script task never runs as a model turn", from, script)
+			cfg.Logger.Warn("refusing a model turn for a script task", "task", cfg.TaskID, "script", script, "namedBy", from)
 		}
 	}
 	if h.script != nil {
@@ -764,6 +766,24 @@ func taskParameters(origin *lib.Envelope) (map[string]string, error) {
 		return nil, err
 	}
 	return params.Parameters, nil
+}
+
+// scriptMarker is the script a held task is marked with, and what marks
+// it: the task credential's trigger, else the submission's own (its
+// authority block's trigger, which admission checked). Neither is "" for a
+// model task.
+func scriptMarker(h *held) (from, script string) {
+	if h.proxyToken != "" {
+		if tr, err := taskcred.UnverifiedTrigger(h.proxyToken); err == nil && tr != nil && tr.Script != "" {
+			return "task credential", tr.Script
+		}
+	}
+	if h.origin != nil {
+		if tr, err := capability.TriggerFromAuthority(h.origin.Authority); err == nil && tr != nil && tr.Script != "" {
+			return "submission's trigger", tr.Script
+		}
+	}
+	return "", ""
 }
 
 // prepareScript clears a script-run task's script to run, or says why it

@@ -626,3 +626,46 @@ func TestAScriptsNamedPathsDirectoriesAreCheckedToo(t *testing.T) {
 		}
 	}
 }
+
+// A submission whose own trigger names a script is a script task's even when the confirm carries
+// no script and the task credential names none (or there is no credential at all): it is
+// rejected script-refused and never falls through to a model turn.
+func TestASubmissionNamingAScriptNeverRunsAsAModelTurn(t *testing.T) {
+	kp, pub := signingKey(t)
+	_, check := scriptRoot(t)
+	ran := filepath.Join(t.TempDir(), "ran")
+	harness := stub(t, "touch "+ran+"\nexit 7\n")
+	for name, token := range map[string]func(task string) string{
+		"no task credential":                    func(string) string { return "" },
+		"a credential whose trigger names none": func(task string) string { return mintProxy(t, kp, task, pwPod, "", taskcred.AudienceCredentialProxy) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			_ = os.Remove(ran)
+			url := startServer(t)
+			d := newFakeDispatcher(t, url)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			startScriptWorker(t, ctx, profileWorkerConfig(t, url, harness), ProfileWorkerConfig{OneShot: true, TaskSigningKeys: pub, scriptCheck: check})
+			task := "task-script-3"
+			origin := profileSubmission(t, task, "run the watch", map[string]string{"cluster": "prod-east"})
+			origin.Authority = []byte(`{"grants":{"capability":{"key":"cap-a","revision":1}},"trigger":{"name":"schedule/stall-watch","origin":"builtin","script":"stall-watch"}}`)
+			d.offer(task, origin, 5)
+			if a := d.nextAccept(5 * time.Second); !a.Accepted {
+				t.Fatalf("answer %+v, want an accept", a)
+			}
+			d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task, ProxyToken: token(task)})
+			if _, final := drainLeases(d, task, 20*time.Second); !final {
+				t.Fatal("no final renewal")
+			}
+			if got := foldTask(t, testClient(t, url), pwProfile, task); got.State != lib.StateRejected {
+				t.Errorf("state %q, want rejected", got.State)
+			}
+			if msg := terminalText(t, url, pwProfile, task); !strings.Contains(msg, "script-refused") || !strings.Contains(msg, "submission's trigger") {
+				t.Errorf("terminal %q, want script-refused for the submission's trigger", msg)
+			}
+			if _, err := os.Stat(ran); err == nil {
+				t.Error("the harness ran a model turn for a script task")
+			}
+		})
+	}
+}
