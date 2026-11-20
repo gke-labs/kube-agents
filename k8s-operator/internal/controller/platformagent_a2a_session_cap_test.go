@@ -725,6 +725,8 @@ func TestAnUpgradeOnAReadableBusRollsOnce(t *testing.T) {
 // the session route, at the fitted cap.
 func TestAPrunedSessionCapHoldsThePlatformRoute(t *testing.T) {
 	agent := sessionRouteTestAgent()
+	// A provisioned bus, where an unreadable pass has no cap to fall back on.
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
 	patches, pruning := 0, true
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
