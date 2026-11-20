@@ -38,6 +38,11 @@ const (
 	relayTimeout = 5 * time.Second
 	// bearerScheme is the Authorization scheme Microsoft uses.
 	bearerScheme = "Bearer "
+	// The challenges a refusal answers with, and the body an acceptance
+	// answers with. Neither is a credential.
+	challengeNoBearer     = `Bearer realm="teams-inbound"` // #nosec G101 -- a WWW-Authenticate challenge, not a credential
+	challengeInvalidToken = `Bearer error="invalid_token"` // #nosec G101 -- a WWW-Authenticate challenge, not a credential
+	acceptedBody          = `{"status":"accepted"}`
 	// metricsNamespace prefixes the receiver's metrics.
 	metricsNamespace = "kubeagents_teams_inbound"
 )
@@ -148,7 +153,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	authz := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authz, bearerScheme) || strings.TrimSpace(authz[len(bearerScheme):]) == "" {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="teams-inbound"`)
+		w.Header().Set("WWW-Authenticate", challengeNoBearer)
 		s.refuse(w, http.StatusUnauthorized, reasonBearer, "the request carries no bearer token")
 		return
 	}
@@ -175,7 +180,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`) // #nosec G101 -- a WWW-Authenticate challenge, not a credential
+		w.Header().Set("WWW-Authenticate", challengeInvalidToken)
 		s.refuse(w, http.StatusUnauthorized, reasonToken, err.Error())
 		return
 	}
@@ -197,7 +202,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		s.requests.WithLabelValues(outcomeAccepted).Inc()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+		_, _ = w.Write([]byte(acceptedBody))
 	case status == http.StatusServiceUnavailable:
 		s.requests.WithLabelValues(outcomeQueueFull).Inc()
 		s.log.Warn("teams inbound: the broker's Teams queue is full; the activity was dropped")

@@ -1,13 +1,13 @@
 """The smoke pipeline deploys the A2A stack on every run.
 
-`hack/ci-deploy.sh` has one path: section 4 names the six A2A images (the
+`hack/ci-deploy.sh` has one path: section 4 names the seven A2A images (the
 pull request's own builds, or the candidate's published ones on the
 release-candidate path) and fills the operator.extraEnv values the release
 expands (the five image overrides, the inject door's flag, and two settings of
 the bridge the operator renders: its image and its concurrency; its executor is
 left to the bridge's default, api, which the start-line wait requires; and the
 card stop), the Cloud Build's `a2a` and `a2a-bridge` steps run with `docker`
-stubbed build and push those six in order with the bridge FROM this build's
+stubbed build and push those seven in order with the bridge FROM this build's
 platform image, and the concurrency guard runs against the values it refuses
 and admits. EVAL_MODE_NEXT, the flag that once chose this path, is read
 nowhere: the build section runs the same with it unset and in every spelling,
@@ -85,12 +85,13 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_CONSOLE_URI",
     "_A2A_BRIDGE_URI",
     "_A2A_DISPATCHER_URI",
+    "_A2A_TEAMS_INBOUND_URI",
     "_PERSONA_CLUSTER_URI",
     "_PERSONA_TSE_URI",
     "_PERSONA_FLEET_AUDIT_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse", "persona-fleet-audit")
-_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "a2a-teams-inbound", "persona-cluster", "persona-tse", "persona-fleet-audit")
+_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher", "teams-inbound")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 # The retired flag, in the spellings a job environment could still carry.
 _FLAG_SPELLINGS = (None, "", "0", "1", "true", "yes")
@@ -585,7 +586,9 @@ class A2AStackTest(unittest.TestCase):
         self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
         self.assertEqual(values[11], "operator.extraEnv[11].value=true")
         self.assertEqual(values[12], "operator.extraEnv[12].value=true")
-        self.assertEqual(len(values), 13, values)
+        # The Teams inbound receiver, at the candidate's published image (#1034).
+        self.assertEqual(values[13], f"operator.extraEnv[13].value={_RC_REGISTRY_PREFIX}/a2a-teams-inbound:{_RC_COMMIT_SHA}")
+        self.assertEqual(len(values), 14, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
@@ -1864,14 +1867,14 @@ class BridgeImageBuildTest(unittest.TestCase):
             self.assertEqual(by_name[name]["override"], override)
             self.assertEqual(by_name[name]["tagPolicy"], "release")
 
-    def test_the_a2a_step_starts_at_once_and_builds_the_six_in_order(self) -> None:
-        """The six A2A images do not depend on the platform image, so their
+    def test_the_a2a_step_starts_at_once_and_builds_the_seven_in_order(self) -> None:
+        """The seven A2A images do not depend on the platform image, so their
         step must not queue behind it; only the bridge does."""
         self.assertEqual(build_step("a2a")["waitFor"], ["-"])
         result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, (*_A2A_IMAGES[:5], "a2a-dispatcher"), strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, (*_A2A_IMAGES[:5], "a2a-dispatcher", "a2a-teams-inbound"), strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
             # The worker's Dockerfile copies the credential broker's shim client
             # from agents/platform/scripts, so it builds from the repository

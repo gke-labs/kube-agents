@@ -17,7 +17,7 @@ tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallou
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `a2a-teams-inbound`, `hermes-bridge`) are built and tagged with the rest of the
 release; `a2a-teams-inbound` runs only when `spec.integration.teams.inbound` is enabled.
 
-The operator derives the six it renders by default from its own image (`OPERATOR_IMAGE`, which the chart
+The operator derives the A2A images it renders by default from its own image (`OPERATOR_IMAGE`, which the chart
 sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it resolves
 for itself. They get the same registry and tag, so an install at a release pulls them at that
 release and a mirrored install pulls them from the mirror. A `PlatformAgent`'s own

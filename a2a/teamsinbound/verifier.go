@@ -120,12 +120,19 @@ func (v *Verifier) Ready() bool {
 	return v.everFetched
 }
 
-// Warm reads the key set once, ahead of the first request. Failure is not
-// fatal: the first request fetches again.
+// Warm reads the key set once, ahead of the first request, bounded by ctx
+// (unlike a request's fetch, which outlives its requester). Failure is not
+// fatal: the first request fetches again. Nothing else runs before the
+// listeners start, so no fetch is pending when it is called.
 func (v *Verifier) Warm(ctx context.Context) error {
-	_, err := v.key(ctx, "")
-	if errors.Is(err, ErrRefused) {
-		return nil
+	keys, err := v.fetchKeys(ctx)
+	v.keysMu.Lock()
+	defer v.keysMu.Unlock()
+	v.fetched = v.now()
+	v.fetchErr = err
+	if err == nil {
+		v.keys = keys
+		v.everFetched = true
 	}
 	return err
 }
