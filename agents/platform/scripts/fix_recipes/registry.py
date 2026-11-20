@@ -21,9 +21,10 @@ Fields: `kind` (the directory's name), `name` (what text kube-agents writes
 calls the fixes), `title` and `dial_environment` (the dial's row), and the
 optional `owner`, `eval_case` (the end-to-end case that grades the fix on the
 cluster after merge), and `recheck_kinds` and `recheck_siblings`: the kubectl
-kinds the one-finding re-check reads in the target namespace, and the
-collector checks a fix could trip, space-separated (`recheck.py` builds its
-`RECHECKS` from them).
+kinds the one-finding re-check reads in the target namespace (separated by
+commas, as `kubectl get` takes them), and the collector checks a fix could
+trip (separated by spaces); `recheck.py` builds its
+`RECHECKS` from them.
 """
 
 from __future__ import annotations

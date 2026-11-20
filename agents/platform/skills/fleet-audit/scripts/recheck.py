@@ -274,21 +274,28 @@ def narrowed_cluster_check(slug: str, context_key: str) -> Step:
 
 
 #: How a sibling check a fix could trip is narrowed to the target: the step
-#: that selects what it may see, and the context key that selection replaces.
-#: A recipe naming a sibling not here fails at import.
-SIBLING_NARROWING: dict[str, tuple[Step, str]] = {
+#: that selects what it may see, the context key that selection replaces, and
+#: the kinds the read must include for the check to judge rightly. A recipe
+#: naming a sibling not here, or reading too little for it, fails at import.
+SIBLING_NARROWING: dict[str, tuple[Step, str, frozenset[str]]] = {
     # A second budget over the same pods makes the eviction API refuse them
     # all, so a fix that adds one beside another is not clean.
-    "pdb-overlapping": (select_target_workload, "workloads"),
-    "blocking-pdb": (select_budgets, "pdbs"),
+    "pdb-overlapping": (select_target_workload, "workloads", frozenset({"poddisruptionbudgets"})),
+    # Without autoscalers read, `blocking-pdb` compares against `spec.replicas`
+    # rather than the autoscaler's floor, and a budget that blocks every drain
+    # would read clean.
+    "blocking-pdb": (select_budgets, "pdbs", frozenset({"poddisruptionbudgets", "horizontalpodautoscalers"})),
 }
 
 
 def recheck_for(recipe: registry.Recipe) -> Recheck:
     """A workload-scoped recipe's re-check: find the target, run its own check, then each sibling narrowed."""
     steps: list[Step] = [in_scope_workload, workload_check(recipe.kind)]
+    read = set(recipe.recheck_kinds.split(","))
     for sibling in recipe.siblings():
-        select, context_key = SIBLING_NARROWING[sibling]
+        select, context_key, needs = SIBLING_NARROWING[sibling]
+        if not needs <= read:
+            raise ValueError(f"{recipe.kind}: {sibling} needs {', '.join(sorted(needs - read))} in recheck_kinds")
         steps += [select, narrowed_cluster_check(sibling, context_key)]
     return Recheck(recipe.recheck_kinds, tuple(steps))
 
