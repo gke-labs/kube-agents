@@ -1,0 +1,100 @@
+# What is graded: the front door (the `default` Hermes profile the chat
+# ingress reaches) is running the plugins its image ships. The entrypoint
+# copies every plugin directory under /opt/defaults/plugins onto the agent's
+# data volume at /opt/data/plugins (deploy/shared/docker-entrypoint.sh, step
+# 2b) and Hermes loads the profile's plugins from there: agent_roster (the
+# `[SPECIALIST AGENTS AVAILABLE NOW]` block), bootstrap_onboarding,
+# chat_metrics, common, legacy_slash_commands, session_otel_bridge,
+# session_store, tool_call_audit, and the pinned hermes_otel.
+#
+# The defect (gke-labs/kube-agents#6279): when the operator mounts a
+# default-profile AgentPlugin under the home (/opt/data/plugins/<name>), the
+# container runtime creates /opt/data/plugins as the mount's parent, root
+# owned with no write bit for the agent's group, and the copy fails for
+# every plugin. On a new data volume there is no earlier copy to keep, so
+# the front door starts with none of them. A later Pod on the same volume
+# repairs the directory (its fsGroup pass adds group write and its
+# entrypoint copies), which is why installs that rolled twice hid it; a
+# fresh install whose first Pod stays shows it on every run.
+#
+# Nothing graded over chat is certain to notice: the agent answers without
+# its roster and usually still routes to the right specialist. So the
+# objective reads the effect, not the words: gateway_plugins_as_shipped
+# execs into the agent container of svc/<AGENT_SERVICE_NAME> and requires
+# each plugin directory the image ships to be on the volume, a real
+# directory owned by the agent's user and (outside hermes_otel, whose
+# directory carries its own state) carrying every file the image ships,
+# unchanged. A missing, symlinked, differing or foreign-owned plugin fails and
+# is named; an entry only the volume has is reported, not failed, because the
+# entrypoint copies without pruning and an image change leaves one behind; an exec
+# or diff that cannot run is status=error, never a pass. It reads the
+# agent's own install, not a seeded-fleet fixture, so there is no
+# `fixtures:` list; the deployer is noop.
+#
+# The prompt is the user-visible half of the same state: "what can you do?"
+# is answered from the roster block in the same turn, with no card
+# (agents/chat/SOUL.md §1, "Handle pure conversation yourself"). Without
+# agent_roster there is no block, and a card for a static question is the
+# way that shows (chat-scope-projects-answered-from-roster, red on the
+# 2026-11-18 nightly). The safeguard forbids the card.
+# The judge reads the answer against expected_output; the answer's wording
+# is not graded by phrase, because the specialist set differs per install.
+#
+# What red and green look like. On main, a fresh install with
+# plugins.pubsubPlatform.enabled=true (every eval install) reads every
+# shipped plugin `missing` under /opt/data/plugins and the objective fails
+# on the first poll. With the parent made as the agent's user before the
+# mount (or the plugin mounted outside the home), every plugin is on the
+# volume, agent-owned and matching, and the objective passes. An install
+# without a default-profile AgentPlugin never has the state and passes on
+# main too; the nightly and presubmit installs all have one.
+#
+# The fix is the operator's (#6357): the agent Pod's first init container
+# makes <home>/plugins as the agent's user when a plugin is mounted under the
+# home (k8s-operator/internal/controller/platformagent_manifests.go,
+# buildSandboxCredentialCleanup), so the runtime creates only the mount point.
+#
+# Isolation class: read-only on the cluster; one front-door turn with no
+# card and one kubectl exec that reads two directories. Tier: nightly,
+# registered in hack/eval/nightly-cases.txt. Cost: one model turn.
+id: platform-agent-shipped-plugins-loaded
+name: The front door starts with the plugins its image ships
+
+# Slug per docs/designs/domains.yaml: the front door's routing journey is
+# what the plugins carry (the roster block, the onboarding hooks).
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: lapis2002
+
+prompt: >-
+  Which specialists can you route work to right now? Give me their names,
+  one line each, and nothing else. Do not file a task.
+expected_output: >-
+  The front door answers in the same turn, without filing a card, listing
+  the specialists its roster block names (the platform agent, and a cluster
+  agent per registered cluster or a count of them), one per line, with no
+  other content.
+infrastructure:
+  deployer: noop
+validated: false
+tool_calls_optional: true
+
+verification_spec:
+  # assert, not the converge default: the volume read is a state the run
+  # left behind and the transcript is immutable once the run ends, so
+  # polling a failed check would only wait out the timeout.
+  - name: the-shipped-plugins-are-on-the-volume
+    role: objective
+    mode: assert
+    check:
+      type: gateway_plugins_as_shipped
+  - name: answered-without-a-card
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

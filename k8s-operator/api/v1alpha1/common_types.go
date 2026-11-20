@@ -1321,7 +1321,10 @@ type AdmissionSpec struct {
 	// the inactive file cache, the figure the kubelet evicts on) and counts it
 	// against this figure. Absent means the agent container's resolved memory request
 	// in MiB (4096 at the operator's default resources), so a CR that raises
-	// the request raises the budget with it.
+	// the request raises the budget with it. Effective memoryBudgetMiB must
+	// be at least workerRssCapMiB regardless of failClosed (refused where the
+	// validating webhook is enabled, or reported as Degraded with reason
+	// InvalidKanbanAdmission).
 	//
 	// Two bounds act on the budget. Each tick admits one new worker per
 	// 512 MiB of headroom under it, so with the container's working set at W
@@ -1332,8 +1335,9 @@ type AdmissionSpec struct {
 	// 64 MiB. At the default budget the headroom bound acts first. A budget
 	// under the container's idle working set plus 512 MiB therefore admits
 	// no worker and refuses every card after QueueBoundSeconds; the schema's
-	// minimum of 512 is left there for a test install that wants exactly
-	// that, and a derived budget under it is clamped to it. A card the tick
+	// minimum of 512 is left there for a test install that sets memoryBudgetMiB
+	// to 512 and workerRssCapMiB to 512 or below, and a derived budget
+	// under it is clamped to it. A card the tick
 	// cannot spawn waits, and is refused after QueueBoundSeconds. Set the
 	// budget below the request to keep headroom for the gateway's own growth,
 	// or above it, up to the limit, on a node pool where eviction is not the
@@ -1595,7 +1599,10 @@ type DeploymentSpec struct {
 
 	// Resources specifies resource requests and limits for the main container.
 	// The memory request is also the dispatcher's default admission budget
-	// (spec.harness.tuning.admission.memoryBudgetMiB).
+	// (spec.harness.tuning.admission.memoryBudgetMiB), so setting it below
+	// workerRssCapMiB without raising memoryBudgetMiB or lowering
+	// workerRssCapMiB is refused where the validating webhook is enabled, or
+	// reported as Degraded (InvalidKanbanAdmission).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
@@ -3061,10 +3068,12 @@ type BusMigrationRetry struct {
 // and three.
 type BusMigrationStatus struct {
 	// Leg is the direction: OneToThree (snapshot and restore, behind a write
-	// freeze) or ThreeToOne (in place). Reshape is reserved for a later
-	// release's leg; nothing in this one starts it, and a run of a leg this
-	// operator does not run is held (A2ABusMigrationLegUnknown) until the
-	// operator that started it carries it on or a person abandons it.
+	// freeze), ThreeToOne (in place), or Reshape (TASKS alone recreated at
+	// the width the CR renders, at the count the bus runs, behind a write
+	// freeze; started only by the kubeagents.x-k8s.io/bus-reshape
+	// annotation). A run of a leg this operator does not run is held
+	// (A2ABusMigrationLegUnknown) until the operator that started it carries
+	// it on or a person abandons it.
 	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne;Reshape
 	Leg string `json:"leg"`
 

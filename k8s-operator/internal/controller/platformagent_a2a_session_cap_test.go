@@ -50,7 +50,7 @@ import (
 // tasksAt is a bus whose TASKS holds width consumers.
 func tasksAt(width int) func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 	return func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
-		return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: ptr.To(width)}}, nil
+		return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: width}}, nil
 	}
 }
 
@@ -193,11 +193,11 @@ func TestTheBusStreamReportCarriesMaxConsumers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := streams[a2aTasksStream]; got.MaxConsumers == nil || *got.MaxConsumers != 110 || got.Bytes != 5 || got.Msgs != 2 {
+	if got := streams[a2aTasksStream]; got.MaxConsumers != 110 || got.Bytes != 5 || got.Msgs != 2 {
 		t.Errorf("TASKS decoded as %+v, want max_consumers 110 beside its state", got)
 	}
-	if streams["KV_cap"].MaxConsumers != nil {
-		t.Errorf("a stream with no config decoded a max_consumers")
+	if streams["KV_cap"].MaxConsumers != 0 {
+		t.Errorf("a stream with no config decoded a max_consumers, want 0 (unreported)")
 	}
 }
 
@@ -1020,7 +1020,7 @@ func TestTheDefaultPlatformRouteDoesNothingNew(t *testing.T) {
 			reads := 0
 			r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 				reads++
-				return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: ptr.To(64)}}, nil
+				return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: 64}}, nil
 			}
 			ctx := context.Background()
 			for i := 0; i < 2; i++ {

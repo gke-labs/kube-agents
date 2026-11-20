@@ -431,6 +431,37 @@ class PrintCommitTest(FetchTest):
         status, out, _ = self.main("--forge", "gitlab")
         self.assertEqual((status, out), (0, COMMIT_C + "\n"), "the lane's own mode and forge pick the night")
 
+    def test_the_fetch_writes_the_newest_nights_builds_by_commit_as_print_commit_chose_them(self):
+        # Last night on commit A (its answer still served), tonight's shards on
+        # B (one publishing later), a rerun on C, and another forge's build.
+        self.objects(VERSION, *(f"answers/{fp(i)}.json" for i in (1, 2, 3, 4)))
+        self.record("100", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 26 * HOUR, job=self.job(COMMIT_A))
+        self.record("200", 1, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
+        self.record("200", 2, {}, created=NOW, job=self.job(COMMIT_B))
+        self.record("201", 1, {VERSION: [f"answers/{fp(3)}.json"]}, created=NOW - 2 * HOUR, job=self.job(COMMIT_B))
+        self.record("202", 1, {}, created=NOW - 1 * HOUR, job=self.job(COMMIT_C))
+        self.record("300", 1, {VERSION: [f"answers/{fp(4)}.json"]}, created=NOW,
+                    job=self.job(COMMIT_A, name="gl", mode="today", forge="gitlab"))
+        night_out = os.path.join(os.path.dirname(self.runs_out), FC.NIGHT_FILE)
+        result = self.fetcher(max_age_hours=30).fetch(self.dest, self.runs_out, night_out)
+        night = self.fetcher(max_age_hours=30).night_commit()
+        with open(night_out) as handle:
+            written = json.load(handle)
+        self.assertEqual(written, {"builds": ["200", "201", "202"],
+                                   "commit_builds": {COMMIT_B: ["200", "201"], COMMIT_C: ["202"]}})
+        self.assertEqual((written["builds"], written["commit_builds"]), (night.builds, night.commit_builds))
+        self.assertEqual(result.night_commit_builds, written["commit_builds"])
+
+    def test_a_malformed_commit_leaves_its_build_out_of_the_night_and_the_fetch_goes_on(self):
+        self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 2 * HOUR, job=self.job("HEAD"))
+        self.record("201", 1, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night_out = os.path.join(os.path.dirname(self.runs_out), FC.NIGHT_FILE)
+        result = self.fetcher().fetch(self.dest, self.runs_out, night_out)
+        self.assertEqual(result.downloaded, 2)
+        with open(night_out) as handle:
+            self.assertEqual(json.load(handle), {"builds": ["200", "201"], "commit_builds": {COMMIT_B: ["201"]}})
+
     def test_records_without_a_commit_are_tolerated(self):
         # A night of records some of which predate the commit: they count for
         # nothing, the others decide. fetch() reads them as it always has.

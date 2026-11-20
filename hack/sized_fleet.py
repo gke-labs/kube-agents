@@ -14,6 +14,11 @@ crashed run left.
   run        on a fleet that is up: reset the install on the host cluster, run the
              burst window (the first-run flow and every audit) and the soak window,
              and write the verdict; exit 1 when it is red
+  install    upgrade the host cluster's install to the newest `main` commit whose
+             images are published, at the size's tier (the release's other values
+             are kept, so no secret is needed)
+  sweep      delete any sized fleet older than --max-age-hours, whatever its size:
+             what an aborted run left
   down       destroy the stack
   plan       show what `up` would change, and change nothing
 
@@ -24,14 +29,19 @@ A run by hand goes through this script, from a `main` checkout, never through
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -41,7 +51,7 @@ sys.path.insert(0, str(REPO / "bench"))
 
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
-from kube_agents_bench.scale import runner, sized_records, sized_run  # noqa: E402
+from kube_agents_bench.scale import operations, runner, sized_records, sized_run  # noqa: E402
 
 LOG = logging.getLogger("sized-fleet")
 STACK_DIR = REPO / "bench" / "tf" / "sized-fleet"
@@ -54,6 +64,46 @@ DEFAULT_ZONE = "us-central1-f"
 DEFAULT_HOST_CLUSTER = "scale-host"
 DEFAULT_HOST_LOCATION = "us-central1-c"
 DEFAULT_NAMESPACE = "kubeagents-system"
+RELEASE = "kube-agents"
+CHART_DIR = REPO / "charts" / "kube-agents"
+CRD_DIR = CHART_DIR / "crds"
+REGISTRY = "ghcr.io"
+IMAGES_FILE = REPO / "images.json"
+FIRST_PARTY = "first-party"
+RELEASE_TAG_POLICY = "release"
+MANIFEST_ACCEPT = ("application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, "
+                   "application/vnd.docker.distribution.manifest.list.v2+json, "
+                   "application/vnd.docker.distribution.manifest.v2+json")
+REGISTRY_TIMEOUT_SECONDS = 30
+HTTP_NOT_FOUND = 404
+# The image tags the release sets, each to the commit under test.
+IMAGE_TAG_KEYS = ("agentSandbox.image.tag", "operator.image.tag", "platformAgent.deployment.image.tag",
+                  "plugins.pubsubPlatform.image.tag", "plugins.stockoutInvestigator.image.tag")
+SIZING_KEY = "platformAgent.deployment.sizingProfile"
+# The design's install under test ("The install under test"): no chat channel, no GitOps
+# repository, and the audits' auto-promote off, so a nightly's reports reach no person.
+AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+AUTO_PROMOTE_OFF = "false"
+CHAT_INTEGRATIONS = ("googleChat", "slack")
+GITOPS_LISTS = ("forges", "repositories")
+# The fleet-sizing page's tier for each size, by its fleet-controllers row.
+TIERS = {"S": "medium", "M": "medium", "L": "fleet"}
+# How far back in `main` to look for a commit whose images are published.
+IMAGE_LOOKBACK = 30
+HELM_TIMEOUT = "20m"
+HELM_TIMEOUT_SECONDS = 25 * 60
+DEFAULT_MAX_AGE_HOURS = 8
+SIZE_LABEL = "kube-agents-scale-size"
+# The soak window's chat questions: eval cases run once each through the eval harness.
+EVAL_CASES_FILE = REPO / "hack" / "eval" / "sized-fleet-cases.txt"
+BENCH_DIR = REPO / "bench"
+EVALS_DIR = "evals"
+EVAL_SUMMARY_FILE = "summary.json"
+EVAL_TIMEOUT_SECONDS = 30 * 60
+AGENT_SERVICE = "platform-agent"
+JUDGE_PROVIDER = "google"
+JUDGE_MODEL = "gemini-3.1-pro-preview"
+RESULTS_LINE = re.compile(r"results: (\S+results\.json)")
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 VERDICT_FILE = "scale-verdict.json"
 # The label a host cluster carries when its install exists to be measured: a run resets the
@@ -80,6 +130,7 @@ CHURN_POLL_SECONDS = 20
 CHURN_WARMUP_SECONDS = 10 * 60
 DEFAULT_CHURN_MINUTES = 6
 SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
 CLUSTER_PARALLELISM = 8
 EXIT_UNSOUND = 1
 POD_FAILING_REASONS = ("ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff", "Error")
@@ -400,6 +451,78 @@ def results_prefix(args: argparse.Namespace) -> str:
     return f"{args.results_bucket.rstrip('/')}/{args.size.lower()}/{args.run_id}/"
 
 
+def eval_cases(path: Path) -> list[str]:
+    """The case paths a cases file lists, relative to bench/, comments and blank lines skipped."""
+    lines = (line.strip() for line in path.read_text().splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def case_passed(result: dict) -> bool:
+    """A case passes when every objective check passed, as the eval gate reads it."""
+    objectives = [c for c in result.get("verification_report") or [] if c.get("role") == "objective"]
+    return bool(objectives) and all(c.get("success") for c in objectives)
+
+
+def run_case(case: str, name: str, env: dict[str, str], evals: Path) -> dict:
+    """Run one case once; its log and results go under ``evals``."""
+    started = time.time()
+    # Its own session, so a timeout stops devops-bench along with uv.
+    proc = subprocess.Popen(["uv", "run", "devops-bench", case, "--agent-type", "kubeagents"], cwd=BENCH_DIR,
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)
+    try:
+        output, _ = proc.communicate(timeout=EVAL_TIMEOUT_SECONDS)
+    except BaseException:
+        # A timeout, or the run's own end (a signal, a lost lease): devops-bench is in its own
+        # session, so nothing else stops it.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        output, _ = proc.communicate()
+        (evals / f"{name}.log").write_text(output or "")
+        raise
+    (evals / f"{name}.log").write_text(output)
+    entry: dict = {"seconds": round(time.time() - started), "exit": proc.returncode, "passed": False}
+    found = RESULTS_LINE.search(output)
+    if found:
+        result = json.loads(Path(found.group(1)).read_text())[0]
+        (evals / f"{name}.results.json").write_text(json.dumps(result, indent=2) + "\n")
+        # The answer's time and tokens are the capability usage design's C9 inputs.
+        entry.update(passed=case_passed(result), latency=result.get("latency"), tokens=result.get("tokens"),
+                     checks={c["name"]: c.get("status") for c in result.get("verification_report") or []})
+    return entry
+
+
+def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
+    """Run each listed case once against the host install; write each result and a summary under out/evals."""
+    evals = out / EVALS_DIR
+    evals.mkdir(parents=True, exist_ok=True)
+    # The agent runs under GKE Sandbox, which a port-forward cannot reach, so the harness rides
+    # the exec relay (bench/README.md, "Sandboxed installs").
+    relay = operations.Relay(host_context, args.namespace)
+    summary: dict[str, dict] = {}
+    relay.start()
+    try:
+        env = {**os.environ, **operations.agent_env(host_context, args.namespace, relay.port),
+               "PROJECT_ID": args.project, "GCP_PROJECT_ID": args.project, "CLUSTER_NAME": args.host_cluster,
+               "AGENT_SERVICE_NAME": AGENT_SERVICE, "BENCH_TF_ROOT": "./tf",
+               "JUDGE_PROVIDER": os.environ.get("JUDGE_PROVIDER", JUDGE_PROVIDER),
+               "JUDGE_MODEL": os.environ.get("JUDGE_MODEL", JUDGE_MODEL)}
+        for case in eval_cases(Path(args.eval_cases)):
+            name = Path(case).parent.name
+            LOG.info("eval case %s", name)
+            try:
+                entry = run_case(case, name, env, evals)
+            except (OSError, ValueError, LookupError, subprocess.SubprocessError) as exc:
+                # One case's failure does not cost the others their records.
+                entry = {"passed": False, "error": str(exc)}
+            LOG.info("eval case %s: %s", name, "passed" if entry["passed"] else "failed")
+            summary[name] = entry
+    finally:
+        relay.stop()
+    (evals / EVAL_SUMMARY_FILE).write_text(json.dumps(summary, indent=2) + "\n")
+    return summary
+
+
 def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     fleet = sf.fleet(args.size)
     credentials(args, fleet)
@@ -409,27 +532,37 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
         churn = measure_churn(args, fleet, args.churn_minutes) if args.churn_minutes > 0 else None
         return sf.check(fleet, observe_all(args, fleet), churn)
 
+    out = Path(args.out or tempfile.mkdtemp(prefix=f"sized-run-{args.run_id}-"))
+    out.mkdir(parents=True, exist_ok=True)
+    evals: dict = {}
+
+    def chat_questions() -> None:
+        evals.update(run_evals(args, host_context, out))
+
     install = collect.Install(args.project, host_context, args.namespace, args.host_cluster, args.host_location)
     record, result = sized_run.run(project=args.project, host_cluster=args.host_cluster, host_context=host_context,
                                    namespace=args.namespace, check_fleet=check_fleet, install=install,
-                                   soak_seconds=args.soak_minutes * SECONDS_PER_MINUTE)
+                                   soak_seconds=args.soak_minutes * SECONDS_PER_MINUTE,
+                                   during_soak=chat_questions if args.eval_cases else None)
     # Before `down`: the cost record reads the fleet's own instances and clusters.
     cost = sized_records.safe(
         lambda: sized_records.cost_record(args.project, args.run_id, record.windows, region=region_of(args.zone)),
         record.errors, "cost record")
     result["errors"] = list(record.errors)
     records = {
-        VERDICT_FILE: {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result},
+        # The chat questions are eval records beside the verdict; they do not change it.
+        VERDICT_FILE: {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result,
+                       "evals": evals},
         MEASUREMENTS_FILE: {"size": args.size, "run_id": args.run_id, "windows": record.windows},
         COST_FILE: cost,
     }
-    out = Path(args.out or tempfile.mkdtemp(prefix=f"sized-run-{args.run_id}-"))
-    out.mkdir(parents=True, exist_ok=True)
     for name, body in records.items():
         (out / name).write_text(json.dumps(body, indent=2) + "\n")
         LOG.info("%s: %s", name, summary(name, body))
     if args.results_bucket:
         kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in records], results_prefix(args)])
+        if (out / EVALS_DIR).is_dir():
+            kube.run([kube.GCLOUD, "storage", "cp", "--recursive", str(out / EVALS_DIR), results_prefix(args)])
     print(json.dumps(records[VERDICT_FILE], indent=2))
     LOG.info("records in %s", out)
     return (0 if result["green"] else EXIT_UNSOUND), out
@@ -447,6 +580,128 @@ def summary(name: str, body: dict) -> str:
                      for w, v in windows.items())
 
 
+def image_repositories() -> list[str]:
+    """The registry path of every first-party image an install pulls at the release's tag.
+
+    images.json is the inventory of what an install pulls. The chart's tag keys name only
+    five; the operator renders the agent bus's images (a2a-*, hermes-bridge, web-console)
+    at its own tag, and the release pushes them last.
+    """
+    images = json.loads(IMAGES_FILE.read_text())["images"]
+    return sorted(i["repository"].removeprefix(f"{REGISTRY}/") for i in images
+                  if i.get("origin") == FIRST_PARTY and i.get("tagPolicy") == RELEASE_TAG_POLICY)
+
+
+def image_published(sha: str) -> bool:
+    """Whether every image the release sets is in the registry at ``sha``.
+
+    The release workflow publishes the operator and the agent images in separate jobs,
+    the agent images one after another, so one image's tag does not mean the others'.
+    """
+    return all(manifest_exists(repo, sha) for repo in image_repositories())
+
+
+def manifest_exists(repo: str, sha: str) -> bool:
+    """Whether ``repo`` has a manifest tagged ``sha``, read anonymously."""
+    token_url = f"https://{REGISTRY}/token?scope=repository:{repo}:pull&service={REGISTRY}"
+    with urllib.request.urlopen(token_url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:  # noqa: S310 -- fixed URL
+        token = json.loads(response.read())["token"]
+    request = urllib.request.Request(f"https://{REGISTRY}/v2/{repo}/manifests/{sha}",
+                                     headers={"Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT})
+    try:
+        with urllib.request.urlopen(request, timeout=REGISTRY_TIMEOUT_SECONDS):  # noqa: S310
+            return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_NOT_FOUND:
+            return False
+        raise
+
+
+def newest_published(ref: str = "HEAD") -> str:
+    """The newest commit at or before ``ref`` whose images are published: a merge's images take minutes."""
+    shas = subprocess.run(["git", "-C", str(REPO), "log", "--format=%H", f"-{IMAGE_LOOKBACK}", ref],
+                          capture_output=True, text=True, check=True).stdout.split()
+    for sha in shas:
+        if image_published(sha):
+            return sha
+    raise SystemExit(f"no commit in the last {IMAGE_LOOKBACK} of {ref} has published images")
+
+
+def test_bed_values(values: dict) -> tuple[list[str], list[dict]]:
+    """What in a release's values the design's install under test forbids, and its env with auto-promote off."""
+    integration = (values.get("platformAgent") or {}).get("integration") or {}
+    problems = [f"platformAgent.integration.{name}.enabled is true" for name in CHAT_INTEGRATIONS
+                if (integration.get(name) or {}).get("enabled")]
+    if (integration.get("github") or {}).get("gitRepo"):
+        problems.append("platformAgent.integration.github.gitRepo is set")
+    problems += [f"platformAgent.integration.{name} is not empty" for name in GITOPS_LISTS if integration.get(name)]
+    env = [e for e in ((values.get("platformAgent") or {}).get("deployment") or {}).get("env") or []
+           if e.get("name") != AUTO_PROMOTE_ENV]
+    return problems, env + [{"name": AUTO_PROMOTE_ENV, "value": AUTO_PROMOTE_OFF}]
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Upgrade the host install to the commit under test, at the size's tier, under its lease."""
+    sha = args.sha or newest_published()
+    tier = TIERS[args.size]
+    host_context = kube.context_name(args.project, args.host_location, args.host_cluster)
+    kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
+                project=args.project)
+    check_host(args)
+    values = json.loads(kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "get", "values",
+                                  RELEASE, "-o", "json"]) or "{}")
+    problems, env = test_bed_values(values)
+    if problems:
+        raise SystemExit("the host install is not the design's install under test: " + "; ".join(problems))
+    with host_lease(args), tempfile.TemporaryDirectory(prefix="sized-chart-") as tree:
+        # The chart and CRDs of the commit whose images run, not of this checkout: HEAD's images
+        # may not be published yet, and a newer chart may read values older images lack.
+        archive = subprocess.run(["git", "-C", str(REPO), "archive", sha, str(CHART_DIR.relative_to(REPO))],
+                                 capture_output=True, check=True).stdout
+        subprocess.run(["tar", "-x", "-C", tree], input=archive, check=True)
+        chart = Path(tree) / CHART_DIR.relative_to(REPO)
+        LOG.info("installing %s at the %s tier on %s", sha[:12], tier, args.host_cluster)
+        kube.run(["kubectl", "--context", host_context, "apply", "--server-side", "--force-conflicts", "-f",
+                  str(chart / CRD_DIR.name)], timeout=HELM_TIMEOUT_SECONDS)
+        sets = [f"--set={key}={sha}" for key in IMAGE_TAG_KEYS] + [f"--set={SIZING_KEY}={tier}"]
+        overrides = Path(tree) / "test-bed-values.json"
+        overrides.write_text(json.dumps({"platformAgent": {"deployment": {"env": env}}}))
+        sets += ["-f", str(overrides)]
+        # --reset-then-reuse-values: the chart's own defaults, then the release's values on top,
+        # so a key the newer chart adds gets its default rather than nothing.
+        kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE, str(chart),
+                  "--reset-then-reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"],
+                 timeout=HELM_TIMEOUT_SECONDS)
+    LOG.info("installed %s", sha)
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Delete every sized fleet with a cluster older than --max-age-hours, by its size's state."""
+    out = kube.gcloud("container", "clusters", "list", "--filter=resourceLabels.managed-by=kube-agents-sized-fleet",
+                      "--format=json", project=args.project)
+    now, stale = time.time(), set()
+    for cluster in json.loads(out or "[]"):
+        created = datetime.fromisoformat(cluster["createTime"].replace("Z", "+00:00")).timestamp()
+        if now - created > args.max_age_hours * SECONDS_PER_HOUR:
+            stale.add(cluster["resourceLabels"].get(SIZE_LABEL, "").upper())
+    unknown = sorted(stale - set(TIERS))
+    if unknown:
+        LOG.warning("sized-fleet clusters with no known size label, left alone: %s", ", ".join(unknown) or "(empty)")
+    swept, failed = [], []
+    # Every stale size is tried: one size whose destroy fails must not keep the others standing.
+    for size in sorted(stale & set(TIERS)):
+        LOG.warning("deleting the %s fleet an earlier run left", size)
+        try:
+            cmd_down(argparse.Namespace(**{**vars(args), "size": size}))
+            swept.append(size)
+        except (TofuFailed, subprocess.SubprocessError, kube.CommandError) as exc:
+            LOG.error("the %s fleet could not be deleted: %s", size, exc)
+            failed.append(size)
+    LOG.info("sweep: deleted %s; failed %s", ", ".join(swept) or "nothing", ", ".join(failed) or "nothing")
+    return EXIT_UNSOUND if failed else 0
+
+
 def cmd_down(args: argparse.Namespace) -> int:
     started = time.time()
     init(args.project, args.size)
@@ -457,7 +712,7 @@ def cmd_down(args: argparse.Namespace) -> int:
 
 
 COMMANDS = {"plan": cmd_plan, "up": cmd_up, "workloads": cmd_workloads, "verify": cmd_verify, "run": cmd_run,
-            "down": cmd_down}
+            "down": cmd_down, "install": cmd_install, "sweep": cmd_sweep}
 
 
 def use_ca_bundle() -> None:
@@ -492,8 +747,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host-location", default=DEFAULT_HOST_LOCATION)
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE, help="run: the install's namespace")
     parser.add_argument("--soak-minutes", type=int, default=sized_run.SOAK_SECONDS // SECONDS_PER_MINUTE)
-    parser.add_argument("--out", help="run: the folder for the three records; default a new temp folder")
+    parser.add_argument("--out", help="run: the folder for the records; default a new temp folder")
     parser.add_argument("--results-bucket", help="run: also copy the records to <bucket>/<size>/<run id>/")
+    parser.add_argument("--eval-cases", nargs="?", const=str(EVAL_CASES_FILE), default=None,
+                        help="run: run the cases this file lists in the soak window "
+                             f"(default file {EVAL_CASES_FILE.relative_to(REPO)})")
+    parser.add_argument("--sha", help="install: the commit to install; default the newest published one")
+    parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS,
+                        help="sweep: delete a fleet with a cluster older than this")
     parser.add_argument("--down", action="store_true",
                         help="run: delete the fleet when the run ends, whether it passed, failed or was interrupted")
     args = parser.parse_args(argv)

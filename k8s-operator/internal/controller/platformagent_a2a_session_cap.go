@@ -184,10 +184,12 @@ func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *
 	switch {
 	case !ok && a2aBusExisted(agent):
 		return 0, false, false
-	case ok && tasks.MaxConsumers == nil:
+	case ok && tasks.MaxConsumers == 0:
+		// Unreported: the server sent no config for TASKS. A live stream
+		// reports -1 for no limit, never 0.
 		return 0, false, false
 	case ok:
-		width, present = *tasks.MaxConsumers, true
+		width, present = tasks.MaxConsumers, true
 	}
 	r.sessionCapReadings.Store(key, a2aTasksWidthReading{width: width, present: present, at: time.Now()})
 	return width, present, true
