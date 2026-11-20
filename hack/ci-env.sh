@@ -293,8 +293,8 @@ readonly REPLAY_SHADOW_PROXY_KIND_VAR="REPLAY_JOB_KIND"
 readonly REPLAY_SHADOW_KUBECTL_TIMEOUT="30s"
 # ─── Inference replay: record and replay modes ───────────────────────────────
 # The proxy's three modes (hack/replay-proxy/README.md, "Modes"). A trusted
-# nightly records: it saves answers, and the collector uploads those from runs
-# that passed to the shared cache bucket (EVAL_REPLAY_RECORD=false keeps it in
+# nightly records: it saves answers, and the collector uploads those graded
+# runs gave, passing or failing, to the shared cache bucket (EVAL_REPLAY_RECORD=false keeps it in
 # shadow mode); only a trusted nightly, filed nightly, records, never a
 # nightly-untrusted one. Only REPLAY_SHADOW_NIGHTLY_RECORDER may create objects
 # in the cache bucket (docs/ci-pool-projects.md). The replay lane (EVAL_REPLAY_LANE=true, a periodic on main)

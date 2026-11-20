@@ -407,6 +407,23 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(report["decisions"], {"fail": 1})
         self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 2}}})
 
+    def test_an_infra_or_blocked_attempts_answers_go_up_and_count(self):
+        # bench-gate graded these attempts as neither pass nor fail, but the
+        # model really gave these answers to these requests.
+        a, b = "a" * 64, "b" * 64
+        self.world.run("case-a", 1, "infra", ["t_11111111"])
+        self.world.run("case-a", 2, "blocked", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=b, tag=World.tag("case-a", 2))
+        self.alternate(1, a)
+        self.alternate(1, b)
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        self.assertTrue(self.published(a))
+        self.assertTrue(self.published(b))
+        self.assertEqual(report["decisions"], {"fail": 2}, "decided as not passing, and published")
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 1, b: 1}}})
+
     def test_an_answer_only_background_traffic_gave_stays(self):
         # A card no graded run worked (an alert's triage, another Cluster
         # Agent's turn): not an eval run's answer, so it neither goes up nor counts.

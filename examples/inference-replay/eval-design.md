@@ -61,8 +61,9 @@ Three properties make this sound for grading:
   kernel, and the others listed there). That includes settings like temperature, max tokens,
   reasoning settings and tool choice; only fields that change how the answer is delivered
   (`stream`) or who is asking (`user`, `metadata`) are left out. A stored answer is a real sample from the model for
-  that exact input. What serving it loses is independence between samples; the cache keeps answers
-  from failing runs as well as passing ones (below), so it is not biased towards passing.
+  that exact input. What serving it loses is independence between samples. The shared nightly
+  cache keeps answers from failing runs as well as passing ones (below), so it is not biased
+  towards passing; a pull request's own answers and the merge copy stay pass-only.
 - **Tools still run.** Only model calls are replayed. `kubectl`, `gcloud`, scripts and GitHub
   writes execute live, and the verifiers grade the live state and the delivered report. A tool
   result that differs from the recording changes the next request, which misses, and from there
@@ -723,7 +724,8 @@ is the problem.
 
 Only real answers are stored: record mode refuses a non-200 response, a stream cut short, a client
 that went away, an answer with no content and no tool calls, a fallback's answer, and a reply whose
-`finish_reason` is anything but `stop` or `tool_calls` (cut off at the token limit, filtered).
+`finish_reason` names anything but `stop` or `tool_calls` (cut off at the token limit, filtered). A
+reply naming none is stored and served as `stop`; every line logs the raw value.
 
 **Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
 15 cases, three times each) going at the same time on the same install, and a build can pass while
@@ -731,9 +733,10 @@ some of those runs fail. Most requests can be tied to their run after the fact w
 have, and the rest carry a run tag (below). A worker's request names the card it's working on (its first
 message is "work kanban task t\_…"), and a front door's request names the cards it created (what
 its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
-and whether it passed. So the copy job can match each saved answer to its card and the card to a
-graded run, and copy what graded runs gave. Only bench-gate's grading says which attempt of a
-repetition counted, so an answer waits for its case to be graded, though not for a pass. A front door's first request
+and whether it passed. So the nightly's publisher can match each saved answer to its card and the
+card to a graded run, and copy what graded runs gave. Only bench-gate's grading says which attempt
+of a repetition counted, so an answer waits for its case to be graded, though not for a pass. The
+merge copy, not built, would match the same way and still take only the passing presubmit's. A front door's first request
 names no card at all, only the case's prompt, and the board reads before its first card name none
 either. Those are matched by the run tag instead: on an eval install the agent stamps every model
 request with its run, case and repetition (`X-Kube-Agents-Eval-Run`), the proxy logs it, and the
@@ -751,11 +754,11 @@ name made of the request's fingerprint and a hash of the answer exactly as it is
 written once like every other object, so two runs that gave the same answer share one file and two
 that differed in any served word or action never do. The replay proxy picks among a request's
 answers at random in proportion to how often graded runs gave each, with a seed made from the run
-tag above (run id, case, repetition) and the key. A rotation would spread repetitions more evenly
+tag above (run id, case, repetition), the key and how often this pod already looked that pair up. A rotation would spread repetitions more evenly
 than the model does: if one answer leads to failure a third of the time, live runs all take it
 about one run in 27 and the case goes red, which a rotation over three repetitions never does. The
 draw keeps that, and stays reproducible: the same run makes the same picks, and a `/retest` (a new
-run id) draws again, as a live re-run would. A refused answer falls through to a draw over the rest
+run id) draws again, as a live re-run would, and so does a run re-sending the same request. A refused answer falls through to a draw over the rest
 by their weights; the request goes live only when every answer is refused. An untagged request
 seeds from the key and the proxy pod's count of untagged lookups of it.
 
@@ -827,8 +830,10 @@ before stage 3 of the rollout (turning replay on):
   both. One option is to count only runs that went live before the part of the case that gets
   checked; another is to compare against a `main` baseline that was also replayed. Caching the judge
   (open questions) would make this worse.
-- **Flaky cases look stable.** A case that's flaky on `main` stops showing its flakiness on unrelated
-  pull requests. The nightly still shows it.
+- **Flaky cases look steadier on a pull request's own answers.** The shared nightly cache serves a
+  flaky case's failing answers too, so it stays as flaky on replay as live. A pull request's own
+  answers and the merge copy keep only passing runs' answers, so where those serve, a case flaky on
+  `main` can look steadier than it is. The nightly still shows it.
 - **Token counts look like the model ran.** A replayed answer comes with the token counts from the
   original run. So the eval record's token numbers, and rung 3's check that the run really called a
   model, both act as if the model was called. To show real savings per run, we match the proxy's log
@@ -914,7 +919,8 @@ before stage 3 of the rollout (turning replay on):
    the cache"; the lane only reads them, and picks among a request's answers by a seeded weighted
    draw ("Save every real answer from graded runs"). For each conversation it records
    how many messages and tokens were replayed before the first miss, what caused that miss (the proxy has the cache, so it logs the closest saved request, which message first differed, and
-   short cleaned-up snippets of both sides), and whether the run's verdict matched the live nightly's. Every miss here is real: a
+   short cleaned-up snippets of both sides), and whether the replayed run passed; each case's
+   replayed verdicts sit beside the newest recording night's on the same commit. Every miss here is real: a
    normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
    runs live after its first miss, each one tells us its first miss only, which is what replay would
    actually save.

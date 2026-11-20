@@ -85,16 +85,17 @@ ANALYSIS_QUEUE_SIZE = 1024
 # Slot answers whose (context, answer) the replay lookup keeps, so a turn
 # normalizes only its new answer's prefix.
 VARIANT_MEMO_CAPACITY = 100_000
-# Keys whose untagged-lookup count replay keeps (ShadowProxy.next_turn), least
-# recently looked up dropped first. A seeded cache holds fewer keys than this.
+# Lookup counters replay keeps, one per key untagged and one per (eval run tag,
+# key) tagged (ShadowProxy.next_turn), least recently used dropped first.
 TURN_MEMO_CAPACITY = 1_000_000
-# The finish reasons of a complete answer. Any other (`length`, cut off at the
-# token limit; `content_filter`; none at all) is a reply the model did not
-# finish, and record mode never stores it.
+# The finish reasons of a complete answer. A response that names none is
+# stored and served as replay_cache.DEFAULT_FINISH_REASON; any other named
+# reason (`length`, cut off at the token limit; `content_filter`) is a reply
+# the model did not finish, and record mode never stores it.
 STORABLE_FINISH_REASONS = frozenset({"stop", "tool_calls"})
 # Where a replay lookup's seed came from (seeded_order), logged as served_seed:
-# the request's eval run tag and the key, or, untagged, the key and this pod's
-# count of untagged lookups of it.
+# the request's eval run tag, the key and this pod's count of that pair's
+# lookups, or, untagged, the key and this pod's count of untagged lookups of it.
 SEED_EVAL_RUN = "eval_run"
 SEED_TURN = "turn"
 SEED_SEPARATOR = "\n"
@@ -510,8 +511,8 @@ def unstorable_reasons(
     """Why replay would not have saved this answer (eval-design.md); empty when it would.
 
     `stored` is the answer as it would be saved (replay_cache.stored_answer),
-    when the caller has it already. `finish_reason` is the response's; only
-    STORABLE_FINISH_REASONS mark a finished answer.
+    when the caller has it already. `finish_reason` is the response's: none,
+    or one of STORABLE_FINISH_REASONS, marks a finished answer.
     """
     for flag, reason in (
         (upstream_incomplete, F.UNSTORABLE_UPSTREAM_INCOMPLETE),
@@ -524,7 +525,7 @@ def unstorable_reasons(
     if status != HTTP_OK or not (message.get("content") or message.get("tool_calls")):
         return [F.UNSTORABLE_NO_ANSWER]
     reasons = []
-    if finish_reason not in STORABLE_FINISH_REASONS:
+    if finish_reason and finish_reason not in STORABLE_FINISH_REASONS:
         reasons.append(F.UNSTORABLE_UNFINISHED)
     group = headers.get(MODEL_GROUP_HEADER)
     if group is None:
@@ -695,7 +696,7 @@ class ShadowProxy:
         # digests of its raw prefix and answer; oldest dropped past the capacity.
         self._variants: "OrderedDict[str, Tuple[Tuple[str, str], str]]" = OrderedDict()
         self._variant_lock = threading.Lock()
-        # Each key's count of untagged lookups (next_turn).
+        # Each lookup counter's count (next_turn).
         self._turns: "OrderedDict[str, int]" = OrderedDict()
         self._turn_lock = threading.Lock()
         self.out = out if out is not None else sys.stdout
@@ -721,9 +722,9 @@ class ShadowProxy:
         each answer in proportion to how often graded runs produced it (its
         weight, replay_cache.AnswerCache.weights; 1 when the cache gives none),
         seeded by the request's eval run tag (`eval_run`: run id, case and
-        repetition) and the key (seed()), so one repetition's lookups of a key
-        always pick alike and another run or repetition draws independently,
-        as live repetitions do. A refused answer falls through to a draw over
+        repetition), the key and how many times this pod looked that pair up
+        (seed()), so a repetition's picks are reproducible and another run or
+        repetition draws independently, as live repetitions do. A refused answer falls through to a draw over
         the answers left (seeded_order), so a request is served whichever of
         them its guards allow and goes live only when they refuse every one.
         `keyed` is the request's normalization and fingerprint (keyed()), when
@@ -769,22 +770,27 @@ class ShadowProxy:
     def seed(self, fingerprint: str, eval_run: Optional[str]) -> Tuple[str, str]:
         """(SEED_* source, seed) for a lookup of `fingerprint`'s answers.
 
-        Tagged: the eval run tag and the key, so the same run, case, repetition
-        and key always draw the same answer, and a /retest (a new run id) draws
-        again. Untagged (a night with tags off, Hermes' auxiliary calls): the
-        key and this pod's count of untagged lookups of it (next_turn), so a pod
-        given the same requests in the same order draws the same answers.
+        Tagged: the eval run tag, the key, and this pod's count of earlier
+        lookups of that key under that tag (next_turn), so a run, case and
+        repetition draw the same answers on a re-run of the same lookups, a
+        client re-sending the same request draws again as it would live, and a
+        /retest (a new run id) draws independently. Untagged (a night with tags
+        off, Hermes' auxiliary calls): the key and this pod's count of untagged
+        lookups of it, so a pod given the same requests in the same order draws
+        the same answers.
         """
         if eval_run:
-            return SEED_EVAL_RUN, SEED_SEPARATOR.join((SEED_EVAL_RUN, eval_run, fingerprint))
-        return SEED_TURN, SEED_SEPARATOR.join((SEED_TURN, fingerprint, str(self.next_turn(fingerprint))))
+            counter = SEED_SEPARATOR.join((SEED_EVAL_RUN, eval_run, fingerprint))
+            return SEED_EVAL_RUN, SEED_SEPARATOR.join((counter, str(self.next_turn(counter))))
+        counter = SEED_SEPARATOR.join((SEED_TURN, fingerprint))
+        return SEED_TURN, SEED_SEPARATOR.join((counter, str(self.next_turn(counter))))
 
-    def next_turn(self, fingerprint: str) -> int:
-        """This pod's count of earlier untagged lookups of a key: 0 for its first, then 1, 2, ..."""
+    def next_turn(self, counter: str) -> int:
+        """This pod's count of earlier lookups under `counter` (seed()): 0 for its first, then 1, 2, ..."""
         with self._turn_lock:
-            turn = self._turns.get(fingerprint, 0)
-            self._turns[fingerprint] = turn + 1
-            self._turns.move_to_end(fingerprint)
+            turn = self._turns.get(counter, 0)
+            self._turns[counter] = turn + 1
+            self._turns.move_to_end(counter)
             while len(self._turns) > TURN_MEMO_CAPACITY:
                 self._turns.popitem(last=False)
         return turn
@@ -1265,6 +1271,7 @@ class ShadowProxy:
             entry[F.UNSTORABLE] = []
         else:
             stored = replay_cache.stored_answer(upstream["message"], normalized.mapping) if upstream["message"] else {}
+            entry[F.FINISH_REASON] = upstream.get("finish_reason")
             entry[F.UNSTORABLE] = unstorable_reasons(
                 body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber,
                 upstream_incomplete=upstream["upstream_incomplete"],

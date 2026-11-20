@@ -26,12 +26,10 @@ which the Prow job exports). It writes, into `--out`:
   from failing runs are published too (publish_cache.py), so a mismatch is a
   replayed run that failed, which a case flaky on `main` can be on replay as
   it can live, not a disagreement with the recording's own verdict. A conversation whose run
-  can't be told (run_attribution.py), whose run bench-gate graded as neither a
-  pass nor a fail (infra, blocked, not_applicable), or whose recording night
-  is in no record the fetch read is `unknown`, each counted by reason in
-  `unknown_reasons`. The recording night is the one that first wrote the
-  answer, which can be as old as the bucket's lifecycle; the fetch reads runs
-  that far back;
+  can't be told (run_attribution.py), or whose run bench-gate graded as neither a
+  pass nor a fail (infra, blocked, not_applicable), is `unknown`, each counted
+  by reason in `unknown_reasons`. A mismatch names the night that first wrote
+  its answers (`recorded_build`), for tracing it;
 - `summary.txt`: the commit replayed, the newest night's builds on it, and the counts. Its lines also go to the job log, where the
   collector masks long hex runs, the commit included; the file in the bucket keeps it whole.
 
@@ -74,7 +72,6 @@ MISMATCH = analyze_replay.VERDICT_MISMATCH
 UNKNOWN = analyze_replay.VERDICT_UNKNOWN
 # Why a served conversation's comparison is unknown, counted in the report.
 RUN_UNATTRIBUTED = "run_unattributed"
-RECORDING_BUILD_UNRECORDED = "recording_build_unrecorded"
 NO_VERDICT = "no_verdict"
 # The report's commit fields, and how the summary reads each source.
 REPORT_COMMIT = "commit"
@@ -239,7 +236,7 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
             if outcomes is None:
                 outcomes = SERVED_FROM_NOT_RUN if build in nightly_runs else UNKNOWN
             case["nightly"][build] = outcomes
-    # Per served conversation: the lane run's verdict against the recording's.
+    # Per served conversation: the replayed run's own verdict.
     conversation_counts = {MATCH: 0, MISMATCH: 0, UNKNOWN: 0}
     unknown_reasons: Dict[str, int] = {}
     mismatched: List[Dict[str, Any]] = []
@@ -256,14 +253,9 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
         if len(keys) != 1:
             unknown(RUN_UNATTRIBUTED)
             continue
-        # The night that first wrote the answer, which can be weeks old: the
-        # fetch reads runs back to the bucket's lifecycle (fetch_cache.py).
-        # The night must be on record, though match and mismatch are the
-        # replayed run's own pass or fail: graded runs produced the answer,
-        # passing or failing (publish_cache.py, alternates).
-        if not recorded or recorded not in nightly_runs:
-            unknown(RECORDING_BUILD_UNRECORDED)
-            continue
+        # Match and mismatch are the replayed run's own pass or fail, so the
+        # recording night's verdict is not needed: graded runs produced the
+        # answer, passing or failing (publish_cache.py, alternates).
         key = next(iter(keys))
         run = by_key.get(key)  # type: ignore[arg-type]
         # Only a pass or a fail is a verdict; infra, blocked and not_applicable
@@ -323,7 +315,7 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
         f" served {replay['served_token_percent']}% of prompt tokens"
         f" ({replay['served_before_first_miss_token_percent']}% before each conversation's first miss,"
         f" {replay['served_via_answer_slots_token_percent']}% through answer slots)",
-        f"served conversations against the recording's verdict: {report['served_conversations']}"
+        f"served conversations by the replayed run's verdict: {report['served_conversations']}"
         f" (unknown because: {report['unknown_reasons'] or 'none'})",
     ]
     for name, case in sorted(report["cases"].items()):

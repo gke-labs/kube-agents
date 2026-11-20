@@ -7,7 +7,8 @@ job's own machine (`--keep-dir`), and calls this every few minutes and once at
 the end. Each call works out which run each recorded answer came from
 (run_attribution.py) against the cases graded so far (bench-gate's
 case-<name>.json under the artifacts directory), and uploads every answer a
-graded attempt got, whether its run passed or failed
+graded attempt got, whatever bench-gate's outcome for it (pass, fail, infra,
+blocked or not_applicable: each is a real model answer to a real input)
 (examples/inference-replay/eval-design.md, "Save every real answer from graded
 runs").
 

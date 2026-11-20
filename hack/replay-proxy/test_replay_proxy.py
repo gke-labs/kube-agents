@@ -950,7 +950,8 @@ class LogLineTest(ProxyTestCase):
         headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
         answer = {"role": "assistant", "content": "Listing the pods now."}
         for finish, expected in (("stop", []), ("tool_calls", []), ("length", ["unfinished_reply"]),
-                                 ("content_filter", ["unfinished_reply"]), (None, ["unfinished_reply"])):
+                                 ("content_filter", ["unfinished_reply"]), ("other", ["unfinished_reply"]),
+                                 (None, []), ("", [])):
             with self.subTest(finish_reason=finish):
                 self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber,
                                                                  finish_reason=finish), expected)
@@ -959,7 +960,19 @@ class LogLineTest(ProxyTestCase):
         FakeLiteLLM.custom_body = json.dumps({"choices": [{"index": 0, "finish_reason": "length", "message": {
             "role": "assistant", "content": "The pods are web-1 and"}}]}).encode()
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
-        self.assertIn("unfinished_reply", self.lines(1)[0]["unstorable"])
+        line = self.lines(1)[0]
+        self.assertIn("unfinished_reply", line["unstorable"])
+        self.assertEqual(line["finish_reason"], "length")
+
+    def test_a_reply_naming_no_finish_reason_is_storable_and_logged_as_none(self):
+        FakeLiteLLM.extra_headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        self.addCleanup(setattr, FakeLiteLLM, "extra_headers", {})
+        FakeLiteLLM.custom_body = json.dumps({"choices": [{"index": 0, "message": {
+            "role": "assistant", "content": "Listing the pods now."}}]}).encode()
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        line = self.lines(1)[0]
+        self.assertNotIn("unfinished_reply", line["unstorable"])
+        self.assertIsNone(line["finish_reason"])
 
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"

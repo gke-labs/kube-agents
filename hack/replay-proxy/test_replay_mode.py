@@ -187,7 +187,7 @@ class FinishReasonTest(AnalyzeCase):
     ANSWER = {"role": "assistant", "content": "Looking at the card."}
 
     def test_a_reply_cut_off_or_filtered_is_not_stored_and_a_finished_one_is(self):
-        for finish, stored in (("length", False), ("content_filter", False), (None, False),
+        for finish, stored in (("length", False), ("content_filter", False), ("other", False), (None, True),
                                ("stop", True), ("tool_calls", True)):
             with self.subTest(finish_reason=finish):
                 shutil.rmtree(self.cache_dir, ignore_errors=True)
@@ -195,6 +195,7 @@ class FinishReasonTest(AnalyzeCase):
                 line = self.proxy("record", "x").analyze(self.BODY, time.time(), upstream)
                 self.assertEqual(line["recorded"], stored)
                 self.assertEqual("unfinished_reply" in line["unstorable"], not stored)
+                self.assertEqual(line["finish_reason"], finish, "the raw value, so it can be counted")
 
 
 class SeveralAnswersTest(SlotCacheCase):
@@ -269,14 +270,23 @@ class SeveralAnswersTest(SlotCacheCase):
         names = [name for name, _ in self.saved(fingerprint)]
         first, second = self.proxy(), self.proxy()  # another pod draws alike
         for run in ("night-1", "night-2", "retest-7"):
-            picks = {self.pick(replay, tag(run, 1)) for replay in (first, second, first)}
-            self.assertEqual(len(picks), 1, run)
-        hit, _ = first.lookup(self.BODY, time.time(), eval_run=tag("night-1", 1))
+            self.assertEqual(self.pick(first, tag(run, 1)), self.pick(second, tag(run, 1)), run)
+        hit, _ = first.lookup(self.BODY, time.time(), eval_run=tag("night-9", 1))
         self.assertEqual((hit[5], hit[8]), (2, "eval_run"))
         self.assertEqual({self.pick(first, tag(f"run-{i}", 1)) for i in range(40)}, set(names),
                          "another run id (a /retest) draws again")
         self.assertEqual({self.pick(first, tag("night-1", rep)) for rep in range(1, 41)}, set(names),
                          "another repetition draws again")
+
+    def test_a_repeated_lookup_under_one_tag_draws_again_reproducibly(self):
+        # A client re-sending the same request in one repetition gets a fresh
+        # draw, as live; a fresh pod given the same lookups draws the same.
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        names = [name for name, _ in self.saved(fingerprint)]
+        runs = [[self.pick(replay, tag("night-1", 1)) for _ in range(40)] for replay in (self.proxy(), self.proxy())]
+        self.assertEqual(runs[0], runs[1])
+        self.assertEqual(set(runs[0]), set(names), "repeats of one key under one tag can differ")
 
     def test_untagged_lookups_draw_by_the_pods_count_reproducibly(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
@@ -436,7 +446,7 @@ class SeveralAnswersTest(SlotCacheCase):
         hits = [replay.lookup(changed, time.time(), eval_run=tag(f"run-{i}", 1))[0] for i in range(40)]
         self.assertEqual({hit[3] for hit in hits}, {"answer_slots"})
         self.assertEqual({hit[0]["content"] for hit in hits}, set(order))
-        again = replay.lookup(changed, time.time(), eval_run=tag("run-0", 1))[0]
+        again = self.proxy().lookup(changed, time.time(), eval_run=tag("run-0", 1))[0]
         self.assertEqual(again[0]["content"], hits[0][0]["content"], "seeded by the slot's key, reproducibly")
 
 
@@ -1396,21 +1406,20 @@ class ReplayTest(ProxyTestCase):
         names = sorted([recorded.stem, "f" * 64])
         _, port, out = self.replay()
         calls = len(FakeLiteLLM.calls)
-        # Two lookups per tag; the tags' first draws differ (checked below).
         tags = [f"night-{i}/case-a/1" for i in range(8)]
         for run in tags:
-            for _ in range(2):
-                status, headers, _ = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port,
-                                                  headers={"X-Kube-Agents-Eval-Run": run})
-                self.assertEqual((status, headers["x-replay-served"]), (200, "true"))
+            status, headers, _ = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port,
+                                              headers={"X-Kube-Agents-Eval-Run": run})
+            self.assertEqual((status, headers["x-replay-served"]), (200, "true"))
         self.assertEqual(len(FakeLiteLLM.calls), calls, "every rep is served")
-        lines = self.lines(2 * len(tags), out)
-        by_tag = {}
-        for line in lines:
-            by_tag.setdefault(line["eval_run"], set()).add(line["served_alternate"])
-        self.assertEqual(set(by_tag), set(tags), "the tag is read before it is dropped")
-        self.assertTrue(all(len(picked) == 1 for picked in by_tag.values()), "one tag, one pick")
-        self.assertEqual(set().union(*by_tag.values()), set(names), "different tags draw differently")
+        lines = self.lines(len(tags), out)
+        served = {line["eval_run"]: line["served_alternate"] for line in lines}
+        self.assertEqual(set(served), set(tags), "the tag is read before it is dropped")
+        # Each a first lookup under its tag: seeded by the tag, the key and count 0.
+        expected = {run: names[replay_proxy.seeded_order((1, 1), "\n".join(("eval_run", run, fingerprint, "0")))[0]]
+                    for run in tags}
+        self.assertEqual(served, expected, "each tag's pick is the seeded one")
+        self.assertEqual(set(served.values()), set(names), "different tags draw differently")
         self.assertEqual({line["served_seed"] for line in lines}, {"eval_run"})
         self.assertEqual({line["served_key"] for line in lines}, {fingerprint}, "an exact hit: its own key")
         self.assertEqual({line["alternates"] for line in lines}, {2})

@@ -37,9 +37,14 @@ replaced before its last segment was copied, a last pass cut short, a pod that
 came and went between passes) can only leave an answer unpublished, never
 publish one.
 
+A graded attempt is any repetition bench-gate's case file names, whatever its
+outcome: pass, fail, and infra, blocked or not_applicable too, since each is a
+real model answer to a real input.
+
 Decisions, per logged request:
 - `pass`: every run it belongs to was graded and passed;
-- `fail`: it belongs to a run that was graded and did not pass;
+- `fail`: it belongs to a run that was graded and did not pass (a fail, or an
+  infra, blocked or not_applicable outcome);
 - `pending`: its text is not all stored yet, or it names a card or tag no
   graded run has yet (its case is still running);
 - `unattributed`: once every case is graded, no stored text, or a card or tag
@@ -101,7 +106,8 @@ UNATTRIBUTED = "unattributed"
 UNTAGGED = "untagged"
 DISAGREE = "disagree"
 DECISIONS = (PASS, FAIL, PENDING, UNATTRIBUTED, UNTAGGED, DISAGREE)
-# A line or alternate a graded attempt produced: published whatever the verdict.
+# A line or alternate a graded attempt produced, whatever its outcome (infra,
+# blocked and not_applicable decide FAIL): published either way.
 GRADED = (PASS, FAIL)
 
 # The eval run tag (`<run>/<case>/<rep>`) as the proxy logs it in `eval_run`:
