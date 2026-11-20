@@ -55,12 +55,12 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 ```
 
 The home channel is the CR field (`spec.integration.googleChat.homeChannel` or
-`spec.integration.slack.homeChannel`) or, for Slack, a channel the gateway learned from a mention.
+`spec.integration.slack.homeChannel`) or a channel or space the gateway learned from a mention.
 `/sethome` does not reach the gateway. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. The operator names every armed platform in
 `A2A_NOTIFY_CONVERSATIONS` and every armed platform with a home channel set on the CR in
-`A2A_NOTIFY_PLATFORM`; the agent adds Slack when the gateway learned a channel, and with no
+`A2A_NOTIFY_PLATFORM`; the agent adds a platform whose home the gateway learned, and with no
 home anywhere, every armed platform keeps the posts for its digest. So an
 install whose gateway holds no platform with a home channel sends anyway: the gateway refuses the
 recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error
@@ -104,6 +104,14 @@ without a session; they are counted on a line of their own and in no other numbe
 load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
 drift record is not an event the watcher forwarded. [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
+
+The same rows answer a question on demand. The Platform Agent's `get_alert_history` tool
+([`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py)) reads one page
+of `GET /v1/intercepted-events` over a window (its `since`), and the
+[`alert-history`](../../agents/platform/skills/alert-history/SKILL.md) skill is how "what alerts
+fired overnight?" reaches it from any door. The tool is the worker's only route: the sandbox shell
+reaches neither the loopback port nor the file. It excludes nothing, so unlike the recap it also
+returns the drift and stall rows.
 
 Three things are deliberately not sources. The `incidents` table alongside it holds the triage
 report each alerted incident produced, and the recap does not read it: nothing it lists was alerted,

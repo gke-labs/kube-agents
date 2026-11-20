@@ -1,0 +1,42 @@
+{
+  "apiVersion": "cloud.google.com/v1",
+  "kind": "ComputeClass",
+  "metadata": {
+    "name": "general-ccc"
+  },
+  "spec": {
+    "nodePoolAutoCreation": {
+      "enabled": false
+    },
+    "priorities": [
+      {
+        "nodepools": ["default-pool"]
+      },
+      {
+        "machineFamily": "n4"
+      },
+      {
+        "machineFamily": "c3"
+      }
+    ],
+    "whenUnsatisfiable": "DoNotScaleUp"
+  },
+  "status": {
+    "conditions": [
+      {
+        "lastTransitionTime": "2026-11-16T04:41:15Z",
+        "message": "Crd taint is missing for the nodepool default-pool.",
+        "reason": "TaintMissing",
+        "status": "True",
+        "type": "NodepoolMisconfigured"
+      },
+      {
+        "lastTransitionTime": "2026-11-16T04:41:15Z",
+        "message": "Crd is not healthy.",
+        "reason": "Health",
+        "status": "False",
+        "type": "Health"
+      }
+    ]
+  }
+}

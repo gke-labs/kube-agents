@@ -46,6 +46,16 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `post-merge-check` follows a fix after it merges
+
+`post-merge-check` is a `no_agent` script: the tick prompts no model. Every five minutes it runs
+`post_merge_check.py`, which reads nothing while `KUBEAGENTS_POST_MERGE_CHECK` is `off`. With it on,
+it follows each recorded fix pull request through merge, apply, the health window and the fleet
+audit's re-check to one stored outcome, and then reports and follows up. A run stops starting work after four minutes, so it ends inside its
+schedule. A clean run is silent and keeps its summary in `logs/post_merge_check.log`. A run in which a record or step errored posts
+one line naming them and exits 0, at most once a day per failure. The steps and their columns are in
+[`session_management.md`](../docs/session_management.md).
+
 ## `stall-watch` hands a stall to the AutoOps pipeline
 
 `stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
@@ -502,40 +512,62 @@ retires once that list was read.
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
 findings bypass the drift floor so single-zone node-pool confinement still
-alerts once per refresh window; `LEEWAY_WATCH_MIN_SEVERITY`,
+alerts once per refresh window. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
-`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
-runs started by hand in the pod with `--dry-run` (the operator's
-`spec.deployment.env` allowlist does not carry them). The report's
+`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` set the
+scheduled sweep's alert thresholds and re-post interval from the `PlatformAgent` CR's
+`spec.deployment.env` (the operator's allowlist carries them), and also work
+on runs started by hand in the pod with `--dry-run`. `LEEWAY_WATCH_CLUSTERS`,
+`LEEWAY_WATCH_PROJECTS` and `LEEWAY_WATCH_HOME` are not carried, so they apply
+only to runs started by hand. The report's
 topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
 `leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
 key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
 `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
 by cluster, class, judging rule and kind. A finding earns a report under
 `<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
-`latest.md` and `latest.json` symlinks) and a chat summary line naming up to
-six due subjects with their cause and share when it first appears, when its
-`suspectedCause` (a rank finding's `rule`) changes or its `severity` escalates,
-or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
-of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
-clusters are retired with a single resolution line, while clusters whose scan
-failed or that were not reached retain their ledger entries so transient
-errors do not erase state and re-page tomorrow. A run with a finding due
-writes and publishes its own report, partial or not. The JSON report carries
-a `coverage` block: `clusters_swept`, `clusters_read`, and the projects
-`not_reached` or with `scan_errors` this run (each with its summary), since
-`summary` counts only the clusters read; a cluster missing from a partial
-report is unread, not clean. Every other rewrite of
+`latest.md` and `latest.json` symlinks) and a place in one chat message when
+it first appears, when its `suspectedCause` (a rank finding's `rule`) changes
+or its `severity` escalates, or when its 7-day refresh window
+(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. The
+message opens with a bold headline ("**2 pod placement problems on 2 clusters
+(1 new, 1 still open)**"), names up to three of them, most severe first, by
+workload, zone, compute class or node pool (named as one) and cluster, with
+leeway's cause in plain words (`CAUSE_PHRASES` in the script) and a share
+where there is one (a workload's pods or a node pool's nodes in one zone, a
+compute class's time on its last machine choice), adds "and N more" past that, and ends by pointing at the agent for
+fixes and with the date its findings are next posted if still open.
+The report's path on the pod is left out, since a chat reader cannot open it.
+Resolved findings on cleanly scanned (`status: "ok"`) clusters are retired
+under their own headline in the same post ("**1 pod placement problem has
+cleared**", then up to three names), while clusters whose scan failed or that
+were not reached retain their ledger entries so transient errors do not erase
+state and re-page tomorrow. Lines about the scan itself follow the headlines. A run
+with a finding due writes and publishes its own report, partial or not. The
+JSON report carries a `coverage` block: `clusters_swept`, `clusters_read`, and
+the projects `not_reached` or with `scan_errors` this run (each with its
+summary), since `summary` counts only the clusters read; a cluster missing
+from a partial report is unread, not clean. Every other rewrite of
 `latest.*` waits for a run that reads every project in full without a
 failure: the refresh after findings retire, a refresh deferred from an
 earlier run, and the one after a threshold override changes. A failed project
 or clusters not reached hold it back. So on a fleet too big for one run,
 `latest.*` and the topic change only when a finding comes due, and otherwise
-keep the previous report. When `NATS_URL` is set, the watch also writes
-`latest.json` to the `topology-skew`
+keep the previous report. When `NATS_URL` is set, the watch also writes the
+JSON report it just saved to the `topology-skew`
 (`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
-fails, it warns once in chat and retries on a later run that reads every
-project in full without a failure, until the write recovers.
+fails, it warns once in chat and retries with `latest.json` on a later run
+that reads every project in full without a failure, until the write recovers.
+A report too large for one bus message (NATS's 1 MiB `max_payload`, less 64
+KiB held back for the envelope and encoding slack) is published capped: the
+same document keeping the fleet's most severe findings in order, up to the
+first that does not fit, each in its own cluster, the full report's `summary`,
+and a `truncated` block counting what was left out. Its `full_report` is the
+timestamped report's path on the Platform Agent profile's disk, which
+leeway-watch prunes once ten newer reports exist. When even the clusters
+stripped of findings do not fit, `clusters` is emptied and counted in
+`truncated.clusters_omitted`. The `--text` summary gains a suffix naming the
+cap.
 
 ## `session-retention` gives every profile's history an end
 

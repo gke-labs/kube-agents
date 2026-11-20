@@ -690,6 +690,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # install, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
+    # This repository, agent-pod-reading. No field: whether every plugin the
+    # image ships is on the front door's data volume, agent-owned and
+    # matching the image, is the whole assertion. Reads the agent's own
+    # install, so not in CLUSTER_READING_TYPES.
+    "gateway_plugins_as_shipped": (),
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),

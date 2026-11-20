@@ -209,8 +209,8 @@ type Notifier struct {
 	subject string
 	// home is the channel home requests post into, "" for none, fixed at
 	// construction from the CR. homeSource, when set, answers instead while
-	// home is empty: the Slack gateway's read of the home channel the
-	// operator projects into the pod as a file (slack_home_channel.go), so a
+	// home is empty: the backend's read of the home channel the
+	// operator projects into the pod as a file (home_channel.go), so a
 	// learned channel is read where it is mounted and never copied here.
 	// Each job takes one snapshot of it in validate and posts with that.
 	home       string
@@ -345,9 +345,10 @@ type replyToRooter interface {
 
 // consoleFramePoster is what the console notifier posts through: one frame
 // per request, a keyed request's later post editing it, with the task the
-// report answers. The console adapter implements it (PostNotifyFrame).
+// post reports on and whether the post is a card's report. The console
+// adapter implements it (PostNotifyFrame).
 type consoleFramePoster interface {
-	PostNotifyFrame(conversation, messageID, text, replyTo string, edit bool) (string, error)
+	PostNotifyFrame(conversation, messageID, text, replyTo string, report, edit bool) (string, error)
 }
 
 // NewConsoleNotifier builds the console door's notifier. The console has no
@@ -377,7 +378,7 @@ func (n *Notifier) ServesConversations() bool {
 }
 
 // SetHomeSource points home requests at the home channel the operator
-// projects into the pod (the Slack gateway's file, slack_home_channel.go),
+// projects into the pod (the backend's file, home_channel.go),
 // read on every request while the CR names no home channel. Called before
 // Start, read-only after.
 func (n *Notifier) SetHomeSource(source func() (home string, present bool)) {
@@ -905,7 +906,11 @@ func (n *Notifier) post(job notifyJob) {
 // postConsole answers a console conversation's request with one notify
 // frame: the text whole (the chat message's text is its fallback, and the
 // console renders text), an Update key editing the frame its key last posted
-// here, and ReplyTo passed on when it is a task id's shape.
+// here, ReplyTo passed on when it is a task id's shape, and the report mark
+// passed on as the frame's Report. The notifier puts reply_to on every post
+// into a console thread, progress notes included, so a client gathers a
+// turn's posts by it; the mark is what tells the one post the gateway keeps
+// a report under, and the console page offers a reply under that frame alone.
 func (n *Notifier) postConsole(job notifyJob) {
 	conversation, key := job.req.Conversation, job.req.Update
 	messageID, edit := "", false
@@ -927,7 +932,7 @@ func (n *Notifier) postConsole(job notifyJob) {
 		cancel()
 	}
 	job.rootTask = replyTo
-	message, err := n.frames.PostNotifyFrame(conversation, messageID, job.req.Text, replyTo, edit)
+	message, err := n.frames.PostNotifyFrame(conversation, messageID, job.req.Text, replyTo, job.req.Report, edit)
 	if err != nil {
 		n.log.Error("notify post failed", "conversation", conversation, "update", key, "err", err)
 		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})

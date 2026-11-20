@@ -117,11 +117,12 @@ unfiltered `leeway` report but suppressed by active thresholds remain silently
 in `ledger.json` rather than retiring as resolved. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE` (topology
 findings), `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and
-`LEEWAY_WATCH_REFRESH_DAYS` — together with `LEEWAY_WATCH_CLUSTERS`,
-`LEEWAY_WATCH_PROJECTS`, and `LEEWAY_WATCH_HOME` — are optional overrides for
-runs started by hand in the pod (pass `--dry-run` when probing narrower or wider
-thresholds so `ledger.json` and `reports/latest.*` are not mutated); the
-operator's `spec.deployment.env` allowlist does not carry them.
+`LEEWAY_WATCH_REFRESH_DAYS` reach the scheduled run from the `PlatformAgent`
+CR's `spec.deployment.env`, which the operator's allowlist carries.
+`LEEWAY_WATCH_CLUSTERS`, `LEEWAY_WATCH_PROJECTS`, and `LEEWAY_WATCH_HOME` are
+not carried; they are overrides for runs started by hand in the pod. Pass
+`--dry-run` when probing narrower or wider thresholds by hand, so `ledger.json`
+and `reports/latest.*` are not mutated.
 
 State ledger, blackboard topic, and 7-day reminder gate. Under
 `<profile home>/leeway/`:
@@ -145,21 +146,38 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   `NATS_URL` is set, the JSON report is also published to the A2A blackboard
   topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
   once in chat on failure and retrying on a later tick that reads every target
-  in full without failing.
+  in full without failing. A report too large for one bus message
+  (`TOPIC_ARTIFACT_BUDGET_BYTES`: the NATS limit less the envelope reserve and
+  encoding slack) is published capped (`cap_topic_report`): the fleet's most
+  severe findings in order, up to the first that does not fit, each kept in its
+  cluster, the full report's `summary`, a `truncated` block with the counts
+  left out and the full report's path (the bare clusters too, counted, when
+  even they do not fit), and a `--text` suffix naming the cap.
 A finding is due for reporting when:
 1. It is **new** (not present in `ledger.json`),
 2. Its **suspected cause changed or severity escalated** since the last report,
    or
 3. Its **7-day scheduled refresh** window has elapsed (`now - last_report_at >=
    7 days - 10m`).
-Chat report lines name up to six due subjects with their cause and share.
-Findings on clusters whose scan succeeded (`status == "ok"`) and that are no
-longer present are retired from `ledger.json` with a single resolution line.
-A finding on a cluster its project's cluster list no longer names retires once
-that list was read. Clusters whose scan failed (`status == "error"`), that were
-not reached, or whose project could not be scanned retain their existing ledger
-entries so a transient outage does not erase state and re-page as new tomorrow.
-A quiet tick prints nothing.
+The chat message for due findings opens with a bold headline (how many pod
+placement problems, on which cluster or how many, and how many are new,
+changed or still open), then names up to three of them, most severe and most
+concentrated first, each as its workload, zone, compute class or node pool
+(named as one), its cluster, leeway's suspected cause in plain words
+(`CAUSE_PHRASES`), and a share where it has one (a workload's pods or a node
+pool's nodes in one zone; a compute class's time on its last machine choice),
+with "and N more" past that. It closes by pointing at the
+agent for fixes, and with the date its findings are next posted if still
+open; the report's path on the pod is not in it. Findings on clusters
+whose scan succeeded (`status == "ok"`) and that are no longer present are
+retired from `ledger.json` under their own headline in the same post, counting
+the cleared problems, then up to three of them by name. Lines about the scan
+itself (a partial scan, a recovery, a failed publish) follow both. A finding on a cluster its
+project's cluster list no longer names retires once that list was read.
+Clusters whose scan failed (`status == "error"`), that were not reached, or
+whose project could not be scanned retain their existing ledger entries so a
+transient outage does not erase state and re-page as new tomorrow. A quiet
+tick prints nothing.
 """
 
 from __future__ import annotations
@@ -429,6 +447,60 @@ A2A_PUBLISH_TIMED_OUT_DETAIL = "TimeoutExpired: a2a topics write {topic} timed o
 A2A_PUBLISH_EXCEPTION_DETAIL = "{error_type}: {error}"
 A2A_RETRY_SUMMARY = "{prefix}: topology-skew blackboard report refreshed"
 ERROR_KIND_TOPIC_PUBLISH = "topic_publish_failed"
+A2A_DATA_STDIN = "-"
+
+# The topic write's size cap. The bus refuses a message over its max_payload,
+# headers included. `a2a topics write --data` parses the JSON and re-encodes it
+# compactly with Go's encoder inside the topic artifact (`name`, `parts`: the
+# `--text` part, then the data part) inside the envelope, so the check measures
+# that encoding, not the indented file on disk.
+# NATS's default max_payload. The operator's nats.conf render sets none;
+# test_leeway_watch reads the render's fixture and fails if one appears.
+NATS_MAX_PAYLOAD_BYTES = 1024 * 1024
+# The envelope's fields outside the artifact (protocol, ids, timestamp, writer,
+# kind) and the Nats-Msg-Id header come to about 400 bytes with 63-character
+# session and profile names.
+A2A_ENVELOPE_RESERVE_BYTES = 4 * 1024
+# What the estimate of Go's encoding can still miss (float formatting, escapes
+# Go writes longer than Python). A compact finding is 2.0-2.4 KB, so this costs
+# about 25 findings of the ~400 that fit.
+A2A_ENCODING_SLACK_BYTES = 60 * 1024
+TOPIC_ARTIFACT_BUDGET_BYTES = NATS_MAX_PAYLOAD_BYTES - A2A_ENVELOPE_RESERVE_BYTES - A2A_ENCODING_SLACK_BYTES
+COMPACT_JSON_SEPARATORS = (",", ":")
+UTF8 = "utf-8"
+# Go's encoder escapes <, > and & as \u003c (6 bytes for 1) and U+2028 and
+# U+2029 as \u2028 (6 bytes for 3); Python's leaves them as they are.
+GO_HTML_ESCAPED_CHARS = ("<", ">", "&")
+GO_HTML_ESCAPE_EXTRA_BYTES = 5
+GO_LINE_SEPARATOR_CHARS = ("\u2028", "\u2029")
+GO_LINE_SEPARATOR_EXTRA_BYTES = 3
+# lib.Artifact and lib.Part field names and part kinds (a2a/lib/payload.go).
+ARTIFACT_NAME_FIELD = "name"
+ARTIFACT_PARTS_FIELD = "parts"
+PART_KIND_FIELD = "kind"
+PART_TEXT_FIELD = "text"
+PART_DATA_FIELD = "data"
+PART_KIND_TEXT = "text"
+PART_KIND_DATA = "data"
+# A comma between two findings in a list, counted for every finding kept.
+JSON_LIST_SEPARATOR_BYTES = 1
+# The capped document: the report's own fields keeping the fleet's most severe
+# findings (severity, then tier, then report order) up to the first that does not
+# fit, in their clusters, the
+# full report's summary unchanged, and this block saying what was left out.
+TRUNCATED_FIELD = "truncated"
+TRUNCATED_REASON_FIELD = "reason"
+TRUNCATED_REASON = "the full report is over the A2A bus's {limit}-byte message limit"
+TRUNCATED_FULL_REPORT_FIELD = "full_report"
+TRUNCATED_FINDINGS_TOTAL_FIELD = "findings_total"
+TRUNCATED_FINDINGS_PUBLISHED_FIELD = "findings_published"
+TRUNCATED_FINDINGS_OMITTED_FIELD = "findings_omitted"
+TRUNCATED_OMITTED_BY_SEVERITY_FIELD = "omitted_by_severity"
+TRUNCATED_CLUSTERS_OMITTED_FIELD = "clusters_omitted"
+CAPPED_TEXT_SUFFIX = " (topic copy capped at {published} of {total} findings, most severe first; full report: {path})"
+FINDING_LIST_FIELDS = (TOPOLOGY_FINDINGS_FIELD, RANK_FINDINGS_FIELD)
+# A finding without a tier sorts after every tier.
+NO_TIER_SORT_KEY = (True, "")
 SPACE_CHAR = " "
 BACKTICK_CHAR = "`"
 SINGLE_QUOTE_CHAR = "'"
@@ -478,11 +550,94 @@ RECOVERED_LINE = "{prefix} watch: the tick runs again"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
-RETIRED_LINE = "{prefix}: {count} finding(s) resolved ({names}); retired from the watch"
-REPORT_LINE = (
-    "{prefix}: {due_count} finding(s) due ({reasons}) across {cluster_count} cluster(s) ({clusters}): {names}; "
-    "report on the gateway pod at {path}; next refresh after {next_date}"
-)
+# The due and resolved messages: a bold headline that answers, then at most
+# MAX_CHAT_ITEMS items, most severe and most concentrated first, then
+# "and N more". Names and items are cut so the message stays bounded however
+# many findings or however long a workload name.
+CHAT_HEADLINE = "**{text}**"
+CHAT_ITEM = "- {text}"
+CHAT_MORE_ITEM = "- and {count} more"
+CHAT_LINE_SEPARATOR = "\n"
+MAX_CHAT_ITEMS = 3
+CHAT_NAME_MAX_CHARS = 60
+CHAT_ITEM_MAX_CHARS = 160
+# An over-long item is cut in its name first and then, if it is still too long,
+# in its cluster, so the share and cause that follow always survive; each part
+# cut keeps at least this much.
+CHAT_SUBJECT_MIN_CHARS = 20
+# Every subject template ends "... on {cluster}".
+SUBJECT_CLUSTER_JOIN = " on "
+CHAT_ELLIPSIS = "…"
+PROBLEM_NOUN = ("pod placement problem", "pod placement problems")
+CLUSTER_NOUN = ("cluster", "clusters")
+HAS_VERB = ("has", "have")
+DUE_HEADLINE = "{count} {problems} on {where} ({breakdown})"
+DUE_WHERE_CLUSTER = "cluster {cluster}"
+DUE_WHERE_CLUSTERS = "{count} {clusters}"
+RESOLVED_HEADLINE = "{count} {problems} {has} cleared"
+# Where the detail is: the agent's topology-drift skill runs `leeway report`
+# again on request. The ledger re-posts these findings on the first run after
+# their refresh window ends that reads their cluster: usually the daily run on
+# that date, later when that run starts early or the cluster is not read.
+DUE_FOLLOW_UP = "Ask me how to fix any of these. If they're still open, I'll post them again on or after {next_date}."
+# Why a finding is in this message, in the order the headline lists them.
+REASON_LABELS: dict[str, str] = {
+    REASON_NEW: "new",
+    REASON_CHANGED: "changed",
+    REASON_REFRESH: "still open",
+}
+BREAKDOWN_PART = "{count} {label}"
+# One reason for every item: "(new)" for one, "(all new)" for several.
+BREAKDOWN_ALL = "all {label}"
+# How an item names what it is about.
+SUBJECT_NAMESPACED = "{name} ({namespace}) on {cluster}"
+SUBJECT_CLUSTER_WIDE = "{name} on {cluster}"
+# A cluster-scoped subject names its kind, so a node pool is not read as a
+# workload; leeway's NodeGroup is a node pool, and its share counts nodes.
+SUBJECT_NODE_POOL = "node pool {name} on {cluster}"
+SUBJECT_KIND_NAMED = "{kind} {name} on {cluster}"
+SUBJECT_KIND_NODE_GROUP = "NodeGroup"
+SUBJECT_ZONE = "zone {name} on {cluster}"
+SUBJECT_COMPUTE_CLASS = "compute class {name} on {cluster}"
+RANK_KIND_PREFIX = "leeway.rank_"
+# What it says about it: the share of pods in the fullest zone (a rank
+# finding's share is the time spent on the class's last machine choice).
+ITEM_WORKLOAD = "{subject}: {pct}% of its pods in one zone; {cause}"
+ITEM_CLUSTER_WIDE = "{subject}: {pct}% in one zone; {cause}"
+ITEM_NODE_POOL = "{subject}: {pct}% of its nodes in one zone; {cause}"
+ITEM_ZONE = "{subject}: {cause}"
+ITEM_RANK = "{subject}: {cause}"
+ITEM_RANK_WITH_SHARE = "{subject}: {cause} (last choice {pct}% of the time)"
+# leeway's suspectedCause (pkg/leeway/cause.go) and, for a rank finding, its
+# judging rule (pkg/leeway/rankjudge.go), in plain words. On a workload,
+# taint_exclusion and domain_outage are about an under-filled zone behind its
+# skew, not the zone it sits in, and say only what leeway measured there: a node
+# cordoned or tainted as the skew began, or at least half the nodes not ready.
+CAUSE_PHRASES: dict[str, str] = {
+    "constraint_ignored": "its zone spread rule is not being kept",
+    "volume_pinning": "zonal disks hold the pods there",
+    "domain_capacity_shortfall": "the other zones are out of room",
+    "taint_exclusion": "a node in another zone was cordoned or tainted",
+    "domain_outage": "another zone has nodes that are not ready",
+    "consolidation": "node consolidation packed the pods together",
+    "rollout_bias": "a rollout placed the pods unevenly",
+    "selector_confined": "its node selector allows only one zone",
+    "unknown": "no clear cause found",
+    "wedged": "pods are stuck with no allowed machines to run on",
+    "rank0-share": "too little time on its first machine choice",
+    "last-rank": "running on its last machine choice too long",
+    "no-migration": "not moving back to its preferred machines",
+    "tier-unused": "one of its machine choices is never used",
+    "rank-baseline": "running on lower machine choices than usual",
+}
+CAUSE_PHRASE_FALLBACK = "cause not identified"
+# On a zone finding the cause is about the zone itself (pkg/leeway/domain.go);
+# leeway's consolidation there only means the zone has no nodes, a guess at why.
+ZONE_CAUSE_PHRASES: dict[str, str] = {
+    "taint_exclusion": "it takes no new pods because every node is cordoned or tainted",
+    "domain_outage": "it takes no new pods because its nodes are not ready",
+    "consolidation": "it has no nodes left",
+}
 TOPIC_PUBLISH_FAILED_LINE = (
     "{prefix} watch: publishing to blackboard topic {topic} failed ({detail}); "
     "on upgraded installs, check `kubectl describe platformagent` for TopicsStateSubjectMissing "
@@ -1178,14 +1333,139 @@ def finding_trigger_reason(
     return None
 
 
+def clip_text(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, the cut marked with an ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - len(CHAT_ELLIPSIS)] + CHAT_ELLIPSIS
+
+
+def plural(nouns: tuple[str, str], count: int) -> str:
+    return nouns[count != 1]
+
+
+def is_rank_finding(item: dict[str, Any]) -> bool:
+    return str(item.get(KIND_FIELD) or "").startswith(RANK_KIND_PREFIX)
+
+
+def cause_phrase(cause: object, *, zone: bool = False) -> str:
+    """leeway's cause code (or a rank finding's rule) in plain words, worded for
+    a zone finding when `zone` is set."""
+    code = str(cause or DEFAULT_UNKNOWN)
+    if zone and code in ZONE_CAUSE_PHRASES:
+        return ZONE_CAUSE_PHRASES[code]
+    return CAUSE_PHRASES.get(code, CAUSE_PHRASE_FALLBACK)
+
+
 def short_finding_label(item: dict[str, Any]) -> str:
-    """Concise human label for chat lines."""
-    cluster_short = str(item.get("cluster") or "").rsplit("/", 1)[-1]
-    ns = str(item.get("namespace") or "")
-    name = str(item.get("subject_name") or "")
+    """What a finding is about, in plain words: the workload, zone, compute
+    class or node pool and the cluster it is on (`kube-dns (kube-system) on
+    prod-east`)."""
+    cluster = clip_text(str(item.get(CLUSTER_FIELD) or "").rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1], CHAT_NAME_MAX_CHARS)
+    ns = str(item.get(NAMESPACE_FIELD) or "")
+    name = clip_text(str(item.get(SUBJECT_NAME_FIELD) or DEFAULT_UNKNOWN), CHAT_NAME_MAX_CHARS)
+    if str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE:
+        return SUBJECT_ZONE.format(name=name, cluster=cluster)
+    if is_rank_finding(item):
+        return SUBJECT_COMPUTE_CLASS.format(name=name, cluster=cluster)
     if ns and ns != CLUSTER_WIDE_NAMESPACE:
-        return f"{cluster_short}:{ns}/{name}"
-    return f"{cluster_short}:{name}"
+        return SUBJECT_NAMESPACED.format(name=name, namespace=clip_text(ns, CHAT_NAME_MAX_CHARS), cluster=cluster)
+    kind = str(item.get(SUBJECT_KIND_FIELD) or "")
+    if kind == SUBJECT_KIND_NODE_GROUP:
+        return SUBJECT_NODE_POOL.format(name=name, cluster=cluster)
+    if kind:
+        return SUBJECT_KIND_NAMED.format(kind=clip_text(kind, CHAT_NAME_MAX_CHARS), name=name, cluster=cluster)
+    return SUBJECT_CLUSTER_WIDE.format(name=name, cluster=cluster)
+
+
+def due_chat_item(item: dict[str, Any]) -> str:
+    """One due finding as a chat item: what it is about, how concentrated, and why."""
+    subject = short_finding_label(item)
+    is_zone = str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE
+    cause = cause_phrase(item.get(SUSPECTED_CAUSE_FIELD), zone=is_zone)
+    pct = round(_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT) * PERCENT_SCALE)
+    ns = str(item.get(NAMESPACE_FIELD) or "")
+    if is_zone:
+        text = ITEM_ZONE.format(subject=subject, cause=cause)
+    elif is_rank_finding(item):
+        template = ITEM_RANK_WITH_SHARE if pct > 0 else ITEM_RANK
+        text = template.format(subject=subject, cause=cause, pct=pct)
+    elif ns and ns != CLUSTER_WIDE_NAMESPACE:
+        text = ITEM_WORKLOAD.format(subject=subject, pct=pct, cause=cause)
+    elif str(item.get(SUBJECT_KIND_FIELD) or "") == SUBJECT_KIND_NODE_GROUP:
+        text = ITEM_NODE_POOL.format(subject=subject, pct=pct, cause=cause)
+    else:
+        text = ITEM_CLUSTER_WIDE.format(subject=subject, pct=pct, cause=cause)
+    if len(text) > CHAT_ITEM_MAX_CHARS:
+        head, join, cluster = subject.rpartition(SUBJECT_CLUSTER_JOIN)
+        rest = text[len(subject) :]
+        room = max(CHAT_ITEM_MAX_CHARS - len(join + cluster + rest), CHAT_SUBJECT_MIN_CHARS)
+        head = clip_text(head, room)
+        over = len(head + join + cluster + rest) - CHAT_ITEM_MAX_CHARS
+        if over > 0:
+            cluster = clip_text(cluster, max(len(cluster) - over, CHAT_SUBJECT_MIN_CHARS))
+        text = head + join + cluster + rest
+    return clip_text(text, CHAT_ITEM_MAX_CHARS)
+
+
+def chat_item_order(item: dict[str, Any]) -> tuple[int, bool, float, str]:
+    """Most severe first; at one severity a zone that takes no pods (the cause
+    of the skew around it), then the most concentrated; then by key."""
+    return (
+        -SEVERITY_RANKS.get(str(item.get(SEVERITY_FIELD) or ""), 0),
+        str(item.get(KIND_FIELD) or "") != FINDING_KIND_DOMAIN_UNAVAILABLE,
+        -_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT),
+        str(item.get(KEY_FIELD) or ""),
+    )
+
+
+def topic_summary(message: str) -> str:
+    """A chat message's headline as plain text: the summary other agents read
+    on the blackboard topic, which carries the report itself as data."""
+    headline = message.split(CHAT_LINE_SEPARATOR, 1)[0]
+    bold_open, bold_close = CHAT_HEADLINE.split("{text}")
+    if headline.startswith(bold_open) and headline.endswith(bold_close):
+        headline = headline[len(bold_open) : len(headline) - len(bold_close)]
+    return headline
+
+
+def chat_message(headline: str, items: list[str], tail: str = "") -> str:
+    """A bold headline, at most MAX_CHAT_ITEMS items and "and N more", then `tail`."""
+    lines = [CHAT_HEADLINE.format(text=headline)]
+    lines.extend(CHAT_ITEM.format(text=text) for text in items[:MAX_CHAT_ITEMS])
+    if len(items) > MAX_CHAT_ITEMS:
+        lines.append(CHAT_MORE_ITEM.format(count=len(items) - MAX_CHAT_ITEMS))
+    if tail:
+        lines.append(tail)
+    return CHAT_LINE_SEPARATOR.join(lines)
+
+
+def resolved_message(labels: list[str]) -> str:
+    """The chat message for findings that cleared, named by `short_finding_label`."""
+    count = len(labels)
+    headline = RESOLVED_HEADLINE.format(count=count, problems=plural(PROBLEM_NOUN, count), has=plural(HAS_VERB, count))
+    return chat_message(headline, labels)
+
+
+def due_message(due_items: list[dict[str, Any]], due_reasons: list[str], next_date: str) -> str:
+    """The chat message for findings due this tick: how many, where, and why."""
+    count = len(due_items)
+    clusters = sorted({str(item.get(CLUSTER_FIELD) or "") for item in due_items})
+    if len(clusters) == 1:
+        where = DUE_WHERE_CLUSTER.format(
+            cluster=clip_text(clusters[0].rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1], CHAT_NAME_MAX_CHARS)
+        )
+    else:
+        where = DUE_WHERE_CLUSTERS.format(count=len(clusters), clusters=plural(CLUSTER_NOUN, len(clusters)))
+    labels = [(label, due_reasons.count(reason)) for reason, label in REASON_LABELS.items() if reason in due_reasons]
+    if len(labels) == 1:
+        label = labels[0][0]
+        breakdown = label if count == 1 else BREAKDOWN_ALL.format(label=label)
+    else:
+        breakdown = LIST_SEPARATOR.join(BREAKDOWN_PART.format(count=n, label=label) for label, n in labels)
+    headline = DUE_HEADLINE.format(count=count, problems=plural(PROBLEM_NOUN, count), where=where, breakdown=breakdown)
+    items = [due_chat_item(item) for item in sorted(due_items, key=chat_item_order)]
+    return chat_message(headline, items, DUE_FOLLOW_UP.format(next_date=next_date))
 
 
 def due_finding_summary(item: dict[str, Any], *, include_cluster: bool) -> str:
@@ -1402,10 +1682,167 @@ def write_report_files(
     return md_path
 
 
+def a2a_encoded_size(value: Any) -> int:
+    """Estimate the bytes Go's json.Marshal writes for `value`, as `a2a topics write` re-encodes it."""
+    text = json.dumps(value, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS)
+    size = len(text.encode(UTF8))
+    size += GO_HTML_ESCAPE_EXTRA_BYTES * sum(text.count(c) for c in GO_HTML_ESCAPED_CHARS)
+    size += GO_LINE_SEPARATOR_EXTRA_BYTES * sum(text.count(c) for c in GO_LINE_SEPARATOR_CHARS)
+    return size
+
+
+def topic_artifact(summary_text: str, data: Any) -> dict[str, Any]:
+    """The artifact `a2a topics write` publishes for `--text` and `--data` (lib.NewTopicArtifact)."""
+    parts: list[dict[str, Any]] = []
+    if summary_text:
+        parts.append({PART_KIND_FIELD: PART_KIND_TEXT, PART_TEXT_FIELD: summary_text})
+    parts.append({PART_KIND_FIELD: PART_KIND_DATA, PART_DATA_FIELD: data})
+    return {ARTIFACT_NAME_FIELD: A2A_TOPIC_NAME, ARTIFACT_PARTS_FIELD: parts}
+
+
+def topic_artifact_size(summary_text: str, data: Any) -> int:
+    return a2a_encoded_size(topic_artifact(summary_text, data))
+
+
+def finding_severity(finding: object) -> str:
+    if not isinstance(finding, dict):
+        return DEFAULT_UNKNOWN
+    return str(finding.get(SEVERITY_FIELD) or DEFAULT_SEVERITY)
+
+
+def finding_sort_key(finding: object) -> tuple[int, tuple[bool, str]]:
+    """Most severe first, then tier A before B before C, then findings without a tier."""
+    if not isinstance(finding, dict):
+        return 0, NO_TIER_SORT_KEY
+    tier = str(finding.get(TIER_FIELD) or "")
+    return -SEVERITY_RANKS.get(finding_severity(finding), 0), ((False, tier) if tier else NO_TIER_SORT_KEY)
+
+
+def cap_topic_report(
+    report: dict[str, Any],
+    summary_text: str,
+    full_report_path: Path,
+) -> tuple[str, dict[str, Any]]:
+    """Cut `report` to its most severe findings whose topic artifact fits under TOPIC_ARTIFACT_BUDGET_BYTES.
+
+    Every finding left out is no more severe than every finding kept. The
+    summary stays the full report's; `truncated` names what was left out and
+    where the full report is. When the clusters alone do not fit, they are
+    left out too.
+    """
+    clusters = report.get(CLUSTERS_FIELD)
+    if not isinstance(clusters, list):
+        clusters = []
+    # (sort key, cluster index, list index, finding index, finding)
+    candidates: list[tuple[Any, int, int, int, Any]] = []
+    for ci, cr in enumerate(clusters):
+        if not isinstance(cr, dict):
+            continue
+        for li, field in enumerate(FINDING_LIST_FIELDS):
+            items = cr.get(field)
+            if isinstance(items, list):
+                for fi, finding in enumerate(items):
+                    candidates.append((finding_sort_key(finding), ci, li, fi, finding))
+    candidates.sort(key=lambda c: c[:4])
+    severity_totals: dict[str, int] = {}
+    for c in candidates:
+        sev = finding_severity(c[4])
+        severity_totals[sev] = severity_totals.get(sev, 0) + 1
+    total = len(candidates)
+    path = str(full_report_path)
+
+    def build(
+        kept: list[tuple[Any, int, int, int, Any]],
+        keep_clusters: bool,
+        *,
+        widest: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        placed: list[Any] = []
+        if keep_clusters:
+            for cr in clusters:
+                if isinstance(cr, dict):
+                    entry = dict(cr)
+                    for field in FINDING_LIST_FIELDS:
+                        if isinstance(cr.get(field), list):
+                            entry[field] = []
+                    placed.append(entry)
+                else:
+                    placed.append(cr)
+            for c in sorted(kept, key=lambda c: c[1:4]):
+                placed[c[1]][FINDING_LIST_FIELDS[c[2]]].append(c[4])
+        # widest: every count at the most digits it can take, for sizing.
+        published = total if widest else len(kept)
+        omitted = total if widest else total - published
+        omitted_by_severity = dict(severity_totals)
+        if not widest:
+            for c in kept:
+                sev = finding_severity(c[4])
+                omitted_by_severity[sev] -= 1
+                if not omitted_by_severity[sev]:
+                    del omitted_by_severity[sev]
+        truncated: dict[str, Any] = {
+            TRUNCATED_REASON_FIELD: TRUNCATED_REASON.format(limit=NATS_MAX_PAYLOAD_BYTES),
+            TRUNCATED_FULL_REPORT_FIELD: path,
+            TRUNCATED_FINDINGS_TOTAL_FIELD: total,
+            TRUNCATED_FINDINGS_PUBLISHED_FIELD: published,
+            TRUNCATED_FINDINGS_OMITTED_FIELD: omitted,
+            TRUNCATED_OMITTED_BY_SEVERITY_FIELD: omitted_by_severity,
+        }
+        if not keep_clusters:
+            truncated[TRUNCATED_CLUSTERS_OMITTED_FIELD] = len(clusters)
+        doc = dict(report)
+        doc[CLUSTERS_FIELD] = placed
+        doc[TRUNCATED_FIELD] = truncated
+        text = summary_text + CAPPED_TEXT_SUFFIX.format(published=published, total=total, path=path)
+        return text, doc
+
+    # Size the document with every count at its widest, so adding findings
+    # costs only their own bytes and a comma each.
+    bound_text, bound_doc = build([], True, widest=True)
+    room = TOPIC_ARTIFACT_BUDGET_BYTES - topic_artifact_size(bound_text, bound_doc)
+    keep_clusters = room >= 0
+    kept: list[tuple[Any, int, int, int, Any]] = []
+    if keep_clusters:
+        for c in candidates:
+            cost = a2a_encoded_size(c[4]) + JSON_LIST_SEPARATOR_BYTES
+            if cost > room:
+                break
+            room -= cost
+            kept.append(c)
+    text, doc = build(kept, keep_clusters)
+    while kept and topic_artifact_size(text, doc) > TOPIC_ARTIFACT_BUDGET_BYTES:
+        kept.pop()
+        text, doc = build(kept, keep_clusters)
+    return text, doc
+
+
+def capped_topic_payload(summary_text: str, json_path: Path) -> tuple[str, dict[str, Any]] | None:
+    """The capped `--text` and data for a report too large for one bus message, or None to publish it as is."""
+    try:
+        report = json.loads(json_path.read_text(encoding=UTF8))
+    except (OSError, ValueError):
+        # `a2a topics write` reads the same file and reports what is wrong with it.
+        return None
+    if not isinstance(report, dict) or topic_artifact_size(summary_text, report) <= TOPIC_ARTIFACT_BUDGET_BYTES:
+        return None
+    return cap_topic_report(report, summary_text, json_path.resolve())
+
+
 def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, str | None]:
-    """Publish the latest leeway report to `agent.platform.topology-skew` when the A2A bus is configured."""
+    """Publish the latest leeway report to `agent.platform.topology-skew` when the A2A bus is configured.
+
+    A report too large for one bus message is published capped
+    (`cap_topic_report`) on stdin instead.
+    """
     if not os.environ.get(NATS_URL_ENV, "").strip() or not shutil.which(A2A_EXECUTABLE):
         return False, None
+    data_arg = f"{A2A_DATA_FILE_PREFIX}{json_path}"
+    stdin_data = None
+    capped = capped_topic_payload(summary_text, json_path)
+    if capped is not None:
+        summary_text, payload = capped
+        data_arg = A2A_DATA_STDIN
+        stdin_data = json.dumps(payload, separators=COMPACT_JSON_SEPARATORS)
     argv = [
         A2A_EXECUTABLE,
         A2A_TOPICS_SUBCOMMAND,
@@ -1414,11 +1851,12 @@ def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, 
         A2A_TEXT_FLAG,
         summary_text,
         A2A_DATA_FLAG,
-        f"{A2A_DATA_FILE_PREFIX}{json_path}",
+        data_arg,
     ]
     try:
         completed = subprocess.run(
             argv,
+            input=stdin_data,
             capture_output=True,
             text=True,
             timeout=A2A_PUBLISH_TIMEOUT_SECONDS,
@@ -2280,14 +2718,13 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         and announced.get(ANNOUNCED_OVERRIDE_THRESHOLDS_KEY) != current_thresholds
     )
 
+    # The answer leads the post: what is due, then what cleared, then any
+    # status lines about the scan itself.
+    retired_line: str | None = None
+    report_line: str | None = None
     try:
         if retired_labels:
-            retired_line = RETIRED_LINE.format(
-                prefix=LINE_PREFIX,
-                count=len(retired_labels),
-                names=format_name_list(retired_labels),
-            )
-            lines.append(retired_line)
+            retired_line = resolved_message(retired_labels)
         if due_reasons:
             announced.pop(ANNOUNCED_DEFERRED_REFRESH_KEY, None)
             if thresholds_overridden:
@@ -2299,27 +2736,11 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             )
             md_path = write_report_files(home, report, markdown, moment)
             due_items = [active_findings[k] for k in sorted(due_reasons)]
-            due_clusters = sorted({item[CLUSTER_FIELD] for item in due_items})
-            multi_cluster = len(due_clusters) > 1
-            reasons_counts = {}
-            for r in due_reasons.values():
-                reasons_counts[r] = reasons_counts.get(r, 0) + 1
-            reasons_str = LIST_SEPARATOR.join(
-                REASON_COUNT_FORMAT.format(count=c, reason=r) for r, c in sorted(reasons_counts.items())
-            )
             next_date = (moment + timedelta(days=days)).strftime(DATE_FORMAT)
-            report_line = REPORT_LINE.format(
-                prefix=LINE_PREFIX,
-                due_count=len(due_reasons),
-                reasons=reasons_str,
-                cluster_count=len(due_clusters),
-                clusters=format_name_list(due_clusters),
-                names=format_name_list([due_finding_summary(i, include_cluster=multi_cluster) for i in due_items]),
-                path=md_path,
-                next_date=next_date,
+            report_line = due_message(due_items, [due_reasons[k] for k in sorted(due_reasons)], next_date)
+            published, err_detail = publish_blackboard_topic(
+                topic_summary(report_line), md_path.with_suffix(REPORT_JSON_SUFFIX)
             )
-            lines.append(report_line)
-            published, err_detail = publish_blackboard_topic(report_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
             record_topic_publish_result(published, err_detail, announced, lines)
         elif retired_labels and scan_errors:
             # A finding retired on a readable cluster during a partial scan (a
@@ -2336,7 +2757,9 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
                 report, active_findings, due_reasons, all_errors, moment, days, not_reached=not_reached
             )
             md_path = write_report_files(home, report, markdown, moment)
-            summary_line = retired_line if retired_labels else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
+            summary_line = (
+                topic_summary(retired_line) if retired_line else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
+            )
             published, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
             record_topic_publish_result(published, err_detail, announced, lines)
         elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not scan_errors:
@@ -2362,7 +2785,8 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         if announced:
             updated_ledger[ANNOUNCED_KEY] = announced
         save_ledger(home, updated_ledger)
-        lines = clear_tick_failure(home, dry_run=dry_run) + lines
+        messages = [message for message in (report_line, retired_line) if message]
+        lines = messages + clear_tick_failure(home, dry_run=dry_run) + lines
     except WriteFailed as exc:
         print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=str(exc)))
         return WRITE_FAILED_EXIT

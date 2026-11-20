@@ -14,8 +14,8 @@ const platformTargetDescription = "the platform agent, which can read and act ac
 // profileLister is what delegateTargets reads the profiles from: every card
 // the gateway holds, in name order. The profile directory serves it from the
 // cards it keeps off DIRECTORY (profiledir.go), so building the list costs no
-// bus read. A cache with its own refresh, or a per-requester view once the
-// PlatformAgent's membership mapping lands, would slot in behind this.
+// bus read. A cache with its own refresh, or a per-requester view by tier
+// (tierOf), would slot in behind this.
 type profileLister interface {
 	sortedCards() []lib.AgentCard
 }
@@ -113,7 +113,7 @@ func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, auth
 	if allowed(targetPlatform) {
 		out.Targets = append(out.Targets, lib.DelegateTarget{Name: targetPlatform, Description: platformTargetDescription})
 	}
-	tier, err := requesterTier(r)
+	tier, err := g.tierFor(everyone, false) // an unknown author list returned above
 	if err != nil {
 		// No attested identity reaches no profile (profileRouteFor's caller
 		// refuses it the same way).
