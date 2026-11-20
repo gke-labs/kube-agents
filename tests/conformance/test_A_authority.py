@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
+import json
 import dataclasses
 import email.message
 import io
@@ -23,6 +25,7 @@ import types
 import re
 import textwrap
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -554,14 +557,21 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             ),
             proposal_update=lambda payload: ran.append(payload) or {"proposal": proposals[payload["number"]]},
         )
-        permitted = types.SimpleNamespace(permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        permitted = types.SimpleNamespace(
+            task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})
+        )
         principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
         principal = dataclasses.replace(principal, task=permitted)
+        # Every proposal here is this task's own (#6400), so only the ownership read can refuse one.
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(Forge(), repo)
+        for number in proposals:
+            record.record_proposal("task-1", 4_000_000_000, key, number)
 
         def update(number: int) -> list:
             body = json.dumps({"repository": f"https://github.com/{repo}", "number": number, "title": "t"}).encode()
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
-            handler.principal, handler.vcs = principal, vcs
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
             handler.headers = email.message.Message()
             handler.headers["Content-Length"] = str(len(body))
             handler.rfile = io.BytesIO(body)
@@ -581,6 +591,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 replies = update(number)
                 self.assertEqual(403, replies[0][0], replies)
                 self.assertEqual(cp.RULE_CALLER_VCS_OWNERSHIP, replies[0][1]["rule"])
+                self.assertNotEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1].get("code"), replies)
         self.assertEqual(1, len(ran), "a refused update reached the forge")
 
     def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
@@ -638,6 +649,119 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         self.assertIsNotNone(cp.report_write_permitted(
             cp.CALLER_ROLE_PROFILE, "fleet-audit", trigger(), audit, "acme%2Fterraform", key, allowlist, registered
         ))
+
+    def test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work(self) -> None:
+        # #6400: the permit is per task, so under it a profile worker writes only
+        # on what that task made. Another open proposal of the install's, one
+        # the ownership check admits, is refused when a different task opened
+        # it. Driven through the handler's own dispatch, so a dispatch that
+        # stops asking the task bar is red, not only the record.
+        cp = h.credential_proxy
+        repo = "acme/infra"
+        ran: list = []
+
+        class Vcs(types.SimpleNamespace):
+            def __getattr__(self, name):
+                return lambda payload: {}
+
+        vcs = Vcs(
+            registry=types.SimpleNamespace(resolve=lambda named: (types.SimpleNamespace(name="github"), repo)),
+            snapshot_source=lambda named: (named, None),
+            require_agent_proposal=lambda verb, payload: None,  # the install's own: the ownership bar passes
+            proposal_update=lambda payload: ran.append(payload) or {"proposal": {"number": payload["number"]}},
+        )
+        task = types.SimpleNamespace(task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        principal = dataclasses.replace(
+            cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u"), task=task
+        )
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(types.SimpleNamespace(name="github"), repo)
+        record.record_proposal("task-1", 4_000_000_000, key, 7)
+        record.record_proposal("task-2", 4_000_000_000, key, 8)
+
+        def update(number: int) -> list:
+            return write("proposal-update", {"number": number, "title": "t"})
+
+        def write(verb: str, fields: dict) -> list:
+            body = json.dumps({"repository": f"https://github.com/{repo}", **fields}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda role: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler._repository_is_permitted = lambda repository, forge: True
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._dispatch_vcs_post(verb)
+            return replies
+
+        self.assertEqual(200, update(7)[0][0], "the task's own proposal must stay updatable")
+        replies = update(8)
+        self.assertEqual(403, replies[0][0], replies)
+        self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
+        self.assertEqual([7], [payload["number"] for payload in ran], "another task's proposal reached the forge")
+        # And the other two writes: a publish to, and a proposal from, another task's branch.
+        allowed, _ = record.claim_branch("task-2", 4_000_000_000, key, "platform-agent/theirs", lambda: False)
+        self.assertTrue(allowed)
+        for verb, field in (("publish", "branch"), ("proposal-create", "source")):
+            with self.subTest(verb=verb):
+                replies = write(verb, {field: "platform-agent/theirs", "title": "t", "target": "main"})
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
+
+    def test_A3_only_a_profile_learns_the_managed_list_from_identity(self) -> None:
+        # #6389: a profile task that names no repository may ask `identity` with
+        # none and learn the managed repositories' names, the list every profile
+        # verb is held to. That is knowledge, not reach, and it is the profile
+        # role's alone: every other role keeps identity's repository requirement,
+        # so no other caller gains a repository-less answer.
+        cp = h.credential_proxy
+
+        def ask(role: str, task) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            principal = cp.Principal(workload="w", uid="u", role=role, pod="p", pod_uid="u")
+            handler.principal = dataclasses.replace(principal, task=task)
+            handler.vcs = types.SimpleNamespace(
+                registry=types.SimpleNamespace(resolve=lambda named: (_ for _ in ()).throw(AssertionError("resolved"))),
+                snapshot_source=lambda named: (named, None),
+            )
+            body = b"{}"
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda r: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler.metrics = types.SimpleNamespace(record_failure=lambda *a, **k: None)
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            original = cp.managed_repositories
+            cp.managed_repositories = lambda: frozenset({"github.com/acme/infra"})
+            original_table = cp.vcs_broker.route_table
+            cp.vcs_broker.route_table = lambda vcs: {"identity": lambda payload: {"identity": {}}}
+            try:
+                try:
+                    handler._dispatch_vcs_post("identity")
+                except AssertionError:
+                    replies.append((0, {"resolved": True}))
+            finally:
+                cp.managed_repositories = original
+                cp.vcs_broker.route_table = original_table
+            return replies
+
+        task = types.SimpleNamespace(permits=frozenset())
+        replies = ask(cp.CALLER_ROLE_PROFILE, task)
+        self.assertEqual([(200, {cp.PROFILE_IDENTITY_MANAGED_KEY: ["github.com/acme/infra"]})], replies)
+        for role in (cp.CALLER_ROLE_SHELL, ""):
+            with self.subTest(role=role or "socket"):
+                replies = ask(role, None)
+                self.assertFalse(
+                    any(cp.PROFILE_IDENTITY_MANAGED_KEY in body for _, body in replies),
+                    f"{role or 'socket'} learned the managed list from a repository-less identity: {replies}",
+                )
 
     def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
         # A report credential (#5619) is the one task credential with no
@@ -709,6 +833,151 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             with self.subTest(name):
                 self.assertIsNotNone(rule)
 
+    def test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway(self) -> None:
+        # The A2A gateway's report reader (#5618) holds the a2a-reports role.
+        # It reaches the audit-report store alone, and there reads one
+        # finished report (latest, or one run) of any audit, on the install's
+        # publish key alone, which it names only as the word `publish` and the
+        # broker resolves; any real key, the publish key's own included, is
+        # refused, and the shell's or a profile's `publish` is never resolved.
+        # It never lists, reads a run index, writes or deletes. The role is conferred by its own audience, to the gateway's
+        # ServiceAccount alone. Each refusal names its own rule, so a refusal
+        # that only falls through to another check is not taken for this one.
+        cp = h.credential_proxy
+        reader = cp.CALLER_ROLE_A2A_REPORTS
+        publish, other = "acme%2Fgitops", "acme%2Fterraform"
+        allowlist = frozenset({"fleet-audit", "platform"})
+        # Every other route refuses it by the role table; and a2a-chat reaches
+        # no store route.
+        self.assertEqual(
+            [cp.AUDIT_REPORTS_PREFIX], [prefix for prefix, roles in cp.ROUTE_ROLES if reader in roles]
+        )
+        self.assertNotIn(cp.CALLER_ROLE_A2A_CHAT, cp.required_roles(cp.AUDIT_REPORTS_PREFIX))
+        read = cp.report_read_permitted
+        word = cp.REPORT_A2A_PUBLISH_KEY
+        self.assertEqual("publish", word)
+        self.assertIsNone(read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST, word))
+        self.assertIsNone(read(reader, None, frozenset(), cp.REPORT_ROUTE_RUN, word))
+        for name, got, rule in (
+            ("the stream list", read(reader, None, frozenset(), cp.REPORT_ROUTE_LIST, None), cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+            ("the run index", read(reader, None, frozenset(), cp.REPORT_ROUTE_RUNS, word), cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+            ("the publish key spelled out", read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST, publish),
+             cp.RULE_REPORT_A2A_REPORTS_KEY),
+            ("a registered repository that is not the publish target",
+             read(reader, "fleet-audit", allowlist, cp.REPORT_ROUTE_LATEST, other), cp.RULE_REPORT_A2A_REPORTS_KEY),
+            ("no_forge spelled out", read(reader, None, frozenset(), cp.REPORT_ROUTE_RUN, "no_forge%2Flocal"),
+             cp.RULE_REPORT_A2A_REPORTS_KEY),
+            ("no key", read(reader, None, frozenset(), cp.REPORT_ROUTE_LATEST), cp.RULE_REPORT_A2A_REPORTS_KEY),
+            ("the a2a-chat role", read(cp.CALLER_ROLE_A2A_CHAT, None, frozenset(), cp.REPORT_ROUTE_LATEST, word),
+             cp.RULE_REPORT_ROLE),
+        ):
+            with self.subTest(name):
+                self.assertEqual(rule, got)
+        for request_key, gitops_key in ((publish, publish), ("no_forge%2Flocal", None)):
+            with self.subTest(write_key=request_key):
+                grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+                self.assertEqual(cp.RULE_REPORT_A2A_REPORTS_WRITE, cp.report_write_permitted(
+                    reader, "fleet-audit", grant, "compliance-audit", request_key, gitops_key, allowlist,
+                    frozenset({publish, other})))
+
+        # Through the handler, with the install's publish key stubbed: only the
+        # two reads on `publish` reach the store, and the store sees the real key.
+        relayed: list = []
+
+        class Store:
+            def relay(self, method, path, body, writer=None):
+                relayed.append((method, path))
+                return 200, b"{}", None
+
+        def handle(method: str, path: str, role: str = reader) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.principal = cp.Principal(workload="gateway", uid="u", role=role)
+            handler.report_store = Store()
+            handler.report_profiles = allowlist
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
+            handler._handle_audit_reports()
+            return replies
+
+        run = "20261113T120000.123456Z"
+        with mock.patch.object(cp, "report_publish_store_key", return_value=publish):
+            for audit in ("compliance-audit", "any-audit"):
+                for suffix in ("latest", f"runs/{run}"):
+                    path = f"/v1/audit-reports/{audit}/publish/{suffix}"
+                    with self.subTest(relayed=path):
+                        self.assertEqual([200], handle("GET", path))
+                        self.assertEqual(("GET", f"/v1/audit-reports/{audit}/{publish}/{suffix}"), relayed[-1])
+            self.assertEqual(4, len(relayed))
+            relayed.clear()
+            # The shell's `publish` is relayed as sent, never resolved.
+            self.assertEqual([200], handle("GET", "/v1/audit-reports/compliance-audit/publish/latest", cp.CALLER_ROLE_SHELL))
+            self.assertEqual([("GET", "/v1/audit-reports/compliance-audit/publish/latest")], relayed)
+            relayed.clear()
+            stream = f"/v1/audit-reports/compliance-audit/{publish}"
+            for method, path, rule in (
+                ("GET", f"{stream}/latest", cp.RULE_REPORT_A2A_REPORTS_KEY),
+                ("GET", f"{stream}/runs/{run}", cp.RULE_REPORT_A2A_REPORTS_KEY),
+                ("GET", "/v1/audit-reports/compliance-audit/publish/runs", cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+                ("PUT", "/v1/audit-reports/compliance-audit/publish/latest", cp.RULE_REPORT_A2A_REPORTS_WRITE),
+                ("GET", "/v1/audit-reports", cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+                ("GET", f"{stream}/runs", cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+                ("GET", f"/v1/audit-reports/compliance-audit/{other}/latest", cp.RULE_REPORT_A2A_REPORTS_KEY),
+                ("GET", f"/v1/audit-reports/compliance-audit/{other}/runs/{run}", cp.RULE_REPORT_A2A_REPORTS_KEY),
+                ("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest", cp.RULE_REPORT_A2A_REPORTS_KEY),
+                ("PUT", f"{stream}/runs/{run}", cp.RULE_REPORT_A2A_REPORTS_WRITE),
+                ("PUT", f"{stream}/latest", cp.RULE_REPORT_A2A_REPORTS_WRITE),
+                ("DELETE", f"{stream}/latest", cp.RULE_REPORT_A2A_REPORTS_WRITE),
+            ):
+                with self.subTest(method=method, path=path):
+                    self.assertEqual([(403, rule)], handle(method, path))
+            self.assertEqual([], relayed)
+        # An install that publishes to no repository: no_forge is the one key.
+        with mock.patch.object(cp, "report_publish_store_key", return_value=None):
+            self.assertEqual([200], handle("GET", "/v1/audit-reports/compliance-audit/publish/latest"))
+            self.assertEqual(("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest"), relayed[-1])
+            self.assertEqual(
+                [(403, cp.RULE_REPORT_A2A_REPORTS_KEY)], handle("GET", "/v1/audit-reports/compliance-audit/no_forge%2Flocal/latest")
+            )
+        # The install's repositories unreadable: 503, nothing relayed.
+        relayed.clear()
+        with mock.patch.object(cp, "report_publish_store_key", side_effect=cp.ReportStoreUnavailable("unreadable")):
+            self.assertEqual([(503, None)], handle("GET", "/v1/audit-reports/compliance-audit/publish/latest"))
+        self.assertEqual([], relayed)
+
+        # The role comes from its own audience, for the gateway's account
+        # alone (build_authenticator's map and binding); an audience that
+        # repeats another confers nothing.
+        gateway = "system:serviceaccount:ns:agent-a2a-gateway"
+        base = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount", "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"shell,{gateway}",
+            "CREDENTIAL_PROXY_AUDIENCE": "shell-aud", "CREDENTIAL_PROXY_CHAT_AUDIENCE": "chat-aud",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "a2a-chat-aud", cp.A2A_REPORTS_CALLERS_ENV: gateway,
+            "KUBERNETES_SERVICE_HOST": "127.0.0.1",
+        }
+        with mock.patch.dict("os.environ", {**base, cp.A2A_REPORTS_AUDIENCE_ENV: "reports-aud"}):
+            authenticator = cp.build_authenticator()
+        self.assertEqual(["reports-aud"], [a for a, role in authenticator.audience_roles.items() if role == reader])
+        for repeated in ("shell-aud", "chat-aud", "a2a-chat-aud"):
+            with self.subTest(repeated=repeated), mock.patch.dict(
+                "os.environ", {**base, cp.A2A_REPORTS_AUDIENCE_ENV: repeated}
+            ):
+                self.assertNotIn(reader, cp.build_authenticator().audience_roles.values())
+
+        def review(username: str, audience: str) -> dict:
+            return {"status": {"authenticated": True, "audiences": [audience], "user": {"username": username, "uid": "u"}}}
+
+        self.assertEqual(reader, authenticator._principal_from(review(gateway, "reports-aud")).role)
+        self.assertEqual(cp.CALLER_ROLE_A2A_CHAT, authenticator._principal_from(review(gateway, "a2a-chat-aud")).role)
+        with self.assertRaises(cp.AuthenticationError):
+            authenticator._principal_from(review("shell", "reports-aud"))
+        # The gateway's account reaches no other role, the shell's included.
+        for audience in ("shell-aud", "chat-aud"):
+            with self.subTest(gateway_audience=audience), self.assertRaises(cp.AuthenticationError):
+                authenticator._principal_from(review(gateway, audience))
+
     def test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod(self) -> None:
         # The store's handler relays a request only when its method and path
         # are one of REPORT_CREDENTIAL_ROUTES whole, for every caller, the
@@ -718,9 +987,9 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         relayed: list = []
 
         class Store:
-            def relay(self, method, path, body):
+            def relay(self, method, path, body, writer=None):
                 relayed.append((method, path))
-                return 200, b"{}"
+                return 200, b"{}", None
 
         def handle(method: str, path: str) -> list:
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
@@ -730,7 +999,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             handler.report_profiles = frozenset()
             replies: list = []
             handler._json = lambda status, body: replies.append(int(status))
-            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
             handler._handle_audit_reports()
             return replies
 
@@ -752,6 +1021,81 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             with self.subTest(exec_pod=method):
                 self.assertFalse(cp.exec_pod_serves(method, path))
                 self.assertFalse(cp.exec_pod_serves(method, f"{stream}/runs/20261113T120000.123456Z"))
+
+    def test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller(self) -> None:
+        # Who wrote a stored run (#5619, fleet-audit-report-store.md §3): on the
+        # PUT of a ring entry the broker sends X-Report-Writer, `shell` for the
+        # shell and `builtin-schedule:<audit>:<task>` for a profile task, the
+        # task id its verified credential's own claim. A caller's header of the
+        # name, in any case and on any route, is stripped and never relayed; and
+        # of the store's answer only the writer comes back. The A2A gateway's
+        # report relay trusts a report on this stamp alone.
+        cp = h.credential_proxy
+        received: list = []
+        answer_writer = ["builtin-schedule:compliance-audit:task-1"]
+
+        class Store:
+            def relay(self, method, path, body, writer=None):
+                received.append((method, writer))
+                return 200, b"{}", answer_writer[0] if method == "GET" else None
+
+        publish = "acme%2Fgitops"
+        stream = f"/v1/audit-reports/compliance-audit/{publish}"
+        run = f"{stream}/runs/20261113T120000.123456Z"
+        grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+        shell = cp.Principal(workload="shell", uid="u", role=cp.CALLER_ROLE_SHELL)
+        profile = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                               task=types.SimpleNamespace(task="task-7f3a", profile="fleet-audit", trigger=grant))
+
+        def handle(method: str, path: str, principal, forged: dict) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.headers = email.message.Message()
+            for name, value in forged.items():
+                handler.headers[name] = value
+            handler.principal = principal
+            handler.report_store = Store()
+            handler.report_profiles = frozenset({"fleet-audit"})
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._read_audit_report_body = lambda: b"{}"
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append((int(status), writer))
+            handler._handle_audit_reports()
+            self.assertIsNone(handler.headers.get(cp.REPORT_WRITER_HEADER), "a caller's writer header survived")
+            return replies
+
+        forgeries = ({}, {"X-Report-Writer": "shell"}, {"x-report-writer": "builtin-schedule:compliance-audit:forged"},
+                     {"X-REPORT-WRITER": "builtin-schedule:compliance-audit:task-7f3a"})
+        with mock.patch.object(cp, "report_install_store_keys", return_value=(publish, frozenset({publish}))):
+            for principal, want in ((shell, "shell"), (profile, "builtin-schedule:compliance-audit:task-7f3a")):
+                for forged in forgeries:
+                    with self.subTest(writer=want, forged=forged):
+                        received.clear()
+                        self.assertEqual([(200, None)], handle("PUT", run, principal, forged))
+                        self.assertEqual([("PUT", want)], received)
+                        # No other route sends a writer, a read least of all.
+                        received.clear()
+                        for method, path in (("PUT", f"{stream}/latest"), ("DELETE", f"{stream}/latest"),
+                                             ("GET", f"{stream}/latest"), ("GET", run), ("GET", "/v1/audit-reports")):
+                            handle(method, path, principal, forged)
+                        self.assertEqual([None] * 5, [writer for _, writer in received])
+            # The store's writer reaches the caller, the a2a-reports reader included.
+            reader = cp.Principal(workload="gateway", uid="u", role=cp.CALLER_ROLE_A2A_REPORTS)
+            with mock.patch.object(cp, "report_publish_store_key", return_value=publish):
+                for principal, path in ((shell, run), (profile, f"{stream}/latest"),
+                                        (reader, "/v1/audit-reports/compliance-audit/publish/latest")):
+                    with self.subTest(reads=principal.role):
+                        self.assertEqual([(200, answer_writer[0])], handle("GET", path, principal, {}))
+            # A profile task with no task id a writer can be made of is refused, unrelayed.
+            received.clear()
+            nameless = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                                    task=types.SimpleNamespace(task=None, profile="fleet-audit", trigger=grant))
+            self.assertEqual([(403, cp.RULE_REPORT_WRITER)], handle("PUT", run, nameless, {"X-Report-Writer": "shell"}))
+            self.assertEqual([], received)
+        # And the relay itself sends the stamp it is given and nothing of the caller's.
+        self.assertEqual("shell", cp.report_writer_for(cp.CALLER_ROLE_SHELL, profile.task, "compliance-audit"))
+        self.assertIsNone(cp.report_writer_for(cp.CALLER_ROLE_A2A_REPORTS, profile.task, "compliance-audit"))
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches
@@ -1101,10 +1445,19 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         class vacuously -- which is how the `worker` grant on `…events` came
         to report as absent while the served config still carried it.
         """
-        source = h.text("a2a_identities")
-        consts = cls._go_string_consts(source, h.text("a2a_jetstream_grants"))
+        # Every file that builds a row of the identity map: the identities
+        # file, and the dispatcher's, whose row the authmap appends when an
+        # AgentProfile is dispatched. A builder left out of this list is a
+        # principal left out of every writer set below.
+        sources = [h.text("a2a_identities"), h.text("a2a_dispatcher")]
+        consts = cls._go_string_consts(*sources, h.text("a2a_jetstream_grants"))
         grants = {}
-        for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
+        builders = [
+            (source, builder)
+            for source in sources
+            for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE)
+        ]
+        for source, builder in builders:
             body = h.go_function_body(source, builder)
             # A5's two halves of the old `worker` name themselves through
             # constants, because the operator renders one of them into an env
@@ -1119,9 +1472,17 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 raise AssertionError(
                     f"{builder} names its user as `{expr.group(1)}`, which this test cannot resolve"
                 )
-            field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
+            field = re.search(
+                r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|append\(\w+,.*?\n\t\t\)|\w+),", body, re.DOTALL
+            )
             if field is None:
+                if re.search(r"\n\t\tpublish:", body):
+                    # A publish field in a shape the reader does not know
+                    # must not read as an empty, complete list.
+                    raise AssertionError(f"{builder} sets publish in a shape this test cannot read")
                 grants[name] = ([], True)
+            elif field.group(1).startswith("append("):
+                grants[name] = cls._resolve_appended_publish(body, field.group(1), consts)
             elif field.group(1).startswith("[]string{"):
                 # Entry by entry rather than scraping every quoted run out of
                 # the block, because a concatenated entry scraped that way
@@ -1170,6 +1531,53 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 else:
                     grants[name] = (read, False)
         return grants
+
+    @classmethod
+    def _resolve_appended_publish(cls, body: str, field: str, consts: dict[str, str]) -> tuple[list[str], bool]:
+        """`publish: append(local, ...)`, where `local` is built in `for` loops.
+
+        The dispatcher's shape: a `var local []string` filled by
+        `local = append(local, ...)` inside `for _, x := range ...` loops over
+        the profiles and durables, then the fixed grants appended in the field.
+        A loop variable is read as `*`, one token of anything, so a per-profile
+        grant counts as reaching every profile's subject. That over-reports
+        writers, which fails loudly, where a placeholder would under-report.
+        Anything else assigned to the local makes the reading partial.
+        """
+        text = re.sub(r"//[^\n]*", "", body)
+        consts = dict(consts)
+        for local, value in re.findall(r"\n\tconst (\w+) = \"([^\"]*)\"", text):
+            consts[local] = value
+        head = re.fullmatch(r"append\((\w+),(.*)\n\t\t\)", re.sub(r"//[^\n]*", "", field), re.DOTALL)
+        if head is None:
+            return [], False
+        var, rest = head.group(1), head.group(2)
+        grants: list[str] = []
+        complete = re.search(rf"\n\tvar {var} \[\]string\n", text) is not None
+        appends = 0
+        for loop_var, loop_body in re.findall(r"\n\tfor _, (\w+) := range \w+ \{\n(.*?)\n\t\}", text, re.DOTALL):
+            scoped = {**consts, loop_var: "*"}
+            for arg in re.findall(rf"\t\t{var} = append\({var},(.*?)\)\n", loop_body + "\n", re.DOTALL):
+                appends += 1
+                for element in arg.split(","):
+                    if not element.strip():
+                        continue
+                    value = cls._resolve_expr(element, scoped)
+                    if value is None:
+                        complete = False
+                    else:
+                        grants.append(value)
+        if appends == 0 or appends != len(re.findall(rf"^\t+{var}\s*=[^=]", text, re.MULTILINE)):
+            complete = False
+        for element in rest.split(","):
+            if not element.strip():
+                continue
+            value = cls._resolve_expr(element, consts)
+            if value is None:
+                complete = False
+            else:
+                grants.append(value)
+        return grants, complete
 
     @staticmethod
     def _go_string_consts(*sources: str) -> dict[str, str]:
@@ -1373,6 +1781,27 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assert "profileWorkerGrants(" in profile, "profileGrants no longer starts from profileWorkerGrants"
         return block.group(1) + "\n".join((session, task, worker, profile))
 
+    @staticmethod
+    def _derived_subject_spellings(derivation: str) -> list[str]:
+        """Every subject the derivation spells, as a NATS pattern to match on.
+
+        Each string literal on its own, and each `+`-joined expression with
+        its non-literal parts read as `*`: `"_INBOX." + pod + ".>"` is
+        `_INBOX.*.>`. Comments are stripped first; they quote the subjects
+        they explain the absence of. A grant built by a named helper
+        (`lib.TaskEventsSubject(...)`) is opaque here; the helpers build
+        `a2a.` subjects.
+        """
+        text = re.sub(r"//[^\n]*", "", derivation)
+        operand = r'(?:"[^"\n]*"|[\w.]+(?:\([^()\n]*\))?)'
+        spellings = re.findall(r'"([^"\n]*)"', text)
+        for chain in re.finditer(rf"{operand}(?:\s*\+\s*{operand})+", text):
+            parts = re.split(r"\s*\+\s*(?=[\"\w])", chain.group(0))
+            spellings.append(
+                "".join(p[1:-1] if p.startswith('"') else "*" for p in parts)
+            )
+        return [s for s in spellings if s]
+
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
         """The principals the writer-set tests iterate, so a moved one is loud.
 
@@ -1382,7 +1811,9 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier"):
+        for user in (
+            "gateway", "agent", "bridge", "web", "console", "console-mcp", "seed", "provision", "verifier", "dispatcher",
+        ):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
@@ -1424,15 +1855,24 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         `…events` with the executor, and a session that ended its own task
         wearing the gateway's `from` was indistinguishable on replay from
         the gateway ending it. The gateway is the supervisor for the chat
-        sessions it spawns; the dispatcher's janitor inherits the token at
-        stage 3 and joins this set when it does, deliberately.
+        sessions it spawns; the dispatcher is the supervisor for the profile
+        tasks it dispatches and writes their terminal failures on
+        `a2a.tasks.<profile>.*.supervisor`, one grant per profile. Read with
+        the profile as `*`, that grant reaches the probe, and it must be the
+        only one of the dispatcher's that does.
         """
+        grants = self._rendered_publish_grants()
         writers = sorted(
             builder
-            for builder, grants in self._rendered_publish_grants().items()
-            if any(self._subject_matches(g, self.SUPERVISOR_PROBE) for g in grants)
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.SUPERVISOR_PROBE) for g in allow)
         )
-        self.assertEqual(["gateway"], writers)
+        self.assertEqual(["dispatcher", "gateway"], writers)
+        self.assertEqual(
+            ["a2a.tasks.*.*.supervisor"],
+            [g for g in grants["dispatcher"] if self._subject_matches(g, self.SUPERVISOR_PROBE)],
+            "the dispatcher reaches a task's supervisor subject other than through its per-profile grant",
+        )
         self.assertNotIn(
             "TaskSupervisorSubject",
             self._session_publish_derivation(),
@@ -1534,6 +1974,43 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         body = self._dispatcher_identity()
         publish = body[body.index("publish:") : body.index("subscribe:")]
         self.assertNotIn("stops", publish, "the dispatcher's stop-record subscription list reaches its publish grants")
+
+    CONSOLE_CONFIRM_PROBE = "chat.console.tab-1.confirm"
+    CONSOLE_IN_PROBE = "chat.console.tab-1.in"
+
+    def test_A3_the_console_confirm_subject_has_exactly_one_writer(self) -> None:
+        """A console confirm is written by the human console user and nobody else.
+
+        The gateway takes a frame on `chat.console.<token>.confirm` as a
+        confirm and submits its task with `ChangeRequested`, the one way a
+        task is granted the permit to make a change. The subject is the only
+        route to it, so its writer set is the whole of who can confirm. The
+        console MCP server's user, `console-mcp`, is driven by a model: it
+        writes the same turns on `.in` and must not reach `.confirm`. No
+        session or profile worker derives a grant on any console subject.
+        """
+        grants = self._rendered_publish_grants()
+        writers = sorted(
+            builder
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.CONSOLE_CONFIRM_PROBE) for g in allow)
+        )
+        self.assertEqual(["console"], writers)
+        # Not vacuous: console-mcp is rendered, and does reach the `.in` door.
+        in_writers = sorted(
+            builder
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.CONSOLE_IN_PROBE) for g in allow)
+        )
+        self.assertEqual(["console", "console-mcp"], in_writers)
+        derived = self._derived_subject_spellings(self._session_publish_derivation())
+        self.assertTrue(derived, "no subject spellings read out of the derivation; the check goes vacuous")
+        self.assertEqual(
+            [],
+            [g for g in derived if self._subject_matches(g, self.CONSOLE_CONFIRM_PROBE)],
+            "the callout derives an executor a publish grant that reaches the console's confirm "
+            "subject; a worker that can write `.confirm` can grant its own task the change permit",
+        )
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"

@@ -1057,6 +1057,7 @@ var DefaultBuiltInPlugins = []string{
 	"bootstrap_onboarding",
 	"pr_opened",
 	"chat_metrics",
+	"eval_run_tag",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -1602,6 +1603,8 @@ var frontDoorPlugins = []string{
 // records the pull request on the card, which is what posts the thread's PR message.
 var frontDoorBackfillPlugins = []string{
 	"pr_opened",
+	// eval_run_tag registers nothing unless KUBEAGENTS_EVAL_RUN_TAGS is on.
+	"eval_run_tag",
 }
 
 // kanbanDispatchIntervalSeconds and kanbanWakeOnEvents mirror the `kanban` block
@@ -1774,12 +1777,14 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	// union contract the AgentPlugin CRD page states outright. The []string values below
 	// are fine: toSlice already handles them.
 	//
-	// Both platform keys unconditionally, matching the adapters the managed scope pins
-	// whether or not each is enabled: a platform turned on later must not also need its
-	// toolsets remembered, and a key for a platform with no adapter is never resolved.
+	// All three platform keys unconditionally, matching the adapters the managed scope
+	// pins whether or not each is enabled: a platform turned on later must not also need
+	// its toolsets remembered, and a key for a platform with no adapter is never resolved.
+	// Teams ingress resolves under `teams` (agents/chat/config.yaml pins the same key).
 	platformToolsets := map[string]any{
 		"google_chat": slices.Clone(frontDoorToolsets),
 		"slack":       slices.Clone(frontDoorToolsets),
+		"teams":       slices.Clone(frontDoorToolsets),
 	}
 
 	return map[string]any{
@@ -4989,6 +4994,9 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
 	envVars = append(envVars, a2aMCPBrokerEnv(agent, owned.mcp)...)
 	envVars = append(envVars, scopeBrokerEnv(agent, owned.scope)...)
+	// The A2A gateway's report-reader audience and its binding, on every
+	// install (a2a_report_reader.go).
+	envVars = append(envVars, a2aReportsBrokerEnv(agent)...)
 	envVars = append(envVars, a2aCuratorBrokerEnv(agent)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
@@ -5179,6 +5187,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// the a2a-chat role. Rendered only while Chat is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
+		// The report reader's audience, callers and the gateway's pair
+		// (a2a_report_reader.go, a2aReportsEnvNames).
+		credentialProxyA2AReportsAudienceEnvVar,
+		credentialProxyA2AReportsCallersEnvVar,
+		a2aReportStoreURLEnvVar,
+		a2aReportStoreTokenFileEnvVar,
 		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
 		// shell's audience would hand the session the shell's role.
 		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
@@ -5559,6 +5573,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// store, and adds no job, path, destination or credential.
 		"CRON_CATCH_UP_STAGGER_MINUTES": {},
 
+		// The eval run tag switch (deploy/docker/patches/eval_run_tag.py),
+		// which the chart renders from platformAgent.deployment.evalRunTags
+		// and only the eval deploy turns on. `1` (or true/yes/on) makes the
+		// API server record an incoming X-Kube-Agents-Eval-Run per session,
+		// stamps it on the cards that session files, and adds it to the
+		// headers of the agent's model requests, which the replay proxy logs
+		// and strips; any other value is off. It adds no path, destination,
+		// credential or code, and changes nothing the model reads.
+		"KUBEAGENTS_EVAL_RUN_TAGS": {},
+
 		// The post-merge check's per-step cap on the records one run reads
 		// from the forge and the clusters (READS_PER_TICK_ENV in
 		// post_merge_check.py; default 20). Parsed as a whole number from 1
@@ -5919,6 +5943,20 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  chatMetricsPortEnv,
 		Value: strconv.Itoa(int(chatMetricsPort)),
 	})
+	// The A2A gateway's default route, the same entry the gateway Deployment
+	// carries (a2aDefaultAddresseeEnv, one resolver for both), so the agent
+	// can tell whether a plain conversation reaches it or a session pod. The
+	// hermes-bridge sidecar copies this container's env
+	// (buildA2ABridgeContainer), so the bridge's runs carry it too. Nothing
+	// in the pod reads it yet: the reader is coming with the platform agent
+	// side of the sessions-by-default work (gke-labs#3658, part 4c: its
+	// prompts, skills and session-kv scripts), and rendering it now means the
+	// value is already in the pod the day that lands. Unconditional because
+	// the A2A stack is: spec.mode is ignored and every install runs the
+	// gateway. Appended after the merge like the entries
+	// above, so an AgentPlugin's env cannot tell the agent a route the
+	// gateway does not take.
+	gatewayEnvVars = append(gatewayEnvVars, a2aDefaultAddresseeEnv(agent))
 
 	// Every "appended after the merge" comment above rests on the kubelet collapsing a
 	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`

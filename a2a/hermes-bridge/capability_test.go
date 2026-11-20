@@ -24,8 +24,9 @@ import (
 //
 // The session executor's suite (a2a/worker-adapter/capability_test.go) covers
 // the same ground for the `delegate:` route. Both exist because both run: the
-// operator renders no A2A_DEFAULT_ADDRESSEE, so an unqualified task reaches
-// this bridge and nothing else. A refusal proven only on the route nobody
+// operator renders A2A_DEFAULT_ADDRESSEE as `platform` unless the install sets
+// defaultRoute to `session`, so by default an unqualified task reaches this
+// bridge and nothing else. A refusal proven only on the route nobody
 // takes by default is not a control.
 //
 // Every test here runs the real verifier against the real bucket (startServer

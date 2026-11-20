@@ -1,20 +1,16 @@
 # Networking fabric, load balancers and Gateway (obtainability-audit): the
 # planted HTTPRoute sends traffic to a Service whose numeric targetPort names a
-# port no backing container declares or serves, and no audit reads that
-# mismatch. A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#2576, item 3, which proposes
-# `ingress-gateway-healthcheck-mismatch`). Obtainability 3.17 flags a named
+# port no backing container declares or serves, detected in cluster by
+# obtainability 3.26 (`ingress-gateway-healthcheck-mismatch`,
+# gke-labs/kube-agents#2576 item 3). Obtainability 3.17 flags a named
 # targetPort no container declares and 3.16 an empty endpoint set; a numeric
 # mismatch passes both, and the networking audit reads the VPC fabric with no
-# cluster read at all. Two flip conditions, both stated here: a check that
-# reads the route's backendRef, the Service's numeric targetPort and the ports
-# the backing pods declare, in cluster, flips this case (the smallest landing
-# is the numeric sibling of 3.17 in the obtainability audit, which already
-# reads Services and EndpointSlices; a landing in the networking audit edits
-# this case's `audit:` and `finding_check` in the same diff); a check that
-# keys on an accepted Gateway or a load balancer health check never reads this
-# plant, because the route's parent Gateway is not created: a Gateway would
-# provision a public load balancer in the install's project, which a bench
+# cluster read at all. Check 3.26 cross-checks HTTPRoute and Ingress
+# backendRefs, Service numeric targetPorts, and BackendConfig /
+# HealthCheckPolicy probe ports against the ports and probes the backing pods
+# declare in cluster without requiring an accepted parent Gateway or a live GCP
+# load balancer: the route's parent Gateway is not created because a Gateway
+# would provision a public load balancer in the install's project, which a bench
 # fixture may not do. The Gateway form of the case follows the network fixture
 # design note. The id keeps the scenario's name. Domain `fleet-audits` as the
 # other networking cases; the capability row is the networking fabric audit.
@@ -22,7 +18,6 @@ id: networking-gateway-ingress-port-mismatch
 name: "Gateway Route to a Service Port Nothing Serves (route and port mismatch check)"
 domain: fleet-audits
 suite: validated-capabilities
-expected_fail: true
 audit_streams:
   - obtainability-audit
 fixtures: []

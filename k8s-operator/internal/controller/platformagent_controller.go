@@ -537,6 +537,13 @@ type PlatformAgentReconciler struct {
 	// writers leave the field out of their unchanged checks, so the write the
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
+	// heldBusMigrationWarned records, per CR, the run and phase of an
+	// unknown-leg run whose hold Warning this process has sent, so the
+	// Warning goes once per run and phase rather than once per pass. Kept
+	// here and not in status, so nothing the run's own operator reads changes
+	// while it is held (holdUnknownBusMigrationLeg). A restart sends it once
+	// more. Keyed by ObjectKey, value "<run>/<phase>".
+	heldBusMigrationWarned sync.Map
 	// prunedBusMigrationStatus records, per CR, that a status write carrying
 	// status.busMigration came back without it: the served CRD predates the
 	// field. A run the API server drops is gone by the next pass, which would
@@ -617,6 +624,12 @@ type PlatformAgentReconciler struct {
 	// when the CR is deleted. Its own gate, as the two above: the overrides
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
+
+	// kanbanAdmissionWarningsLogged records, per CR, the spec generation whose
+	// zero-slot kanban.admission warning reconcileConfigMap last logged, so each
+	// generation logs it once. Keyed by ObjectKey, value int64; cleared when
+	// the CR is fixed or deleted.
+	kanbanAdmissionWarningsLogged sync.Map
 
 	// a2aChartPodsWarned records, per CR, the spec generation and the
 	// chart-pods Warning last reported (a2aQuotaAgent), so each generation and
@@ -1888,6 +1901,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.kanbanAdmissionWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
@@ -1991,6 +2005,18 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 }
 
 func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) (string, error) {
+	key := client.ObjectKeyFromObject(agent)
+	if refusal := kanbanAdmissionRefusal(agent); refusal != "" {
+		if logged, ok := r.kanbanAdmissionWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
+			logf.FromContext(ctx).Info("kanban.admission sets memoryBudgetMiB below workerRssCapMiB; single worker RSS cap exceeds pod admission budget until resolved",
+				"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+			r.kanbanAdmissionWarningsLogged.Store(key, agent.Generation)
+		}
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidKanbanAdmission, refusal)
+	} else {
+		r.kanbanAdmissionWarningsLogged.Delete(key)
+	}
+
 	cm := buildConfigMap(agent, agentPlugins)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
@@ -4171,7 +4197,8 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicyWithFQDN(ctx context.Con
 	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
 	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
 	if skipFQDNReconcile {
-		// On a cold-start metadata timeout with no prior resolved universe, leave
+		// On a cold-start metadata timeout with no prior resolved universe, or
+		// with a prior value the validators refuse, leave
 		// any existing FQDNNetworkPolicy untouched rather than rendering default
 		// commercial domains or deleting a previously applied sovereign policy.
 		// Probe CRD presence via List (not Get, because isCRDNotInstalledError treats
@@ -5292,8 +5319,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedReason = conditionReasonA2AGatewayWaitingForTasks
 		degradedMsg = a2aTasksWaitMsg
 	} else if reason, msg := specResourceDegraded(agent); reason != "" {
-		// The spec's resource and exec-tier refusals, last: each leaves its
-		// workload at the operator's defaults, and the reasons above report
+		// The spec's resource, exec-tier, and admission refusals, last: the
+		// resource and exec checks leave workloads at the operator's defaults,
+		// InvalidKanbanAdmission keeps rendering the resolved budget (so a low
+		// resource limit never spawns into OOM), and the reasons above report
 		// lost function and must not be masked by them (specResourceDegraded).
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = reason

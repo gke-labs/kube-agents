@@ -76,7 +76,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-a2a-chat-gateway-any-audience",
         "agents/platform/scripts/credential_proxy.py",
-        ("        if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:\n",
+        ("        if username in self.a2a_chat_callers and role not in (CALLER_ROLE_A2A_CHAT, CALLER_ROLE_A2A_REPORTS):\n",
          "        if False:\n"),
         "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
         "let the A2A gateway's account present any audience, since its pod "
@@ -161,6 +161,16 @@ MUTATIONS: list[Mutation] = [
         "as the shell does with no per-task identity",
     ),
     Mutation(
+        "A3-identity-lists-for-any-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('                if role == CALLER_ROLE_PROFILE and verb == "identity" and not payload.get("repository"):\n',
+         '                if verb == "identity" and not payload.get("repository"):\n'),
+        "test_A3_only_a_profile_learns_the_managed_list_from_identity",
+        "answer every caller's repository-less identity with the managed list, "
+        "since the names are harmless -- and so hand them to a role that has "
+        "capabilities' own gate, or to the socket with no role at all",
+    ),
+    Mutation(
         "A3-profile-update-not-owned",
         "agents/platform/scripts/credential_proxy.py",
         ("                        self.vcs.require_agent_proposal(verb, payload)\n",
@@ -168,6 +178,15 @@ MUTATIONS: list[Mutation] = [
         "test_A3_a_permitted_profile_update_reaches_only_the_installs_own_proposals",
         "drop the ownership read on a profile worker's permitted write, trusting "
         "the permit, which names no proposal, to keep it off a person's",
+    ),
+    Mutation(
+        "A3-profile-write-any-tasks",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)\n",
+         "                    refusal, fresh_branch = None, None\n"),
+        "test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work",
+        "let a confirmed task write on any open proposal the install owns, since "
+        "the permit says a change was asked for -- though not which one",
     ),
     Mutation(
         "A3-report-credential-any-route",
@@ -252,8 +271,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-report-read-any-role",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if role != CALLER_ROLE_PROFILE:\n        return RULE_REPORT_ROLE\n",
-         "    if False:\n        return RULE_REPORT_ROLE\n"),
+        ("        return report_a2a_reports_read_permitted(route, key)\n    return RULE_REPORT_ROLE\n",
+         "        return report_a2a_reports_read_permitted(route, key)\n    return None\n"),
         "test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist",
         "read the store for any role holding an allowlisted profile name, since "
         "only the shell and profile reach the route -- until a role table edit "
@@ -262,8 +281,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-report-read-any-profile",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if not _report_profile_permitted(profile, allowlist):\n        return RULE_REPORT_PROFILE\n    return None\n",
-         "    if False:\n        return RULE_REPORT_PROFILE\n    return None\n"),
+        ("        if not _report_profile_permitted(profile, allowlist):\n            return RULE_REPORT_PROFILE\n        return None\n",
+         "        if False:\n            return RULE_REPORT_PROFILE\n        return None\n"),
         "test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist",
         "let any profile task read the store, since reads change nothing -- every "
         "profile's model output then reads the fleet's audit findings",
@@ -298,6 +317,46 @@ MUTATIONS: list[Mutation] = [
         "pod has no store token, and its pods' tokens are not the broker's",
     ),
     Mutation(
+        "A3-report-writer-shell-for-every-caller",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role == CALLER_ROLE_SHELL:\n        return REPORT_WRITER_SHELL\n",
+         "    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE):\n        return REPORT_WRITER_SHELL\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every permitted write `shell`, since the broker already decided "
+        "the caller may write -- a profile task's run then reads as the shell's, "
+        "and the A2A relay cannot tell which task wrote it",
+    ),
+    Mutation(
+        "A3-report-writer-task-is-the-profile",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        task_id = getattr(task, \"task\", None)\n",
+         "        task_id = getattr(task, \"profile\", None)\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp the profile instead of the task, as the allowlist names profiles "
+        "-- every task of the profile then wrote every run, and the relay cannot "
+        "hold a report to the task that asked for it",
+    ),
+    Mutation(
+        "A3-report-writer-caller-header-kept",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if caller_headers is not None:\n            del caller_headers[REPORT_WRITER_HEADER]\n",
+         "        if caller_headers is not None:\n            pass\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "leave the caller's header in place, since the relay builds its own "
+        "headers -- until a change forwards the request's headers and a caller "
+        "names its own writer",
+    ),
+    Mutation(
+        "A3-report-writer-on-every-write",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            if rule is None and method == \"PUT\" and report_route_kind(path) == REPORT_ROUTE_RUN:\n",
+         "            if rule is None:\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every write, latest and DELETE included -- the listener copies "
+        "latest's writer from the matched run, and a stamp sent there is one it "
+        "must then be trusted to ignore",
+    ),
+    Mutation(
         "A3-report-no-role-is-shell",
         "agents/platform/scripts/credential_proxy.py",
         ("    if role == CALLER_ROLE_SHELL:\n        pass\n",
@@ -306,6 +365,115 @@ MUTATIONS: list[Mutation] = [
         "treat a caller with no role as the shell, as the role table does for a "
         "Unix-socket broker -- a broker with no audience split then hands every "
         "caller the shell's writes",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-reads-as-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if role == CALLER_ROLE_SHELL:\n        return None\n    if role == CALLER_ROLE_PROFILE:\n',
+         '    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_A2A_REPORTS):\n        return None\n    if role == CALLER_ROLE_PROFILE:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the report reader read as the shell does, since reads change nothing -- "
+        "the gateway then lists and reads every repository's findings for every audit",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-writes-as-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if role == CALLER_ROLE_A2A_REPORTS:\n        return RULE_REPORT_A2A_REPORTS_WRITE\n    if role == CALLER_ROLE_SHELL:\n        pass\n',
+         '    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_A2A_REPORTS):\n        pass\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the report reader write as the shell, so a chat reply can drop a stale "
+        "latest -- a prompt injected into a chat then rewrites an audit's baseline",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-write-falls-through",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if role == CALLER_ROLE_A2A_REPORTS:\n        return RULE_REPORT_A2A_REPORTS_WRITE\n',
+         '    if False:\n        return RULE_REPORT_A2A_REPORTS_WRITE\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "drop the a2a-reports write refusal as redundant, since the role check below "
+        "refuses it anyway -- until that check is widened and the reader writes",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if route not in REPORT_A2A_READ_ROUTES:\n        return RULE_REPORT_A2A_REPORTS_ROUTE\n',
+         '    if False:\n        return RULE_REPORT_A2A_REPORTS_ROUTE\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the reader read a stream's run index too, to offer older runs -- it "
+        "then enumerates every run of every audit it can name",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-any-key",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if key != REPORT_A2A_PUBLISH_KEY:\n        return RULE_REPORT_A2A_REPORTS_KEY\n',
+         '    if False:\n        return RULE_REPORT_A2A_REPORTS_KEY\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the reader send any key, since the broker swaps in the publish key "
+        "anyway -- until that swap is narrowed to the word and a chat user reads "
+        "another repository's findings by naming it",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-key-from-the-request",
+        "agents/platform/scripts/credential_proxy.py",
+        ('                segments[REPORT_STORE_KEY_SEGMENT] = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY\n',
+         '                segments[REPORT_STORE_KEY_SEGMENT] = key\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "relay the reader's key as sent, since the listener only serves keys it "
+        "holds -- the word then reaches the store, and whichever stream it names is read",
+    ),
+    Mutation(
+        "A3-report-publish-word-for-every-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            if rule is None and role == CALLER_ROLE_A2A_REPORTS:\n',
+         '            if rule is None and key == REPORT_A2A_PUBLISH_KEY:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "resolve the word for every caller, as a convenience -- the shell and every "
+        "profile worker then gain an alias whose meaning moves with the ConfigMap",
+    ),
+    Mutation(
+        "A3-report-a2a-chat-reaches-the-store",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_A2A_REPORTS)),\n',
+         '    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_A2A_REPORTS, CALLER_ROLE_A2A_CHAT)),\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "admit the Chat relay's role to the store as well, since it is the same "
+        "gateway -- its token is projected beside a Chat adapter that reads untrusted input",
+    ),
+    Mutation(
+        "A3-a2a-reports-reaches-exec",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),\n',
+         '    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE, CALLER_ROLE_A2A_REPORTS)),\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the report reader run a read-only kubectl too, to enrich a report reply "
+        "-- a token meant for two GETs then reaches the broker's credentialed commands",
+    ),
+    Mutation(
+        "A3-a2a-reports-audience-may-repeat-another",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if a2a_reports_audience and a2a_reports_audience in audience_roles:\n',
+         '        if False:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the reports audience be any string, a copy-paste of the chat one "
+        "included -- the chat token then reads as the report reader's",
+    ),
+    Mutation(
+        "A3-a2a-reports-any-account",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if role == CALLER_ROLE_A2A_REPORTS and username not in self.a2a_reports_callers:\n',
+         '        if False:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the audience alone confer the role, as a2a-chat's does -- any allowed "
+        "caller projecting the reports audience then reads the store as the gateway",
+    ),
+    Mutation(
+        "A3-a2a-reports-caller-any-audience",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if username in self.a2a_reports_callers and role not in (CALLER_ROLE_A2A_REPORTS, CALLER_ROLE_A2A_CHAT):\n',
+         '        if False:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the gateway account present whichever audience it projects, now that "
+        "it is always a broker caller -- it then projects the shell audience and runs commands",
     ),
     Mutation(
         "A3-profile-reaches-gke-mcp",
@@ -3041,6 +3209,56 @@ Mutation(
         "derive every executor a grant on profiles' submit subject, the "
         "shortcut a worker delegating straight to a profile would take. A "
         "worker can then start tasks of its own outside the gateway's checks",
+    ),
+    Mutation(
+        "A3-console-mcp-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t\t"chat.console.*.in",\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",',
+         '\t\t\t"chat.console.*.in",\n\t\t\ta2aConsoleConfirmSubject,\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the console MCP server's user the console's confirm door, so "
+        "an IDE agent can confirm the change it just proposed. A model can "
+        "then grant its own task the permit to open a pull request",
+    ),
+    Mutation(
+        "A3-session-derives-all-chat",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\t"chat.>",\n\t\t},'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "derive every executor publish on `chat.>` so a worker can post its "
+        "own progress to a chat surface. It never spells `chat.console`, and "
+        "it reaches the console's confirm door all the same",
+    ),
+    Mutation(
+        "A3-dispatcher-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"chat.console.*.confirm",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the AgentProfile dispatcher the console's confirm door, so it "
+        "can confirm a queued change on the requester's behalf. Its identity "
+        "is built in its own file, outside the identities file the writer "
+        "sets used to read",
+    ),
+    Mutation(
+        "A3-dispatcher-stops-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"a2a.stop.*.*",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the dispatcher publish on stop records, so it can drop a "
+        "queued task itself on a deadline. It can then stop any requester's task",
+    ),
+    Mutation(
+        "A3-bridge-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.console.*.confirm",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the static bridge publish on the console's confirm door, so the "
+        "platform agent can confirm a card's proposed change itself. A task "
+        "can then grant itself the change permit",
     ),
     Mutation(
         "A3-bridge-sends-a-notify",

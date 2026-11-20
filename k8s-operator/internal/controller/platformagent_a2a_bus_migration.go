@@ -63,6 +63,14 @@ const (
 	busMigrationGrow busMigrationLeg = "OneToThree"
 )
 
+// busMigrationLegKnown reports a leg this operator runs. Any other leg is a
+// run a newer operator started (the CRD's enum names legs this one does not
+// run, so a rollback mid-run can find one): it is held, never advanced
+// (holdUnknownBusMigrationLeg).
+func busMigrationLegKnown(leg busMigrationLeg) bool {
+	return leg == busMigrationGrow || leg == busMigrationShrink
+}
+
 // busMigrationPhase is where a run is.
 type busMigrationPhase string
 
@@ -75,7 +83,7 @@ const (
 	busMigrationHashing           busMigrationPhase = "Hashing"           // grow: the operator's hashing pod digests the stage
 	busMigrationClearing          busMigrationPhase = "Clearing"          // grow: the streams deleted ahead of the conversion, or of the rollback after a failed restore
 	busMigrationConverting        busMigrationPhase = "Converting"        // grow: three servers rendered, waiting for them
-	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores and raises to R3
+	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores, raises to R3 and waits for it to settle
 	busMigrationRollingBack       busMigrationPhase = "RollingBack"       // grow failed in or after the conversion: one server rendered again
 	busMigrationRollbackRestoring busMigrationPhase = "RollbackRestoring" // grow: the same snapshot restored into one server
 	busMigrationReleasing         busMigrationPhase = "Releasing"         // grow: the freeze lifted
@@ -215,9 +223,12 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 }
 
 // busMigrationFrozen reports whether a phase holds the write freeze: only
-// the migration's principals reach the bus. Three to one never freezes.
+// the migration's principals reach the bus. Three to one never freezes. A
+// leg this operator does not know keeps the freeze in every phase that is
+// not over: it may have deleted streams it has not put back, and lifting
+// the freeze would let the provision Job and the workloads write over them.
 func busMigrationFrozen(leg busMigrationLeg, phase busMigrationPhase) bool {
-	if leg != busMigrationGrow {
+	if leg == busMigrationShrink {
 		return false
 	}
 	switch phase {
@@ -641,6 +652,9 @@ func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Cond
 		return metav1.Condition{}, false
 	}
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
+	if !busMigrationLegKnown(leg) {
+		return unknownLegCondition(agent, run), phase != busMigrationDone
+	}
 	from, to := 3, 1
 	if leg == busMigrationGrow {
 		from, to = 1, 3
@@ -728,9 +742,15 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		step, verbs = busMigrationStreamIdentity, []string{"INFO", "DELETE"}
 	case busMigrationRestoring, busMigrationRollbackRestoring:
 		// The restores create each stream, send its chunks, raise its
-		// replicas, and delete a stream whose restore went wrong.
+		// replicas, and delete a stream whose restore went wrong. The
+		// forward restore then reads each stream's consumers by name, and
+		// changes none, until every durable is up on its leader (#6174):
+		// the stream's own consumer count is the cluster's assignments, not
+		// consumers that answer.
 		step, verbs = busMigrationStreamIdentity, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}
-		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.RESTORE." + stream + ".>"} }
+		extra = func(stream string) []string {
+			return []string{"$JS.SNAPSHOT.RESTORE." + stream + ".>", "$JS.API.CONSUMER.NAMES." + stream, "$JS.API.CONSUMER.INFO." + stream + ".*"}
+		}
 	default:
 		return nil
 	}
@@ -1242,6 +1262,15 @@ func (r *PlatformAgentReconciler) recordRestoreReport(ctx context.Context, agent
 	if err := json.Unmarshal([]byte(msg), &report); err != nil {
 		return "its report could not be read", nil
 	}
+	// Only a restore that finished settled: a failed one is turning back.
+	if report.SettleSeconds > 0 && report.Error == "" && run.SettleTime == "" {
+		settled := time.Duration(report.SettleSeconds * float64(time.Second)).Round(time.Millisecond)
+		run.SettleTime = settled.String()
+		if r.Recorder != nil {
+			r.Recorder.Event(agent, corev1.EventTypeNormal, "BusMigrationSettled",
+				fmt.Sprintf("the A2A bus migration's restored streams reached three replicas, every replica current and every restored durable consumer answering from its leader, %s after the last raise", settled))
+		}
+	}
 	if len(report.Warnings) > 0 && run.Warnings == nil {
 		run.Warnings = report.Warnings
 		if r.Recorder != nil {
@@ -1363,7 +1392,7 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 // accepted cost. Before the forward clear the single server still holds every
 // stream, and the claim goes as before.
 func busMigrationStageIsTheOnlyCopy(run *agentv1alpha1.BusMigrationStatus) bool {
-	if busMigrationLeg(run.Leg) != busMigrationGrow || !run.GivenUp {
+	if busMigrationLeg(run.Leg) == busMigrationShrink || !run.GivenUp {
 		return false
 	}
 	switch busMigrationPhase(run.FailedIn) {
@@ -1578,6 +1607,10 @@ func busMigrationActOnFailed(agent *agentv1alpha1.PlatformAgent, now metav1.Time
 		return true
 	}
 	retry := busMigrationRetryPhase(busMigrationPhase(run.FailedIn))
+	if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		// Only the operator that knows the leg knows its way back.
+		retry = ""
+	}
 	if retry == "" || len(run.Retries) >= busMigrationMaxRetries || agent.Annotations[a2aBusMigrationRetryAnnotation] != busMigrationRetryValue(run) {
 		return false
 	}
@@ -1593,10 +1626,16 @@ func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 	run := agent.Status.BusMigration
 	if run.GivenUp {
 		if busMigrationStageIsTheOnlyCopy(run) {
+			if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+				// A leg this operator does not run may not have made the claim
+				// or the Secret; what it made is kept all the same.
+				return fmt.Sprintf(" It was given up: the freeze is lifted, and streams it did not put back are recreated empty. Their data may be only on the staging claim %s, if the run made one, which is kept, with the run Secret %s, until a person deletes it, or the PlatformAgent is deleted.",
+					busMigrationStageClaim(agent, run.RunID), busMigrationRunSecret(agent, run.RunID))
+			}
 			return fmt.Sprintf(" It was given up: the freeze is lifted, and streams it did not put back are recreated empty. Their data is only on the staging claim %s, which is kept, with the run Secret %s, until a person deletes it, or the PlatformAgent is deleted.",
 				busMigrationStageClaim(agent, run.RunID), busMigrationRunSecret(agent, run.RunID))
 		}
-		if busMigrationLeg(run.Leg) == busMigrationGrow {
+		if busMigrationLeg(run.Leg) != busMigrationShrink {
 			return " It was given up: the freeze is lifted, and streams it did not put back are recreated empty."
 		}
 		// Three to one never freezes or deletes a stream: its streams are
@@ -1604,7 +1643,7 @@ func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 		return " It was given up; its streams keep their data where the run left them, and another migration may start."
 	}
 	var b strings.Builder
-	if busMigrationRetryPhase(busMigrationPhase(run.FailedIn)) != "" {
+	if busMigrationLegKnown(busMigrationLeg(run.Leg)) && busMigrationRetryPhase(busMigrationPhase(run.FailedIn)) != "" {
 		if left := busMigrationMaxRetries - len(run.Retries); left > 0 {
 			fmt.Fprintf(&b, " To retry (%d of %d left): annotate the PlatformAgent %s=%s.", left, busMigrationMaxRetries, a2aBusMigrationRetryAnnotation, busMigrationRetryValue(run))
 		} else {
@@ -1836,4 +1875,56 @@ func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 		}
 	}
 	return streams, nil
+}
+
+// reasonA2ABusMigrationLegUnknown is the Warning for a run whose leg this
+// operator does not run.
+const reasonA2ABusMigrationLegUnknown = "A2ABusMigrationLegUnknown"
+
+// busMigrationLegUnknownMessage says what holding a run of an unknown leg
+// means, and the two ways out.
+func busMigrationLegUnknownMessage(run *agentv1alpha1.BusMigrationStatus) string {
+	return fmt.Sprintf("unrecognised migration leg %s (run %s, phase %s): holding; nothing advances, the bus keeps its server count and the write freeze, and the provision Job waits. Upgrade the operator to the release that started the run, which carries it on, or turns it back if its deadline has passed meanwhile, or abandon the run: annotate the PlatformAgent %s=%s, which lifts the freeze and recreates every stream the run did not put back, empty",
+		run.Leg, run.RunID, run.Phase, a2aBusMigrationAbandonAnnotation, run.RunID)
+}
+
+// holdUnknownBusMigrationLeg is a pass over a run whose leg this operator
+// does not run: one a newer operator started, found after a rollback. It
+// writes nothing to the run, so nothing the run's own operator reads
+// changes: no phase moves, no pod or Job is made or deleted, the deadline
+// does not apply, and the freeze and the provision hold stay
+// (busMigrationFrozen, busMigrationHoldsProvision). Upgrading back resumes
+// the run where it was. A Warning says so, once per run and phase
+// (heldBusMigrationWarned); the A2ABusMigrating condition says it on every
+// pass (unknownLegCondition). A person who gives the run up with the abandon annotation
+// moves it to Failed, given up, on the next pass, as busMigrationActOnFailed
+// does for any Failed run: the freeze lifts, and the provision Job recreates
+// what the run did not put back.
+func (r *PlatformAgentReconciler) holdUnknownBusMigrationLeg(agent *agentv1alpha1.PlatformAgent) {
+	run := agent.Status.BusMigration
+	if agent.Annotations[a2aBusMigrationAbandonAnnotation] == run.RunID {
+		run.FailedIn, run.Phase = run.Phase, string(busMigrationFailed)
+		run.Cause = fmt.Sprintf("this operator does not run the %s leg", run.Leg)
+		run.Message = "held, then given up by the abandon annotation"
+		return
+	}
+	key, seen := client.ObjectKeyFromObject(agent), run.RunID+"/"+run.Phase
+	if prev, ok := r.heldBusMigrationWarned.Load(key); !ok || prev != seen {
+		r.heldBusMigrationWarned.Store(key, seen)
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationLegUnknown, busMigrationLegUnknownMessage(run))
+	}
+}
+
+// unknownLegCondition is A2ABusMigrating for a run whose leg this operator
+// does not run.
+func unknownLegCondition(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) metav1.Condition {
+	if busMigrationPhase(run.Phase) == busMigrationAbandoned {
+		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Abandoned",
+			Message: fmt.Sprintf("the %s migration %s did not complete and was undone (%s); the bus runs as it did before it", run.Leg, run.RunID, run.Cause)}
+	}
+	if busMigrationPhase(run.Phase) == busMigrationFailed {
+		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Failed",
+			Message: fmt.Sprintf("the %s migration %s stopped (%s): %s.%s", run.Leg, run.RunID, run.Cause, run.Message, busMigrationFailedActions(agent))}
+	}
+	return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionTrue, Reason: "LegUnknown", Message: busMigrationLegUnknownMessage(run)}
 }

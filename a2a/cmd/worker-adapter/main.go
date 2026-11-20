@@ -230,6 +230,9 @@ func run() int {
 			// The persona's MCP servers through the broker's relay (#5495).
 			Relay:      workeradapter.ProfileRelay(selfPath(), os.Getenv),
 			ResetPaths: resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
+			// What a script-run task's credential is verified against
+			// (#5622): rendered into Job templates only.
+			TaskSigningKeys: os.Getenv("A2A_TASK_SIGNING_PUBLIC_KEYS"),
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
