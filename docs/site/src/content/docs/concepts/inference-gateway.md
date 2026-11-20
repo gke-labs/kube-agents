@@ -115,6 +115,19 @@ Each gateway pod exports the remaining share as `litellm_provider_remaining_budg
 
 A model that LiteLLM's cost map does not price costs `0` on every call, so `litellm_spend_metric` does not move and the ceiling is never reached. Check that the series moves on your model before you rely on the ceiling. A ceiling whose per-replica share would round to `0.0000` fails the render, because LiteLLM reads a `budget_limit` of `0` as no limit; raise the amount or lower `litellm.replicaCount`. Why the ceiling is split rather than shared, and what is still to come on the `PlatformAgent`: [`docs/designs/gateway-spend-cap.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gateway-spend-cap.md).
 
+### Caller authentication
+
+The gateway checks the key each caller sends. The chart runs LiteLLM with a master key, which it generates into the `litellm-master-key` Secret on first install and keeps across upgrades (`litellm.masterKey.generate: false` turns that off for offline renders such as [Argo CD](/kube-agents/deploy/gitops-argocd/)). Only the gateway container reads that Secret, and the master key is what reaches LiteLLM's admin routes. Every other caller goes through a LiteLLM `custom_auth` hook that the chart mounts beside the gateway's `config.yaml` (`charts/kube-agents/files/litellm_caller_auth.py`):
+
+- A key whose SHA-256 is listed in the `litellm-caller-keys` Secret is admitted as the caller class the entry names. LiteLLM reports the class as the `api_key_alias` and `team` labels on its spend and token metrics, and the key's digest, never the key, as `hashed_api_key`.
+- A call with no key, or with a placeholder the install's own clients send (`none`, `a2a-playground`, and the agent runtime's `no-key-required`), is admitted as the class `keyless`.
+- A key listed under the reserved class `gateway-probe` reaches `GET /v1/models` and nothing else. It lets a readiness check confirm that a gateway pod has loaded the current map without sending any caller's key.
+- Any other key is refused with HTTP 401.
+
+An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
+
+`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart. While the Secret is absent the gateway knows no caller key and every caller is `keyless`. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
+
 ### Fallback alias and parameter dropping
 
 Two chart blocks, both off by default, add a fallback alias and router retry limits when a primary call fails. At their defaults nothing is rendered, so the gateway config and its rollout checksum are what they were.

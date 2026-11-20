@@ -318,6 +318,8 @@ The other providers give the gateway no GCP identity at all. It authenticates wi
 
 ### What leaves for the model provider
 
+Callers authenticate to the gateway by key. Its master key, in the `litellm-master-key` Secret the chart generates, is read by the gateway container alone and is the only key that reaches LiteLLM's admin routes. Any other caller reaches the inference routes only, admitted as the caller class its key names, or as `keyless` when it sends no key or a placeholder; an unknown key is refused. [Caller authentication](/kube-agents/concepts/inference-gateway/#caller-authentication) has the rules.
+
 The gateway is the one point every provider request transits, and the chart can make it redact those requests. `litellm.redaction.enabled=true` (`LITELLM_REDACTION_ENABLED=true` in `install.env`, or the Terraform example's `litellm_redaction` variable) runs the shared `AuditRedactor` as a LiteLLM pre-call hook. It masks the built-in credential shapes and masks or pseudonymises IP literals and any operator-named identifiers before the body leaves the cluster. It is off by default, and it covers request bodies and, through the same switch, the files the agent writes to its volume (below). A pseudonymised identifier is one the agent can no longer act on; [Inference gateway](/kube-agents/concepts/inference-gateway/#redaction-at-the-gateway) owns the rules, the actions and that limitation.
 
 ### Egress when model data must stay off hosted providers
