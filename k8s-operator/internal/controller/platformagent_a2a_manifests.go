@@ -4295,10 +4295,12 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   # it declared more than the default, or recreates the stream, and
   # provisioning does none of those. Note that
   # set -euo pipefail exits with the failing command's own status, which is
-  # not 2, so an unexpected failure stays on the retry budget. The bus
-  # reshape relies on this exit being the only 2 (busProvisionRefusedOnlyForWidth):
-  # a Job failed on it counts as provisioned for a reshape, which fixes
-  # exactly this. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate holds it.
+  # usually not 2, so an unexpected failure stays on the retry budget. The
+  # bus reshape treats a Job failed on this exit as provisioned for a
+  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth), and
+  # checks the bus holds every stream besides, since a shell error can exit
+  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate keeps this the
+  # script's only explicit exit 2.
   exit 2
 fi
 

@@ -548,33 +548,62 @@ func TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate(t *testing.T) {
 // A reshape given up before its clear drops BusProvisioned, and the
 // provision Job that runs next refuses the narrow TASKS at its consumer
 // gate (failed by its podFailurePolicy). That bus counts as provisioned for
-// a reshape, so a new request starts one; a Job failed any other way (its
-// backoff spent) still refuses as not provisioned (#6598).
+// a reshape, so a new request starts one (#6598). Not when the Job failed
+// any other way (its backoff spent), when the failed Job is an older
+// render's, or when a stream the Job creates is missing from the bus (a
+// shell error can exit 2 too).
 func TestAReshapeStartsOnABusRefusedOnlyForWidth(t *testing.T) {
+	narrow := a2aTasksMaxConsumers(a2aTestAgent()) - 20
+	allStreams := func(missing string) func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+		return func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+			streams := map[string]a2aBusStream{}
+			for _, name := range a2aProvisionedStreams {
+				if name != missing {
+					streams[name] = a2aBusStream{MaxConsumers: 64}
+				}
+			}
+			streams["TASKS"] = a2aBusStream{MaxConsumers: narrow}
+			return streams, nil
+		}
+	}
 	for _, c := range []struct {
-		reason string
-		starts bool
-	}{{batchv1.JobReasonPodFailurePolicy, true}, {batchv1.JobReasonBackoffLimitExceeded, false}} {
-		m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
-		meta.RemoveStatusCondition(&m.agent.Status.Conditions, busProvisionedConditionType)
-		m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationReshape), RunID: "3" + busReshapeRunSuffix("first"), Phase: string(busMigrationFailed), FailedIn: string(busMigrationHashing), GivenUp: true}
-		job := buildA2AProvisionJob(m.agent)
-		m.own(job)
-		if err := m.cl.Create(context.Background(), job); err != nil {
-			t.Fatal(err)
-		}
-		job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: c.reason}}
-		if err := m.cl.Status().Update(context.Background(), job); err != nil {
-			t.Fatal(err)
-		}
-		m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "second"}
-		if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
-			t.Fatal(err)
-		}
-		run := m.agent.Status.BusMigration
-		started := run.Leg == string(busMigrationReshape) && strings.HasSuffix(run.RunID, busReshapeRunSuffix("second"))
-		if started != c.starts {
-			t.Errorf("provision Job failed with %s: reshape started %v, want %v (run %+v, events %q)", c.reason, started, c.starts, run, m.reshapeEvents())
-		}
+		name    string
+		reason  string
+		jobName string // "" for this render's
+		missing string
+		starts  bool
+	}{
+		{"refused at the width gate", batchv1.JobReasonPodFailurePolicy, "", "", true},
+		{"backoff spent", batchv1.JobReasonBackoffLimitExceeded, "", "", false},
+		{"an older render's Job", batchv1.JobReasonPodFailurePolicy, "test-agent-a2a-provision-00000000", "", false},
+		{"a stream missing", batchv1.JobReasonPodFailurePolicy, "", "DIRECTORY", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := reshapeTrigger(t, narrow)
+			m.r.busStreamState = allStreams(c.missing)
+			meta.RemoveStatusCondition(&m.agent.Status.Conditions, busProvisionedConditionType)
+			m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationReshape), RunID: "3" + busReshapeRunSuffix("first"), Phase: string(busMigrationFailed), FailedIn: string(busMigrationHashing), GivenUp: true}
+			job := buildA2AProvisionJob(m.agent)
+			if c.jobName != "" {
+				job.Name = c.jobName
+			}
+			m.own(job)
+			if err := m.cl.Create(context.Background(), job); err != nil {
+				t.Fatal(err)
+			}
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: c.reason}}
+			if err := m.cl.Status().Update(context.Background(), job); err != nil {
+				t.Fatal(err)
+			}
+			m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "second"}
+			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+				t.Fatal(err)
+			}
+			run := m.agent.Status.BusMigration
+			started := run.Leg == string(busMigrationReshape) && strings.HasSuffix(run.RunID, busReshapeRunSuffix("second"))
+			if started != c.starts {
+				t.Errorf("reshape started %v, want %v (run %+v, events %q)", started, c.starts, run, m.reshapeEvents())
+			}
+		})
 	}
 }

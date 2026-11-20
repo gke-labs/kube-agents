@@ -136,8 +136,11 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 			return "the last bus migration failed and waits for a person (retry or abandon it first)", "failed", false
 		}
 	}
-	if !busProvisioned(agent) && !r.busProvisionRefusedOnlyForWidth(ctx, agent) {
-		return "the bus is not provisioned yet", "unprovisioned", false
+	refusedForWidth := false
+	if !busProvisioned(agent) {
+		if refusedForWidth = r.busProvisionRefusedOnlyForWidth(ctx, agent); !refusedForWidth {
+			return "the bus is not provisioned yet", "unprovisioned", false
+		}
 	}
 	if busMigrationImage() == "" {
 		return "this operator was deployed without OPERATOR_IMAGE, which runs the reshape's work", "image", false
@@ -148,6 +151,17 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 	streams, err := r.a2aBusStreamState(ctx, agent)
 	if err != nil {
 		return "TASKS's width could not be read (" + err.Error() + ")", "unreadable", false
+	}
+	if refusedForWidth {
+		// The Job's exit 2 says the script reached its last gate; the bus
+		// itself is the proof: every stream and bucket the Job creates is
+		// there. A shell error can exit 2 too, and then something is
+		// missing.
+		for _, name := range a2aProvisionedStreams {
+			if _, ok := streams[name]; !ok {
+				return "the bus is not provisioned yet (" + name + " is missing)", "unprovisioned", false
+			}
+		}
 	}
 	tasks, ok := streams["TASKS"]
 	if !ok {
@@ -166,10 +180,12 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 	return "", "", false
 }
 
-// busProvisionRefusedOnlyForWidth reports a bus whose provision Job failed
-// by its podFailurePolicy: the script's exit 2, which by its own convention
-// is only the closing max_consumers gate, reached once every stream and
-// bucket exists and the one limit is short. That is the state a reshape
+// busProvisionRefusedOnlyForWidth reports a bus whose current provision Job
+// (this render's name, this CR's, not being deleted) failed by its
+// podFailurePolicy: the script's exit 2, which by its own convention is
+// only the closing max_consumers gate, reached once every stream and bucket
+// exists and the one limit is short. busReshapeRefusal also checks the bus
+// holds every stream, since a shell error can exit 2 as well. That is the state a reshape
 // fixes, so it counts as provisioned for one, though BusProvisioned is not
 // set: a reshape given up before its clear (or whose rollback put a narrow
 // TASKS back) drops the condition, and the provision Job that runs next
@@ -184,8 +200,13 @@ func (r *PlatformAgentReconciler) busProvisionRefusedOnlyForWidth(ctx context.Co
 	}); err != nil {
 		return false
 	}
+	current := buildA2AProvisionJob(agent).Name
 	for i := range jobs.Items {
-		for _, c := range jobs.Items[i].Status.Conditions {
+		job := &jobs.Items[i]
+		if job.Name != current || !metav1.IsControlledBy(job, agent) || job.DeletionTimestamp != nil {
+			continue
+		}
+		for _, c := range job.Status.Conditions {
 			if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue && c.Reason == batchv1.JobReasonPodFailurePolicy {
 				return true
 			}
