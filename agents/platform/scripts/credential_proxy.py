@@ -2291,7 +2291,8 @@ DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 #
 # The split is real rather than notional because the two callers already need
 # disjoint routes and the operator already gives each only what its side needs:
-# the gateway has GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL and an empty
+# the gateway has a relay URL (TEAMS_RELAY_URL with Teams on; the operator no
+# longer renders GOOGLE_CHAT_RELAY_URL or SLACK_RELAY_URL) and an empty
 # CREDENTIAL_PROXY_URL, and the sandbox has the reverse. What was missing was
 # anything on this side that refused when a caller reached across.
 #
