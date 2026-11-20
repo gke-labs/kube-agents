@@ -3709,7 +3709,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"chat.board.reply.gateway.>",
 		// Attested trigger ingress (#5617): every source's submissions and
 		// status queries, read only.
-		"a2a.trigger.*.submit", "a2a.trigger.*.status",
+		"a2a.trigger.*.submit", "a2a.trigger.*.status", "a2a.trigger.*.stop",
 		"_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)

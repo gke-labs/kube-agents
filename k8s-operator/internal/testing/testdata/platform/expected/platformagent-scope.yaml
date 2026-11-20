@@ -3073,7 +3073,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "e659f58d74177b7a",
+      "version": "9683f7e153999d02",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3240,6 +3240,7 @@ data:
               "chat.board.reply.gateway.>",
               "a2a.trigger.*.submit",
               "a2a.trigger.*.status",
+              "a2a.trigger.*.stop",
               "_INBOX.gateway.>"
             ],
             "denyPublish": [
@@ -3293,7 +3294,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: e659f58d74177b7a
+    kubeagents.x-k8s.io/a2a-authmap-version: 9683f7e153999d02
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3967,6 +3968,7 @@ stringData:
                   "chat.board.reply.gateway.>",
                   "a2a.trigger.*.submit",
                   "a2a.trigger.*.status",
+                  "a2a.trigger.*.stop",
                   "_INBOX.gateway.>"
                 ]
                 deny = [
