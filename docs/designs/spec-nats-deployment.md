@@ -82,6 +82,13 @@ another `busReplicas` change while one runs.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.
+- **Reshape**, on request only (the `kubeagents.x-k8s.io/bus-reshape` annotation): TASKS alone is
+  snapshotted, deleted and restored at the width the CR renders, at the count the bus runs,
+  behind the same write freeze as one to three, with the same way back. It starts only on a
+  provisioned bus whose live TASKS is narrower than the render, and never twice for one
+  annotation value, which the bus StatefulSet records. The run's phases are only names the hold below
+  knows, so an operator rolled back to the release that added the hold holds a reshape too
+  (amended 11/19).
 - **A run of a leg this operator does not run** (one a later release started, found after a
   rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
   the bus keeps its count, until the operator that started it is back or a person gives it up
