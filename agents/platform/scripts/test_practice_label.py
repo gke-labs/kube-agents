@@ -14,6 +14,7 @@ import automation_rules
 import automerge_checks as ac
 import automerge_eligibility as ae
 import vcs_broker
+from fix_recipes import registry
 from workspace_paths import WorkspaceError
 
 CLUSTER = "acme-prod-1/us-central1/fleet-1"
@@ -21,7 +22,8 @@ CONTEXT = "gke_acme-prod-1_us-central1_fleet-1"
 NS = "shop"
 LABELS = {"app": "checkout"}
 FID = "no-pdb.acme-prod-1-us-central1-fleet-1.shop.deployment-checkout"
-NAME, TEXT = ae.render_budget(CLUSTER, "Deployment/checkout", NS, {"matchLabels": LABELS}, FID)
+FIX = registry.generator("no-pdb")
+NAME, TEXT = FIX.generate({"cluster": CLUSTER, "object": "Deployment/checkout", "namespace": NS, "pod_selector": {"matchLabels": LABELS}}, FID)
 PATH = "clusters/fleet-1/shop/checkout-pdb.yaml"
 
 
@@ -260,8 +262,17 @@ class PracticeLabelTest(unittest.TestCase):
         self.assertTrue(answer["labelled"])
         self.assertEqual(self.writes(calls), [])
 
+    def test_a_misplaced_budget_says_so_and_reads_nothing(self):
+        answer, _ = self.run_verb(diff=diff_adding("apps/shop/checkout-pdb.yaml", TEXT))
+        self.assertFalse(answer["labelled"])
+        self.assertIn("is not where the budget for", answer["reason"])
+        self.assertEqual(self.reads, [])
+
     def test_a_cluster_name_that_could_be_a_flag_is_not_read(self):
-        _, text = ae.render_budget("--project=x/us-central1/c", "Deployment/checkout", NS, {"matchLabels": LABELS}, FID)
+        _, text = FIX.generate(
+            {"cluster": "--project=x/us-central1/c", "object": "Deployment/checkout", "namespace": NS, "pod_selector": {"matchLabels": LABELS}},
+            FID,
+        )
         answer, _ = self.run_verb(diff=diff_adding(PATH, text))
         self.assertFalse(answer["labelled"])
         self.assertEqual(self.reads, [])

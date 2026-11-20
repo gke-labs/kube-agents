@@ -2,11 +2,10 @@
 
 The expected texts below were captured from `audit_report._pdb_manifest` before
 the generator moved into `fix_recipes/no-pdb/fix.py`. They are literals on
-purpose: the broker is to verify a pull request by re-running the generator
-and comparing bytes (today it re-renders with
-`automerge_eligibility.render_budget`, held equal by
-`test_broker_budget_parity.py`), so any change to this output is a change to
-what auto-merge accepts, and has to show up here as an edited expectation.
+purpose: the broker verifies a pull request by re-running the generator and
+comparing bytes (`automerge_eligibility.verify_added_manifest`), so any
+change to this output is a change to what auto-merge accepts, and has to show
+up here as an edited expectation.
 """
 
 from __future__ import annotations
@@ -120,6 +119,22 @@ class NoPdbGenerate(unittest.TestCase):
     def test_kind_matches_the_recipe(self):
         self.assertEqual(FIX.KIND, "no-pdb")
         self.assertIn(FIX.KIND, registry.kinds())
+
+
+class ReadInputs(unittest.TestCase):
+    def test_reads_back_what_generate_wrote(self):
+        for candidate, finding_id, _, text in PINNED[:1]:
+            self.assertEqual(FIX.read_inputs(text), (candidate, finding_id))
+
+    def test_finding_id_shape_is_the_audits(self):
+        # The broker reads only the finding ids the audit mints.
+        audit = SCRIPTS.parent / "skills" / "fleet-audit" / "scripts"
+        sys.path.insert(0, str(audit))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(audit))
+        self.assertEqual(FIX.FINDING_ID.pattern, audit_report.FINDING_ID_RE.pattern.removeprefix("^").removesuffix("\\Z"))
 
 
 class Generator(unittest.TestCase):

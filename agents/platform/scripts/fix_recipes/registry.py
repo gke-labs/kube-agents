@@ -11,7 +11,8 @@ Those are the lists; the code that handles one kind's fix is still per kind
 gets a dial row and post-merge records but no broker label.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
-through `automation_rules`, and neither may depend on PyYAML being there. So
+(through `automation_rules`, and the proxy also through
+`automerge_eligibility`), and neither may depend on PyYAML being there. So
 `recipe.yaml` is a strict subset of YAML: one `key: value` per line, `#`
 comments, a value plain or in double quotes. Anything else refuses the file,
 and a refused or missing recipe is an import-time error, caught by the tests,
@@ -23,7 +24,10 @@ optional `owner` and `eval_case` (the end-to-end case that grades the fix on
 the cluster after merge).
 
 A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
-`generator(kind)`; `no-pdb` has one, which `audit_report._pdb_manifest` calls.
+`generator(kind)`, and stdlib only for the same reason. `no-pdb` has one:
+the audit calls it through `audit_report._pdb_manifest`, and the broker
+re-runs it to verify a pull request
+(`automerge_eligibility.verify_added_manifest`).
 """
 
 from __future__ import annotations

@@ -12,7 +12,8 @@ install's declared scope, before it reads anything. And whether the read is
 whole: `judge` cannot tell "no budgets or autoscalers" from "not read", so a
 partial read (a failed or forbidden kind) must be refused before it gets here,
 as the sandbox's `recheck._gate` does. The budget file's own shape is
-`automerge_eligibility.parse_budget`'s.
+the `no-pdb` recipe's (`fix_recipes/no-pdb/fix.py`), which
+`automerge_eligibility.verify_added_manifest` holds the file to.
 
 One deliberate difference from the sandbox: a live budget whose selector this
 cannot read (an operator it does not know) counts as overlapping, where
