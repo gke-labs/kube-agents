@@ -3186,6 +3186,9 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Gating the A2A stack of ${PLATFORM_
 # the first provisioning Job measures, which counts the rendered bridge's
 # workers, fits the floor, or on a session run for its parallel conversations.
 echo "Front door: ${EVAL_FRONT_DOOR} (EVAL_FRONT_DOOR; session sizing ${EVAL_FRONT_DOOR_SESSIONS})"
+# The directory may not exist yet on a passing deploy (report_cr_status makes
+# it later), and the compare reads a missing file as platform.
+mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
 echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
 if [ -z "${MODE_NEXT_MAX_SESSIONS}" ]; then
   echo "spec.harness.tuning.maxSessions: not set (EVAL_FRONT_DOOR_SESSIONS=shipped); the install default applies, and the provision sizes TASKS for it"

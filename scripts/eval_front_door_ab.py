@@ -35,7 +35,8 @@ It prints a Markdown table and exits 1 when any case regressed, 0 otherwise.
 It exits 2 when the two runs can't be compared: a directory it can't read, a
 run with no case hand-offs (often a path one level too high), every case of B
 unscored or missing (the session route broke before any case could be graded,
-which the harness classes as infrastructure), or the runs' ``front-door.txt``
+which the harness classes as infrastructure), no case graded on both runs (run
+A graded nothing, or the two graded different cases), or the runs' ``front-door.txt``
 (written by the deploy) naming the doors the other way round. It reads only;
 nothing is written.
 
@@ -145,6 +146,15 @@ def check_comparable(
     if all(b_run.get(case) is None or b_run[case].rate is None for case in a_run):
         raise UnreadableRun(
             "no case of run A was graded on run B: every one is unscored or missing, so the session route never ran a case"
+        )
+    if not any(
+        a.rate is not None
+        and b_run.get(case) is not None
+        and b_run[case].rate is not None
+        for case, a in a_run.items()
+    ):
+        raise UnreadableRun(
+            "no case was graded on both runs: run A graded nothing, or the two runs graded different cases"
         )
 
 

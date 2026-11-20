@@ -125,6 +125,18 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("never ran a case", err)
 
+    def test_no_case_graded_on_both_runs_cannot_pass(self) -> None:
+        """Run A graded nothing, or the two runs graded different cases: no
+        case was compared, which must not read as no regression."""
+        for a_cases, b_cases in (
+            ({"held": (0, 0), "other": (0, 0)}, {"held": (0, 3), "other": (3, 3)}),
+            ({"case1": (3, 3), "case2": (0, 0)}, {"case1": (0, 0), "case2": (0, 3)}),
+        ):
+            with self.subTest(a=a_cases, b=b_cases):
+                code, _, err = self.run_ab(a_cases, b_cases)
+                self.assertEqual(code, 2)
+                self.assertIn("no case was graded on both runs", err)
+
     def test_an_empty_run_cannot_pass(self) -> None:
         code, _, err = self.run_ab({}, {"held": (3, 3)})
         self.assertEqual(code, 2)
