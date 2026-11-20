@@ -28,6 +28,11 @@ func cfg(name, model string) string {
 	return fmt.Sprintf("- model_name: %s\n  litellm_params:\n    model: %s\n", name, model)
 }
 
+// cfgWith renders one model_list entry with one more litellm_params line after model.
+func cfgWith(name, model, extra string) string {
+	return cfg(name, model) + "    " + extra + "\n"
+}
+
 func TestParseLiteLLMDefaultModel(t *testing.T) {
 	cases := []struct {
 		name, yaml, provider, model string
@@ -594,5 +599,33 @@ func TestInferenceStatusKeyIsAbsentUntilRead(t *testing.T) {
 	g.publish(&agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "ns"}})
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 0 {
 		t.Errorf("%d samples for an agent with no inference key, want 0", n)
+	}
+}
+
+func TestParseLiteLLMDefaultModelReadsTheReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name, yaml, effort string
+		ok                 bool
+	}{
+		{"quoted", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", `reasoning_effort: "high"`), "high", true},
+		{"bare", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", "reasoning_effort: low"), "low", true},
+		{"absent", cfg("model-default", "vertex_ai/gemini-3.8-flash"), "", true},
+		{"empty", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", `reasoning_effort: ""`), "", true},
+		{"whitespace drops the effort alone", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", `reasoning_effort: "very high"`), "", true},
+		{"a number drops the effort alone", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", "reasoning_effort: 1"), "", true},
+		{"a bool drops the effort alone", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", "reasoning_effort: true"), "", true},
+		{"from the fallback entry", cfgWith("other", "openai/gpt-5.4", "reasoning_effort: medium"), "medium", true},
+		{"effort before model", "- model_name: model-default\n  litellm_params:\n    reasoning_effort: high\n    model: gemini/g\n", "high", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseLiteLLMDefaultModel("model_list:\n" + c.yaml)
+			if ok != c.ok || got.ReasoningEffort != c.effort {
+				t.Fatalf("got %+v ok=%v, want effort %q ok=%v", got, ok, c.effort, c.ok)
+			}
+			if c.ok && (got.Provider == "" || got.Model == "") {
+				t.Fatalf("the pair must survive the effort rule: %+v", got)
+			}
+		})
 	}
 }

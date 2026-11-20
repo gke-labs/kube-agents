@@ -26,7 +26,9 @@ import (
 // states it. The value is the litellm_params.model of the model_list entry named
 // agentModelName, split at its first separator into a provider and a name, both
 // non-empty. A resource reference keeps its resource id only, so a project id, a region
-// or an account id never reaches the status.
+// or an account id never reaches the status. The same entry's reasoning_effort rides
+// along as a third value: a non-empty string with no whitespace, as typed, or nothing;
+// a malformed effort drops the effort alone and the pair stays.
 const (
 	// litellmConfigMapName is the LiteLLM config ConfigMap the chart writes.
 	litellmConfigMapName = "litellm-config"
@@ -86,12 +88,16 @@ type litellmConfig struct {
 		ModelName     string `json:"model_name"`
 		LitellmParams struct {
 			Model string `json:"model"`
+			// any, not string: a number or bool here must not fail the whole
+			// unmarshal and take the model pair with it.
+			ReasoningEffort any `json:"reasoning_effort"`
 		} `json:"litellm_params"`
 	} `json:"model_list"`
 }
 
-// inferenceModel is the provider and model pair status.inference carries.
-type inferenceModel struct{ Provider, Model string }
+// inferenceModel is the provider and model pair status.inference carries, with the
+// reasoning effort configured on the entry, or "" when it states none.
+type inferenceModel struct{ Provider, Model, ReasoningEffort string }
 
 // parseLiteLLMDefaultModel reads the default model out of a LiteLLM config file. The
 // entry named agentModelName is the answer when it exists, and a malformed model there
@@ -106,15 +112,31 @@ func parseLiteLLMDefaultModel(configYAML string) (inferenceModel, bool) {
 	}
 	for _, entry := range config.ModelList {
 		if entry.ModelName == agentModelName {
-			return splitInferenceModel(entry.LitellmParams.Model)
+			model, ok := splitInferenceModel(entry.LitellmParams.Model)
+			if ok {
+				model.ReasoningEffort = inferenceReasoningEffort(entry.LitellmParams.ReasoningEffort)
+			}
+			return model, ok
 		}
 	}
 	for _, entry := range config.ModelList {
 		if model, ok := splitInferenceModel(entry.LitellmParams.Model); ok {
+			model.ReasoningEffort = inferenceReasoningEffort(entry.LitellmParams.ReasoningEffort)
 			return model, true
 		}
 	}
 	return inferenceModel{}, false
+}
+
+// inferenceReasoningEffort is the entry's reasoning_effort as a status value: the string
+// as typed when it is non-empty and holds no whitespace, "" otherwise (absent, empty, a
+// number or bool, or a value that would not stay on one line as a label).
+func inferenceReasoningEffort(raw any) string {
+	effort, ok := raw.(string)
+	if !ok || effort == "" || strings.ContainsFunc(effort, unicode.IsSpace) {
+		return ""
+	}
+	return effort
 }
 
 // splitInferenceModel splits a LiteLLM model at its first separator. Both sides must be
