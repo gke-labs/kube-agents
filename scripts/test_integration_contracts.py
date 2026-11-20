@@ -284,7 +284,7 @@ class SpecToolRegistryTest(unittest.TestCase):
     SCORING = "bench/kube_agents_bench/scoring.py"
 
     # Trajectory entries the harness writes itself (a stopped ask's, a
-    # pushed-report replay's plant): what it did, not a tool the agent called.
+    # pushed-report replay's plant, a reply-after-idle replay's wait): what it did, not a tool the agent called.
     # A spec names them in `tool_called` with `require_success`. Evidence of
     # each is a constant in the module named beside it that the harness, or
     # that module, puts on an entry's `name`
@@ -294,6 +294,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         "harness_cards_stopped": "bench/kube_agents_bench/stop_hook.py",
         "harness_cancel_reported": "bench/kube_agents_bench/stop_hook.py",
         "harness_pushed_report_stored": "bench/kube_agents_bench/pushed_report.py",
+        "harness_idle_wait": "bench/kube_agents_bench/idle_reply.py",
     }
     HARNESS_ENTRIES = frozenset(HARNESS_ENTRY_MODULES)
     HARNESS = "bench/kube_agents_bench/harness.py"

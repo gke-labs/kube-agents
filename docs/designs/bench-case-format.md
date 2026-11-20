@@ -102,6 +102,13 @@ into a Slack or Google Chat gateway conversation, then sends the reply as a seco
 ([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
 the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
 for the plant. Inject transport only, as the stop directives are.
+A first line of `[bench:reply-after-idle]`, with `opening:`, `idle_seconds:` (60 to 1800) and
+`reply:` lines under it, sends the opening as turn one, waits that long with the conversation
+idle, then sends the reply as a second message on it
+([`bench/kube_agents_bench/idle_reply.py`](../../bench/kube_agents_bench/idle_reply.py)). The
+reply turn's answer is the deliverable. The harness writes `harness_idle_wait`, which completes
+only when the reply ran on a different session pod from the opening's, so a case can grade
+that the reply was rehydrated. Inject transport only.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
 carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which
