@@ -168,7 +168,7 @@ func TestTheBuiltinPolicyLeavesBuiltinToTheOperator(t *testing.T) {
 	// Update of the operator's built-in schedule.
 	allowed(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) {
 		s.Annotations = map[string]string{
-			agentv1alpha1.AgentScheduleRunNowAnnotation: "t1", "kubeagents.x-k8s.io/stop": "s1",
+			agentv1alpha1.AgentScheduleRunNowAnnotation: "t1",
 		}
 	}), "a writer annotating a built-in schedule")
 	refused(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) {
@@ -184,6 +184,14 @@ func TestTheBuiltinPolicyLeavesBuiltinToTheOperator(t *testing.T) {
 	}), "a writer changing the PlatformAgent controller")
 	refused(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "Run something else." }),
 		"a writer changing a built-in schedule's spec")
+	// Suspending is the exception: the one way to pause a built-in audit
+	// until PlatformAgent.spec.schedules.overrides exists.
+	allowed(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Suspend = true }),
+		"a writer suspending a built-in schedule")
+	refused(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) {
+		s.Spec.Suspend = false
+		s.Spec.Schedule = "*/5 * * * *"
+	}), "a writer changing a built-in schedule's spec beside its suspend")
 	refused(writer.Patch(ctx, schedule("w-user", false, false), client.RawPatch(types.MergePatchType,
 		[]byte(`{"metadata":{"labels":{"kubeagents.x-k8s.io/origin":"builtin"}}}`))), "a writer's merge patch adding the builtin label")
 	allowed(update(operator, "builtin", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "Run the audit again." }),

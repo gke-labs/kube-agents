@@ -1420,8 +1420,8 @@ Another, `kube-agents-agentschedule-builtin`, is generated from
 `k8s-operator/config/admission/agentschedule-builtin-policy.yaml`. It keeps
 everyone but the operator's ServiceAccount from making or unmaking a built-in
 `AgentSchedule`. Nobody else may set, change or remove its
-`kubeagents.x-k8s.io/origin: builtin` label or its controller reference, on create or update, or change a built-in schedule's spec. The garbage collector may still orphan a schedule. Annotating a built-in schedule (`run-now`,
-`stop`) still works for anyone the RBAC lets write it.
+`kubeagents.x-k8s.io/origin: builtin` label or its controller reference, on create or update, or change a built-in schedule's spec (except `spec.suspend`). The garbage collector may still orphan a schedule. Annotating a built-in schedule (`run-now`) or suspending it (`spec.suspend`) still
+works for anyone the RBAC lets write it.
 
 Another, `kube-agents-web-console-cr`, is generated from
 `k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the

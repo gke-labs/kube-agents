@@ -27,7 +27,7 @@
 #
 # And templates/agentschedule-builtin-admission-policy.yaml: only the operator may
 # make or unmake a built-in AgentSchedule (its origin: builtin label and controller
-# reference) or change a built-in's spec.
+# reference) or change a built-in's spec (spec.suspend excepted).
 #
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
