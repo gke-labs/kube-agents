@@ -262,7 +262,5 @@ func withResume(argv []string, id string) []string {
 	if id == "" {
 		return argv
 	}
-	out := make([]string, 0, len(argv)+2)
-	out = append(out, argv...)
-	return append(out, harnessResumeFlag, id)
+	return slices.Concat(argv, []string{harnessResumeFlag, id})
 }
