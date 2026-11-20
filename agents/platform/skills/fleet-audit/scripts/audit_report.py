@@ -1334,7 +1334,7 @@ CHECK_PHRASES = {
     "single-zone-nodepool": "{object} node pool sits in one zone",
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
-    "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
+    "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -3205,6 +3205,9 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # whose request is its limit, so a number sized from an idle week becomes an
 # enforcement ceiling; the SOP has that finding published as `manual`, and the
 # marker keeps a `manifest` the model wrote anyway out of the sweep. The
+# stockout collector also sets `class-status` on a §3.12(b) finding, a
+# ComputeClass that GKE reports misconfigured: the fix taints or relabels a
+# node pool, which decides where every other Pod on it can schedule. The
 # compliance collector sets `default-deny` on every §2.6 finding: each arm's
 # fix leaves the namespace denying ingress by default, which drops every
 # connection no allow rule names until the team writes those rules. The
@@ -3217,6 +3220,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 TRIAGE_REASONS = {
     "service-fronted": "stands down a controller a Service routes to",
     "new-computeclass": "needs a new ComputeClass and a workload that selects it",
+    "class-status": "changes a node pool or a ComputeClass, and the audit did not read what else runs on that pool",
     "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",
