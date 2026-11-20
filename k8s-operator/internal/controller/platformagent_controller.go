@@ -648,6 +648,23 @@ type PlatformAgentReconciler struct {
 	// a2aChartPodsWarning; cleared when the CR is deleted.
 	a2aChartPodsWarned sync.Map
 
+	// sessionCapWarned records, per CR, the SessionCapFitted Warning last
+	// recorded (resolveA2ASessionCap), so a cap fitted to the same width
+	// warns once rather than on every pass. Keyed by ObjectKey, value the
+	// event message; cleared when the CR is deleted and when the cap is no
+	// longer fitted.
+	sessionCapWarned sync.Map
+	// sessionCapPruned records, per CR, when a write's echo came back
+	// without the cap (resolveA2ASessionCap), and sessionWarmPruned when one
+	// came back with the cap but without status.effectiveWarmSessions, which
+	// renders no warm pod until a reprobe finds the field kept.
+	// sessionCapReadings is the last known reading of each CR's TASKS width
+	// (a2aTasksLiveWidth). All three are keyed by ObjectKey and cleared when
+	// the CR is deleted.
+	sessionWarmPruned  sync.Map
+	sessionCapPruned   sync.Map
+	sessionCapReadings sync.Map
+
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
 	// cap reconcileWorkload last logged, so each generation logs it once
 	// rather than on every requeue. Keyed by ObjectKey, value int64; cleared
@@ -1472,6 +1489,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if _, err := r.ensureA2ACredsSecret(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
 	}
+	// The session cap, fitted to the TASKS stream's live width
+	// (platformagent_a2a_session_cap.go), before the workload: the platform
+	// agent container's A2A_DEFAULT_ADDRESSEE reads it, as the gateway's
+	// does in the A2A stack below, so both render from the one reading.
+	r.resolveA2ASessionCap(ctx, renderAgent, instance)
 	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1752,12 +1774,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
 // pruned-status probe: the interval while a record is held for this CR, the
-// whole usage block's, status.busReplicas', status.inference's, or
-// status.observedVersion's. With no record it returns the secret re-read's
+// whole usage block's, status.busReplicas', status.inference's,
+// status.observedVersion's, status.universeDomain's, or, on the session route,
+// status.effectiveSessionCap's (sessionCapStatusPruned). With no record it returns the secret re-read's
 // interval, the ceiling the caller already applies, so the min it feeds leaves
 // the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) || r.sessionCapStatusPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -1914,6 +1937,10 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.kanbanAdmissionWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionCapWarned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionWarmPruned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionCapPruned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionCapReadings.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
 		r.forgetA2AGatewayLease(agent)

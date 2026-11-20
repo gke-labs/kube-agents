@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` held at 1, the only value the gateway accepts until a stop walks the whole tree; a batch's results already come back in one wake); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, its retirement is tracked in #6483, and while the flag is set `defaultRoute: session` keeps the install on `platform` routing, so plain turns do not reach the view; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` held at 1, the only value the gateway accepts until a stop walks the whole tree; a batch's results already come back in one wake); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` when unset until the flip, a later change gated on evidence; `defaultRoute: session` opts an install in, with the session cap fitted to the live `TASKS` stream's width (`status.effectiveSessionCap`)
 
 ## Purpose
 
@@ -538,7 +538,7 @@ One exception stands while its flag is on: the session pod's temporary read-only
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
 credential broker directly, with the platform agent's scope and no child task, so the only gate
 between the requester and that read is the gateway's ingress allowlist, not the target's
-`AllowedUsers`. The view retires on the default flip (#2371); until then, on an install whose
+`AllowedUsers`. Its retirement is tracked in #6483, and while the flag is set `defaultRoute: session` keeps plain turns on `platform` routing; until it retires, on an install whose
 operator has turned the flag on and whose CR narrows the platform agent's allowlist, a person the
 gateway refuses a delegation to `platform` can still read its clusters through a session's view.
 
@@ -679,9 +679,17 @@ or, when no wake followed, the end the observers were told. Chat backends read t
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
 setting, the PlatformAgent's `spec.harness.tuning.defaultRoute` (`session` or `platform`, unset
-meaning `platform` until the default flips), which the operator renders as
+meaning `platform`; making `session` the default is a later change, gated on evidence), which the operator renders as
 `A2A_DEFAULT_ADDRESSEE` on the gateway and on the platform agent container (which the hermes-bridge sidecar copies) from one resolver,
-so the two cannot disagree. The Delegate flow covers one task; the
+so the two cannot disagree. An install that sets `defaultRoute: session` opts into the session route,
+where the operator reads the live `TASKS` stream's `max_consumers` off the bus's monitoring endpoint
+and fits the session cap to it, since a stream cannot be widened once it exists:
+`status.effectiveSessionCap` is `maxSessions` or the sessions the stream has room for, whichever is
+fewer, the gateway's cap, the session quota and the provision Job's check follow it, and a stream
+with no room for one session sends plain conversations to `platform`. On an existing install, until
+the width has been read once, the provision Job waits. While the operator's
+`A2A_SESSION_CLUSTER_VIEW` is set, plain turns stay on `platform` even there, so the session route
+never widens what a plain turn reaches. On `platform` none of this runs. The Delegate flow covers one task; the
 per-conversation opt-in is `/session`: deterministic, resolved before status, stop and steer,
 naming a route rather than a handle. A bare `/session` marks the conversation session-routed
 and the next message opens the pod; `/session <text>` marks it and runs the text as the first
@@ -708,11 +716,45 @@ in the KV only) and its pseudonymized attribution, so a child minted later and t
 it run under the turn that asked. Working
 state richer than the transcript primer rehydrate builds today - what the session has
 discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
-conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is
-paid.
+conversation is a resumed agent.
+
+A new conversation's first turn takes a warm pod when one is ready, so it skips scheduling and
+the image pull; every later turn pays the harness start as before. On the session route the
+leader gateway keeps `A2A_WARM_SESSIONS` warm pods (`spec.harness.tuning.warmSessions`, default 1,
+0 off; the operator renders the variable only where the install resolves to the session route,
+so on platform no warm pod runs), at most
+the cap less one and fewer while live sessions fill the cap (`a2a/gateway/warm_pool.go`). A warm
+pod is the session pod `Spawn` builds, created through the same CREATE-only path and admission
+policy, with no task or conversation annotation and an `a2a.kubeagents.dev/warm` mark. It has a
+freshly minted name, never one `TASKS` holds anything for (a minted name can repeat an earlier
+pod's within the stream's retention, so the pool mints again), and its adapter starts without
+`TASK_ID` (`A2A_SESSION_WARM`), opens its task watcher on its own `…in` subjects reading only
+what is published from then on, and reports Ready once the watcher's consumer exists,
+from a loopback endpoint that keeps answering for the pod's life. It carries a digest of the
+spec it was made with (`a2a.kubeagents.dev/warm-shape`), so after a release or a config change
+the old pods are never claimed and the pool replaces them. A
+session pod's bus identity is its name, so the gateway claims a warm pod by setting the
+record's bus session and addressee to the pod's name instead of minting one. Nothing is
+re-bound: the capability names the pod, and its grants are what a fresh spawn under that
+name gets, so an unclaimed pod can run nothing. Only a session-routed conversation with no
+earlier turn claims one (a warm pod has no primer, which is read once at start), never a
+one-shot Delegate, and with none ready the turn spawns cold. A pod `TASKS` holds anything for
+on its subjects (anything published within the stream's retention) is never claimed, whatever
+the claim index says, and counts as a live session. The gateway cannot patch the
+pod, so the claim goes in the session-state bucket (`warm.<pod>` naming the conversation),
+and the cap count, the cap eviction and both sweeps read the claim in place of the
+annotations; an unclaimed warm pod holds no cap slot and is no stranded orphan. The pool
+replaces an unclaimed pod at 25 minutes; its adapter exits unclaimed at 30, which is what
+frees it under a gateway that predates the pool, whose sweep deletes an ended pod with no
+task annotations. A claimed pod has no such bound there: it lasts until its conversation is
+reaped or its deadline, and that gateway's cap counts it but its eviction can't choose it, since
+the pod carries no session key and the gateway can't patch one on. A warm pod's deadline is
+that 30 minutes plus a reused pod's lifetime, and a claimed pod takes turns only as long as one
+spawned at the claim would (`podClaimedAt` on the record). Each warm pod takes one `TASKS` consumer and one pod in the session quota, and warm pods use only consumers the session cap leaves spare (`status.effectiveWarmSessions`): the cap is fitted as before, and a stream with none spare runs without a warm pod rather than losing a session. A new `TASKS` is created with room for them. Recycling is quiet: the readiness probe waits out the adapter's start rather than failing during it, and the pool and the sweep log at info and record no Event. On Autopilot without Pod bursting a warm pod is billed at the per-Pod minimum of 250m and 512Mi.
 
 What this costs is pods: one per live conversation, bounded by the session cap and the
-idle TTL. That is the figure to measure before the default flips.
+idle TTL, and the warm pods, one session pod's requests each. That is the figure to measure
+before the default flips.
 
 ## Routing to AgentProfiles (added 10/28)
 

@@ -120,6 +120,16 @@ type SessionRecord struct {
 	// handed a later task, and only such a pod's running task is held to
 	// the reap scan's overdue bound; a one-task pod has its own deadline.
 	PodReuse bool `json:"podReuse,omitempty"`
+	// PodClaimedAt is when PodName was claimed from the warm pool, zero for
+	// a pod spawned for the conversation. A warm pod was started before its
+	// claim, so its reuse window counts from here, ending when a fresh
+	// spawn's would (reuseLivePod). An older gateway ignores it.
+	PodClaimedAt time.Time `json:"podClaimedAt,omitzero"`
+	// warmClaim is the warm pod this turn claimed as the conversation's
+	// next incarnation (claimOrMint), for ensureSessionPod to record in
+	// place of a spawn. The turn's own: never stored, since the record's
+	// PodName and the claim index are what persist.
+	warmClaim string
 	// LastTaskActivity is when a task last started or, from an executor's
 	// terminal, ended in this session. It is what the Slack adapter's
 	// session-thread rule bounds on (Gateway.hasSession), separately from
@@ -1410,6 +1420,100 @@ func (r *Registry) SessionForTask(ctx context.Context, taskID string) (string, e
 		return "", err
 	}
 	return string(entry.Value()), nil
+}
+
+// warmClaimPrefix keys the warm pod claim index: warm.<pod> holds the session
+// key of the conversation that claimed that warm pod. Pod names are dot-free
+// DNS-1123 labels, so the key is one token past the prefix.
+const warmClaimPrefix = "warm."
+
+func warmClaimKey(pod string) string { return warmClaimPrefix + pod }
+
+// ClaimWarmPod records that the conversation sessionKey has claimed the warm
+// pod pod (warm_pool.go). It stands in for the conversation annotations a
+// spawned pod carries and a warm pod can't be given (the gateway holds no
+// patch on pods): the cap count, the cap eviction and both sweeps read the
+// pod's conversation from here. A create, so a pod is claimed once: a second
+// claim of the same pod fails with jetstream.ErrKeyExists. Fenced by the
+// claiming session's record, as IndexTask is.
+func (r *Registry) ClaimWarmPod(ctx context.Context, pod, sessionKey string) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	if mine := r.epoch.Load(); mine != 0 {
+		if _, err := r.fencedRecord(ctx, kv, sessionKey, mine); err != nil {
+			return err
+		}
+	}
+	if _, err := kv.Create(ctx, warmClaimKey(pod), []byte(sessionKey)); err != nil {
+		return fmt.Errorf("warm claim %s: %w", pod, err)
+	}
+	return nil
+}
+
+// WarmClaims is the claim index: warm pod name to the session key that
+// claimed it.
+func (r *Registry) WarmClaims(ctx context.Context) (map[string]string, error) {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lister, err := kv.ListKeysFiltered(ctx, warmClaimPrefix+">")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lister.Stop() }()
+	var keys []string
+	for key := range lister.Keys() {
+		keys = append(keys, key)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	claims := make(map[string]string, len(keys))
+	for _, key := range keys {
+		entry, err := kv.Get(ctx, key)
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		claims[strings.TrimPrefix(key, warmClaimPrefix)] = string(entry.Value())
+	}
+	return claims, nil
+}
+
+// StillLeading reports whether this gateway's term is still the newest: no
+// later term has begun on the counter. At term 0 (no election) it always is.
+// A read that fails is not leading: the caller is about to delete, and a
+// delete a deposed leader should not make waits for the next pass.
+func (r *Registry) StillLeading(ctx context.Context) bool {
+	mine := r.epoch.Load()
+	if mine == 0 {
+		return ctx.Err() == nil
+	}
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return false
+	}
+	term, _, err := readTerm(ctx, kv)
+	return err == nil && term <= mine
+}
+
+// DropWarmClaim removes a claim whose pod is gone (the pool's pass). Not
+// fenced: a claim names a pod, and once the pod no longer exists the entry
+// says nothing anyone can act on, whoever removes it.
+func (r *Registry) DropWarmClaim(ctx context.Context, pod string) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	if err := kv.Delete(ctx, warmClaimKey(pod)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("warm claim %s: %w", pod, err)
+	}
+	return nil
 }
 
 // SessionCallback is invoked for each session record in a scan.

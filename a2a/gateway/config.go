@@ -60,6 +60,14 @@ var backendArms = []backendArm{
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultWarmSessions is what WarmSessions means when A2A_WARM_SESSIONS is
+// unset: no warm pool. The operator renders the variable from
+// spec.harness.tuning.warmSessions (default 1) only on an install that
+// resolves to the session route, so unset is the platform route, where a
+// warm pod would serve nothing, or a gateway run by hand, which spends
+// nothing it was not asked to.
+const defaultWarmSessions = 0
+
 // defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
@@ -717,6 +725,17 @@ type Config struct {
 	// margin absorbs.
 	MaxSessions int
 
+	// WarmSessions is how many warm session pods the leader keeps ready
+	// (A2A_WARM_SESSIONS, warm_pool.go): pods started before a conversation
+	// needs one, so a new conversation's first turn is handed a running pod
+	// instead of waiting on scheduling and the image pull. Each costs one
+	// session pod's requests while it waits. The pool keeps
+	// min(WarmSessions, MaxSessions - 1 - live sessions) of them, so it never
+	// takes the last slot, and none below a cap of 2; 0 turns it off. It runs
+	// only with SessionReuse, since a claimed warm pod serves its
+	// conversation the way a reused pod does.
+	WarmSessions int
+
 	// SessionResources are the session pod's CPU and memory requests and
 	// limits (#2371), from A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, which
 	// the operator renders resolved from spec.harness.tuning.sessionResources
@@ -1094,6 +1113,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	warmSessions := envOr("A2A_WARM_SESSIONS", strconv.Itoa(defaultWarmSessions))
+	warm, err := strconv.Atoi(warmSessions)
+	if err != nil || warm < 0 {
+		return nil, fmt.Errorf("A2A_WARM_SESSIONS %q: need an integer >= 0", warmSessions)
+	}
+	cfg.WarmSessions = warm
 	sessionResources, err := sessionResourcesFromEnv()
 	if err != nil {
 		return nil, err

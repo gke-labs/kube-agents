@@ -318,6 +318,20 @@ type Gateway struct {
 	capCheck chan struct{}
 	capMu    sync.Mutex
 	capHolds map[string]capHold
+	// warmMu guards warmClaiming and warmDeleting, the warm pods a turn is
+	// claiming and the pool is deleting right now, so neither acts on a pod
+	// the other has in hand (warm_pool.go). It is held only to read and mark
+	// them, never across an API call.
+	warmMu       sync.Mutex
+	warmClaiming map[string]bool
+	warmDeleting map[string]bool
+	// warmMint, when set, mints the warm pool's pod names in place of
+	// mintSessionName: a test hook, so a name TASKS holds can be minted on
+	// purpose.
+	warmMint func(profile string) string
+	// warmUsedErr, when set, fails warmPodUsed for the pods it returns an
+	// error for: a test hook for a TASKS read that fails on one pod.
+	warmUsedErr func(pod string) error
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
@@ -978,6 +992,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
+	}
+	if g.warmPoolOn() {
+		go g.warmPoolLoop(ctx)
 	}
 
 	// The adapter's delivery goroutines only enqueue (or refuse a console
@@ -1686,6 +1703,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			if rec.Profile == "" {
 				rec.Profile = sessionProfile
 			}
+			// Always minted, never a warm pod: a one-shot Delegate on a
+			// fixed-route conversation must not inherit a reused pod's
+			// lifetime (warmClaimEligible).
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
 			msg = wordsAfter(msg, rest)
@@ -1724,8 +1744,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				}
 				rec.SessionRouted = true
 				rec.Profile = sessionProfile
-				rec.BusSession = mintSessionName(rec.Profile)
-				rec.Addressee = rec.BusSession
+				g.claimOrMint(ctx, rec)
 			}
 		}
 		// The busy notice: counted once the task is on the bus, leaving the
@@ -2546,8 +2565,9 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	if !g.retireIncarnation(ctx, rec, "session route", retireRefusalNotStarted) {
 		return false
 	}
-	rec.BusSession = mintSessionName(rec.Profile)
-	rec.Addressee = rec.BusSession
+	// A new conversation's first turn may be handed a warm pod instead of a
+	// fresh name (warm_pool.go); everything else mints, as before.
+	g.claimOrMint(ctx, rec)
 	return true
 }
 

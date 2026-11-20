@@ -17,6 +17,13 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+// TaskSubjectsOf is every task subject of one addressee, all tasks and all
+// classes: the filter that answers whether anything was published to it
+// within TASKS' retention.
+func TaskSubjectsOf(addressee string) string {
+	return fmt.Sprintf("a2a.tasks.%s.>", addressee)
+}
+
 // TaskInSubject is where a requester publishes message and cancel envelopes
 // for a task. The addressee token — the executor's profile or session name,
 // added in 0.4 — is the authorization seam: it is what makes connection-time
