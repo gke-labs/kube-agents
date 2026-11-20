@@ -54,6 +54,14 @@ const (
 	verifierUnreachable = "the verifier could not be reached"
 )
 
+// podLeftItsLoop is in each line the adapter logs when it ends a reused
+// session by itself, with no SIGTERM.
+const podLeftItsLoop = "exiting so the next turn starts"
+
+// waitFinalReadWithin bounds one read of waitFinal's poll. Short, so a request
+// whose reply was lost in a reconnect costs little of the wait's deadline.
+const waitFinalReadWithin = 3 * time.Second
+
 // reusedPod runs the real adapter as a reused session pod under podA's
 // session grants and returns its log and a stop that sends a SIGTERM after
 // the last turn and checks the clean exit.
@@ -103,6 +111,11 @@ echo '{"type":"result","subtype":"success","result":"answered"}'
 			afterItsTurn := out.res == workeradapter.Result{State: lib.StateCompleted}
 			if out.err != nil || (!idle && !afterItsTurn) {
 				t.Errorf("SIGTERM after the last turn: %+v err=%v, want a zero Result or the completed turn's", out.res, out.err)
+			}
+			// A pod that left its session loop unasked returns the completed
+			// turn's Result too, and says so in its log.
+			if strings.Contains(logs.String(), podLeftItsLoop) {
+				t.Errorf("the pod left its session loop by itself:\n%s", logs.String())
 			}
 		case <-time.After(30 * time.Second):
 			t.Fatal("the adapter did not exit on SIGTERM after the last turn")
@@ -219,9 +232,10 @@ func TestAReusedSessionPodTakesTurnsAcrossItsGrantExpiry(t *testing.T) {
 // the pod. On a loaded host a new connect then outlasts its own grant or the
 // callout's budget, and the test ends on the reader instead of on the pod
 // (gke-labs#6284). That connection reconnects at its
-// grant's expiry too, and a read that lands there loses its reply, so a
-// failed read is read again rather than fatal: the reader is the observer
-// here, and the deadline below is what fails a pod that never answers.
+// grant's expiry too, and a read that lands there loses its reply. Such a
+// read fails, or comes back empty with no error, so either is read again
+// rather than fatal: the reader is the observer here, and the deadline below
+// is what fails a pod that never answers.
 func waitFinal(t *testing.T, h *harness, addressee, taskID string) (lib.TaskState, string) {
 	t.Helper()
 	gateway := gatewayConn(t, h)
@@ -229,7 +243,7 @@ func waitFinal(t *testing.T, h *harness, addressee, taskID string) (lib.TaskStat
 	failedReads := 0
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		events, err := readEventsOn(t, gateway, addressee, taskID)
+		events, err := readEventsOn(t, gateway, addressee, taskID, waitFinalReadWithin)
 		if err != nil {
 			readErr = err
 			failedReads++
@@ -250,6 +264,6 @@ func waitFinal(t *testing.T, h *harness, addressee, taskID string) (lib.TaskStat
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("%s never reached a final under the session's grants (%d reads of its events failed, the last with: %v)", taskID, failedReads, readErr)
+	t.Fatalf("%s never reached a final under the session's grants (%d reads of its events returned an error, the last: %v)", taskID, failedReads, readErr)
 	return "", ""
 }

@@ -769,7 +769,7 @@ const testReaderName = "test-reader"
 // what the session may only write.
 func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envelope {
 	t.Helper()
-	out, err := readEventsOn(t, gatewayConn(t, h), addressee, taskID)
+	out, err := readEventsOn(t, gatewayConn(t, h), addressee, taskID, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -778,16 +778,17 @@ func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envel
 
 // readEventsOn is readEvents over a gateway connection the caller holds. A
 // read that fails is returned rather than ending the test, for a caller that
-// reads again. Each read starts from the subject's first event: the reader
-// consumer is dropped first, because a durable keeps its position, and a read
-// whose reply was lost would otherwise have taken those events for good.
-func readEventsOn(t *testing.T, nc *nats.Conn, addressee, taskID string) ([]*lib.Envelope, error) {
+// reads again, and within bounds its requests. Each read starts from the
+// subject's first event: the reader consumer is dropped first, because a named
+// consumer keeps its position while it is in use, and a read whose reply was
+// lost would otherwise have taken those events for good.
+func readEventsOn(t *testing.T, nc *nats.Conn, addressee, taskID string, within time.Duration) ([]*lib.Envelope, error) {
 	t.Helper()
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return nil, fmt.Errorf("jetstream: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), within)
 	defer cancel()
 	if err := js.DeleteConsumer(ctx, lib.TasksStream, testReaderName); err != nil && !errors.Is(err, jetstream.ErrConsumerNotFound) {
 		return nil, fmt.Errorf("drop the reader consumer: %w", err)
