@@ -777,7 +777,10 @@ The same object may carry `"changeRequested": true`: the requester asked for a c
 request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
 and only for a turn that arrived as a structured confirm action, never from free text or a
 delegation's arguments. A child task or a wake carries its parent's value from the gateway's own
-record and cannot raise it. When it is true the gateway attaches the part even with no parameters.
+record and cannot raise it. No steer reaches a running task that holds it, from any door: a typed
+message there is refused with a notice to stop the task and confirm again, since the gateway can't
+tell which client on a door sent it and a change-permitted task's instructions must not change
+mid-run (a confirm is already refused while a task runs). When it is true the gateway attaches the part even with no parameters.
 Absent means false, so a submission that asks for no change is byte-identical to one written before
 the field existed. The dispatcher turns it into the `vcs:proposal-create` permit on the task's
 credential-proxy token.
