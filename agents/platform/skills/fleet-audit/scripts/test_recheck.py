@@ -370,9 +370,10 @@ class RegistrationTest(unittest.TestCase):
             recheck.recheck_for(recipe._replace(recheck_siblings="no-such-sibling"))
         # The recipe's own check refuses a read missing what it looks up (the
         # budgets) or a workload kind its target could be.
-        for missing in ("poddisruptionbudgets", "statefulsets", "daemonsets"):
+        for missing in ("deployments", "statefulsets", "daemonsets", "poddisruptionbudgets"):
             kinds = ",".join(k for k in full.split(",") if k != missing)
-            with self.subTest(own_check=True, missing=missing), self.assertRaises(ValueError):
+            with self.subTest(own_check=True, missing=missing), \
+                    self.assertRaisesRegex(ValueError, rf"^no-pdb needs {missing}\b"):
                 recheck.recheck_for(recipe._replace(recheck_kinds=kinds))
         with self.assertRaises(ValueError):
             recheck.recheck_for(recipe._replace(recheck_kinds="deployments"))
@@ -381,13 +382,20 @@ class RegistrationTest(unittest.TestCase):
             recheck.recheck_for(recipe._replace(kind="hpa-floors-at-one"))
         # Each PDB sibling refuses a read missing any kind it counts: the
         # autoscaler floor, and every workload kind a budget can select (a
-        # DaemonSet under the budget makes it unscalable).
-        for sibling, missing in (("blocking-pdb", "horizontalpodautoscalers"), ("blocking-pdb", "daemonsets"),
-                                 ("blocking-pdb", "statefulsets"), ("pdb-overlapping", "daemonsets"),
-                                 ("pdb-overlapping", "poddisruptionbudgets")):
-            kinds = ",".join(k for k in full.split(",") if k != missing)
-            with self.subTest(sibling=sibling, missing=missing), self.assertRaises(ValueError):
-                recheck.recheck_for(recipe._replace(recheck_kinds=kinds, recheck_siblings=sibling))
+        # DaemonSet under the budget makes it unscalable). The own check's needs
+        # are emptied so each case reaches the sibling's own refusal.
+        sibling_needs = (
+            ("blocking-pdb", ("deployments", "statefulsets", "daemonsets", "poddisruptionbudgets",
+                              "horizontalpodautoscalers")),
+            ("pdb-overlapping", ("deployments", "statefulsets", "daemonsets", "poddisruptionbudgets")),
+        )
+        with mock.patch.dict(recheck.CHECK_NEEDS, {"no-pdb": frozenset()}):
+            for sibling, required in sibling_needs:
+                for missing in required:
+                    kinds = ",".join(k for k in full.split(",") if k != missing)
+                    with self.subTest(sibling=sibling, missing=missing), \
+                            self.assertRaisesRegex(ValueError, rf"^no-pdb: {sibling} needs {missing}\b"):
+                        recheck.recheck_for(recipe._replace(recheck_kinds=kinds, recheck_siblings=sibling))
         # A group-qualified name reads the same kind.
         qualified = full.replace("poddisruptionbudgets", "poddisruptionbudgets.policy")
         recheck.recheck_for(recipe._replace(recheck_kinds=qualified, recheck_siblings="blocking-pdb pdb-overlapping"))
