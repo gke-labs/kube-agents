@@ -547,8 +547,7 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. Two more, `ci-kube-agents-validated-capabilities-1` and `-2`, are
 not pool jobs but the validated-capabilities lane's weekly slices, one a suite part, watched here because
-their record is their logs bucket and nothing else reads a failed build of them. The first slice is
-also watched as `ci-kube-agents-certification-1`, the name its job has until `oss-test-infra` renames it. Another,
+their record is their logs bucket and nothing else reads a failed build of them. Another,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
 and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
 `ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
