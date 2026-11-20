@@ -7,7 +7,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 --manifest-file` cross-checks the published document against.
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
-twenty-six-check roster (§3.1–§3.26 of `governance/obtainability_audit_sop.md`),
+twenty-seven-check roster (§3.1–§3.27 of `governance/obtainability_audit_sop.md`),
 `compliance-audit`'s twenty-check roster (§2.1–§2.20 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
@@ -287,6 +287,121 @@ _IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH = (
     "Traffic routed through an Ingress or Gateway HTTPRoute, or probed by a "
     "load-balancer health check, targets a port that the Service or its backing "
     "pods do not expose, so requests or health checks fail while the pods report Ready."
+)
+
+# §3.27 (`network-daemonset-missing-ccc-toleration`): a DaemonSet that sets up
+# networking on each node, read against the taints of the cluster's nodes.
+NETWORK_DAEMONSET_MISSING_TOLERATION_SLUG = "network-daemonset-missing-ccc-toleration"
+# The context key saying the cluster is Autopilot, where S1 binds this check.
+CONTEXT_AUTOPILOT = "autopilot"
+# The one system namespace 3.27 reads on a Standard cluster: where GKE's
+# documented ip-masq-agent manifest is applied by the cluster's owner. The
+# others (`gke-managed-*`, `gmp-system`, ...) hold objects that are not the
+# owner's to edit, with or without the add-on label.
+OWNER_APPLIED_SYSTEM_NAMESPACE = "kube-system"
+DAEMONSET_KIND = "DaemonSet"
+NODE_POOL_LABEL = "cloud.google.com/gke-nodepool"
+HOST_PATH_VOLUME = "hostPath"
+HOST_PATH_SEPARATOR = "/"
+# Where a network plug-in keeps its configuration and its binaries on a node
+# (kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/).
+# A mount of either directory, or of a path under it, marks a node-networking
+# agent.
+CNI_HOST_DIRECTORIES = ("/etc/cni/net.d", "/opt/cni/bin")
+# Where GKE's node image keeps those binaries. Matched whole only: other node
+# software lives in its subdirectories. With the two above it is the
+# `CNI_HOST_PATHS` of fleet-upgrade-verification's `upgrade_shape_tables.py`,
+# copied because this script ships and runs standalone.
+GKE_CNI_BINARY_DIRECTORY = "/home/kubernetes/bin"
+# The two taints GKE puts on a node to keep software built for another platform
+# off it: `node.kubernetes.io/os=windows:NoSchedule` on Windows Server nodes
+# ("helps ensure that the GKE scheduler does not attempt to run Linux
+# containers on Windows Server nodes",
+# docs.cloud.google.com/kubernetes-engine/docs/how-to/deploying-windows-app) and
+# `kubernetes.io/arch=arm64:NoSchedule` on Arm nodes ("prevents x86-compatible
+# workloads from being inadvertently scheduled to your Arm nodes",
+# docs.cloud.google.com/kubernetes-engine/docs/how-to/prepare-arm-workloads-for-deployment).
+# A DaemonSet that does not tolerate one is read as not built for that
+# platform, and the node as none of its nodes: a toleration there would start
+# an image the node cannot run.
+PLATFORM_SEPARATION_TAINT_KEYS = frozenset({"node.kubernetes.io/os", "kubernetes.io/arch"})
+# Two more taints that describe a node's state, not a node pool
+# (kubernetes.io/docs/reference/labels-annotations-taints/): a node a person
+# marked out of service, and one the cloud provider reports shut down.
+NODE_STATE_TAINT_KEYS = frozenset(
+    {"node.kubernetes.io/out-of-service", "node.cloudprovider.kubernetes.io/shutdown"}
+)
+# Taints a node carries only until its own start-up is done, so not a node
+# pool's standing taint: the one Cilium puts on a node until its agent is ready
+# ("Cilium runs on the node, initializes it and, once ready, removes the
+# aforementioned taint", docs.cilium.io/en/stable/installation/taints/), and
+# the cluster autoscaler's start-up prefixes ("meant to be used when there is
+# an operation that has to complete before any pods can run on the node"; the
+# `ignore-taint` prefix is "deprecated and treated as startup taints",
+# cluster-autoscaler/FAQ.md).
+NODE_STARTUP_TAINT_KEYS = frozenset({"node.cilium.io/agent-not-ready"})
+NODE_STARTUP_TAINT_KEY_PREFIXES = (
+    "startup-taint.cluster-autoscaler.kubernetes.io/",
+    "ignore-taint.cluster-autoscaler.kubernetes.io/",
+)
+# The taint effects that keep a pod off a node. `PreferNoSchedule` does not.
+TAINT_EFFECTS_KEEPING_PODS_OFF = frozenset({"NOSCHEDULE", "NOEXECUTE"})
+# The one node field a node affinity term may match on.
+NODE_NAME_FIELD = "metadata.name"
+# The node selector operators beside `NODE_SELECTOR_OP_IN`.
+NODE_SELECTOR_OP_NOT_IN = "NotIn"
+NODE_SELECTOR_OP_EXISTS = "Exists"
+NODE_SELECTOR_OP_DOES_NOT_EXIST = "DoesNotExist"
+NODE_SELECTOR_OP_GT = "Gt"
+NODE_SELECTOR_OP_LT = "Lt"
+DAEMONSET_STATUS_DESIRED = "desiredNumberScheduled"
+DAEMONSET_STATUS_READY = "numberReady"
+# The excerpt's sentences, in the order they are written. The counts come
+# before the taints because the report cuts a long excerpt at its end, and the
+# counts must survive a long list of taints.
+NETWORK_DAEMONSET_EXCERPT_LEAD = "{kind} (checked here because of: {marks}) cannot be placed on "
+NETWORK_DAEMONSET_EXCERPT_NODES = "{uncovered} of the cluster's {total} nodes"
+NETWORK_DAEMONSET_EXCERPT_READY = (
+    " It reports {ready} of {desired} pods ready, which counts only the nodes it can be placed on."
+)
+NETWORK_DAEMONSET_EXCERPT_TAINTS = " It has no toleration for {taints}."
+NETWORK_DAEMONSET_TAINT_WHERE = "{taint} ({where}, {count})"
+NETWORK_DAEMONSET_POOL_NOUN = "node pool"
+NETWORK_DAEMONSET_MORE_POOLS = " and {more} more"
+NETWORK_DAEMONSET_NODE_COUNT = "{total} node{plural}"
+NETWORK_DAEMONSET_SENTENCE_END = "."
+PLURAL_SUFFIX = "s"
+CONTEXT_NODES = "nodes"
+CONTEXT_RAW_WORKLOADS = "raw_workloads"
+# The most host mounts the excerpt names as the reason a DaemonSet was checked.
+NETWORK_DAEMONSET_MAX_MOUNTS_NAMED = 4
+NETWORK_DAEMONSET_MORE_MOUNTS = "{more} more plug-in mount{plural}"
+NETWORK_DAEMONSET_MARK_HOST_NETWORK = "hostNetwork: true with {capabilities}"
+# The Linux capabilities that let a container change the node's packet rules
+# and interfaces. Host networking alone is how many log, metrics and security
+# agents reach the node's ports, so it marks a node-networking agent only
+# together with one of these: GKE's documented ip-masq-agent manifest adds
+# both ("add: [\"NET_ADMIN\", \"NET_RAW\"]",
+# docs.cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent).
+# `privileged: true` is not read as one: it is how security agents run too.
+NETWORK_CAPABILITIES = ("NET_ADMIN", "NET_RAW")
+NETWORK_DAEMONSET_CAPABILITY_JOIN = ", "
+NETWORK_DAEMONSET_MARK_CNI_MOUNT = "mounts {path} from the node"
+# How the excerpt names the nodes that carry no node pool label.
+NETWORK_DAEMONSET_UNLABELLED_NODES = "nodes with no node pool label"
+# The most node pools the excerpt names for one taint before it counts the
+# rest: node auto-provisioning can create dozens. Every taint is written,
+# because the fix is one toleration per taint; the report's own limit on an
+# excerpt's length is the only thing that cuts them.
+NETWORK_DAEMONSET_MAX_POOLS_NAMED = 10
+NETWORK_DAEMONSET_LIST_JOIN = "; "
+NETWORK_DAEMONSET_POOL_JOIN = ", "
+NETWORK_DAEMONSET_WHERE_JOIN = " and "
+IMPACT_NETWORK_DAEMONSET_MISSING_TOLERATION = (
+    "This DaemonSet cannot be placed on the nodes of one or more node pools, so "
+    "those nodes come up without whatever it sets up on a node. Nothing reports "
+    "it: Kubernetes leaves those nodes out of the number of pods the DaemonSet "
+    "expects (DESIRED), so its ready count can be complete while they have none."
 )
 
 # The manifest contract's outcomes, and the target names a sweep of more than
@@ -1150,7 +1265,8 @@ DUMP_COMMAND_KINDS = (
     # volume and no credential of any kind; a claim is a request for storage,
     # not the storage.
     ",persistentvolumeclaims"
-    # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload).
+    # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload); `nodes`
+    # and `daemonsets` also serve 3.27 (network-daemonset-missing-ccc-toleration).
     ",namespaces,nodes"
     # `ingresses` serves 3.26 (ingress-gateway-healthcheck-mismatch).
     ",ingresses"
@@ -1575,10 +1691,14 @@ def workload_keys(dump: dict) -> set[tuple[str, str, str]]:
     }
 
 
-def _is_excluded_object(item: dict) -> bool:
-    """Standard S1 (system namespace), S2 (addon-managed), and S4 (opt-out) exclusions."""
+def _is_excluded_object(item: dict, *, system_namespaces: bool = True) -> bool:
+    """Standard S1 (system namespace), S2 (addon-managed), and S4 (opt-out) exclusions.
+
+    `system_namespaces=False` leaves S1 out, for 3.27, the one check that reads
+    an object its owner applies to `kube-system`.
+    """
     meta = item.get("metadata") or {}
-    if _is_system_namespace(meta.get("namespace", "")):  # S1
+    if system_namespaces and _is_system_namespace(meta.get("namespace", "")):  # S1
         return True
     labels = meta.get("labels") or {}
     annotations = meta.get("annotations") or {}
@@ -5143,6 +5263,244 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     }
 
 
+def _node_networking_marks(template: dict) -> list[str]:
+    """What makes this pod template a node-networking agent, as the excerpt
+    states it; empty when nothing does: the host network together with a
+    network capability, or a host mount of a network plug-in directory."""
+    marks = []
+    if template.get("hostNetwork") is True:
+        added = set()
+        for container in (template.get("containers") or []) + (template.get("initContainers") or []):
+            if not isinstance(container, dict):
+                continue
+            capabilities = (container.get("securityContext") or {}).get("capabilities") or {}
+            added.update(str(c) for c in capabilities.get("add") or [])
+        held = [c for c in NETWORK_CAPABILITIES if c in added]
+        if held:
+            marks.append(
+                NETWORK_DAEMONSET_MARK_HOST_NETWORK.format(capabilities=NETWORK_DAEMONSET_CAPABILITY_JOIN.join(held))
+            )
+    mounts = []
+    for volume in template.get("volumes") or []:
+        if not isinstance(volume, dict) or not isinstance(volume.get(HOST_PATH_VOLUME), dict):
+            continue
+        path = str(volume[HOST_PATH_VOLUME].get("path") or "")
+        normalized = path.rstrip(HOST_PATH_SEPARATOR)
+        under_cni_directory = any(
+            normalized == directory or normalized.startswith(directory + HOST_PATH_SEPARATOR)
+            for directory in CNI_HOST_DIRECTORIES
+        )
+        if under_cni_directory or normalized == GKE_CNI_BINARY_DIRECTORY:
+            mark = NETWORK_DAEMONSET_MARK_CNI_MOUNT.format(path=path)
+            if mark not in mounts:
+                mounts.append(mark)
+    more = len(mounts) - NETWORK_DAEMONSET_MAX_MOUNTS_NAMED
+    marks.extend(mounts[:NETWORK_DAEMONSET_MAX_MOUNTS_NAMED])
+    if more > 0:
+        marks.append(NETWORK_DAEMONSET_MORE_MOUNTS.format(more=more, plural=_plural(more)))
+    return marks
+
+
+def _plural(count: int) -> str:
+    return PLURAL_SUFFIX if count != 1 else ""
+
+
+def _is_node_state_taint(key) -> bool:
+    """A taint that describes a node's state or start-up, not a node pool: the
+    ones the DaemonSet controller tolerates by itself, the node lifecycle's,
+    and the start-up taints a node sheds once it is ready."""
+    return (
+        key in _CONTROLLER_NODE_TAINT_KEYS
+        or key in NODE_STATE_TAINT_KEYS
+        or key in NODE_STARTUP_TAINT_KEYS
+        or str(key or "").startswith(NODE_STARTUP_TAINT_KEY_PREFIXES)
+    )
+
+
+def _node_selector_requirement_holds(requirement: dict, values_by_key: dict) -> bool:
+    """One `matchExpressions` or `matchFields` entry against a node's labels or
+    fields, with the operators the scheduler knows. Anything else matches
+    nothing, as an entry the API server would have refused."""
+    if not isinstance(requirement, dict):
+        return False
+    key, operator = requirement.get("key"), requirement.get("operator")
+    wanted = [str(v) for v in requirement.get("values") or []]
+    present = key in values_by_key
+    actual = str(values_by_key.get(key, ""))
+    if operator == NODE_SELECTOR_OP_IN:
+        return present and actual in wanted
+    if operator == NODE_SELECTOR_OP_NOT_IN:
+        return not present or actual not in wanted
+    if operator == NODE_SELECTOR_OP_EXISTS:
+        return present
+    if operator == NODE_SELECTOR_OP_DOES_NOT_EXIST:
+        return not present
+    if operator in (NODE_SELECTOR_OP_GT, NODE_SELECTOR_OP_LT):
+        try:
+            have, bound = int(actual), int(wanted[0])
+        except (ValueError, IndexError):
+            return False
+        return present and (have > bound if operator == NODE_SELECTOR_OP_GT else have < bound)
+    return False
+
+
+def _node_admits_daemon_pod(template: dict, node: dict) -> bool:
+    """Whether the template's `nodeSelector` and required node affinity admit
+    this node, which is the DaemonSet controller's test before it reads taints.
+
+    Written against the Node rather than reusing 3.24's
+    `_pool_satisfies_scheduling_selectors`, which reads a pool's configured
+    labels, takes an empty affinity term as matching every node and skips an
+    operator it does not know: each would report a node the DaemonSet's own
+    affinity excludes. `upgrade_retrospective._node_satisfies` is a third
+    reader of the same fields and also lets an empty term match every node.
+    """
+    meta = node.get("metadata") or {}
+    labels = meta.get("labels") or {}
+    for key, value in (template.get("nodeSelector") or {}).items():
+        if key not in labels or labels[key] != value:
+            return False
+    required = (
+        ((template.get("affinity") or {}).get("nodeAffinity") or {}).get("requiredDuringSchedulingIgnoredDuringExecution")
+        or {}
+    )
+    terms = required.get("nodeSelectorTerms") or []
+    if not terms:
+        return True
+    fields = {NODE_NAME_FIELD: meta.get("name", "")}
+    for term in terms:
+        if not isinstance(term, dict):
+            continue
+        expressions = term.get("matchExpressions") or []
+        field_matches = term.get("matchFields") or []
+        # A term with neither matches no node.
+        if not expressions and not field_matches:
+            continue
+        if all(_node_selector_requirement_holds(e, labels) for e in expressions) and all(
+            _node_selector_requirement_holds(f, fields) for f in field_matches
+        ):
+            return True
+    return False
+
+
+def _taint_text(taint: dict) -> str:
+    key = taint.get("key", "")
+    value = taint.get("value")
+    return f"{key}={value}:{taint.get('effect', '')}" if value else f"{key}:{taint.get('effect', '')}"
+
+
+def _uncovered_taint_text(taint: str, nodes_by_pool: dict[str, int]) -> str:
+    """One untolerated taint with where it is, for the excerpt: its node pools
+    by name, the first `NETWORK_DAEMONSET_MAX_POOLS_NAMED` of them, and how
+    many nodes carry it. The key `""` holds the nodes with no node pool label."""
+    pools = sorted(name for name in nodes_by_pool if name)
+    where = []
+    if pools:
+        named = pools[:NETWORK_DAEMONSET_MAX_POOLS_NAMED]
+        more = len(pools) - len(named)
+        where.append(
+            f"{NETWORK_DAEMONSET_POOL_NOUN}{_plural(len(pools))} {NETWORK_DAEMONSET_POOL_JOIN.join(named)}"
+            + (NETWORK_DAEMONSET_MORE_POOLS.format(more=more) if more else "")
+        )
+    if nodes_by_pool.get(""):
+        where.append(NETWORK_DAEMONSET_UNLABELLED_NODES)
+    total = sum(nodes_by_pool.values())
+    return NETWORK_DAEMONSET_TAINT_WHERE.format(
+        taint=taint,
+        where=NETWORK_DAEMONSET_WHERE_JOIN.join(where),
+        count=NETWORK_DAEMONSET_NODE_COUNT.format(total=total, plural=_plural(total)),
+    )
+
+
+def check_network_daemonset_missing_toleration(context: dict) -> list[dict]:
+    """§3.27 -- a node-networking DaemonSet with no toleration for a taint on a
+    node pool that has nodes.
+
+    The DaemonSet controller places a pod on every node the template's node
+    selector and affinity admit and whose taints it tolerates, and counts only
+    those nodes in `status.desiredNumberScheduled`. A pool tainted after the
+    agent was written -- a ComputeClass pool, a dedicated pool -- therefore
+    runs without it while the DaemonSet reports every pod ready.
+
+    Read from the Node objects rather than from `gcloud container node-pools
+    list`: a node's own taints and labels are what the controller reads, the
+    dump already holds them, and a pool with no node has nothing to cover.
+    S1 does not bind `kube-system` on a Standard cluster: GKE's documented
+    ip-masq-agent manifest is for Standard and is applied there by the
+    cluster's owner. The other system namespaces stay excluded, as objects
+    that are not the owner's to edit. On Autopilot S1 binds whole, because there "GKE
+    always deploys an `ip-masq-agent` DaemonSet" itself
+    (docs.cloud.google.com/kubernetes-engine/docs/concepts/ip-masquerade-agent)
+    and the system namespaces hold GKE's objects only. A host-network DaemonSet
+    an allowlist admitted to a user namespace is still read. S2 and S4 bind
+    everywhere, and so does the annotation GKE puts on the components it
+    manages.
+    """
+    nodes = [n for n in context.get(CONTEXT_NODES) or [] if isinstance(n, dict)]
+    autopilot = bool(context.get(CONTEXT_AUTOPILOT))
+    hits = []
+    for item in context.get(CONTEXT_RAW_WORKLOADS) or []:
+        if item.get("kind") != DAEMONSET_KIND or _is_excluded_object(item, system_namespaces=False):  # S2, S4
+            continue
+        meta = item.get("metadata") or {}
+        namespace = meta.get("namespace", "")
+        if _is_system_namespace(namespace) and (autopilot or namespace != OWNER_APPLIED_SYSTEM_NAMESPACE):  # S1
+            continue
+        if (meta.get("annotations") or {}).get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        template = ((item.get("spec") or {}).get("template") or {}).get("spec") or {}
+        marks = _node_networking_marks(template)
+        if not marks:
+            continue
+        tolerations = [t for t in template.get("tolerations") or [] if isinstance(t, dict)]
+        # taint text -> node pool name -> nodes carrying it untolerated
+        uncovered: dict[str, dict[str, int]] = {}
+        uncovered_nodes = 0
+        for node in nodes:
+            if not _node_admits_daemon_pod(template, node):
+                continue
+            pool_name = ((node.get("metadata") or {}).get("labels") or {}).get(NODE_POOL_LABEL) or ""
+            untolerated = [
+                t for t in (node.get("spec") or {}).get("taints") or []
+                if isinstance(t, dict)
+                and _normalize_taint_effect(t.get("effect")) in TAINT_EFFECTS_KEEPING_PODS_OFF
+                and not _is_node_state_taint(t.get("key"))
+                and not _tolerates_taint(tolerations, t)
+            ]
+            if not untolerated or any(t.get("key") in PLATFORM_SEPARATION_TAINT_KEYS for t in untolerated):
+                continue
+            uncovered_nodes += 1
+            for text in {_taint_text(t) for t in untolerated}:
+                by_pool = uncovered.setdefault(text, {})
+                by_pool[pool_name] = by_pool.get(pool_name, 0) + 1
+        if not uncovered:
+            continue
+        excerpt = (
+            NETWORK_DAEMONSET_EXCERPT_LEAD.format(kind=DAEMONSET_KIND, marks=NETWORK_DAEMONSET_LIST_JOIN.join(marks))
+            + NETWORK_DAEMONSET_EXCERPT_NODES.format(uncovered=uncovered_nodes, total=len(nodes))
+            + NETWORK_DAEMONSET_SENTENCE_END
+        )
+        status = item.get("status") or {}
+        desired, ready = status.get(DAEMONSET_STATUS_DESIRED), status.get(DAEMONSET_STATUS_READY)
+        if all(isinstance(v, int) and not isinstance(v, bool) for v in (desired, ready)):
+            excerpt += NETWORK_DAEMONSET_EXCERPT_READY.format(ready=ready, desired=desired)
+        excerpt += NETWORK_DAEMONSET_EXCERPT_TAINTS.format(
+            taints=NETWORK_DAEMONSET_LIST_JOIN.join(
+                _uncovered_taint_text(text, uncovered[text]) for text in sorted(uncovered)
+            )
+        )
+        hits.append(
+            {
+                "namespace": meta.get("namespace", ""),
+                "object": f"{DAEMONSET_KIND}/{meta.get('name', '')}",
+                "excerpt": excerpt,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return hits
+
+
 # --------------------------------------------------------------------------- #
 # compliance-audit: all twenty checks of §2.
 #
@@ -8415,6 +8773,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         None,
         _IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH,
     ),
+    CheckSpec(
+        NETWORK_DAEMONSET_MISSING_TOLERATION_SLUG,
+        CHECK_KIND_CLUSTER,
+        check_network_daemonset_missing_toleration,
+        SEVERITY_MAJOR,
+        None,
+        IMPACT_NETWORK_DAEMONSET_MISSING_TOLERATION,
+    ),
 )
 
 def _condition(item: dict, condition_type: str) -> dict | None:
@@ -9408,6 +9774,8 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
     record = _record(paged_command_text(DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig), dump_run)
 
     context = build_context(dump, workloads)
+    # 3.27 reads system namespaces on a Standard cluster and not on Autopilot.
+    context[CONTEXT_AUTOPILOT] = bool(cluster.get("autopilot"))
     commands = {spec.slug: record for spec in checks}
     if any(spec.slug == INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG for spec in checks):
         served_crd_runs: list[tuple[str, Run]] = []
@@ -11215,7 +11583,13 @@ def collect_cluster(
         for spec in checks:
             if spec.slug in not_applicable_slugs:
                 continue
-            if spec.kind != "workload" and spec.slug not in _WORKLOAD_ANCHORED_CLUSTER_CHECKS:
+            # 3.27 reads `kube-system` past S1 on a Standard cluster. On
+            # Autopilot S1 binds it whole, so there it examined this same
+            # empty set.
+            anchored = spec.slug in _WORKLOAD_ANCHORED_CLUSTER_CHECKS or (
+                spec.slug == NETWORK_DAEMONSET_MISSING_TOLERATION_SLUG and bool(cluster.get("autopilot"))
+            )
+            if spec.kind != "workload" and not anchored:
                 continue
             not_applicable_slugs.add(spec.slug)
             checks_not_applicable.append({"check": spec.slug, "reason": reason})
