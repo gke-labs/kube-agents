@@ -362,6 +362,12 @@ const (
 	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
 	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
 
+	// a2aTierMembershipEnvVar carries spec.tiers.membership to the gateway
+	// as backend:user=tier, comma-separated, plaintext like the allowlists:
+	// the gateway HMACs the ids. Spelled the same in a2a/gateway/
+	// tier_membership.go (EnvTierMembership).
+	a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP"
+
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
 	// address it listens on. The host is the pod's loopback, not every
@@ -1561,6 +1567,28 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
 	}
 	return env
+}
+
+// a2aTierMembershipEnv renders spec.tiers.membership for the gateway
+// (#3659), and nothing when it's empty, so an install without it renders as
+// before. The schema keeps commas, equals signs and spaces out of a user, so
+// the list joins as it is. A person listed twice (two cases of one Google
+// Chat email, which the schema's keys tell apart and the webhook refuses, but
+// a cluster without the webhook admits) keeps the first entry: the gateway
+// refuses a repeat at boot, and one bad entry mustn't stop it.
+func a2aTierMembershipEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Tiers == nil || len(agent.Spec.Tiers.Membership) == 0 {
+		return nil
+	}
+	entries := make([]string, 0, len(agent.Spec.Tiers.Membership))
+	seen := map[string]bool{}
+	for _, m := range agent.Spec.Tiers.Membership {
+		if key := tierMemberKey(m); !seen[key] {
+			seen[key] = true
+			entries = append(entries, m.Backend+":"+m.User+"="+m.Tier)
+		}
+	}
+	return []corev1.EnvVar{{Name: a2aTierMembershipEnvVar, Value: strings.Join(entries, ",")}}
 }
 
 // a2aAgentDoorEnabled reports whether the operator was deployed with the A2A
@@ -7227,6 +7255,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
 	env = append(env, a2aTargetAllowlistEnv(agent)...)
+	env = append(env, a2aTierMembershipEnv(agent)...)
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
 	}
