@@ -142,6 +142,7 @@ from typing import NamedTuple
 import bootstrap_handoff  # beside this script in the pod
 import chat_notify  # beside this script in the pod
 import findings_queue as fq  # beside this script in the pod
+import first_run_report  # beside this script in the pod
 import forge  # beside this script in the pod
 import gitops_workspace  # beside this script in the pod
 import inventory_card  # beside this script in the pod
@@ -161,13 +162,14 @@ UNSET_LABEL = "<unset>"
 # The delivered report is renamed here rather than deleted. It is the only copy
 # of a sweep that can take many minutes over a whole fleet, and a chat message
 # is easy to lose; keeping it means a re-send is a `cat`, not a re-scan.
-DELIVERED_REPORT_NAME = "INVENTORY.delivered.md"
-REPORT_NAME = "INVENTORY.md"
+# The names are first_run_report.py's, which the on-demand read shares.
+DELIVERED_REPORT_NAME = first_run_report.DELIVERED_REPORT_NAME
+REPORT_NAME = first_run_report.REPORT_NAME
 # Touched once the sweep's findings are in the findings queue (or the sweep found
 # none), before the claim: the record that the fleet was checked, which the
 # Slack Home tab's board reads (agents/platform/scripts/board_snapshot.py) so a
 # clean cluster is not drawn as unchecked after a delivery that never posts.
-FINDINGS_REGISTERED_MARKER = ".bootstrap_findings_registered"
+FINDINGS_REGISTERED_MARKER = first_run_report.FINDINGS_REGISTERED_MARKER
 
 # The items the report lists, written by ``inventory_findings.py select``
 # (its DEFAULT_SHOWN_PATH and the keys below; test_bootstrap_onboarding_scripts.py
@@ -214,7 +216,7 @@ MARK_TIMEOUT_SECONDS = 5
 # The sandbox's data volume, whatever HERMES_HOME says on this side: the same
 # path by construction (deploy/sandbox/Dockerfile), and a separate constant
 # because it names a directory on the far side of the connection.
-SANDBOX_HOME = "/opt/data"
+SANDBOX_HOME = first_run_report.SANDBOX_HOME
 
 # Far above the report the prioritization stage writes, which is sized for one
 # chat message. It bounds what one tick moves over ssh; a report past it is
@@ -247,12 +249,12 @@ STALE_CLAIM_SECONDS = CONVERSATION_POST_MAX_SECONDS + CLAIM_MARGIN_SECONDS
 # place), so the lock and its holder are one file. An empty file is a claim from before the
 # tag (an older build, or a hand); ``_claim_path`` reads it as "", or as the no-human path's
 # when that path's old marker is beside it.
-COMPLETED_FILE = ".bootstrap_completed"
-CLAIM_PATH_ORIGIN = "origin"
-CLAIM_PATH_CONVERSATION = "conversation"
-CLAIM_PATH_NO_HUMAN = "no-human"
+COMPLETED_FILE = first_run_report.COMPLETED_FILE
+CLAIM_PATH_ORIGIN = first_run_report.CLAIM_PATH_ORIGIN
+CLAIM_PATH_CONVERSATION = first_run_report.CLAIM_PATH_CONVERSATION
+CLAIM_PATH_NO_HUMAN = first_run_report.CLAIM_PATH_NO_HUMAN
 # A claim that is there but could not be read this tick: nothing settles or releases on it.
-CLAIM_PATH_UNREADABLE = "unreadable"
+CLAIM_PATH_UNREADABLE = first_run_report.CLAIM_PATH_UNREADABLE
 # The marker builds before the tag wrote beside a no-human claim. Read only beside an empty claim
 # (one such build took and a restart left), so an upgrade mid-claim does not settle it unfiled;
 # removed with the claim.
@@ -478,7 +480,7 @@ CONVERSATION_REPORT_UPDATE = "onboarding-report"
 NOTIFY_EDIT_FAILED_PREFIX = "edit failed:"
 # Written right after the report's post answers, with the outcome: the
 # conversation path's "delivered", which the stale-claim rule and retirement wait on.
-CONVERSATION_DONE_FILE = ".bootstrap_conversation_done"
+CONVERSATION_DONE_FILE = first_run_report.CONVERSATION_DONE_FILE
 # A conversation post's outcome: posted; posted nothing as far as can be told
 # (exit 1, a route absent through the retries, a CLI that could not start); or
 # may have posted (exit 3, a killed CLI, any other exit).
@@ -538,7 +540,7 @@ REPORT_ISSUE_MARKER = "<!-- onboarding-first-report -->"
 REPORT_ISSUE_SWEEP_MARKER = "<!-- onboarding-first-report sweep={sweep} -->"
 # Written by the retire path beside the claim; with REPORT_FILED_FILE it is
 # what tells a claim this path kept from one its run died holding.
-REPORT_RETIRED_FILE = ".bootstrap_report_retired"
+REPORT_RETIRED_FILE = first_run_report.REPORT_RETIRED_FILE
 REPORT_ISSUE_TITLE = "First-run inventory report ({date} UTC)"
 REPORT_ISSUE_INTRO = (
     "Onboarding's first-run inventory report, filed here on {date} UTC because no chat thread could take it: "
@@ -555,11 +557,11 @@ REPORT_FORGE_CALLS_BEFORE_RECORD = 4
 REPORT_ISSUE_DATE_FMT = "%Y-%m-%d %H:%M"
 # Where this stage records the issue it filed (repository, number, when), read
 # by a later run's log line and by an operator asking where the report went.
-REPORT_FILED_FILE = ".bootstrap_report_filed"
-FILED_REPO = "repo"
-FILED_NUMBER = "number"
-FILED_URL = "url"
-FILED_AT = "filed_at"
+REPORT_FILED_FILE = first_run_report.REPORT_FILED_FILE
+FILED_REPO = first_run_report.FILED_REPO
+FILED_NUMBER = first_run_report.FILED_NUMBER
+FILED_URL = first_run_report.FILED_URL
+FILED_AT = first_run_report.FILED_AT
 # The issue's web address when the broker's answer carries none: github.com for
 # an `owner/name` slug, the named host for a GitHub Enterprise Server
 # `host/owner/name` one (gitops_workspace.get_managed_github_repo_names).

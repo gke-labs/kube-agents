@@ -185,6 +185,14 @@ operator:
   # so in the PlatformAgent's DispatcherCeiling condition.
   profileDispatcher:
     enabled: true
+  # Whether a chat `stop`, or Slack's Stop button, also stops the kanban cards
+  # the conversation filed. true sets A2A_CARD_STOP=true on the controller
+  # manager, which renders it onto the A2A gateway. Off by default: the stop
+  # needs a hermes-bridge sidecar and agent image that answer it, and an older
+  # pair answers that it couldn't confirm the cards stopped. An A2A_CARD_STOP
+  # entry in extraEnv wins.
+  cardStop:
+    enabled: false
   # Slack member ids of end-to-end test users, meant for CI and eval installs;
   # integration.slack.allowedUsers is still the gate on who is served.
   # A post such a user makes with a user token through an app carries the
@@ -1403,6 +1411,14 @@ platformAgent:
       #   requests:
       #     cpu: 150m
       #     memory: 384Mi
+      # defaultRoute is where the A2A gateway sends a plain conversation's first
+      # message: platform to the Platform Agent, session to a session pod of the
+      # conversation's own. Unset means platform; a later release flips the
+      # default to session. The Platform Agent stays reachable by handle either
+      # way. A change rolls the gateway and the Platform Agent pod. Against a
+      # PlatformAgent CRD that predates the field the chart fails; apply crds/
+      # first (upgrade.sh does).
+      # defaultRoute: platform
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
@@ -1417,7 +1433,11 @@ platformAgent:
       # thread. memoryBudgetMiB defaults to the agent container's memory request
       # in MiB (4096 at the default 4Gi), workerRssCapMiB to 1536,
       # queueBoundSeconds to 600 and failClosed to true; the operator renders
-      # the block with those defaults when nothing is set here.
+      # the block with those defaults when nothing is set here. Effective
+      # memoryBudgetMiB must be at least workerRssCapMiB regardless of
+      # failClosed: Helm template rendering refuses invalid admission blocks,
+      # the validating webhook refuses them where enabled, and the operator
+      # reports Degraded (InvalidKanbanAdmission).
       # admission:
       #   memoryBudgetMiB: 3072
       #   workerRssCapMiB: 1536

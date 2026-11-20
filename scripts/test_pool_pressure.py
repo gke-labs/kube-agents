@@ -6,11 +6,13 @@ import io
 import json
 import os
 import shutil
+import ssl
 import sys
 import tempfile
 import unittest
 import unittest.mock
 import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -97,7 +99,7 @@ class HeldProjectsTest(unittest.TestCase):
                 return False
 
         seen = {}
-        def fake_urlopen(request, timeout=None, context=None):
+        def fake_urlopen(request, timeout=None):
             seen.update(url=request.full_url, auth=request.get_header("Authorization"), timeout=timeout)
             if seen.get("code"):
                 raise urllib.error.HTTPError(request.full_url, seen["code"], "nope", {}, None)
@@ -112,7 +114,7 @@ class HeldProjectsTest(unittest.TestCase):
                     unittest.mock.patch.object(pp, "IN_CLUSTER_TOKEN_FILE", str(token)), \
                     unittest.mock.patch.object(pp, "IN_CLUSTER_CA_FILE", str(ca)), \
                     unittest.mock.patch.object(pp.ssl, "create_default_context", lambda cafile=None: cafile), \
-                    unittest.mock.patch.object(pp.urllib.request, "urlopen", fake_urlopen):
+                    unittest.mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=fake_urlopen):
                 source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
                 self.assertTrue(source.ok, source.error)
                 self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
@@ -127,6 +129,45 @@ class HeldProjectsTest(unittest.TestCase):
                 self.assertIn("not a JSON object", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
                 token.unlink()
                 self.assertIn("no service-account token", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
+
+    def test_the_in_cluster_read_takes_no_proxy_from_the_environment(self):
+        # The API server is inside the cluster. With a proxy variable and no NO_PROXY
+        # entry for it, urllib opens the connection to the API server through the proxy.
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        openers = []
+
+        def fake_open(opener, request, data=None, timeout=None):
+            openers.append(opener)
+            return Response(json.dumps(RESOURCES_DOC).encode("utf-8"))
+
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp, "token")
+            token.write_text("pod-token\n")
+            proxy = "http://egress.invalid:3128"
+            env = {
+                pp.IN_CLUSTER_HOST_ENV: "10.0.0.1", pp.IN_CLUSTER_PORT_ENV: "443",
+                "https_proxy": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "HTTP_PROXY": proxy,
+            }
+            with unittest.mock.patch.dict(os.environ, env), \
+                    unittest.mock.patch.object(pp, "IN_CLUSTER_TOKEN_FILE", str(token)), \
+                    unittest.mock.patch.object(pp.ssl, "create_default_context", lambda cafile=None: tls), \
+                    unittest.mock.patch.object(urllib.request.OpenerDirector, "open", autospec=True, side_effect=fake_open):
+                for name in ("no_proxy", "NO_PROXY"):
+                    os.environ.pop(name, None)
+                source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+        self.assertTrue(source.ok, source.error)
+        (opener,) = openers
+        self.assertFalse(any(h.proxies for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)))
+        # `_context` is where the handler of the Python library keeps its TLS context.
+        https = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+        self.assertEqual([h._context for h in https], [tls])
 
     def test_measure_publishes_held_and_its_error(self):
         code, out = run(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1, as_json=True)

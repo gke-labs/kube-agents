@@ -40,6 +40,7 @@ scripts/test_eval_rosters.py pins the arrays to the sets the script carried
 before the split.
 """
 
+import functools
 import os
 import pathlib
 import re
@@ -992,6 +993,18 @@ def load_matrix_through_the_part(
     return subprocess.run(["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True, check=False, env=clean_env(env))
 
 
+@functools.cache
+def nightly_part(part: str) -> subprocess.CompletedProcess:
+    """One part of the nightly through the part step, run one time for the
+    file. The result depends on the part, on the checkout's files and on the
+    environment that clean_env passes on, and no test changes those: a test
+    that reorders the rosters passes its own hack_dir to
+    load_matrix_through_the_part for that run. For a main shard the part step
+    starts a python3 for most entries of the main part, so one run for each
+    test that reads the shards is slow."""
+    return load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+
+
 class NightlyPartTest(unittest.TestCase):
     """EVAL_NIGHTLY_PART: the nightly as two periodics, one for the cases
     that request a pull request and one for the rest."""
@@ -1008,8 +1021,8 @@ class NightlyPartTest(unittest.TestCase):
         # The second-phase placement the docs and the roster reason blocks
         # state: a writes_alone case leaves the main halves.
         self.assertTrue(WRITES_ALONE, "no registered writes_alone case left to place")
-        main = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
-        writers = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        main = nightly_part("main")
+        writers = nightly_part("writers")
         for result in (main, writers):
             self.assertEqual(result.returncode, 0, result.stderr)
         main_names = {pathlib.Path(t).parent.name for t in lines_tagged(main, "TASK")}
@@ -1038,7 +1051,7 @@ class NightlyPartTest(unittest.TestCase):
                 self.assertNotIn("Nightly part:", result.stdout)
 
     def test_main_is_the_nightly_less_exactly_the_requesting_cases(self):
-        result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
+        result = nightly_part("main")
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = [e for e in self.nightly_matrix() if not self.is_writer(e)]
         self.assertEqual(lines_tagged(result, "TASK"), expected)
@@ -1052,7 +1065,7 @@ class NightlyPartTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c not in WRITERS)])
 
     def test_writers_is_exactly_the_requesting_cases_in_matrix_order(self):
-        result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        result = nightly_part("writers")
         self.assertEqual(result.returncode, 0, result.stderr)
         tasks = lines_tagged(result, "TASK")
         self.assertEqual(tasks, [e for e in self.nightly_matrix() if self.is_writer(e)])
@@ -1067,8 +1080,8 @@ class NightlyPartTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in WRITERS)])
 
     def test_the_two_parts_cover_the_nightly_once(self):
-        main = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
-        writers = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        main = nightly_part("main")
+        writers = nightly_part("writers")
         both = lines_tagged(main, "TASK") + lines_tagged(writers, "TASK")
         self.assertEqual(sorted(both), sorted(self.nightly_matrix()))
 
@@ -1120,7 +1133,7 @@ class NightlyPartTest(unittest.TestCase):
     def main_shards(self) -> list[list[str]]:
         out = []
         for part in MAIN_SHARDS:
-            result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+            result = nightly_part(part)
             self.assertEqual(result.returncode, 0, result.stderr)
             out.append(lines_tagged(result, "TASK"))
         return out
@@ -1227,7 +1240,7 @@ class NightlyPartTest(unittest.TestCase):
     def test_the_main_shards_export_only_their_own_roster_cases(self):
         for part, tasks in zip(MAIN_SHARDS, self.main_shards()):
             with self.subTest(part=part):
-                result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+                result = nightly_part(part)
                 names = set(self.names(tasks))
                 self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in names)])
                 self.assertIn(f"Nightly part: {part} ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
@@ -1240,7 +1253,7 @@ class NightlyPartTest(unittest.TestCase):
     def thirds(self) -> tuple[list[str], list[str], list[str]]:
         out = []
         for part in WRITERS_THIRDS:
-            result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+            result = nightly_part(part)
             self.assertEqual(result.returncode, 0, result.stderr)
             out.append(lines_tagged(result, "TASK"))
         return out[0], out[1], out[2]
@@ -1294,7 +1307,7 @@ class NightlyPartTest(unittest.TestCase):
         # half does (the roster block's comment on NIGHTLY_PART_DROPPED).
         for part, tasks in zip(WRITERS_THIRDS, self.thirds()):
             with self.subTest(part=part):
-                result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+                result = nightly_part(part)
                 names = set(self.names(tasks))
                 self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in names)])
                 self.assertIn(f"Nightly part: {part} ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)

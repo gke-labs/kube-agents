@@ -467,10 +467,10 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if live, err := sp.LiveSessions(ctx); err != nil {
+	if live, err := sp.SessionPods(ctx); err != nil {
 		t.Fatalf("live count against the install: %v", err)
-	} else if live != 0 {
-		t.Skipf("install busy: %d live session pods; rerun when quiet", live)
+	} else if len(live) != 0 {
+		t.Skipf("install busy: %d live session pods; rerun when quiet", len(live))
 	}
 
 	convA, convB, convC := "discord:livecap/s8-a", "discord:livecap/s8-b", "discord:livecap/s8-c"
@@ -518,8 +518,8 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 	turn(convB, "s8-live-2", "Delegate: write a haiku about resource limits")
 	taskB := taskFor(convB)
 	waitLive(t, "two live session pods on the install", 2*time.Minute, func() bool {
-		n, err := sp.LiveSessions(ctx)
-		return err == nil && n == 2
+		pods, err := sp.SessionPods(ctx)
+		return err == nil && len(pods) == 2
 	})
 
 	turn(convC, "s8-live-3", "Delegate: write a haiku about refusals")
@@ -532,8 +532,8 @@ func TestLiveSessionCapOnInstall(t *testing.T) {
 	if !refused {
 		t.Fatalf("no honest refusal at the cap; posts: %q", adapter.postTexts())
 	}
-	if n, err := sp.LiveSessions(ctx); err != nil || n != 2 {
-		t.Fatalf("third pod appeared past the cap (n=%d, err=%v)", n, err)
+	if pods, err := sp.SessionPods(ctx); err != nil || len(pods) != 2 {
+		t.Fatalf("third pod appeared past the cap (n=%d, err=%v)", len(pods), err)
 	}
 	// A refused turn changes nothing the turn did: first contact Creates
 	// the bare identity record (contextId minting is create-only, per the

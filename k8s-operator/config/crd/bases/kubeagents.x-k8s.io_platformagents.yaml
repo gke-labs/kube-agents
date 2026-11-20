@@ -5426,7 +5426,10 @@ spec:
                       description: |-
                         Resources specifies resource requests and limits for the main container.
                         The memory request is also the dispatcher's default admission budget
-                        (spec.harness.tuning.admission.memoryBudgetMiB).
+                        (spec.harness.tuning.admission.memoryBudgetMiB), so setting it below
+                        workerRssCapMiB without raising memoryBudgetMiB or lowering
+                        workerRssCapMiB is refused where the validating webhook is enabled, or
+                        reported as Degraded (InvalidKanbanAdmission).
                       properties:
                         claims:
                           description: |-
@@ -10012,7 +10015,10 @@ spec:
                                 the inactive file cache, the figure the kubelet evicts on) and counts it
                                 against this figure. Absent means the agent container's resolved memory request
                                 in MiB (4096 at the operator's default resources), so a CR that raises
-                                the request raises the budget with it.
+                                the request raises the budget with it. Effective memoryBudgetMiB must
+                                be at least workerRssCapMiB regardless of failClosed (refused where the
+                                validating webhook is enabled, or reported as Degraded with reason
+                                InvalidKanbanAdmission).
 
                                 Two bounds act on the budget. Each tick admits one new worker per
                                 512 MiB of headroom under it, so with the container's working set at W
@@ -10023,8 +10029,9 @@ spec:
                                 64 MiB. At the default budget the headroom bound acts first. A budget
                                 under the container's idle working set plus 512 MiB therefore admits
                                 no worker and refuses every card after QueueBoundSeconds; the schema's
-                                minimum of 512 is left there for a test install that wants exactly
-                                that, and a derived budget under it is clamped to it. A card the tick
+                                minimum of 512 is left there for a test install that sets memoryBudgetMiB
+                                to 512 and workerRssCapMiB to 512 or below, and a derived budget
+                                under it is clamped to it. A card the tick
                                 cannot spawn waits, and is refused after QueueBoundSeconds. Set the
                                 budget below the request to keep headroom for the gateway's own growth,
                                 or above it, up to the limit, on a node pool where eviction is not the
@@ -10153,6 +10160,28 @@ spec:
                               minimum: 1
                               type: integer
                           type: object
+                        defaultRoute:
+                          description: |-
+                            DefaultRoute is the addressee the A2A gateway sends a plain
+                            conversation's first message to: `session` opens a session pod of the
+                            conversation's own, `platform` hands it to the platform agent. Unset
+                            means `platform` for now; a later change flips the default to
+                            `session`. `platform` stays reachable by handle either way, and a
+                            `delegate:` still opens a session pod on either route. The operator
+                            renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
+                            on the platform agent container (which the hermes-bridge sidecar
+                            copies), so a change rolls the gateway and the platform agent pod.
+
+                            `session` widens the TASKS consumer budget: each session also counts
+                            the replays of its conversation's task, 7 consumers rather than 3, so
+                            40 more at the default 10 sessions. TASKS cannot be widened once it
+                            exists, so on an install whose stream was created narrower the
+                            provision Job refuses until maxSessions is lowered to fit or TASKS is
+                            recreated; its message names both.
+                          enum:
+                            - session
+                            - platform
+                          type: string
                         maxInProgress:
                           description: |-
                             MaxInProgress caps how many kanban workers run concurrently across the whole
@@ -12343,10 +12372,16 @@ spec:
                     leg:
                       description: |-
                         Leg is the direction: OneToThree (snapshot and restore, behind a write
-                        freeze) or ThreeToOne (in place).
+                        freeze), ThreeToOne (in place), or Reshape (TASKS alone recreated at
+                        the width the CR renders, at the count the bus runs, behind a write
+                        freeze; started only by the kubeagents.x-k8s.io/bus-reshape
+                        annotation). A run of a leg this operator does not run is held
+                        (A2ABusMigrationLegUnknown) until the operator that started it carries
+                        it on or a person abandons it.
                       enum:
                         - OneToThree
                         - ThreeToOne
+                        - Reshape
                       type: string
                     message:
                       description: Message is the manual step a Failed migration names.
@@ -12405,6 +12440,14 @@ spec:
                       description: |-
                         RunID names this migration's own Jobs, pods, ServiceAccounts and bus
                         principals.
+                      type: string
+                    settleTime:
+                      description: |-
+                        SettleTime is how long the one to three restore waited, from raising
+                        the last restored stream to three replicas, for every stream's replicas
+                        to be current and every restored durable consumer to answer from its
+                        leader, as a Go duration ("1.2s"). Set when a restore that succeeded
+                        reports it.
                       type: string
                     startedAt:
                       description: StartedAt is when the migration began.

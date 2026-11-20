@@ -162,6 +162,8 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         for url, why in (
             ("https://github.com/%zz-marker", "not a repository URL"),
             ("https://gitlab.com/marker-org/marker-repo.git", "not a GitHub host"),
+            # A host-less path: git takes it as a local directory (#6509).
+            ("github.com/marker-org/marker-repo", "names no host"),
         ):
             with self.subTest(url=url):
                 res.stdout = url + "\n"

@@ -391,7 +391,7 @@ Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback 
 
   A second `stop` before the task ends gets `🛑 cancel already sent — the task ends when the executor confirms`. With nothing running in the conversation, `stop` gets `🤷 nothing is running`. In a conversation that has run a task, the reply adds that if the agent filed a card for it, that card keeps working until it finishes. A card outlives the turn that filed it, and by default `stop` cannot reach it.
 
-  On an install whose operator sets `A2A_CARD_STOP=true`, `stop` stops the cards instead, except in a conversation whose tasks go to a session worker (the `/session` route below, or after `delegate`), which keeps the card notice. It posts `🛑 stopping this conversation's cards…`, which becomes `🛑 stopped 2 cards: <title>, <title>` naming up to five cards, with a note for anything it could not promise, such as cards that had already finished or a card that may still start.
+  On an install whose operator sets `A2A_CARD_STOP=true`, `stop` stops the cards instead, except in a conversation whose tasks go to a session worker (the `/session` route below, or after `delegate`), which keeps the card notice. It posts `🛑 stopping this conversation's cards…`, which becomes `🛑 stopped 2 cards: <title>, <title>` naming up to five cards, with a note for anything it could not promise, such as cards that had already finished or a card that may still start. `CARD_STOP_ENABLED=true` in `install.env`, or the chart's `operator.cardStop.enabled`, sets it.
 
   With no card open it answers `🤷 nothing is running`, or `🤷 no card was open in this conversation` if you've asked something new in the meantime. Card titles are shown as plain text, so a title can't mention anyone or add a link; dots and colons in a title show as look-alikes, so a URL in it isn't clickable.
 
@@ -825,9 +825,13 @@ The [admin console](/kube-agents/reference/admin-console/), started from a repos
 
 Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither reaches a person as it happens. The audit reports stay in the report store on the data volume, the triage shows on the board, and other scheduled reports are not kept.
 
+What the alert path did is still readable. Ask the agent through any of these doors `what alerts fired overnight?` and it answers from its event ledger: the alerts it posted, and the events it held back from chat and why.
+
 The onboarding delivery stage waits a day for a human to connect over chat. Then it files the first-run inventory report as an issue labelled `agent:onboarding`, in the GitOps repository when it is on GitHub or else in the install's one managed GitHub repository. A report it could not file is retired a week after the sweep. For that first day the report sits at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume.
 
 Read it there with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md`, or in the issue afterwards. The file is renamed `INVENTORY.delivered.md` once filed or retired.
+
+Or ask through any of these doors. `what did onboarding find?` answers from that report, `show me the full inventory` from the sweep's complete findings, and `was the first-run report delivered?` says where it went: the chat where the first person wrote, the issue, or retired after a week with nobody arriving.
 
 ## Where to go next
 
