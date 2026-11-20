@@ -61,7 +61,14 @@ func a2aDeploymentFullyOnTemplate(dep *appsv1.Deployment) bool {
 type a2aSupervisorReader struct {
 	name      string
 	container string
-	image     string
+	// image is this release's reader: the image whose readers parse the
+	// six-token form.
+	image string
+	// rendered is the image this operator renders for the reader on this
+	// install. It differs from image only where a spec pins it (the agent
+	// pod's hermes-bridge, derived from a pinned spec.deployment.image): a
+	// standing hold, which no rollout of this release will clear.
+	rendered string
 	// optional readers that aren't deployed don't hold the gate: one
 	// rendered later is this release's, which reads both forms.
 	optional bool
@@ -73,11 +80,12 @@ type a2aSupervisorReader struct {
 // the MCP server when its door is on.
 func a2aProfileSupervisorReaders(agent *agentv1alpha1.PlatformAgent) []a2aSupervisorReader {
 	readers := []a2aSupervisorReader{
-		{name: a2aGatewayName(agent), image: a2aGatewayImage()},
-		{name: agent.Name + "-gateway", container: a2aBridgeContainerName, image: a2aBridgeImage(defaultPlatformAgentImage())},
+		{name: a2aGatewayName(agent), image: a2aGatewayImage(), rendered: a2aGatewayImage()},
+		{name: agent.Name + "-gateway", container: a2aBridgeContainerName, image: a2aBridgeImage(defaultPlatformAgentImage()),
+			rendered: a2aBridgeImage(resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage()))},
 	}
 	if a2aMCPDoorEnabled() {
-		readers = append(readers, a2aSupervisorReader{name: a2aMCPName(agent), image: a2aConsoleImage(), optional: true})
+		readers = append(readers, a2aSupervisorReader{name: a2aMCPName(agent), image: a2aConsoleImage(), rendered: a2aConsoleImage(), optional: true})
 	}
 	return readers
 }
@@ -118,18 +126,23 @@ func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Con
 }
 
 // a2aSupervisorReadersCheck is a2aSupervisorReadersOnTemplate, also saying
-// whether the blocker runs an image other than this operator's render: a
-// standing hold (an older release's reader, a pinned agent image's bridge),
-// unlike a rollout still in flight.
+// whether the blocker is a standing hold: a reader this operator renders on an
+// image other than this release's (a pinned agent image's bridge). A live
+// reader still on an older release's image is not one: this pass, or the
+// next, applies this release's render, so it is a rollout in flight, like one
+// still rolling, even before the apply.
 func (r *PlatformAgentReconciler) a2aSupervisorReadersCheck(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, bool, error) {
 	for _, rd := range a2aProfileSupervisorReaders(agent) {
+		if rd.rendered != rd.image {
+			return false, rd.name, true, nil
+		}
 		key := client.ObjectKey{Namespace: agent.Namespace, Name: rd.name}
 		dep := &appsv1.Deployment{}
 		err := r.a2aReader().Get(ctx, key, dep)
 		switch {
 		case err == nil:
 			if !templateRunsImage(dep.Spec.Template.Spec, rd.container, rd.image) {
-				return false, rd.name, true, nil
+				return false, rd.name, false, nil
 			}
 			if !a2aDeploymentFullyOnTemplate(dep) {
 				return false, rd.name, false, nil
@@ -149,7 +162,7 @@ func (r *PlatformAgentReconciler) a2aSupervisorReadersCheck(ctx context.Context,
 			return false, rd.name, false, err
 		}
 		if !templateRunsImage(sts.Spec.Template.Spec, rd.container, rd.image) {
-			return false, rd.name, true, nil
+			return false, rd.name, false, nil
 		}
 		if !a2aStatefulSetFullyOnTemplate(sts) {
 			return false, rd.name, false, nil
@@ -207,7 +220,7 @@ func (r *PlatformAgentReconciler) a2aProfileSupervisorFormAndHold(ctx context.Co
 const a2aProfileSupervisorFormHeldReason = "ReaderNotOnReleaseImage"
 
 func profileSupervisorFormHeldMessage(heldBy string) string {
-	return heldBy + " runs an image other than this operator's release renders (an older release's, or a pinned agent image's hermes-bridge), so profile terminals stay on the five-token supervisor subject; a later release that drops that subject keeps it for this install while this holds"
+	return heldBy + " is rendered on an image older than this release's (the hermes-bridge of a pinned spec.deployment.image), so profile terminals stay on the five-token supervisor subject; a later release that drops that subject keeps it for this install while this holds, and raising or removing the pin clears it"
 }
 
 // profileSupervisorFormConditionCurrent reports whether the CR already carries

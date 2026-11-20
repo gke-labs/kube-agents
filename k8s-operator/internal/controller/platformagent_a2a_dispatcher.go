@@ -787,13 +787,20 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 	if len(jobTemplates) > 0 {
 		cfg.JobLabels = dispatchJobLabels(agent)
 	}
+	return cfg, stampDispatchConfigVersion(&cfg)
+}
+
+// stampDispatchConfigVersion sets cfg.Version to the digest of the rest of the
+// config, so the version follows the content.
+func stampDispatchConfigVersion(cfg *a2aDispatchConfig) error {
+	cfg.Version = ""
 	body, err := json.Marshal(cfg)
 	if err != nil {
-		return cfg, err
+		return err
 	}
 	sum := sha256.Sum256(body)
 	cfg.Version = hex.EncodeToString(sum[:dispatchConfigVersionBytes])
-	return cfg, nil
+	return nil
 }
 
 // dispatchConfigHeader is the dispatch config with no profiles: the
@@ -996,7 +1003,15 @@ func buildA2ADispatchConfigMapForm(agent *agentv1alpha1.PlatformAgent, profiles 
 	if err != nil {
 		return nil, err
 	}
-	cfg.ProfileSupervisorForm = supervisorForm
+	if supervisorForm != "" {
+		// Part of the digest, so the version moves when the switch flips.
+		// Empty, the field is omitted and the version is the one an older
+		// operator renders.
+		cfg.ProfileSupervisorForm = supervisorForm
+		if err := stampDispatchConfigVersion(&cfg); err != nil {
+			return nil, err
+		}
+	}
 	// Compact, not indented: indentation roughly doubles a Job template, and
 	// the whole config has to fit one ConfigMap (gke-labs/kube-agents#5479).
 	body, err := json.Marshal(cfg)

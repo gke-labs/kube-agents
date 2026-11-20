@@ -149,6 +149,7 @@ func TestTheRelayDurableTakesTheThirdFilterOnlyWhenAsked(t *testing.T) {
 
 func TestTheDispatchConfigCarriesTheSwitchItIsGiven(t *testing.T) {
 	agent := a2aTestAgent()
+	versions := map[string]string{}
 	for _, form := range []string{"", a2aProfileSupervisorFormValue} {
 		cm, err := buildA2ADispatchConfigMapForm(agent, nil, nil, nil, form)
 		if err != nil {
@@ -165,6 +166,16 @@ func TestTheDispatchConfigCarriesTheSwitchItIsGiven(t *testing.T) {
 		if form != "" && v != form {
 			t.Errorf("form %q rendered %v", form, v)
 		}
+		versions[form], _ = got["version"].(string)
+	}
+	// The version follows the content: it moves when the switch flips, and
+	// with the switch unset it is the version an older operator renders.
+	if versions[""] == versions[a2aProfileSupervisorFormValue] {
+		t.Errorf("flipping the switch left the version at %s", versions[""])
+	}
+	older, err := desiredDispatchConfigWith(agent, nil, nil, nil)
+	if err != nil || older.Version != versions[""] {
+		t.Errorf("an unset switch rendered version %s, the config without it %s (%v)", versions[""], older.Version, err)
 	}
 }
 
@@ -217,11 +228,18 @@ func TestTheGateReadsEachReadersImageAndWorkloadKind(t *testing.T) {
 // ReaderNotOnReleaseImage) so an admin can see why; a rollout still in flight
 // is no hold. The latch, once True, is never replaced by a hold.
 func TestAReaderOnAnOlderImageHoldsTheInstallAndSaysSo(t *testing.T) {
-	agent := a2aTestAgent()
 	ctx := context.Background()
+	// An install pinning an older platform-agent image renders that release's
+	// bridge: a standing hold, named.
+	agent := a2aTestAgent()
 	readers := a2aProfileSupervisorReaders(agent)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Image: "registry.example/kube-agents/" + platformAgentImageName + ":v0.0.1-older"}
+	pinnedReaders := a2aProfileSupervisorReaders(agent)
+	if pinnedReaders[1].rendered == pinnedReaders[1].image {
+		t.Fatalf("the pinned agent image rendered this release's bridge %q", pinnedReaders[1].rendered)
+	}
 	pinned := readerDeployment(agent, readers[1], true)
-	pinned.Spec.Template.Spec.Containers[0].Image = "registry/hermes-bridge:pinned-older"
+	pinned.Spec.Template.Spec.Containers[0].Image = pinnedReaders[1].rendered
 	r := supervisorFormReconciler(t, readerDeployment(agent, readers[0], true), pinned)
 	_, form, heldBy, err := r.a2aProfileSupervisorFormAndHold(ctx, agent)
 	if err != nil || form != "" || heldBy != readers[1].name {
@@ -236,9 +254,19 @@ func TestAReaderOnAnOlderImageHoldsTheInstallAndSaysSo(t *testing.T) {
 		t.Fatalf("hold condition = %+v", c)
 	}
 
+	agent.Spec.Deployment = nil
 	r = supervisorFormReconciler(t, readerDeployment(agent, readers[0], false), readerDeployment(agent, readers[1], true))
 	if _, _, heldBy, _ := r.a2aProfileSupervisorFormAndHold(ctx, agent); heldBy != "" {
 		t.Errorf("a gateway mid-roll was reported as a hold by %q", heldBy)
+	}
+	// The first pass of an upgrade reads the gateway before this pass applies
+	// it: still the older release's image, but this release renders the
+	// gateway itself, so that is a rollout to come, not a hold.
+	older := readerDeployment(agent, readers[0], true)
+	older.Spec.Template.Spec.Containers[0].Image = "registry.example/kube-agents/a2a-gateway:v0.0.1-older"
+	r = supervisorFormReconciler(t, older, readerDeployment(agent, readers[1], true))
+	if _, form, heldBy, _ := r.a2aProfileSupervisorFormAndHold(ctx, agent); heldBy != "" || form != "" {
+		t.Errorf("a gateway not yet re-applied: form %q, reported as a hold by %q", form, heldBy)
 	}
 	setProfileSupervisorFormCondition(agent, false, "", metav1.Now())
 	if meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition) != nil {
