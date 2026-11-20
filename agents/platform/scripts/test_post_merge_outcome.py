@@ -331,7 +331,7 @@ class TickTest(unittest.TestCase):
         with mock.patch.object(post_merge_check, "notice_merges", broken), \
                 self.assertLogs("post_merge_check", level="WARNING"):
             seen = self.tick(1)
-        self.assertEqual(seen["notice"], {"errors": ["RuntimeError: forge module missing"]})
+        self.assertEqual(seen["notice"], {"errors": ["checking which fixes merged"], "fault": "RuntimeError: forge module missing"})
         self.assertIn("outcomes", seen)
 
 
@@ -413,8 +413,18 @@ class CronRunTest(unittest.TestCase):
         # Exit 0: a non-zero exit makes the scheduler say the check "didn't run", and it did.
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(len(out.strip().splitlines()), 1, out)
-        self.assertTrue(out.startswith("The post-merge check ran, but 1 record(s) or step(s) failed"), out)
-        self.assertIn("logs/post_merge_check.log", out)
+        self.assertTrue(out.startswith("I checked merged fixes, but this failed: "), out)
+        # No plumbing in chat: no file path, step name or exception text, so the line is the same every run.
+        self.assertNotIn("logs/", out)
+        self.assertNotIn("render unreadable", out)
+        self.assertIn("reading this install's declared scope.", out)
+        self.assertIn("every five minutes", out)
+
+    def test_every_step_has_a_plain_task_for_the_chat_line(self):
+        names = {"notice", "edited", "health", "outcomes", "environments", "reports", "followups", "reverts"}
+        self.assertEqual(set(post_merge_outcome.STEP_TASKS), names)
+        # A plain phrase, never the bare internal name.
+        self.assertTrue(all(" " in task and task not in names for task in post_merge_outcome.STEP_TASKS.values()))
 
 
 class FailuresToReportTest(unittest.TestCase):
