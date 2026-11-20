@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -237,6 +238,9 @@ type Gateway struct {
 	// triggerEventLimits is the same for event sources' kinds (#6572).
 	triggerEventLimiterOnce sync.Once
 	triggerEventLimits      *triggerRateLimiter
+	// triggerMint, when set, mints trigger run grants in place of the cap
+	// bucket's minter (tests: a mint that fails).
+	triggerMint func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error)
 	// reports keeps the notify route's posts into conversations for the
 	// replies under them (reports.go).
 	reports pushedReports
@@ -3236,6 +3240,25 @@ type taskStart struct {
 	ChangeRequested bool
 }
 
+// childKeepsLine reports whether a task keeps its rolling line on a backend
+// that shows task status itself (StatusShower): a single child delegated to
+// an AgentProfile by a session turn (#6532). The backend's own status says
+// the chain is running, but none of it carries a profile worker's progress:
+// the plan rows come from the platform agent's notices, and the worker's
+// working and progress events render only on a line. Without one the room
+// sees "delegated to <profile>" and then nothing until the answer. A child
+// to platform keeps the platform's own status; a batch child (KeepActive)
+// is left as it is, since the relay doesn't edit its line yet; and a child
+// of a profile task is left lineless, so the room never holds two live
+// lines, its parent's and its own.
+func childKeepsLine(rec *SessionRecord, ts taskStart) bool {
+	if ts.Role != taskRoleChild || ts.Route == nil || ts.KeepActive {
+		return false
+	}
+	parent, ok := rec.TaskRefFor(ts.ParentTaskID)
+	return ok && parent.Tier == ""
+}
+
 // startTask opens a turn for a human message, and returns its task id once
 // the submission is on the bus, "" otherwise (startTaskWith).
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority, route *profileRoute) string {
@@ -3401,8 +3424,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	// None on a backend that shows the task's status itself (StatusShower).
-	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
+	// None on a backend that shows the task's status itself (StatusShower),
+	// except for a task delegated to a profile (childKeepsLine).
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key) && !childKeepsLine(rec, ts)
 	// A trigger's conversation has no chat backend: no placeholder there
 	// (unpostableTrigger), for a child or a wake started on its record.
 	if !lineless && !g.unpostableTrigger(rec.Key) {

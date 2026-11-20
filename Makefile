@@ -10,7 +10,17 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 # stay pinned in the Dockerfile and images.json); unset ones are simply not
 # passed, so an ordinary build is unchanged:
 #   make docker-build HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent
-BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
+# GOLANG_VERSION is the one tag among them: a mirrored golang copy is frozen at
+# one patch, and the builder stages run with GOTOOLCHAIN=local, so when a `go`
+# directive moves past that patch, a rebuild needs a tag that names a newer one.
+# Each list holds it where its Dockerfile declares the arg. It counts from the
+# make command line only: the golang image exports an environment variable of
+# the same name (a bare version, no `-alpine`), and a build inside such a
+# container must not take its builder tag from there.
+ifeq ($(origin GOLANG_VERSION),environment)
+GOLANG_VERSION :=
+endif
+BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE GOLANG_VERSION
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
 # The sandbox image is built from a different Dockerfile and shares none of
@@ -19,10 +29,10 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE DISTROLESS_IMAGE
+KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE GOLANG_VERSION DISTROLESS_IMAGE
 KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-HERMES_BRIDGE_IMAGE_VARS := GOLANG_IMAGE
+HERMES_BRIDGE_IMAGE_VARS := GOLANG_IMAGE GOLANG_VERSION
 HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
 # What the image reports as its own version. Hermes interpolates it into the
@@ -824,7 +834,10 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # fail here in a second instead. The same rules gate in CI through
 # scripts/test_task_registration.py (the tree-level scans, the sanitizer and
 # the run-record guard, as assertions of their own there); this target is the
-# fast path to them.
+# fast path to them. One rule loads each check entry with the harness's own
+# parser, which is in the bench package (`make test-bench-deps`): without the
+# package it does not run and the last line of the output says so, and its
+# gate in CI is bench/tests/test_case_entries_load.py.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \

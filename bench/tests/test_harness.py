@@ -1955,25 +1955,6 @@ def instant_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
 
 
-@pytest.fixture(autouse=True)
-def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Keep settling a card off whatever cluster kubectl is pointed at.
-
-    Settling reads the card's artifacts back and then deletes them, both by
-    exec-ing into the agent pod. Left live, the suite would issue a ``kubectl
-    exec`` per delegating test against the developer's current context -- slow,
-    and a delete aimed at a real pod. Returns the scripts that would have run.
-    """
-    scripts: list[str] = []
-
-    def _record(script: str, timeout: float) -> str:
-        scripts.append(script)
-        return ""
-
-    monkeypatch.setattr(harness, "_agent_shell", _record)
-    return scripts
-
-
 def _is_purge(script: str) -> bool:
     return harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script
 

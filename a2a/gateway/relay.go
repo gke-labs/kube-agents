@@ -110,6 +110,11 @@ var reasonSentences = map[string]string{
 	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
 	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A script-run task's worker (#5622): refused before the script ran,
+	// the script failed, or it ran past its bound.
+	"script-refused": "the worker refused to run this scheduled script, and its log says why",
+	"script-failed":  "the scheduled script ended with an error",
+	"script-timeout": "the scheduled script ran past its time limit and was stopped",
 	// A script-run task naming a script its profile doesn't list (#5622).
 	"script-not-allowed": "this agent isn't set up to run the script this schedule asked for, so it didn't run; whoever manages this agent can allow the script, or change the schedule",
 	// The agent ran and produced no answer.
@@ -1018,7 +1023,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
+			// On a backend that shows task status itself, the only line is a
+			// delegated profile child's (childKeepsLine): done, it closes to
+			// the bare mark, as a line that took its answer does, rather than
+			// leaving a "completed" header above the answer for good.
+			onLine := doneLine != "" || g.showsTaskStatus(rec.Key)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		if !active.Detached && rec.fanOutPending(taskID) {

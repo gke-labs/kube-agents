@@ -414,7 +414,13 @@ What the operator renders per profile, as built (amended 10/6):
     claim is a closed list of strings, allowed only on the `credential-proxy` audience: an
     unknown permit, a malformed list or a `permits` key on a `nats` credential refuses the
     token, in both verifiers. The permit names no repository; the managed list bounds where
-    every verb lands, a permitted write included. Under the permit the writes are still held
+    every verb lands, a permitted write included. The permit names one task, so its writes
+    reach only what that task made (#6400): `publish` a branch the task already published, or
+    one absent from the remote, claimed by the first task to publish it; `proposal-create`
+    only from a branch the task published; `proposal-update` only on a proposal the task
+    opened (`PROPOSAL_NOT_THIS_TASKS`, rule `caller.vcs-ownership`). The record is the one
+    stateful broker pod's own memory, so a restart refuses a task's later writes rather than
+    permitting anyone's. Under the permit the writes are also held
     to the install's own work (`VcsBroker.require_agent_proposal`, profile role only, rule
     `caller.vcs-ownership`): `proposal-update` only on a proposal `forge.is_agent_pull_request`
     calls the install's (opened by the credential's login, from a branch under
@@ -434,8 +440,9 @@ What the operator renders per profile, as built (amended 10/6):
     The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
     `capabilities`, which skip the managed list, and every other write, `branch-delete`
     among them. The shim sends the credential on these calls as it does on an exec. Known
-    limits: a task that names no cluster gets no `proxyToken`, so it reaches no
-    version-control verb at all; and `submit-suggestion` deletes a spent branch with
+    limits: a task that names no cluster gets no targeted `proxyToken` (at most a report
+    credential, which the broker refuses here), so it reaches no version-control verb at
+    all; and `submit-suggestion` deletes a spent branch with
     `branch-delete`, so on a profile worker that one path is refused.
   - A report credential (no target, the `unattended` tier and a trigger; #5619) is refused on
     `/v1/exec` and the MCP relay before any of this runs.

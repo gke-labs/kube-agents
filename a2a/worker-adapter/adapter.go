@@ -639,6 +639,11 @@ type turnPlan struct {
 	// dispatched worker's persona config). The run publishes a failed
 	// terminal for it and runs nothing.
 	setupErr error
+	// script is the helper script a script-run task runs in place of the
+	// harness, cleared by prepareScript (#5622). scriptRefusal, set
+	// instead, is why it can't run: the task is rejected and nothing runs.
+	script        *scriptRun
+	scriptRefusal string
 }
 
 // turnOutcome is one task's run, as the session loop needs it: the terminal
@@ -746,6 +751,16 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		}
 		state := lib.StateRejected
 		return done(Result{State: state}, a.finalize(state, reason, ""))
+	}
+
+	// A script-run task runs its script, or is refused, here: after the
+	// capability check, and never as a model turn.
+	if plan.scriptRefusal != "" {
+		state := lib.StateRejected
+		return done(Result{State: state}, a.finalize(state, "reason: script-refused - "+plan.scriptRefusal, ""))
+	}
+	if plan.script != nil {
+		return a.runScript(ctx, origin, originSeq, plan.script)
 	}
 
 	// The deliverable prompt is the message's text parts. A submission with

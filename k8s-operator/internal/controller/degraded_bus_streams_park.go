@@ -130,8 +130,10 @@ func applyParkBusStreamsDegraded(agent *agentv1alpha1.PlatformAgent, edit busStr
 // "" when none applies. They are read from the spec on every pass rather than
 // carried from the reconcile that applied the defaults, so the condition
 // clears on the pass the override is corrected. Each is Degraded only: the
-// workload runs at the operator's defaults, so Ready and the phase keep what
-// the workload says. A parked pass reads them too (parkBusStreamsDegraded):
+// resource and exec checks run workloads at the operator's defaults, and
+// InvalidKanbanAdmission keeps rendering the resolved kanban.admission block,
+// so Ready and the phase keep what the workload says. A parked pass reads them
+// too (parkBusStreamsDegraded):
 // they are what Degraded falls back to when the bus streams' reason goes.
 func specResourceDegraded(agent *agentv1alpha1.PlatformAgent) (string, string) {
 	if refusal, _ := credentialProxyResourcesRefusal(agent); refusal != "" {
@@ -147,6 +149,9 @@ func specResourceDegraded(agent *agentv1alpha1.PlatformAgent) (string, string) {
 	// broker.
 	if refusal := ValidateCredentialProxyExec(agent, nil); len(refusal) > 0 {
 		return conditionReasonInvalidCredentialProxyExec, fmt.Sprintf(invalidExecTierReplicasMsgFmt, refusal[0].Detail)
+	}
+	if refusal := kanbanAdmissionRefusal(agent); refusal != "" {
+		return conditionReasonInvalidKanbanAdmission, fmt.Sprintf(kanbanAdmissionDegradedMsgFmt, refusal)
 	}
 	return "", ""
 }
