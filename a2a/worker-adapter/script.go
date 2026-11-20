@@ -33,8 +33,9 @@ import (
 //   - the path resolves to a regular file under the script root, owned by
 //     root and writable by no one else, neither setuid nor setgid, in
 //     directories that are the same on both the named path and the resolved
-//     one; the file itself may be a symlink within the root, and no
-//     directory on the named path may be.
+//     one; the file itself may be one symlink within the root, straight to
+//     the file (not to another link, nor through a symlinked directory), and
+//     no directory on the named path may be a symlink.
 //
 // The script gets a cleared environment: the worker's own PATH and HOME and
 // the broker hand-off (all rendered by the operator), plus the task's
@@ -96,12 +97,15 @@ func (c scriptFileCheck) withDefaults() scriptFileCheck {
 
 // resolve is the real path of the script at path, or why it can't run. The
 // path has ScriptPath's shape under the root; its real path lies under the
-// root too; every directory from the root down to it, and down to the named
-// path (where none may be a symlink), and the file itself,
-// is owned by the owner and writable by no group or other; the file is a
-// regular file, neither setuid nor setgid; and the worker isn't the owner, so it can't have written
-// it. The root's own ancestors are image layers, which the build-time check
-// (deploy/docker/test_script_root_ownership.py) keeps root-owned.
+// root too; a named path that is a symlink names its real path as written,
+// so it is one link with no symlink, file or directory, on the way to the
+// file; every directory from the root down to the real path, and down to
+// the named path (where none may be a symlink), and the file itself, is
+// owned by the owner and writable by no group or other; the file is a
+// regular file, neither setuid nor setgid; and the worker isn't the owner,
+// so it can't have written it. The root's own ancestors are image layers,
+// which the build-time check (deploy/docker/test_script_root_ownership.py)
+// keeps root-owned.
 func (c scriptFileCheck) resolve(path string) (string, error) {
 	c = c.withDefaults()
 	root := strings.TrimSuffix(c.root, "/") + "/"
@@ -119,6 +123,12 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 	if !strings.HasPrefix(real, root) {
 		return "", fmt.Errorf("%s resolves to %s, outside %s", path, real, root)
 	}
+	// One link at most: the checks below cover the named path's directories and the real path's, so
+	// a second link, or a symlinked directory in the link's target, would leave a directory between
+	// them unchecked.
+	if err := oneLinkAtMost(path, real); err != nil {
+		return "", err
+	}
 	// Both chains: the resolved file's, and the named path's, so a directory on the way that is a
 	// symlink or writable by someone else is refused even when the file it leads to passes.
 	for _, d := range append(dirChain(root, path), dirChain(root, real)...) {
@@ -130,6 +140,30 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 		return "", err
 	}
 	return real, nil
+}
+
+// oneLinkAtMost refuses a named path that is a symlink whose target, as
+// written and taken from the link's own directory, isn't real: a link to a
+// link, or a link through a symlinked directory.
+func oneLinkAtMost(path, real string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return fmt.Errorf("reading the link %s: %w", path, err)
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	if filepath.Clean(target) != real {
+		return fmt.Errorf("%s links to %s, which is itself a symlink or reached through one (it resolves to %s); a script may be one link to its file", path, target, real)
+	}
+	return nil
 }
 
 // dirChain is every directory from root (which ends in "/") down to file's

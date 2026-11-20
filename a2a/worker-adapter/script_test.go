@@ -618,7 +618,8 @@ func TestAScriptThatExitsZeroWithAChildHoldingItsOutputIsNotATimeout(t *testing.
 
 // The directories on the path the confirm names are checked as well as the resolved file's: a
 // symlinked directory, or a group-writable one, on the named path is refused even when the file
-// it leads to passes every check.
+// it leads to passes every check, and a world-writable directory on the resolved path is refused
+// even when the named path's directories pass.
 func TestAScriptsNamedPathsDirectoriesAreCheckedToo(t *testing.T) {
 	root, check := scriptRoot(t)
 	good := filepath.Join(root, "helpers", "watch.sh")
@@ -647,12 +648,73 @@ func TestAScriptsNamedPathsDirectoriesAreCheckedToo(t *testing.T) {
 	if got, err := check.resolve(lib.ScriptRoot + "tidy/watch.sh"); err != nil || got != good {
 		t.Fatalf("a symlinked file in a sound directory: %q, %v; want the target", got, err)
 	}
+	// A named path whose own directories pass, through a symlinked file whose target lies in a
+	// world-writable directory: only the resolved file's chain is unsound.
+	loose := filepath.Join(root, "loose", "watch.sh")
+	writeScript(t, loose, "#!/bin/sh\necho ok\n", 0o755)
+	if err := os.Chmod(filepath.Dir(loose), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(loose, filepath.Join(tidy, "loose.sh")); err != nil {
+		t.Fatal(err)
+	}
 	for name, p := range map[string]string{
-		"a symlinked directory on the named path":      lib.ScriptRoot + "linked/watch.sh",
-		"a group-writable directory on the named path": lib.ScriptRoot + "open/watch.sh",
+		"a symlinked directory on the named path":              lib.ScriptRoot + "linked/watch.sh",
+		"a group-writable directory on the named path":         lib.ScriptRoot + "open/watch.sh",
+		"a world-writable directory on the resolved path only": lib.ScriptRoot + "tidy/loose.sh",
 	} {
 		if got, err := check.resolve(p); err == nil {
 			t.Errorf("%s: resolved to %q; want a refusal", name, got)
+		}
+	}
+}
+
+// A script file may be one symlink straight to its file, absolute or relative, and no more: a link
+// to a link (whose own directory the other checks don't reach) or a link through a symlinked
+// directory is refused.
+func TestAScriptsSymlinkMustLeadStraightToItsFile(t *testing.T) {
+	root, check := scriptRoot(t)
+	good := filepath.Join(root, "helpers", "watch.sh")
+	writeScript(t, good, "#!/bin/sh\necho ok\n", 0o755)
+	tidy := filepath.Join(root, "tidy")
+	if err := os.Mkdir(tidy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	openDir := filepath.Join(root, "open")
+	if err := os.Mkdir(openDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(openDir, 0o777); err != nil { // past the umask
+		t.Fatal(err)
+	}
+	links := map[string]string{
+		"tidy/abs.sh":     good,
+		"tidy/rel.sh":     "../helpers/watch.sh",
+		"open/hop.sh":     good,
+		"tidy/in.sh":      filepath.Join(openDir, "hop.sh"),
+		"tidy/hop.sh":     good,
+		"tidy/chain.sh":   "hop.sh",
+		"linkdir":         "helpers",
+		"tidy/viadir.sh":  "../linkdir/watch.sh",
+		"tidy/selfdir.sh": "../tidy/../helpers/watch.sh",
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"tidy/abs.sh", "tidy/rel.sh", "tidy/selfdir.sh"} {
+		if got, err := check.resolve(lib.ScriptRoot + name); err != nil || got != good {
+			t.Errorf("one link straight to the file (%s -> %s): %q, %v; want the target", name, links[name], got, err)
+		}
+	}
+	for name, why := range map[string]string{
+		"tidy/in.sh":     "a link to a link in a world-writable directory",
+		"tidy/chain.sh":  "a link to a link in a sound directory",
+		"tidy/viadir.sh": "a link through a symlinked directory",
+	} {
+		if got, err := check.resolve(lib.ScriptRoot + name); err == nil || !strings.Contains(err.Error(), "one link to its file") {
+			t.Errorf("%s (%s): %q, %v; want it refused as more than one link", why, name, got, err)
 		}
 	}
 }
