@@ -1791,6 +1791,10 @@ its first `/`. A Vertex AI endpoint path (`projects/…`) or a Bedrock ARN keeps
 so no project id, region or account id is written; every other name is kept as typed, an
 organisation prefix such as `meta-llama/` included.
 
+`inference.reasoningEffort` is the `reasoning_effort` on the same entry, as typed (the chart writes
+`litellm.reasoningEffort` there). It is absent when the entry states none, so the model thinks at
+its own default.
+
 The pair is written whole or not at all. Both fields are absent when the namespace has no LiteLLM
 config, when the `litellm` Deployment mounts none, or when the default model has no provider or no
 name. A Deployment that mounts none leaves any remaining `litellm-config*` ConfigMaps unread, and a
@@ -1811,6 +1815,9 @@ install, at once when the Ready status update next writes for any other reason. 
 writers carry the field through as they read it, so a pass that ends `Degraded` lands nothing new.
 `inference`, `resolvedUniverseDomain` and `universeDomainSource` follow the same Ready-writer and
 five-minute reprobe rule under a served CRD that predates them.
+
+A served CRD from before `inference.reasoningEffort` keeps the provider and model and drops the
+effort until it is applied.
 
 `profileSubmitMaxAgeSeconds` is the live `PROFILE_SUBMITS` stream's max age, as the A2A
 provision Job last read it, when it is longer than this release creates the stream with (`0` is no

@@ -181,6 +181,40 @@ operator applies no allowlist. `usage-counters-producer.md`'s security section g
 sentence that names the block, says its two strings come from the install's own LiteLLM config,
 and states the rule.
 
+### 2.5 The reasoning effort (added 2026-11-20)
+
+The maintainers' next headcount is "how many installs run at each reasoning effort". The chart
+renders `litellm.reasoningEffort` as `reasoning_effort` on the same `model_list` entries, so the
+value rides the read of section 2.3 with no new source: the `reasoning_effort` of the entry that
+answers the model (the `model-default` entry, else the first well-formed provider-qualified
+entry), as typed. It is absent when the key is missing, empty, not a string (LiteLLM's config
+accepts a bare number, and the parser must not fail the pair over it), or holds any whitespace; a
+malformed effort drops the effort alone and the pair stays. There is no cap on its length, as the
+model name has none, and no table of allowed words: the chart writes `low`, `medium` or `high`,
+and a vLLM template reads whatever its author chose. Absent means the model thinks at its own
+default; never a stand-in word.
+
+The carriers are the three the pair already has. `status.inference.reasoningEffort`, a string,
+`omitempty`, written by the Ready writer in the same block. The gauge
+`kubeagents_platformagent_model` gains a label, `reasoning_effort`, the empty string while the
+status holds no effort, so one sample per install stays, `sum by (provider, model)` is what it was
+and `sum by (reasoning_effort)` is the new headcount; a second gauge was rejected for the join
+it would force and the second publish path. Both summary copies print `reasoning effort:` directly
+under `model:`: the value, `unset` when the model is known and the status holds none, and
+`unavailable` whenever the model line is `unavailable`; each copy's line cap rises by one, as the
+origin line's did. The script's ConfigMap fallback, taken only when the status has no `inference`
+key, reads the key from the `model-default` entry alone, and prints `unavailable` when the
+first-qualified scan answered the model, whose entry that reader does not know.
+
+A served CRD from before the field keeps the pair and prunes the effort, so the Ready writer's
+echo rule gains a case: a pair that comes back as written with the effort alone dropped is pruning,
+recorded under the block's one record, and the five-minute reprobe holds as for the block. Without
+it an operator newer than its CRD would write the status on every reconcile. Under that skew the
+summary prints `unset` for the install; it makes no extra ConfigMap read to tell the two apart.
+
+Out of scope, as for the pair: the fallback alias's own effort, `max_tokens`, a request's own
+`reasoning_effort` (which wins over the configured one), and what each provider maps the value to.
+
 ## 3. What changes, by component
 
 - **Operator** (`common_types.go`, `platformagent_controller.go`, a new `inference_status.go`
@@ -218,8 +252,8 @@ and states the rule.
 
 ## 4. Goals, non-goals, what stays out
 
-Goals: one `provider/model` per install, readable from the CR, the operator's gauges and both
-summary copies, with no new egress.
+Goals: one `provider/model` per install, and the reasoning effort configured beside it, readable
+from the CR, the operator's gauges and both summary copies, with no new egress.
 
 Non-goals: the model that served a request (fallbacks, per-profile models, per-request overrides);
 a per-model request mix or its movement over time; a model per AgentProfile in status.

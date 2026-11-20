@@ -268,8 +268,8 @@ state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedbac
 deterministically, with the environment, usage, performance and feedback sections `scripts/feedback-summary.sh`
 prints from a workstation (epic #3426's share surface; the script alone adds the cluster scale
 counts, LiteLLM's live figures and recent task rows): environment (tag, mode, model from
-`status.inference` or `unavailable`, Kubernetes version, install age, readiness, active
-interfaces), the `status.usage` counters, the credential broker's top five tool and subcommand
+`status.inference` or `unavailable`, its reasoning effort or `unset`, Kubernetes version, install
+age, readiness, active interfaces), the `status.usage` counters, the credential broker's top five tool and subcommand
 pairs from `status.usage.topTools` (the operator's reading of the broker's counter,
 [`usage-counters-producer.md`](usage-counters-producer.md); the script reads the broker's
 metrics directly when it can and falls back to the same status list), a roll-up of the
