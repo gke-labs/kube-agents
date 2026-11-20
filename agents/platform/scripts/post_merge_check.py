@@ -45,6 +45,8 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
+from fix_recipes import probes
+
 logger = logging.getLogger("post_merge_check")
 
 RECORDS_TABLE = "post_merge_records"
@@ -704,8 +706,6 @@ def observed_directly(kubectl_json: KubectlJson, record: dict, workload: dict | 
     """Whether the fix is on the cluster, by the recipe's ``applied`` probe (``fix_recipes/probes.py``):
     for ``no-pdb``, a PodDisruptionBudget selecting the workload (design: "the driver observes the object
     directly")."""
-    from fix_recipes import probes
-
     return probes.applied(_recipe(record), kubectl_json, record, workload, selects)
 def cluster_coordinates(record: dict) -> tuple[str, str, str]:
     """``(project, name, location)`` for ``gcloud``: the fleet audit names a cluster
@@ -870,8 +870,6 @@ def watch_health(
                     return found
 
                 objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists, changed)
-                from fix_recipes import probes
-
                 watched = probes.holds_health_window(_recipe(record))
                 # A kind with no health window reads a workload only when the record names one, for
                 # an ``object_present`` probe that matches on its selector.
@@ -913,8 +911,6 @@ def watch_health(
                 applied_at = _parse_time(record["applied_at"])
                 if applied_at is None:
                     raise WorkloadGone("the apply time is unreadable")
-                from fix_recipes import probes
-
                 if not probes.holds_health_window(_recipe(record)):
                     # ``health: none``: the fix's object is not a workload, so applied is the whole check.
                     updates.update(health_result=HEALTH_PASSED, health_at=stamp,

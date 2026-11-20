@@ -31,12 +31,15 @@ The verification fields, all optional:
   `applied_resource` in the record's namespace, one whose selector selects the
   workload when the record names a workload, else the object the record names.
   `field_equals`: the object the record names, read as `applied_resource`, has
-  `applied_field` (a dotted path) equal to `applied_value`. Empty: the fix is
+  `applied_field` (a dotted path of plain keys: no list index, and no key with a
+  `.` in it) equal to `applied_value`. That object must exist before the fix,
+  since the probe reads it by name and a missing one fails the record; a fix
+  that creates its object uses `object_present`. Empty: the fix is
   seen only through a reconciler. `applied_noun` names the object in the
   reading (`budget`); it defaults to `object`.
 - `health`: `restart_flat` (the default) holds the health window on the
-  workload the record names; `none` passes the window once the fix is applied,
-  for a fix whose object is not a workload.
+  workload the record names; `none` passes the window on the run after the fix
+  is applied, for a fix whose object is not a workload.
 """
 
 from __future__ import annotations
