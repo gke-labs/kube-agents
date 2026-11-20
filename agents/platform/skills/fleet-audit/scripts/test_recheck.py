@@ -363,11 +363,22 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(sorted(recheck.RECHECKS), ["no-pdb"])
 
     def test_a_recipe_builds_its_steps_and_an_unknown_sibling_fails(self):
-        recipe = recheck.registry.Recipe("no-pdb", "n", "t", "dev", recheck_kinds="deployments")
+        full = "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers"
+        recipe = recheck.registry.Recipe("no-pdb", "n", "t", "dev", recheck_kinds=full)
         self.assertEqual(len(recheck.recheck_for(recipe).steps), 2)
         with self.assertRaises(KeyError):
             recheck.recheck_for(recipe._replace(recheck_siblings="no-such-sibling"))
-        full = "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers"
+        # The recipe's own check refuses a read missing what it looks up (the
+        # budgets) or a workload kind its target could be.
+        for missing in ("poddisruptionbudgets", "statefulsets", "daemonsets"):
+            kinds = ",".join(k for k in full.split(",") if k != missing)
+            with self.subTest(own_check=True, missing=missing), self.assertRaises(ValueError):
+                recheck.recheck_for(recipe._replace(recheck_kinds=kinds))
+        with self.assertRaises(ValueError):
+            recheck.recheck_for(recipe._replace(recheck_kinds="deployments"))
+        # A check that has not declared what it reads cannot be re-checked yet.
+        with self.assertRaises(KeyError):
+            recheck.recheck_for(recipe._replace(kind="hpa-floors-at-one"))
         # Each PDB sibling refuses a read missing any kind it counts: the
         # autoscaler floor, and every workload kind a budget can select (a
         # DaemonSet under the budget makes it unscalable).

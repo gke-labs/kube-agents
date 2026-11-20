@@ -57,7 +57,9 @@ target as the audit's scope leaves it, run one collector check by id on it,
 narrow a cluster check to the objects that select it. `RECHECKS` is built from
 the fix recipes (`fix_recipes/<kind>/recipe.yaml`, `recheck_kinds` and
 `recheck_siblings`); only `no-pdb` declares one. A recipe adds a re-check in its
-recipe file, plus a `SIBLING_NARROWING` entry for a sibling check not yet there.
+recipe file, plus a `CHECK_NEEDS` entry saying what its own check reads, and a
+`SIBLING_NARROWING` entry for a sibling check not yet there. A read short of
+either fails at import.
 Only collector workload checks are re-checked; readiness rules are not yet.
 
 Exit codes: 0 clean, 1 reproduces, 2 unchecked (a failed read, a crash inside
@@ -293,11 +295,24 @@ SIBLING_NARROWING: dict[str, tuple[Step, str, frozenset[str]]] = {
 }
 
 
+#: The kinds a recipe's own check needs in the read: every workload kind, so
+#: `in_scope_workload` can find a target of any of them, plus what the check
+#: itself looks up. Without budgets read, `no-pdb` finds none and reports a
+#: fixed workload as `reproduces`. A recipe whose check is not here fails at
+#: import, so a new check declares what it reads before it can be re-checked.
+CHECK_NEEDS: dict[str, frozenset[str]] = {
+    "no-pdb": WORKLOAD_KINDS | {"poddisruptionbudgets"},
+}
+
+
 def recheck_for(recipe: registry.Recipe) -> Recheck:
     """A workload-scoped recipe's re-check: find the target, run its own check, then each sibling narrowed."""
-    steps: list[Step] = [in_scope_workload, workload_check(recipe.kind)]
     # `poddisruptionbudgets.policy` reads the same kind as `poddisruptionbudgets`.
     read = {kind.split(".", 1)[0] for kind in recipe.recheck_kinds.split(",")}
+    needs = CHECK_NEEDS[recipe.kind]
+    if not needs <= read:
+        raise ValueError(f"{recipe.kind} needs {', '.join(sorted(needs - read))} in recheck_kinds")
+    steps: list[Step] = [in_scope_workload, workload_check(recipe.kind)]
     for sibling in recipe.siblings():
         select, context_key, needs = SIBLING_NARROWING[sibling]
         if not needs <= read:
