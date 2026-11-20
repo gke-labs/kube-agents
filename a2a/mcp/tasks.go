@@ -157,8 +157,7 @@ func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 		return nil, ErrTaskNotFound
 	}
 	for {
-		t, ferr := w.fold()
-		if ferr == nil && t.Final {
+		if t, final := w.ended(); final {
 			return t, nil
 		}
 		if err := w.next(ctx); err != nil {
@@ -183,6 +182,8 @@ type taskWatch struct {
 	seen    int
 	pending uint64
 	release func(created bool)
+	// statusUnfolded is a status-update read since ended last folded.
+	statusUnfolded bool
 }
 
 func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error) {
@@ -262,6 +263,7 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 		}
 		if env := agreedEnvelope(msg.Subject(), msg.Data()); env != nil {
 			w.events = append(w.events, env)
+			w.statusUnfolded = w.statusUnfolded || env.Kind == lib.KindStatusUpdate
 		}
 		if md, err := msg.Metadata(); err == nil {
 			w.pending = md.NumPending
@@ -285,6 +287,25 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 }
 
 func (w *taskWatch) fold() (*lib.Task, error) { return lib.FoldTask(w.ref.TaskID, w.events) }
+
+// ended reports the task once it is final, folding only when a status-update
+// has been read since the last fold: nothing else ends a task (FoldTask sets
+// Final from a status-update alone). A fold parses every payload read so
+// far, so folding after each artifact of a task near readMaxBytes costs the
+// whole task again between one pull and the next. On a slow pod that took
+// the gap between pulls past taskConsumerIdle, the server reaped the
+// consumer under the read, and the next pull failed with "no responders".
+func (w *taskWatch) ended() (*lib.Task, bool) {
+	if !w.statusUnfolded {
+		return nil, false
+	}
+	w.statusUnfolded = false
+	t, err := w.fold()
+	if err != nil || !t.Final {
+		return nil, false
+	}
+	return t, true
+}
 
 // taskAgreement is the supervisor check agreedEnvelope applies, the same
 // writers gateway.SupervisorAgreement accepts.
