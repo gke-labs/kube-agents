@@ -358,6 +358,7 @@ check_go_directive a2a/Dockerfile.dispatcher GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.console GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.teams-inbound GOLANG_VERSION a2a/go.mod
 check_go_directive hack/ghes-proxy/Dockerfile GOLANG_VERSION hack/ghes-proxy/go.mod
 check_go_directive a2a/Dockerfile.web-console GOLANG_VERSION a2a/go.mod
 

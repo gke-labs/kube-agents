@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"regexp"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -73,9 +75,9 @@ const (
 
 	// The projected ServiceAccount token the receiver presents to the
 	// broker, under an audience of its own.
-	teamsInboundTokenVolume     = "broker-token"
-	teamsInboundTokenDir        = "/var/run/secrets/kube-agents/teams-inbound"
-	teamsInboundTokenKey        = "token"
+	teamsInboundTokenVolume     = "broker-token"                               // #nosec G101 -- a volume name, not a credential
+	teamsInboundTokenDir        = "/var/run/secrets/kube-agents/teams-inbound" // #nosec G101 -- a mount path, not a credential
+	teamsInboundTokenKey        = "token"                                      // #nosec G101 -- a file name, not a credential
 	teamsInboundTokenTTLSeconds = 3600
 	teamsInboundTokenFileMode   = int32(0400)
 
@@ -109,6 +111,11 @@ const (
 	teamsInboundFenceIndex = 3
 )
 
+// teamsInboundTenantPattern is the shape of a tenant id, a GUID: the CRD
+// rule pins it too, and the receiver refuses anything else at boot, so a
+// domain pasted in place of the id renders no pod rather than a crash loop.
+var teamsInboundTenantPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
 // teamsInboundEgressExcept keeps the receiver's internet rule off every
 // in-cluster and private address: the API server's ClusterIP, the pods, the
 // nodes, the metadata server. Not a const: Go has no constant slices.
@@ -123,7 +130,7 @@ func teamsInboundEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 		return false
 	}
 	teams := agent.Spec.Integration.Teams
-	return teams.Inbound != nil && teams.Inbound.Enabled != nil && *teams.Inbound.Enabled && teams.TenantId != ""
+	return teams.Inbound != nil && teams.Inbound.Enabled != nil && *teams.Inbound.Enabled && teamsInboundTenantPattern.MatchString(strings.TrimSpace(teams.TenantId))
 }
 
 func a2aTeamsInboundImage() string {
@@ -183,11 +190,11 @@ func buildTeamsInboundServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1
 	}
 }
 
-// buildTeamsInboundDeployment runs the receiver: one replica, read-only
+// buildA2ATeamsInboundDeployment runs the receiver: one replica, read-only
 // root, no API server token mounted, the broker token projected under its
 // own audience, and the bot's app id read from the same Secret key the
 // broker reads it from (the password stays with the broker).
-func buildTeamsInboundDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+func buildA2ATeamsInboundDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := teamsInboundName(agent)
 	teams := agent.Spec.Integration.Teams
 	podLabels := a2aLabels(agent, teamsInboundComponent)
@@ -197,12 +204,16 @@ func buildTeamsInboundDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Dep
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, teamsInboundComponent)},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(1)),
+			// Recreate, as every single-replica pod of the stack rolls: the
+			// namespace quota budgets no surge pod for it.
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: teamsInboundPodSelector(agent)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           name,
 					AutomountServiceAccountToken: ptr.To(false),
+					DNSConfig:                    brokerCallerPodDNSConfig(),
 					ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
@@ -224,6 +235,9 @@ func buildTeamsInboundDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Dep
 					Containers: []corev1.Container{{
 						Name:  teamsInboundContainer,
 						Image: a2aTeamsInboundImage(),
+						// The image's own WORKDIR is /home/nonroot, which uid 1000
+						// cannot enter (#1259); "/" is 0755 on distroless static.
+						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: teamsInboundEnvListen, Value: teamsInboundListenAnyHost + ":" + strconv.Itoa(int(teamsInboundPort))},
 							{Name: teamsInboundEnvStatusListen, Value: teamsInboundListenAnyHost + ":" + strconv.Itoa(int(teamsInboundStatusPort))},
@@ -344,9 +358,16 @@ func (r *PlatformAgentReconciler) reconcileTeamsInbound(ctx context.Context, age
 	if !teamsInboundEnabled(agent) {
 		return r.removeTeamsInbound(ctx, agent)
 	}
+	dep := buildA2ATeamsInboundDeployment(agent)
+	// The secret-env digest, as the broker carries it (platformagent_secret_hash.go):
+	// the app id is read from the Teams Secret once at boot, as the audience
+	// every token must name, so a rotation in place must roll this pod too.
+	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
+		return err
+	}
 	for _, obj := range []client.Object{
 		buildTeamsInboundServiceAccount(agent),
-		buildTeamsInboundDeployment(agent),
+		dep,
 		buildTeamsInboundService(agent),
 	} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {

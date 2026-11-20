@@ -5362,7 +5362,7 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	n += int64(credentialProxyExecTierReplicas(agent))
 	// The Teams inbound receiver, a CR field like the exec tier.
 	if teamsInboundEnabled(agent) {
-		n += int64(ptr.Deref(buildTeamsInboundDeployment(agent).Spec.Replicas, 1))
+		n += int64(ptr.Deref(buildA2ATeamsInboundDeployment(agent).Spec.Replicas, 1))
 	}
 	// The profile dispatcher and the MCP server, each on unless its flag is
 	// "false" (operator.profileDispatcher.enabled and operator.mcpServer.enabled

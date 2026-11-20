@@ -467,7 +467,7 @@ type SlackSpec struct {
 
 // TeamsSpec contains the configuration for the Microsoft Teams integration.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef) && has(self.appPasswordSecretRef))",message="appIdSecretRef and appPasswordSecretRef are required when Teams integration is enabled"
-// +kubebuilder:validation:XValidation:rule="!has(self.inbound) || !has(self.inbound.enabled) || self.inbound.enabled == false || (has(self.enabled) && self.enabled == true && has(self.tenantId) && size(self.tenantId) > 0)",message="integration.teams.enabled and tenantId are required when integration.teams.inbound is enabled: the receiver serves one tenant of one enabled integration"
+// +kubebuilder:validation:XValidation:rule="!has(self.inbound) || !has(self.inbound.enabled) || self.inbound.enabled == false || (has(self.enabled) && self.enabled == true && has(self.tenantId) && self.tenantId.matches('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'))",message="integration.teams.enabled and a tenantId in GUID form are required when integration.teams.inbound is enabled: the receiver serves one tenant of one enabled integration"
 type TeamsSpec struct {
 	// Enabled toggles the Microsoft Teams integration.
 	// +kubebuilder:default=false
