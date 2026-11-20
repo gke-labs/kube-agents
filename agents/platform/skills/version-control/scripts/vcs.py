@@ -66,8 +66,10 @@ from vcs_client import VcsError  # noqa: E402
 # broker, so the text says that it may have taken effect, and a caller does not
 # send a write again without a look. A refusal keeps its strings and numbers
 # (`error`, `code`); a part that is a list or an object is left out.
+# The bound is the broker client's: `vcs_call` holds each broker body to it
+# first, so this step meets a deeper document only when a verb builds one itself.
 JSON_INDENT = 2
-MAX_PRINT_DEPTH = 500
+MAX_PRINT_DEPTH = credential_proxy_client.MAX_VCS_BODY_DEPTH
 ANSWER_TOO_DEEP_TEXT = (
     "the answer is nested too deep to print; the request reached the broker and may have taken effect"
 )
@@ -658,19 +660,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _nests_deeper_than(document: object, bound: int) -> bool:
-    """Whether `document` nests lists and objects more than `bound` levels. A loop, with no recursion."""
-    layer = [document]
-    for _ in range(bound):
-        layer = [
-            child
-            for node in layer
-            if isinstance(node, (dict, list))
-            for child in (node.values() if isinstance(node, dict) else node)
-        ]
-        if not layer:
-            return False
-    return any(isinstance(node, (dict, list)) for node in layer)
+#: The depth check of the broker client, which holds its answers to the same bound.
+_nests_deeper_than = credential_proxy_client.nests_deeper_than
 
 
 def _as_text(document: dict) -> str | None:
