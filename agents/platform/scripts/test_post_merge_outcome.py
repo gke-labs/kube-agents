@@ -305,6 +305,13 @@ class TickTest(unittest.TestCase):
         self.assertEqual(ran, ["fill_edited", "report"], "outcomes already reached are still reported")
         self.assertTrue(post_merge_outcome.errored(seen))
 
+    def test_every_step_tick_runs_has_a_plain_task_for_the_chat_line(self):
+        # The names come from a real run, so a step added to tick() without a phrase fails here.
+        names = set(self.tick(0, **self.fakes([])))
+        self.assertLessEqual(names, set(post_merge_outcome.STEP_TASKS))
+        # A plain phrase, never the bare internal name.
+        self.assertTrue(all(" " in task and task not in names for task in post_merge_outcome.STEP_TASKS.values()))
+
     def test_every_step_runs_in_order_with_the_environment_before_the_follow_ups(self):
         ran = []
         seen = self.tick(0, **self.fakes(ran))
@@ -418,13 +425,8 @@ class CronRunTest(unittest.TestCase):
         self.assertNotIn("logs/", out)
         self.assertNotIn("render unreadable", out)
         self.assertIn("reading this install's declared scope.", out)
-        self.assertIn("every five minutes", out)
-
-    def test_every_step_has_a_plain_task_for_the_chat_line(self):
-        names = {"notice", "edited", "health", "outcomes", "environments", "reports", "followups", "reverts"}
-        self.assertEqual(set(post_merge_outcome.STEP_TASKS), names)
-        # A plain phrase, never the bare internal name.
-        self.assertTrue(all(" " in task and task not in names for task in post_merge_outcome.STEP_TASKS.values()))
+        self.assertIn("say so again tomorrow", out)
+        self.assertNotIn("keep trying", out, "no promise to retry: a given-up record is never retried")
 
 
 class FailuresToReportTest(unittest.TestCase):

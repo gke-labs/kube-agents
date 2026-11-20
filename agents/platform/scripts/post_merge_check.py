@@ -1056,7 +1056,7 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
                 # One line on stdout, which chat posts, and exit 0: a non-zero exit makes the scheduler post
                 # that the check "didn't run" and will retry, where it did run and did the other records.
                 print(f"I checked merged fixes, but this failed: {'; '.join(failures)[:1500]}. "
-                      "I'll keep trying every five minutes and won't repeat this today.")
+                      "If it keeps failing, I'll say so again tomorrow.")
     return 0
 
 
