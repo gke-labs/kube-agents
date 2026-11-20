@@ -648,7 +648,6 @@ func (r *AgentScheduleReconciler) handleStop(ctx context.Context, sched *agentv1
 	// gateway has answered, so a stop lost to a crash, a lost leadership or a
 	// failed write before it is sent again on the next pass (the gateway
 	// answers a repeat for a run it already stopped as stopped).
-	prevStopped := st.StoppedTaskID
 	st.StoppedTaskID = st.ActiveTaskID
 	if err := r.writeStatus(ctx, sched, pass); err != nil {
 		return false, err
@@ -665,11 +664,13 @@ func (r *AgentScheduleReconciler) handleStop(ctx context.Context, sched *agentv1
 		// record of its trigger, say): the token is handled, and the run
 		// ends at its deadline.
 		logf.FromContext(ctx).Error(err, "the gateway refused a scheduled run's stop", "schedule", sched.Name, "taskId", st.ActiveTaskID)
-		st.LastHandledStop, st.StoppedTaskID = token, prevStopped
+		st.LastHandledStop, st.StoppedTaskID = token, ""
 		return false, nil
 	case err != nil:
+		// Kept while the stop is retried, as a claimed slot is
+		// (PendingSlot): a run-now meanwhile doesn't adopt the run being
+		// stopped, and a retry pass has nothing new to write.
 		logf.FromContext(ctx).Error(err, "stopping a scheduled run", "schedule", sched.Name, "taskId", st.ActiveTaskID)
-		st.StoppedTaskID = prevStopped
 		return true, nil
 	}
 	st.LastHandledStop = token
