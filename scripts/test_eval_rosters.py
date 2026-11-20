@@ -891,6 +891,10 @@ INJECT_LANE_SAFEGUARDS = [
 # finished. A new requesting case edits this set in the same pull request.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
+    # cluster-profile-confirmed-pdb-pull-request: a confirmed task asks the
+    # cluster profile for the no-pdb pull request; its objective's
+    # pull_request_opened leaf allows one.
+    "cluster-profile-confirmed-pdb-pull-request",
     # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
     # may propose the change as a pull request; its objective's
     # pull_request_opened leaf allows one.
@@ -909,6 +913,9 @@ INJECT_LANE_REQUESTING = [
     # objective's pull_request_opened leaf allows one.
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
+    # post-merge-verified-fixed: the post-merge check's case (#6343); its
+    # objective's pull_request_opened leaf allows the fix it opens.
+    "post-merge-verified-fixed",
     "rca-remediation-pr",
     # scale-request-proposes-pr: asked to scale a Deployment, it may propose
     # the change as a pull request; its objective's pull_request_opened leaf

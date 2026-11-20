@@ -29,10 +29,14 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shlex
+import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
+from kube_agents_bench import harness
 
 #: The variables that select and configure a forge: GitLab, a GitHub
 #: Enterprise Server host, another GitHub API root, a private CA, the renewed
@@ -57,6 +61,95 @@ FORGE_ENV_VARS = (
 def _no_forge_from_the_shell(monkeypatch):
     for name in FORGE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+#: What a `kubectl` without a kubeconfig reads next: the in-cluster service of a
+#: pod, and a default server.
+KUBECTL_FALLBACK_ENV_VARS = ("KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "KUBERNETES_MASTER")
+
+
+@pytest.fixture(autouse=True)
+def _no_cluster_from_the_shell(monkeypatch):
+    """`make test-bench` runs with the caller's environment, and the code under
+    test starts `kubectl` (the harness reads the agent through `kubectl exec`).
+    With the caller's kubeconfig, which is KUBECONFIG or `~/.kube/config` when
+    that is unset, a call that a test does not stub goes to the cluster of the
+    caller's current context. Each test gets KUBECONFIG set to the null device, which names no
+    cluster and keeps no write, and loses the variables in
+    KUBECTL_FALLBACK_ENV_VARS. A test that needs a kubeconfig sets its own.
+
+    This covers a test's own time only, not an import or a session fixture, and
+    a `kubectl` with no cluster still tries `localhost:8080`. A test that would
+    start `kubectl` must stub the call."""
+    monkeypatch.setenv("KUBECONFIG", os.devnull)
+    for name in KUBECTL_FALLBACK_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+#: The harness's one way into the agent's pod, `kubectl exec`, as the module has it.
+_REAL_AGENT_SHELL = harness._agent_shell
+
+
+@pytest.fixture(autouse=True)
+def no_cluster_exec(monkeypatch) -> list[str]:
+    """No test execs into an agent's pod through the harness.
+    `KubeAgentsHarness.run` reads the pod's clock before each run, and after it
+    settles the cards: it reads their files and then deletes them. Each step
+    goes through `harness._agent_shell`, which starts `kubectl exec`. Each test
+    gets a stand-in that answers as `_agent_shell` does when `kubectl` finds no
+    cluster: with no text. Returns the scripts that would have run. A test of
+    `_agent_shell` itself asks for `real_agent_shell`. Code with its own
+    `kubectl exec` is not covered; its tests stub their own call."""
+    scripts: list[str] = []
+
+    def _record(script: str, timeout: float) -> str:
+        scripts.append(script)
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _record)
+    return scripts
+
+
+@pytest.fixture
+def real_agent_shell(monkeypatch, no_cluster_exec) -> None:
+    """The module's own `_agent_shell`, for a test that stubs the `subprocess`
+    call below it."""
+    monkeypatch.setattr(harness, "_agent_shell", _REAL_AGENT_SHELL)
+
+
+@pytest.fixture(scope="session")
+def _recording_kubectl(tmp_path_factory):
+    """A `kubectl` first on PATH, from the first test to the last. It records
+    each start on one line and fails, as `kubectl` fails where it finds no
+    cluster. A test that puts its own `kubectl` first, or replaces PATH, does
+    not reach it."""
+    folder = tmp_path_factory.mktemp("no-host-kubectl")
+    starts = folder / "starts.log"
+    starts.write_text("")
+    kubectl = folder / "kubectl"
+    record = shlex.quote(str(starts))
+    kubectl.write_text(f"#!/bin/sh\nprintf '%s' \"$*\" | tr '\\n' ' ' >> {record}\necho >> {record}\nexit 1\n")
+    kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    patch = pytest.MonkeyPatch()
+    patch.setenv("PATH", f"{folder}{os.pathsep}{os.environ.get('PATH', '')}")
+    yield starts
+    patch.undo()
+
+
+@pytest.fixture(autouse=True)
+def _no_test_starts_the_hosts_kubectl(_recording_kubectl):
+    """A test that starts the `kubectl` on PATH gets an error here, with the
+    commands: with a developer's kubeconfig that start goes to a real cluster.
+    The record holds each start since the last test's check, so a start by a
+    module fixture counts for the first test that uses it."""
+    yield
+    started = _recording_kubectl.read_text().splitlines()
+    if started:
+        _recording_kubectl.write_text("")
+        pytest.fail(
+            "this test, or a fixture set up for it, started the kubectl on PATH. Stub the call that starts it: "
+            + "; ".join(f"kubectl {args.strip()}" for args in started)
+        )
 
 
 @pytest.fixture(autouse=True)

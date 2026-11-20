@@ -1501,6 +1501,10 @@ spec:
               value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
+              value: kubeagents-credential-proxy-a2a-reports
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1945,6 +1949,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -2024,6 +2030,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2220,6 +2229,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
             - name: NATS_URL
@@ -2300,6 +2311,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2599,6 +2613,11 @@ spec:
                   audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
         - name: a2a-bus-token
           projected:
             sources:
@@ -3044,7 +3063,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "498e575ea76aa076",
+      "version": "cb9ea894632366ed",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3179,6 +3198,7 @@ data:
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
               "chat.board",
+              "a2a.trigger.reply.>",
               "chat.incident",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.CONSUMER.CREATE.TASKS.>",
@@ -3224,6 +3244,8 @@ data:
               "chat.notify.slack",
               "chat.notify.console",
               "chat.board.reply.gateway.>",
+              "a2a.trigger.*.submit",
+              "a2a.trigger.*.status",
               "chat.incident.reply.gateway.>",
               "_INBOX.gateway.>"
             ],
@@ -3278,7 +3300,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 498e575ea76aa076
+    kubeagents.x-k8s.io/a2a-authmap-version: cb9ea894632366ed
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3480,7 +3502,7 @@ spec:
             - name: A2A_RESERVED_PRINCIPALS
               value: callout,gateway,bridge,seed,web,console,console-mcp,sys
             - name: A2A_RESERVED_ADDRESSEES
-              value: platform
+              value: platform,session
             - name: A2A_TASK_SIGNING_PUBLIC_KEYS
               value: <GENERATED_FOR_TESTS>
             - name: A2A_ISSUER_SEED
@@ -3903,6 +3925,7 @@ stringData:
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
                   "chat.board",
+                  "a2a.trigger.reply.>",
                   "chat.incident",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
@@ -3964,6 +3987,8 @@ stringData:
                   "chat.notify.slack",
                   "chat.notify.console",
                   "chat.board.reply.gateway.>",
+                  "a2a.trigger.*.submit",
+                  "a2a.trigger.*.status",
                   "chat.incident.reply.gateway.>",
                   "_INBOX.gateway.>"
                 ]
@@ -5734,6 +5759,7 @@ metadata:
 ---
 apiVersion: v1
 data:
+  gchat_home: ""
   slack_home: ""
 kind: ConfigMap
 metadata:
@@ -6017,29 +6043,29 @@ spec:
               so a restarted one can still read\n# every lease it has to re-adopt or fail.\n$NATS
               kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1
               --replicas=\"${STREAM_REPLICAS}\" --storage=file --max-bucket-size=67108864\n\n#
-              SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the\n#
-              report and whether and where it was posted (a2a/gateway/scheduled_reports.go;\n#
-              docs/designs/scheduling-on-profiles.md section 4). Written only by the\n#
-              gateway, before any post, so a run is on record whether it posts or not.\n#
-              History 1: each record moves through its statuses in place, and only the\n#
-              last is read. It is the durable record later readers enumerate, so the max\n#
-              age is long, 90 days, rather than none: KV is discard=new, and a bucket
-              with\n# no age would fill and refuse every later run's record, which posts
-              nothing.\n# The gateway cuts a report at 24KiB, and a value is capped at
-              256KiB, room\n# for that report's JSON escaping at its worst; a full-size
-              record is about\n# 25KB, so 256MiB holds about ten thousand, over a hundred
-              runs a day for the\n# 90 days.\n$NATS kv info SCHEDULED_REPORTS >/dev/null
-              2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas=\"${STREAM_REPLICAS}\"
-              --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h\n\n#
-              SCHEDULE_THREADS: the home-channel thread each schedule posts into for one\n#
-              UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;\n#
-              docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read\n#
-              only by the gateway, so a failover keeps posting into the day's thread.\n#
-              History 1; a 48h max age keeps a day's entry past its day and then drops\n#
-              it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a\n#
-              value is capped at 4KiB.\n$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1
-              || $NATS kv add SCHEDULE_THREADS --history=1 --replicas=\"${STREAM_REPLICAS}\"
-              --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h\n\n#
+          SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the\n#
+          report and whether and where it was posted (a2a/gateway/scheduled_reports.go;\n#
+          docs/designs/scheduling-on-profiles.md section 4). Written only by the\n#
+          gateway, before any post, so a run is on record whether it posts or not.\n#
+          History 1: each record moves through its statuses in place, and only the\n#
+          last is read. It is the durable record later readers enumerate, so the max\n#
+          age is long, 90 days, rather than none: KV is discard=new, and a bucket
+          with\n# no age would fill and refuse every later run's record, which posts
+          nothing.\n# The gateway cuts a report at 24KiB, and a value is capped at
+          256KiB, room\n# for that report's JSON escaping at its worst; a full-size
+          record is about\n# 25KB, so 256MiB holds about ten thousand, over a hundred
+          runs a day for the\n# 90 days.\n$NATS kv info SCHEDULED_REPORTS >/dev/null
+          2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+          --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h\n\n#
+          SCHEDULE_THREADS: the home-channel thread each schedule posts into for one\n#
+          UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;\n#
+          docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read\n#
+          only by the gateway, so a failover keeps posting into the day's thread.\n#
+          History 1; a 48h max age keeps a day's entry past its day and then drops\n#
+          it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a\n#
+          value is capped at 4KiB.\n$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1
+          || $NATS kv add SCHEDULE_THREADS --history=1 --replicas=\"${STREAM_REPLICAS}\"
+          --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h\n\n#
           NOTIFY_THREADS: the home-channel threads the gateway opened with a keyed\n#
           chat.notify post (an alert's), keyed <platform>.<hash of chat and thread>\n#
           (a2a/gateway/notify_threads.go). Written and read only by the gateway: a\n#
@@ -6484,6 +6510,8 @@ spec:
               value: "9096"
             - name: A2A_SPAWN_SESSIONS
               value: "true"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
             - name: A2A_WORKER_IMAGE
               value: ghcr.io/gke-labs/kube-agents/a2a-worker:latest
             - name: A2A_STRICT_EVENTS_WRITER
@@ -6523,6 +6551,14 @@ spec:
               value: default
             - name: A2A_GCHAT_TOKEN_PATH
               value: /var/run/secrets/a2a-chat-relay/token
+            - name: A2A_GCHAT_HOME_POLICY
+              value: auto
+            - name: A2A_HOME_CHANNEL_RECORD
+              value: platformagent-home-channel
+            - name: A2A_SELF_IMAGE
+              value: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
+            - name: A2A_HOME_CHANNEL_LEARN
+              value: "true"
             - name: A2A_RESOLVED_SCOPE_CONFIGMAP
               value: platformagent-resolved-scope
             - name: A2A_GATEWAY_LEASE
@@ -6532,6 +6568,10 @@ spec:
                 fieldRef:
                   apiVersion: v1
                   fieldPath: metadata.name
+            - name: A2A_REPORT_STORE_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: A2A_REPORT_STORE_TOKEN_FILE
+              value: /var/run/secrets/a2a-reports/token
             - name: A2A_TIERS_FILE
               value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
@@ -6569,6 +6609,12 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
+              readOnly: true
+            - mountPath: /etc/a2a/chat-home
+              name: chat-home
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-reports
+              name: a2a-reports-token
               readOnly: true
             - mountPath: /etc/a2a-tiers
               name: a2a-tiers
@@ -6615,6 +6661,19 @@ spec:
             sources:
               - serviceAccountToken:
                   audience: kubeagents-credential-proxy-a2a-chat
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
+        - name: a2a-reports-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-a2a-reports
                   expirationSeconds: 3600
                   path: token
         - configMap:

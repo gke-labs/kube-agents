@@ -156,6 +156,9 @@ class RelayTestCase(unittest.TestCase):
         })
         self.env.start()
         self.addCleanup(self.env.stop)
+        # The operator's project wins over GCP_PROJECT_ID, so a value from the shell must not
+        # reach a test. The patch above puts the value back.
+        os.environ.pop("PUBSUB_RELAY_PROJECT", None)
         # The expected paths have the default universe's host. The adapter takes the universe
         # from these two variables, so a value from the shell must not reach a test. The patch
         # above puts the values back.
@@ -179,7 +182,9 @@ class RelayTestCase(unittest.TestCase):
         self.adapter._set_fatal_error = lambda code, detail, retryable: fatal.append((code, detail, retryable))
         self.adapter._mark_connected = lambda: None
         self.adapter._mark_disconnected = lambda: None
-        logging.getLogger(LOGGER_NAME).setLevel(logging.INFO)
+        logger = logging.getLogger(LOGGER_NAME)
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(logging.INFO)
 
     def run_connect(self, connected_for=0.3):
         async def session():
@@ -343,6 +348,47 @@ class SettleTest(RelayTestCase):
         time.sleep(0.2)
         settles = [(path, body) for _, path, _, body in self.broker.calls]
         self.assertEqual(settles, [(NACK_PATH, {"ackIds": ["ack-1"], "ackDeadlineSeconds": 0})])
+
+
+class NoProxyTest(RelayTestCase):
+    def _the_adapter_loaded_with_a_proxy_in_the_environment(self):
+        """A stand-in proxy that records requests, and the adapter loaded after the proxy is set."""
+        proxy = FakeBroker()
+        self.addCleanup(proxy.close)
+        # The patch of os.environ in setUp puts these back. urllib reads the name in any case.
+        for name in [name for name in os.environ if name.lower() == "no_proxy"]:
+            del os.environ[name]
+        for name in ("http_proxy", "HTTP_PROXY"):
+            os.environ[name] = proxy.url
+        # A load of its own, after the variables are set: an opener that the module builds when
+        # it loads takes its proxy at that time.
+        loaded, put_back = test_dedup.load_adapter_for_a_test_file()
+        self.addCleanup(put_back)
+        return proxy, loaded
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_relay(self):
+        """The relay is an in-cluster Service, and each call to it has the gateway's token on it."""
+        proxy, loaded = self._the_adapter_loaded_with_a_proxy_in_the_environment()
+        relay = loaded.PubsubRelay(self.broker.url, self.token_file.name)
+        relay.get_subscription(SUB_PATH, timeout=5)
+        self.assertEqual(proxy.calls, [])
+        self.assertEqual([(method, path) for method, path, _, _ in self.broker.calls], [("GET", GET_PATH)])
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_gateway_api(self):
+        """The gateway's API is on loopback: a proxy cannot reach it, and would get the alert's prompt."""
+        proxy, loaded = self._the_adapter_loaded_with_a_proxy_in_the_environment()
+        os.environ["PLATFORM_API_URL"] = self.broker.url
+        os.environ["API_SERVER_KEY"] = "api-server-key"
+        adapter = loaded.PubSubAdapter.__new__(loaded.PubSubAdapter)
+        asyncio.run(adapter._run_turn_via_api("platform", "look at this alert", "alert-1", ROUTE))
+        self.assertEqual(proxy.calls, [])
+        self.assertEqual(
+            [(method, path, headers["Authorization"]) for method, path, headers, _ in self.broker.calls],
+            [
+                ("POST", "/p/platform/api/sessions", "Bearer api-server-key"),
+                ("POST", "/p/platform/api/sessions/alert-1/chat", "Bearer api-server-key"),
+            ],
+        )
 
 
 class PreflightTest(RelayTestCase):

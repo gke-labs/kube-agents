@@ -12,11 +12,14 @@ name: Installer tests on bash 3.2
 # on PATH, as step0-bash-floor.yml does for one file. It also runs the tests of
 # scripts/dev/repeat_under_load.sh. The pull request rules ask every
 # contributor to run that developer script, and a contributor on a stock Mac
-# runs it with bash 3.2.
+# runs it with bash 3.2. And it runs tests/test_ci_deploy_helm_retry.py, whose
+# harness runs parts of hack/ci-deploy.sh with the bash on PATH: the script
+# runs on Linux only, but a contributor on a stock Mac runs its tests.
 #
 # NOT a required check. A red run here does not block a merge; it tells the
-# author that the change breaks the installer, or repeat_under_load.sh, on
-# bash 3.2. Whether the job becomes required is the question of #6078.
+# author that the change breaks the installer, repeat_under_load.sh, or the
+# helm retry tests, on bash 3.2. Whether the job becomes required is the
+# question of #6078.
 #
 # The paths are the files that the job needs, measured, not guessed: the test
 # files pass in a tree that holds the listed test inputs and nothing else, and
@@ -37,6 +40,7 @@ on:
       - "scripts/release/common.sh"
       - "scripts/confirm_agent_image.sh"
       - "scripts/dev/repeat_under_load.sh"
+      - "hack/ci-deploy.sh"
       - "terraform/examples/full-install/**"
       - "terraform/modules/kube-agents-scope-resolver/**"
       - "charts/kube-agents/**"
@@ -57,6 +61,7 @@ on:
       - "tests/test_installer_report_files.py"
       - "tests/test_lifecycle_script.py"
       - "tests/test_repeat_under_load.py"
+      - "tests/test_ci_deploy_helm_retry.py"
       - "tests/testing/**"
       - "tests/testdata/**"
       - "tests/data/**"
@@ -91,6 +96,7 @@ env:
     tests/test_installer_report_files.py
     tests/test_lifecycle_script.py
     tests/test_repeat_under_load.py
+    tests/test_ci_deploy_helm_retry.py
 
 jobs:
   installer-tests-on-bash-3-2:
@@ -112,7 +118,7 @@ jobs:
       # tests/test_upgrade_script.py has chart tests that are `skipUnless(helm)`;
       # the same version as the Linux unit-test job.
       - name: Set up Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.2.3
 

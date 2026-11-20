@@ -110,6 +110,26 @@ func waitForRunEnded(t *testing.T, tr *triggerRig) {
 	})
 }
 
+// TestATriggerStatusCarriesTheRunsDelivery: once a run has ended and its
+// report is recorded, the status reply the reconciler reads carries the
+// record's status, here stored_no_home for an install with no home channel.
+func TestATriggerStatusCarriesTheRunsDelivery(t *testing.T) {
+	t.Parallel()
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	s.Delivery.SilentWhenClean = false
+	taskID := runScheduled(t, tr, s, "Two findings.", nil)
+	waitForScheduledReport(t, tr.rig, "compliance-audit", taskID, "the record", func(r *ScheduledReport) bool { return true })
+	var got lib.TriggerStatusReply
+	waitFor(t, "the delivery in the status", func() bool {
+		got = tr.status(t, s, taskID)
+		return got.Delivery != ""
+	})
+	if !got.Terminal || got.Delivery != scheduledStoredNoHome {
+		t.Fatalf("status = %+v, want terminal with delivery %s", got, scheduledStoredNoHome)
+	}
+}
+
 // TestAScheduledRunThatFoundNothingIsRecordedSilentAndNotPosted: a
 // silent-when-clean schedule whose run reports [SILENT] is recorded silent
 // and posts nothing.
