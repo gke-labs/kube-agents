@@ -409,7 +409,7 @@ const a2aGatewayUser = "gateway"
 const (
 	a2aTriggerSubmitWildcard  = "a2a.trigger.*.submit"
 	a2aTriggerStatusWildcard  = "a2a.trigger.*.status"
-	a2aTriggerStopWildcard    = "a2a.trigger.*.stop"
+	a2aTriggerStopSubjects    = "a2a.trigger.*.stop"
 	a2aTriggerReplySubjects   = "a2a.trigger.reply.>"
 	a2aTriggerScheduleSubmit  = "a2a.trigger." + triggerScheduleSource + ".submit"
 	a2aTriggerScheduleStatus  = "a2a.trigger." + triggerScheduleSource + ".status"
@@ -738,7 +738,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			// own recorded runs.
 			a2aTriggerSubmitWildcard,
 			a2aTriggerStatusWildcard,
-			a2aTriggerStopWildcard,
+			a2aTriggerStopSubjects,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
