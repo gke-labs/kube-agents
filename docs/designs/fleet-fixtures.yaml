@@ -401,8 +401,11 @@ fixtures:
     defect: >-
       A Deployment targeted through the nodeSelector with a hand-written
       toleration for the class taint that names key, value and effect and no
-      operator. The pool it targets carries no taint, so the pod runs; the
-      toleration's shape is the fixture.
+      operator. GKE adds its own toleration with operator Equal to a Pod
+      that selects a class, and a live test ran this shape on a tainted class
+      pool, hand-made and GKE-created (Standard 1.35.8, Autopilot 1.36.4;
+      older versions not tested): no defect, and no case reads the role. The
+      pool it targets carries no taint, so the pod runs.
 
   - role: no-ephemeral-limit-workload
     slot: c
@@ -411,7 +414,7 @@ fixtures:
       - deployment/batch-worker-a
     namespace: seeded-compute-class
     defect: >-
-      The same batch-worker-a Deployment, read for a second defect: its
+      The same batch-worker-a Deployment, read for its defect: its
       container sets no ephemeral-storage request or limit, so its writable
       layer and logs can fill the node's boot disk until the kubelet evicts
       pods under DiskPressure. GKE Standard admission adds none, where

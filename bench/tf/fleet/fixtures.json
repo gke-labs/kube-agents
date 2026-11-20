@@ -1570,7 +1570,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/app-worker-a", "computeclass/general-ccc"],
-      "fixture": "app-worker-a Deployment, three replicas, no cloud.google.com/compute-class nodeSelector and no compute-class affinity, in a namespace with no default class, on the cluster whose only untainted pool carries the general-ccc label; the untargeted workload the obtainability audit's 3.24 and the stockout audit's pre-filter check name",
+      "fixture": "app-worker-a Deployment, three replicas, no cloud.google.com/compute-class nodeSelector and no compute-class affinity, in a namespace with no default class, on the cluster whose only untainted pool carries the general-ccc label; the untargeted workload the obtainability audit's 3.24 names",
       "state": [
         {
           "subject": "deployment/app-worker-a",
@@ -1583,7 +1583,7 @@
           "subject": "deployment/app-worker-a",
           "path": "spec.template.spec.nodeSelector",
           "op": "absent",
-          "why": "the defect is the missing selector; the remediation the cases forbid is adding it"
+          "why": "the defect is the missing selector; the remediation the case forbids is adding it"
         },
         {
           "subject": "computeclass/general-ccc",
@@ -1619,7 +1619,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/batch-worker-a", "computeclass/general-ccc"],
-      "fixture": "batch-worker-a Deployment, one replica, nodeSelector on ComputeClass general-ccc with a hand-written toleration for the class taint that names key, value and effect and no operator (planted through a raw manifest: the provider's typed Deployment would write `operator: Equal`); the pool carries no taint, so the pod runs and the shape, not a scheduling failure, is the fixture",
+      "fixture": "batch-worker-a Deployment, one replica, nodeSelector on ComputeClass general-ccc with a hand-written toleration for the class taint that names key, value and effect and no operator (planted through a raw manifest: the provider's typed Deployment would write `operator: Equal`); GKE adds its own `operator: Equal` toleration to a Pod that selects a class, and a live test ran this shape on a tainted class pool, hand-made and GKE-created (Standard 1.35.8, Autopilot 1.36.4; older versions not tested): no defect, and no check flags it; the pool carries no taint, so the pod runs",
       "state": [
         {
           "subject": "deployment/batch-worker-a",
@@ -1633,13 +1633,13 @@
           "path": "spec.template.spec.nodeSelector[\"cloud.google.com/compute-class\"]",
           "op": "eq",
           "value": "general-ccc",
-          "why": "the workload is targeted; the defect is in its toleration, not its selector"
+          "why": "the workload is targeted through its selector"
         },
         {
           "subject": "deployment/batch-worker-a",
           "path": "spec.template.spec.tolerations[?(@.key=='cloud.google.com/compute-class')].operator",
           "op": "absent",
-          "why": "the defect is the toleration without an operator; the API server stores it as written, and anyone adding `operator: Equal` heals the shape the check reads"
+          "why": "the control is the toleration with no operator, which the API server stores as written; an operator added makes it the plain explicit form"
         }
       ]
     },
@@ -1647,7 +1647,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/batch-worker-a"],
-      "fixture": "the same batch-worker-a Deployment, read for a second defect: its container sets no ephemeral-storage request or limit, as every planted workload in the fleet does (GKE Standard admission adds none, where Autopilot writes a 1Gi request and limit onto every container), so its writable layer and logs can fill the node's boot disk until the kubelet evicts pods under DiskPressure",
+      "fixture": "the same batch-worker-a Deployment, read for its defect: its container sets no ephemeral-storage request or limit, as every planted workload in the fleet does (GKE Standard admission adds none, where Autopilot writes a 1Gi request and limit onto every container), so its writable layer and logs can fill the node's boot disk until the kubelet evicts pods under DiskPressure",
       "state": [
         {
           "subject": "deployment/batch-worker-a",
