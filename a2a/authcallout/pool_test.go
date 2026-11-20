@@ -266,3 +266,17 @@ func TestARequestWithNoBudgetLeftAndNoFreeSlotIsRefusedNotHeld(t *testing.T) {
 		t.Errorf("the refusal was not logged with its reason; log:\n%s", logged)
 	}
 }
+
+// The suite's harnesses lift the callout's two budgets (serveCallout); what
+// ships is whatever the constructors set. Both are authDecisionBudget, the
+// bound the server's first-ping timer puts on a decision, and a constructor
+// that left either at zero would refuse every connection.
+func TestTheConstructorsSetTheShippedDecisionBudget(t *testing.T) {
+	d := startDirectCallout(t, map[string]Attested{}, nil)
+	if d.svc.decisionBudget != authDecisionBudget {
+		t.Errorf("NewService's decision budget = %v, want %v", d.svc.decisionBudget, authDecisionBudget)
+	}
+	if d.svc.validator.reviewBudget != authDecisionBudget {
+		t.Errorf("NewTokenValidator's review budget = %v, want %v", d.svc.validator.reviewBudget, authDecisionBudget)
+	}
+}

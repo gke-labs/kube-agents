@@ -37,7 +37,11 @@ const renderedTLSDir = "/etc/nats-tls/"
 // refusal in whichever test happened to be connecting. None of the four is
 // what this suite asserts, so the harness's dial option carries this on the
 // client side and startHarness/startLiveHarness set it on the embedded
-// server (serverConnectBudget); the rendered conf is untouched. Three
+// server (serverConnectBudget); the rendered conf is untouched. The callout
+// holds a fifth bound, authDecisionBudget, measured from the request's
+// receipt and so spent queueing behind its worker slots: a burst of
+// connections whose handshakes a loaded runner spreads past it is refused
+// as "authorization timed out". serveCallout lifts that one too. Three
 // clients stay at their own budgets: lib.Connect's callers keep its 10 s
 // dial timeout; the worker adapter the session tests run opens a second,
 // raw connection in dialBus with the library's 2 s; and the nats CLI
@@ -131,4 +135,27 @@ func serverConnectBudget(opts *natsserver.Options) {
 	opts.TLSTimeout = testDialTimeout.Seconds()
 	opts.AuthTimeout = testDialTimeout.Seconds()
 	opts.DisableShortFirstPing = true
+}
+
+// serveCallout subscribes the callout on conn and returns once the server
+// holds the subscription, with the callout's decision and review budgets
+// lifted to the suite's connect budget; see testDialTimeout.
+//
+// The flush is the harness's, not Subscribe's (which says why it has none).
+// A SUB is written by the client's flusher goroutine some time after
+// Subscribe returns, and the server waits out its whole authorization
+// timeout on a request it published to no subscriber. A test that dials
+// straight after the harness returns could get there first, and its connect
+// then failed as an i/o timeout at testDialTimeout. The server answers the
+// flush's PING after it has processed the SUB before it.
+func serveCallout(t *testing.T, svc *Service, validator *TokenValidator, conn *nats.Conn) {
+	t.Helper()
+	svc.decisionBudget = testDialTimeout
+	validator.reviewBudget = testDialTimeout
+	if _, err := svc.Subscribe(conn); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := conn.FlushTimeout(testDialTimeout); err != nil {
+		t.Fatalf("the server did not acknowledge the callout's subscription: %v", err)
+	}
 }

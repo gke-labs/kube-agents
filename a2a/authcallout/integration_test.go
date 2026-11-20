@@ -363,9 +363,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("the callout service could not connect: %v", err)
 	}
 	t.Cleanup(svcConn.Close)
-	if _, err := svc.Subscribe(svcConn); err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	serveCallout(t, svc, validator, svcConn)
 
 	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, dial: dialOpt}
 }
