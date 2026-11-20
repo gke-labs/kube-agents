@@ -19,6 +19,10 @@ endpoint and ``inject`` enters the A2A gateway through its side door. This one
 goes the way a person does. A test user mentions the install's bot in a CI
 channel with ``chat.postMessage`` and a user token, Slack delivers it over
 Socket Mode, and the transport reads the thread back until the turn settles.
+A prompt opening with ``[reply-under-home-post: <marker>]`` (HOME_POST_DIRECTIVE)
+starts no thread: it waits for the bot's newest top-level post holding the
+marker in the channel, a post the case's setup had the agent make on its own
+(a scheduled report, an alert), and replies under it as the test user.
 What it grades is the report the thread delivered (split_thread; the harness folds it), and it times each Slack leg:
 post to the bot's first reaction, to its first reply (the ack), and to the
 answer.
@@ -81,6 +85,20 @@ TIMING_FILE_ENV = "BENCH_SLACK_TIMING_FILE"
 # a follow-up, or a typed choice for a question's buttons. Recorded beside the
 # first turn's timing under slack_then_*; the case grades the first turn.
 THEN_ENV = "BENCH_SLACK_THEN"
+# A prompt whose first line is "[reply-under-home-post: <marker>]" replies in
+# the thread of a post the agent made on its own in the channel (the home
+# channel, on the lane), not in a thread a mention opens: the case's setup has
+# the agent post (a scheduled report, an alert), and the rest of the prompt is
+# the reply. The post is the newest top-level bot post holding <marker> since
+# HOME_POST_LOOKBACK_ENV seconds before the turn (default
+# HOME_POST_LOOKBACK_SECONDS), watched for up to HOME_POST_WAIT_ENV seconds
+# (default HOME_POST_WAIT_SECONDS), since it may land after the setup returns.
+HOME_POST_DIRECTIVE = "[reply-under-home-post:"
+HOME_POST_LOOKBACK_ENV = "BENCH_SLACK_HOME_POST_LOOKBACK"
+HOME_POST_LOOKBACK_SECONDS = 3600.0
+HOME_POST_WAIT_ENV = "BENCH_SLACK_HOME_POST_WAIT"
+HOME_POST_WAIT_SECONDS = 600.0
+HISTORY_PAGE_LIMIT = 200
 
 POLL_SECONDS = 2.0
 # The bot's reactions that end a turn rather than mark it in flight: blocked and
@@ -207,6 +225,31 @@ def split_thread(posts: list[dict]) -> tuple[dict | None, list[dict]]:
     return (content[0], content[1:]) if content else (None, [])
 
 
+def parse_home_post(prompt: str) -> tuple[str, str] | None:
+    """The (marker, reply) of a reply-under-home-post prompt, or None for any other prompt.
+
+    Raises ValueError for the directive with no marker or no reply: a case
+    written wrong, never a turn to post.
+    """
+    first, _, rest = prompt.lstrip().partition("\n")
+    first = first.strip()
+    if not first.startswith(HOME_POST_DIRECTIVE):
+        return None
+    if not first.endswith("]"):
+        raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] is not closed: {first!r}")
+    marker = first[len(HOME_POST_DIRECTIVE):-1].strip()
+    reply = rest.strip()
+    if not marker or not reply:
+        raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] needs a marker and a reply after it")
+    return marker, reply
+
+
+def is_top_level(msg: dict) -> bool:
+    """Whether msg opens its own thread or none, rather than replying in one."""
+    thread = msg.get("thread_ts")
+    return not thread or thread == msg.get("ts")
+
+
 @dataclass
 class SlackExchange:
     """One turn as the thread showed it.
@@ -283,6 +326,51 @@ class SlackTurn:
                                 text=f"<@{self.bot_user}> {text}")
         ex = SlackExchange(ask_ts=str(sent["ts"]))
         return self._await(ex, first.ask_ts, deadline_seconds, also_marked=first.ask_ts)
+
+    def find_home_post(self, marker: str, lookback_seconds: float, wait_seconds: float) -> dict | None:
+        """The newest top-level post of the bot's holding marker, from lookback_seconds
+        ago on, watched for until wait_seconds pass; None if none came.
+
+        A thread reply never counts (a post the agent made on its own opens its
+        thread), and neither does another app's post or a test user's.
+        """
+        oldest = f"{self._wall() - lookback_seconds:.6f}"
+        deadline = self._clock() + wait_seconds
+        while True:
+            try:
+                found = [m for m in self._history(oldest)
+                         if is_bot_message(m, self.bot_user) and is_top_level(m) and marker in str(m.get("text") or "")]
+            except SlackAPIError as err:
+                if not err.transient:
+                    raise
+                found = []
+            if found:
+                return max(found, key=lambda m: ts_value(m.get("ts")) or Decimal(0))
+            if self._clock() >= deadline:
+                return None
+            self._sleep(self._poll)
+
+    def reply_under(self, post_ts: str, text: str, deadline_seconds: float) -> SlackExchange:
+        """Reply in post_ts's thread as the test user, mentioning the bot, and read that
+        turn until it settles. The exchange's posts are the bot's replies after the reply,
+        so the post itself and anything before the reply in its thread are not the turn's."""
+        sent = self.client.call("chat.postMessage", channel=self.channel, thread_ts=post_ts,
+                                text=f"<@{self.bot_user}> {text}")
+        ex = SlackExchange(ask_ts=str(sent["ts"]))
+        return self._await(ex, post_ts, deadline_seconds)
+
+    def _history(self, oldest: str) -> list[dict]:
+        messages: list[dict] = []
+        cursor = ""
+        while True:
+            params = {"channel": self.channel, "oldest": oldest, "limit": str(HISTORY_PAGE_LIMIT)}
+            if cursor:
+                params["cursor"] = cursor
+            page = self.client.call("conversations.history", **params)
+            messages.extend(page.get("messages") or [])
+            cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                return messages
 
     def _await(self, ex: SlackExchange, root_ts: str, deadline_seconds: float,
                also_marked: str = "") -> SlackExchange:

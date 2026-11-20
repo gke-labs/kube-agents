@@ -82,7 +82,9 @@ Environment:
     AGENT_TRANSPORT: ``api`` (default; everything above), ``slack`` (advisory, for
         the Slack lane: a test user's post in a CI channel, read back from the
         thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
-        ``AGENT_SLACK_TIMEOUT``, 600 s unset) or ``inject``, which
+        ``AGENT_SLACK_TIMEOUT``, 600 s unset; a prompt opening with
+        ``[reply-under-home-post: <marker>]`` replies under a post the agent
+        made on its own instead, and only this transport takes it) or ``inject``, which
         hands the prompt to the agent through the A2A gateway's inject backend
         instead -- ``POST /inject`` with the prompt, then the conversation's
         transcript folded until the task's terminal, the way the gateway
@@ -3005,14 +3007,39 @@ def _execute_slack(prompt: str) -> AgentResult:
         timeout = _numeric_env("AGENT_SLACK_TIMEOUT", _SLACK_DEFAULT_TIMEOUT, float)
     except ValueError as exc:
         return AgentResult.errored(str(exc))
-    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
     try:
-        exchange = turn.run(prompt, timeout)
+        home_post = slack.parse_home_post(prompt)
+        lookback = _numeric_env(slack.HOME_POST_LOOKBACK_ENV, str(slack.HOME_POST_LOOKBACK_SECONDS), float)
+        wait = _numeric_env(slack.HOME_POST_WAIT_ENV, str(slack.HOME_POST_WAIT_SECONDS), float)
+    except ValueError as exc:
+        return AgentResult.errored(str(exc))
+    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
+    home_ts = ""
+    try:
+        if home_post is None:
+            exchange = turn.run(prompt, timeout)
+        else:
+            marker, reply = home_post
+            post = turn.find_home_post(marker, lookback, wait)
+            if post is None:
+                # The agent never posted what the case set it up to post: the
+                # case's failure to grade, not infrastructure.
+                return AgentResult(
+                    output="", trajectory=[], tokens={},
+                    errors=[f"slack: no top-level post of the bot's holding {marker!r} in the channel within {wait:g}s"],
+                    metadata={"transport": TRANSPORT_SLACK, "outcome": "no_home_post", "slack_home_post_marker": marker},
+                )
+            home_ts = str(post["ts"])
+            exchange = turn.reply_under(home_ts, reply, timeout)
     except (slack.SlackAPIError, OSError) as exc:
         return _infra_failure(f"slack: {exc}")
     timing = exchange.timing()
     then_text = os.environ.get(slack.THEN_ENV, "").strip()
-    if then_text and exchange.outcome == "settled":
+    if then_text and home_ts:
+        # A reply under the agent's post is the case's one turn; a second
+        # one would need the post's thread, not the reply's.
+        timing["slack_then_outcome"] = "skipped: a reply under a home post takes no second turn"
+    elif then_text and exchange.outcome == "settled":
         timing.update(_slack_then(turn, exchange, then_text, timeout))
     elif then_text:
         timing["slack_then_outcome"] = f"skipped: the first turn's outcome was {exchange.outcome}"
@@ -3034,6 +3061,7 @@ def _execute_slack(prompt: str) -> AgentResult:
             "outcome": exchange.outcome,
             "window_posts": len(exchange.posts),
             "slack_ask_ts": exchange.ask_ts,
+            "slack_home_post_ts": home_ts or None,
             "slack_reaction": exchange.reaction or None,
             "slack_buttons": exchange.buttons,
             "slack_transient_errors": len(exchange.errors),
@@ -3242,6 +3270,11 @@ class KubeAgentsHarness(AgentHarness):
         if transport not in _TRANSPORTS:
             return AgentResult.errored(
                 f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
+            )
+        if transport != TRANSPORT_SLACK and prompt.lstrip().startswith(slack.HOME_POST_DIRECTIVE):
+            # Only Slack shows a post the agent made on its own to reply under.
+            return AgentResult.errored(
+                f"{slack.HOME_POST_DIRECTIVE} <marker>] needs AGENT_TRANSPORT={TRANSPORT_SLACK}, got {transport!r}"
             )
         if transport == TRANSPORT_INJECT:
             result = self._execute_inject(prompt)
