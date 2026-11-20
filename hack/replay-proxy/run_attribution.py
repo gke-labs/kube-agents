@@ -1,10 +1,10 @@
 """Which eval run each request a proxy logged belongs to, and whether that run passed.
 
-One build runs many cases and repetitions at once on one install, and a request
-does not say which run it belongs to (examples/inference-replay/eval-design.md,
-"Telling the runs in a build apart"). After the run it can be worked out from
-the kanban cards: a request is tied to the cards its own conversation works on,
-and each repetition's results.json names the cards its workers worked.
+One build runs many cases and repetitions at once on one install
+(examples/inference-replay/eval-design.md, "Telling the runs in a build
+apart"). A request is tied to its run by the kanban cards its own conversation
+works on, which each repetition's results.json names, or, with no card of its
+own, by the eval run tag it carried (below).
 
 A request's cards are read from its stored, scrubbed text (the proxy's
 REPLAY_STORE_DIR), and only from two places that belong to its conversation:
@@ -16,35 +16,49 @@ lists the assignee's runs on other cards. A run's cards are the `task` its
 worker trajectory entries carry. (A front door's request names no A2A task id,
 so a run's A2A task is no evidence and is not read.)
 
-A request that names no card of its own (a front door's opening, which is only
-the case's prompt) is decided by evidence instead: a later request whose
-conversation went on from exactly the answer that was saved. Record mode logs
-each line's answer (`answer_variant`) and the answer the request's last
-assistant message is (`prior_answer`), both as normalizer.answer_variant
-identifies an answer in a history. A continuation attributed to one run, holding
-the request as its prefix and that answer next, proves that run got that answer
-to that request. The proof chains: a continuation with no card of its own
-(a front door that reads its board before it creates a card) counts for each run
-its own answer is proven, by the same rule, to have gone on from; the answer is published when any such run passed, which is the
-design's "at least one passing run produced that same fingerprint", here for
-the same answer as well. Only positive evidence decides, so a line lost before
-it reached a segment (a spent budget, a pod replaced before its last segment
-was copied, a last pass cut short, a pod that came and went between passes) can
-only leave an answer unpublished, never publish one.
+A request also says which run it belongs to when the install tags it: the
+agent sends `X-Kube-Agents-Eval-Run: <run>/<case>/<rep>` on its model requests
+(deploy/docker/patches/eval_run_tag.py), the proxy logs it as `eval_run`, and
+the harness writes the same tag to `eval_run.json` beside each repetition's
+results.json (hack/ci-eval-pr.sh). The run id is minted per invocation, so the
+tag tells a retried attempt of a case and repetition from the one bench-gate
+graded. A tagged line belongs to exactly the graded repetition whose
+eval_run.json holds that tag. A line with a card is still decided by its card,
+and its tag must agree: when the tag names a graded run other than the card's,
+or a different attempt, or a repetition not graded while the card's is, the
+line is a disagreement and the answer it gave is not published. A line with no
+card of its own (a front door's opening, the board reads before a worker's
+first `kanban_create`) is decided by its tag alone; with no tag, or a tag whose
+repetition has no eval_run.json to check it against, it is never published:
+nothing else in the line says whose it is (Hermes' auxiliary calls, gateway
+session pods and a night with the tags off log none). Only positive evidence
+decides, so a line lost before it reached a segment (a spent budget, a pod
+replaced before its last segment was copied, a last pass cut short, a pod that
+came and went between passes) can only leave an answer unpublished, never
+publish one.
 
 Decisions, per logged request:
 - `pass`: every run it belongs to was graded and passed;
 - `fail`: it belongs to a run that was graded and did not pass;
-- `pending`: its text is not all stored yet, or it names a card no graded run
-  has yet (its case is still running), or it names none and no passing run has
-  been seen going on from its answer while cases are still running;
-- `unattributed`: once every case is graded, no stored text or a card no run worked;
-- `ambiguous`: no card of its own, and no graded run went on from its answer.
+- `pending`: its text is not all stored yet, or it names a card or tag no
+  graded run has yet (its case is still running);
+- `unattributed`: once every case is graded, no stored text, or a card or tag
+  no run has; at any time, a tag of an attempt bench-gate did not grade;
+- `untagged`: no card of its own and no tag that can be checked;
+- `disagree`: its tag and its card name different runs.
 
-A saved answer is decided by its recording line, or, when that line is left
-unattributed or ambiguous on the last call, by the other lines that sent the
-same request and got the same answer, provided no failing run is tied to any of
-them (Attribution.decide_answer).
+A saved alternate (one distinct answer to one request) is decided by every
+storable line whose logged `stored_answer_hash`, the hash of the answer as
+stored, is the alternate's name, recorded or not: it passes when any of them is
+attributed to runs that all passed, since a passing run produced that very
+answer, even when a failing run gave it first and saved it
+(Attribution.decide_alternate), and never while any of them is a disagreement.
+An answer only failing runs gave never passes. A different answer to the same
+request is an alternate of its own, decided by its own lines. An answer in the
+older layout (one per request) is decided by its recording line, or, when that
+line is left unattributed or untagged on the last call, by the other lines
+that sent the same request and got the same answer, provided no failing run is
+tied to any of them (Attribution.decide_answer).
 """
 
 from __future__ import annotations
@@ -55,7 +69,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-import replay_cache
 import schema as F
 
 CARD_RE = re.compile(r"^t_[0-9a-f]{8}\Z")
@@ -82,8 +95,29 @@ PASS = "pass"
 FAIL = "fail"
 PENDING = "pending"
 UNATTRIBUTED = "unattributed"
-AMBIGUOUS = "ambiguous"
-DECISIONS = (PASS, FAIL, PENDING, UNATTRIBUTED, AMBIGUOUS)
+UNTAGGED = "untagged"
+DISAGREE = "disagree"
+DECISIONS = (PASS, FAIL, PENDING, UNATTRIBUTED, UNTAGGED, DISAGREE)
+
+# The eval run tag (`<run>/<case>/<rep>`) as the proxy logs it in `eval_run`:
+# replay_proxy.EVAL_RUN_RE, which deploy/docker/patches/test_eval_run_tag.py
+# holds equal to the agent's.
+EVAL_RUN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}")
+EVAL_RUN_SEPARATOR = "/"
+EVAL_RUN_PARTS = 3
+# The harness's eval_run.json beside a repetition's results.json
+# (bench/kube_agents_bench/harness.py, _eval_run_record; hack/ci-eval-pr.sh).
+EVAL_RUN_FILE = "eval_run.json"
+EVAL_RUN_TAG_KEY = "eval_run"
+EVAL_RUN_ID_KEY = "run_id"
+EVAL_RUN_CASE_KEY = "case_id"
+EVAL_RUN_REP_KEY = "repetition"
+# What a line's tag says about the graded runs (Attribution.tag_status).
+TAG_NONE = "none"  # no well-formed tag
+TAG_RUN = "run"  # exactly a graded repetition's tag
+TAG_OTHER_ATTEMPT = "other_attempt"  # a graded repetition's case and rep, another run id
+TAG_UNCHECKED = "unchecked"  # a graded repetition's case and rep, which has no eval_run.json
+TAG_UNGRADED = "ungraded"  # no graded repetition has its case and rep yet
 
 # bench-gate's case-<name>.json (bench/kube_agents_bench/scoring.py, CaseVerdict.to_dict):
 # the case, its repetitions, and each one's index, outcome and run directory.
@@ -205,12 +239,14 @@ def read_json(path: str) -> Optional[Any]:
 
 @dataclass(frozen=True)
 class Run:
-    """One graded repetition: its case, index, bench-gate outcome and the cards its record says it worked."""
+    """One graded repetition: its case, index, bench-gate outcome, the cards its record says it worked,
+    and its eval run tag (empty when its eval_run.json is missing or does not name this case and rep)."""
 
     case: str
     rep: int
     outcome: str
     ids: frozenset = frozenset()
+    tag: str = ""
 
     @property
     def key(self) -> str:
@@ -226,7 +262,8 @@ def load_runs(verdicts_dir: str, results_cache: Optional[Dict[Tuple[str, int, in
 
     A case file still being written does not parse and is skipped until it does;
     a repetition with no run directory, a relative one, or no readable
-    results.json names no card, so no request is attributed to it.
+    results.json names no card, so no request is attributed to it by card, and
+    one with no readable eval_run.json there has no tag (run_tag).
     `results_cache`, kept between calls, reads each results.json once while it
     is unchanged.
     """
@@ -246,11 +283,33 @@ def load_runs(verdicts_dir: str, results_cache: Optional[Dict[Tuple[str, int, in
             if not isinstance(rep, dict) or not isinstance(rep.get(REP_INDEX_FIELD), int):
                 continue
             ids: Set[str] = set()
+            tag = ""
             run_dir = rep.get(REP_RUN_DIR_FIELD)
             if isinstance(run_dir, str) and os.path.isabs(run_dir):
                 ids = _results_cards(os.path.join(run_dir, RESULTS_FILE), results_cache)
-            runs.append(Run(case_id, rep[REP_INDEX_FIELD], str(rep.get(REP_OUTCOME_FIELD) or ""), frozenset(ids)))
+                tag = run_tag(read_json(os.path.join(run_dir, EVAL_RUN_FILE)), case_id, rep[REP_INDEX_FIELD])
+            runs.append(Run(case_id, rep[REP_INDEX_FIELD], str(rep.get(REP_OUTCOME_FIELD) or ""), frozenset(ids), tag))
     return runs
+
+
+def run_tag(record: Any, case: str, rep: int) -> str:
+    """The tag an eval_run.json gives the repetition it sits in; empty unless it is well formed and
+    names that repetition's case and index, so a stray or stale file never claims another's lines."""
+    if not isinstance(record, dict):
+        return ""
+    tag = record.get(EVAL_RUN_TAG_KEY)
+    if not isinstance(tag, str) or not EVAL_RUN_RE.fullmatch(tag):
+        return ""
+    parts = (record.get(EVAL_RUN_ID_KEY), record.get(EVAL_RUN_CASE_KEY), record.get(EVAL_RUN_REP_KEY))
+    if tag.split(EVAL_RUN_SEPARATOR) != list(parts) or parts[1] != case or parts[2] != str(rep):
+        return ""
+    return tag
+
+
+def tag_slot(tag: str) -> Tuple[str, str]:
+    """A well-formed tag's (case, rep): the repetition it claims, whichever attempt."""
+    _, case, rep = tag.split(EVAL_RUN_SEPARATOR, EVAL_RUN_PARTS - 1)
+    return case, rep
 
 
 def _results_cards(path: str, cache: Optional[Dict[Tuple[str, int, int], Set[str]]]) -> Set[str]:
@@ -274,31 +333,41 @@ class Line:
     request_id: str
     fingerprint: str
     build: str
-    chain: List[str]
     recorded: bool = False
     served: bool = False
     served_from_build: str = ""
     prompt_tokens: int = 0
     answer_variant: Optional[Tuple[str, ...]] = None
-    prior_answer: Optional[Tuple[str, ...]] = None
+    # Whether record mode would have saved this line's answer (no unstorable reason).
+    storable: bool = False
+    # The eval run tag the request carried (`eval_run`), empty when it had
+    # none or a malformed one.
+    eval_run: str = ""
+    # The hash of the answer as record mode stores it (stored_answer_hash):
+    # the name of the alternate it saved or would have saved.
+    stored_hash: str = ""
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
         job = entry.get(F.JOB) or {}
-        hashes = [str(h) for h in entry.get(F.DIAG_MESSAGE_HASHES) or []]
         served_from = entry.get(F.SERVED_FROM) or {}
         return cls(
             request_id=str(entry.get(F.REQUEST_ID) or ""),
             fingerprint=str(entry.get(F.FINGERPRINT) or ""),
             build=str(job.get(F.JOB_BUILD) or ""),
-            chain=list(replay_cache.prefix_keys(str(entry.get(F.DIAG_SETTINGS_HASH) or ""), hashes)),
             recorded=entry.get(F.RECORDED) is True,
             served=entry.get(F.SERVED) is True,
             served_from_build=str(served_from.get(F.JOB_BUILD) or "") if isinstance(served_from, dict) else "",
             prompt_tokens=int(entry.get(F.PROMPT_TOKENS) or 0),
             answer_variant=_pair(entry.get(F.ANSWER_VARIANT)),
-            prior_answer=_pair(entry.get(F.PRIOR_ANSWER)),
+            storable=entry.get(F.UNSTORABLE) == [],
+            stored_hash=str(entry.get(F.STORED_ANSWER_HASH) or ""),
+            eval_run=_tag(entry.get(F.EVAL_RUN)),
         )
+
+
+def _tag(value: Any) -> str:
+    return value if isinstance(value, str) and EVAL_RUN_RE.fullmatch(value) else ""
 
 
 def _pair(value: Any) -> Optional[Tuple[str, ...]]:
@@ -429,41 +498,28 @@ class Attribution:
         for run in runs:
             for run_id in run.ids:
                 self.by_id.setdefault(run_id, set()).add(run.key)
-        # Continuations by the answer they went on from: (build, answer pair) ->
-        # [(the continuation's prefix keys, a run proven for it)]. A continuation
-        # counts for the run its own cards name, or, with no card, for each run
-        # proven to have gone on from its own answer. Lines are taken longest
-        # first, so every continuation of a request is in before the request.
-        # A card-less continuation proven for several runs counts for each of
-        # them, never for a run it was not proven for: every one of them sent
-        # that request after that answer, since each holds both as a prefix.
-        self.went_on: Dict[Tuple[str, Tuple[str, ...]], List[Tuple[List[str], str]]] = {}
-        # Every line by (build, fingerprint): the cache keeps the first answer
-        # to a fingerprint, and later lines sent the same request.
+        # Graded repetitions by their exact tag, and by the (case, rep) every
+        # attempt's tag claims.
+        self.by_tag: Dict[str, str] = {run.tag: run.key for run in runs if run.tag}
+        self.by_slot: Dict[Tuple[str, str], Run] = {(run.case, str(run.rep)): run for run in runs}
+        # Every line by (build, fingerprint): the cache keeps each distinct
+        # answer to a fingerprint once, so a later line that got the same
+        # answer recorded nothing, and its runs count through this.
         self.by_fingerprint: Dict[Tuple[str, str], List[Line]] = {}
         for line in logs.lines:
             self.by_fingerprint.setdefault((line.build, line.fingerprint), []).append(line)
-        for line in sorted(logs.lines, key=lambda l: -len(l.chain)):
-            run = self.run_of(line)
-            proven: Set[str] = {run} if run is not None else set()
-            if run is None:
-                own = self._own(line)
-                if own is None or own[1] or own[0]:
-                    continue
-                proven = self._went_on_from(line)
-            if line.prior_answer is not None:
-                for each in sorted(proven):
-                    self.went_on.setdefault((line.build, line.prior_answer), []).append((line.chain, each))
 
-    def _went_on_from(self, line: Line) -> Set[str]:
-        """The runs proven for continuations that hold `line`'s request and went on from its answer."""
-        evidence: Set[str] = set()
-        if line.answer_variant is not None:
-            depth = len(line.chain)
-            for chain, run in self.went_on.get((line.build, line.answer_variant), []):
-                if len(chain) > depth and chain[depth - 1] == line.chain[-1]:
-                    evidence.add(run)
-        return evidence
+    def tag_status(self, line: Line) -> Tuple[str, Optional[str]]:
+        """What the line's tag says (TAG_*), and the graded repetition it names or claims, if any."""
+        if not line.eval_run:
+            return TAG_NONE, None
+        key = self.by_tag.get(line.eval_run)
+        if key is not None:
+            return TAG_RUN, key
+        slot = self.by_slot.get(tag_slot(line.eval_run))
+        if slot is None:
+            return TAG_UNGRADED, None
+        return (TAG_OTHER_ATTEMPT if slot.tag else TAG_UNCHECKED), slot.key
 
     def _own(self, line: Line) -> Optional[Tuple[Set[str], bool]]:
         """(runs its own IDs name, whether any ID names no graded run); None without stored text.
@@ -489,42 +545,53 @@ class Attribution:
             return Decision(PASS, keys)
         return Decision(FAIL, keys)
 
+    def disagrees(self, line: Line) -> bool:
+        """Whether the line's cards name a graded run and its tag says otherwise: another graded run,
+        another attempt of the card's repetition, or a repetition not graded yet."""
+        own = self._own(line)
+        if own is None or not own[0]:
+            return False
+        status, key = self.tag_status(line)
+        if status == TAG_RUN:
+            return bool(own[0] - {key})
+        return status in (TAG_OTHER_ATTEMPT, TAG_UNGRADED)
+
     def decide(self, line: Line) -> Decision:
         own = self._own(line)
         if own is None:
             return Decision(PENDING if not self.final else UNATTRIBUTED)
         runs, unknown = own
+        if self.disagrees(line):
+            return Decision(DISAGREE, tuple(sorted(runs)))
         if unknown:
             return Decision(UNATTRIBUTED if self.final else PENDING, tuple(sorted(runs)))
         if runs:
             return self._of_runs(runs)
-        # No card of its own: the runs seen going on from exactly its answer.
-        evidence = self._went_on_from(line)
-        passed = {run for run in evidence if self.runs[run].passed}
-        if passed:
-            return Decision(PASS, tuple(sorted(passed)))
-        if not self.final:
-            return Decision(PENDING)
-        if evidence:
-            return Decision(FAIL, tuple(sorted(evidence)))
-        return Decision(AMBIGUOUS)
+        # No card of its own: the run its tag names, and nothing else.
+        status, key = self.tag_status(line)
+        if status == TAG_RUN:
+            return self._of_runs({key})
+        if status == TAG_OTHER_ATTEMPT:
+            return Decision(UNATTRIBUTED)
+        if status == TAG_UNGRADED:
+            return Decision(UNATTRIBUTED if self.final else PENDING)
+        return Decision(UNTAGGED)
 
     def decide_answer(self, saved: Line) -> Decision:
         """The decision for the answer `saved` recorded: its own, or other lines' that got the same answer.
 
-        The cache keeps the first answer to a fingerprint, so when traffic no
-        graded run owns (an alert's triage, another Cluster Agent's turn) sent a
-        request first, a run that later sent the same request is never the
-        recording line. A line of the same build and fingerprint whose own
-        answer is the saved one (`answer_variant`, the identity a
-        continuation's `prior_answer` is checked against) proves its runs got
+        The cache keeps each distinct answer to a fingerprint once, so when
+        traffic no graded run owns (an alert's triage, another Cluster Agent's
+        turn) got an answer first, a run that later got the same answer to the
+        same request is never its recording line. A line of the same build and fingerprint whose own
+        answer is the saved one (`answer_variant`) proves its runs got
         that answer to that request. Only a recording line left unattributed or
-        ambiguous on the last call takes that evidence, and only when no failing
+        untagged on the last call takes that evidence, and only when no failing
         run is tied to the saved line or to any line that got the same answer
         (`_tied_runs`), whatever those lines' own decisions say.
         """
         decision = self.decide(saved)
-        if decision.decision not in (UNATTRIBUTED, AMBIGUOUS) or saved.answer_variant is None:
+        if decision.decision not in (UNATTRIBUTED, UNTAGGED) or saved.answer_variant is None or not self.final:
             return decision
         if self._any_failed(self._tied_runs(saved)):
             return decision
@@ -535,23 +602,72 @@ class Attribution:
             if self._any_failed(self._tied_runs(other)):
                 return decision
             found = self.decide(other)
+            if found.decision == DISAGREE:
+                return decision
             if found.decision == PASS:
                 passed.update(found.runs)
         if passed:
             return Decision(PASS, tuple(sorted(passed)))
         return decision
 
+    def decide_alternate(self, producers: List[Line]) -> Decision:
+        """The decision for one alternate, from every line that produced it (same request, same stored hash).
+
+        Record mode saves an answer once, so of several runs that gave the same
+        answer only the first line says `recorded`; the later ones still
+        produced it. The alternate passes when any storable producer is
+        decided PASS on its own (decide): a passing run gave exactly this
+        answer to exactly this request, whichever run saved the file. A
+        failing run that gave it too does not hold it back, since what is
+        served is that passing run's answer. A producer whose tag and card
+        disagree refuses it outright: the attribution of that answer cannot be
+        trusted. An answer only failing runs gave never passes. With no PASS, a
+        producer still pending keeps it pending; otherwise the first
+        producer's decision stands.
+        """
+        decisions = [found for _, found in self._producer_decisions(producers)]
+        if any(found.decision == DISAGREE for found in decisions):
+            return Decision(DISAGREE)
+        passed = sorted({run for found in decisions if found.decision == PASS for run in found.runs})
+        if passed:
+            return Decision(PASS, tuple(passed))
+        if any(found.decision == PENDING for found in decisions):
+            return Decision(PENDING)
+        return decisions[0] if decisions else Decision(UNATTRIBUTED if self.final else PENDING)
+
+    def _producer_decisions(self, producers: List[Line]) -> List[Tuple[Line, Decision]]:
+        """Each storable producer's own decision (decide_alternate)."""
+        return [(line, self.decide(line)) for line in producers if line.storable]
+
+    def passing_count(self, producers: List[Line]) -> int:
+        """How many times passing runs produced an alternate: its producers decided PASS, one per request.
+
+        The same per-line decision decide_alternate publishes on, counted
+        rather than or-ed, by card or by tag alike: each is one request a
+        passing run sent and the model answered with exactly this stored
+        answer, so the counts of a key's alternates are how often passing runs
+        got each. A request is counted once however many times its line was
+        read; an alternate with a disagreeing producer counts none.
+        """
+        found = self._producer_decisions(producers)
+        if any(decision.decision == DISAGREE for _, decision in found):
+            return 0
+        return len({line.request_id for line, decision in found if decision.decision == PASS})
+
+    def disagreements(self) -> int:
+        """How many of the build's logged requests have a tag and a card naming different runs."""
+        return len({line.request_id for line in self.logs.lines if self.disagrees(line)})
+
     def _tied_runs(self, line: Line) -> Set[str]:
         """Every graded run a line is tied to: its own cards' runs, even beside a card no run worked,
-        and, with no card of its own, the runs seen going on from its answer. A decision keeps only
-        some of them (PASS drops a failing run that also went on), so the publish guard reads these."""
+        and the run its tag names. A decision keeps only some of them (PASS drops a failing run that
+        also produced it), so the publish guard reads these."""
         own = self._own(line)
-        if own is None:
-            return set()
-        runs, unknown = own
-        if runs or unknown:
-            return set(runs)
-        return self._went_on_from(line)
+        runs = set(own[0]) if own is not None else set()
+        status, key = self.tag_status(line)
+        if status == TAG_RUN:
+            runs.add(key)
+        return runs
 
     def _any_failed(self, runs: Set[str]) -> bool:
         return any(not self.runs[run].passed for run in runs)

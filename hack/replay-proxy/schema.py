@@ -63,6 +63,9 @@ DIAG_MESSAGE_HASHES = "diag_message_hashes"
 DIAG_SETTINGS_HASH = "diag_settings_hash"
 ROLES = "roles"
 ANSWER_HASH = "answer_hash"
+# In record mode: replay_cache.stored_hash of the answer as it would be saved,
+# on every line with an answer, saved or not: the name of its alternate.
+STORED_ANSWER_HASH = "stored_answer_hash"
 # Why replay would not have saved the answer; empty on a served line, whose
 # answer is a saved one and is never judged as a new one.
 UNSTORABLE = "unstorable"
@@ -152,8 +155,24 @@ EVAL_RUN = "eval_run"
 EVAL_AGENT = "eval_agent"
 VIA_EXACT = "exact"
 VIA_ANSWER_SLOTS = "answer_slots"
-# In record mode: whether this request's answer was saved (false when the key
-# was already there, or the answer was unstorable).
+# On a served line: which of the key's saved answers was served (the
+# alternate's name, the STORED_ANSWER_HASH of the line that saved it; empty for the
+# older layout's single answer), and how
+# many answers the key had. Replay hands a key's answers out in turn, by weight.
+SERVED_ALTERNATE = "served_alternate"
+ALTERNATES = "alternates"
+# On a served line: the key the answer was served from, its own FINGERPRINT on
+# an exact hit and the slot's key on an answer_slots hit; the key whose
+# answers SERVED_ALTERNATE and ALTERNATES count.
+SERVED_KEY = "served_key"
+# On a served line: the served answer's weight, how often passing runs
+# produced it (1 when the replay cache gave no count), and the sum over the
+# key's answers. Replay serves each answer in proportion to its weight, so over
+# a key's lookups an answer's share is about SERVED_WEIGHT / ALTERNATES_WEIGHT.
+SERVED_WEIGHT = "served_weight"
+ALTERNATES_WEIGHT = "alternates_weight"
+# In record mode: whether this request's answer was saved (false when the same
+# answer to the key was already saved, or the answer was unstorable).
 RECORDED = "recorded"
 # In record mode, when writing the cache failed: the exception's type name, or
 # RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
@@ -163,7 +182,9 @@ RECORD_ERROR_BUDGET = "budget_spent"
 # later request's history holds it (normalizer.answer_variant), and the same
 # pair for the last assistant message this request holds. A later request's
 # PRIOR_ANSWER equal to an earlier line's ANSWER_VARIANT says its conversation
-# went on from that very answer (hack/replay-proxy/run_attribution.py).
+# went on from that answer, up to what answer_variant renames. Diagnostic only:
+# nothing reads PRIOR_ANSWER now that run_attribution.py ties lines to runs by
+# card and eval run tag.
 ANSWER_VARIANT = "answer_variant"
 PRIOR_ANSWER = "prior_answer"
 # On a replay miss: the closest saved request and where this one differed.
@@ -183,6 +204,9 @@ MISS_SIGNATURE = "signature"
 MISS_REFUSED = "refused"
 REFUSED_VIA = "via"
 REFUSED_GUARD = "guard"
+# When the key had several saved answers and guards refused every one: how
+# many. REFUSED_GUARD is then the first one's guard.
+REFUSED_ALTERNATES = "alternates"
 # A slot held an answer no recording stored for its context.
 GUARD_ANSWER_NOT_RECORDED = "answer_not_recorded"
 # Through a slot, the saved answer names a value only an assistant message binds.
