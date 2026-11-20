@@ -63,7 +63,7 @@ class ParseTest(unittest.TestCase):
         for path in sorted(registry.HERE.glob(f"*/{registry.RECIPE_FILE}")):
             text = path.read_text(encoding="utf-8")
             loaded = {k: ("" if v is None else str(v)) for k, v in yaml.safe_load(text).items()}
-            self.assertEqual(registry.parse(text)._asdict(), {**dict.fromkeys(registry.OPTIONAL, ""), **loaded})
+            self.assertEqual(registry.parse(text)._asdict(), {**registry.Recipe._field_defaults, **loaded})
 
 
 class LoadTest(unittest.TestCase):
