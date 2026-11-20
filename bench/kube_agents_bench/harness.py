@@ -83,7 +83,7 @@ Environment:
         the Slack lane: a test user's post in a CI channel, read back from the
         thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
         ``AGENT_SLACK_TIMEOUT``, 600 s unset; a prompt opening with
-        ``[reply-under-home-post: <marker>]`` replies under a post the agent
+        ``[bench:reply-under-home-post: <marker>]`` replies under a post the agent
         made on its own instead, its wait for the post,
         ``BENCH_SLACK_HOME_POST_WAIT``, coming before that budget, and only this
         transport takes it) or ``inject``, which

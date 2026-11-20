@@ -19,7 +19,7 @@ endpoint and ``inject`` enters the A2A gateway through its side door. This one
 goes the way a person does. A test user mentions the install's bot in a CI
 channel with ``chat.postMessage`` and a user token, Slack delivers it over
 Socket Mode, and the transport reads the thread back until the turn settles.
-A prompt opening with ``[reply-under-home-post: <marker>]`` (HOME_POST_DIRECTIVE)
+A prompt opening with ``[bench:reply-under-home-post: <marker>]`` (HOME_POST_DIRECTIVE)
 starts no thread: it waits for the bot's newest top-level post holding the
 marker in the channel, a post the case's setup had the agent make on its own
 (a scheduled report, an alert), and replies under it as the test user.
@@ -85,7 +85,7 @@ TIMING_FILE_ENV = "BENCH_SLACK_TIMING_FILE"
 # a follow-up, or a typed choice for a question's buttons. Recorded beside the
 # first turn's timing under slack_then_*; the case grades the first turn.
 THEN_ENV = "BENCH_SLACK_THEN"
-# A prompt whose first line is "[reply-under-home-post: <marker>]" replies in
+# A prompt whose first line is "[bench:reply-under-home-post: <marker>]" replies in
 # the thread of a post the agent made on its own in the channel (the home
 # channel, on the lane), not in a thread a mention opens: the case's setup has
 # the agent post (a scheduled report, an alert), and the rest of the prompt is
@@ -96,7 +96,7 @@ THEN_ENV = "BENCH_SLACK_THEN"
 # run's post with the same marker is never this run's. It is watched for up to
 # HOME_POST_WAIT_ENV seconds (default HOME_POST_WAIT_SECONDS), since it may
 # land after the setup returns, read every HOME_POST_POLL_SECONDS.
-HOME_POST_DIRECTIVE = "[reply-under-home-post:"
+HOME_POST_DIRECTIVE = "[bench:reply-under-home-post:"
 CASE_START_ENV = "BENCH_SLACK_CASE_START"
 # Taken off the case's start before it bounds the search: the runner's clock
 # and Slack's timestamps differ, and a post a few seconds after the start must

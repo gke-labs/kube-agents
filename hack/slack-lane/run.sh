@@ -3,7 +3,11 @@
 #
 # Each case runs once with AGENT_TRANSPORT=slack: a test user mentions the
 # install's bot in a CI channel and bench/kube_agents_bench/slack_transport.py
-# reads the thread back, timing post -> first reaction -> ack -> answer. A
+# reads the thread back, timing post -> first reaction -> ack -> answer. A case
+# whose prompt opens with "[bench:reply-under-home-post: <marker>]" starts no
+# thread: it replies under a post the agent made on its own, found by its
+# marker since the case's start, which the runner exports per case as
+# BENCH_SLACK_CASE_START. A
 # "then:" line adds a second turn in the same thread (BENCH_SLACK_THEN), timed
 # as slack_then_* and not graded. The
 # lane gates nothing and always exits 0; a case's result and timing land under
