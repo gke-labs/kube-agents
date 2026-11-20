@@ -1086,7 +1086,11 @@ Worked examples:
 ### Payload
 
 A `topic-update` envelope carries an A2A `Artifact`: `name` is the topic, parts are
-typically one DataPart (the structured state) with an optional TextPart summary. When the
+typically one DataPart (the structured state) with an optional TextPart summary. The
+`topology-skew` document adds a `coverage` object to the leeway report: `clusters_swept`,
+`clusters_read`, and the projects `not_reached` or with `scan_errors` in that run, each
+mapped to its summary. A cluster absent from `clusters` was not read that run; it is not
+clean. When the
 update happened in the course of a task, the envelope carries that task's `taskId` and
 `correlationId` - which is the audit thread from a user's question to the standing state it
 changed. Updates published on an agent's own schedule carry a `correlationId` minted for
