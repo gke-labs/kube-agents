@@ -78,7 +78,7 @@ type PlatformAgentSpec struct {
 	// pod-template hash covers, the kubelet syncs the mounted file (usually
 	// within a minute or two), and both components re-read it on the next
 	// request. Like an exclusion it is checked when a request starts: a watch, a
-	// followed log, or an exec, attach or port-forward stream opened before the
+	// followed log, or an exec, attach, port-forward or proxy stream opened before the
 	// hold reached them keeps running until it ends. The installer does not
 	// carry it: an upgrade keeps the live value.
 	// +optional
