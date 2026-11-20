@@ -877,3 +877,51 @@ func TestTheStopSubscriptionsRefusalIsItsOwn(t *testing.T) {
 		t.Error("another refusal restarts the stop loop")
 	}
 }
+
+// A stop whose stop record can't be published is refused unavailable and
+// marks nothing, so the operator asks again and the retry sends the record:
+// the record is what removes a run still starting, and a stop answered
+// stopped without it could never be sent again.
+func TestATriggerStopWhoseRecordFailsIsRefusedAndSentOnRetry(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	ctx := context.Background()
+	js, err := jetstream.New(tr.nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.DeleteStream(ctx, lib.DispatchStopStream); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.stop(t, s, reply.TaskID); got.Refused == nil || got.Refused.Reason != lib.TriggerRefusedUnavailable {
+		t.Fatalf("a stop with no stop record = %+v, want unavailable", got)
+	}
+	rec, err := tr.g.reg.Get(ctx, "trigger:schedule/kubeagents-system/compliance-audit")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if ref, _ := rec.TaskRefFor(reply.TaskID); ref.Canceled {
+		t.Fatal("the task was marked canceled though its stop record never went out")
+	}
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name: lib.DispatchStopStream, Subjects: []string{lib.DispatchStopPrefix + ">"},
+		Retention: jetstream.LimitsPolicy, MaxMsgsPerSubject: 1, AllowDirect: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopStopped {
+		t.Fatalf("the retry = %+v, want stopped", got)
+	}
+	if _, err := js.Stream(ctx, lib.DispatchStopStream); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := js.Stream(ctx, lib.DispatchStopStream)
+	if _, err := stream.GetLastMsgForSubject(ctx, lib.DispatchStopSubject("fleet-audit", reply.TaskID)); err != nil {
+		t.Fatalf("the retry wrote no stop record: %v", err)
+	}
+}

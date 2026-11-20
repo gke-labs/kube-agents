@@ -598,13 +598,22 @@ func (g *Gateway) handleTriggerStop(ctx context.Context, subject string, data []
 		g.log.Error("trigger stop envelope build failed", "taskId", q.TaskID, "err", err)
 		return refuse(lib.TriggerRefusedInvalid, "the cancel could not be built")
 	}
+	// The stop record first: the dispatcher reads that, not the cancel, for
+	// a submission it still holds queued or a Job still starting, so it is
+	// the half the stop exists for. Either publish failing is refused
+	// unavailable with nothing marked, so the operator asks again and both
+	// are sent again (the record is one per subject, and a second cancel for
+	// the same task is answered as the first).
+	if ref.Tier != "" {
+		if err := g.client.PublishDispatchStop(ctx, ref.Addressee, ref.ID); err != nil {
+			g.log.Error("trigger stop record publish failed", "taskId", q.TaskID, "profile", ref.Addressee, "err", err)
+			return refuse(lib.TriggerRefusedUnavailable, "the stop record could not be published")
+		}
+	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, q.TaskID), env); err != nil {
 		g.log.Error("trigger stop cancel publish failed", "taskId", q.TaskID, "err", err)
 		return refuse(lib.TriggerRefusedUnavailable, "the cancel could not be published")
 	}
-	// The stop record too: the dispatcher reads that, not the cancel, for a
-	// submission it still holds queued or a Job still starting.
-	g.publishDispatchStop(ctx, ref)
 	rec.MarkCanceled(q.TaskID)
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("trigger stop record write failed", "conversation", rec.Key, "taskId", q.TaskID, "err", err)
