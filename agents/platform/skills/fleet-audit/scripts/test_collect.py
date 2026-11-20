@@ -12,6 +12,7 @@ import errno
 import hashlib
 import importlib
 import inspect
+import contextlib
 import io
 import json
 import time
@@ -5058,6 +5059,544 @@ class TestDumpStateGate(unittest.TestCase):
         self.assertIsNone(parsed)
         self.assertEqual(74, result.rc)
         self.assertIn("credential proxy output truncated", result.stderr)
+
+
+# The pods of the two planted image-pull Deployments, as a 1.35 Autopilot host returned them
+# (testdata/image_pull_failing/pods.json says how): two pods that name no pull secret, then two that name one.
+IMAGE_PULL_PODS = Path(__file__).resolve().parent / "testdata" / "image_pull_failing" / "pods.json"
+PULL_NODE_IDENTITY_WORKLOAD = "streamed-image-service"
+PULL_NODE_IDENTITY_NAMESPACE = "seeded-streaming"
+PULL_NODE_IDENTITY_IMAGE = "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+PULL_NAMED_WORKLOAD = "private-image-worker"
+PULL_NAMED_NAMESPACE = "seeded-registry"
+PULL_NAMED_IMAGE = "us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2"
+PULL_REF_NAME = "private-reg-creds"
+# The later of the two node-identity pods' start times, and of the two pull-secret pods'.
+PULL_NODE_IDENTITY_STARTS = ("2026-11-19T00:01:27Z", "2026-11-19T00:01:22Z")
+PULL_NAMED_STARTS = ("2026-11-19T00:01:35Z", "2026-11-19T00:01:32Z")
+PULL_MIN_SECONDS = 600
+PULL_INIT_SECONDS = 1200
+# A claim only a Secret read could back, or the kubelet's own text: neither belongs in the evidence.
+PULL_EVIDENCE_NEVER_SAYS = ("expired", "dockerconfigjson", "oauth token", "https://", "was used", "pulled through")
+PULL_WAITING_PODS_PATH = "/api/v1/pods?"
+# Six Deployments and the pods the collector's own read returned for them on a Standard cluster
+# (testdata/image_pull_failing/standard_read.json says how), read past the minimum age.
+IMAGE_PULL_STANDARD_READ = Path(__file__).resolve().parent / "testdata" / "image_pull_failing" / "standard_read.json"
+PULL_STANDARD_NAMESPACE = "pull-audit-std-read"
+PULL_NODE_IDENTITY_NOTE = "the pods name no pull secret, so the pull runs as the node service account"
+PULL_UNNAMED_NOTE = "the pods name no pull secret"
+# What each Deployment's excerpt says after the container line: the stated reason, the availability, the pull path.
+PULL_STANDARD_EXPECTED = {
+    "image-not-found": ("the image was not found", "0 of 1", PULL_UNNAMED_NOTE),
+    "registry-not-reached": ("the registry's host name did not resolve", "0 of 1", PULL_UNNAMED_NOTE),
+    "refused-node-identity": ("the registry refused the pull (403 Forbidden)", "0 of 1", PULL_NODE_IDENTITY_NOTE),
+    "refused-pull-secret": ("the registry refused the pull (401 Unauthorized, 403 Forbidden)", "0 of 1", "the pods name pull secret `private-reg-creds`"),
+    "init-then-refused": ("the registry refused the pull (403 Forbidden)", "0 of 1", PULL_NODE_IDENTITY_NOTE),
+    "surge-stuck": ("the registry refused the pull (403 Forbidden)", "2 of 3", PULL_NODE_IDENTITY_NOTE),
+}
+# When the init container of `init-then-refused` finished, two minutes after its pod started.
+PULL_STANDARD_INIT_DONE = "2026-11-20T19:09:12Z"
+PULL_WAITING_SELECTOR = "fieldSelector=status.phase%3DPending%2Cspec.nodeName%21%3D"
+
+
+def pull_epoch(stamp):
+    return collect._rfc3339(stamp)
+
+
+def pull_stamp(epoch):
+    return collect.datetime.datetime.fromtimestamp(epoch, collect.datetime.timezone.utc).strftime(collect.TIMESTAMP_FORMAT)
+
+
+def pull_pods(first=0, count=2):
+    """`count` of the fixture's pods from index `first`: 0 for the pods that name no pull secret, 2 for the ones that name one."""
+    return json.loads(IMAGE_PULL_PODS.read_text(encoding="utf-8"))["items"][first : first + count]
+
+
+def pull_workload(name=PULL_NODE_IDENTITY_WORKLOAD, ns=PULL_NODE_IDENTITY_NAMESPACE, kind="Deployment", counted=2, available=0):
+    """The raw workload a dump holds: a selector on `app`, and a status that counts `counted` pods and `available` of them available."""
+    doc = deployment(name, ns=ns)
+    doc["kind"] = kind
+    doc["spec"]["selector"] = {"matchLabels": {"app": name}}
+    doc["status"] = (
+        {"desiredNumberScheduled": counted, "numberAvailable": available}
+        if kind == "DaemonSet"
+        else {"replicas": counted, "availableReplicas": available}
+    )
+    return doc
+
+
+def pull_waiting(pod, message, reason="ImagePullBackOff"):
+    pod["status"]["containerStatuses"][0]["state"] = {"waiting": {"reason": reason, "message": message}}
+    return pod
+
+
+class TestImagePullFailing(unittest.TestCase):
+    """3.28: a workload with a pod that has failed to pull its image for ten minutes or more is
+    named once, with what the pod's status states and no diagnosis of its own."""
+
+    def hit(self, pods, raw=None, read_at=None, after=PULL_MIN_SECONDS, others=()):
+        """The check's answer for `raw` over `pods`, read `after` seconds past the latest start time among the fixture's pods."""
+        raw = raw or pull_workload()
+        raws = [raw, *others]
+        workloads = collect.normalize_workloads(dump_of(*raws))
+        if read_at is None:
+            read_at = max(pull_epoch(p["status"]["startTime"]) for p in pods) + after
+        context = {
+            "pull_waiting_pods": [collect.pull_waiting_pod_record(p) for p in pods],
+            "pod_availability": collect.workloads_short_of_pods(raws, workloads),
+            "pull_waiting_read_at": read_at,
+        }
+        workload = next(w for w in workloads if w["name"] == raw["metadata"]["name"])
+        return collect.check_image_pull_failing(workload, context)
+
+    def test_the_planted_pods_are_one_finding_on_their_deployment(self):
+        hit = self.hit(pull_pods())
+        self.assertEqual(hit["object"], f"Deployment/{PULL_NODE_IDENTITY_WORKLOAD}")
+        self.assertEqual(
+            hit["excerpt"],
+            f"At this audit's read: app: 2 pods could not pull {PULL_NODE_IDENTITY_IMAGE}, waiting since "
+            f"{min(PULL_NODE_IDENTITY_STARTS)}; the kubelet's stated reason: the registry refused the pull (403 Forbidden); "
+            "0 of 2 pods of the workload are available; "
+            "the pods name no pull secret, so the pull runs as the node service account",
+        )
+
+    def test_the_pod_that_names_a_pull_secret_is_named_with_its_secret_and_both_answers(self):
+        # With a pull secret the kubelet tries the secret's credential and then the node's: two statuses.
+        raw = pull_workload(PULL_NAMED_WORKLOAD, PULL_NAMED_NAMESPACE)
+        excerpt = self.hit(pull_pods(first=2), raw=raw)["excerpt"]
+        self.assertIn(f"app: 2 pods could not pull {PULL_NAMED_IMAGE}, waiting since {min(PULL_NAMED_STARTS)}", excerpt)
+        self.assertIn("the registry refused the pull (401 Unauthorized, 403 Forbidden)", excerpt)
+        self.assertTrue(excerpt.endswith(f"the pods name pull secret `{PULL_REF_NAME}`"), excerpt)
+
+    def test_a_wait_is_named_at_ten_minutes_and_not_a_second_before(self):
+        older = min(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        self.assertIsNone(self.hit(pull_pods(), read_at=older + PULL_MIN_SECONDS - 1))
+        self.assertIsNotNone(self.hit(pull_pods(), read_at=older + PULL_MIN_SECONDS))
+        self.assertEqual(collect.IMAGE_PULL_FAILING_MIN_SECONDS, PULL_MIN_SECONDS)
+
+    def test_only_the_pods_past_the_minimum_are_counted(self):
+        # One pod is five seconds older than the other: at ten minutes past the older one, one pod counts.
+        older = min(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        self.assertIn("app: 1 pod could not pull", self.hit(pull_pods(), read_at=older + PULL_MIN_SECONDS)["excerpt"])
+
+    def test_the_wait_runs_from_the_end_of_the_init_containers_and_not_from_the_pods_start(self):
+        # A pod that spent twenty minutes in an init container has waited on its main image since
+        # the Initialized condition turned True, which is what the evidence says and what the minimum counts from.
+        pod = pull_pods(count=1)[0]
+        started = pull_epoch(pod["status"]["startTime"])
+        initialized = started + PULL_INIT_SECONDS
+        for condition in pod["status"]["conditions"]:
+            if condition["type"] == "Initialized":
+                condition["lastTransitionTime"] = pull_stamp(initialized)
+        self.assertIsNone(self.hit([pod], read_at=initialized + PULL_MIN_SECONDS - 1))
+        hit = self.hit([pod], read_at=initialized + PULL_MIN_SECONDS)
+        self.assertIn(f"waiting since {pull_stamp(initialized)}", hit["excerpt"])
+
+    def test_an_init_container_that_cannot_pull_waits_from_the_init_container_before_it(self):
+        pod = pull_pods(count=1)[0]
+        started = pull_epoch(pod["status"]["startTime"])
+        first_done = started + PULL_INIT_SECONDS
+        waiting = pod["status"].pop("containerStatuses")[0]
+        waiting["name"] = "fetch"
+        pod["status"]["initContainerStatuses"] = [
+            {"name": "warm-up", "state": {"terminated": {"exitCode": 0, "finishedAt": pull_stamp(first_done)}}},
+            waiting,
+        ]
+        pod["status"]["conditions"] = [c for c in pod["status"]["conditions"] if c["type"] != "Initialized"]
+        pod["spec"]["initContainers"] = [{"name": "warm-up", "image": "gcr.io/acme/warm:1.0"}, {"name": "fetch", "image": PULL_NODE_IDENTITY_IMAGE}]
+        pod["spec"]["containers"] = [{"name": "app", "image": "gcr.io/acme/app:1.0"}]
+        self.assertIsNone(self.hit([pod], read_at=first_done + PULL_MIN_SECONDS - 1))
+        hit = self.hit([pod], read_at=first_done + PULL_MIN_SECONDS)
+        self.assertIn(f"fetch: 1 pod could not pull {PULL_NODE_IDENTITY_IMAGE}, waiting since {pull_stamp(first_done)}", hit["excerpt"])
+
+    def test_a_pod_with_no_start_time_is_not_judged(self):
+        pod = pull_pods(count=1)[0]
+        self.assertIsNotNone(self.hit([pod]))
+        read_at = pull_epoch(pod["status"].pop("startTime")) + PULL_MIN_SECONDS
+        self.assertIsNone(self.hit([pod], read_at=read_at))
+
+    def test_either_waiting_reason_is_a_failed_pull_and_a_pod_that_is_pulling_is_not(self):
+        for reason, named in (("ErrImagePull", True), ("ImagePullBackOff", True), ("ContainerCreating", False)):
+            with self.subTest(reason=reason):
+                pod = pull_pods(count=1)[0]
+                pod["status"]["containerStatuses"][0]["state"]["waiting"]["reason"] = reason
+                self.assertEqual(self.hit([pod]) is not None, named)
+
+    def test_a_terminating_pod_is_not_read(self):
+        pod = pull_pods(count=1)[0]
+        self.assertIsNotNone(self.hit([pod]))
+        pod["metadata"]["deletionTimestamp"] = "2026-11-19T00:30:00Z"
+        self.assertIsNone(self.hit([pod], read_at=pull_epoch(pod["status"]["startTime"]) + PULL_MIN_SECONDS))
+
+    def test_a_workload_whose_pods_are_all_available_is_not_judged(self):
+        """The gate: a workload the dump shows whole gets no finding whatever the pod list
+        holds, and the same pods under a status that is one pod short are named."""
+        self.assertIsNone(self.hit(pull_pods(), raw=pull_workload(counted=2, available=2)))
+        self.assertIsNotNone(self.hit(pull_pods(), raw=pull_workload(counted=2, available=1)))
+
+    def test_a_rollout_with_one_stuck_surge_pod_is_named_and_says_the_old_pods_serve(self):
+        # Three old replicas available and one surge pod that cannot pull: the status counts four pods.
+        hit = self.hit(pull_pods(count=1), raw=pull_workload(counted=4, available=3))
+        self.assertIn("app: 1 pod could not pull", hit["excerpt"])
+        self.assertIn("3 of 4 pods of the workload are available", hit["excerpt"])
+
+    def test_a_daemonset_rollout_with_a_stuck_surge_pod_opens_the_gate(self):
+        """A DaemonSet counts a node available from its old pod, so a surge pod that cannot pull
+        lowers neither the desired nor the available count; the count of pods on the current
+        template is what shows the rollout is not finished."""
+
+        def short(updated):
+            raw = pull_workload(kind="DaemonSet", counted=3, available=3)
+            if updated is not None:
+                raw["status"]["updatedNumberScheduled"] = updated
+            return collect.workloads_short_of_pods([raw], collect.normalize_workloads(dump_of(raw)))
+
+        self.assertEqual(short(1), {("DaemonSet", PULL_NODE_IDENTITY_NAMESPACE, PULL_NODE_IDENTITY_WORKLOAD): (3, 3)})
+        self.assertEqual(short(3), {})
+        self.assertEqual(short(None), {})
+        pod = pull_pods(count=1)[0]
+        pod["metadata"]["ownerReferences"] = [{"kind": "DaemonSet", "name": PULL_NODE_IDENTITY_WORKLOAD, "controller": True}]
+        raw = pull_workload(kind="DaemonSet", counted=3, available=3)
+        raw["status"]["updatedNumberScheduled"] = 1
+        self.assertIn("3 of 3 pods of the workload are available", self.hit([pod], raw=raw)["excerpt"])
+
+    def test_a_container_that_ran_and_cannot_pull_again_waits_from_the_end_of_its_last_run(self):
+        # An init container ran for an hour, exited, and its image cannot be pulled again: it has
+        # waited since it exited, not since the pod started an hour before.
+        pod = pull_pods(count=1)[0]
+        ran_until = pull_epoch(pod["status"]["startTime"]) + 3600
+        pod["status"]["containerStatuses"][0]["lastState"] = {"terminated": {"exitCode": 1, "finishedAt": pull_stamp(ran_until)}}
+        self.assertIsNone(self.hit([pod], read_at=ran_until + PULL_MIN_SECONDS - 1))
+        self.assertIn(f"waiting since {pull_stamp(ran_until)}", self.hit([pod], read_at=ran_until + PULL_MIN_SECONDS)["excerpt"])
+
+    def test_the_wait_does_not_start_before_the_pods_sandbox_is_up(self):
+        pod = pull_pods(count=1)[0]
+        sandbox_up = pull_epoch(pod["status"]["startTime"]) + PULL_INIT_SECONDS
+        pod["status"]["conditions"].append(
+            {"type": "PodReadyToStartContainers", "status": "True", "lastTransitionTime": pull_stamp(sandbox_up)}
+        )
+        self.assertIsNone(self.hit([pod], read_at=sandbox_up + PULL_MIN_SECONDS - 1))
+        self.assertIsNotNone(self.hit([pod], read_at=sandbox_up + PULL_MIN_SECONDS))
+
+    def test_the_availability_of_each_kind_is_read_from_its_own_status(self):
+        for kind in ("Deployment", "StatefulSet", "DaemonSet"):
+            with self.subTest(kind=kind):
+                self.assertEqual(collect.pod_availability(pull_workload(kind=kind, counted=3, available=1)), (3, 1))
+        self.assertEqual(collect.pod_availability({"kind": "Deployment"}), (0, 0))
+        self.assertEqual(collect.pod_availability({"kind": "Deployment", "status": {"replicas": 2}}), (2, 0))
+
+    def test_the_other_workload_kinds_are_named_by_their_own_name(self):
+        for kind in ("StatefulSet", "DaemonSet"):
+            with self.subTest(kind=kind):
+                pod = pull_pods(count=1)[0]
+                pod["metadata"]["ownerReferences"] = [{"kind": kind, "name": PULL_NODE_IDENTITY_WORKLOAD, "controller": True}]
+                self.assertEqual(self.hit([pod], raw=pull_workload(kind=kind))["object"], f"{kind}/{PULL_NODE_IDENTITY_WORKLOAD}")
+
+    def test_a_pod_is_counted_for_its_own_workload_only(self):
+        """Labels and owner both: a pod with the workload's labels under another owner is not its
+        pod, and neither is a pod of a ReplicaSet that only shares the name's prefix."""
+        stray = pull_pods(count=1)[0]
+        stray["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "other-5c8d7", "controller": True}]
+        self.assertIsNone(self.hit([stray], read_at=pull_epoch(stray["status"]["startTime"]) + PULL_MIN_SECONDS))
+        relabelled = pull_pods(count=1)[0]
+        relabelled["metadata"]["labels"]["app"] = "other"
+        self.assertIsNone(self.hit([relabelled], read_at=pull_epoch(relabelled["status"]["startTime"]) + PULL_MIN_SECONDS))
+        longer = pull_workload(f"{PULL_NODE_IDENTITY_WORKLOAD}-79dd67676b")
+        longer["spec"]["selector"] = {"matchLabels": {"app": PULL_NODE_IDENTITY_WORKLOAD}}
+        self.assertIsNone(self.hit(pull_pods(), raw=longer))
+        self.assertIsNotNone(self.hit(pull_pods(), others=[longer]))
+
+    def test_an_excluded_workload_is_not_judged(self):
+        system = pull_workload(ns="kube-system")
+        self.assertEqual(collect.workloads_short_of_pods([system], collect.normalize_workloads(dump_of(system))), {})
+        judged = pull_workload()
+        self.assertEqual(
+            collect.workloads_short_of_pods([judged], collect.normalize_workloads(dump_of(judged))),
+            {("Deployment", PULL_NODE_IDENTITY_NAMESPACE, PULL_NODE_IDENTITY_WORKLOAD): (2, 0)},
+        )
+
+    def test_the_pull_secrets_are_read_from_the_pods_spec_in_its_order(self):
+        # The ServiceAccount admission plugin copies an account's pull secrets onto the pod, so the pod is what is read.
+        pod = pull_pods(count=1)[0]
+        pod["spec"]["imagePullSecrets"] = [{"name": "second-creds"}, {"name": PULL_REF_NAME}]
+        self.assertTrue(self.hit([pod])["excerpt"].endswith(f"the pods name pull secrets `second-creds`, `{PULL_REF_NAME}`"))
+
+    def test_pods_that_disagree_on_the_pull_secret_get_one_clause_each(self):
+        # A rolling update that added the secret: both generations wait on the same pull.
+        bare, named = pull_pods()
+        named["spec"]["imagePullSecrets"] = [{"name": PULL_REF_NAME}]
+        self.assertTrue(
+            self.hit([bare, named])["excerpt"].endswith(
+                "of the waiting pods, 1 name no pull secret, so their pull runs as the node service account; "
+                f"1 name pull secret `{PULL_REF_NAME}`"
+            )
+        )
+
+    def test_the_stated_reason_is_one_of_a_closed_set(self):
+        image = PULL_NODE_IDENTITY_IMAGE
+        host = image.partition("/")[0]
+        refused = f'failed to pull image "{image}": unexpected status from GET request to https://{host}/v2/token?scope=x: 403 Forbidden'
+        not_found = f'failed to resolve reference "{image}": {image}: not found'
+        unresolved = f'failed to do request: Head "https://{host}/v2/x": dial tcp: lookup {host} on 10.0.0.2:53: no such host'
+        cases = (
+            (refused, "the registry refused the pull (403 Forbidden)"),
+            (not_found, "the image was not found"),
+            (unresolved, "the registry's host name did not resolve"),
+            (f"dial tcp: lookup {host}: no such host", "the registry's host name did not resolve"),
+            # Attempts within one message that state different things give each, whatever their order.
+            (f"[{refused}, {not_found}]", "the image was not found; the registry refused the pull (403 Forbidden)"),
+            (f"[{not_found}, {refused}]", "the image was not found; the registry refused the pull (403 Forbidden)"),
+            # A status from another host is a proxy's, a mirror's or a token service's: not read as the registry's.
+            (refused.replace(f"https://{host}/", "https://mirror.example.com/"), ""),
+            (
+                'failed to pull image "docker.io/acme/app:1": failed to authorize: failed to fetch oauth token: '
+                "unexpected status from GET request to https://auth.docker.io/token?scope=x: 401 Unauthorized",
+                "",
+            ),
+            # The same words about something else than the resolved reference or the image's host state nothing.
+            (f'failed to pull image "{image}": no match for platform in manifest sha256:0a1b: not found', ""),
+            (f'failed to pull image "{image}": dial tcp: lookup mirror.example.com on 10.0.0.2:53: no such host', ""),
+            (f"[lookup {host} on 10.0.0.2:53: i/o timeout, lookup auth.example.com on 10.0.0.2:53: no such host]", ""),
+            # Wording that is said of more than one fault states nothing.
+            (f'failed to pull image "{image}": dial tcp 10.0.0.1:443: connect: connection refused', ""),
+            (f'failed to pull image "{image}": dial tcp 10.0.0.1:443: i/o timeout', ""),
+            (f'failed to pull and unpack image "{image}": failed to copy: context deadline exceeded', ""),
+            (f'failed to pull image "{image}": tls: failed to verify certificate: x509: certificate signed by unknown authority', ""),
+            (f'failed to pull image "{image}": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://{host}/v2/token: 503 Service Unavailable', ""),
+            (f'failed to pull image "{image}": pull access denied', ""),
+            (f'Back-off pulling image "{image}"', ""),
+        )
+        for message, reason in cases:
+            with self.subTest(message=message):
+                self.assertEqual(collect.stated_pull_failure([message], image), reason)
+
+    def test_a_reference_the_runtime_spells_differently_and_a_host_with_a_port_are_still_read(self):
+        # The runtime resolves `gcr.io/acme/app` as `gcr.io/acme/app:latest`, and the resolver names a host without its port.
+        self.assertEqual(
+            collect.stated_pull_failure(
+                ['failed to resolve reference "gcr.io/acme/app:latest": gcr.io/acme/app:latest: not found'], "gcr.io/acme/app"
+            ),
+            "the image was not found",
+        )
+        self.assertEqual(
+            collect.stated_pull_failure(["dial tcp: lookup reg.internal on 10.0.0.2:53: no such host"], "reg.internal:5000/a:1"),
+            "the registry's host name did not resolve",
+        )
+
+    def test_a_pull_that_states_no_reason_is_still_named_and_says_so(self):
+        pods = [pull_waiting(pod, f'Back-off pulling image "{PULL_NODE_IDENTITY_IMAGE}"') for pod in pull_pods()]
+        self.assertIn("the kubelet's message states no reason this check reads", self.hit(pods)["excerpt"])
+
+    def test_a_reason_one_pod_states_is_read_for_the_workload(self):
+        # A back-off message that carries no cause says nothing; another pod of the workload may still state it.
+        stated, silent = pull_pods()
+        pull_waiting(silent, f'Back-off pulling image "{PULL_NODE_IDENTITY_IMAGE}"')
+        excerpt = self.hit([stated, silent])["excerpt"]
+        self.assertIn("app: 2 pods could not pull", excerpt)
+        self.assertIn("the registry refused the pull (403 Forbidden)", excerpt)
+
+    def test_the_excerpt_quotes_no_kubelet_text_and_survives_redaction(self):
+        import audit_report
+
+        for first, name, ns in ((0, PULL_NODE_IDENTITY_WORKLOAD, PULL_NODE_IDENTITY_NAMESPACE), (2, PULL_NAMED_WORKLOAD, PULL_NAMED_NAMESPACE)):
+            with self.subTest(workload=name):
+                excerpt = self.hit(pull_pods(first=first), raw=pull_workload(name, ns))["excerpt"]
+                for words in PULL_EVIDENCE_NEVER_SAYS:
+                    self.assertNotIn(words, excerpt.lower())
+                self.assertEqual(audit_report.redact_secrets(excerpt), excerpt)
+
+
+class TestImagePullFailingOnAStandardRead(unittest.TestCase):
+    """The check over a live read of a Standard cluster: each cause of a failed pull, the init
+    container's clock and the stuck surge pod, as the API server returned them."""
+
+    def hits(self, read_at=None):
+        read = json.loads(IMAGE_PULL_STANDARD_READ.read_text(encoding="utf-8"))
+        workloads = collect.normalize_workloads(dump_of(*read["deployments"]))
+        context = {
+            "pull_waiting_pods": [collect.pull_waiting_pod_record(pod) for pod in read["pods"]],
+            "pod_availability": collect.workloads_short_of_pods(read["deployments"], workloads),
+            "pull_waiting_read_at": read_at if read_at is not None else pull_epoch(read["read_at"]),
+        }
+        return {w["name"]: collect.check_image_pull_failing(w, context) for w in workloads}
+
+    def test_every_planted_workload_is_named_with_its_stated_reason(self):
+        hits = self.hits()
+        self.assertEqual(set(hits), set(PULL_STANDARD_EXPECTED))
+        for name, (reason, available, path) in PULL_STANDARD_EXPECTED.items():
+            with self.subTest(workload=name):
+                self.assertEqual(hits[name]["object"], f"Deployment/{name}")
+                excerpt = hits[name]["excerpt"]
+                self.assertIn("app: 1 pod could not pull", excerpt)
+                self.assertIn(f"; the kubelet's stated reason: {reason}; {available} pods of the workload are available; ", excerpt)
+                self.assertTrue(excerpt.endswith(f"; {path}"), excerpt)
+
+    def test_the_init_containers_two_minutes_do_not_count_toward_the_minimum(self):
+        # Every pod started within five seconds; the one that ran an init container first has
+        # waited on its image two minutes less, and is named two minutes later than the rest.
+        done = pull_epoch(PULL_STANDARD_INIT_DONE)
+        early = self.hits(read_at=done + PULL_MIN_SECONDS - 1)
+        self.assertIsNone(early["init-then-refused"])
+        self.assertIsNotNone(early["refused-node-identity"])
+        self.assertIn(f"waiting since {PULL_STANDARD_INIT_DONE}", self.hits(read_at=done + PULL_MIN_SECONDS)["init-then-refused"]["excerpt"])
+
+    def test_a_pull_from_another_registry_with_no_pull_secret_is_not_said_to_run_as_the_node(self):
+        hits = self.hits()
+        self.assertNotIn("node service account", hits["image-not-found"]["excerpt"])
+        self.assertIn("node service account", hits["refused-node-identity"]["excerpt"])
+
+    def test_no_excerpt_quotes_the_kubelet_or_changes_under_redaction(self):
+        import audit_report
+
+        for name, hit in self.hits().items():
+            with self.subTest(workload=name):
+                for words in PULL_EVIDENCE_NEVER_SAYS:
+                    self.assertNotIn(words, hit["excerpt"].lower())
+                self.assertEqual(audit_report.redact_secrets(hit["excerpt"]), hit["excerpt"])
+
+
+class TestImagePullFailingCollection(unittest.TestCase):
+    """The read behind 3.28: none while every workload is available, one narrowed and paged read
+    when one is not, and a failed read that costs this check alone."""
+
+    CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+    SLUG = "image-pull-failing"
+
+    def collect(self, raws, pods=(), pod_reply=None, cluster=None, now=None, patch_clock=True):
+        """One collection over `raws` as the dump's workloads, through the real paged read (the
+        fake answers each `--raw` page itself). Returns the cluster's entry, the pod reads
+        issued, and the kubeconfig the reads ran under."""
+        pod_calls = []
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                if argv[3].startswith(PULL_WAITING_PODS_PATH):
+                    pod_calls.append(argv[3])
+                    return pod_reply(argv) if pod_reply else Run(argv, 0, json.dumps(dump_of(*pods)), "", 0.02)
+                kind_path = argv[3].partition("?")[0].rpartition("/")[2]
+                items = [raw for raw in raws if f"{raw['kind'].lower()}s" == kind_path]
+                return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.02)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "x"', 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        cluster = cluster or self.CLUSTER
+        read_at = now if now is not None else max((pull_epoch(p["status"]["startTime"]) for p in pods), default=0.0) + PULL_MIN_SECONDS
+        clock = patch.object(collect.time, "time", return_value=read_at) if patch_clock else contextlib.nullcontext()
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(collect, "KUBECONFIG_DIR", Path(tmp)),
+            patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump),
+            clock,
+        ):
+            result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+            kubeconfig = collect.kubeconfig_path(cluster["project"], cluster["name"], cluster["location"])
+        return result, pod_calls, kubeconfig
+
+    def command(self, result):
+        return next((c["command"] for c in result["commands"] if c["check"] == self.SLUG), None)
+
+    def candidates(self, result):
+        return [c for c in result["candidates"] if c["check"] == self.SLUG]
+
+    def test_a_cluster_whose_workloads_are_all_available_reads_no_pods(self):
+        result, pod_calls, kubeconfig = self.collect([pull_workload(counted=2, available=2)], pods=pull_pods())
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        self.assertEqual(pod_calls, [])
+        self.assertEqual(self.candidates(result), [])
+        self.assertEqual(self.command(result), collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig))
+
+    def test_a_workload_short_of_pods_is_one_narrowed_paged_read_and_a_candidate(self):
+        import audit_report
+
+        result, pod_calls, kubeconfig = self.collect([pull_workload()], pods=pull_pods())
+        self.assertEqual(len(pod_calls), 1, pod_calls)
+        self.assertIn(PULL_WAITING_SELECTOR, pod_calls[0])
+        self.assertIn("limit=500", pod_calls[0])
+        (found,) = self.candidates(result)
+        self.assertEqual(
+            (found["object"], found["namespace"], found["severity"], found["needs_triage"]),
+            (f"Deployment/{PULL_NODE_IDENTITY_WORKLOAD}", PULL_NODE_IDENTITY_NAMESPACE, "major", "image-pull"),
+        )
+        self.assertIn("could not pull", found["excerpt"])
+        dump = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
+        pod_read = collect.paged_command_text(("pods",), query=collect.PULL_WAITING_PODS_QUERY, kubeconfig=kubeconfig)
+        self.assertEqual(self.command(result), f"{dump}; {pod_read}")
+        self.assertLessEqual(len(self.command(result)), audit_report.MAX_COMMAND_CHARS)
+        self.assertIn(found["needs_triage"], audit_report.NO_SWEEP_TRIAGE)
+
+    def test_the_collector_takes_the_time_of_its_own_read(self):
+        # The same pods one second short of the minimum at the collector's clock are not a candidate.
+        latest = max(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        early, _, _ = self.collect([pull_workload()], pods=pull_pods(), now=min(pull_epoch(s) for s in PULL_NODE_IDENTITY_STARTS) + PULL_MIN_SECONDS - 1)
+        self.assertEqual(self.candidates(early), [])
+        late, _, _ = self.collect([pull_workload()], pods=pull_pods(), now=latest + PULL_MIN_SECONDS)
+        self.assertEqual(len(self.candidates(late)), 1)
+
+    def test_autopilot_runs_the_check_at_the_same_severity(self):
+        cluster = {**self.CLUSTER, "autopilot": True}
+        result, pod_calls, _ = self.collect([pull_workload()], pods=pull_pods(), cluster=cluster)
+        self.assertEqual(len(pod_calls), 1)
+        self.assertEqual([c["severity"] for c in self.candidates(result)], ["major"])
+
+    def test_a_failed_pod_read_leaves_this_check_alone_not_evaluated(self):
+        refused = lambda argv: Run(argv, 1, "", "Error from server (Forbidden): pods is forbidden", 0.01)  # noqa: E731
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            result, _, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=refused)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}
+        self.assertEqual(set(unevaluated), {self.SLUG})
+        # The reason reaches the run's report, so it is plain words: the exit code and
+        # the stderr go to the collector's log and stay out of it.
+        self.assertEqual(
+            unevaluated[self.SLUG],
+            f"{collect.UNDETERMINED_PREFIX} the pods that have a node and have not started could not be read, "
+            "so a failing image pull could not be established. This check cleared nothing on this cluster.",
+        )
+        self.assertIn("pods is forbidden", logged.getvalue())
+        self.assertIsNone(self.command(result))
+        self.assertEqual(self.candidates(result), [])
+        self.assertIn("no-pdb", {c["check"] for c in result["commands"]})
+
+    def test_a_read_past_its_page_ceiling_is_not_evaluated_and_stops_there(self):
+        pages = {"n": 0}
+
+        def endless(argv):
+            pages["n"] += 1
+            page = {"items": pull_pods(), "metadata": {"continue": f"t{pages['n']}"}}
+            return Run(argv, 0, json.dumps(page), "", 0.01)
+
+        result, pod_calls, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=endless)
+        self.assertEqual(len(pod_calls), collect.PULL_WAITING_PODS_MAX_PAGES)
+        unevaluated = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}
+        self.assertIn("are more than the 2000 this check reads on one cluster", unevaluated[self.SLUG])
+        self.assertEqual(self.candidates(result), [])
+
+    def test_a_pod_read_that_times_out_says_so_in_plain_words(self):
+        timed_out = lambda argv: Run(argv, collect.TIMEOUT_RC, "", "timed out after 60s", 60.0)  # noqa: E731
+        result, _, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=timed_out)
+        reason = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}[self.SLUG]
+        self.assertIn("could not be read in time", reason)
+        self.assertNotIn(str(collect.TIMEOUT_RC), reason)
+
+    def test_the_time_is_taken_before_the_pods_are_read(self):
+        """A slow read must not age the pods it returns: the clock is one second short of the
+        minimum until the read is issued and far past it afterwards, and nothing is named."""
+        latest = max(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        oldest = min(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        clock = {"now": oldest + PULL_MIN_SECONDS - 1}
+
+        def slow_read(argv):
+            clock["now"] = latest + 10 * PULL_MIN_SECONDS
+            return Run(argv, 0, json.dumps(dump_of(*pull_pods())), "", 0.02)
+
+        with patch.object(collect.time, "time", side_effect=lambda: clock["now"]):
+            result, pod_calls, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=slow_read, patch_clock=False)
+        self.assertEqual(len(pod_calls), 1)
+        self.assertEqual(self.candidates(result), [])
 
 
 class TestCollectCluster(unittest.TestCase):
