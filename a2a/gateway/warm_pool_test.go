@@ -850,3 +850,54 @@ func TestADeposedLeaderCreatesNoWarmPod(t *testing.T) {
 		t.Fatalf("the leader created %v, want one warm pod", got)
 	}
 }
+
+// An unclaimed warm pod something was published to (a claim entry lost from
+// the bucket, its conversation likely on it) is no longer the pool's: it is
+// left out of the pool's count, so the pool replaces it rather than waiting
+// out its claim window, and the cap counts it as a live session, with no
+// conversation named. An unused warm pod still holds no cap slot.
+func TestAUsedUnclaimedWarmPodCountsAsALiveSessionNotAPoolPod(t *testing.T) {
+	g, spawn, r := warmPassRig(t)
+	ctx := context.Background()
+	const used, idle = "chat-otter-wused", "chat-otter-widle"
+	publishTaskTo(t, r, used, "task-lost-claim")
+	spawn.setWarm(readyWarm(used))
+	spawn.setSessionPods(sessionPod{PodName: used, Warm: true, Reuse: true}, sessionPod{PodName: idle, Warm: true, Reuse: true})
+	pods, err := g.sessionPods(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || pods[0].PodName != used || pods[0].SessionKey != "" {
+		t.Fatalf("sessionPods = %+v, want only the used warm pod, with no conversation named", pods)
+	}
+	g.warmPoolOnce(ctx)
+	if got := spawn.warmSpawned(); len(got) != 1 {
+		t.Fatalf("warm pods created %v, want one: the used pod is not the pool's", got)
+	}
+	if slices.Contains(spawn.deleted(), used) {
+		t.Fatal("the pool deleted a used warm pod")
+	}
+}
+
+// A warm pod past its claim window whose task subjects can't be read is kept
+// and stays counted, so the pool does not replace it beside itself and run
+// one more warm pod than it was budgeted.
+func TestAnAgedWarmPodWhoseSubjectsCantBeReadIsNotReplaced(t *testing.T) {
+	g, spawn, _ := warmPassRig(t)
+	ctx := context.Background()
+	const aged = "chat-otter-waged"
+	g.warmUsedErr = func(pod string) error {
+		if pod == aged {
+			return errors.New("direct get: timeout")
+		}
+		return nil
+	}
+	spawn.setWarm(warmPod{Name: aged, Created: time.Now().Add(-warmClaimableAge), Ready: true, Current: true})
+	g.warmPoolOnce(ctx)
+	if got := spawn.deleted(); len(got) != 0 {
+		t.Fatalf("deleted %v with the task subjects unreadable", got)
+	}
+	if got := spawn.warmSpawned(); len(got) != 0 {
+		t.Fatalf("warm pods created %v beside a pod that may still be there", got)
+	}
+}

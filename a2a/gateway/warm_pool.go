@@ -199,9 +199,15 @@ func (g *Gateway) tryClaimWarm(ctx context.Context, rec *SessionRecord, pod stri
 	return pod, true, false
 }
 
-// warmPodUsed reports whether anything was ever published to pod's task
-// subjects, read with one direct get of the newest message on them.
+// warmPodUsed reports whether anything was published to pod's task subjects
+// within TASKS' retention, read with one direct get of the newest message on
+// them.
 func (g *Gateway) warmPodUsed(ctx context.Context, pod string) (bool, error) {
+	if g.warmUsedErr != nil {
+		if err := g.warmUsedErr(pod); err != nil {
+			return false, err
+		}
+	}
 	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
 	if err != nil {
 		return false, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
@@ -262,8 +268,12 @@ func (g *Gateway) endWarmDelete(pod string) {
 // conversation's, so it holds no cap slot (the pool sizes itself inside the
 // cap, and the operator's quota headroom and TASKS budget count it apart),
 // and it is no stranded orphan for the untracked sweep or a candidate for
-// the cap's eviction. The claim index is read only when a warm pod is
-// listed.
+// the cap's eviction. The exception is an unclaimed warm pod something was
+// published to (warmPodUsed), most likely a claim entry lost from the
+// bucket: it may be serving a conversation, so it counts as a live session,
+// with no conversation named, which the eviction and the untracked sweep
+// skip. One whose subjects can't be read counts too, the safe side of the
+// cap. The claim index is read only when a warm pod is listed.
 func (g *Gateway) sessionPods(ctx context.Context) ([]sessionPod, error) {
 	pods, err := g.spawner.SessionPods(ctx)
 	if err != nil || !slices.ContainsFunc(pods, func(p sessionPod) bool { return p.Warm }) {
@@ -278,7 +288,9 @@ func (g *Gateway) sessionPods(ctx context.Context) ([]sessionPod, error) {
 		if p.Warm {
 			key, claimed := claims[p.PodName]
 			if !claimed {
-				continue
+				if used, err := g.warmPodUsed(ctx, p.PodName); err == nil && !used {
+					continue
+				}
 			}
 			p.SessionKey = key
 		}
@@ -364,23 +376,43 @@ func (g *Gateway) warmPoolOnce(ctx context.Context) {
 	}
 	live := len(pods) + len(g.capHoldSnapshot("", time.Now()))
 	now := time.Now()
+	// fresh is the pool's own pods: every unclaimed warm pod that is still
+	// there after this pass's deletes, so a pod a delete left in place is
+	// never replaced beside it. A pod something was published to is not the
+	// pool's (sessionPods counts it as a live session), and one whose
+	// subjects can't be read stays counted, deleted or not.
 	var fresh []warmPod
 	for _, p := range warm {
 		if _, claimed := claims[p.Name]; claimed || p.Gone {
 			continue
 		}
+		used, err := g.warmPodUsed(ctx, p.Name)
+		switch {
+		case err != nil:
+			g.log.Warn("warm pool: task subject read failed; keeping the pod counted", "pod", p.Name, "err", err)
+			fresh = append(fresh, p)
+			continue
+		case used:
+			continue
+		}
 		switch {
 		case !p.Current:
-			g.deleteWarmIfUnclaimed(ctx, p.Name, "made under an earlier config")
+			if !g.deleteWarmIfUnclaimed(ctx, p.Name, "made under an earlier config") {
+				fresh = append(fresh, p)
+			}
 		case now.Sub(p.Created) >= warmClaimableAge:
-			g.deleteWarmIfUnclaimed(ctx, p.Name, "aged past its claim window")
+			if !g.deleteWarmIfUnclaimed(ctx, p.Name, "aged past its claim window") {
+				fresh = append(fresh, p)
+			}
 		default:
 			fresh = append(fresh, p)
 		}
 	}
 	slices.SortFunc(fresh, func(a, b warmPod) int { return a.Created.Compare(b.Created) })
 	for len(fresh) > g.cfg.WarmSessions {
-		g.deleteWarmIfUnclaimed(ctx, fresh[0].Name, "beyond the configured warm count")
+		if !g.deleteWarmIfUnclaimed(ctx, fresh[0].Name, "beyond the configured warm count") {
+			break
+		}
 		fresh = fresh[1:]
 	}
 	for n := len(fresh); n < warmPoolSize(g.cfg.WarmSessions, g.cfg.MaxSessions, live); n++ {
@@ -432,33 +464,42 @@ func (g *Gateway) mintWarmName(ctx context.Context) (string, error) {
 
 // deleteWarmIfUnclaimed deletes an unclaimed warm pod: not while a turn is
 // claiming it, not once the index names a conversation for it, not if
-// anything was ever published to it, and not unless this gateway still
-// leads, each checked immediately before the delete.
-func (g *Gateway) deleteWarmIfUnclaimed(ctx context.Context, pod, why string) {
+// anything was published to it within TASKS' retention, and not unless this
+// gateway still leads, each checked immediately before the delete. It
+// reports whether the pod is no longer the pool's: deleted, or found claimed
+// or used, so a conversation's. false is a pod left in place as the pool's
+// (a read or the delete failed, a turn is claiming it, or this gateway no
+// longer leads), which the pass keeps counting.
+func (g *Gateway) deleteWarmIfUnclaimed(ctx context.Context, pod, why string) bool {
 	if !g.beginWarmDelete(pod) {
-		return
+		return false
 	}
 	defer g.endWarmDelete(pod)
 	claims, err := g.reg.WarmClaims(ctx)
 	if err != nil {
 		g.log.Warn("warm pool: claim index read failed; not deleting", "pod", pod, "err", err)
-		return
+		return false
 	}
 	if _, claimed := claims[pod]; claimed {
-		return
+		return true
 	}
 	// A pod with a task on its subjects is a conversation's, its claim
 	// entry lost or not: never deleted here (claimWarm says why).
-	if used, err := g.warmPodUsed(ctx, pod); err != nil || used {
-		return
+	used, err := g.warmPodUsed(ctx, pod)
+	if err != nil {
+		return false
+	}
+	if used {
+		return true
 	}
 	if !g.reg.StillLeading(ctx) {
 		g.log.Info("warm pool: no longer leading; not deleting", "pod", pod)
-		return
+		return false
 	}
 	if err := g.spawner.Delete(ctx, pod); err != nil {
 		g.log.Warn("warm pool: warm pod delete failed", "pod", pod, "why", why, "err", err)
-		return
+		return false
 	}
 	g.log.Info("warm pool: deleted an unclaimed warm pod", "pod", pod, "why", why)
+	return true
 }

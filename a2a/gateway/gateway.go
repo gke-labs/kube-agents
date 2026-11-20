@@ -329,6 +329,9 @@ type Gateway struct {
 	// mintSessionName: a test hook, so a name TASKS holds can be minted on
 	// purpose.
 	warmMint func(profile string) string
+	// warmUsedErr, when set, fails warmPodUsed for the pods it returns an
+	// error for: a test hook for a TASKS read that fails on one pod.
+	warmUsedErr func(pod string) error
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
