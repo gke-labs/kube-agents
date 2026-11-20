@@ -761,7 +761,8 @@ Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and use
 delegation to profiles onward. The gateway carries a `delegate` request's `parameters` into the
 child's submission once their names pass the target profile's declared ones. These are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
-`taskParameters` parts.
+`taskParameters` parts. Of the task parameters' fields, `changeRequested` is set true only for a
+turn that arrived as a structured confirm.
 
 **Task parameters.** A profile task's submission carries
 `{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
@@ -774,11 +775,11 @@ and that check is what makes these message fields authoritative.
 The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
 request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
 and only for a turn that arrived as a structured confirm action, never from free text or a
-delegation's arguments. A child task carries its parent's value from the gateway's own record and
-cannot raise it. The gateway's half is #4457, which owns both rules; until it lands, nothing sets
-the field and every profile write is refused. Absent means false, so a
-submission that asks for no change is byte-identical to one written before the field existed. The
-dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
+delegation's arguments. A child task or a wake carries its parent's value from the gateway's own
+record and cannot raise it. When it is true the gateway attaches the part even with no parameters.
+Absent means false, so a submission that asks for no change is byte-identical to one written before
+the field existed. The dispatcher turns it into the `vcs:proposal-create` permit on the task's
+credential-proxy token.
 
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
