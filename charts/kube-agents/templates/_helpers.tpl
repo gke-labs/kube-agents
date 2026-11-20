@@ -1271,6 +1271,24 @@ litellm_settings:
   drop_params: true
   {{- end }}
   callbacks: {{ .callbacks }}
+  {{- /*
+    /metrics stays open to the scrape, as it was while the gateway had no
+    master key: LiteLLM v1.108.6 runs its auth on /metrics unless this is
+    false (litellm/__init__.py, prometheus_auth_middleware.py), and the
+    managed-Prometheus scrape sends no key. Set as an attribute of the
+    litellm module, like every other key here (proxy_server.py, load_config).
+  */}}
+  require_auth_for_metrics_endpoint: false
+{{- /*
+  Caller authentication, in the kustomize base's config.yaml too. custom_auth
+  is the hook in files/litellm_caller_auth.py, mounted beside config.yaml,
+  where LiteLLM resolves the module; its docstring says what it admits. The
+  master key comes from the environment, which templates/litellm.yaml fills
+  from the litellm-master-key Secret, so the ConfigMap carries no key.
+*/}}
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  custom_auth: litellm_caller_auth.caller_auth
 {{- /*
   Prompt caching, for Anthropic-family models only: the $claude gate, which
   leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
