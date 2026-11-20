@@ -519,10 +519,10 @@ or its `severity` escalates, or when its 7-day refresh window
 (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. The
 message opens with a bold headline ("**2 pod placement problems on 2 clusters
 (1 new, 1 still open)**"), names up to three of them, most severe first, by
-workload, zone or compute class and cluster, with leeway's cause in plain
-words (`CAUSE_PHRASES` in the script) and a share where there is one (a
-workload's pods in one zone, a compute class's time on its last machine
-choice), adds "and N more" past that, and ends by pointing at the agent for
+workload, zone, compute class or node pool (named as one) and cluster, with
+leeway's cause in plain words (`CAUSE_PHRASES` in the script) and a share
+where there is one (a workload's pods or a node pool's nodes in one zone, a
+compute class's time on its last machine choice), adds "and N more" past that, and ends by pointing at the agent for
 fixes and with the date its findings are next posted if still open.
 The report's path on the pod is left out, since a chat reader cannot open it.
 Resolved findings on cleanly scanned (`status: "ok"`) clusters are retired

@@ -1639,7 +1639,12 @@ class ChatMessageTests(unittest.TestCase):
             watch.due_chat_item(wedged), "compute class gold on prod-east: pods are stuck with no allowed machines to run on"
         )
         pool = chat_item(name="pool-a", namespace="_cluster", subject_kind="NodeGroup", cause="unknown", share=0.5)
-        self.assertEqual(watch.due_chat_item(pool), "pool-a on prod-east: 50% in one zone; no clear cause found")
+        self.assertEqual(
+            watch.due_chat_item(pool), "node pool pool-a on prod-east: 50% of its nodes in one zone; no clear cause found"
+        )
+        self.assertEqual(watch.short_finding_label(pool), "node pool pool-a on prod-east")
+        custom = chat_item(name="tier-1", namespace="_cluster", subject_kind="Custom", cause="unknown", share=0.5)
+        self.assertEqual(watch.due_chat_item(custom), "Custom tier-1 on prod-east: 50% in one zone; no clear cause found")
         self.assertEqual(watch.short_finding_label(zone), "zone us-central1-c on prod-east")
 
     def test_most_severe_then_unusable_zone_then_most_concentrated_first(self) -> None:

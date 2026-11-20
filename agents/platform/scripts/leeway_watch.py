@@ -155,10 +155,11 @@ A finding is due for reporting when:
 The chat message for due findings opens with a bold headline (how many pod
 placement problems, on which cluster or how many, and how many are new,
 changed or still open), then names up to three of them, most severe and most
-concentrated first, each as its workload, zone or compute class, its cluster,
-leeway's suspected cause in plain words (`CAUSE_PHRASES`), and a share where it
-has one (a workload's pods in one zone; a compute class's time on its last
-machine choice), with "and N more" past that. It closes by pointing at the
+concentrated first, each as its workload, zone, compute class or node pool
+(named as one), its cluster, leeway's suspected cause in plain words
+(`CAUSE_PHRASES`), and a share where it has one (a workload's pods or a node
+pool's nodes in one zone; a compute class's time on its last machine choice),
+with "and N more" past that. It closes by pointing at the
 agent for fixes, and with the date its findings are next posted if still
 open; the report's path on the pod is not in it. Findings on clusters
 whose scan succeeded (`status == "ok"`) and that are no longer present are
@@ -530,6 +531,11 @@ BREAKDOWN_ALL = "all {label}"
 # How an item names what it is about.
 SUBJECT_NAMESPACED = "{name} ({namespace}) on {cluster}"
 SUBJECT_CLUSTER_WIDE = "{name} on {cluster}"
+# A cluster-scoped subject names its kind, so a node pool is not read as a
+# workload; leeway's NodeGroup is a node pool, and its share counts nodes.
+SUBJECT_NODE_POOL = "node pool {name} on {cluster}"
+SUBJECT_KIND_NAMED = "{kind} {name} on {cluster}"
+SUBJECT_KIND_NODE_GROUP = "NodeGroup"
 SUBJECT_ZONE = "zone {name} on {cluster}"
 SUBJECT_COMPUTE_CLASS = "compute class {name} on {cluster}"
 RANK_KIND_PREFIX = "leeway.rank_"
@@ -537,6 +543,7 @@ RANK_KIND_PREFIX = "leeway.rank_"
 # finding's share is the time spent on the class's last machine choice).
 ITEM_WORKLOAD = "{subject}: {pct}% of its pods in one zone; {cause}"
 ITEM_CLUSTER_WIDE = "{subject}: {pct}% in one zone; {cause}"
+ITEM_NODE_POOL = "{subject}: {pct}% of its nodes in one zone; {cause}"
 ITEM_ZONE = "{subject}: {cause}"
 ITEM_RANK = "{subject}: {cause}"
 ITEM_RANK_WITH_SHARE = "{subject}: {cause} (last choice {pct}% of the time)"
@@ -1290,8 +1297,9 @@ def cause_phrase(cause: object, *, zone: bool = False) -> str:
 
 
 def short_finding_label(item: dict[str, Any]) -> str:
-    """What a finding is about, in plain words: the workload, zone or compute
-    class and the cluster it is on (`kube-dns (kube-system) on prod-east`)."""
+    """What a finding is about, in plain words: the workload, zone, compute
+    class or node pool and the cluster it is on (`kube-dns (kube-system) on
+    prod-east`)."""
     cluster = clip_text(str(item.get(CLUSTER_FIELD) or "").rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1], CHAT_NAME_MAX_CHARS)
     ns = str(item.get(NAMESPACE_FIELD) or "")
     name = clip_text(str(item.get(SUBJECT_NAME_FIELD) or DEFAULT_UNKNOWN), CHAT_NAME_MAX_CHARS)
@@ -1301,6 +1309,11 @@ def short_finding_label(item: dict[str, Any]) -> str:
         return SUBJECT_COMPUTE_CLASS.format(name=name, cluster=cluster)
     if ns and ns != CLUSTER_WIDE_NAMESPACE:
         return SUBJECT_NAMESPACED.format(name=name, namespace=clip_text(ns, CHAT_NAME_MAX_CHARS), cluster=cluster)
+    kind = str(item.get(SUBJECT_KIND_FIELD) or "")
+    if kind == SUBJECT_KIND_NODE_GROUP:
+        return SUBJECT_NODE_POOL.format(name=name, cluster=cluster)
+    if kind:
+        return SUBJECT_KIND_NAMED.format(kind=clip_text(kind, CHAT_NAME_MAX_CHARS), name=name, cluster=cluster)
     return SUBJECT_CLUSTER_WIDE.format(name=name, cluster=cluster)
 
 
@@ -1318,6 +1331,8 @@ def due_chat_item(item: dict[str, Any]) -> str:
         text = template.format(subject=subject, cause=cause, pct=pct)
     elif ns and ns != CLUSTER_WIDE_NAMESPACE:
         text = ITEM_WORKLOAD.format(subject=subject, pct=pct, cause=cause)
+    elif str(item.get(SUBJECT_KIND_FIELD) or "") == SUBJECT_KIND_NODE_GROUP:
+        text = ITEM_NODE_POOL.format(subject=subject, pct=pct, cause=cause)
     else:
         text = ITEM_CLUSTER_WIDE.format(subject=subject, pct=pct, cause=cause)
     if len(text) > CHAT_ITEM_MAX_CHARS:
