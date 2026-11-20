@@ -58,13 +58,16 @@ const (
 	inferenceNewerField = "status.inference"
 )
 
-// The info gauge: one sample at 1 per PlatformAgent whose status.inference holds both
-// fields, labelled with the agent (the usage gauges' two labels) and the pair, so
-// sum by (provider, model) over a shared project is the headcount.
+// The info gauge: one sample at 1 per PlatformAgent whose status.inference holds the
+// pair, labelled with the agent (the usage gauges' two labels), the pair and the
+// reasoning effort (empty while the status holds none), so sum by (provider, model)
+// over a shared project is the model headcount and sum by (reasoning_effort) the
+// effort headcount.
 const (
-	inferenceGaugeName          = "kubeagents_platformagent_model"
-	inferenceGaugeProviderLabel = "provider"
-	inferenceGaugeModelLabel    = "model"
+	inferenceGaugeName                 = "kubeagents_platformagent_model"
+	inferenceGaugeProviderLabel        = "provider"
+	inferenceGaugeModelLabel           = "model"
+	inferenceGaugeReasoningEffortLabel = "reasoning_effort"
 	// inferenceGaugeValue is an info gauge's constant sample value.
 	inferenceGaugeValue = 1
 )
@@ -390,8 +393,8 @@ type inferenceGauges struct {
 
 func newInferenceGauges(reg prometheus.Registerer) *inferenceGauges {
 	g := &inferenceGauges{
-		model: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: inferenceGaugeName, Help: "A PlatformAgent's default model from status.inference, at 1; absent while the status holds no pair."},
-			[]string{usageGaugeNamespaceLabel, usageGaugeNameLabel, inferenceGaugeProviderLabel, inferenceGaugeModelLabel}),
+		model: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: inferenceGaugeName, Help: "A PlatformAgent's default model and its configured reasoning effort from status.inference, at 1; absent while the status holds no pair, reasoning_effort empty while it holds no effort."},
+			[]string{usageGaugeNamespaceLabel, usageGaugeNameLabel, inferenceGaugeProviderLabel, inferenceGaugeModelLabel, inferenceGaugeReasoningEffortLabel}),
 	}
 	reg.MustRegister(g.model)
 	return g
@@ -401,8 +404,9 @@ func newInferenceGauges(reg prometheus.Registerer) *inferenceGauges {
 var inferenceMetrics = newInferenceGauges(metrics.Registry)
 
 // publish sets the agent's one sample from status.inference, deleting its previous
-// pair first so a collector never sees two models for one agent. No sample while
-// either field is empty.
+// labels first so a collector never sees two models, or two efforts, for one agent.
+// No sample while the provider or model is empty; an empty effort is a sample with an
+// empty reasoning_effort label.
 func (g *inferenceGauges) publish(agent *agentv1alpha1.PlatformAgent) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -411,7 +415,7 @@ func (g *inferenceGauges) publish(agent *agentv1alpha1.PlatformAgent) {
 	if inference == nil || inference.Provider == "" || inference.Model == "" {
 		return
 	}
-	g.model.WithLabelValues(agent.Namespace, agent.Name, inference.Provider, inference.Model).Set(inferenceGaugeValue)
+	g.model.WithLabelValues(agent.Namespace, agent.Name, inference.Provider, inference.Model, inference.ReasoningEffort).Set(inferenceGaugeValue)
 }
 
 // forget drops the agent's sample when the CR is deleted.

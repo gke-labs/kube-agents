@@ -441,7 +441,7 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 2 {
 		t.Fatalf("%d samples after two agents published, want 2", n)
 	}
-	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "a")); v != 1 {
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "a", "")); v != 1 {
 		t.Errorf("model a sample = %v, want 1", v)
 	}
 
@@ -450,10 +450,10 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 2 {
 		t.Fatalf("%d samples after the model changed, want 2: the old pair was not deleted", n)
 	}
-	if g.model.DeleteLabelValues("ns", "pa", "gemini", "a") {
+	if g.model.DeleteLabelValues("ns", "pa", "gemini", "a", "") {
 		t.Error("the model a sample survived the change")
 	}
-	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "b")); v != 1 {
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "b", "")); v != 1 {
 		t.Errorf("model b sample = %v, want 1", v)
 	}
 
@@ -468,8 +468,24 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 		t.Errorf("%d samples with only a provider, want 1: one field alone is no sample", n)
 	}
 
-	agent.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "c"}
+	agent.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "c", ReasoningEffort: "high"}
 	g.publish(agent)
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "c", "high")); v != 1 {
+		t.Errorf("effort high sample = %v, want 1", v)
+	}
+	agent.Status.Inference.ReasoningEffort = "low"
+	g.publish(agent)
+	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 2 {
+		t.Fatalf("%d samples after the effort changed, want 2: the old effort was not deleted", n)
+	}
+	if g.model.DeleteLabelValues("ns", "pa", "gemini", "c", "high") {
+		t.Error("the effort high sample survived the change")
+	}
+	agent.Status.Inference.ReasoningEffort = ""
+	g.publish(agent)
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "c", "")); v != 1 {
+		t.Errorf("unset effort sample = %v, want 1 under an empty label", v)
+	}
 	g.forget("ns", "pa")
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 1 {
 		t.Errorf("%d samples after forget, want 1 (the other agent's)", n)
