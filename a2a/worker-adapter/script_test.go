@@ -120,6 +120,34 @@ func TestAScriptFileIsCheckedBeforeItRuns(t *testing.T) {
 	}
 }
 
+// A script file with the setuid or setgid bit is refused, and the same file without either
+// resolves.
+func TestAScriptFileThatIsSetuidOrSetgidIsRefused(t *testing.T) {
+	root, check := scriptRoot(t)
+	for name, bit := range map[string]os.FileMode{"setuid": os.ModeSetuid, "setgid": os.ModeSetgid} {
+		p := filepath.Join(root, name+".sh")
+		writeScript(t, p, "#!/bin/sh\necho ok\n", 0o755)
+		if got, err := check.resolve(lib.ScriptRoot + name + ".sh"); err != nil || got != p {
+			t.Fatalf("%s: without the bit: %q, %v; want it resolved", name, got, err)
+		}
+		if err := os.Chmod(p, 0o755|bit); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode()&bit == 0 {
+			// A setgid bit for a group the test's user isn't in is cleared by the kernel.
+			t.Logf("%s: the file system cleared the bit (%v), so this case can't be checked here", name, fi.Mode())
+			continue
+		}
+		if got, err := check.resolve(lib.ScriptRoot + name + ".sh"); err == nil || !strings.Contains(err.Error(), "setuid or setgid") {
+			t.Errorf("%s: resolved to %q, %v; want it refused as setuid or setgid", name, got, err)
+		}
+	}
+}
+
 // mintProxy is a credential-proxy task credential from kp, for task on pod,
 // with a trigger naming script (none when script is "").
 func mintProxy(t *testing.T, kp nkeys.KeyPair, task, pod, script string, aud taskcred.Audience) string {

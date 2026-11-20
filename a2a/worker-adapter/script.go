@@ -31,9 +31,10 @@ import (
 //     names this task and this pod, and carries a trigger whose script is the
 //     confirm's (so neither the confirm nor the credential alone decides);
 //   - the path resolves to a regular file under the script root, owned by
-//     root and writable by no one else, in directories that are the same on
-//     both the named path and the resolved one; the file itself may be a
-//     symlink within the root, and no directory on the named path may be.
+//     root and writable by no one else, neither setuid nor setgid, in
+//     directories that are the same on both the named path and the resolved
+//     one; the file itself may be a symlink within the root, and no
+//     directory on the named path may be.
 //
 // The script gets a cleared environment: the worker's own PATH and HOME and
 // the broker hand-off (all rendered by the operator), plus the task's
@@ -98,7 +99,7 @@ func (c scriptFileCheck) withDefaults() scriptFileCheck {
 // root too; every directory from the root down to it, and down to the named
 // path (where none may be a symlink), and the file itself,
 // is owned by the owner and writable by no group or other; the file is a
-// regular file; and the worker isn't the owner, so it can't have written
+// regular file, neither setuid nor setgid; and the worker isn't the owner, so it can't have written
 // it. The root's own ancestors are image layers, which the build-time check
 // (deploy/docker/test_script_root_ownership.py) keeps root-owned.
 func (c scriptFileCheck) resolve(path string) (string, error) {
@@ -158,6 +159,8 @@ func (c scriptFileCheck) ownedAndUnwritable(path string, dir bool) error {
 		return fmt.Errorf("%s is not a directory", path)
 	case !dir && !fi.Mode().IsRegular():
 		return fmt.Errorf("%s is not a regular file", path)
+	case !dir && fi.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0:
+		return fmt.Errorf("%s is setuid or setgid (%v)", path, fi.Mode())
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {

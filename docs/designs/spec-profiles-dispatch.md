@@ -419,8 +419,8 @@ leave open:
   - its task credential verifies against `A2A_TASK_SIGNING_PUBLIC_KEYS`, which the operator renders into
     each Job template from the key the callout and the proxy use;
   - the credential names this task and pod, and a trigger whose `script` is the confirm's;
-  - the path resolves to a regular file under the script root, owned by root and writable by no group
-    or other, in directories that are the same on both the named path and the resolved one, and the
+  - the path resolves to a regular file under the script root, owned by root, writable by no group
+    or other, and neither setuid nor setgid, in directories that are the same on both the named path and the resolved one, and the
     worker isn't its owner. The file itself may be a symlink within the root; no directory on the named
     path may be.
 
