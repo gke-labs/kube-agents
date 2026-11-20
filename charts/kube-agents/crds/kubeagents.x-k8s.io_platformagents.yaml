@@ -10580,8 +10580,9 @@ spec:
                     carry it: an upgrade keeps the live value.
                   properties:
                     all:
-                      description: All holds every cluster, the one the harness
-                        runs in included.
+                      description:
+                        All holds every cluster, the one the harness runs
+                        in included.
                       type: boolean
                     clusters:
                       description: |-
