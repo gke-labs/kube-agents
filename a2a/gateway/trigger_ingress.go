@@ -31,12 +31,14 @@ import (
 // the trigger's own conversation, publishes the submission on the profile's
 // unattended intake, and answers with the task's id or a refusal.
 //
-// It ships dark: until the callout grants a source publish on the subject
-// (#5617's second pull request), nothing can reach it.
+// Only a source the callout grants publish on the subject can reach it: the
+// operator, as the schedule source, while A2A_AGENT_SCHEDULES is on (#5617).
 
 const (
 	// triggerSubmitWildcard is every source's submission subject.
 	triggerSubmitWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerSubmitSubjectSuffix
+	// triggerStatusWildcard is every source's status query subject.
+	triggerStatusWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerStatusSubjectSuffix
 	// triggerConversationPrefix opens a trigger's own conversation key:
 	// trigger:<source>/<namespace>/<name>.
 	triggerConversationPrefix = "trigger:"
@@ -66,8 +68,23 @@ const (
 // submission subject, retrying a failed subscribe as the directory does, for
 // as long as the term's ctx lives.
 func (g *Gateway) startTriggerIngress(ctx context.Context) {
+	denied := make(chan struct{}, 1)
+	remove := g.client.OnAsyncError(func(err error) {
+		if isTriggerSubscriptionRefusal(err) {
+			select {
+			case denied <- struct{}{}:
+			default:
+			}
+		}
+	})
 	go func() {
+		defer remove()
 		for {
+			// A refusal from a previous attempt's subscriptions is spent.
+			select {
+			case <-denied:
+			default:
+			}
 			sub, err := g.client.SubscribeCore(triggerSubmitWildcard, func(m *nats.Msg) {
 				// Answered only on the source's own reply namespace
 				// (lib.TriggerReplySubject): a submission naming any other
@@ -86,9 +103,39 @@ func (g *Gateway) startTriggerIngress(ctx context.Context) {
 				}
 			})
 			if err == nil {
-				<-ctx.Done()
-				sub.Stop()
-				return
+				status, serr := g.client.SubscribeCore(triggerStatusWildcard, func(m *nats.Msg) {
+					source, err := lib.ParseTriggerStatusSubject(m.Subject)
+					if err != nil || !lib.ValidTriggerReplySubject(source, m.Reply) {
+						g.log.Info("trigger status query dropped: no reply subject in the source's namespace", "subject", m.Subject)
+						return
+					}
+					if data, err := json.Marshal(g.handleTriggerStatus(ctx, m.Subject, m.Data)); err == nil {
+						if err := m.Respond(data); err != nil {
+							g.log.Warn("trigger status reply failed", "subject", m.Subject, "err", err)
+						}
+					}
+				})
+				if serr != nil {
+					sub.Stop()
+					err = serr
+				} else {
+					// A refused SUB arrives after the flush, as an async
+					// permissions violation (the bus hasn't loaded the
+					// gateway's trigger grants yet, say, on an upgrade that
+					// rolled the gateway first). A server reload doesn't
+					// revive a refused subscription, so drop both and
+					// subscribe again after the retry wait.
+					select {
+					case <-ctx.Done():
+						sub.Stop()
+						status.Stop()
+						return
+					case <-denied:
+						sub.Stop()
+						status.Stop()
+						err = errTriggerSubscriptionRefused
+					}
+				}
 			}
 			g.log.Warn("trigger ingress subscription failed; retrying", "err", err, "in", triggerIngressRetry)
 			select {
@@ -98,6 +145,22 @@ func (g *Gateway) startTriggerIngress(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// errTriggerSubscriptionRefused is the retry's reason when the server refused
+// a trigger subscription after accepting the SUB.
+var errTriggerSubscriptionRefused = errors.New("the server refused a trigger subscription (permissions violation)")
+
+// isTriggerSubscriptionRefusal reports whether err is the server refusing a
+// subscription on the trigger subjects. nats.go hands these with a nil
+// subscription, so the subject comes from the error text.
+func isTriggerSubscriptionRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return (errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(text, "Permissions Violation")) &&
+		strings.Contains(text, "Subscription to \"a2a.trigger.")
 }
 
 // triggerRefused is a refusal reply, logged with the trigger it was for.
@@ -144,6 +207,14 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
 	}
+	// A run already on the bus under this key is that run, answered with its
+	// task before any directory check: it needs nothing from the directory,
+	// and a new leader that hasn't read DIRECTORY yet, or a profile deleted
+	// since, would otherwise answer its retry profile_unknown in place of
+	// the task it started.
+	if run := rec.triggerRun(s.IdempotencyKey); run != nil && run.Published {
+		return lib.TriggerSubmitReply{TaskID: run.Task}
+	}
 	card, ok := g.profiles.lookup(s.Profile)
 	if !ok {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedProfileUnknown, "no profile "+s.Profile+" in the directory")
@@ -163,15 +234,12 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the schedule's target routes to profile "+route.Profile+", not "+s.Profile)
 	}
 
-	// A recent run under this key is that run. One already on the bus is
-	// answered with its task; one recorded but not yet published (its
-	// publish failed, or the gateway stopped) is published again with the
-	// same grant and envelope id, so the stream dedupes a publish that had
-	// in fact landed. Neither mints or spends the rate budget.
+	// A run recorded but not yet published (its publish failed, or the
+	// gateway stopped) is published again with the same grant and envelope
+	// id, so the stream dedupes a publish that had in fact landed. It
+	// takes the route checks above, since it does reach the dispatcher.
+	// Neither it nor a published run mints or spends the rate budget.
 	if run := rec.triggerRun(s.IdempotencyKey); run != nil {
-		if run.Published {
-			return lib.TriggerSubmitReply{TaskID: run.Task}
-		}
 		return g.publishTriggerRun(ctx, rec, s, route, *run)
 	}
 
@@ -318,6 +386,65 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	return lib.TriggerSubmitReply{TaskID: taskID}
 }
 
+// handleTriggerStatus answers what state one of a schedule's tasks is in,
+// for a task this gateway recorded on that schedule's trigger record and no
+// other, so a source reads only the tasks it started. A recorded run with no
+// events yet is submitted; a task the record no longer holds is not found,
+// which the reconciler reads as Lost.
+func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data []byte) lib.TriggerStatusReply {
+	refuse := func(reason, detail string) lib.TriggerStatusReply {
+		return lib.TriggerStatusReply{Refused: &lib.TriggerRefusal{Reason: reason, Detail: detail}}
+	}
+	source, err := lib.ParseTriggerStatusSubject(subject)
+	if err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	var q lib.TriggerStatus
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, "the query is not well-formed")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return refuse(lib.TriggerRefusedInvalid, "the query has data after its object")
+	}
+	if err := lib.ValidateTriggerStatus(source, q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	if g.cfg.Namespace == "" || q.Schedule.Namespace != g.cfg.Namespace {
+		return refuse(lib.TriggerRefusedInvalid, "schedule "+q.Schedule.Namespace+"/"+q.Schedule.Name+" is not in the install's namespace")
+	}
+	rec, err := g.reg.Get(ctx, triggerConversationKey(source, q.Schedule))
+	if err != nil {
+		return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
+	}
+	var run *TriggerRun
+	if rec != nil {
+		for i := range rec.TriggerRuns {
+			if rec.TriggerRuns[i].Task == q.TaskID {
+				run = &rec.TriggerRuns[i]
+			}
+		}
+	}
+	if run == nil {
+		return lib.TriggerStatusReply{Found: false}
+	}
+	addressee := ""
+	for _, t := range rec.Tasks {
+		if t.ID == q.TaskID {
+			addressee = t.Addressee
+		}
+	}
+	if addressee == "" || !run.Published {
+		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
+	}
+	task, err := g.replayForTerminal(ctx, addressee, q.TaskID)
+	if err != nil || task == nil || task.State == "" {
+		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
+	}
+	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+}
+
 // triggerConversationKey is a trigger's own conversation:
 // trigger:<source>/<namespace>/<name>.
 func triggerConversationKey(source string, s lib.ScheduleRef) string {
@@ -337,8 +464,11 @@ func (g *Gateway) unpostableTrigger(conversation string) bool {
 }
 
 // triggerRunsKept bounds SessionRecord.TriggerRuns: a reconciler retries a
-// slot only inside its starting deadline, so the recent runs are enough.
-const triggerRunsKept = 64
+// slot only inside its starting deadline, so the recent runs are enough. It
+// is taskHistoryCap, never more: a status query reads a run's addressee from
+// the record's Tasks, which keeps that many, and a run kept here but trimmed
+// there would answer "submitted" until the reconciler gave it up as lost.
+const triggerRunsKept = taskHistoryCap
 
 // triggerMintAttempts bounds the task ids one run may try when an earlier,
 // unrecorded attempt left its grant key taken.
