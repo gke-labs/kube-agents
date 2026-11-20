@@ -458,6 +458,38 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The AgentSchedule reconciler (#5617), behind A2A_AGENT_SCHEDULES while
+	// scheduled runs are new, and gated as the Tier one is: a missing CRD or
+	// a role that can't read schedules skips it rather than crashlooping. It
+	// also watches and reads AgentProfiles, so it needs the AgentProfile
+	// controller's gate too: without that kind, or a role that can list it,
+	// its informer never syncs and the manager stops.
+	if controller.AgentSchedulesEnabled() {
+		schedGVK := agentv1alpha1.GroupVersion.WithKind("AgentSchedule")
+		_, schedMapErr := mgr.GetRESTMapper().RESTMapping(schedGVK.GroupKind(), schedGVK.Version)
+		schedDenied := controller.AgentScheduleAccessDenied(rbacChecker)
+		switch {
+		case schedMapErr == nil && len(schedDenied) > 0:
+			setupLog.Error(nil, "The operator's role cannot read AgentSchedules; skipping the AgentSchedule controller. Restart the operator after applying the current ClusterRole.", "denied", schedDenied)
+		case schedMapErr == nil && mapErr != nil:
+			// Only "no such kind" gets here: any other discovery error
+			// exited at the AgentProfile controller above.
+			setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentSchedule controller, which reads profiles. Restart the operator after installing the CRD to enable it.")
+		case schedMapErr == nil && len(profileDenied) > 0:
+			setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentSchedule controller, which reads profiles. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
+		case schedMapErr == nil:
+			if err := (&controller.AgentScheduleReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "Failed to create controller", "controller", "agentschedule")
+				os.Exit(1)
+			}
+		case meta.IsNoMatchError(schedMapErr):
+			setupLog.Info("AgentSchedule CRD is not installed on cluster; skipping the AgentSchedule controller. Restart the operator after installing the CRD to enable it.")
+		default:
+			setupLog.Error(schedMapErr, "Failed to discover the AgentSchedule kind")
+			os.Exit(1)
+		}
+	}
+
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		webhooks := []struct {
 			name      string

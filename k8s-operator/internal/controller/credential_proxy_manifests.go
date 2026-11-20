@@ -592,6 +592,10 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 			Annotations: map[string]string{credentialProxyClusterTypeAnnotation: clusterType},
 		},
 		Spec: appsv1.DeploymentSpec{
+			// One pod, rolled with Recreate: the broker keeps a process-local record
+			// of which profile task made which branch and proposal (#6400), which is
+			// only right while one process serves /v1/vcs/. Scaling this out moves
+			// that record to shared state first (TestTheStatefulBrokerIsOnePod...).
 			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,

@@ -501,3 +501,8 @@ func (r *PlatformAgentReconciler) syncDispatcherCeiling(ctx context.Context, age
 	}
 	return r.Status().Update(ctx, agent)
 }
+
+// a2aTaskSigningKeyPlaceholder stands in for the task-signing public key
+// where a Job template is measured rather than applied: an nkey public key
+// is 56 characters.
+var a2aTaskSigningKeyPlaceholder = strings.Repeat("C", 56)

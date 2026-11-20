@@ -673,6 +673,56 @@ func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
 	}
 }
 
+// A card the task's kanban_create made counts as the task's whatever its
+// title: a create whose title scrubs or shortens to nothing still claims
+// its card's worker deliveries for the set.
+func TestActivity_AnUntitledFiledCardStillFeedsTheSet(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-untitled"
+	create := func(result string) {
+		d := hookDelivery{ToolName: kanbanCreateTool, SessionID: a.sessionID}
+		d.Extra.Result = json.RawMessage(result)
+		a.mu.Lock()
+		a.observeWorkerContextLocked(d, json.RawMessage(`{"title":"  "}`), createdKanbanCardID(kanbanCreateTool, d.Extra.Result))
+		a.mu.Unlock()
+	}
+	create(`{"id":"t_card77","status":"todo"}`)
+	// A rejected create that still reports ok names another task's card in
+	// its text: an untitled create must not file it.
+	create(`{"error":"title required; duplicate of t_other1"}`)
+	create(`"title required: see t_other2"`)
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-untitled"}, state: stateRunning}
+	run.act.Store(a)
+	other := newActivityState(false)
+	other.sessionID = "a2a-coord-other"
+	other.waitingCard.Store(true)
+	otherRun := &taskRun{origin: &lib.Envelope{TaskID: "task-other"}, state: stateRunning}
+	otherRun.act.Store(other)
+	runs := []*taskRun{otherRun, run}
+	d := hookDelivery{SessionID: "20990101_120001_worker", Cwd: "/var/lib/hermes/kanban/workspaces/t_card77/repo", ToolName: "terminal"}
+	if got := cardWorkerRun(runs, d); got != run {
+		t.Error("the untitled card's worker was not claimed for the task that filed it")
+	}
+	missed := d
+	missed.Cwd = "/var/lib/hermes/kanban/workspaces/t_card78/repo"
+	if got := cardWorkerRun(runs, missed); got != nil {
+		t.Error("a card no task filed was claimed")
+	}
+	for _, other := range []string{"t_other1", "t_other2"} {
+		named := d
+		named.Cwd = "/var/lib/hermes/kanban/workspaces/" + other + "/repo"
+		if got := cardWorkerRun(runs, named); got != nil {
+			t.Errorf("a card an error text named (%s) was claimed", other)
+		}
+	}
+	// Waiting on its cards, the filing task, not another waiting one, takes
+	// the worker's activity.
+	a.waitingCard.Store(true)
+	if got := matchWorkerDeliveryRun(runs, d); got != run {
+		t.Error("the untitled card's worker activity was not attributed to the task that filed it")
+	}
+}
+
 // The pools keep their reserves: shape-caught values leave a Secret value
 // tracked and redacted, and a result holding many of them keeps its newest
 // within its shape allowance; a forged Secret with many values adds at most
