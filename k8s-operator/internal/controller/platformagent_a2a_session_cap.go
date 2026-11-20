@@ -70,12 +70,16 @@ import (
 // not caught up, or a stream deleted for recreation, and the pass treats it as
 // unreadable.
 //
-// A stored cap's reading is reused for a2aSessionCapReadingTTL, so a settled
-// install does not make a blocking GET of the bus on every pass. Under a
-// served CRD that prunes status.effectiveSessionCap the stored cap is always
-// absent; the echo of the write says so (noteSessionCapEcho), and for
-// a2aSessionCapPrunedReprobe the pass keeps the cap it last rendered rather
-// than falling back, and does not write it.
+// A stored cap's reading is reused for sessionCapReadingTTL, so a settled
+// install does not make a blocking GET of the bus on every pass. A served CRD
+// that prunes status.effectiveSessionCap (one older than the operator) can't
+// store the cap the session route renders from, so the install falls back to
+// platform with SessionCapFitted saying why (sessionCapPrunedReason). The
+// condition is the record: it survives a restart, and the route reads it.
+// Every sessionCapPrunedReprobe a pass writes the fitted cap again, keeping
+// platform for that pass's render; only an echo that keeps the cap engages
+// the session route. A pass that can't read the bus doesn't probe, so it
+// can't widen anything.
 const (
 	// sessionCapFittedConditionType is written only while the cap is below
 	// maxSessions, the install fell back to platform, or the cap is waiting
@@ -96,6 +100,10 @@ const (
 	// on, so defaultRoute: session does not engage and plain turns stay
 	// with the platform agent (resolveA2ADefaultRoute).
 	sessionCapClusterViewReason = "SessionClusterViewOn"
+	// sessionCapPrunedReason: the served PlatformAgent CRD drops
+	// status.effectiveSessionCap, so the session route can't keep its cap,
+	// and plain conversations stay with platform until the CRD is updated.
+	sessionCapPrunedReason = "StatusFieldPruned"
 
 	// sessionCapReadingTTL is how long a reading of the bus's TASKS width is
 	// reused while a cap is stored: the bus stream poller's period. A stream
@@ -122,6 +130,8 @@ const (
 		sessionCapRemedy
 	sessionCapNoRoomMessage = "the TASKS stream has no room for one session's consumers on the session route, " +
 		"so plain conversations go to platform (status.effectiveSessionCap is 0); " + sessionCapRemedy
+	sessionCapPrunedMessage = "the served PlatformAgent CRD drops status.effectiveSessionCap, so the session route can't keep its fitted cap " +
+		"and plain conversations stay with platform; apply the chart's crds/ (upgrade.sh does) and the next probe engages the session route"
 	sessionCapWaitingMessage = "the session cap waits on the A2A bus's TASKS width, which could not be read yet; " +
 		"routing and the session cap stay as they were and the provision Job waits until it is read"
 
@@ -190,66 +200,126 @@ func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *
 // nothing later in the pass writes a status field the Ready writer does not
 // track. The patch's version and both fields are carried to instance too, so
 // the pass's later status writes neither drop them nor conflict on them.
-// Under a served CRD that prunes the field (sessionCapStatusPruned), the cap
-// is set in memory for the render and not written.
+// Under a served CRD that prunes the cap the install is held on platform
+// (holdSessionCapPruned), probed every sessionCapPrunedReprobe.
 func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agent, instance *agentv1alpha1.PlatformAgent) {
+	key := client.ObjectKeyFromObject(agent)
 	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
 		// The platform route, the default: no fit applies, and nothing is
 		// read off the bus. This reconciler's memory of the route is
 		// dropped, so an install that opts back in reads the bus afresh.
-		key := client.ObjectKeyFromObject(agent)
 		r.sessionCapWarned.Delete(key)
-		r.sessionCapLast.Delete(key)
+		r.sessionCapPruned.Delete(key)
 		r.sessionCapReadings.Delete(key)
 		r.clearA2ASessionCap(ctx, agent, instance)
 		return
 	}
-	pruned := r.sessionCapStatusPruned(agent)
-	sessionCap, cond, event := r.fitA2ASessionCap(ctx, agent, pruned)
-	key := client.ObjectKeyFromObject(agent)
+	if r.sessionCapStatusPruned(agent) {
+		r.holdSessionCapPruned(ctx, agent, instance)
+		return
+	}
+	// A pruned write past its reprobe, or a condition saying so from before
+	// a restart: this pass probes the CRD, and renders platform either way.
+	_, recorded := r.sessionCapPruned.Load(key)
+	probing := recorded || a2aSessionCapPrunedHeld(agent)
+	sessionCap, cond, event := r.fitA2ASessionCap(ctx, agent)
 	if event == "" {
 		r.sessionCapWarned.Delete(key)
 	} else if warned, ok := r.sessionCapWarned.Load(key); !ok || warned.(string) != event {
 		r.recordEvent(agent, corev1.EventTypeWarning, sessionCapFittedConditionType, event)
 		r.sessionCapWarned.Store(key, event)
 	}
-	if sessionCap != nil {
-		r.sessionCapLast.Store(key, *sessionCap)
-	} else {
-		r.sessionCapLast.Delete(key)
-	}
-	if sessionCapCurrent(agent, sessionCap, cond, pruned) {
-		if pruned {
-			setSessionCap(agent, sessionCap, cond)
-			if instance != nil {
-				setSessionCap(instance, sessionCap, cond)
-			}
+	if probing {
+		if sessionCap == nil || !r.probeSessionCapStored(ctx, agent, instance, *sessionCap) {
+			// Nothing to probe with (the bus unreadable, or the cluster
+			// view on), or the CRD still drops the field: platform, and
+			// the next probe after the reprobe.
+			r.sessionCapPruned.Store(key, time.Now())
+			r.holdSessionCapPruned(ctx, agent, instance)
+			return
 		}
+		r.sessionCapPruned.Delete(key)
+	}
+	if sessionCapCurrent(agent, sessionCap, cond) {
 		return
 	}
 	original := agent.DeepCopy()
 	patch := client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
-	setSessionCap(agent, sessionCap, cond)
-	written := agent.DeepCopy()
-	if pruned {
-		// Not written while the served CRD drops it: the field stays as the
-		// store has it, and only the condition goes out.
-		written.Status.EffectiveSessionCap = original.Status.EffectiveSessionCap
-	}
+	written := original.DeepCopy()
+	setSessionCap(written, sessionCap, cond)
 	if err := r.Status().Patch(ctx, written, patch); err != nil {
-		// The render still follows this pass's reading; the next pass
-		// writes it.
+		// The render follows this pass's reading; the next pass writes it.
+		setSessionCap(agent, sessionCap, cond)
 		logf.FromContext(ctx).Error(err, "could not record the A2A session cap; the next pass records it")
 		return
 	}
-	if !pruned {
-		r.noteSessionCapEcho(ctx, agent, sessionCap, written.Status.EffectiveSessionCap)
+	if sessionCap != nil && written.Status.EffectiveSessionCap == nil {
+		// The echo dropped the cap: the served CRD prunes it. Held on
+		// platform from this pass, so the session route never renders a
+		// cap the store can't keep.
+		logf.FromContext(ctx).Info("the served PlatformAgent CRD drops status.effectiveSessionCap; plain conversations stay with platform until the CRD is updated")
+		r.sessionCapPruned.Store(key, time.Now())
+		agent.ResourceVersion = written.ResourceVersion
+		agent.Status = written.Status
+		if instance != nil {
+			instance.ResourceVersion = written.ResourceVersion
+			instance.Status = *written.Status.DeepCopy()
+		}
+		r.holdSessionCapPruned(ctx, agent, instance)
+		return
 	}
+	setSessionCap(agent, sessionCap, cond)
 	agent.ResourceVersion = written.ResourceVersion
 	if instance != nil {
 		setSessionCap(instance, sessionCap, cond)
 		instance.ResourceVersion = written.ResourceVersion
 	}
+}
+
+// holdSessionCapPruned renders platform under a CRD that prunes
+// status.effectiveSessionCap: no cap, and the SessionCapFitted condition
+// saying why (sessionCapPrunedReason), which resolveA2ADefaultRoute reads.
+// The condition is written only when it changes.
+func (r *PlatformAgentReconciler) holdSessionCapPruned(ctx context.Context, agent, instance *agentv1alpha1.PlatformAgent) {
+	cond := sessionCapCondition(agent, metav1.ConditionTrue, sessionCapPrunedReason, sessionCapPrunedMessage)
+	if !sessionCapCurrent(agent, nil, cond) {
+		patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		written := agent.DeepCopy()
+		setSessionCap(written, nil, cond)
+		if err := r.Status().Patch(ctx, written, patch); err != nil {
+			logf.FromContext(ctx).Error(err, "could not record that the session route is held on platform; the next pass records it")
+		} else {
+			agent.ResourceVersion = written.ResourceVersion
+			if instance != nil {
+				instance.ResourceVersion = written.ResourceVersion
+			}
+		}
+	}
+	setSessionCap(agent, nil, cond)
+	if instance != nil {
+		setSessionCap(instance, nil, cond)
+	}
+}
+
+// probeSessionCapStored writes sessionCap with the held condition kept, and
+// reports whether the echo kept the cap: the CRD has been updated. The
+// render copy is not given the cap here; the caller's write that follows
+// sets it and the fitted condition.
+func (r *PlatformAgentReconciler) probeSessionCapStored(ctx context.Context, agent, instance *agentv1alpha1.PlatformAgent, sessionCap int) bool {
+	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	written := agent.DeepCopy()
+	written.Status.EffectiveSessionCap = &sessionCap
+	if err := r.Status().Patch(ctx, written, patch); err != nil {
+		logf.FromContext(ctx).Error(err, "could not probe whether the PlatformAgent CRD keeps status.effectiveSessionCap; the next probe retries")
+		return false
+	}
+	agent.ResourceVersion = written.ResourceVersion
+	agent.Status.EffectiveSessionCap = written.Status.EffectiveSessionCap
+	if instance != nil {
+		instance.ResourceVersion = written.ResourceVersion
+		instance.Status.EffectiveSessionCap = written.Status.EffectiveSessionCap
+	}
+	return written.Status.EffectiveSessionCap != nil
 }
 
 // clearA2ASessionCap removes, on the platform route, the cap and the
@@ -276,23 +346,8 @@ func (r *PlatformAgentReconciler) clearA2ASessionCap(ctx context.Context, agent,
 	}
 }
 
-// noteSessionCapEcho reads status.effectiveSessionCap back after a write, as
-// noteBusReplicasEcho does status.busReplicas: a cap written and absent from
-// the answer is the served CRD pruning it.
-func (r *PlatformAgentReconciler) noteSessionCapEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wrote, echo *int) {
-	key := client.ObjectKeyFromObject(agent)
-	if wrote == nil || echo != nil {
-		r.sessionCapPruned.Delete(key)
-		return
-	}
-	if _, seen := r.sessionCapPruned.Load(key); !seen {
-		logf.FromContext(ctx).Info("the served PlatformAgent CRD drops status.effectiveSessionCap; the session cap is kept in memory and not written until the CRD is updated")
-	}
-	r.sessionCapPruned.Store(key, time.Now())
-}
-
-// sessionCapStatusPruned reports a recent echo without the cap
-// (noteSessionCapEcho), reprobed every sessionCapPrunedReprobe.
+// sessionCapStatusPruned reports a recent write whose echo dropped the cap
+// (resolveA2ASessionCap), reprobed every sessionCapPrunedReprobe.
 func (r *PlatformAgentReconciler) sessionCapStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
 	at, ok := r.sessionCapPruned.Load(client.ObjectKeyFromObject(agent))
 	return ok && time.Since(at.(time.Time)) < sessionCapPrunedReprobe
@@ -301,21 +356,14 @@ func (r *PlatformAgentReconciler) sessionCapStatusPruned(agent *agentv1alpha1.Pl
 // fitA2ASessionCap is resolveA2ASessionCap's decision: the cap to store, the
 // condition to hold (nil for none; keep, from an unreadable pass with a cap,
 // is the stored one), and the Warning's text ("" for none). Only on the
-// session route: resolveA2ASessionCap does not call it on platform. Under a pruning
-// CRD the cap this reconciler last rendered stands in for the stored one.
-func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pruned bool) (*int, *metav1.Condition, string) {
+// session route: resolveA2ASessionCap does not call it on platform.
+func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*int, *metav1.Condition, string) {
 	if a2aSessionClusterViewEnabled(agent) {
 		// The cluster view holds the session route off (resolveA2ADefaultRoute):
 		// platform routing at maxSessions, and no fit.
 		return nil, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapClusterViewReason, sessionCapClusterViewMessage), ""
 	}
 	stored := agent.Status.EffectiveSessionCap
-	if stored == nil && pruned {
-		if last, ok := r.sessionCapLast.Load(client.ObjectKeyFromObject(agent)); ok {
-			v := last.(int)
-			stored = &v
-		}
-	}
 	configured := resolveA2AMaxSessions(agent)
 	width, present, known := r.a2aTasksLiveWidth(ctx, agent, stored != nil)
 	switch {
@@ -365,11 +413,10 @@ func sessionCapCondition(agent *agentv1alpha1.PlatformAgent, status metav1.Condi
 
 // sessionCapCurrent reports whether agent already holds cap and cond, the
 // condition compared on what the writers key on (status, reason, message)
-// and on the generation it observed, so a spec edit refreshes it. ignoreCap
-// leaves the cap out, for a CRD that prunes it.
-func sessionCapCurrent(agent *agentv1alpha1.PlatformAgent, want *int, cond *metav1.Condition, ignoreCap bool) bool {
+// and on the generation it observed, so a spec edit refreshes it.
+func sessionCapCurrent(agent *agentv1alpha1.PlatformAgent, want *int, cond *metav1.Condition) bool {
 	have := agent.Status.EffectiveSessionCap
-	if !ignoreCap && ((have == nil) != (want == nil) || (have != nil && *have != *want)) {
+	if (have == nil) != (want == nil) || (have != nil && *have != *want) {
 		return false
 	}
 	existing := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType)
@@ -413,6 +460,17 @@ func a2aSessionCapWaiting(agent *agentv1alpha1.PlatformAgent) bool {
 	}
 	c := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType)
 	return c != nil && c.Reason == sessionCapWaitingReason
+}
+
+// a2aSessionCapPrunedHeld reports an install held on platform because the
+// served CRD prunes status.effectiveSessionCap (sessionCapPrunedReason).
+// Only on the session route, as a2aSessionCapWaiting.
+func a2aSessionCapPrunedHeld(agent *agentv1alpha1.PlatformAgent) bool {
+	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
+		return false
+	}
+	c := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType)
+	return c != nil && c.Reason == sessionCapPrunedReason
 }
 
 // UseA2ABusWithoutTasksForTesting answers every reconciler's bus stream read

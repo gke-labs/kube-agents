@@ -718,48 +718,104 @@ func TestAnUpgradeOnAReadableBusRollsOnce(t *testing.T) {
 	}
 }
 
-// A served CRD that prunes status.effectiveSessionCap: the cap is kept in
-// memory and rendered, an unreadable pass keeps it rather than falling back,
-// and the field is not written again within the reprobe.
-func TestAPrunedSessionCapKeepsTheRenderedCap(t *testing.T) {
+// A served CRD that prunes status.effectiveSessionCap: the install is held on
+// platform with SessionCapFitted saying why, from the pass that sees the
+// prune. A pass past the reprobe that can't read the bus stays there rather
+// than rendering maxSessions, and only an echo that keeps the cap engages
+// the session route, at the fitted cap.
+func TestAPrunedSessionCapHoldsThePlatformRoute(t *testing.T) {
 	agent := sessionRouteTestAgent()
-	patches := 0
+	patches, pruning := 0, true
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 			patches++
-			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && pruning {
 				pa.Status.EffectiveSessionCap = nil // the older CRD's schema
 			}
 			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
 		}}).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: tasksAt(110)}
 	ctx := context.Background()
+	key := client.ObjectKeyFromObject(agent)
+	held := func(step string, a *agentv1alpha1.PlatformAgent) {
+		t.Helper()
+		c := meta.FindStatusCondition(a.Status.Conditions, sessionCapFittedConditionType)
+		if resolveA2ADefaultRoute(a) != agentv1alpha1.DefaultRoutePlatform || resolveA2AEffectiveSessions(a) != resolveA2AMaxSessions(a) ||
+			a.Status.EffectiveSessionCap != nil || a2aSessionCapWaiting(a) || c == nil || c.Reason != sessionCapPrunedReason {
+			t.Errorf("%s: route %q at %d, cap %v, condition %v; want platform at maxSessions, held by %s", step,
+				resolveA2ADefaultRoute(a), resolveA2AEffectiveSessions(a), a.Status.EffectiveSessionCap, c, sessionCapPrunedReason)
+		}
+		if stored := storedCapAgent(t, cl, agent); resolveA2ADefaultRoute(stored) != agentv1alpha1.DefaultRoutePlatform {
+			t.Errorf("%s: the stored status routes %q, want platform", step, resolveA2ADefaultRoute(stored))
+		}
+	}
+	age := func() {
+		r.sessionCapPruned.Store(key, time.Now().Add(-sessionCapPrunedReprobe-time.Second))
+		r.sessionCapReadings.Clear()
+	}
+
 	first := storedCapAgent(t, cl, agent)
 	r.resolveA2ASessionCap(ctx, first, nil)
-	if first.Status.EffectiveSessionCap == nil || *first.Status.EffectiveSessionCap != 4 {
-		t.Fatalf("the render copy's cap = %v, want the fitted 4 in memory", first.Status.EffectiveSessionCap)
-	}
+	held("the pass that sees the prune", first)
 	if !r.sessionCapStatusPruned(first) {
 		t.Fatal("the echo without the cap was not noticed")
 	}
+
 	before := patches
 	r.busStreamState = unreadableBus
-	r.sessionCapReadings.Clear()
 	for i := 0; i < 3; i++ {
 		pass := storedCapAgent(t, cl, agent)
-		if pass.Status.EffectiveSessionCap != nil {
-			t.Fatalf("precondition: the store holds a cap the CRD should have pruned")
-		}
 		r.resolveA2ASessionCap(ctx, pass, nil)
-		if pass.Status.EffectiveSessionCap == nil || *pass.Status.EffectiveSessionCap != 4 || a2aSessionCapWaiting(pass) ||
-			resolveA2ADefaultRoute(pass) != agentv1alpha1.DefaultRouteSession {
-			t.Errorf("pass %d under a pruning CRD: cap %v, waiting %v, route %q; want the rendered 4 on session", i+1,
-				pass.Status.EffectiveSessionCap, a2aSessionCapWaiting(pass), resolveA2ADefaultRoute(pass))
-		}
+		held(fmt.Sprintf("pass %d within the reprobe", i+1), pass)
 	}
 	if patches != before {
-		t.Errorf("%d status patches on passes that changed nothing but the pruned cap, want none", patches-before)
+		t.Errorf("%d status patches within the reprobe, want none", patches-before)
+	}
+
+	// Past the reprobe, with the bus unreadable: nothing to probe with.
+	age()
+	pass := storedCapAgent(t, cl, agent)
+	r.resolveA2ASessionCap(ctx, pass, nil)
+	held("an unreadable pass past the reprobe", pass)
+	if !r.sessionCapStatusPruned(pass) {
+		t.Error("an unreadable pass past the reprobe did not wait a reprobe before the next probe")
+	}
+
+	// Past the reprobe, readable, the CRD still pruning.
+	r.busStreamState = tasksAt(110)
+	age()
+	pass = storedCapAgent(t, cl, agent)
+	r.resolveA2ASessionCap(ctx, pass, nil)
+	held("a probe the CRD still prunes", pass)
+
+	// A restart: no memory, the held condition stored, the CRD still pruning.
+	restarted := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: unreadableBus}
+	pass = storedCapAgent(t, cl, agent)
+	restarted.resolveA2ASessionCap(ctx, pass, nil)
+	held("an unreadable first pass after a restart", pass)
+	restarted.busStreamState = tasksAt(110)
+	age()
+	restarted.sessionCapPruned.Store(key, time.Now().Add(-sessionCapPrunedReprobe-time.Second))
+	pass = storedCapAgent(t, cl, agent)
+	restarted.resolveA2ASessionCap(ctx, pass, nil)
+	held("a probe after a restart", pass)
+
+	// The CRD updated: the next probe's echo keeps the cap.
+	pruning = false
+	age()
+	pass = storedCapAgent(t, cl, agent)
+	r.resolveA2ASessionCap(ctx, pass, nil)
+	stored := storedCapAgent(t, cl, agent)
+	for name, a := range map[string]*agentv1alpha1.PlatformAgent{"the render copy": pass, "the store": stored} {
+		c := meta.FindStatusCondition(a.Status.Conditions, sessionCapFittedConditionType)
+		if resolveA2ADefaultRoute(a) != agentv1alpha1.DefaultRouteSession || resolveA2AEffectiveSessions(a) != 4 || c == nil || c.Reason != sessionCapNarrowReason {
+			t.Errorf("%s after the CRD keeps the cap: route %q at %d, condition %v; want session at the fitted 4, %s", name,
+				resolveA2ADefaultRoute(a), resolveA2AEffectiveSessions(a), c, sessionCapNarrowReason)
+		}
+	}
+	if _, ok := r.sessionCapPruned.Load(key); ok {
+		t.Error("the prune record outlived an echo that kept the cap")
 	}
 }
 

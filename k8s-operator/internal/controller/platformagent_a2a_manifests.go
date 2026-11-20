@@ -5271,7 +5271,10 @@ func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
 	// included, so turning the default on never silently widens what a plain
 	// turn reaches (SessionCapFitted says why; its retirement is
 	// gke-labs/kube-agents#6483).
-	if a2aSessionClusterViewEnabled(agent) || a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
+	// A CRD that prunes status.effectiveSessionCap can't keep the cap the
+	// session route renders from, so that install stays on platform too.
+	if a2aSessionClusterViewEnabled(agent) || a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession ||
+		a2aSessionCapPrunedHeld(agent) {
 		return agentv1alpha1.DefaultRoutePlatform
 	}
 	stored := agent.Status.EffectiveSessionCap
