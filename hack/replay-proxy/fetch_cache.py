@@ -14,11 +14,18 @@ so its `served_from`, is the night that first wrote it, which can be that old,
 though a night inside the window produced it; its verdict is read from that
 night's newest record (one small object per older build).
 
-An answer is loaded only from a record that says its night's passing runs
-produced it: an alternate (`alts/`) must be in the record's `produced` list
-for its fingerprint as well as among its objects, so a record that merely
+An answer is loaded only when a build in the window says its passing runs
+produced it: an alternate (`alts/`) must be in an in-window record's
+`produced` list or `produced_counts` for its build, so a record that merely
 found an older night's object in the bucket never brings it in, and no answer
-served is older than the window. An older-layout answer (`answers/`, one per
+served is older than the window. A build lists an alternate under `produced`
+only in the record of the call that first confirmed it, and counts it again in
+every later record, so a build whose first record has aged out still makes
+its alternate eligible through a newer record's count; the object is then
+planned at no size and costed for real once downloaded. An alternate every
+producing build in the window now counts 0 times (a producer of it was later
+found to disagree with its tag) is refused and counted (`skipped`), even when
+an earlier pass uploaded it. An older-layout answer (`answers/`, one per
 key, from records written before alternates) is still taken as before, and
 can be as old as the bucket's lifecycle.
 
@@ -28,9 +35,10 @@ requests from passing runs got it, which the proxy serves the key's answers in
 proportion to. A build's records count every answer it put up again on each
 call (`produced_counts`), so a build's count is its newest in-window record's,
 never a sum of its records; builds are different runs, so their counts add.
-Only builds whose in-window records list the answer under `produced` count, so
-the weight covers the same window as the answers. A build with no count for an
-answer it produced (a record written before counts) adds 1. A weights file
+Only builds whose in-window records list the answer (under `produced` or
+`produced_counts`) count, so the weight covers the same window as the answers.
+A build with no count for an answer it produced (a record written before
+counts) adds 1; one whose newest count is 0 adds nothing. A weights file
 past `--max-bytes` is left out and counted; its key's answers then weigh 1.
 
 What fits under `--max-bytes` is chosen before anything downloads, in this
@@ -151,8 +159,15 @@ GCLOUD_ENV = {"CLOUDSDK_CORE_DISABLE_PROMPTS": "1"}
 PRIORITY = (P.ANSWERS, P.ALTS, P.SLOTS, P.VARIANTS, P.MESSAGES)
 # Kinds stored one directory deeper on disk (object_path), each new directory a block.
 NESTED_KINDS = (P.VARIANTS, P.ALTS)
-# An alternate a recent record confirms but does not say its night produced.
+# An alternate a recent record confirms but no build in the window says it produced.
 NOT_PRODUCED = "not_produced"
+# An alternate every build in the window that produced it now counts 0 times
+# (a producer later found disagreeing with its tag: publish_cache.py), so no
+# passing run vouches for it any more.
+ZERO_COUNT = "zero_count"
+# The size an alternate is planned at when no in-window record confirmed it
+# (its build's confirming record aged out): costed for real once downloaded.
+UNKNOWN_SIZE = 0
 # The weights files written beside the alternates (replay_cache.WEIGHTS_DIR), by name in the summary.
 WEIGHTS = replay_cache.WEIGHTS_DIR
 
@@ -196,7 +211,7 @@ class Fetched:
     by_kind: Dict[str, int] = field(default_factory=dict)
     left_out: Dict[str, int] = field(default_factory=dict)
     removed: Dict[str, int] = field(default_factory=dict)
-    # Objects a recent record named that the lane may not load (NOT_PRODUCED).
+    # Alternates the lane may not load (NOT_PRODUCED, ZERO_COUNT).
     skipped: Dict[str, int] = field(default_factory=dict)
     runs: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
 
@@ -553,10 +568,12 @@ class Fetcher:
                     result.verdict_records += 1
                     result.runs[build] = [r for r in runs if isinstance(r, dict)]
             confirmed: Dict[str, Tuple[str, int, str]] = {}
-            # Per build, the alternates its in-window records say it produced,
-            # and its newest record's count of each (weight()).
+            # Per build, the alternates its in-window records say it produced
+            # (listed or counted), and its newest record's count of each (weight()).
             produced_by: Dict[str, Set[Tuple[str, str]]] = {}
             counted: Dict[str, Dict[Tuple[str, str], int]] = {}
+            # Every alternate an in-window record confirmed, decided once all are read.
+            alternates: Dict[str, Tuple[str, int, str]] = {}
             # Newest first, so what the bound leaves out is the oldest.
             for key in reversed(keys):
                 build = RECORD_KEY_RE.match(key).group(1)  # type: ignore[union-attr]
@@ -577,17 +594,34 @@ class Fetcher:
                 if not self._same_job(record):
                     result.other_job_records += 1
                     continue
-                produced_by.setdefault(build, set()).update(produced)
+                produced_by.setdefault(build, set()).update(produced, counts)
                 for pair, count in counts.items():
                     counted.setdefault(build, {}).setdefault(pair, count)  # newest record first
                 for item in items:
-                    parts = P.alternate_parts(item[0])
-                    if parts is not None and parts not in produced:
-                        # Confirmed in the bucket, but not this night's answer: it
-                        # could be an older night's, so it never comes in on this record.
-                        result.count(result.skipped, NOT_PRODUCED)
-                        continue
-                    confirmed.setdefault(item[0], item)
+                    if P.alternate_parts(item[0]) is not None:
+                        alternates.setdefault(item[0], item)
+                    else:
+                        confirmed.setdefault(item[0], item)
+            eligible = set().union(*produced_by.values()) if produced_by else set()
+            for name, item in alternates.items():
+                pair = P.alternate_parts(name)
+                if pair not in eligible:
+                    # Confirmed in the bucket, but no build in the window produced
+                    # it: it could be an older night's, so it never comes in.
+                    result.count(result.skipped, NOT_PRODUCED)
+                elif weight(pair, produced_by, counted) == 0:  # type: ignore[arg-type]
+                    result.count(result.skipped, ZERO_COUNT)
+                else:
+                    confirmed.setdefault(name, item)
+            for fingerprint, answer in sorted(eligible):
+                name = f"{P.ALTS}/{fingerprint}{P.VARIANT_SEPARATOR}{answer}{P.JSON_SUFFIX}"
+                if name in alternates:
+                    continue
+                # Counted by a build whose confirming record aged out of the window.
+                if weight((fingerprint, answer), produced_by, counted) == 0:
+                    result.count(result.skipped, ZERO_COUNT)
+                else:
+                    confirmed.setdefault(name, (name, UNKNOWN_SIZE, ""))
             result.objects = len(confirmed)
             chosen = self._plan(list(confirmed.values()), result)
             prefix = P.cache_prefix(self.bucket, self.version)
@@ -647,10 +681,13 @@ def weight(pair: Tuple[str, str], produced_by: Dict[str, Set[Tuple[str, str]]],
     A build's records count again on every call (publish_cache.RECORD_PRODUCED_COUNTS),
     so its newest record's count is the build's and its records are not
     summed; different builds are different runs, so they are. A build whose
-    records give no count (written before them), or a count below 1, adds 1:
-    it published the answer, so it produced it at least once.
+    records give no count (written before them) adds 1: it published the
+    answer, so it produced it at least once. A build whose newest count is 0
+    adds nothing: an answer it put up on an earlier pass lost its passing
+    producer. 0 overall means no build in the window vouches for the answer,
+    and fetch refuses it.
     """
-    return sum(max(counted.get(build, {}).get(pair, 1), 1)
+    return sum(counted.get(build, {}).get(pair, 1)
                for build, pairs in sorted(produced_by.items()) if pair in pairs)
 
 

@@ -174,6 +174,51 @@ class FetchTest(unittest.TestCase):
         self.fetcher().fetch(self.dest)
         self.assertEqual(self.weights(fp(1)), {fp(7): 1 + 3, fp(8): 1})
 
+    def test_a_build_whose_first_record_aged_out_still_loads_and_weighs_its_counted_answer(self):
+        # Build 100 listed fp(7) as produced in its first record, now past the
+        # window; its newer in-window record only counts it. Build 101 gave fp(8).
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a]}, created=NOW - 40 * HOUR, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 1}}})
+        self.record("100", 2, {VERSION: []}, created=NOW - 10 * HOUR, produced={VERSION: {}},
+                    counts={VERSION: {fp(1): {fp(7): 4}}})
+        self.record("101", 1, {VERSION: [b]}, produced={VERSION: {fp(1): [fp(8)]}},
+                    counts={VERSION: {fp(1): {fp(8): 1}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dest, "alts", fp(1)))), [f"{fp(7)}.json", f"{fp(8)}.json"])
+        self.assertEqual(self.weights(fp(1)), {fp(7): 4, fp(8): 1})
+        self.assertEqual(result.skipped, {})
+
+    def test_an_answer_whose_newest_count_is_zero_in_every_producing_build_is_refused(self):
+        # An interval pass put fp(7) up; the final pass found a disagreeing
+        # producer and counts it 0. fp(8) keeps the key answered.
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced={VERSION: {fp(1): [fp(7), fp(8)]}},
+                    counts={VERSION: {fp(1): {fp(7): 1, fp(8): 2}}})
+        self.record("100", 2, {VERSION: []}, created=NOW - 9 * HOUR, produced={VERSION: {}},
+                    counts={VERSION: {fp(1): {fp(7): 0, fp(8): 2}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(os.listdir(os.path.join(self.dest, "alts", fp(1))), [f"{fp(8)}.json"])
+        self.assertEqual(result.skipped, {"zero_count": 1})
+        self.assertFalse(any(c.endswith(a) for c in self.bucket.copied), "never downloaded")
+
+    def test_a_zero_count_in_one_build_is_outweighed_by_another_builds_positive_or_missing_count(self):
+        a = f"alts/{fp(1)}-{fp(7)}.json"
+        b = f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced={VERSION: {fp(1): [fp(7), fp(8)]}},
+                    counts={VERSION: {fp(1): {fp(7): 0, fp(8): 1}}})
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 3}}})
+        self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 3, fp(8): 1}, "build 100 adds nothing, build 101 its 3")
+        self.record("102", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}})
+        shutil.rmtree(self.dest, ignore_errors=True)
+        self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 3 + 1, fp(8): 1}, "a build with no count adds 1")
+
     def test_a_key_with_one_answer_gets_no_weights_file(self):
         a = f"alts/{fp(1)}-{fp(7)}.json"
         self.objects(VERSION, a)
