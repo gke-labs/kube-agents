@@ -1142,6 +1142,7 @@ func a2aStreamPolicies(agent *agentv1alpha1.PlatformAgent, replicas int) []busmi
 		stream(a2aDispatchStopStream, []string{"a2a.stop.>"}, day, 67108864, 1, 1),
 		kv(a2aScheduledReportsBucket, 268435456, 90*day),
 		kv(a2aScheduleThreadsBucket, 8388608, 2*day),
+		kv(a2aNotifyThreadsBucket, 8388608, 7*day),
 	}
 }
 

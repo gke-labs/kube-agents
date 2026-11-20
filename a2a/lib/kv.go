@@ -42,6 +42,15 @@ const ScheduledReportsBucket = "SCHEDULED_REPORTS"
 // only reader and writer.
 const ScheduleThreadsBucket = "SCHEDULE_THREADS"
 
+// NotifyThreadsBucket is the KV bucket holding one entry per home-channel
+// thread the gateway opened with a keyed chat.notify post (an alert's), keyed
+// <platform>.<chat>.<thread> hashed (a2a/gateway/notify_threads.go). It is the
+// gateway's own record of the threads it posted, which a thread delivery
+// (ScheduleDeliveryThread) must name: a trigger can't steer a post into a
+// thread the gateway never opened. Provisioned by the deployment with a
+// 7-day max age; the gateway's user is the only reader and writer.
+const NotifyThreadsBucket = "NOTIFY_THREADS"
+
 // KV returns a handle to the named KV bucket on the client's current
 // connection. Handles bind to that connection and do not survive a terminal
 // rebuild (NR-2), so callers fetch one per operation rather than caching it;

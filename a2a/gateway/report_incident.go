@@ -33,14 +33,14 @@ const (
 // busIncidentWriter keeps reports over client's connection.
 type busIncidentWriter struct{ client *lib.Client }
 
-func (w busIncidentWriter) keepReportIncident(ctx context.Context, platform, chatID, threadID, report string) error {
+func (w busIncidentWriter) keepReportIncident(ctx context.Context, platform, chatID, threadID, report, source string) error {
 	nc := w.client.Conn()
 	if nc == nil {
 		return errors.New("incident: no bus connection")
 	}
 	ctx, cancel := context.WithTimeout(ctx, incidentKeepTimeout)
 	defer cancel()
-	return keepIncidentOver(ctx, nc, lib.IncidentKeep{Platform: platform, ChatID: chatID, ThreadID: threadID, Report: report})
+	return keepIncidentOver(ctx, nc, lib.IncidentKeep{Platform: platform, ChatID: chatID, ThreadID: threadID, Report: report, Source: source})
 }
 
 // keepIncidentOver publishes one incident write and waits for the bridge's

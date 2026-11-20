@@ -374,6 +374,11 @@ func (n *Notifier) Backend() string {
 	return n.backend
 }
 
+// setThreadRecorder sets the route's threadRecorder.
+func (n *Notifier) setThreadRecorder(record func(platform, chatID, thread string)) {
+	n.threadRecorder = record
+}
+
 // keepJob is one refused home post on its way to the store, with the
 // requester's answer (Kept goes back only once the store has it) and the
 // requester's deadline, as notifyJob carries it.

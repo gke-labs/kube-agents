@@ -297,7 +297,7 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Eight KV buckets ride the same JetStream deployment:
+Nine KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
@@ -376,6 +376,13 @@ Eight KV buckets ride the same JetStream deployment:
   by grant, with STREAM.INFO and DIRECT.GET on `KV_SCHEDULE_THREADS` and no consumer verb.
   A 48-hour max age (`--ttl=48h`), a 4KiB value cap and an 8MiB bucket cap. Provision and
   seed hold CREATE and INFO on it for the info-then-add guard. The
+  [scheduling design](scheduling-on-profiles.md) owns what an entry holds (section 4).
+- `NOTIFY_THREADS` - the home-channel threads the gateway opened with a keyed `chat.notify`
+  post (an alert's), keyed `<platform>.<hash of chat and thread>`. A thread delivery may
+  name only a thread on it. The gateway is its only reader and writer by grant, with
+  STREAM.INFO and DIRECT.GET on `KV_NOTIFY_THREADS` and no consumer verb. A 7-day max age
+  (`--ttl=168h`), a 1KiB value cap and an 8MiB bucket cap. Provision and seed hold CREATE
+  and INFO on it for the info-then-add guard. The
   [scheduling design](scheduling-on-profiles.md) owns what an entry holds (section 4).
 
 ## Accounts and connection-time authorization

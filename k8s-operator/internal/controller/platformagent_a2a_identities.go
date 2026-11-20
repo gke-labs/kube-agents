@@ -605,6 +605,10 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// Each schedule's thread for a UTC day (a2a/gateway/schedule_threads.go),
 		// the bucket's data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
 		"$KV.SCHEDULE_THREADS.>",
+		// The home-channel threads its keyed notify posts opened
+		// (a2a/gateway/notify_threads.go), the bucket's data plane; its
+		// JetStream grants are a2aGatewayJetStreamGrants'.
+		"$KV.NOTIFY_THREADS.>",
 		// The console adapter's notices (spec-chatops-gateway.md, "The
 		// console adapter"): core NATS, one subject per conversation.
 		"chat.console.*.out",
@@ -672,7 +676,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"KV_session-state, its own registry, on KV_feedback, the kept\n" +
 			"answer ratings, and on KV_people, one hashed key per chat person;\n" +
 			"INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs,\n" +
-			"and on KV_SCHEDULE_THREADS, a schedule's thread for the day.\n" +
+			"on KV_SCHEDULE_THREADS, a schedule's thread for the day, and on\n" +
+			"KV_NOTIFY_THREADS, the threads its keyed notify posts opened.\n" +
 			"So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
@@ -783,7 +788,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
 		// stream on the bus. It provisions - it creates the six streams
-		// and eight buckets, idempotently, with an info-then-add - so it
+		// and nine buckets, idempotently, with an info-then-add - so it
 		// needs CREATE and INFO on exactly those and nothing else. A KV
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
@@ -824,6 +829,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.DISPATCH_STOPS",
 			"$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
 			"$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
+			"$JS.API.STREAM.CREATE.KV_NOTIFY_THREADS",
 			"$JS.API.STREAM.INFO.TASKS",
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -838,6 +844,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
 			"$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
 			"$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+			"$JS.API.STREAM.INFO.KV_NOTIFY_THREADS",
 			// The two TASKS durables it makes (#4173), as natscli 0.1.5's
 			// consumer add asks for them: INFO, then CREATE with the filter
 			// token for one filter and without it for two. CREATE is

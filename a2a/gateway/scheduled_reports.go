@@ -209,6 +209,8 @@ type homePost struct {
 type homeReporter interface {
 	homeChannel() string
 	postHomeReport(ctx context.Context, home, thread, text string) (homePost, error)
+	// Backend is the route's platform, lib's NotifyPlatform name.
+	Backend() string
 }
 
 // SetHomeReporters points scheduled reports at this term's chat.notify
@@ -219,6 +221,9 @@ func (g *Gateway) SetHomeReporters(routes ...*Notifier) {
 	for _, n := range routes {
 		if n != nil && n.poster != nil {
 			reporters = append(reporters, n)
+			// The threads its keyed home posts open, for a thread
+			// delivery to name (notify_threads.go).
+			n.setThreadRecorder(g.recordNotifyThread)
 		}
 	}
 	g.setHomeReporters(reporters...)
@@ -361,9 +366,16 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	}
 
 	// Into the schedule's thread for the UTC day, or a new one
-	// (schedule_threads.go).
+	// (schedule_threads.go); a thread delivery into the thread it names
+	// (notify_threads.go).
 	postCtx, cancel := context.WithTimeout(ctx, postTimeout)
-	post, postErr := g.postScheduledReport(postCtx, reporter, home, report)
+	var post homePost
+	var postErr error
+	if d.Mode == lib.ScheduleDeliveryThread {
+		post, postErr = g.postThreadDelivery(postCtx, reporter, home, *d, report)
+	} else {
+		post, postErr = g.postScheduledReport(postCtx, reporter, home, report)
+	}
 	cancel()
 	report.Attempts++
 	report.PostStartedAt = time.Time{}

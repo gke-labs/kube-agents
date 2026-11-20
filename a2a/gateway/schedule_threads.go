@@ -51,7 +51,8 @@ type ScheduleThread struct {
 // a2a/hermes-bridge/incident.go as <untrusted_report>). Called on every
 // post with the stored, truncated report.
 type reportIncidentWriter interface {
-	keepReportIncident(ctx context.Context, platform, chatID, threadID, report string) error
+	// source names the writer on the row; "" is a scheduled report's.
+	keepReportIncident(ctx context.Context, platform, chatID, threadID, report, source string) error
 }
 
 // scheduleThreadKey is jobKey's thread key for the UTC day of at.
@@ -217,6 +218,12 @@ func (g *Gateway) dayThread(ctx context.Context, threads scheduledStore, key, ta
 // keepIncident writes the posted report against where it landed, logged
 // when it fails: the post stands either way.
 func (g *Gateway) keepIncident(ctx context.Context, post homePost, report ScheduledReport, logArgs []any) {
+	g.keepIncidentAs(ctx, post, report, "", logArgs)
+}
+
+// keepIncidentAs is keepIncident with the row's source named; "" is a
+// scheduled report's.
+func (g *Gateway) keepIncidentAs(ctx context.Context, post homePost, report ScheduledReport, source string, logArgs []any) {
 	if g.reportIncidents == nil {
 		g.log.Debug("no incident writer; the posted report is not kept for replies", logArgs...)
 		return
@@ -225,7 +232,7 @@ func (g *Gateway) keepIncident(ctx context.Context, post homePost, report Schedu
 	if thread == "" {
 		thread = post.MessageID
 	}
-	if err := g.reportIncidents.keepReportIncident(context.WithoutCancel(ctx), post.Platform, post.ChatID, thread, report.Text); err != nil {
+	if err := g.reportIncidents.keepReportIncident(context.WithoutCancel(ctx), post.Platform, post.ChatID, thread, report.Text, source); err != nil {
 		g.log.Warn("posted report not kept for replies in its thread", append(logArgs, "err", err)...)
 	}
 }

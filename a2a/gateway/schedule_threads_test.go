@@ -29,6 +29,8 @@ type threadedReporter struct {
 
 func (f *threadedReporter) homeChannel() string { return "C0HOME" }
 
+func (f *threadedReporter) Backend() string { return lib.NotifyPlatformSlack }
+
 func (f *threadedReporter) postHomeReport(_ context.Context, home, thread, text string) (homePost, error) {
 	if thread == "" && f.hold != nil {
 		f.started <- struct{}{}
@@ -55,14 +57,16 @@ func (f *threadedReporter) all() []threadPost {
 
 // incidentRecorder is the incident store as the scheduled delivery writes it.
 type incidentRecorder struct {
-	mu   sync.Mutex
-	kept []string
+	mu      sync.Mutex
+	kept    []string
+	sources []string
 }
 
-func (r *incidentRecorder) keepReportIncident(_ context.Context, platform, chatID, threadID, report string) error {
+func (r *incidentRecorder) keepReportIncident(_ context.Context, platform, chatID, threadID, report, source string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.kept = append(r.kept, platform+"|"+chatID+"|"+threadID+"|"+report)
+	r.sources = append(r.sources, source)
 	return nil
 }
 

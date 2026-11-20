@@ -235,6 +235,10 @@ type Notifier struct {
 	// threadTS turns an admitted thread into the one the poster takes (Slack's
 	// channel-qualified thread to its bare ts); nil leaves it as it is.
 	threadTS func(string) string
+	// threadRecorder, when set, is told the thread every keyed home post
+	// landed in: the gateway's record of the threads it opened, which a
+	// thread delivery must name (notify_threads.go). Set before Start.
+	threadRecorder func(platform, chatID, thread string)
 	// convPrefix is the conversation-key prefix of this backend, and conv
 	// the gateway's conversations; nil leaves conversation requests refused.
 	convPrefix string
@@ -1181,6 +1185,9 @@ func (n *Notifier) postHome(job notifyJob) bool {
 		landed = thread
 	}
 	if landed != "" {
+		if n.threadRecorder != nil {
+			n.threadRecorder(n.backend, home, landed)
+		}
 		n.updates.put(notifyHomeKeyPrefix+landed, key, message)
 		if m.Feedback != "" {
 			// The thread's opening post was rated: its key's later edit

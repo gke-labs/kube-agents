@@ -3044,7 +3044,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "76dac01c12b1a320",
+      "version": "498e575ea76aa076",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3075,6 +3075,7 @@ data:
               "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
               "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
               "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
+              "$JS.API.STREAM.CREATE.KV_NOTIFY_THREADS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -3089,6 +3090,7 @@ data:
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
               "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
               "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+              "$JS.API.STREAM.INFO.KV_NOTIFY_THREADS",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -3172,6 +3174,7 @@ data:
               "$KV.people.>",
               "$KV.SCHEDULED_REPORTS.>",
               "$KV.SCHEDULE_THREADS.>",
+              "$KV.NOTIFY_THREADS.>",
               "chat.console.*.out",
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
@@ -3198,6 +3201,8 @@ data:
               "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
               "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
               "$JS.API.DIRECT.GET.KV_SCHEDULE_THREADS.>",
+              "$JS.API.STREAM.INFO.KV_NOTIFY_THREADS",
+              "$JS.API.DIRECT.GET.KV_NOTIFY_THREADS.>",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
               "$JS.ACK.TASKS.>",
@@ -3273,7 +3278,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 76dac01c12b1a320
+    kubeagents.x-k8s.io/a2a-authmap-version: 498e575ea76aa076
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3870,7 +3875,8 @@ stringData:
           # KV_session-state, its own registry, on KV_feedback, the kept
           # answer ratings, and on KV_people, one hashed key per chat person;
           # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs,
-          # and on KV_SCHEDULE_THREADS, a schedule's thread for the day.
+          # on KV_SCHEDULE_THREADS, a schedule's thread for the day, and on
+          # KV_NOTIFY_THREADS, the threads its keyed notify posts opened.
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
@@ -3892,6 +3898,7 @@ stringData:
                   "$KV.people.>",
                   "$KV.SCHEDULED_REPORTS.>",
                   "$KV.SCHEDULE_THREADS.>",
+                  "$KV.NOTIFY_THREADS.>",
                   "chat.console.*.out",
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
@@ -3918,6 +3925,8 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
                   "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
                   "$JS.API.DIRECT.GET.KV_SCHEDULE_THREADS.>",
+                  "$JS.API.STREAM.INFO.KV_NOTIFY_THREADS",
+                  "$JS.API.DIRECT.GET.KV_NOTIFY_THREADS.>",
                   "$JS.API.STREAM.INFO.DIRECTORY",
                   "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
@@ -4019,6 +4028,8 @@ stringData:
                   "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
                   "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
                   "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+                  "$JS.API.STREAM.CREATE.KV_NOTIFY_THREADS",
+                  "$JS.API.STREAM.INFO.KV_NOTIFY_THREADS",
                   "_INBOX.seed.>"
                 ]
               }

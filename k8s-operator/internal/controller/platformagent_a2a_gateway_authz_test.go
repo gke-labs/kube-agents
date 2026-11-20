@@ -306,6 +306,19 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	allowed("$KV.SCHEDULE_THREADS update, the day's thread (putScheduleThread)", err)
 	allowed("$KV.SCHEDULE_THREADS delete, a released claim", threads.Delete(ctx, threadKey, jetstream.LastRevision(trev)))
 
+	// A thread a keyed notify post opened (a2a/gateway/notify_threads.go):
+	// bound, read (absent), and put.
+	notifyThreads, err := js.KeyValue(ctx, a2aNotifyThreadsBucket)
+	allowed("STREAM.INFO KV_NOTIFY_THREADS (notifyThreadStore js.KeyValue)", err)
+	const notifyThreadKey = "slack.0123456789abcdef0123456789abcdef01234567"
+	_, err = notifyThreads.Get(ctx, notifyThreadKey)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		err = nil
+	}
+	allowed("DIRECT.GET KV_NOTIFY_THREADS (notifyThreadKnown)", err)
+	_, err = notifyThreads.Put(ctx, notifyThreadKey, []byte(`{"platform":"slack"}`))
+	allowed("$KV.NOTIFY_THREADS put (putNotifyThread)", err)
+
 	if v := log.publishViolations("gateway"); len(v) != 0 {
 		t.Errorf("the gateway's own operations tripped %d publish violations; each is a grant a2aGatewayJetStreamGrants is missing:\n%s",
 			len(v), strings.Join(v, "\n"))

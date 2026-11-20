@@ -132,6 +132,13 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if g.cfg.Namespace == "" || s.Schedule.Namespace != g.cfg.Namespace {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "schedule "+s.Schedule.Namespace+"/"+s.Schedule.Name+" is not in the install's namespace")
 	}
+	// A thread delivery posts into a thread the gateway opened, and only
+	// from a source the install trusts for it (notify_threads.go).
+	if s.Delivery.Mode == lib.ScheduleDeliveryThread {
+		if reason, detail := g.threadDeliveryRefusal(ctx, source, s.Delivery); reason != "" {
+			return g.triggerRefused(s.Trigger.Name, reason, detail)
+		}
+	}
 	key := triggerConversationKey(source, s.Schedule)
 	// One submission at a time per trigger, and the relay's batches for its
 	// tasks wait on the same lock (relayBatch): the record read here is the
@@ -329,8 +336,9 @@ func triggerConversationKey(source string, s lib.ScheduleRef) string {
 // unpostableTrigger reports whether conversation is a trigger's own, which
 // no chat backend owns: the relay posts nothing there (a backend handed the
 // key would refuse it, or worse, read it as one of its own). A schedule's
-// result goes to the home channel, or nowhere, by the record's Delivery
-// (deliverScheduledReport, from relayTerminal).
+// result goes to the home channel, into a thread the gateway opened there,
+// or nowhere, by the record's Delivery (deliverScheduledReport, from
+// relayTerminal).
 func (g *Gateway) unpostableTrigger(conversation string) bool {
 	if !strings.HasPrefix(conversation, triggerConversationPrefix) {
 		return false

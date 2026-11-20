@@ -130,7 +130,10 @@ const (
 	// a2aScheduleThreadsBucket is lib.ScheduleThreadsBucket: each
 	// schedule's home-channel thread for a UTC day, the gateway's alone.
 	a2aScheduleThreadsBucket = "SCHEDULE_THREADS"
-	a2aKVStreamPrefix        = "KV_"
+	// a2aNotifyThreadsBucket is lib.NotifyThreadsBucket: the home-channel
+	// threads the gateway opened with a keyed notify post, its alone.
+	a2aNotifyThreadsBucket = "NOTIFY_THREADS"
+	a2aKVStreamPrefix      = "KV_"
 
 	// a2aProfileSubmitStream holds the profiles' submissions, every subject
 	// under a2aProfileSubmitPrefix (lib.ProfileSubmitStream and
@@ -1928,7 +1931,7 @@ var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
 	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS", "KV_SCHEDULED_REPORTS",
-	"KV_SCHEDULE_THREADS",
+	"KV_SCHEDULE_THREADS", "KV_NOTIFY_THREADS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -2212,6 +2215,11 @@ func a2aAgentJetStreamGrants() []string {
 //     the thread's update and a failed claim's delete are publishes on
 //     $KV.SCHEDULE_THREADS.>.
 //
+//   - KV_NOTIFY_THREADS, the home-channel threads the gateway opened with a
+//     keyed notify post (a2a/gateway/notify_threads.go): the same two verbs,
+//     STREAM.INFO to bind it and DIRECT.GET for a thread's entry. The
+//     record's put is a publish on $KV.NOTIFY_THREADS.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -2296,6 +2304,7 @@ func a2aGatewayJetStreamGrants() []string {
 	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	kvScheduledReports := a2aKVStreamPrefix + a2aScheduledReportsBucket
 	kvScheduleThreads := a2aKVStreamPrefix + a2aScheduleThreadsBucket
+	kvNotifyThreads := a2aKVStreamPrefix + a2aNotifyThreadsBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -2320,6 +2329,8 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvScheduledReports + ".>",
 		"$JS.API.STREAM.INFO." + kvScheduleThreads,
 		"$JS.API.DIRECT.GET." + kvScheduleThreads + ".>",
+		"$JS.API.STREAM.INFO." + kvNotifyThreads,
+		"$JS.API.DIRECT.GET." + kvNotifyThreads + ".>",
 	}
 }
 
@@ -4066,6 +4077,14 @@ $NATS kv info SCHEDULED_REPORTS >/dev/null 2>&1 || $NATS kv add SCHEDULED_REPORT
 # it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a
 # value is capped at 4KiB.
 $NATS kv info SCHEDULE_THREADS >/dev/null 2>&1 || $NATS kv add SCHEDULE_THREADS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h
+
+# NOTIFY_THREADS: the home-channel threads the gateway opened with a keyed
+# chat.notify post (an alert's), keyed <platform>.<hash of chat and thread>
+# (a2a/gateway/notify_threads.go). Written and read only by the gateway: a
+# thread delivery must name a thread on it. History 1; a 7-day max age
+# outlives an alert's triage and its replies. An entry is a few hundred
+# bytes: 8MiB holds tens of thousands, and a value is capped at 1KiB.
+$NATS kv info NOTIFY_THREADS >/dev/null 2>&1 || $NATS kv add NOTIFY_THREADS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=8388608 --max-value-size=1024 --ttl=168h
 
 # PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task
 # (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the gateway and

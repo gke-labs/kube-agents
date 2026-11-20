@@ -32,6 +32,11 @@ type IncidentKeep struct {
 	ChatID   string `json:"chat_id"`
 	ThreadID string `json:"thread_id"`
 	Report   string `json:"report"`
+	// Source names the writer on the stored row (session-kv's source,
+	// ValidIncidentSource). Empty is a scheduled report's, the only writer
+	// before the field; a bridge from before it ignores the field and
+	// stores the row as a scheduled report's.
+	Source string `json:"source,omitempty"`
 }
 
 // IncidentKeepResult is the bridge's answer: OK, or why the report was not

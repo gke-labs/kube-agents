@@ -145,6 +145,38 @@ func TestAnIncidentIsStoredWhereItsThreadsReplyLooksForIt(t *testing.T) {
 	}
 }
 
+// TestAnIncidentKeepsTheSourceItNames: a request naming one of the
+// gateway's sources is stored under it; one naming none under the scheduled
+// reports'; one naming any other is refused and stores nothing.
+func TestAnIncidentKeepsTheSourceItNames(t *testing.T) {
+	t.Parallel()
+	keep := lib.IncidentKeep{Platform: lib.NotifyPlatformSlack, ChatID: "C0HOME", ThreadID: "1763100000.000100", Report: "Triage report."}
+	for _, tc := range []struct{ source, want string }{{"a2a-triage", "a2a-triage"}, {"", incidentStoreSource}} {
+		kv := &incidentKV{}
+		b := incidentBridge(t, kv)
+		k := keep
+		k.Source = tc.source
+		if err := b.keepIncident(keepRequest(t, k)); err != nil {
+			t.Fatal(err)
+		}
+		if got := kv.writes(); len(got) != 1 || got[0]["source"] != tc.want || got[0]["replace"] != true {
+			t.Fatalf("source %q: writes = %v, want source %q", tc.source, got, tc.want)
+		}
+	}
+	for _, bad := range []string{"kanban", "a2a-Triage", "a2a-", "a2a-" + strings.Repeat("a", 29)} {
+		kv := &incidentKV{}
+		b := incidentBridge(t, kv)
+		k := keep
+		k.Source = bad
+		if err := b.keepIncident(keepRequest(t, k)); err == nil {
+			t.Fatalf("source %q accepted", bad)
+		}
+		if got := kv.writes(); len(got) != 0 {
+			t.Fatalf("source %q: writes = %v, want none", bad, got)
+		}
+	}
+}
+
 // TestAnIncidentOutsideTheServedChannelsIsRefused: a write naming a channel
 // this install's chat backend does not serve is refused and stores nothing,
 // so the gateway cannot attach a report to an arbitrary thread; the Slack

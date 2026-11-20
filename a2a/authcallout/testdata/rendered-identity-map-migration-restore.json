@@ -1,5 +1,5 @@
 {
-  "version": "76f2f4bdf643d2e0",
+  "version": "2edcfdd5a0989877",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -78,7 +78,12 @@
           "$JS.API.STREAM.RESTORE.KV_SCHEDULE_THREADS",
           "$JS.API.STREAM.UPDATE.KV_SCHEDULE_THREADS",
           "$JS.API.STREAM.DELETE.KV_SCHEDULE_THREADS",
-          "$JS.SNAPSHOT.RESTORE.KV_SCHEDULE_THREADS.>"
+          "$JS.SNAPSHOT.RESTORE.KV_SCHEDULE_THREADS.>",
+          "$JS.API.STREAM.INFO.KV_NOTIFY_THREADS",
+          "$JS.API.STREAM.RESTORE.KV_NOTIFY_THREADS",
+          "$JS.API.STREAM.UPDATE.KV_NOTIFY_THREADS",
+          "$JS.API.STREAM.DELETE.KV_NOTIFY_THREADS",
+          "$JS.SNAPSHOT.RESTORE.KV_NOTIFY_THREADS.>"
         ],
         "subscribe": [
           "_INBOX.migrate-stream-3-1.>"

@@ -47,7 +47,8 @@ const (
 	// incidentReportMaxBytes bounds the decoded report: the gateway cuts one
 	// at 24KiB plus a note, so anything past this is not one of its reports.
 	incidentReportMaxBytes = 32 << 10
-	// incidentStoreSource names this writer on the rows it stores: session-kv
+	// incidentStoreSource names this writer on the rows it stores when the
+	// request names no source of its own (lib.IncidentKeep.Source): session-kv
 	// lets a replace update only a row the same source wrote, so a report
 	// the relay, the kanban notifier or a triage card stored in a home
 	// thread is never overwritten by a scheduled report.
@@ -144,7 +145,14 @@ func (b *Bridge) keepIncident(data []byte) error {
 			"platform", keep.Platform, "chat", addr.chatID, "thread", addr.threadID)
 		return errIncidentNotHosted
 	}
-	return b.storeIncident(addr, keep.Report)
+	source := incidentStoreSource
+	if keep.Source != "" {
+		if !lib.ValidIncidentSource(keep.Source) {
+			return fmt.Errorf("incident source %q is not one of the gateway's (a2a- and up to 28 of a-z, 0-9 and -)", keep.Source)
+		}
+		source = keep.Source
+	}
+	return b.storeIncident(addr, keep.Report, source)
 }
 
 // incidentStoreAddress is the (chat_id, thread_id) getIncident reads for a
@@ -237,9 +245,9 @@ type incidentStoreBody struct {
 }
 
 // storeIncident writes report at addr with session-kv's POST /v1/incidents,
-// replacing the thread's earlier report.
-func (b *Bridge) storeIncident(addr incidentAddress, report string) error {
-	body, err := json.Marshal(incidentStoreBody{ChatID: addr.chatID, ThreadID: addr.threadID, Report: report, Replace: true, Source: incidentStoreSource})
+// replacing the thread's earlier report when source wrote it.
+func (b *Bridge) storeIncident(addr incidentAddress, report, source string) error {
+	body, err := json.Marshal(incidentStoreBody{ChatID: addr.chatID, ThreadID: addr.threadID, Report: report, Replace: true, Source: source})
 	if err != nil {
 		return err
 	}

@@ -312,6 +312,12 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	}); err != nil {
 		t.Fatalf("provision bucket SCHEDULE_THREADS as seed: %v", err)
 	}
+	// `nats kv add NOTIFY_THREADS --max-value-size=1024 --ttl=168h`: the threads the gateway's keyed notify posts opened.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "NOTIFY_THREADS", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 8388608, MaxValueSize: 1024, TTL: 168 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket NOTIFY_THREADS as seed: %v", err)
+	}
 }
 
 // TestBridgeJetStreamGrantOnARealServer is the refusal proof for the bridge's

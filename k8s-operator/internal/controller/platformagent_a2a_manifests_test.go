@@ -3623,6 +3623,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$KV.SCHEDULED_REPORTS.>",
 		// A schedule's thread for the day.
 		"$KV.SCHEDULE_THREADS.>",
+		// The threads its keyed notify posts opened.
+		"$KV.NOTIFY_THREADS.>",
 		"chat.console.*.out",
 		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
@@ -3782,6 +3784,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// A schedule's thread for the day: the same.
 		"$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduleThreadsBucket:       true,
 		"$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduleThreadsBucket + ".>": true,
+		// The threads its keyed notify posts opened: the same.
+		"$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aNotifyThreadsBucket:       true,
+		"$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aNotifyThreadsBucket + ".>": true,
 		// The bind on its own pre-created relay (#4173), by exact name.
 		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay": true,
 	}
@@ -3859,6 +3864,9 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		// gateway schedule threads, over the SCHEDULE_THREADS bucket.
 		{"threadStore js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduleThreadsBucket},
 		{"getScheduleThread kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduleThreadsBucket + ".$KV." + a2aScheduleThreadsBucket + ".compliance-audit.2026-11-16"},
+		// gateway notify threads, over the NOTIFY_THREADS bucket.
+		{"notifyThreadStore js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aNotifyThreadsBucket},
+		{"notifyThreadKnown kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aNotifyThreadsBucket + ".$KV." + a2aNotifyThreadsBucket + ".slack.0123456789abcdef0123456789abcdef01234567"},
 		// The ack the relay's explicit-ack durable publishes, granted
 		// beside the API list rather than in it.
 		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
@@ -3899,7 +3907,7 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
-	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket, a2aScheduledReportsBucket, a2aScheduleThreadsBucket} {
+	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket, a2aScheduledReportsBucket, a2aScheduleThreadsBucket, a2aNotifyThreadsBucket} {
 		dataPlane := "$KV." + bucket + ".>"
 		if !slices.Contains(grants, dataPlane) {
 			t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
@@ -4397,6 +4405,8 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 				a2aKVStreamPrefix + a2aScheduledReportsBucket: {"KV", "STREAM.INFO", "DIRECT.GET"},
 				// A schedule's thread for the day: the same three.
 				a2aKVStreamPrefix + a2aScheduleThreadsBucket: {"KV", "STREAM.INFO", "DIRECT.GET"},
+				// The threads its keyed notify posts opened: the same three.
+				a2aKVStreamPrefix + a2aNotifyThreadsBucket: {"KV", "STREAM.INFO", "DIRECT.GET"},
 				// Minting, and only minting. The grant is
 				// `$KV.cap.root.*` -- the root namespace, one token
 				// deep, so one request id and no reach into the hop

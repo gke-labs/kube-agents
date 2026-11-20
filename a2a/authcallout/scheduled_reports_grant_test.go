@@ -96,6 +96,14 @@ func TestTheScheduleThreadsBucketIsTheGatewaysAlone(t *testing.T) {
 	assertGatewayOnlyBucket(t, lib.ScheduleThreadsBucket, "compliance-audit.2026-11-16")
 }
 
+// TestTheNotifyThreadsBucketIsTheGatewaysAlone is the same measurement for
+// NOTIFY_THREADS (a2a/gateway/notify_threads.go): a principal that could
+// write a thread onto the record would let a trigger's thread delivery post
+// into a thread the gateway never opened.
+func TestTheNotifyThreadsBucketIsTheGatewaysAlone(t *testing.T) {
+	assertGatewayOnlyBucket(t, lib.NotifyThreadsBucket, "slack.0123456789abcdef0123456789abcdef01234567")
+}
+
 // assertGatewayOnlyBucket holds bucket, at key, to the gateway alone: see
 // TestTheScheduledReportsBucketIsTheGatewaysAlone.
 func assertGatewayOnlyBucket(t *testing.T, bucket, key string) {

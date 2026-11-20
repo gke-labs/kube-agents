@@ -30,6 +30,8 @@ func (f *fakeHomeReporter) homeChannel() string {
 	return f.home
 }
 
+func (f *fakeHomeReporter) Backend() string { return lib.NotifyPlatformSlack }
+
 func (f *fakeHomeReporter) postHomeReport(_ context.Context, home, thread, text string) (homePost, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
