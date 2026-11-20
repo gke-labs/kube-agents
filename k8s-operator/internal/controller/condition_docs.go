@@ -42,6 +42,7 @@ var degradedConditionReasons = []string{
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
 	conditionReasonInvalidCredentialProxyExec,
+	conditionReasonInvalidKanbanAdmission,
 	reasonRBACIncomplete,
 }
 
@@ -141,7 +142,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    a2aBusMigratingConditionType,
 		Written: "While a bus migration runs (True), and after one ended without converting the bus (False, `Abandoned`) or stopped for a person (False, `Failed`); absent once one converted the bus, or when none has run",
-		Meaning: "`status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. `True`, `LegUnknown`: the run's leg is one this operator does not run, a later release's found after a rollback; it is held where it is, with the freeze, until that release is back or a person abandons it ([a run this operator does not run](#a-run-this-operator-does-not-run)). An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases.",
+		Meaning: "`status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. A reshape (leg `Reshape`, [recreating TASKS wider](#recreating-tasks-wider)) reads the same way, its message naming TASKS rather than a server count. `True`, `LegUnknown`: the run's leg is one this operator does not run, a later release's found after a rollback; it is held where it is, with the freeze, until that release is back or a person abandons it ([a run this operator does not run](#a-run-this-operator-does-not-run)). An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases.",
 	},
 	{
 		Type:    noChatPlatformConditionType,

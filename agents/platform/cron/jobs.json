@@ -295,6 +295,22 @@
       "deliver": "chat"
     },
     {
+      "id": "post-merge-check",
+      "name": "Post-Merge Check",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/5 * * * *",
+        "display": "*/5 * * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "post_merge_check.py",
+      "risk": "high",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "upgrade-readiness-watch",
       "name": "Upgrade Readiness Watch",
       "schedule": {

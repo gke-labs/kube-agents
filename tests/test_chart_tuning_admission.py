@@ -127,6 +127,28 @@ class AdmissionBlockRenderTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("memoryBudgetMib", proc.stderr)
 
+    def test_budget_below_cap_fails_render_regardless_of_fail_closed(self):
+        cases = (
+            ("explicit budget below default 1536MiB cap", {"memoryBudgetMiB": 512}),
+            ("explicit budget below custom cap", {"memoryBudgetMiB": 1024, "workerRssCapMiB": 2048}),
+            ("sub-cap budget with failClosed=false", {"memoryBudgetMiB": 1024, "failClosed": False}),
+            ("custom cap above default 4096MiB budget", {"workerRssCapMiB": 5000}),
+        )
+        for label, block in cases:
+            with self.subTest(label=label):
+                proc = self._render("-f", self._values_file({"admission": block}))
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertIn("exceeds the pod's admission budget", proc.stderr)
+                self.assertNotIn("failClosed: false", proc.stderr)
+
+    def test_equal_budget_or_matching_cap_renders(self):
+        with self.subTest(case="budget equals default cap"):
+            tuning = self._tuning_of(self._render("-f", self._values_file({"admission": {"memoryBudgetMiB": 1536}})))
+            self.assertEqual(tuning, {"admission": {"memoryBudgetMiB": 1536}})
+        with self.subTest(case="budget and cap both lowered to 1024"):
+            tuning = self._tuning_of(self._render("-f", self._values_file({"admission": {"memoryBudgetMiB": 1024, "workerRssCapMiB": 1024, "failClosed": False}})))
+            self.assertEqual(tuning, {"admission": {"memoryBudgetMiB": 1024, "workerRssCapMiB": 1024, "failClosed": False}})
+
 
 if __name__ == "__main__":
     unittest.main()
