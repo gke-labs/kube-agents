@@ -3084,7 +3084,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "e659f58d74177b7a",
+      "version": "9841d88bd24b3a94",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3113,6 +3113,8 @@ data:
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
               "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+              "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -3125,6 +3127,8 @@ data:
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+              "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
               "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
@@ -3206,11 +3210,14 @@ data:
               "$KV.session-state.>",
               "$KV.feedback.>",
               "$KV.people.>",
+              "$KV.SCHEDULED_REPORTS.>",
+              "$KV.SCHEDULE_THREADS.>",
               "chat.console.*.out",
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
               "chat.board",
               "a2a.trigger.reply.>",
+              "chat.incident",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.CONSUMER.CREATE.TASKS.>",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3228,6 +3235,10 @@ data:
               "$JS.API.DIRECT.GET.KV_people.>",
               "$JS.API.CONSUMER.CREATE.KV_people.>",
               "$JS.API.CONSUMER.DELETE.KV_people.*",
+              "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+              "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
+              "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+              "$JS.API.DIRECT.GET.KV_SCHEDULE_THREADS.>",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
               "$JS.ACK.TASKS.>",
@@ -3251,6 +3262,7 @@ data:
               "chat.board.reply.gateway.>",
               "a2a.trigger.*.submit",
               "a2a.trigger.*.status",
+              "chat.incident.reply.gateway.>",
               "_INBOX.gateway.>"
             ],
             "denyPublish": [
@@ -3304,7 +3316,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: e659f58d74177b7a
+    kubeagents.x-k8s.io/a2a-authmap-version: 9841d88bd24b3a94
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3868,6 +3880,7 @@ stringData:
           { stream: "a2a.cap.reply.>", accounts: [ APP ] }
           { stream: "chat.notify.reply.agent.>", accounts: [ APP ] }
           { stream: "chat.board", accounts: [ APP ] }
+          { stream: "chat.incident", accounts: [ APP ] }
           { stream: "_INBOX.bridge.>", accounts: [ APP ] }
           { stream: "_INBOX.web.>", accounts: [ APP ] }
           { stream: "chat.console.*.out", accounts: [ CONSOLE ] }
@@ -3884,6 +3897,7 @@ stringData:
           { stream: { account: APP, subject: "chat.notify.slack" } }
           { stream: { account: APP, subject: "chat.notify.console" } }
           { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+          { stream: { account: APP, subject: "chat.incident.reply.gateway.>" } }
         ]
         users [
           # task requester, chat-session supervisor, session-registry owner.
@@ -3897,7 +3911,9 @@ stringData:
           # (#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on
           # TASKS, and INFO, DIRECT.GET and consumer create/delete on
           # KV_session-state, its own registry, on KV_feedback, the kept
-          # answer ratings, and on KV_people, one hashed key per chat person.
+          # answer ratings, and on KV_people, one hashed key per chat person;
+          # INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs,
+          # and on KV_SCHEDULE_THREADS, a schedule's thread for the day.
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
@@ -3917,11 +3933,14 @@ stringData:
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
+                  "$KV.SCHEDULED_REPORTS.>",
+                  "$KV.SCHEDULE_THREADS.>",
                   "chat.console.*.out",
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
                   "chat.board",
                   "a2a.trigger.reply.>",
+                  "chat.incident",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
                   "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3939,6 +3958,10 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULED_REPORTS.>",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
+                  "$JS.API.DIRECT.GET.KV_SCHEDULE_THREADS.>",
                   "$JS.API.STREAM.INFO.DIRECTORY",
                   "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
@@ -3978,6 +4001,7 @@ stringData:
                   "chat.board.reply.gateway.>",
                   "a2a.trigger.*.submit",
                   "a2a.trigger.*.status",
+                  "chat.incident.reply.gateway.>",
                   "_INBOX.gateway.>"
                 ]
                 deny = [
@@ -4037,6 +4061,10 @@ stringData:
                   "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
                   "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
                   "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+                  "$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
+                  "$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
                   "_INBOX.seed.>"
                 ]
               }
@@ -4199,6 +4227,7 @@ stringData:
           { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
           { stream: "chat.notify.console", accounts: [ TRUSTED ] }
           { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+          { stream: "chat.incident.reply.gateway.>", accounts: [ TRUSTED ] }
         ]
         imports [
           { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
@@ -4225,6 +4254,7 @@ stringData:
           { stream: { account: TRUSTED, subject: "a2a.cap.reply.>" } }
           { stream: { account: TRUSTED, subject: "chat.notify.reply.agent.>" } }
           { stream: { account: TRUSTED, subject: "chat.board" } }
+          { stream: { account: TRUSTED, subject: "chat.incident" } }
           { stream: { account: TRUSTED, subject: "_INBOX.bridge.>" } }
           { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
         ]
@@ -4258,7 +4288,8 @@ stringData:
                   "$JS.FC.>",
                   "_INBOX.bridge.>",
                   "a2a.cap.verify.platform",
-                  "chat.board.reply.gateway.>"
+                  "chat.board.reply.gateway.>",
+                  "chat.incident.reply.gateway.>"
                 ]
                 deny = [
                   "$JS.API.*.*.KV_cap",
@@ -4281,6 +4312,7 @@ stringData:
                   "$KV.runtime-state.>",
                   "a2a.cap.reply.platform.>",
                   "chat.board",
+                  "chat.incident",
                   "_INBOX.bridge.>"
                 ]
                 deny = [

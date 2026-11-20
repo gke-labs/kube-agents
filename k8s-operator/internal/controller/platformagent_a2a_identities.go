@@ -277,6 +277,16 @@ const (
 	a2aBoardSubject       = "chat.board"
 	a2aBoardReplySubjects = "chat.board.reply.gateway.>"
 
+	// The incident route (a2a/gateway/report_incident.go,
+	// a2a/hermes-bridge/report_incident.go, a2a/lib/incident.go): a posted
+	// scheduled report, kept by the bridge in the agent pod's incident
+	// store against the thread it landed in. The board route's shape: the
+	// gateway publishes the first and reads the second, the bridge reads
+	// the first and publishes the second, and no other principal holds
+	// either, so no credential reaches session-kv but the bridge's.
+	a2aIncidentSubject       = "chat.incident"
+	a2aIncidentReplySubjects = "chat.incident.reply.gateway.>"
+
 	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
 	// callout — see bridgeIdentity for why a token cannot separate it from
 	// the container above.
@@ -615,6 +625,12 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// One hashed key per chat person (a2a/gateway/people.go), the
 		// bucket's data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
 		"$KV.people.>",
+		// A schedule trigger's finished runs (a2a/gateway/scheduled_reports.go),
+		// the bucket's data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
+		"$KV.SCHEDULED_REPORTS.>",
+		// Each schedule's thread for a UTC day (a2a/gateway/schedule_threads.go),
+		// the bucket's data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
+		"$KV.SCHEDULE_THREADS.>",
 		// The console adapter's notices (spec-chatops-gateway.md, "The
 		// console adapter"): core NATS, one subject per conversation.
 		"chat.console.*.out",
@@ -652,6 +668,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// The gateway answers only on the asking source's own prefix
 		// (lib.ValidTriggerReplySubject).
 		a2aTriggerReplySubjects,
+		// A posted scheduled report to keep against its thread
+		// (a2aIncidentSubject), answered by the bridge on
+		// a2aIncidentReplySubjects. The bridge stores it only in a channel
+		// this install's chat backend serves.
+		a2aIncidentSubject,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	// The profile cards' start-up read (a2a/gateway/profiledir.go): the
@@ -682,7 +703,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"(#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on\n" +
 			"TASKS, and INFO, DIRECT.GET and consumer create/delete on\n" +
 			"KV_session-state, its own registry, on KV_feedback, the kept\n" +
-			"answer ratings, and on KV_people, one hashed key per chat person.\n" +
+			"answer ratings, and on KV_people, one hashed key per chat person;\n" +
+			"INFO and DIRECT.GET on KV_SCHEDULED_REPORTS, a schedule's runs,\n" +
+			"and on KV_SCHEDULE_THREADS, a schedule's thread for the day.\n" +
 			"So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
@@ -733,6 +756,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			// its ServiceAccount, so the subject token names the caller.
 			a2aTriggerSubmitWildcard,
 			a2aTriggerStatusWildcard,
+			// The bridge's answer to an incident write.
+			a2aIncidentReplySubjects,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -795,8 +820,8 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// a2aJetStreamSurfaceRationale above: $JS.API.> would let this
 		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
-		// stream on the bus. It provisions - it creates the five streams
-		// and six buckets, idempotently, with an info-then-add - so it
+		// stream on the bus. It provisions - it creates the six streams
+		// and eight buckets, idempotently, with an info-then-add - so it
 		// needs CREATE and INFO on exactly those and nothing else. A KV
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
@@ -835,6 +860,8 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
 			"$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+			"$JS.API.STREAM.CREATE.KV_SCHEDULED_REPORTS",
+			"$JS.API.STREAM.CREATE.KV_SCHEDULE_THREADS",
 			"$JS.API.STREAM.INFO.TASKS",
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -847,6 +874,8 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
 			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
+			"$JS.API.STREAM.INFO.KV_SCHEDULED_REPORTS",
+			"$JS.API.STREAM.INFO.KV_SCHEDULE_THREADS",
 			// The two TASKS durables it makes (#4173), as natscli 0.1.5's
 			// consumer add asks for them: INFO, then CREATE with the filter
 			// token for one filter and without it for two. CREATE is
@@ -1151,6 +1180,11 @@ func bridgeIdentity() a2aIdentity {
 	// it forged would show on the Home tab to the members the gateway admits,
 	// and an outcome it forged on a tapped row; it cannot ask for a tap.
 	publish = append(publish, a2aBoardReplySubjects)
+	// The answer to the gateway's incident write (a2aIncidentSubject):
+	// whether session-kv's POST /v1/incidents kept the report. The same
+	// pod boundary as the board's answer: a forged answer misleads only
+	// the gateway's log line.
+	publish = append(publish, a2aIncidentReplySubjects)
 
 	return a2aIdentity{
 		user:     a2aBridgeUser,
@@ -1173,6 +1207,8 @@ func bridgeIdentity() a2aIdentity {
 			"a2a.cap.reply." + a2aBridgeAddressee + ".>",
 			// The gateway's board request.
 			a2aBoardSubject,
+			// The gateway's incident write.
+			a2aIncidentSubject,
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was

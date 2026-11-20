@@ -754,3 +754,40 @@ func TestADeclaredBridgeBindsThePreCreatedIntake(t *testing.T) {
 		t.Errorf("a sidecar that isn't the bridge got %s=%q", a2aBridgeDurablePrecreatedEnvVar, v)
 	}
 }
+
+// TestTheBridgeIsToldTheChannelsAnIncidentMayName: the rendered bridge names
+// the CR's Slack and Google Chat home channels and the projected learned
+// Slack home's file, which an incident write must name before the bridge
+// stores it (a2a/hermes-bridge/report_incident.go); with no chat armed it
+// names none, and an inherited copy of any of them is dropped.
+func TestTheBridgeIsToldTheChannelsAnIncidentMayName(t *testing.T) {
+	envOf := func(env []corev1.EnvVar) map[string]string {
+		out := map[string]string{}
+		for _, e := range env {
+			out[e.Name] = e.Value
+		}
+		return out
+	}
+	got := envOf(a2aBridgeIncidentEnv(chatAgent()))
+	want := map[string]string{
+		a2aBridgeIncidentSlackHomeEnvVar: "C0SEEDED",
+		a2aBridgeIncidentSlackFileEnvVar: agentChatHomeDir + "/" + homeChannelProjectionKey,
+		a2aBridgeIncidentGchatHomeEnvVar: "spaces/SEEDED",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("incident env = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+	if env := a2aBridgeIncidentEnv(a2aTestAgent()); len(env) != 0 {
+		t.Errorf("an install with no chat names %v", env)
+	}
+	for _, name := range []string{a2aBridgeIncidentSlackHomeEnvVar, a2aBridgeIncidentGchatHomeEnvVar, a2aBridgeIncidentSlackFileEnvVar} {
+		if !a2aBridgeDroppedAgentEnv[name] {
+			t.Errorf("%s inherited from the agent container would reach the bridge", name)
+		}
+	}
+}
