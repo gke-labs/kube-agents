@@ -5601,7 +5601,8 @@ def _ensure_session_row(session_id: str, profile: str, job_id: str, title: str =
 
 
 def _store_incident_report(chat_id: str, thread_id: str, report: str) -> None:
-    """Persist the delivered text so a reply in this thread carries it back.
+    """Persist the delivered text so a reply in this thread carries it back
+    (for the findings nudge, the text and the finding ids it does not print).
 
     This is the half of the mechanism that makes the Chat Agent context-aware
     about something it did not investigate. `incident_context`

@@ -515,8 +515,8 @@ def select_items(
     `FIRST_REPORT_ROWS_MAX`, and nothing else.
     Provider-managed observations (`fq.rolled_up`) are never items and count
     once per line (`fq.item_key`) among the others; a line that also has an
-    ordinary row is already counted as that item. The nudge's open count
-    still counts such a line twice, once as the item and once as managed.
+    ordinary row is already counted as that item. The count the nudge shows
+    leaves provider-managed lines out, so it counts such a line once too.
     Ids in `exclude` are rows the user dismissed, which are neither listed nor
     counted.
     """

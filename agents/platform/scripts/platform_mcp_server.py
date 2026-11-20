@@ -1347,11 +1347,11 @@ def update_finding(
     `item_rows_decided`. So one call per item the user decided is enough.
     Covering the rest of the item is the decision's design, not a side effect
     to confirm: the nudge names one line per item and counts beside it the
-    other objects a decision on it covers. Its message prints no id: the
-    item's id is in the context stored for the nudge's thread, under
-    "[Queued item metadata for thread replies]", in the order the lines are
-    shown. So apply the decision the user gave, and say in the reply which
-    other findings it covered. A 'queued' finding of the item, which no message has named yet,
+    other objects a decision on it covers. Its message prints no id (the
+    id is kept with the nudge's thread, and `get_findings` lists a
+    cluster's findings with their ids). So apply the decision the user gave, and say in
+    the reply which other findings it covered. A 'queued' finding of the
+    item, which no message has named yet,
     keeps its state, and its id comes back in `item_rows_left_open`: say in
     the reply that it is still open. A finding that no longer reproduces is
     not set here: that is a verification outcome.
