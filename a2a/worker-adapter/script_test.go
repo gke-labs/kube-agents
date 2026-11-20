@@ -1,6 +1,7 @@
 package workeradapter
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"os"
@@ -527,5 +528,44 @@ func TestACappedOutputIsCutOnACharacterBoundary(t *testing.T) {
 	}
 	if want := "abcd" + scriptTruncated; got != want {
 		t.Errorf("text = %q, want %q", got, want)
+	}
+}
+
+// Only an incomplete character at the cut is trimmed, by at most three bytes, whatever its width
+// and wherever the cut falls inside it.
+func TestACappedOutputTrimsAtMostThreeBytesAtTheCut(t *testing.T) {
+	for _, r := range []string{"\u00e9", "\u20ac", "\U0001F600"} { // two, three and four bytes
+		for split := 1; split < len(r); split++ {
+			prefix := strings.Repeat("a", 10)
+			b := &cappedBuffer{max: len(prefix) + split}
+			_, _ = b.Write([]byte(prefix + r + "tail"))
+			got := strings.TrimSuffix(b.text(), scriptTruncated)
+			if got != prefix {
+				t.Errorf("%q cut after %d of its %d bytes: kept %q, want %q", r, split, len(r), got, prefix)
+			}
+			if trimmed := b.max - len(got); trimmed > utf8.UTFMax-1 {
+				t.Errorf("%q cut after %d bytes: trimmed %d bytes, more than %d", r, split, trimmed, utf8.UTFMax-1)
+			}
+		}
+		// A whole character at the cut is kept.
+		b := &cappedBuffer{max: len(r)}
+		_, _ = b.Write([]byte(r + "tail"))
+		if got := b.text(); got != r+scriptTruncated {
+			t.Errorf("%q whole at the cut: text %q, want it kept", r, got)
+		}
+	}
+}
+
+// An invalid byte early in a capped output doesn't cost the output after it: the result keeps
+// the full cap.
+func TestAnInvalidByteEarlyInACappedOutputKeepsTheRest(t *testing.T) {
+	b := &cappedBuffer{max: scriptStdoutCap}
+	_, _ = b.Write(append([]byte("ok\xff"), bytes.Repeat([]byte("a"), 2*scriptStdoutCap)...))
+	got := b.text()
+	if want := scriptStdoutCap + len(scriptTruncated); len(got) != want {
+		t.Errorf("text of %d bytes, want %d (the cap and the marker)", len(got), want)
+	}
+	if !strings.HasPrefix(got, "ok\xffaaa") {
+		t.Errorf("text starts %q, want the script's bytes as written", got[:8])
 	}
 }

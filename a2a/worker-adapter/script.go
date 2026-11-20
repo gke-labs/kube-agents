@@ -245,11 +245,16 @@ func (b *cappedBuffer) text() string {
 	defer b.mu.Unlock()
 	if b.over {
 		// The cap is a byte count, so it can fall inside a multi-byte character; drop that character's
-		// leading bytes rather than publish invalid UTF-8 before the marker.
+		// leading bytes (at most UTFMax-1) rather than cut it before the marker. Only the cut point is
+		// trimmed: an invalid byte earlier is the script's and stays, so no output past it is lost.
 		kept := b.buf.Bytes()
-		for len(kept) > 0 && !utf8.Valid(kept) {
-			_, size := utf8.DecodeLastRune(kept)
-			kept = kept[:len(kept)-size]
+		for i := len(kept) - 1; i >= 0 && i >= len(kept)-(utf8.UTFMax-1); i-- {
+			if utf8.RuneStart(kept[i]) {
+				if !utf8.FullRune(kept[i:]) {
+					kept = kept[:i]
+				}
+				break
+			}
 		}
 		return string(kept) + scriptTruncated
 	}
