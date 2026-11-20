@@ -2574,7 +2574,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 f"and the node pools those options need were not read: {pools_failure}"
             )
             limitations.append(
-                f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {_and_list(manual_fallback_unread)}: "
+                f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {OPTION_LIST_SEPARATOR.join(manual_fallback_unread)}: "
                 f"the node pools were not read"
             )
         else:

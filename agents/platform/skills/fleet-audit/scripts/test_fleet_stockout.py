@@ -4620,6 +4620,8 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         two = self.run_with(dump_items=[self.fleet_class(), second], pools_rc=1)
         [reason_for_two] = [e["reason"] for e in two["checks_unevaluated"] if e["check"] == self.SLUG]
         self.assertTrue(reason_for_two.startswith("ComputeClass/general-ccc and ComputeClass/batch-ccc leave automatic node pool creation off and list machine options, "))
+        # The limitation is one line for every check on the cluster, so it lists the classes as the other checks do.
+        self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc, ComputeClass/batch-ccc: the node pools were not read", two["limitations"])
         self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
         self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc: the node pools were not read", entry["limitations"])
         self.assertNotIn("priority", reason.lower())
