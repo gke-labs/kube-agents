@@ -606,7 +606,7 @@ The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired betwe
 
 Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`). See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
 
-What an evaluator gets today: the bot posts to Teams. A direct answer, a proactive alert and a cron report each arrive as an Adaptive Card in the conversation they belong to. A message typed in Teams does not reach the agent on its own. Microsoft delivers it to the endpoint registered for the bot, and no component of the install listens there yet, so a trial needs a forwarder of your own that posts each activity into the broker's queue. The in-cluster receiver that removes that step is the next piece of the Teams work. Until it ships, read `spec.integration.teams` as the outbound half.
+What an evaluator gets today: the bot posts to Teams. A direct answer and a cron report each arrive as an Adaptive Card in the conversation they belong to. A message typed in Teams does not reach the agent on its own. Microsoft delivers it to the endpoint registered for the bot, and no component of the install listens there yet, so a trial needs a forwarder of your own that posts each activity into the broker's queue. The in-cluster receiver that removes that step is the next piece of the Teams work. Until it ships, read `spec.integration.teams` as the outbound half.
 
 ## Proactive alerts (both channels)
 
