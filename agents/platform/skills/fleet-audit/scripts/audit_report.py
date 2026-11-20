@@ -1335,7 +1335,7 @@ CHECK_PHRASES = {
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
-    "ccc-unbacked-manual-fallback": "{object} compute class has priority rules with no node pool",
+    "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists backup machines that it cannot use",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -3230,7 +3230,7 @@ TRIAGE_REASONS = {
     "service-selector": "rewrites or deletes a Service on a judgement about its backend",
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
     "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
-    "manual-pool-fallback": "adds node pools or turns node pool auto-creation on, and which of the two is the owners' call",
+    "manual-pool-fallback": "creates node pools or turns on automatic node pool creation, and which of the two is the owners' call",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
