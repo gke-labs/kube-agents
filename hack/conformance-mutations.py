@@ -180,6 +180,15 @@ MUTATIONS: list[Mutation] = [
         "the permit, which names no proposal, to keep it off a person's",
     ),
     Mutation(
+        "A3-profile-write-any-tasks",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)\n",
+         "                    refusal, fresh_branch = None, None\n"),
+        "test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work",
+        "let a confirmed task write on any open proposal the install owns, since "
+        "the permit says a change was asked for -- though not which one",
+    ),
+    Mutation(
         "A3-report-credential-any-route",
         "agents/platform/scripts/credential_proxy.py",
         ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
@@ -306,6 +315,46 @@ MUTATIONS: list[Mutation] = [
         "test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod",
         "serve the store from the exec tier too, to spread the load -- an exec "
         "pod has no store token, and its pods' tokens are not the broker's",
+    ),
+    Mutation(
+        "A3-report-writer-shell-for-every-caller",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role == CALLER_ROLE_SHELL:\n        return REPORT_WRITER_SHELL\n",
+         "    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE):\n        return REPORT_WRITER_SHELL\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every permitted write `shell`, since the broker already decided "
+        "the caller may write -- a profile task's run then reads as the shell's, "
+        "and the A2A relay cannot tell which task wrote it",
+    ),
+    Mutation(
+        "A3-report-writer-task-is-the-profile",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        task_id = getattr(task, \"task\", None)\n",
+         "        task_id = getattr(task, \"profile\", None)\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp the profile instead of the task, as the allowlist names profiles "
+        "-- every task of the profile then wrote every run, and the relay cannot "
+        "hold a report to the task that asked for it",
+    ),
+    Mutation(
+        "A3-report-writer-caller-header-kept",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if caller_headers is not None:\n            del caller_headers[REPORT_WRITER_HEADER]\n",
+         "        if caller_headers is not None:\n            pass\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "leave the caller's header in place, since the relay builds its own "
+        "headers -- until a change forwards the request's headers and a caller "
+        "names its own writer",
+    ),
+    Mutation(
+        "A3-report-writer-on-every-write",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            if rule is None and method == \"PUT\" and report_route_kind(path) == REPORT_ROUTE_RUN:\n",
+         "            if rule is None:\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every write, latest and DELETE included -- the listener copies "
+        "latest's writer from the matched run, and a stamp sent there is one it "
+        "must then be trusted to ignore",
     ),
     Mutation(
         "A3-report-no-role-is-shell",
@@ -3177,6 +3226,56 @@ Mutation(
         "derive every executor a grant on profiles' submit subject, the "
         "shortcut a worker delegating straight to a profile would take. A "
         "worker can then start tasks of its own outside the gateway's checks",
+    ),
+    Mutation(
+        "A3-console-mcp-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t\t"chat.console.*.in",\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",',
+         '\t\t\t"chat.console.*.in",\n\t\t\ta2aConsoleConfirmSubject,\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the console MCP server's user the console's confirm door, so "
+        "an IDE agent can confirm the change it just proposed. A model can "
+        "then grant its own task the permit to open a pull request",
+    ),
+    Mutation(
+        "A3-session-derives-all-chat",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\t"chat.>",\n\t\t},'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "derive every executor publish on `chat.>` so a worker can post its "
+        "own progress to a chat surface. It never spells `chat.console`, and "
+        "it reaches the console's confirm door all the same",
+    ),
+    Mutation(
+        "A3-dispatcher-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"chat.console.*.confirm",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the AgentProfile dispatcher the console's confirm door, so it "
+        "can confirm a queued change on the requester's behalf. Its identity "
+        "is built in its own file, outside the identities file the writer "
+        "sets used to read",
+    ),
+    Mutation(
+        "A3-dispatcher-stops-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"a2a.stop.*.*",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the dispatcher publish on stop records, so it can drop a "
+        "queued task itself on a deadline. It can then stop any requester's task",
+    ),
+    Mutation(
+        "A3-bridge-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.console.*.confirm",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the static bridge publish on the console's confirm door, so the "
+        "platform agent can confirm a card's proposed change itself. A task "
+        "can then grant itself the change permit",
     ),
     Mutation(
         "A3-bridge-sends-a-notify",

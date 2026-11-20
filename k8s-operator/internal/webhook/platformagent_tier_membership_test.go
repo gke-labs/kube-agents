@@ -12,7 +12,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// Step 7 is wired: a person mapped to an unattended Tier is refused on
+// Step 9 is wired: a person mapped to an unattended Tier is refused on
 // spec.tiers.membership, and one mapped to read is admitted (#3659).
 func TestTheWebhookChecksTierMembership(t *testing.T) {
 	scheme := runtime.NewScheme()

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,9 +62,13 @@ func (g *fakeScheduleGateway) distinctRuns() int {
 	return len(g.tasks)
 }
 
-type fakeScheduleTracker struct{ state ScheduleTaskState }
+type fakeScheduleTracker struct {
+	state ScheduleTaskState
+	calls int
+}
 
 func (t *fakeScheduleTracker) State(context.Context, *agentv1alpha1.AgentSchedule, string) (ScheduleTaskState, error) {
+	t.calls++
 	return t.state, nil
 }
 
@@ -104,6 +109,12 @@ func newScheduleFixtureWith(t *testing.T, mutate func(*agentv1alpha1.AgentSchedu
 			Name: "compliance-audit", Namespace: "kubeagents-system", Generation: 1,
 			CreationTimestamp: metav1.NewTime(scheduleCreated),
 			Labels:            map[string]string{agentv1alpha1.AgentScheduleOriginLabel: agentv1alpha1.AgentScheduleOriginBuiltin},
+			// Built-in by default: the install's PlatformAgent controls it.
+			// User schedules don't fire yet (UserSchedulesDeferred).
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
+				Name: "platform-agent", UID: "agent-uid", Controller: ptr.To(true),
+			}},
 		},
 		Spec: agentv1alpha1.AgentScheduleSpec{
 			Schedule:                "0 * * * *",
@@ -383,6 +394,75 @@ func TestAgentScheduleARateLimitedSlotIsCountedNotRetried(t *testing.T) {
 	}
 }
 
+// A run that ends with no final delivery yet is asked about once on the pass
+// that settles it, not a second time for its delivery on the same pass: that
+// answer was just read. The next pass asks for the delivery.
+func TestAgentScheduleASettlingRunIsAskedAboutOncePerPass(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded, CompletedAt: hourAt(1, 5)}
+	f.tracker.calls = 0
+	f.at(t, hourAt(1, 6))
+	if s := f.get(t); s.Status.ActiveTaskID != "" || f.tracker.calls != 1 {
+		t.Fatalf("settling pass: active = %q, tracker calls = %d, want 1", s.Status.ActiveTaskID, f.tracker.calls)
+	}
+	f.at(t, hourAt(1, 7))
+	if f.tracker.calls != 2 {
+		t.Fatalf("the next pass: tracker calls = %d, want 2 (its delivery)", f.tracker.calls)
+	}
+}
+
+// A refusal of the submission itself (here tier_not_allowed) drops the slot
+// at once, without retrying it inside the starting deadline or counting it as
+// an outage, and says so on the Submitted condition. The next slot tries
+// again, and a run the gateway takes sets the condition back to True.
+func TestAgentScheduleARefusedSubmissionIsShownNotRetried(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.gw.err = fmt.Errorf("%w (tier_not_allowed): the profile does not allow unattended", errTriggerRefused)
+	f.at(t, hourAt(0, 45))
+	res := f.at(t, hourAt(1, 0))
+	s := f.get(t)
+	if len(f.gw.sends) != 1 || s.Status.PendingSlot != nil || res.RequeueAfter == agentScheduleRetry {
+		t.Fatalf("sends = %v, status = %+v, requeue = %s", f.gw.sends, s.Status, res.RequeueAfter)
+	}
+	if s.Status.SkipCounts.GatewayUnavailable != 0 || !s.Status.NextScheduleTime.UTC().Equal(hourAt(2, 0)) {
+		t.Fatalf("a refusal was counted as an outage or held the slot: %+v", s.Status)
+	}
+	c := meta.FindStatusCondition(s.Status.Conditions, agentv1alpha1.AgentScheduleConditionSubmitted)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonGatewayRefused || !strings.Contains(c.Message, "tier_not_allowed") {
+		t.Fatalf("Submitted = %+v", c)
+	}
+	f.at(t, hourAt(1, 10))
+	if len(f.gw.sends) != 1 {
+		t.Fatalf("the refused slot was sent again: %v", f.gw.sends)
+	}
+	f.gw.err = nil
+	f.at(t, hourAt(2, 0))
+	s = f.get(t)
+	c = meta.FindStatusCondition(s.Status.Conditions, agentv1alpha1.AgentScheduleConditionSubmitted)
+	if len(f.gw.sends) != 2 || s.Status.ActiveTaskID == "" || c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("the next slot: sends = %v, status = %+v", f.gw.sends, s.Status)
+	}
+}
+
+// A name the run's trigger can't carry (a dot, or past 63 characters) reads
+// Accepted=False and fires nothing, rather than being refused at every slot.
+func TestAgentScheduleANameTheTriggerCantCarryIsNotAccepted(t *testing.T) {
+	for _, name := range []string{"team.a.nightly", strings.Repeat("a", 64)} {
+		f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Name = name })
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		if len(f.gw.sends) != 0 {
+			t.Fatalf("%s: submitted %v", name, f.gw.sends)
+		}
+		c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonInvalidName {
+			t.Fatalf("%s: Accepted = %+v", name, c)
+		}
+	}
+}
+
 // Nothing fires for a schedule that doesn't parse, or whose profile is
 // missing or doesn't allow the unattended tier.
 func TestAgentScheduleNotAcceptedFiresNothing(t *testing.T) {
@@ -426,17 +506,19 @@ func TestAgentScheduleWithNoPlatformAgentFiresNothing(t *testing.T) {
 // and its origin label reads builtin: a broker kept to origin: user by the
 // admission policy can add the controller reference but not the label, and a
 // hand-written schedule can set the label but has no controller reference.
+// Anything else is a user schedule, and user schedules are deferred to Track 7
+// (#5624, decided B on #5635): it reads Accepted=False and never submits.
 func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		controlled bool
 		label      string
-		want       string
+		builtin    bool
 	}{
-		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, agentv1alpha1.AgentScheduleOriginUser},
-		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, agentv1alpha1.AgentScheduleOriginUser},
-		{"controlled, unlabelled", true, "", agentv1alpha1.AgentScheduleOriginUser},
-		{"controlled by the install, labelled builtin", true, agentv1alpha1.AgentScheduleOriginBuiltin, agentv1alpha1.AgentScheduleOriginBuiltin},
+		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, false},
+		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, false},
+		{"controlled, unlabelled", true, "", false},
+		{"controlled by the install, labelled builtin", true, agentv1alpha1.AgentScheduleOriginBuiltin, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
@@ -445,17 +527,25 @@ func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 				} else {
 					s.Labels[agentv1alpha1.AgentScheduleOriginLabel] = tc.label
 				}
-				if tc.controlled {
-					s.OwnerReferences = []metav1.OwnerReference{{
-						APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
-						Name: "platform-agent", UID: "agent-uid", Controller: ptr.To(true),
-					}}
+				if !tc.controlled {
+					s.OwnerReferences = nil
 				}
 			})
 			f.at(t, hourAt(0, 45))
 			f.at(t, hourAt(1, 0))
-			if len(f.gw.origins) != 1 || f.gw.origins[0] != tc.want {
-				t.Fatalf("origins = %v, want [%s]", f.gw.origins, tc.want)
+			if tc.builtin {
+				if len(f.gw.origins) != 1 || f.gw.origins[0] != agentv1alpha1.AgentScheduleOriginBuiltin {
+					t.Fatalf("origins = %v, want [builtin]", f.gw.origins)
+				}
+				return
+			}
+			if len(f.gw.origins) != 0 {
+				t.Fatalf("submitted %v; a user schedule must not fire yet", f.gw.origins)
+			}
+			got := f.get(t)
+			cond := meta.FindStatusCondition(got.Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != agentScheduleReasonUserDeferred {
+				t.Fatalf("Accepted = %+v, want False/%s", cond, agentScheduleReasonUserDeferred)
 			}
 		})
 	}
@@ -692,4 +782,70 @@ func TestAgentScheduleAnUnchangedPassWritesNoStatus(t *testing.T) {
 	if after := f.get(t).ResourceVersion; after != before {
 		t.Fatalf("an idle pass wrote status: resourceVersion %s -> %s", before, after)
 	}
+}
+
+// How a run's report was delivered (Track 3): a final value on the terminal
+// is recorded at once; posting is asked after on later passes, inside the
+// window, without holding the next slot; post_failed is counted once; an
+// unknown spelling and anything past the window leave the run as it was.
+func TestAgentScheduleRecordsHowARunsReportWasDelivered(t *testing.T) {
+	ended := func(delivery string) ScheduleTaskState {
+		return ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded, CompletedAt: hourAt(1, 20), Delivery: delivery}
+	}
+	t.Run("final on the terminal", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPosted)
+		f.at(t, hourAt(1, 21))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != agentv1alpha1.AgentScheduleReportPosted || s.Status.PostFailed != 0 {
+			t.Fatalf("status = %+v", s.Status)
+		}
+	})
+	t.Run("posting, then post_failed", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPosting)
+		res := f.at(t, hourAt(1, 21))
+		s := f.get(t)
+		if s.Status.ActiveTaskID != "" || s.Status.RecentRuns[0].Delivery != "" {
+			t.Fatalf("posting: the run is settled with no delivery yet; status = %+v", s.Status)
+		}
+		if res.RequeueAfter > agentScheduleActivePoll {
+			t.Errorf("requeue %v while a delivery is awaited, want at most %v", res.RequeueAfter, agentScheduleActivePoll)
+		}
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPostFailed)
+		f.at(t, hourAt(1, 23))
+		f.at(t, hourAt(1, 24))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != agentv1alpha1.AgentScheduleReportPostFailed || s.Status.PostFailed != 1 {
+			t.Fatalf("post_failed: want it recorded and counted once; status = %+v", s.Status)
+		}
+	})
+	t.Run("post_unknown counts apart", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPostUnknown)
+		f.at(t, hourAt(1, 21))
+		f.at(t, hourAt(1, 22))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != agentv1alpha1.AgentScheduleReportPostUnknown || s.Status.PostUnknown != 1 || s.Status.PostFailed != 0 {
+			t.Fatalf("status = %+v", s.Status)
+		}
+	})
+	t.Run("unknown, then past the window", func(t *testing.T) {
+		f := newScheduleFixture(t, nil)
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		f.tracker.state = ended("bounced")
+		f.at(t, hourAt(1, 21))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != "" {
+			t.Fatalf("an unknown spelling was recorded: %+v", s.Status.RecentRuns[0])
+		}
+		f.tracker.state = ended(agentv1alpha1.AgentScheduleReportPosted)
+		f.at(t, hourAt(1, 20).Add(agentScheduleDeliveryWindow+time.Minute))
+		if s := f.get(t); s.Status.RecentRuns[0].Delivery != "" {
+			t.Fatalf("a delivery was asked after past the window: %+v", s.Status.RecentRuns[0])
+		}
+	})
 }
