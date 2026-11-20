@@ -1635,7 +1635,7 @@ func proxyContainerSlotCapEnv(pod *corev1.Pod) (string, bool) {
 }
 
 func proxyContainerMatchesTierForCluster(pod *corev1.Pod, deployment *agentv1alpha1.DeploymentSpec, autopilot bool, tier sizingTier, clamped bool) bool {
-	if gotSlots, hasEnv := proxyContainerSlotCapEnv(pod); hasEnv {
+	if gotSlots, hasEnv := proxyContainerSlotCapEnv(pod); hasEnv && (podHasCredentialProxyStandby(pod) || gotSlots != credentialProxyMaxConcurrentCommands) {
 		return gotSlots == credentialProxyTierMaxConcurrentCommands(tier)
 	}
 	wantRes := renderedCredentialProxyResourcesAt(deployment, autopilot, tier)

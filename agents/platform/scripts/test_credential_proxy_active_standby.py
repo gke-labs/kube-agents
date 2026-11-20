@@ -696,6 +696,60 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
         self.assertEqual(BROKER_STATE_ACTIVE, lifecycle.state)
         self.assertEqual(["survived"], activated)
 
+    def test_standby_watchdog_resets_grace_on_probe_error_after_absent_probes(self) -> None:
+        # False probes for less than grace (0.3s < 0.5s), then None (inconclusive probe error),
+        # then False again (< 0.5s): cumulative elapsed exceeds 0.5s, yet None resets
+        # no_peer_since so standby stays standby until a full uninterrupted 0.5s of False passes.
+        schedule: list[tuple[float, bool | None]] = [
+            (0.00, False),
+            (0.30, False),
+            (0.40, None),   # must reset no_peer_since
+            (0.50, False),  # total elapsed >= 0.50s since start, but only 0.00s since reset
+            (0.80, False),  # 0.30s since reset (< 0.50s) -> must NOT activate yet
+        ]
+        idx = [0]
+        now_val = [0.0]
+        activated: list[str] = []
+        done = threading.Event()
+        release_final = threading.Event()
+        self.addCleanup(release_final.set)
+
+        def scripted_probe() -> bool | None:
+            i = idx[0]
+            if i < len(schedule):
+                t, result = schedule[i]
+                now_val[0] = t
+                idx[0] += 1
+                if idx[0] == len(schedule):
+                    done.set()
+                return result
+            release_final.wait(timeout=2.0)
+            now_val[0] = 1.10  # >= 0.50s after 0.50 -> now cleanly activates
+            return False
+
+        lifecycle = BrokerLifecycle(
+            enabled=True,
+            control_file=self.token_path,
+            peer_active_probe=scripted_probe,
+            peer_probe_interval_seconds=0.001,
+            self_activate_grace_seconds=0.50,
+            clock=lambda: now_val[0],
+        )
+        self.addCleanup(lifecycle.stop_watchdog)
+        lifecycle.set_warm(on_activate=lambda: activated.append("after-fresh-grace"))
+
+        self.assertTrue(done.wait(timeout=2.0))
+        time.sleep(0.02)
+        self.assertEqual(BROKER_STATE_STANDBY, lifecycle.state)
+        self.assertEqual([], activated)
+
+        release_final.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and lifecycle.state != BROKER_STATE_ACTIVE:
+            time.sleep(0.01)
+        self.assertEqual(BROKER_STATE_ACTIVE, lifecycle.state)
+        self.assertEqual(["after-fresh-grace"], activated)
+
     def test_activate_refuses_while_shutting_down_and_sigterm_stops_watchdog(self) -> None:
         external_stop = threading.Event()
         activated: list[str] = []

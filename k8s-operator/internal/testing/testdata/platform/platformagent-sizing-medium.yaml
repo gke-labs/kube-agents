@@ -59,8 +59,8 @@ spec:
     # CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS=8) on the proxy Deployment and
     # the agent-api-auth sidecar's 4Gi memory limit on the gateway pod: the
     # shell container has no medium row and keeps the small one, no override is
-    # set, and nothing else in the render moves. The auto profile's latch and
-    # quota gate are not part of a golden render; sizing_profile_test.go covers
+    # set, and nothing else in the render moves. Auto-mode tier management and
+    # quota gates are not part of a golden render; sizing_profile_test.go covers
     # them.
     sizingProfile: medium
   security:

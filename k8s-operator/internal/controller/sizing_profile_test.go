@@ -3026,11 +3026,32 @@ func TestSizingSurgeStepAndRollbackWithEqualizedProxyOverride(t *testing.T) {
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
 			Name:      credentialProxyContainerName,
 			Resources: renderedCredentialProxyResourcesAt(equalOverride(sizingProfileSmall, 25).Spec.Deployment, false, sizingTierSmall),
-			Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMaxConcurrentCommands}},
+			Env: []corev1.EnvVar{
+				{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMaxConcurrentCommands},
+				{Name: credentialProxyStandbyEnv, Value: credentialProxyStandbyEnabledValue},
+			},
 		}}},
 	}
 	if active, ok := brokerActiveTierFromPods([]corev1.Pod{*smallActivePod}, equalOverride(sizingProfileFleet, 25), false, false, sizingTierFleet); !ok || active != sizingTierSmall {
 		t.Fatalf("brokerActiveTierFromPods = (%v, %v), want (small, true)", active, ok)
+	}
+
+	// Pre-standby medium pod (4Gi, 8 slots, no CREDENTIAL_PROXY_STANDBY) must match medium via resources, not small.
+	legacyMedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platformagent-credential-proxy-legacy-med",
+			Namespace: "kubeagents-system",
+			Labels:    credentialProxySelector(sizingAgent(sizingProfileAuto, sizingProfileMedium, nil, nil)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:      credentialProxyContainerName,
+			Resources: renderedCredentialProxyResourcesAt(nil, false, sizingTierMedium),
+			Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMaxConcurrentCommands}},
+		}}},
+	}
+	if active, ok := brokerActiveTierFromPods([]corev1.Pod{*legacyMedPod}, sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil), false, false, sizingTierFleet); !ok || active != sizingTierMedium {
+		t.Fatalf("brokerActiveTierFromPods(legacy 4Gi/8-slot medium) = (%v, %v), want (medium, true)", active, ok)
 	}
 
 	agentRefused := equalOverride(sizingProfileFleet, 25)

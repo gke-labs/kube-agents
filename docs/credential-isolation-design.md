@@ -414,7 +414,7 @@ including:
 - background processes or commands that outlive the request;
 - commands exceeding request, output, or timeout limits;
 - more commands at once than the broker admits: at most
-  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default, 12 on `medium`, 16 on `fleet`), and within that only as many
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (`8` on fixed/default profiles; `8` small, `12` `medium`, `16` `fleet` under `sizingProfile: auto`), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (ten at
   the operator's 2Gi small default, so the slot cap of eight binds); a request waits up to 60 seconds for admission and is then
   refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
@@ -945,7 +945,7 @@ Consequences:
   cut on stderr alone keeps the command's exit code, and the marker says stdout
   is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
-  flight at once (8 on the default `small` tier, 12 on `medium`, and 16 on `fleet` via `spec.deployment.sizingProfile`; the operator sets it, as it sets the output cap, and
+  flight at once (`8` on fixed/default profiles, stepping `8` small, `12` `medium`, and `16` `fleet` under `spec.deployment.sizingProfile: auto`; the operator sets it, as it sets the output cap, and
   reserves the name; the fixed-`2Gi` exec tier stays at 8). A slot is held from admission until the response is on
   the wire, because everything a request costs lives that long: a child
   process plus about six times the output cap of transient copies in the
@@ -960,7 +960,7 @@ Consequences:
   At the operator's
   defaults (a 2Gi limit on `small`, raised from 1Gi when the kanban slot default rose to six) that admits ten
   requests at once, whatever executable fills them; the slot cap of eight is the upper
-  bound on `small` (4Gi `medium` admits 22, held to 12; 8Gi `fleet` admits 45, held to 16). The container's limit moves through the CR,
+  bound on `small` and fixed profiles (`8` slots); under `sizingProfile: auto`, `4Gi` `medium` admits `22` (held to `12`, leaving `1792 MiB` headroom) and `8Gi` `fleet` admits `45` (held to `16`, leaving `5184 MiB` headroom). The container's limit moves through the CR,
   `spec.deployment.credentialProxy.resources`, which merges over the operator's
   defaults per key; raising it raises the budget ceiling. The slot cap still follows
   `spec.deployment.sizingProfile` alone, because an explicit `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` override is reserved by the operator. A limit under which the budget would admit fewer than two

@@ -853,11 +853,36 @@ func TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier(t *testing.T) {
 }
 
 func TestTheExecTierPinsSlotCapAcrossSizingProfiles(t *testing.T) {
-	for _, profile := range []string{sizingProfileSmall, sizingProfileMedium, sizingProfileFleet} {
-		t.Run(profile, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, profile, effectiveTier string
+		wantStatefulSlots            string
+	}{
+		{"small", sizingProfileSmall, "", credentialProxyMaxConcurrentCommands},
+		{"medium", sizingProfileMedium, "", credentialProxyMaxConcurrentCommands},
+		{"fleet", sizingProfileFleet, "", credentialProxyMaxConcurrentCommands},
+		{"auto-medium", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMaxConcurrentCommands},
+		{"auto-fleet", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMaxConcurrentCommands},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			agent := execTierTestAgent(ptr.To(int32(1)))
-			agent.Spec.Deployment.SizingProfile = profile
-			dep := buildCredentialProxyExecTierDeployment(agent, buildCredentialProxyDeployment(agent, brokerTestPolicyHash))
+			agent.Spec.Deployment.SizingProfile = tc.profile
+			agent.Status.EffectiveSizingTier = tc.effectiveTier
+			statefulDep := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+			var gotStateful string
+			for _, c := range statefulDep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				for _, e := range c.Env {
+					if e.Name == credentialProxyMaxConcurrentCommandsEnv {
+						gotStateful = e.Value
+					}
+				}
+			}
+			if gotStateful != tc.wantStatefulSlots {
+				t.Fatalf("stateful %s at %s = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, tc.name, gotStateful, tc.wantStatefulSlots)
+			}
+			dep := buildCredentialProxyExecTierDeployment(agent, statefulDep)
 			for _, c := range dep.Spec.Template.Spec.Containers {
 				if c.Name != credentialProxyContainerName {
 					continue
@@ -869,7 +894,7 @@ func TestTheExecTierPinsSlotCapAcrossSizingProfiles(t *testing.T) {
 					}
 				}
 				if found != credentialProxyMaxConcurrentCommands {
-					t.Fatalf("exec %s at profile %q = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, profile, found, credentialProxyMaxConcurrentCommands)
+					t.Fatalf("exec %s at %s = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, tc.name, found, credentialProxyMaxConcurrentCommands)
 				}
 			}
 		})
