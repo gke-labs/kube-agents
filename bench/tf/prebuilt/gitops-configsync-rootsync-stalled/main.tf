@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/gitops-configsync-rootsync-stalled-oom.
+# The scenario driver for bench/tasks/gitops-configsync-rootsync-stalled.
 #
 # It plants one Config Sync RootSync, `root-sync` in var.namespace, whose
 # status reports Stalled, for one run. Compliance check 2.17
@@ -59,7 +59,7 @@ terraform {
 }
 
 locals {
-  stack       = "gitops-configsync-rootsync-stalled-oom"
+  stack       = "gitops-configsync-rootsync-stalled"
   api_version = "configsync.gke.io/v1beta1"
   crd_script  = "${path.module}/rootsync_crd.sh"
   ci_labels = {

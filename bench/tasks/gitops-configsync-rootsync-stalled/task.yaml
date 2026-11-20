@@ -24,7 +24,9 @@
 # `Deployment` ("InProgress: Available: 0/1"), `Stalled` was not True, and
 # check 2.17 does not read `Reconciling` alone. Not tested: a reconciler that
 # worked and then runs out of memory, and one blocked by an admission webhook.
-# The scenario's name says "oom"; this case validates its stalled half.
+# The scenario this case comes from is named "Stalled or OOMKilled"
+# (gitops-configsync-rootsync-stalled-oom in the scenario list); this case
+# validates its stalled half, and its name says only that.
 #
 # The object is planted for one run. A run stopped between plant and removal
 # leaves it on the host until this stack's next plant clears it, and a
@@ -36,7 +38,7 @@
 # Isolation class: cluster-read-only, GitOps-repo write (every fleet-audit
 # stream's `start` and `finish`), plus the stack's one namespace and one CRD
 # on the host.
-id: gitops-configsync-rootsync-stalled-oom
+id: gitops-configsync-rootsync-stalled
 name: "Config Sync RootSync Reports Stalled (configsync-reconciler-stalled)"
 domain: security
 suite: validated-capabilities
@@ -56,7 +58,7 @@ expected_output: >-
 infrastructure:
   deployer: "tofu"
   provider: "gcp"
-  stack: "prebuilt/gitops-configsync-rootsync-stalled-oom"
+  stack: "prebuilt/gitops-configsync-rootsync-stalled"
   teardown: true
   variables:
     namespace: "config-management-system"

@@ -1,6 +1,6 @@
 """The one-run stalled RootSync: what the stack writes is what check 2.17 reads.
 
-bench/tf/prebuilt/gitops-configsync-rootsync-stalled-oom plants a RootSync on
+bench/tf/prebuilt/gitops-configsync-rootsync-stalled plants a RootSync on
 the host cluster for one run, with its status in the manifest, because no
 operator runs there. These tests pin the stack against the things it has to
 agree with: the compliance audit's own predicate, the status Config Sync
@@ -25,7 +25,7 @@ import unittest
 import yaml
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_CASE = "gitops-configsync-rootsync-stalled-oom"
+_CASE = "gitops-configsync-rootsync-stalled"
 _STACK_DIR = _REPO_ROOT / "bench" / "tf" / "prebuilt" / _CASE
 _MAIN = _STACK_DIR / "main.tf"
 _VARIABLES = _STACK_DIR / "variables.tf"
