@@ -19,6 +19,7 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "dev" / "repeat_under_load.sh"
@@ -142,6 +143,9 @@ SETSID_STAND_IN = (
     "os.setsid()\n"
     "os.execvp(sys.argv[1], sys.argv[1:])\n"
 )
+# Inside the directory that `path_hiding` makes: the name of a folder of stand-ins, before
+# the number of the PATH folder that it stands in for.
+STAND_INS_FOLDER_PREFIX = "stand-ins-for-path-"
 # Builtins that bash 4 added and macOS's /bin/bash 3.2 lacks.
 BASH_4_BUILTINS = ("mapfile", "readarray")
 # A cpu count below the cores the fallback test asks for, so the clamp shows.
@@ -189,42 +193,43 @@ def wait_until(condition, deadline=INTERRUPT_DEADLINE_SECONDS):
     return condition()
 
 
-def path_without(name):
-    """A PATH holding every tool on the current PATH except `name`."""
-    bin_dir = Path(os.environ.get("TMPDIR", "/tmp")) / f"repeat-under-load-path-{os.getpid()}-{name}"
-    if bin_dir.exists():
-        shutil.rmtree(bin_dir)
-    bin_dir.mkdir()
-    for d in os.environ["PATH"].split(os.pathsep):
-        for entry in os.listdir(d) if os.path.isdir(d) else []:
-            link = bin_dir / entry
-            if entry == name or link.is_symlink() or link.exists():
-                continue
-            link.symlink_to(Path(d) / entry)
-    return bin_dir
-
-
 def path_hiding(name):
-    """A directory and a PATH on which `name` is not found. The caller may add a stand-in
-    to the directory and removes it afterwards.
+    """A new directory and a PATH on which `name` is not found. The directory is first on
+    that PATH: the caller may add a stand-in to it, and removes it afterwards.
 
-    Where the machine has no `name` there is nothing to hide: the PATH is the current one
-    behind a new, empty directory, and no tool is linked. Otherwise the PATH is
-    `path_without(name)` alone.
+    Each folder of the current PATH that holds `name` gives way to a folder, inside the new
+    directory, of stand-ins for its other tools. A stand-in is a script of the test's own
+    that runs the tool by its full path. It is not a link to the tool: on a managed machine
+    a link to a protected tool is one that the test cannot remove again, and the folder
+    then stays behind. A folder that does not hold `name` stays on the PATH as it is, so
+    where the machine has no `name` the PATH is the current one behind the new directory.
     """
-    if shutil.which(name) is None:
-        bin_dir = Path(mkdtemp(prefix=f"repeat-under-load-path-{name}-"))
-        return bin_dir, f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
-    bin_dir = path_without(name)
-    return bin_dir, str(bin_dir)
+    bin_dir = Path(mkdtemp(prefix=f"repeat-under-load-path-{name}-"))
+    folders = [str(bin_dir)]
+    try:
+        for number, folder in enumerate(os.environ["PATH"].split(os.pathsep)):
+            # An empty entry of a PATH is the current folder, here that of the test.
+            here = os.path.abspath(folder or os.curdir)
+            if not os.path.lexists(os.path.join(here, name)):
+                folders.append(folder)
+                continue
+            stand_ins = bin_dir / f"{STAND_INS_FOLDER_PREFIX}{number}"
+            stand_ins.mkdir()
+            for entry in os.listdir(here):
+                tool = os.path.join(here, entry)
+                if entry != name and os.path.isfile(tool) and os.access(tool, os.X_OK):
+                    add_stand_in(stand_ins, entry, f'#!/bin/sh\nexec {shlex.quote(tool)} "$@"\n')
+            folders.append(str(stand_ins))
+    except BaseException:
+        # The caller gets no directory to remove, so it must not stay.
+        shutil.rmtree(bin_dir)
+        raise
+    return bin_dir, os.pathsep.join(folders)
 
 
 def add_stand_in(bin_dir, name, script):
-    """Put an executable `script` at `bin_dir/name`, in place of a link to the real tool:
-    the link is removed first, so the write never follows it to the tool itself."""
+    """Put an executable `script` at `bin_dir/name`."""
     stand_in = bin_dir / name
-    if stand_in.is_symlink() or stand_in.exists():
-        stand_in.unlink()
     stand_in.write_text(script)
     stand_in.chmod(0o755)
 
@@ -263,6 +268,99 @@ def pid_alive(pid):
     except PermissionError:
         return True
     return True
+
+
+class PathHidingTest(unittest.TestCase):
+    """`path_hiding`, which the tests below use to take a tool off the PATH."""
+
+    # A tool that prints the name it was started by, its pid and its arguments.
+    NAME_PID_ARGUMENTS = '#!/bin/sh\necho "${0##*/} $$ got: $*"\n'
+
+    def setUp(self):
+        # Two folders of tools on the PATH, each with the tool to hide, as `/usr/bin` and
+        # `/bin` both hold a tool on Linux. The first has a space in its name, one more
+        # tool, a link to that one (as a package manager makes a link for a tool), a file
+        # that is not executable and a sub-folder.
+        tools = TemporaryDirectory(prefix="tools with a space ")
+        more = TemporaryDirectory()
+        for folder in (tools, more):
+            self.addCleanup(folder.cleanup)
+        self.tools, self.more = Path(tools.name), Path(more.name)
+        for folder, name, script in (
+            (self.tools, "hidden-tool", "#!/bin/sh\nexit 0\n"),
+            (self.tools, "other-tool", self.NAME_PID_ARGUMENTS),
+            (self.more, "hidden-tool", "#!/bin/sh\nexit 0\n"),
+            (self.more, "second-tool", self.NAME_PID_ARGUMENTS),
+        ):
+            (folder / name).write_text(script)
+            (folder / name).chmod(0o755)
+        (self.tools / "linked-tool").symlink_to(self.tools / "other-tool")
+        (self.tools / "not-a-tool.txt").write_text("a file that is not executable\n")
+        (self.tools / "a-folder").mkdir()
+        path = mock.patch.dict(os.environ, {"PATH": os.pathsep.join([str(self.tools), str(self.more), os.environ["PATH"]])})
+        path.start()
+        self.addCleanup(path.stop)
+
+    def test_the_tool_is_not_found_and_the_other_tools_of_its_folders_still_run(self):
+        bin_dir, path = path_hiding("hidden-tool")
+        try:
+            # Neither folder gives the tool.
+            self.assertIsNone(shutil.which("hidden-tool", path=path))
+            # Each other tool runs as itself: by its own name (a tool behind a link can read
+            # that name), with the pid that the caller started, and with its arguments whole.
+            for tool in ("other-tool", "linked-tool", "second-tool"):
+                started = subprocess.Popen([tool, "a b", "c"], env=dict(os.environ, PATH=path), stdout=subprocess.PIPE, text=True)
+                printed, _ = started.communicate()
+                self.assertEqual((started.returncode, printed), (0, f"{tool} {started.pid} got: a b c\n"))
+            for not_a_tool in ("not-a-tool.txt", "a-folder"):
+                self.assertIsNone(shutil.which(not_a_tool, path=path), not_a_tool)
+            # A tool of a folder that does not hold the hidden one is found where it is.
+            self.assertEqual(shutil.which("sh", path=path), shutil.which("sh"))
+            # The new directory is first: a stand-in that the caller adds wins over the tool.
+            add_stand_in(bin_dir, "other-tool", "#!/bin/sh\necho stand-in\n")
+            done = subprocess.run(["other-tool"], env=dict(os.environ, PATH=path), capture_output=True, text=True, check=False)
+            self.assertEqual(done.stdout, "stand-in\n")
+        finally:
+            shutil.rmtree(bin_dir)
+
+    def test_the_directory_holds_no_link_so_the_test_can_remove_all_of_it(self):
+        """On a managed machine a link to a protected tool cannot be removed again. A file of
+        the test's own can, whatever tool it runs."""
+        bin_dir, _ = path_hiding("hidden-tool")
+        try:
+            made = sorted(bin_dir.rglob("*"))
+            self.assertEqual([str(path) for path in made if path.is_symlink()], [])
+            self.assertIn("linked-tool", [path.name for path in made])
+        finally:
+            shutil.rmtree(bin_dir)
+        self.assertFalse(bin_dir.exists())
+
+    def test_a_tool_that_the_machine_does_not_have_changes_nothing_on_the_path(self):
+        bin_dir, path = path_hiding("a-tool-that-no-machine-has")
+        try:
+            self.assertEqual(path, f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+            self.assertEqual(list(bin_dir.iterdir()), [])
+        finally:
+            shutil.rmtree(bin_dir)
+
+    def test_a_helper_that_fails_part_way_leaves_no_directory(self):
+        """The caller gets no directory to remove when the helper raises."""
+        made = []
+        real_mkdtemp = mkdtemp
+
+        def recording_mkdtemp(**options):
+            made.append(Path(real_mkdtemp(**options)))
+            # A helper that does leave its directory fails this test; the test removes it then.
+            self.addCleanup(shutil.rmtree, made[-1], ignore_errors=True)
+            return str(made[-1])
+
+        fault = OSError("no space left on device")
+        with mock.patch(f"{__name__}.mkdtemp", recording_mkdtemp), mock.patch(f"{__name__}.add_stand_in", side_effect=fault):
+            with self.assertRaises(OSError) as caught:
+                path_hiding("hidden-tool")
+        self.assertIs(caught.exception, fault)
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made[0].exists())
 
 
 class RepeatUnderLoadTest(unittest.TestCase):
