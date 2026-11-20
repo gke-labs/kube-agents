@@ -769,7 +769,8 @@ turn that arrived as a structured confirm.
 declares, such as the cluster persona's `project`, `location` and `cluster`. The gateway sets them
 from what the client or the parent task asked. They never ride the authority block. The dispatcher
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
-to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
+to the worker as `PROFILE_TASK_<NAME>`, or to a script-run task's script as `KA_PARAM_<NAME>`
+(`spec-profiles-dispatch.md`, #5622), whose name may be at most 32 characters. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
 
 The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
