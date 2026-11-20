@@ -6633,7 +6633,7 @@ class TestBoardHealthCardRelay(unittest.TestCase):
 
 
 class TestFindingsNudgeCardRelay(unittest.TestCase):
-    """The findings-morning-nudge cron relay posts Option C cards and stores hidden thread metadata."""
+    """The findings-morning-nudge cron relay posts its cards and stores hidden thread metadata."""
 
     SLACK_THREAD = "1712345678.000100"
     HOME = "C0123456789"

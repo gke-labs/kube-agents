@@ -1,14 +1,16 @@
 """The findings-nudge card: surfaced issues, collapsible queue breakdown, and hidden thread context.
 
 ``findings_nudge.py`` writes a sidecar card file beside its daily state whenever
-it prints a nudge, and removes the file when a tick prints nothing. The relay
+it prints a nudge, and removes the file when a tick prints nothing (a tick that
+fails before it prints leaves the file, which no later report's text matches). The relay
 (``session_kv_server.relay_cron_report``) loads the card here when its ``text``
 matches the relayed report:
 
 * On a card platform (Slack via the relay as Block Kit, or Slack and Google Chat
   through the A2A gateway as ``kube-agents.chat/v1``), the card replaces the
-  plain-text post with an answer-first headline, clean finding rows, a collapsed
-  cluster breakdown table for the rest of the queue, and action buttons.
+  plain-text post with an answer-first headline, clean finding rows, a cluster
+  breakdown table for the rest of the queue (collapsed on Slack, an open
+  monospace block on Google Chat), and action buttons.
 * On every leg that lands, ``thread_context`` is stored in Session KV's
   ``incidents`` table instead of the bare text, so a reply or button click in
   that thread receives the finding ids and item coverage counts without showing
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -70,6 +73,10 @@ PLATFORM_PROFILE = "platform"
 
 VALID_TONES = frozenset({_chat.TONE_SUCCESS, _chat.TONE_ATTENTION, _chat.TONE_CRITICAL})
 
+ROW_TEXT_KEY = "text"
+ROW_OPTIONAL_KEYS = ("severity", "detail")
+LOG_PREFIX = "findings_nudge_card"
+
 
 def profile_home(env: Mapping[str, str] | None = None) -> Path:
     """Resolve the platform profile directory shared by the cron script and Session KV."""
@@ -105,17 +112,19 @@ def save(path: Path, card: dict | None) -> None:
         tmp = path.with_name(path.name + CARD_TMP_SUFFIX)
         tmp.write_text(json.dumps(card, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(tmp, path)
-    except OSError:
-        pass
+    except OSError as exc:
+        # The text still posts; what is lost is the card and, with it, the ids
+        # the thread's stored context would have carried.
+        sys.stderr.write(f"{LOG_PREFIX}: could not write {path}: {exc}\n")
 
 
 def _row_ok(row: Any) -> bool:
     if not isinstance(row, dict):
         return False
-    text = row.get("text")
+    text = row.get(ROW_TEXT_KEY)
     if not isinstance(text, str) or not text.strip():
         return False
-    for key in ("severity", "detail"):
+    for key in ROW_OPTIONAL_KEYS:
         if key in row and not isinstance(row[key], str):
             return False
     return True
@@ -126,8 +135,10 @@ def _fold_ok(fold: Any) -> bool:
         return True
     if not isinstance(fold, dict):
         return False
-    title = fold.get(FOLD_TITLE_KEY, "")
-    if not isinstance(title, str):
+    # A fold the renderer would have to title or clip itself is refused here,
+    # so the report posts as its text, whole.
+    title = fold.get(FOLD_TITLE_KEY)
+    if not isinstance(title, str) or not title.strip() or len(title) > _chat.FOLD_TITLE_MAX:
         return False
     table = fold.get(FOLD_TABLE_KEY)
     if not isinstance(table, dict):
@@ -136,12 +147,14 @@ def _fold_ok(fold: Any) -> bool:
     rows = table.get(TABLE_ROWS_KEY)
     if not isinstance(columns, list) or not (1 <= len(columns) <= FOLD_COLUMNS_MAX):
         return False
-    if not all(isinstance(col, str) and col.strip() for col in columns):
+    if not all(isinstance(col, str) and col.strip() and len(col) <= FOLD_COLUMN_MAX for col in columns):
         return False
     if not isinstance(rows, list) or not (1 <= len(rows) <= FOLD_TABLE_ROWS_MAX):
         return False
     return all(
-        isinstance(row, list) and len(row) == len(columns) and all(isinstance(cell, str) for cell in row)
+        isinstance(row, list)
+        and len(row) == len(columns)
+        and all(isinstance(cell, str) and len(cell) <= FOLD_CELL_MAX for cell in row)
         for row in rows
     )
 
@@ -214,7 +227,9 @@ def _clean_fold(fold: dict | None) -> dict | None:
     ]
     if not rows:
         return None
-    title = _presenter._clip(_chat._line(fold.get(FOLD_TITLE_KEY) or ""), _chat.FOLD_TITLE_MAX) or _chat.FOLD_TITLE_DEFAULT
+    title = _presenter._clip(_chat._line(fold.get(FOLD_TITLE_KEY) or ""), _chat.FOLD_TITLE_MAX)
+    if not title:
+        return None
     return {
         FOLD_TITLE_KEY: title,
         FOLD_TABLE_KEY: {

@@ -134,7 +134,7 @@
         "tone": "critical",
         "rows": [
           {
-            "text": "**kube-system/istiod** on `prod-central` \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)",
+            "text": "**kube-system/istiod** on `prod-central` \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)",
             "severity": "critical",
             "detail": "Allow at least 1 pod disruption or run at least 2 replicas."
           },
@@ -152,7 +152,7 @@
               "Cluster",
               "Critical",
               "Major",
-              "Lower",
+              "Minor",
               "Next queued issue"
             ],
             "rows": [
@@ -176,7 +176,7 @@
         "choices": [
           {
             "text": "Fix first issue",
-            "reply": "Fix first issue: kube-system/istiod on prod-central \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)",
+            "reply": "Fix first issue: kube-system/istiod on prod-central \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)",
             "primary": true
           },
           {

@@ -6,7 +6,8 @@ The cases are ``tests/conformance/chat/`` (``agents/platform/scripts/chat_cases.
 reads them). A case with one input runs through the composer that lays it out
 (``agents/platform/scripts/chat_message.py``, ``slack_ux_incident.chat_triage``, or the
 fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue``,
-``agents/chat/scripts/inventory_presenter.chat`` and ``agents/chat/scripts/inventory_card.chat``).
+``agents/chat/scripts/inventory_presenter.chat`` and ``agents/chat/scripts/inventory_card.chat``,
+or the findings nudge's, ``findings_nudge.build_nudge`` through ``findings_nudge_card.chat_from_card``).
 A case that is a sequence of card events runs through the gateway patches that
 send it, with a stand-in for the chat.notify adapter recording each send:
 ``kanban_progress_lines.deliver`` and ``slack_ux_status`` for the plan (the fold

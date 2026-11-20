@@ -5,6 +5,8 @@ Run: python3 -m unittest agents/platform/scripts/test_findings_nudge_card.py
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -113,6 +115,10 @@ class FindingsNudgeCardTests(unittest.TestCase):
             sample_card(tone="neon"),
             sample_card(fold={"title": "Queue", "table": {"columns": ["Cluster"], "rows": [["a", "b"]]}}),
             sample_card(links=[["only-one-element"]]),
+            # A layout the renderer would have to title or clip itself posts as text, whole.
+            sample_card(fold={"title": "", "table": {"columns": ["Cluster"], "rows": [["a"]]}}),
+            sample_card(fold={"title": "Queue", "table": {"columns": ["Cluster"], "rows": [["a" * 201]]}}),
+            sample_card(fold={"title": "Queue", "table": {"columns": ["C" * 41], "rows": [["a"]]}}),
         ):
             card_mod.save(path, bad)
             self.assertIsNone(card_mod.load(self.profile, bad["text"]))
@@ -151,6 +157,19 @@ class FindingsNudgeCardTests(unittest.TestCase):
         self.assertEqual(table_block["type"], "table")
         # Header row + 2 cluster rows.
         self.assertEqual(len(table_block["rows"]), 3)
+
+    def test_a_fold_with_no_title_is_not_given_one(self):
+        card = sample_card(fold={"title": "", "table": {"columns": ["Cluster"], "rows": [["a"]]}})
+        self.assertNotIn("fold", card_mod.chat_from_card(card)[0])
+        self.assertNotIn("container", [block["type"] for block in card_mod.blocks_from_card(card)[0]])
+
+    def test_a_card_that_cannot_be_written_says_so_on_stderr(self):
+        blocked = self.gateway / "a-file"
+        blocked.write_text("x", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            card_mod.save(blocked / card_mod.CARD_FILE, sample_card())
+        self.assertIn("could not write", err.getvalue())
+        self.assertIn(card_mod.CARD_FILE, err.getvalue())
 
     def test_thread_context_falls_back_when_empty(self):
         card = sample_card(thread_context="")

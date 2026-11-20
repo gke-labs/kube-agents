@@ -16,6 +16,7 @@ import chat_cases
 import findings_nudge as nudge
 import findings_nudge_card as nudge_card
 import findings_queue as fq
+import upgrade_readiness_review as review
 
 UTC = timezone.utc
 
@@ -65,7 +66,7 @@ class ComposeTests(unittest.TestCase):
     def test_a_message_opens_with_plain_answer_headline_and_never_asks_for_the_full_list(self):
         rows = [finding(id="a"), finding(id="b", check_slug="x", severity="minor")]
         message = nudge.compose(plan_for(rows), 2, False, rows=rows)
-        self.assertTrue(message.startswith("1 new critical issue needs attention · 2 open across 1 cluster\n\n"))
+        self.assertTrue(message.startswith("**1 new critical issue needs attention** · 2 open across 1 cluster\n\n"))
         self.assertIn("1 more issue is queued.", message)
         self.assertNotIn("Findings queue", message)
         self.assertNotIn("Ask for the full list", message)
@@ -104,7 +105,10 @@ class ComposeTests(unittest.TestCase):
             for i in range(3, 16)
         ]
         bundle = nudge.build_nudge(plan_for(rows), 1, daily=True, rows=rows)
-        self.assertIn("payments/d0 (+2 more) on prod", bundle.text)
+        # Three reported rows and thirteen a sweep stopped reporting: a decision
+        # reaches all sixteen, and the line says so.
+        self.assertIn("payments/d0 (+15 more) on prod", bundle.text)
+        self.assertIn("**payments/d0** (+15 more) on `prod`", bundle.card["rows"][0]["text"])
         self.assertNotIn("id:", bundle.text)
         self.assertNotIn("unreported", bundle.text)
         self.assertIn("covers=16 unreported=13", bundle.card["thread_context"])
@@ -171,7 +175,7 @@ class ComposeTests(unittest.TestCase):
 
 
 class CardAndChatUxTests(unittest.TestCase):
-    """Issue #6256 regressions, Option C fold.table layout, and chat UX lint checks."""
+    """Issue #6256 regressions, the fold.table layout, and chat UX lint checks."""
 
     def test_issue_6256_upgrade_blockers_render_cleanly_with_zero_plumbing(self):
         pdb = shown(
@@ -263,7 +267,7 @@ class CardAndChatUxTests(unittest.TestCase):
         self.assertEqual(chat["tone"], "critical")
         self.assertEqual(len(chat["rows"]), 2)
         self.assertIn("**kube-system/istiod** on `prod-central`", chat["rows"][0]["text"])
-        self.assertIn("(minAvailable: 1, expects at least 1 pod)", chat["rows"][0]["text"])
+        self.assertIn("(minAvailable: 1, 1 pod expected)", chat["rows"][0]["text"])
         self.assertIn("(1 replica)", chat["rows"][0]["text"])
         self.assertEqual(
             chat["rows"][1]["detail"],
@@ -289,11 +293,11 @@ class CardAndChatUxTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, visible_serialized)
 
-        # Option C collapsible queue breakdown table.
+        # The queue breakdown table.
         self.assertEqual(chat["fold"]["title"], "Queue breakdown (3 more queued)")
         self.assertEqual(
             chat["fold"]["table"]["columns"],
-            ["Cluster", "Critical", "Major", "Lower", "Next queued issue"],
+            ["Cluster", "Critical", "Major", "Minor", "Next queued issue"],
         )
         self.assertEqual(
             chat["fold"]["table"]["rows"],
@@ -341,6 +345,154 @@ class CardAndChatUxTests(unittest.TestCase):
         self.assertEqual(chat["tone"], "attention")
         self.assertNotIn("fold", chat)
         self.assertEqual([c["text"] for c in chat["choices"]], ["Fix issue"])
+
+
+class DetectorWordingTests(unittest.TestCase):
+    """The text the detectors really write, not titles made up for a fixture.
+
+    `upgrade_readiness_review.ENTRY_TITLE_FORMAT` is `<entry>. <title>: <subject> <lead>`,
+    so the subject the row already leads with sits in the middle of a sentence.
+    """
+
+    BUDGET_TITLE = (
+        "1. A PodDisruptionBudget forbids the eviction: default/jayanti-pdb "
+        "(minAvailable: 6 (>= 1 expected pods)) holds the node drain"
+    )
+    ORPHAN_TITLE = "22. A Node object outlives its virtual machine: this cluster blocks the upgrade"
+
+    def issue_rows(self) -> list[dict]:
+        budget = shown(
+            at(5, 12),
+            id="upgrade-drain-blocking-budget.kube-agents-gkedemos.jayanti-cluster.default.jayanti-pdb",
+            check_slug="upgrade-drain-blocking-budget",
+            project="kube-agents-gkedemos",
+            cluster="jayanti-cluster",
+            namespace="default",
+            object="jayanti-pdb",
+            rank_score=150,
+            title=self.BUDGET_TITLE,
+            recommendation={
+                "action": "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget "
+                "default/jayanti-pdb, and run two replicas of Deployment default/jayanti-deployment "
+                "(1 replicas) so the budget can be honoured."
+            },
+        )
+        orphan = shown(
+            at(5, 12),
+            id="upgrade-orphan-node-objects.kube-agents-gkedemos.wolfram-auto-01._.cluster",
+            check_slug="upgrade-orphan-node-objects",
+            project="kube-agents-gkedemos",
+            cluster="wolfram-auto-01",
+            namespace="",
+            object=review.CLUSTER_OBJECT,
+            rank_score=150,
+            title=self.ORPHAN_TITLE,
+            recommendation={"action": "Delete the orphan Node object (kubectl delete node <name>); nothing runs on it."},
+        )
+        return [budget, orphan]
+
+    def test_the_two_findings_of_issue_6256_read_as_sentences(self):
+        rows = self.issue_rows()
+        bundle = nudge.build_nudge(plan_for(rows, added={"critical": 2}), 2, daily=True, rows=rows)
+        chat, _ = nudge_card.chat_from_card(bundle.card)
+        self.assertEqual(
+            [(row["text"], row["detail"]) for row in chat["rows"]],
+            [
+                (
+                    "**default/jayanti-pdb** on `jayanti-cluster` — A PodDisruptionBudget forbids the eviction: "
+                    "holds the node drain (minAvailable: 6, 1 pod expected)",
+                    "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget "
+                    "default/jayanti-pdb, and run two replicas of Deployment default/jayanti-deployment "
+                    "(1 replica) so the budget can be honoured.",
+                ),
+                (
+                    "**wolfram-auto-01** — A Node object outlives its virtual machine: this cluster blocks the upgrade",
+                    "Delete the orphan Node object; nothing runs on it.",
+                ),
+            ],
+        )
+
+    def test_the_cluster_wide_placeholder_and_the_check_prefix_are_the_detectors(self):
+        self.assertIn(review.CLUSTER_OBJECT, nudge.CLUSTER_SCOPE_OBJECTS)
+        self.assertEqual(nudge.UPGRADE_CHECK_PREFIX, review.CHECK_PREFIX)
+
+    def test_a_subject_is_peeled_only_as_a_whole_name(self):
+        row = finding(namespace="", object="web", title="Ingress has no backend: web-frontend and web")
+        message = nudge.compose(plan_for([row]), 1, False)
+        self.assertIn("web on prod — Ingress has no backend: web-frontend and web", message)
+
+    def test_the_pod_count_keeps_its_meaning(self):
+        # The source reads "minAvailable is at or above the pods expected", not a floor on pods.
+        self.assertEqual(
+            nudge.clean_title("x (minAvailable: 6 (>= 1 expected pods)) holds the node drain"),
+            "x (minAvailable: 6, 1 pod expected) holds the node drain",
+        )
+        self.assertEqual(
+            nudge.clean_title("x (minAvailable: 50% (rounds up to 2 of 2 expected pods))"),
+            "x (minAvailable: 50%, rounds up to 2 of 2 expected pods)",
+        )
+
+    def test_a_command_with_dots_in_it_is_removed_whole(self):
+        self.assertEqual(
+            nudge.clean_action(
+                "Upgrade the control plane of prod-usc1 with gcloud container clusters upgrade prod-usc1 "
+                "--master --cluster-version=1.33.5-gke.1080000."
+            ),
+            "Upgrade the control plane of prod-usc1.",
+        )
+        self.assertEqual(
+            nudge.clean_action(
+                "Restrict the control-plane endpoint with gcloud container clusters update prod "
+                "--master-authorized-networks=10.20.0.0/16 --no-enable-google-cloud-access."
+            ),
+            "Restrict the control-plane endpoint.",
+        )
+        self.assertEqual(
+            nudge.clean_action("Upgrade with gcloud container clusters upgrade prod --cluster-version=1.33.5; then verify."),
+            "Upgrade; then verify.",
+        )
+        self.assertEqual(nudge.clean_action("Cordon the node, then run kubectl drain node-1."), "Cordon the node.")
+
+    def test_the_fallback_opens_on_a_bold_headline(self):
+        rows = self.issue_rows()
+        text = nudge.compose(plan_for(rows, added={"critical": 2}), 2, daily=True, rows=rows)
+        self.assertTrue(text.startswith("**2 critical issues will block cluster upgrades** · across 2 clusters\n\n"), text)
+
+    def test_the_queue_line_and_the_table_use_one_set_of_words(self):
+        rows = [
+            finding(id="a"),
+            finding(id="b", check_slug="b"),
+            finding(id="c", check_slug="c"),
+            finding(id="m", check_slug="m", severity="minor", cluster="dev"),
+        ]
+        # Two criticals a day: the third waits, and the minor waits behind it.
+        bundle = nudge.build_nudge(plan_for(rows), 4, False, rows=rows)
+        self.assertEqual(bundle.card["after"], ["2 more issues are queued (1 critical, 1 lower priority)."])
+        self.assertEqual(
+            bundle.card["fold"]["table"]["columns"], ["Cluster", "Critical", "Major", "Minor", "Next queued issue"]
+        )
+        only_critical = rows[:3]
+        bundle = nudge.build_nudge(plan_for(only_critical), 3, False, rows=only_critical)
+        self.assertEqual(bundle.card["after"], ["1 more issue is queued (1 critical)."])
+
+    def test_a_table_cut_short_says_so_in_its_title(self):
+        rows = [finding(id="a")] + [
+            finding(id=f"q{i}", check_slug=f"q{i}", severity="minor", cluster=f"c{i:02d}") for i in range(20)
+        ]
+        bundle = nudge.build_nudge(plan_for(rows), 21, False, rows=rows)
+        fold = bundle.card["fold"]
+        self.assertEqual(len(fold["table"]["rows"]), nudge.MAX_FOLD_CLUSTERS)
+        self.assertEqual(fold["title"], "Queue breakdown (top 15 clusters)")
+        self.assertEqual(bundle.card["after"], ["20 more issues are queued."])
+        self.assertLessEqual(len(fold["title"]), nudge.chat_message.FOLD_TITLE_MAX)
+        chat_cases.check_chat(nudge_card.chat_from_card(bundle.card)[0], "cut table")
+
+    def test_a_long_row_is_cut_at_a_word_in_the_buttons_reply(self):
+        row = finding(title="word " * 120)
+        bundle = nudge.build_nudge(plan_for([row]), 1, False, rows=[row])
+        reply = bundle.card["replies"]["Fix issue"]
+        self.assertLessEqual(len(reply), nudge.chat_message.REPLY_MAX)
+        self.assertTrue(reply.endswith("word…"), reply[-20:])
 
 
 class NudgeHarness(unittest.TestCase):

@@ -61,7 +61,7 @@
                 "type": "text"
               },
               {
-                "text": " — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)",
+                "text": " — PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)",
                 "type": "text"
               },
               {
@@ -159,7 +159,7 @@
                   "type": "raw_text"
                 },
                 {
-                  "text": "Lower",
+                  "text": "Minor",
                   "type": "raw_text"
                 },
                 {
@@ -238,7 +238,7 @@
                   "type": "plain_text"
                 },
                 "type": "button",
-                "value": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)"
+                "value": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)"
               },
               {
                 "action_id": "kage.choice.1",

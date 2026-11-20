@@ -5,9 +5,9 @@ Backs the ``findings-morning-nudge`` cron job, which runs hourly with
 ``no_agent: true`` and ``deliver: "chat"``. Most hours have nothing to say and
 print nothing. When findings are due, this script writes a structured sidecar
 card (:mod:`findings_nudge_card`) carrying the ``kube-agents.chat/v1`` card
-fields, a collapsible cluster breakdown table for the rest of the queue, and
-hidden thread metadata (finding ids and item coverage counts), then prints a
-clean plain-text fallback to stdout.
+fields, a cluster breakdown table for the rest of the queue, and hidden thread
+metadata (finding ids and item coverage counts), then prints a clean plain-text
+fallback to stdout.
 
 No model turn runs here: ordering comes from ``GET /v1/findings/ranked``,
 pacing from ``findings_queue.pace`` (§7.2 of ``docs/designs/inventory-findings-queue.md``),
@@ -22,9 +22,9 @@ and recommendations from the detectors that registered the findings. Each run:
    non-critical the nudge named waits for a decision, nothing is added.
 3. Once a UTC day, on the first run at or after 12:00 UTC, also reminds the
    top pending criticals and names every pending non-critical holding
-   additions back. Hidden thread metadata carries the finding ids and how many
-   objects each item covers so replies in the thread act on the right rows
-   without printing ids in chat.
+   additions back. Each line says how many other objects a decision on it
+   reaches (`findings_queue.patch_finding`); the ids, which chat does not
+   print, go into the thread's stored context for a reply in the thread.
 4. Writes the sidecar card, prints the fallback text, records the day's state
    in the profile home (the daily part sent, the items announced today), then
    marks every named row surfaced as the paced publisher, which is what makes
@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 import chat_message
 import findings_nudge_card as nudge_card
 import findings_queue as fq
+import slack_presenter
 
 JOB_ID = nudge_card.JOB_ID
 
@@ -139,13 +140,20 @@ LOG_PREFIX = "findings_nudge"
 CRITICAL_SEVERITY = fq.SEVERITIES[0]
 MAJOR_SEVERITY = fq.SEVERITIES[1]
 DEFAULT_SEVERITY = MAJOR_SEVERITY
-UPGRADE_CHECK_PREFIXES = ("upgrade-", "urr-")
-UPGRADE_ID_PREFIX = "urr-"
+# What the upgrade readiness review calls its checks and a cluster-wide
+# finding's object (`upgrade_readiness_review.CHECK_PREFIX`, `CLUSTER_OBJECT`);
+# test_findings_nudge.py holds the two in step.
+UPGRADE_CHECK_PREFIX = "upgrade-"
+CLUSTER_SCOPE_OBJECTS = ("Cluster",)
 UNSCOPED_CLUSTER = "fleet"
 
 LEADING_NUMBER_RE = re.compile(r"^\s*(?:\[\d+\]\s*|\d+\.\s+)+")
+# "minAvailable: 6 (>= 1 expected pods)" says the budget is at or above the pods
+# expected, so the plain form keeps both numbers and claims no floor on pods.
 EXPECTED_PODS_RE = re.compile(r"\(>=\s*(\d+)\s+expected\s+pods?\)", re.IGNORECASE)
-NESTED_EXPECTS_RE = re.compile(r"\(([^()]+?)\s+\((expects at least \d+ pods?)\)\)")
+EXPECTED_PODS_PLAIN = "({pods} expected)"
+NESTED_PARENS_RE = re.compile(r"\(([^()]+?)\s+\(([^()]+)\)\)")
+NESTED_PARENS_FLAT = r"(\1, \2)"
 ONE_PLURAL_RE = re.compile(r"\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
 
 CLI_TOOLS_PATTERN = r"(?:kubectl|gcloud|helm|git|gh|terraform|tofu|docker)"
@@ -157,8 +165,11 @@ RUN_CLI_TO_RE = re.compile(
     rf"^\s*run\s+`?{CLI_TOOLS_PATTERN}\s+[^`]+?`?\s+to\s+(.+)$",
     re.IGNORECASE,
 )
+# The command runs to the end of its sentence: a "." or ";" inside it (a
+# version, a CIDR, a file name) is not the end, one before a space or the end is.
 TRAILING_CLI_RE = re.compile(
-    rf"(?:\s*[:;—-]\s*|\s+(?:with|via|using|by running)\s+)`?{CLI_TOOLS_PATTERN}\s+[^.;]+`?",
+    rf"(?:\s*[:;—-]\s*|,?\s+(?:(?:then|and)\s+)?(?:with|via|using|by running|run)\s+)"
+    rf"`?{CLI_TOOLS_PATTERN}\s+(?:(?![.;]`?(?:\s|$)).)+`?",
     re.IGNORECASE,
 )
 INLINE_BACKTICK_CLI_RE = re.compile(rf"`{CLI_TOOLS_PATTERN}\s+[^`]+`", re.IGNORECASE)
@@ -168,6 +179,9 @@ KUBECTL_DELETE_RE = re.compile(
 )
 BARE_CLI_RE = re.compile(rf"^\s*`?{CLI_TOOLS_PATTERN}\s+.+$", re.IGNORECASE)
 FALLBACK_ACTION = "Review and update the affected resource configuration."
+REMOVE_ACTION = "Remove the {kind} {name}."
+ACTION_EDGE_CHARS = " ,;:-—"
+SUBJECT_EDGE_CHARS = " :—-"
 SENTENCE_ENDINGS = (".", "!", "?")
 
 # Card and fallback presentation constants.
@@ -205,6 +219,12 @@ NOTE_OPEN_ONLY = "· {open_count} open"
 NOTE_SINGLE_CLUSTER = "· {cluster}"
 NOTE_MULTI_CLUSTER = "· across {clusters}"
 
+# The fallback opens on the bold line the card's headline is.
+FALLBACK_HEAD = "**{headline}**"
+# How many more objects a decision on the line reaches, beside the one it names.
+EXTRA_SUFFIX = " (+{extra} more)"
+EXTRA_ONLY = "({extra} more)"
+
 FIX_SINGLE_LABEL = "Fix issue"
 FIX_FIRST_LABEL = "Fix first issue"
 REVIEW_SINGLE_LABEL = "Review item"
@@ -219,18 +239,33 @@ BLOCKING_NOTICE_MULTI = (
     "New findings are paused until you resolve, snooze, or dismiss these {count} open items{waiting}."
 )
 WAITING_SUFFIX = " ({waiting} waiting behind {pronoun})"
+WAITING_PRONOUNS = ("it", "them")
+WAITING_CRITICAL = ("critical issue", "critical issues")
+WAITING_OTHER = ("other issue", "other issues")
+WAITING_PLAIN = ("issue", "issues")
+MORE_QUEUED = ("more issue is", "more issues are")
 QUEUED_WITH_CRITICAL = "{more} queued ({critical} critical, {lower} lower priority)."
+QUEUED_ONLY_CRITICAL = "{more} queued ({critical} critical)."
 QUEUED_PLAIN = "{more} queued."
 ROLLED_UP_SINGLE = "1 provider-managed finding requires no action from you and is hidden."
 ROLLED_UP_MULTI = "{count} provider-managed findings require no action from you and are hidden."
 
 FOLD_TITLE_TEMPLATE = "Queue breakdown ({count} more queued)"
-FOLD_COLUMNS = ["Cluster", "Critical", "Major", "Lower", "Next queued issue"]
+# The table lists the first clusters only; its title says so when it is cut
+# (the count is in the line above it, and the title has 40 characters).
+FOLD_TITLE_CUT_TEMPLATE = "Queue breakdown (top {shown} clusters)"
+# One column per severity (`findings_queue.SEVERITIES`), so the line above the
+# table can say "lower priority" for major and minor together.
+FOLD_COLUMNS = ["Cluster", "Critical", "Major", "Minor", "Next queued issue"]
+FOLD_CRITICAL, FOLD_MAJOR, FOLD_MINOR, FOLD_NEXT = "critical", "major", "minor", "next"
+FOLD_PREVIEW = "{target}: {summary}"
 MAX_FOLD_CLUSTERS = 15
 FOLD_NEXT_ISSUE_MAX = 80
 REPLY_SUMMARY_MAX = 300
 
 METADATA_HEADER = "[Queued item metadata for thread replies]"
+METADATA_LINE = "{index}. [{role}] id={id} members={members} location={location} covers={covers} unreported={unreported}"
+METADATA_NO_LOCATION = "-"
 
 
 class NudgeBundle(NamedTuple):
@@ -371,10 +406,10 @@ def clean_title(raw_title: str) -> str:
     """Strip check entry numbers, raw scores, and awkward pod/replica phrasing from a title."""
     cleaned = LEADING_NUMBER_RE.sub("", _one_line(raw_title))
     cleaned = EXPECTED_PODS_RE.sub(
-        lambda m: f"(expects at least {_plural(int(m.group(1)), 'pod', 'pods')})",
+        lambda m: EXPECTED_PODS_PLAIN.format(pods=_plural(int(m.group(1)), "pod", "pods")),
         cleaned,
     )
-    cleaned = NESTED_EXPECTS_RE.sub(r"(\1, \2)", cleaned)
+    cleaned = NESTED_PARENS_RE.sub(NESTED_PARENS_FLAT, cleaned)
     cleaned = _fix_singular_plurals(cleaned)
     return _one_line(cleaned)
 
@@ -397,11 +432,11 @@ def clean_action(raw_action: str) -> str:
         text = goal[:1].upper() + goal[1:] if goal else FALLBACK_ACTION
     delete_match = KUBECTL_DELETE_RE.match(text)
     if delete_match:
-        return f"Remove the {delete_match.group(1)} {delete_match.group(2)}."
+        return REMOVE_ACTION.format(kind=delete_match.group(1), name=delete_match.group(2))
     text = PAREN_CLI_RE.sub("", text)
     text = TRAILING_CLI_RE.sub("", text)
     text = INLINE_BACKTICK_CLI_RE.sub("", text)
-    text = _fix_singular_plurals(_one_line(text)).strip(" ,;:-—")
+    text = _fix_singular_plurals(_one_line(text)).strip(ACTION_EDGE_CHARS)
     if not text or BARE_CLI_RE.match(text):
         return FALLBACK_ACTION
     return _ensure_period(text)
@@ -431,23 +466,48 @@ def _target_name(finding: dict) -> str:
     raw_cluster = str(finding.get("cluster") or "").strip()
     namespace = str(finding.get("namespace") or "").strip()
     obj = str(finding.get("object") or "").strip()
-    if not obj or obj == raw_cluster:
+    # A cluster-wide finding has no workload to name: the row leads with its cluster.
+    if not obj or obj == raw_cluster or obj in CLUSTER_SCOPE_OBJECTS:
         return ""
     return f"{namespace}/{obj}" if namespace else obj
 
 
+def _leading_groups(text: str) -> tuple[str, str]:
+    """Split ``text`` into the parenthesised groups it opens with and what follows them."""
+    end = 0
+    while end < len(text) and text[end] == "(":
+        depth = 0
+        for offset, char in enumerate(text[end:]):
+            depth += (char == "(") - (char == ")")
+            if depth == 0:
+                break
+        else:
+            break  # an unclosed group is not a group
+        end += offset + 1
+        end += len(text[end:]) - len(text[end:].lstrip())
+    return text[:end].rstrip(), text[end:]
+
+
 def _peel_redundant_subject(cleaned_title: str, target: str, obj: str, raw_cluster: str) -> str:
-    """Remove redundant workload or cluster names when the row already leads with them."""
+    """Remove redundant workload or cluster names when the row already leads with them.
+
+    A detector's title is `<what is wrong>: <subject> (<its settings>) <what it
+    does>`; the settings go last, so what is left still reads as a sentence.
+    """
     for candidate in (target, obj):
         if not candidate:
             continue
-        marker = f": {candidate}"
-        if marker in cleaned_title:
-            category, _, rest = cleaned_title.partition(marker)
-            rest = rest.lstrip(" :—-")
+        # The whole name only: `web` is not the subject of "...: web-frontend".
+        found = re.search(rf": {re.escape(candidate)}(?=$|[\s(:,])", cleaned_title)
+        if found:
+            category = cleaned_title[: found.start()]
+            rest = cleaned_title[found.end() :].lstrip(SUBJECT_EDGE_CHARS)
             if not rest:
                 return category
-            return f"{category} {rest}" if rest.startswith("(") else f"{category}: {rest}"
+            groups, lead = _leading_groups(rest)
+            if not groups:
+                return f"{category}: {rest}"
+            return f"{category}: {lead} {groups}" if lead else f"{category} {groups}"
     for candidate in (target, obj):
         if candidate and cleaned_title.startswith(f"{candidate} "):
             return cleaned_title[len(candidate) + 1 :].strip()
@@ -476,8 +536,10 @@ def format_item(
     cluster = cluster_label(top, ambiguous)
     obj = str(top.get("object") or "").strip()
     target = _target_name(top)
-    extra = max(0, len(item.members) - 1)
-    extra_suffix = f" (+{extra} more)" if extra else ""
+    # Every object a decision on this line reaches, the ones a sweep stopped
+    # reporting included: the reader is told how far a dismissal goes.
+    extra = max(0, max(len(item.members), item.covers) - 1)
+    extra_suffix = EXTRA_SUFFIX.format(extra=extra) if extra else ""
 
     raw_title = str(top.get("title") or "").strip()
     cleaned = clean_title(raw_title)
@@ -493,7 +555,7 @@ def format_item(
         subject_md = f"**{cluster}**{extra_suffix}"
         subject_plain = f"{cluster}{extra_suffix}"
     else:
-        subject_md = f"({extra} more)" if extra else ""
+        subject_md = EXTRA_ONLY.format(extra=extra) if extra else ""
         subject_plain = subject_md
 
     card_text = f"{subject_md} — {summary}" if (subject_md and summary) else (subject_md or summary)
@@ -519,9 +581,14 @@ def format_item(
         if part
     )
     unreported = max(0, item.covers - len(item.members))
-    metadata_line = (
-        f"{index}. [{role}] id={top.get('id')} members={member_ids} "
-        f"location={raw_where or '-'} covers={item.covers} unreported={unreported}"
+    metadata_line = METADATA_LINE.format(
+        index=index,
+        role=role,
+        id=top.get("id"),
+        members=member_ids,
+        location=raw_where or METADATA_NO_LOCATION,
+        covers=item.covers,
+        unreported=unreported,
     )
     return FormattedItem(
         role=role,
@@ -529,7 +596,7 @@ def format_item(
         cluster=cluster,
         card_row=card_row,
         plain_line=plain_line,
-        reply_summary=plain_head[:REPLY_SUMMARY_MAX],
+        reply_summary=slack_presenter._clip(plain_head, REPLY_SUMMARY_MAX),
         metadata_line=metadata_line,
     )
 
@@ -537,8 +604,7 @@ def format_item(
 def _is_upgrade_item(item) -> bool:
     for member in item.members:
         check = str(member.get("check_slug") or member.get("check") or "").lower()
-        fid = str(member.get("id") or "").lower()
-        if check.startswith(UPGRADE_CHECK_PREFIXES) or fid.startswith(UPGRADE_ID_PREFIX):
+        if check.startswith(UPGRADE_CHECK_PREFIX):
             return True
     return False
 
@@ -590,11 +656,10 @@ def _waiting_phrase(waiting_items: list, blocking_count: int) -> str:
     waiting_other = len(waiting_items) - waiting_critical
     parts = []
     if waiting_critical:
-        parts.append(_plural(waiting_critical, "critical issue", "critical issues"))
+        parts.append(_plural(waiting_critical, *WAITING_CRITICAL))
     if waiting_other:
-        noun = "other issue" if waiting_critical else "issue"
-        parts.append(_plural(waiting_other, noun, f"{noun}s"))
-    pronoun = "it" if blocking_count == 1 else "them"
+        parts.append(_plural(waiting_other, *(WAITING_OTHER if waiting_critical else WAITING_PLAIN)))
+    pronoun = WAITING_PRONOUNS[blocking_count != 1]
     return WAITING_SUFFIX.format(waiting=" and ".join(parts), pronoun=pronoun)
 
 
@@ -604,7 +669,7 @@ def _queue_fold(
     ambiguous: frozenset[str],
     remaining_count: int,
 ) -> tuple[dict | None, int]:
-    """Build Option C's collapsible cluster breakdown table and return ``(fold, remaining_critical)``."""
+    """Build the cluster breakdown table for the rest of the queue and return ``(fold, remaining_critical)``."""
     grouped_items: dict[tuple, list[dict]] = {}
     for row in rows:
         if fq.rolled_up(row):
@@ -627,15 +692,15 @@ def _queue_fold(
         cluster = cluster_label(top, ambiguous) or UNSCOPED_CLUSTER
         bucket = by_cluster.setdefault(
             cluster,
-            {"critical": 0, "major": 0, "lower": 0, "next": ""},
+            {FOLD_CRITICAL: 0, FOLD_MAJOR: 0, FOLD_MINOR: 0, FOLD_NEXT: ""},
         )
         if sev == CRITICAL_SEVERITY:
-            bucket["critical"] = int(bucket["critical"]) + 1
+            bucket[FOLD_CRITICAL] = int(bucket[FOLD_CRITICAL]) + 1
         elif sev == MAJOR_SEVERITY:
-            bucket["major"] = int(bucket["major"]) + 1
+            bucket[FOLD_MAJOR] = int(bucket[FOLD_MAJOR]) + 1
         else:
-            bucket["lower"] = int(bucket["lower"]) + 1
-        if not bucket["next"]:
+            bucket[FOLD_MINOR] = int(bucket[FOLD_MINOR]) + 1
+        if not bucket[FOLD_NEXT]:
             target = _target_name(top)
             cleaned = _peel_redundant_subject(
                 clean_title(str(top.get("title") or "")),
@@ -643,26 +708,33 @@ def _queue_fold(
                 str(top.get("object") or "").strip(),
                 str(top.get("cluster") or "").strip(),
             )
-            preview = f"{target}: {cleaned}" if (target and cleaned) else (target or cleaned)
-            bucket["next"] = preview[:FOLD_NEXT_ISSUE_MAX]
+            preview = (
+                FOLD_PREVIEW.format(target=target, summary=cleaned) if (target and cleaned) else (target or cleaned)
+            )
+            bucket[FOLD_NEXT] = slack_presenter._clip(preview, FOLD_NEXT_ISSUE_MAX)
 
     sorted_clusters = sorted(
         by_cluster.items(),
-        key=lambda kv: (-int(kv[1]["critical"]), -int(kv[1]["major"]), -int(kv[1]["lower"]), kv[0]),
+        key=lambda kv: (-int(kv[1][FOLD_CRITICAL]), -int(kv[1][FOLD_MAJOR]), -int(kv[1][FOLD_MINOR]), kv[0]),
     )[:MAX_FOLD_CLUSTERS]
 
     table_rows = [
         [
             cluster_name,
-            str(stats["critical"]),
-            str(stats["major"]),
-            str(stats["lower"]),
-            str(stats["next"]),
+            str(stats[FOLD_CRITICAL]),
+            str(stats[FOLD_MAJOR]),
+            str(stats[FOLD_MINOR]),
+            str(stats[FOLD_NEXT]),
         ]
         for cluster_name, stats in sorted_clusters
     ]
+    title = (
+        FOLD_TITLE_CUT_TEMPLATE.format(shown=len(sorted_clusters))
+        if len(by_cluster) > len(sorted_clusters)
+        else FOLD_TITLE_TEMPLATE.format(count=remaining_count)
+    )
     fold = {
-        nudge_card.FOLD_TITLE_KEY: FOLD_TITLE_TEMPLATE.format(count=remaining_count)[: chat_message.FOLD_TITLE_MAX],
+        nudge_card.FOLD_TITLE_KEY: slack_presenter._clip(title, chat_message.FOLD_TITLE_MAX),
         nudge_card.FOLD_TABLE_KEY: {
             nudge_card.TABLE_COLUMNS_KEY: list(FOLD_COLUMNS),
             nudge_card.TABLE_ROWS_KEY: table_rows,
@@ -683,7 +755,7 @@ def build_nudge(
     rows: list[dict] | None = None,
     backlog_url: str = "",
 ) -> NudgeBundle:
-    """Build both the plain-text fallback and the structured Option C card for ``plan``."""
+    """Build both the plain-text fallback and the structured card for ``plan``."""
     critical_class = fq.ITEM_CLASSES[0]
     added_critical = [item for item in plan.add if item.item_class == critical_class]
     added_other = [item for item in plan.add if item.item_class != critical_class]
@@ -731,15 +803,14 @@ def build_nudge(
         else:
             after_lines.append(BLOCKING_NOTICE_MULTI.format(count=len(blocking), waiting=waiting))
     if remaining > 0:
-        more_words = _plural(remaining, "more issue is", "more issues are")
-        if rows is not None and remaining_critical > 0:
+        more_words = _plural(remaining, *MORE_QUEUED)
+        lower = max(0, remaining - remaining_critical)
+        if rows is not None and remaining_critical > 0 and lower:
             after_lines.append(
-                QUEUED_WITH_CRITICAL.format(
-                    more=more_words,
-                    critical=remaining_critical,
-                    lower=max(0, remaining - remaining_critical),
-                )
+                QUEUED_WITH_CRITICAL.format(more=more_words, critical=remaining_critical, lower=lower)
             )
+        elif rows is not None and remaining_critical > 0:
+            after_lines.append(QUEUED_ONLY_CRITICAL.format(more=more_words, critical=remaining_critical))
         else:
             after_lines.append(QUEUED_PLAIN.format(more=more_words))
     if plan.rolled_up:
@@ -761,13 +832,14 @@ def build_nudge(
         primary_label: CHOICE_REPLY_FORMAT.format(
             label=primary_label,
             summary=formatted[0].reply_summary,
-        )[: chat_message.REPLY_MAX]
+        )
     }
 
     clean_backlog = backlog_url.strip() if backlog_url and backlog_url.strip().startswith(HTTP_SCHEMES) else ""
     links = [[BACKLOG_LINK_LABEL, clean_backlog]] if clean_backlog else []
 
-    head_line = f"{headline} {note}".strip() if note else headline
+    head = FALLBACK_HEAD.format(headline=headline)
+    head_line = f"{head} {note}" if note else head
     text_sections = [head_line, "\n".join(entry.plain_line for entry in formatted)]
     tail_lines = list(after_lines)
     if clean_backlog:

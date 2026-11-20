@@ -2,7 +2,7 @@
   {
     "expected": 0,
     "carrier": "notify",
-    "text": "*2 critical issues will block cluster upgrades* · 4 open across 2 clusters\n\n- `critical` *kube-system/istiod* on `prod-central` — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica) · Allow at least 1 pod disruption or run at least 2 replicas.\n- `critical` *gke-prod-pool-8f2a* on `prod-central` — Orphan Node objects: has no backing GCE instance · Delete the orphan Node object.\n\n2 more issues are queued (1 critical, 1 lower priority).\n\n*Queue breakdown (2 more queued)*\n```\nCluster      | Critical | Major | Lower | Next queued issue\n-------------+----------+-------+-------+------------------------------------------------------------------\nprod-central | 1        | 0     | 0     | billing/invoice-worker: mounts a static GCP key\nprod-europe  | 0        | 1     | 0     | authz-webhook: Fail-closed webhook: blocks API calls during drain\n```",
+    "text": "*2 critical issues will block cluster upgrades* · 4 open across 2 clusters\n\n- `critical` *kube-system/istiod* on `prod-central` — PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica) · Allow at least 1 pod disruption or run at least 2 replicas.\n- `critical` *gke-prod-pool-8f2a* on `prod-central` — Orphan Node objects: has no backing GCE instance · Delete the orphan Node object.\n\n2 more issues are queued (1 critical, 1 lower priority).\n\n*Queue breakdown (2 more queued)*\n```\nCluster      | Critical | Major | Minor | Next queued issue\n-------------+----------+-------+-------+------------------------------------------------------------------\nprod-central | 1        | 0     | 0     | billing/invoice-worker: mounts a static GCP key\nprod-europe  | 0        | 1     | 0     | authz-webhook: Fail-closed webhook: blocks API calls during drain\n```",
     "widgets": [
       {
         "buttonList": {
@@ -14,7 +14,7 @@
                   "parameters": [
                     {
                       "key": "reply",
-                      "value": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)"
+                      "value": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)"
                     },
                     {
                       "key": "choice",
