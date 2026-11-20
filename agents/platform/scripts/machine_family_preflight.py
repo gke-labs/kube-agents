@@ -5,11 +5,15 @@ Checks source node pools and cluster settings against target machine families
 (n2, n2d, n4, c3, c4) before the agent proposes ComputeClass, Config Connector
 ContainerNodePool, or Terraform google_container_node_pool manifests:
 
-  - Security settings: rejects disabled cluster shieldedNodes, node-pool vTPM,
-    integrity monitoring, or Secure Boot on Shielded-only targets (n2, n2d, n4,
-    c3, c4); rejects Confidential VM (confidentialNodes) on non-confidential
-    families (n2, n4, c4); and flags AMD SEV/SEV-SNP (n2d) versus Intel TDX
-    (c3) technology transitions.
+  - Security settings: warns when cluster shieldedNodes, node-pool vTPM,
+    integrity monitoring, or Secure Boot is disabled (baseline security policy
+    checks, never blocking on GKE's default disabled Secure Boot); rejects
+    Confidential VM (confidentialNodes) on non-confidential families (n2, n4);
+    enforces supported Confidential VM shapes and Local SSD modes (Intel TDX on
+    c3-standard-* and on c3-standard-*-lssd with ephemeralStorageLocalSsdConfig,
+    and Intel TDX on c4-standard-* without Local SSDs, rejecting
+    localNvmeSsdBlockConfig on Confidential VM pools); and flags AMD
+    SEV/SEV-SNP (n2d) versus Intel TDX (c3, c4) technology transitions.
   - Disk and Local SSD constraints: rejects Persistent Disk (pd-*) on
     Hyperdisk-only families (n4, c4), rejects pd-standard on c3, rejects
     Hyperdisk boot disks on n2 and n2d, rejects Local SSD configurations
@@ -81,17 +85,11 @@ SUPPORTED_TARGET_FAMILIES = (
     FAMILY_C3,
     FAMILY_C4,
 )
-SHIELDED_ONLY_FAMILIES = (
-    FAMILY_N2,
-    FAMILY_N2D,
-    FAMILY_N4,
-    FAMILY_C3,
-    FAMILY_C4,
-)
 # Identifier names use CVM rather than the full word so CodeQL's Python
 # SensitiveDataHeuristics.qll secret-source regex does not flag configuration
 # booleans or enum names flowing to stdout or the report file.
-NON_CVM_FAMILIES = (FAMILY_N2, FAMILY_N4, FAMILY_C4)
+NON_CVM_FAMILIES = (FAMILY_N2, FAMILY_N4)
+TDX_CVM_FAMILIES = (FAMILY_C3, FAMILY_C4)
 HYPERDISK_ONLY_FAMILIES = (FAMILY_N4, FAMILY_C4)
 PD_ONLY_BOOT_FAMILIES = (FAMILY_N2, FAMILY_N2D)
 GEN2_PD_FAMILIES = (FAMILY_N1, FAMILY_E2, FAMILY_N2, FAMILY_N2D)
@@ -133,6 +131,7 @@ PD_ONLY_ALLOWED_BOOT_DISKS = (
 
 LSSD_MACHINE_SUFFIX = "-lssd"
 C3_TDX_ALLOWED_SHAPE_PREFIX = "c3-standard-"
+C4_TDX_ALLOWED_SHAPE_PREFIX = "c4-standard-"
 
 # GKE / Config Connector / Terraform field names.
 FIELD_NAME = "name"
@@ -734,7 +733,7 @@ def _extract_boot_disk_type(config: dict[str, Any]) -> str:
 
 def _default_cvm_type_for_family(source_family: str) -> str:
     """Return the platform's default Confidential VM technology when omitted by `describe`."""
-    if source_family == FAMILY_C3:
+    if source_family in TDX_CVM_FAMILIES:
         return CVM_TYPE_TDX
     if source_family == FAMILY_N2D:
         return CVM_TYPE_SEV
@@ -913,6 +912,23 @@ def _extract_local_ssd_configs(
     return details, has_legacy_count
 
 
+def _has_active_nvme_block_lssd(config: dict[str, Any]) -> bool:
+    """Return True when `config` configures an active `localNvmeSsdBlockConfig` block."""
+    nvme_block = _as_dict(
+        _first_present(
+            config,
+            FIELD_NVME_SSD_BLOCK,
+            FIELD_NVME_SSD_BLOCK_SNAKE,
+        )
+    )
+    if not isinstance(nvme_block, dict):
+        return False
+    count_keys = (FIELD_LOCAL_SSD_COUNT, FIELD_LOCAL_SSD_COUNT_SNAKE)
+    has_count_key = any(k in nvme_block for k in count_keys)
+    count = _safe_positive_int(_first_present(nvme_block, *count_keys))
+    return count > 0 or (not has_count_key and bool(nvme_block))
+
+
 def _evaluate_security(
     config: dict[str, Any],
     cluster: dict[str, Any] | None,
@@ -922,176 +938,182 @@ def _evaluate_security(
     *,
     node_pool: dict[str, Any] | None = None,
     source_machine_type: str = "",
-) -> list[Finding]:
-    """Check Shielded VM, Secure Boot, vTPM, integrity monitoring, and Confidential VM."""
+) -> tuple[list[Finding], list[Finding]]:
+    """Check Confidential VM platform constraints and Shielded VM policy warnings."""
     blockers: list[Finding] = []
+    warnings: list[Finding] = []
     cluster = _normalize_cluster_doc(cluster)
 
-    if target_family in SHIELDED_ONLY_FAMILIES:
-        if isinstance(cluster, dict):
-            has_shielded_block = (
-                FIELD_SHIELDED_NODES in cluster
-                or FIELD_SHIELDED_NODES_SNAKE in cluster
+    if isinstance(cluster, dict):
+        has_shielded_block = (
+            FIELD_SHIELDED_NODES in cluster
+            or FIELD_SHIELDED_NODES_SNAKE in cluster
+        )
+        raw_shielded_nodes = _first_present(
+            cluster,
+            FIELD_SHIELDED_NODES,
+            FIELD_SHIELDED_NODES_SNAKE,
+        )
+        shielded_nodes_dict = _as_dict(raw_shielded_nodes)
+        flat_shielded = _first_present(
+            cluster,
+            FIELD_ENABLE_SHIELDED_NODES,
+            FIELD_ENABLE_SHIELDED_NODES_SNAKE,
+        )
+        # GKE's Proto3 JSON serializer omits `enabled: false`, serializing a
+        # disabled `shieldedNodes` message as `{}`.
+        shielded_disabled = (
+            (
+                has_shielded_block
+                and isinstance(shielded_nodes_dict, dict)
+                and shielded_nodes_dict.get(FIELD_ENABLED) is not True
             )
-            raw_shielded_nodes = _first_present(
-                cluster,
-                FIELD_SHIELDED_NODES,
-                FIELD_SHIELDED_NODES_SNAKE,
-            )
-            shielded_nodes_dict = _as_dict(raw_shielded_nodes)
-            flat_shielded = _first_present(
-                cluster,
-                FIELD_ENABLE_SHIELDED_NODES,
-                FIELD_ENABLE_SHIELDED_NODES_SNAKE,
-            )
-            # GKE's Proto3 JSON serializer omits `enabled: false`, serializing a
-            # disabled `shieldedNodes` message as `{}`.
-            shielded_disabled = (
-                (
-                    has_shielded_block
-                    and isinstance(shielded_nodes_dict, dict)
-                    and shielded_nodes_dict.get(FIELD_ENABLED) is not True
+            or raw_shielded_nodes is False
+            or flat_shielded is False
+        )
+        if shielded_disabled:
+            warnings.append(
+                Finding(
+                    rule=RULE_SHIELDED_NODES_DISABLED,
+                    category=CATEGORY_SECURITY,
+                    field=f"{FIELD_SHIELDED_NODES}.{FIELD_ENABLED}",
+                    message=(
+                        f"Cluster has {FIELD_SHIELDED_NODES}.{FIELD_ENABLED}=false; "
+                        "GKE enables Shielded GKE Nodes by default and disabling them "
+                        "weakens baseline cluster security policy when migrating to "
+                        f"{target_family}."
+                    ),
+                    remediation=(
+                        f"Enable Shielded GKE Nodes ({FIELD_SHIELDED_NODES}.{FIELD_ENABLED}: true) "
+                        "on the cluster to maintain baseline security policy when "
+                        f"migrating node pools to {target_family}."
+                    ),
                 )
-                or raw_shielded_nodes is False
-                or flat_shielded is False
             )
-            if shielded_disabled:
-                blockers.append(
-                    Finding(
-                        rule=RULE_SHIELDED_NODES_DISABLED,
-                        category=CATEGORY_SECURITY,
-                        field=f"{FIELD_SHIELDED_NODES}.{FIELD_ENABLED}",
-                        message=(
-                            f"Cluster has {FIELD_SHIELDED_NODES}.{FIELD_ENABLED}=false; "
-                            f"target family {target_family} requires Shielded GKE Nodes "
-                            "and Shielded VM instances."
-                        ),
-                        remediation=(
-                            f"Enable Shielded GKE Nodes ({FIELD_SHIELDED_NODES}.{FIELD_ENABLED}: true) "
-                            f"on the cluster before migrating node pools to {target_family}."
-                        ),
-                    )
-                )
 
-        shielded_from_cluster = False
-        shielded_cfg = _as_dict(
+    shielded_from_cluster = False
+    shielded_cfg = _as_dict(
+        _first_present(
+            config,
+            FIELD_SHIELDED_INSTANCE_CONFIG,
+            FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+        )
+    )
+    if not isinstance(shielded_cfg, dict) and isinstance(cluster, dict):
+        cluster_node_cfg = _as_dict(
             _first_present(
-                config,
-                FIELD_SHIELDED_INSTANCE_CONFIG,
-                FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+                cluster,
+                FIELD_NODE_CONFIG,
+                FIELD_NODE_CONFIG_SNAKE,
             )
         )
-        if not isinstance(shielded_cfg, dict) and isinstance(cluster, dict):
-            cluster_node_cfg = _as_dict(
+        if isinstance(cluster_node_cfg, dict):
+            shielded_cfg = _as_dict(
                 _first_present(
-                    cluster,
-                    FIELD_NODE_CONFIG,
-                    FIELD_NODE_CONFIG_SNAKE,
+                    cluster_node_cfg,
+                    FIELD_SHIELDED_INSTANCE_CONFIG,
+                    FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
                 )
             )
-            if isinstance(cluster_node_cfg, dict):
-                shielded_cfg = _as_dict(
-                    _first_present(
-                        cluster_node_cfg,
-                        FIELD_SHIELDED_INSTANCE_CONFIG,
-                        FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
-                    )
-                )
-                if isinstance(shielded_cfg, dict):
-                    shielded_from_cluster = True
+            if isinstance(shielded_cfg, dict):
+                shielded_from_cluster = True
 
-        if isinstance(shielded_cfg, dict):
-            is_gke_proto3 = _is_gke_proto3_shielded_schema(
-                node_pool,
-                config,
-                shielded_cfg,
-                from_cluster=shielded_from_cluster,
-                cluster=cluster,
-            )
-            vtpm = _first_present(
-                shielded_cfg,
-                FIELD_ENABLE_VTPM,
-                FIELD_ENABLE_VTPM_SNAKE,
-            )
-            if vtpm is False:
-                blockers.append(
-                    Finding(
-                        rule=RULE_SHIELDED_VTPM_DISABLED,
-                        category=CATEGORY_SECURITY,
-                        field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_VTPM}",
-                        message=(
-                            f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
-                            f"{FIELD_ENABLE_VTPM}=false; target family {target_family} "
-                            "requires Shielded VM vTPM and the baseline security floor "
-                            "forbids disabling vTPM."
-                        ),
-                        remediation=(
-                            f"Remove {FIELD_ENABLE_VTPM}: false from the source configuration, "
-                            f"ensure cluster {FIELD_SHIELDED_NODES}.{FIELD_ENABLED} is true, and "
-                            f"keep {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}: true "
-                            f"on the target {target_family} node pool or ComputeClass (GKE enables "
-                            "vTPM automatically on Shielded GKE Nodes and does not accept an "
-                            "enableVtpm field in ComputeClass or NodePool YAML)."
-                        ),
-                    )
+    if isinstance(shielded_cfg, dict):
+        is_gke_proto3 = _is_gke_proto3_shielded_schema(
+            node_pool,
+            config,
+            shielded_cfg,
+            from_cluster=shielded_from_cluster,
+            cluster=cluster,
+        )
+        vtpm = _first_present(
+            shielded_cfg,
+            FIELD_ENABLE_VTPM,
+            FIELD_ENABLE_VTPM_SNAKE,
+        )
+        if vtpm is False:
+            warnings.append(
+                Finding(
+                    rule=RULE_SHIELDED_VTPM_DISABLED,
+                    category=CATEGORY_SECURITY,
+                    field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_VTPM}",
+                    message=(
+                        f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
+                        f"{FIELD_ENABLE_VTPM}=false; disabling Shielded VM vTPM "
+                        "violates baseline node security policy when migrating to "
+                        f"{target_family}."
+                    ),
+                    remediation=(
+                        f"Remove {FIELD_ENABLE_VTPM}: false from the source configuration, "
+                        f"ensure cluster {FIELD_SHIELDED_NODES}.{FIELD_ENABLED} is true, and "
+                        f"keep {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}: true "
+                        f"on the target {target_family} node pool or ComputeClass (GKE enables "
+                        "vTPM automatically on Shielded GKE Nodes and does not accept an "
+                        "enableVtpm field in ComputeClass or NodePool YAML)."
+                    ),
                 )
+            )
 
-            integrity = _first_present(
-                shielded_cfg,
-                FIELD_ENABLE_INTEGRITY,
-                FIELD_ENABLE_INTEGRITY_SNAKE,
-            )
-            # In GKE's ShieldedInstanceConfig Proto3 JSON, a false boolean is
-            # omitted from the serialized object; in KCC and Terraform manifests,
-            # an omitted enableIntegrityMonitoring defaults to true.
-            if integrity is False or (integrity is None and is_gke_proto3):
-                blockers.append(
-                    Finding(
-                        rule=RULE_SHIELDED_INTEGRITY_DISABLED,
-                        category=CATEGORY_SECURITY,
-                        field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}",
-                        message=(
-                            f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
-                            f"{FIELD_ENABLE_INTEGRITY}=false; target family {target_family} "
-                            "requires Shielded VM integrity monitoring and the baseline "
-                            "security floor forbids disabling it."
-                        ),
-                        remediation=(
-                            f"Set {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}: true "
-                            "(or omit the override so GKE defaults it to true) on the "
-                            f"replacement node pool or ComputeClass targeting {target_family}."
-                        ),
-                    )
+        integrity = _first_present(
+            shielded_cfg,
+            FIELD_ENABLE_INTEGRITY,
+            FIELD_ENABLE_INTEGRITY_SNAKE,
+        )
+        # In GKE's ShieldedInstanceConfig Proto3 JSON, a false boolean is
+        # omitted from the serialized object; in KCC and Terraform manifests,
+        # an omitted enableIntegrityMonitoring defaults to true.
+        if integrity is False or (integrity is None and is_gke_proto3):
+            warnings.append(
+                Finding(
+                    rule=RULE_SHIELDED_INTEGRITY_DISABLED,
+                    category=CATEGORY_SECURITY,
+                    field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}",
+                    message=(
+                        f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
+                        f"{FIELD_ENABLE_INTEGRITY}=false; disabling Shielded VM "
+                        "integrity monitoring violates baseline node security policy "
+                        f"when migrating to {target_family}."
+                    ),
+                    remediation=(
+                        f"Set {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}: true "
+                        "(or omit the override so GKE defaults it to true) on the "
+                        f"replacement node pool or ComputeClass targeting {target_family}."
+                    ),
                 )
+            )
 
-            secure_boot = _first_present(
-                shielded_cfg,
-                FIELD_ENABLE_SECURE_BOOT,
-                FIELD_ENABLE_SECURE_BOOT_SNAKE,
-            )
-            # Unlike enableIntegrityMonitoring (which defaults to true in KCC and
-            # Terraform), enableSecureBoot defaults to false in GKE, KCC, and
-            # Terraform whenever omitted from shieldedInstanceConfig.
-            if secure_boot is not True:
-                blockers.append(
-                    Finding(
-                        rule=RULE_SHIELDED_SECURE_BOOT_DISABLED,
-                        category=CATEGORY_SECURITY,
-                        field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_SECURE_BOOT}",
-                        message=(
-                            f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
-                            f"{FIELD_ENABLE_SECURE_BOOT}=false; carrying disabled Secure Boot "
-                            f"into target family {target_family} violates the baseline node "
-                            "security floor (and indicates potential unsigned third-party "
-                            "kernel modules from the source pool)."
-                        ),
-                        remediation=(
-                            "Verify no workloads depend on unsigned kernel modules and enable "
-                            f"Secure Boot ({FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_SECURE_BOOT}: true) "
-                            f"on the target {target_family} node pool or ComputeClass."
-                        ),
-                    )
+        secure_boot = _first_present(
+            shielded_cfg,
+            FIELD_ENABLE_SECURE_BOOT,
+            FIELD_ENABLE_SECURE_BOOT_SNAKE,
+        )
+        # Unlike enableIntegrityMonitoring (which defaults to true in KCC and
+        # Terraform), enableSecureBoot defaults to false in GKE, KCC, and
+        # Terraform whenever omitted from shieldedInstanceConfig. Because GKE
+        # disables Secure Boot by default and no machine family requires it,
+        # report disabled Secure Boot as a security policy warning rather than
+        # a migration blocker.
+        if secure_boot is not True:
+            warnings.append(
+                Finding(
+                    rule=RULE_SHIELDED_SECURE_BOOT_DISABLED,
+                    category=CATEGORY_SECURITY,
+                    field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_SECURE_BOOT}",
+                    message=(
+                        f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
+                        f"{FIELD_ENABLE_SECURE_BOOT}=false (the GKE default); "
+                        "Secure Boot is not enabled on the source pool and is "
+                        "recommended by baseline node security policy when "
+                        f"migrating to {target_family} if no workloads depend on "
+                        "unsigned kernel modules."
+                    ),
+                    remediation=(
+                        "Verify no workloads depend on unsigned kernel modules and enable "
+                        f"Secure Boot ({FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_SECURE_BOOT}: true) "
+                        f"on the target {target_family} node pool or ComputeClass."
+                    ),
                 )
+            )
 
     cvm_enabled, cvm_type, cvm_field = _extract_cvm_state(
         config,
@@ -1109,12 +1131,14 @@ def _evaluate_security(
                         f"Source configuration enables Confidential GKE Nodes ({cvm_field}), "
                         f"which is not supported on target family {target_family} "
                         "(among the target families, Confidential VM is supported on "
-                        "n2d with AMD SEV/SEV_SNP and c3 with Intel TDX)."
+                        "n2d with AMD SEV/SEV_SNP and on c3 and c4 with Intel TDX)."
                     ),
                     remediation=(
-                        "Target n2d (AMD SEV/SEV_SNP) or c3 (Intel TDX on c3-standard-* shapes) "
-                        "for Confidential VM workloads, or confirm with the security owner "
-                        f"before moving non-confidential workloads to {target_family}."
+                        "Target n2d (AMD SEV/SEV_SNP), c3 (Intel TDX on c3-standard-* or "
+                        "c3-standard-*-lssd with ephemeralStorageLocalSsdConfig), or c4 "
+                        "(Intel TDX on c4-standard-* shapes) for Confidential VM workloads, "
+                        "or confirm with the security owner before moving non-confidential "
+                        f"workloads to {target_family}."
                     ),
                 )
             )
@@ -1129,12 +1153,73 @@ def _evaluate_security(
                         message=(
                             f"Source Confidential VM pool uses {source_label}, whereas "
                             "target family c3 requires Intel TDX "
-                            f"({FIELD_CVM_TYPE}: {CVM_TYPE_TDX} on c3-standard-* shapes)."
+                            f"({FIELD_CVM_TYPE}: {CVM_TYPE_TDX} on c3-standard-* or "
+                            "c3-standard-*-lssd shapes)."
                         ),
                         remediation=(
                             f"Explicitly configure {FIELD_CVM_TYPE}: {CVM_TYPE_TDX} on a "
-                            "c3-standard-* shape (GKE 1.28.6-gke.1317000+) and update any "
-                            "remote attestation policies from AMD SEV to Intel TDX."
+                            "c3-standard-* or c3-standard-*-lssd shape (GKE 1.28.6-gke.1317000+) "
+                            "and update any remote attestation policies from AMD SEV to Intel TDX."
+                        ),
+                    )
+                )
+            if _has_active_nvme_block_lssd(config):
+                blockers.append(
+                    Finding(
+                        rule=RULE_CVM_TECHNOLOGY_MISMATCH,
+                        category=CATEGORY_SECURITY,
+                        field=FIELD_MACHINE_TYPE,
+                        message=(
+                            f"Source Confidential VM pool configures raw block Local SSDs "
+                            f"({FIELD_NVME_SSD_BLOCK}), which cannot be combined with "
+                            "Confidential GKE Nodes on target family c3 (Confidential GKE "
+                            "Nodes on c3-standard-*-lssd support Local SSD only for "
+                            f"ephemeral storage via {FIELD_EPHEMERAL_LOCAL_SSD})."
+                        ),
+                        remediation=(
+                            f"Use {FIELD_EPHEMERAL_LOCAL_SSD} on a c3-standard-*-lssd shape "
+                            f"instead of {FIELD_NVME_SSD_BLOCK}, remove Local SSD "
+                            "configurations to use a c3-standard-* shape, or target n2d "
+                            "(AMD SEV/SEV_SNP)."
+                        ),
+                    )
+                )
+            if target_machine_type and not target_machine_type.startswith(
+                C3_TDX_ALLOWED_SHAPE_PREFIX
+            ):
+                blockers.append(
+                    Finding(
+                        rule=RULE_CVM_TECHNOLOGY_MISMATCH,
+                        category=CATEGORY_SECURITY,
+                        field=FIELD_MACHINE_TYPE,
+                        message=(
+                            f"Target machine shape {target_machine_type} does not support "
+                            "Confidential VM with Intel TDX on c3 (only c3-standard-* and "
+                            "c3-standard-*-lssd shapes support Intel TDX)."
+                        ),
+                        remediation=(
+                            "Select a c3-standard-* shape (or c3-standard-*-lssd with "
+                            f"{FIELD_EPHEMERAL_LOCAL_SSD}) for Confidential VM with Intel TDX."
+                        ),
+                    )
+                )
+        elif target_family == FAMILY_C4:
+            if cvm_type != CVM_TYPE_TDX:
+                source_label = cvm_type if cvm_type in AMD_CVM_TYPES else CVM_DEFAULT_AMD_LABEL
+                blockers.append(
+                    Finding(
+                        rule=RULE_CVM_TECHNOLOGY_MISMATCH,
+                        category=CATEGORY_SECURITY,
+                        field=f"{cvm_field}.{FIELD_CVM_TYPE}",
+                        message=(
+                            f"Source Confidential VM pool uses {source_label}, whereas "
+                            "target family c4 requires Intel TDX "
+                            f"({FIELD_CVM_TYPE}: {CVM_TYPE_TDX} on c4-standard-* shapes)."
+                        ),
+                        remediation=(
+                            f"Explicitly configure {FIELD_CVM_TYPE}: {CVM_TYPE_TDX} on a "
+                            "c4-standard-* shape and update any remote attestation policies "
+                            "from AMD SEV to Intel TDX."
                         ),
                     )
                 )
@@ -1151,19 +1236,20 @@ def _evaluate_security(
                         field=FIELD_MACHINE_TYPE,
                         message=(
                             f"Source Confidential VM pool also configures Local SSDs "
-                            f"({joined_lssd}), which cannot be combined on target family c3 "
-                            "(Intel TDX is supported only on c3-standard-* shapes without "
-                            "Local SSDs, whereas Local SSDs on c3 require c3-*-lssd shapes)."
+                            f"({joined_lssd}), which cannot be combined on target family c4 "
+                            "(Intel TDX on c4 is supported only on c4-standard-* shapes "
+                            "without Local SSDs)."
                         ),
                         remediation=(
                             "Remove Local SSD configurations to use Confidential VM with "
-                            "Intel TDX on a c3-standard-* shape, or target n2d (AMD "
-                            "SEV/SEV_SNP) if both Confidential VM and Local SSDs are required."
+                            "Intel TDX on a c4-standard-* shape, or target c3-standard-*-lssd "
+                            f"(with {FIELD_EPHEMERAL_LOCAL_SSD}) or n2d (AMD SEV/SEV_SNP) if "
+                            "both Confidential VM and Local SSDs are required."
                         ),
                     )
                 )
             elif target_machine_type and (
-                not target_machine_type.startswith(C3_TDX_ALLOWED_SHAPE_PREFIX)
+                not target_machine_type.startswith(C4_TDX_ALLOWED_SHAPE_PREFIX)
                 or target_machine_type.endswith(LSSD_MACHINE_SUFFIX)
             ):
                 blockers.append(
@@ -1173,12 +1259,13 @@ def _evaluate_security(
                         field=FIELD_MACHINE_TYPE,
                         message=(
                             f"Target machine shape {target_machine_type} does not support "
-                            "Confidential VM with Intel TDX on c3 (only c3-standard-* shapes "
+                            "Confidential VM with Intel TDX on c4 (only c4-standard-* shapes "
                             "without Local SSDs support Intel TDX)."
                         ),
                         remediation=(
-                            "Select a c3-standard-* shape (without -lssd) for Confidential VM "
-                            "with Intel TDX."
+                            "Select a c4-standard-* shape (without -lssd) for Confidential VM "
+                            "with Intel TDX on c4, or use c3-standard-*-lssd with "
+                            f"{FIELD_EPHEMERAL_LOCAL_SSD} if Local SSD ephemeral storage is required."
                         ),
                     )
                 )
@@ -1199,7 +1286,7 @@ def _evaluate_security(
                 )
             )
 
-    return blockers
+    return blockers, warnings
 
 
 def _evaluate_disk_and_local_ssd(
@@ -1716,17 +1803,18 @@ def evaluate_node_pool_transition(
     source_family = extract_machine_family(source_machine_type)
 
     blockers: list[Finding] = []
-    blockers.extend(
-        _evaluate_security(
-            config,
-            cluster,
-            source_family,
-            parsed_family,
-            effective_target_shape,
-            node_pool=node_pool,
-            source_machine_type=source_machine_type,
-        )
+    warnings: list[Finding] = []
+    sec_blockers, sec_warnings = _evaluate_security(
+        config,
+        cluster,
+        source_family,
+        parsed_family,
+        effective_target_shape,
+        node_pool=node_pool,
+        source_machine_type=source_machine_type,
     )
+    blockers.extend(sec_blockers)
+    warnings.extend(sec_warnings)
     blockers.extend(
         _evaluate_disk_and_local_ssd(
             config,
@@ -1745,6 +1833,7 @@ def evaluate_node_pool_transition(
         require_dynamic_rwo=require_dynamic_rwo,
     )
     blockers.extend(ver_blockers)
+    warnings.extend(ver_warnings)
 
     return TransitionResult(
         node_pool=pool_name,
@@ -1753,7 +1842,7 @@ def evaluate_node_pool_transition(
         target_family=parsed_family,
         target_machine_type=effective_target_shape,
         blockers=tuple(blockers),
-        warnings=tuple(ver_warnings),
+        warnings=tuple(warnings),
     )
 
 
