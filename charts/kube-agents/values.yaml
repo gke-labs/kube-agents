@@ -374,6 +374,16 @@ litellm:
   # same name here. envFrom does not roll the pods on a Secret change:
   # `kubectl rollout restart deployment/litellm` after rotating it.
   envFromSecret: ""
+  masterKey:
+    # The gateway's admin key, in the litellm-master-key Secret (key
+    # LITELLM_MASTER_KEY). true: the chart generates it on first install and
+    # keeps it across upgrades with lookup. false: the chart renders no Secret
+    # and reads litellm-master-key only if you created it; without it the
+    # gateway runs with no admin key, and the caller-auth hook still checks
+    # every caller. Set false where the chart is rendered offline (Argo CD and
+    # other helm template pipelines), where lookup finds nothing and a
+    # generated key would change on every render.
+    generate: true
   # Empty selects the per-provider default (mirrors common.sh).
   # A Claude model (anthropic, vertex_ai with a claude-* name, or sap with an
   # anthropic--* name) gets

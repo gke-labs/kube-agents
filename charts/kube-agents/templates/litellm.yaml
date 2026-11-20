@@ -205,10 +205,14 @@
 {{- $existingMasterKeySecret := lookup "v1" "Secret" .Release.Namespace $masterKeySecretName }}
 {{- $existingMasterKey := get ((get ($existingMasterKeySecret | default dict) "data") | default dict) $masterKeySecretKey }}
 {{- $masterKey := ternary ($existingMasterKey | b64dec) (printf "%s%s" $masterKeyPrefix (randAlphaNum $masterKeyLength)) (not (empty $existingMasterKey)) }}
+{{- /* litellm.masterKey.generate=false (offline renders): no Secret here, and
+       the gateway reads one only if someone created it. */}}
+{{- $generateMasterKey := ne ((.Values.litellm.masterKey | default dict).generate) false }}
 {{- /*
   The caller-key map: digests of the caller keys and their classes, never a
-  key. The operator writes this Secret; until it does, the optional volume is
-  empty and the hook knows no caller key, which leaves every caller keyless.
+  key. Nothing in the install writes this Secret yet (the operator is to);
+  until something does, the optional volume is empty and the hook knows no
+  caller key, which leaves every caller keyless.
   Mounted as a directory, not subPath, so the kubelet's in-place updates
   reach the file and the hook's re-read sees them without a restart. The
   directory and file name are the hook's DEFAULT_CALLER_KEYS_FILE.
@@ -358,6 +362,7 @@ data:
   litellm_session_affinity_callback.py: |
     {{- $sessionAffinitySource | nindent 4 }}
   {{- end }}
+{{- if $generateMasterKey }}
 ---
 apiVersion: v1
 kind: Secret
@@ -370,6 +375,7 @@ metadata:
 type: Opaque
 stringData:
   {{ $masterKeySecretKey }}: {{ $masterKey | quote }}
+{{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
 {{- /* Nothing else creates this one. The Platform Agent's KSA can be left to
@@ -491,15 +497,25 @@ spec:
             - name: HOME
               value: /tmp
             # The master key general_settings.master_key reads, from the Secret
-            # rendered above. Not optional: the chart renders the Secret in the
-            # same release, so a pod without it is a broken install and fails
-            # to start rather than booting with no admin key. Callers never
-            # get it; the caller-auth hook admits them by their own keys.
+            # rendered above. Not optional when the chart generates it: the
+            # Secret is in the same release, so a pod without it is a broken
+            # install and fails to start rather than booting with no admin key.
+            # With litellm.masterKey.generate=false the chart renders no Secret,
+            # so the reference is optional, and LiteLLM needs the permit below
+            # to boot without one. Callers never get it; the caller-auth hook
+            # admits them by their own keys.
             - name: {{ $masterKeySecretKey }}
               valueFrom:
                 secretKeyRef:
                   name: {{ $masterKeySecretName }}
                   key: {{ $masterKeySecretKey }}
+                  {{- if not $generateMasterKey }}
+                  optional: true
+                  {{- end }}
+            {{- if not $generateMasterKey }}
+            - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
+              value: "true"
+            {{- end }}
             {{- $retryAfter := int ($fallback.retryAfterSeconds | default 0) }}
             {{- if gt $retryAfter 8 }}
             # LiteLLM applies router_settings.retry_after as the floor of its pause

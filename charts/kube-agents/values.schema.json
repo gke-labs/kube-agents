@@ -201,6 +201,15 @@
         "envFromSecret": {
           "type": "string"
         },
+        "masterKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "generate": {
+              "type": "boolean"
+            }
+          }
+        },
         "maxTokens": {
           "type": "integer",
           "minimum": 0

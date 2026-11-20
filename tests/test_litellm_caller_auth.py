@@ -465,6 +465,20 @@ class TestChartRender(unittest.TestCase):
         configmap = next(d for d in documents if d["kind"] == "ConfigMap")
         self.assertNotIn(value, json.dumps(configmap))
 
+    def test_an_offline_render_generates_no_master_key_and_boots_without_one(self):
+        # litellm.masterKey.generate=false: lookup finds nothing under helm template,
+        # so a generated key would change on every render. No Secret, an optional
+        # reference, and the permit LiteLLM needs to boot with no master key.
+        documents = self._documents(["--set", "litellm.masterKey.generate=false"])
+        self.assertFalse([d for d in documents if d["kind"] == "Secret" and d["metadata"]["name"] == _MASTER_SECRET])
+        deployment = next(d for d in documents if d["kind"] == "Deployment" and d["metadata"]["name"] == "litellm")
+        env = {e["name"]: e for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
+        self.assertEqual(env[_PERMIT_ENV]["value"], "true")
+        ref = env["LITELLM_MASTER_KEY"]["valueFrom"]["secretKeyRef"]
+        self.assertEqual((ref["name"], ref["key"], ref.get("optional")), (_MASTER_SECRET, "LITELLM_MASTER_KEY", True))
+        config = yaml.safe_load(next(d for d in documents if d["kind"] == "ConfigMap")["data"]["config.yaml"])
+        self.assertEqual(config["general_settings"], {"master_key": _MASTER_KEY_REF, "custom_auth": _CUSTOM_AUTH})
+
     def test_the_hook_source_feeds_the_rollout_checksum(self):
         # A subPath ConfigMap mount never updates in place; only the checksum rolls the pods.
         template = (_CHART / "templates" / "litellm.yaml").read_text()
