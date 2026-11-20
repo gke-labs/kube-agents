@@ -1121,6 +1121,15 @@
 # fixture, 200s default until it has a record.
 ./tasks/cluster-agent-storage-audit-collector/task.yaml
 
+# The cluster profile's version-control write path (#6380): a task submitted
+# as a structured confirm ([bench:profile ... intent=confirm]) asks the
+# `cluster` profile to open a pull request adding a PodDisruptionBudget for
+# the no-pdb-workload fixture on the job's GitOps repository, graded on that
+# pull request (pull_request_opened, the budget file only) and an unchanged
+# cluster. deployer: noop. Red until #4457 (the structured confirm) and #6168
+# (the persona's version-control skill) land; its record shows when they do.
+./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
+
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
 # verdict lines: the cause is the missing class and not a stockout, and the
