@@ -35,7 +35,11 @@
 #      allowPrivilegeEscalation false, all capabilities dropped and none added, the default
 #      procMount, no privileged container. Without it a pod under the session account could still
 #      reach the node, and the other pods' tokens on it.
-#   7. No environment variable read from a Secret.
+#   7. No environment read from a Secret but one variable: ANTHROPIC_API_KEY, from key `api-key`
+#      of `<name>-inference-key-a2a-session`, not optional. That is the session's inference key,
+#      the one Secret the session pod may read; no envFrom secretRef, no other Secret, key or
+#      variable name. The name derives from the requester, so one install's gateway cannot hand
+#      its session pods another install's key. Init containers are refused by item 5.
 #   8. Exactly the two session labels the gateway stamps (part-of a2a-next, component a2a-session):
 #      without one the session NetworkPolicy does not select the pod; with another workload's label
 #      added, that workload's policies and Services would.
@@ -58,6 +62,9 @@
 #     policy, not that the API server still enforces it.
 #   - It selects the requester by ServiceAccount name. Any ServiceAccount named `*-a2a-gateway` is
 #     held to it, in any namespace; a gateway that ran under another name would not be.
+#   - Item 7 checks the session key reference by name only. It does not check that the Secret
+#     exists or what it holds. A pod naming a missing Secret fails to start rather than reading
+#     another.
 #   - configMap volumes are allowed whatever their name: the session pod mounts the bus's CA from
 #     one, and ConfigMaps hold no credentials in this install.
 #   - A mutating webhook that adds any other scheduling field (a nodeSelector, a toleration, a
@@ -86,6 +93,11 @@ metadata:
   labels:
     app.kubernetes.io/name: kube-agents
     app.kubernetes.io/part-of: kube-agents
+  annotations:
+    # This copy admits a session pod's inference key reference (item 7). An operator that gives the
+    # gateway the key's Secret name reads this off the live policy first, so a cluster holding an
+    # older copy, which refuses every secretKeyRef, is given no reference to refuse.
+    kubeagents.x-k8s.io/allows-session-inference-key: "true"
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -106,8 +118,12 @@ spec:
   variables:
     - name: gateway
       expression: "request.userInfo.username.split(':')[3]"
+    - name: agent
+      expression: "variables.gateway.substring(0, variables.gateway.size() - size('-a2a-gateway'))"
     - name: sessionAccount
-      expression: "variables.gateway.substring(0, variables.gateway.size() - size('-a2a-gateway')) + '-a2a-session'"
+      expression: "variables.agent + '-a2a-session'"
+    - name: sessionKeySecret
+      expression: "variables.agent + '-inference-key-a2a-session'"
     - name: volumes
       expression: "has(object.spec.volumes) ? object.spec.volumes : []"
     - name: containers
@@ -177,11 +193,19 @@ spec:
           (!has(c.securityContext.appArmorProfile) || c.securityContext.appArmorProfile.type != 'Unconfined'))
       message: "a pod the A2A gateway creates must run its containers unprivileged: allowPrivilegeEscalation false, all capabilities dropped and none added, the default procMount, non-root, and no Unconfined seccomp or AppArmor"
       reason: Forbidden
+    # The one Secret read: the session's inference key, by exact variable name,
+    # Secret, key, and not optional.
     - expression: >-
         variables.containers.all(c,
           (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef))) &&
-          (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef))))
-      message: "a pod the A2A gateway creates may not read environment from a Secret"
+          (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) ||
+            (e.name == 'ANTHROPIC_API_KEY' &&
+             has(e.valueFrom.secretKeyRef.name) && e.valueFrom.secretKeyRef.name == variables.sessionKeySecret &&
+             e.valueFrom.secretKeyRef.key == 'api-key' &&
+             (!has(e.valueFrom.secretKeyRef.optional) || !e.valueFrom.secretKeyRef.optional)))))
+      messageExpression: >-
+        'a pod the A2A gateway creates may not read environment from a Secret, except ANTHROPIC_API_KEY from key api-key of ' +
+        variables.sessionKeySecret + ', not optional'
       reason: Forbidden
     # Exactly the two session labels: a missing one drops the pod out of the
     # session NetworkPolicy, and an extra one (another workload's app label, the

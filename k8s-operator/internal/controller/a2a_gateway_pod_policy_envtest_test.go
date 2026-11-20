@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -53,6 +54,14 @@ const (
 	gatewayPodPolicyAgent     = "pa"
 	// How long the API server may take to start enforcing a policy it just stored.
 	gatewayPodPolicyActivation = 30 * time.Second
+	// The session's inference key: the one Secret a session pod may read, by
+	// this variable name and key.
+	gatewaySessionKeySecret = gatewayPodPolicyAgent + "-inference-key-a2a-session"
+	gatewaySessionKeyEnv    = "ANTHROPIC_API_KEY"
+	gatewaySessionKeyKey    = "api-key"
+	// The annotation the operator reads off the live policy before it hands the
+	// gateway the session key's Secret name.
+	gatewayPodPolicySessionKeyAnnotation = "kubeagents.x-k8s.io/allows-session-inference-key"
 )
 
 // TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape runs the shipped
@@ -69,9 +78,19 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 	ctx := context.Background()
 	applyAdmissionPolicyFile(ctx, t, admin, gatewayPodPolicyFile)
 
+	// The operator gates the session key reference on this annotation; the
+	// policy that admits the reference carries it.
+	vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+	if err := admin.Get(ctx, client.ObjectKey{Name: "kube-agents-a2a-gateway-pod"}, vap); err != nil {
+		t.Fatal(err)
+	}
+	if got := vap.Annotations[gatewayPodPolicySessionKeyAnnotation]; got != "true" {
+		t.Errorf("policy annotation %s = %q, want \"true\"", gatewayPodPolicySessionKeyAnnotation, got)
+	}
+
 	ns := gatewayPodPolicyNamespace
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
-	for _, sa := range []string{gatewayPodPolicyAgent + "-a2a-gateway", gatewayPodPolicyAgent + "-a2a-session", gatewayPodPolicyAgent, "other-a2a-gateway"} {
+	for _, sa := range []string{gatewayPodPolicyAgent + "-a2a-gateway", gatewayPodPolicyAgent + "-a2a-session", gatewayPodPolicyAgent, "other-a2a-gateway", "other-a2a-session"} {
 		mustCreate(ctx, t, admin, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: sa, Namespace: ns}})
 	}
 	// The gateway Role's pod verbs, for both gateway-named identities.
@@ -139,8 +158,10 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 			p.Spec.SchedulerName = "gke.io/optimize-utilization-scheduler"
 			p.Spec.Tolerations = autopilotTolerations()
 		},
-		"the session pod with the default scheduler": func(p *corev1.Pod) { p.Spec.SchedulerName = "default-scheduler" },
-		"the session pod under a zero-value class":   func(p *corev1.Pod) { p.Spec.PriorityClassName = "zero" },
+		"the session pod with the default scheduler":          func(p *corev1.Pod) { p.Spec.SchedulerName = "default-scheduler" },
+		"the session pod under a zero-value class":            func(p *corev1.Pod) { p.Spec.PriorityClassName = "zero" },
+		"the session pod with its inference key":              withSessionKey(nil),
+		"the session pod with its inference key not optional": withSessionKey(func(s *corev1.SecretKeySelector) { s.Optional = ptr.To(false) }),
 	} {
 		if err := gateway.Create(ctx, sessionPod(strings.ReplaceAll(name, " ", "-"), mutate)); err != nil {
 			t.Errorf("%s: refused, want admitted: %v", name, err)
@@ -224,6 +245,34 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		"envFrom a Secret": {func(p *corev1.Pod) {
 			p.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "x"}}}}
 		}, secretEnv},
+		// The session key is the one Secret read, and only in its exact shape:
+		// each case changes one field of the admitted reference.
+		"envFrom the session key's Secret": {func(p *corev1.Pod) {
+			p.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: gatewaySessionKeySecret}}}}
+		}, secretEnv},
+		"the session key's variable from the platform agent's Secret": {withSessionKey(func(s *corev1.SecretKeySelector) { s.Name = "platform-agent-secrets" }), secretEnv},
+		"the session key's variable from the master key":              {withSessionKey(func(s *corev1.SecretKeySelector) { s.Name = "litellm-master-key" }), secretEnv},
+		"the session key's variable from the agent's class key": {withSessionKey(func(s *corev1.SecretKeySelector) {
+			s.Name = gatewayPodPolicyAgent + "-inference-key-a2a-gateway"
+		}), secretEnv},
+		"the session key's Secret under another key": {withSessionKey(func(s *corev1.SecretKeySelector) { s.Key = "pending" }), secretEnv},
+		"the session key under another variable": {func(p *corev1.Pod) {
+			withSessionKey(nil)(p)
+			p.Spec.Containers[0].Env[len(p.Spec.Containers[0].Env)-1].Name = "OPENAI_API_KEY"
+		}, secretEnv},
+		"the session key, optional": {withSessionKey(func(s *corev1.SecretKeySelector) { s.Optional = ptr.To(true) }), secretEnv},
+		"the session key beside another Secret read": {func(p *corev1.Pod) {
+			withSessionKey(nil)(p)
+			p.Spec.Containers[0].Env = append(p.Spec.Containers[0].Env, corev1.EnvVar{Name: "K", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "platform-agent-secrets"}, Key: "k"},
+			}})
+		}, secretEnv},
+		// Init containers are refused whole, before their env is read.
+		"an init container reading another Secret": {func(p *corev1.Pod) {
+			p.Spec.InitContainers = []corev1.Container{{Name: "init", Image: "busybox", Env: []corev1.EnvVar{{Name: "K", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "platform-agent-secrets"}, Key: "k"},
+			}}}}}
+		}, host},
 		"no session label":   {func(p *corev1.Pod) { delete(p.Labels, "app.kubernetes.io/component") }, labels},
 		"an extra label":     {func(p *corev1.Pod) { p.Labels["app"] = "pa-gateway" }, labels},
 		"a runtimeClassName": {func(p *corev1.Pod) { p.Spec.RuntimeClassName = ptr.To("gvisor") }, scheduling},
@@ -289,6 +338,16 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 	other := impersonatedClient(t, cfg, ns, "other-a2a-gateway")
 	if err := other.Create(ctx, sessionPod("other", nil)); err == nil || !strings.Contains(err.Error(), "must run as other-a2a-session") {
 		t.Errorf("another gateway creating a pod as pa-a2a-session: %v, want refused for other-a2a-session", err)
+	}
+	// The session key follows the requester's name too: another install's
+	// gateway, running its pod as its own session account, may not read this
+	// install's key.
+	asOther := sessionPod("other-key", func(p *corev1.Pod) {
+		p.Spec.ServiceAccountName = "other-a2a-session"
+		withSessionKey(nil)(p)
+	})
+	if err := other.Create(ctx, asOther); err == nil || !strings.Contains(err.Error(), "api-key of other-inference-key-a2a-session") {
+		t.Errorf("another gateway reading %s: %v, want refused for other-inference-key-a2a-session", gatewaySessionKeySecret, err)
 	}
 
 	// Not selected: the same out-of-shape pod from an identity that is not a gateway.
@@ -359,6 +418,19 @@ func sessionPod(name string, mutate func(*corev1.Pod)) *corev1.Pod {
 		mutate(p)
 	}
 	return p
+}
+
+// withSessionKey adds the session's inference key reference the policy admits
+// to the session pod's container, with mutate applied to the reference when it
+// is not nil.
+func withSessionKey(mutate func(*corev1.SecretKeySelector)) func(*corev1.Pod) {
+	return func(p *corev1.Pod) {
+		ref := &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: gatewaySessionKeySecret}, Key: gatewaySessionKeyKey}
+		if mutate != nil {
+			mutate(ref)
+		}
+		p.Spec.Containers[0].Env = append(p.Spec.Containers[0].Env, corev1.EnvVar{Name: gatewaySessionKeyEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: ref}})
+	}
 }
 
 func withClusterViewToken(p *corev1.Pod) {
