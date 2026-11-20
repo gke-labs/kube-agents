@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,6 +170,34 @@ func TestAKeyedHomePostRecordsItsThread(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("a keyed reply into a named thread was recorded: %v", got)
+	}
+	// A keyed post too long for one message opens its thread in chunks,
+	// and is recorded the same.
+	p.landsIn = testHome + "/threads/T2"
+	if r := serveJSON(t, n, lib.NotifyRequest{Text: strings.Repeat("x", discordChunk+10), Update: "alert-s3"}); r.Error != "" {
+		t.Fatalf("long keyed post: %+v", r)
+	}
+	if want := lib.NotifyPlatformGchat + "|" + testHome + "|" + testHome + "/threads/T2"; len(got) != 2 || got[1] != want {
+		t.Fatalf("recorded = %v, want the long post's %s second", got, want)
+	}
+}
+
+// TestTheThreadRecordIsKeptOnlyWhereTheModeIsOn: an install that takes a
+// thread delivery from no source records nothing, so it needs no bucket; one
+// that takes it from some source records its keyed posts' threads.
+func TestTheThreadRecordIsKeptOnlyWhereTheModeIsOn(t *testing.T) {
+	t.Parallel()
+	off := startRig(t)
+	nOff := newTestNotifier(t, &fakeNotifyPoster{})
+	off.g.SetHomeReporters(nOff)
+	if nOff.threadRecorder != nil {
+		t.Fatal("a recorder was set with the mode off")
+	}
+	on := startRigWith(t, func(c *Config) { c.TriggerThreadSources = []string{"schedule"} })
+	nOn := newTestNotifier(t, &fakeNotifyPoster{})
+	on.g.SetHomeReporters(nOn)
+	if nOn.threadRecorder == nil {
+		t.Fatal("no recorder was set with the mode on")
 	}
 }
 

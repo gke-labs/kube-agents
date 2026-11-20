@@ -129,6 +129,7 @@ func TestAThreadDeliveryNamesItsThreadAndOnlyItDoes(t *testing.T) {
 		"a source outside a2a-":         func(d *ScheduleDelivery) { d.IncidentSource = "kanban" },
 		"a source with an upper letter": func(d *ScheduleDelivery) { d.IncidentSource = "a2a-Triage" },
 		"an overlong source":            func(d *ScheduleDelivery) { d.IncidentSource = "a2a-" + strings.Repeat("a", 29) },
+		"the scheduled reports' source": func(d *ScheduleDelivery) { d.IncidentSource = IncidentSourceSchedule },
 		"a bad job key":                 func(d *ScheduleDelivery) { d.JobKey = "has.dot" },
 		"chat mode naming a thread":     func(d *ScheduleDelivery) { d.Mode = ScheduleDeliveryChat },
 		"local mode naming a source": func(d *ScheduleDelivery) {

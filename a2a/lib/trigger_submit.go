@@ -112,9 +112,17 @@ const scheduleDeliveryTargetMaxLen = 256
 // replace (same source only) never reaches a row another writer stored.
 var incidentSourcePattern = regexp.MustCompile(`^a2a-[a-z0-9-]{1,28}$`)
 
-// ValidIncidentSource reports whether s is an incident source the gateway
-// writes under.
-func ValidIncidentSource(s string) bool { return incidentSourcePattern.MatchString(s) }
+// IncidentSourceSchedule is the scheduled reports' incident source, the
+// bridge's default (a2a/hermes-bridge/report_incident.go): reserved, so a
+// thread delivery's rows never replace a scheduled report's.
+const IncidentSourceSchedule = "a2a-schedule"
+
+// ValidIncidentSource reports whether s is an incident source a thread
+// delivery may write under: one of the gateway's, never the scheduled
+// reports'.
+func ValidIncidentSource(s string) bool {
+	return s != IncidentSourceSchedule && incidentSourcePattern.MatchString(s)
+}
 
 // IncidentSourceOf is d's incident source: its own, or the default.
 func (d ScheduleDelivery) IncidentSourceOf() string {

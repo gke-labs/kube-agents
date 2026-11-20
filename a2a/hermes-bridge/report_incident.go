@@ -52,7 +52,7 @@ const (
 	// lets a replace update only a row the same source wrote, so a report
 	// the relay, the kanban notifier or a triage card stored in a home
 	// thread is never overwritten by a scheduled report.
-	incidentStoreSource = "a2a-schedule"
+	incidentStoreSource = lib.IncidentSourceSchedule
 	// incidentStoreKept is session-kv's answer when the thread's row is
 	// another writer's and was left as it was.
 	incidentStoreKept = "kept"

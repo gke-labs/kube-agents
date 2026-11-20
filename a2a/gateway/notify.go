@@ -913,6 +913,11 @@ func (n *Notifier) post(job notifyJob) {
 			n.reply(job, lib.NotifyReply{MessageID: first, ThreadID: thread})
 		}
 	}
+	if job.req.Conversation == "" && job.req.Update != "" && job.req.Thread == "" && thread != "" && n.threadRecorder != nil {
+		// A keyed home post too long for postHome opened its thread here,
+		// in chunks: on the record as postHome's would be.
+		n.threadRecorder(n.backend, job.home, thread)
+	}
 	n.log.Info("notify posted", "home", job.home, "thread", thread, "message", first)
 }
 

@@ -163,7 +163,7 @@ func TestAnIncidentKeepsTheSourceItNames(t *testing.T) {
 			t.Fatalf("source %q: writes = %v, want source %q", tc.source, got, tc.want)
 		}
 	}
-	for _, bad := range []string{"kanban", "a2a-Triage", "a2a-", "a2a-" + strings.Repeat("a", 29)} {
+	for _, bad := range []string{"kanban", "a2a-Triage", "a2a-", "a2a-" + strings.Repeat("a", 29), lib.IncidentSourceSchedule} {
 		kv := &incidentKV{}
 		b := incidentBridge(t, kv)
 		k := keep

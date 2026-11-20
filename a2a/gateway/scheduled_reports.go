@@ -222,8 +222,12 @@ func (g *Gateway) SetHomeReporters(routes ...*Notifier) {
 		if n != nil && n.poster != nil {
 			reporters = append(reporters, n)
 			// The threads its keyed home posts open, for a thread
-			// delivery to name (notify_threads.go).
-			n.setThreadRecorder(g.recordNotifyThread)
+			// delivery to name (notify_threads.go): only on an install
+			// that takes the mode from some source, so the rest write
+			// nothing and need no bucket.
+			if len(g.cfg.TriggerThreadSources) > 0 {
+				n.setThreadRecorder(g.recordNotifyThread)
+			}
 		}
 	}
 	g.setHomeReporters(reporters...)
