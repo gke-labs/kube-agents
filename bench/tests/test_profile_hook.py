@@ -48,6 +48,10 @@ def test_a_profile_with_no_parameters_carries_none() -> None:
         ("[bench:profile name=My_Prof] ask", "not a profile's name"),
         ("[bench:profile name=cluster] [bench:stop-in-card-wait] ask", "may follow"),
         ("[bench:profile name=cluster]\n[bench:stop-after-first-card] ask", "may follow"),
+        ("[bench:profile name=cluster intent=cancel] ask", "intent=cancel is not one"),
+        ("[bench:profile name=cluster intent=Confirm] ask", "intent=Confirm is not one"),
+        ("[bench:profile name=cluster intent=] ask", "is not key=value"),
+        ("[bench:profile name=cluster intent=confirm intent=confirm] ask", "given twice"),
     ],
 )
 def test_a_malformed_directive_is_refused(prompt: str, why: str) -> None:
@@ -58,3 +62,23 @@ def test_a_malformed_directive_is_refused(prompt: str, why: str) -> None:
 def test_is_profile_ask_reads_only_an_opening_directive() -> None:
     assert profile_hook.is_profile_ask("  [bench:profile name=cluster] ask")
     assert not profile_hook.is_profile_ask("[bench:stop-after-first-card]\n[bench:profile name=cluster] ask")
+
+
+def test_intent_confirm_is_the_asks_intent_and_not_a_parameter() -> None:
+    ask = profile_hook.parse("[bench:profile name=cluster intent=confirm project=p1] open the pull request")
+    assert ask is not None
+    assert ask.intent == "confirm"
+    assert ask.parameters == {"project": "p1"}
+    assert ask.prompt == "open the pull request"
+
+
+def test_a_directive_without_intent_sends_a_typed_message() -> None:
+    ask = profile_hook.parse("[bench:profile name=cluster project=p1] look at it")
+    assert ask is not None and ask.intent == ""
+
+
+def test_the_directives_intents_are_the_doors() -> None:
+    """Restated in profile_hook so the validator can load it alone; held equal here."""
+    from kube_agents_bench import inject_transport
+
+    assert profile_hook.INTENTS == inject_transport.INTENTS
