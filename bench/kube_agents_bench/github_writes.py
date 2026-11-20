@@ -553,9 +553,9 @@ class GitHubClient:
     def _refuse(status: int, repo: str, what: str, permission: str, payload: Any = None) -> None:
         if _is_rate_limit(status, payload):
             # A limit, not a permission: the grading App's installation is
-            # shared by every evals repository, so one hourly budget (#6105).
+            # shared by every evals repository of its shard, so one hourly budget (#6105).
             raise GitHubUnreadable(
-                f"GitHub rate-limited {what} on {repo} (answered {status}); the evals repositories "
+                f"GitHub rate-limited {what} on {repo} (answered {status}); the evals repositories of a shard "
                 "share one App installation's hourly budget, so this check could not be evaluated"
             )
         if status == STATUS_UNAUTHORIZED:

@@ -153,7 +153,7 @@ func TestTheRestorePodWidensForwardAndNotOnTheWayBack(t *testing.T) {
 		}
 		var created time.Time
 		for i := 1; i <= 2; i++ {
-			if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); err != nil {
+			if _, _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); err != nil {
 				t.Fatalf("snapshot %d, run %d: %v", c.snapshot, i, err)
 			}
 			info, err := streamInfo(ctx, nc, "TASKS")
@@ -187,7 +187,7 @@ func TestTheRestorePodWidensForwardAndNotOnTheWayBack(t *testing.T) {
 	defer nc.Close()
 	var created time.Time
 	for i := 1; i <= 2; i++ {
-		if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 1); err != nil {
+		if _, _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 1); err != nil {
 			t.Fatalf("way back, run %d: %v", i, err)
 		}
 		info, err := streamInfo(ctx, nc, "TASKS")

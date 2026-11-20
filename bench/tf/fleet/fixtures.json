@@ -1479,7 +1479,7 @@
       "cluster_slot": null,
       "namespace": null,
       "probes": ["snapshot/declared-orphan-snap-*"],
-      "fixture": "declared-orphan-snap-<prefix>, a Persistent Disk snapshot whose source disk is gone: the stack's planter (main.tf, terraform_data.orphan_snapshots) snapshots a 10 GB throwaway disk and deletes it, and no snapshot schedule took the snapshot, so it is the GCE compute audit's orphaned-snapshots shape (section 2.5) once it is more than 90 full days old. The posture the pool project's GitOps knowledge/ note is to declare on purpose once that check is declarable, so the compute audit lists it under Declared intent rather than as a finding; orphan-snapshot is the undeclared control beside it. Not ready, rather than drifted, until day 91: creationTimestamp is server-set, and re-creating the snapshot restarts that clock. Project-scoped, as startup-fail-vm is",
+      "fixture": "declared-orphan-snap-<prefix>, a Persistent Disk snapshot whose source disk is gone: the stack's planter (main.tf, terraform_data.orphan_snapshots) snapshots a 10 GB throwaway disk and deletes it, and no snapshot schedule took the snapshot, so it is the GCE compute audit's orphaned-snapshots shape (section 2.5) once it is more than 90 full days old. The posture the pool project's GitOps knowledge/ note declares on purpose, so the compute audit lists it under Declared intent rather than as a finding; orphan-snapshot is the undeclared control beside it. Not ready, rather than drifted, until day 91: creationTimestamp is server-set, and re-creating the snapshot restarts that clock. Project-scoped, as startup-fail-vm is",
       "state": [
         {
           "subject": "snapshot/declared-orphan-snap-*",
@@ -1511,6 +1511,12 @@
           "op": "ready_after_hours",
           "value": 2184,
           "why": "the check flags a snapshot more than 90 full days old ((now - creationTimestamp).days > 90), so the fixture is invisible to the compute audit until day 91, 2184 hours; until then the role is not ready, not drifted, and the case waits for the date"
+        },
+        {
+          "subject": "repository/knowledge/notification-relay-no-pdb.md",
+          "path": null,
+          "op": "as_seeded",
+          "why": "the declaration this posture rests on lives in the same note as the other declared-* roles'; once the compute stream's declared-intent case grades it, a note missing or edited away from what provisioning seeds files the snapshot as a finding, and the case fails on a correct report"
         }
       ]
     },
