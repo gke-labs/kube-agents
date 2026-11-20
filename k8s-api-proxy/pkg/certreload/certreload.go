@@ -35,6 +35,8 @@ const (
 	DefaultCheckInterval = time.Second
 
 	pemTypeCertificate = "CERTIFICATE"
+	// pemBeginMarker opens every PEM block; parseCABundle counts them.
+	pemBeginMarker = "-----BEGIN "
 
 	// dialTimeout and dialKeepAlive match http.DefaultTransport's dialer.
 	dialTimeout   = 30 * time.Second
@@ -267,7 +269,7 @@ func NewCAPool(file string, opts Options) (*CAPool, error) {
 
 func parseCABundle(data []byte) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
-	count := 0
+	count, blocks := 0, 0
 	rest := data
 	for {
 		var block *pem.Block
@@ -275,6 +277,7 @@ func parseCABundle(data []byte) (*x509.CertPool, error) {
 		if block == nil {
 			break
 		}
+		blocks++
 		if block.Type != pemTypeCertificate {
 			continue
 		}
@@ -287,6 +290,11 @@ func parseCABundle(data []byte) (*x509.CertPool, error) {
 	}
 	if len(bytes.TrimSpace(rest)) > 0 {
 		return nil, errors.New("trailing data is not a complete PEM block")
+	}
+	// pem.Decode skips a block it cannot decode and returns the next one, so a corrupt
+	// block followed by a good one leaves no trailing data: count the markers instead.
+	if markers := bytes.Count(data, []byte(pemBeginMarker)); markers != blocks {
+		return nil, fmt.Errorf("%d of %d PEM blocks could not be decoded", markers-blocks, markers)
 	}
 	if count == 0 {
 		return nil, errors.New("no CERTIFICATE block")
