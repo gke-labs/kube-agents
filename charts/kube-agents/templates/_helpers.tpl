@@ -3564,7 +3564,6 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- $busOne := eq (toString ((((.Values.platformAgent | default dict).harness | default dict).tuning | default dict).busReplicas)) "1" -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
-      {{- $surges := $workload.surges -}}
       {{- if and $busOne (eq $key "a2aNats") -}}
         {{- $n := $workload.pods | default 1 | int64 -}}
         {{- $workload = dict "pods" 1 "surges" $workload.surges
@@ -3594,7 +3593,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
       {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
       {{- $pods := $workload.pods | default 0 | int64 -}}
-      {{- if and $surges (gt $pods (int64 0)) -}}
+      {{- if and $workload.surges (gt $pods (int64 0)) -}}
         {{- $surgeCpuReq = max $surgeCpuReq (div ($workload.cpuMillisRequest | default 0 | int64) $pods) -}}
         {{- $surgeCpuLim = max $surgeCpuLim (div ($workload.cpuMillisLimit | default 0 | int64) $pods) -}}
         {{- $surgeMemReq = max $surgeMemReq (div ($workload.memoryBytesRequest | default 0 | int64) $pods) -}}

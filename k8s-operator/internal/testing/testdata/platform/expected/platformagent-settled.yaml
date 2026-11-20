@@ -1372,27 +1372,6 @@ spec:
     - Egress
 ---
 apiVersion: v1
-data:
-  token: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-kind: Secret
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: kube-agents
-  name: platformagent-credential-proxy-control
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-type: Opaque
----
-apiVersion: v1
 kind: Service
 metadata:
   labels:
@@ -1445,10 +1424,7 @@ spec:
       app: platformagent-credential-proxy
       kubeagents.x-k8s.io/component: credential-proxy
   strategy:
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
-    type: RollingUpdate
+    type: Recreate
   template:
     metadata:
       annotations:
@@ -1567,10 +1543,6 @@ spec:
               value: /var/run/secrets/kubeagents/audit-report-store/token
             - name: CREDENTIAL_PROXY_REPORT_PROFILES
               value: fleet-audit,platform
-            - name: CREDENTIAL_PROXY_STANDBY
-              value: "1"
-            - name: CREDENTIAL_PROXY_CONTROL_FILE
-              value: /var/run/secrets/kubeagents/control/token
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
@@ -1582,13 +1554,13 @@ spec:
             - containerPort: 8768
               name: cred-health
           readinessProbe:
-            failureThreshold: 2
+            failureThreshold: 3
             httpGet:
               path: /healthz
               port: cred-health
-            initialDelaySeconds: 2
-            periodSeconds: 2
-            timeoutSeconds: 2
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
           resources:
             limits:
               cpu: "2"
@@ -1630,9 +1602,6 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
-              readOnly: true
-            - mountPath: /var/run/secrets/kubeagents/control
-              name: credential-proxy-control
               readOnly: true
             - mountPath: /etc/a2a-tiers
               name: a2a-tiers
@@ -1713,10 +1682,6 @@ spec:
                   audience: kubeagents-audit-report-store
                   expirationSeconds: 3600
                   path: token
-        - name: credential-proxy-control
-          secret:
-            defaultMode: 256
-            secretName: platformagent-credential-proxy-control
         - configMap:
             name: platformagent-a2a-tiers
             optional: true

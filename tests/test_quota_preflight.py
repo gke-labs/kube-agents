@@ -148,13 +148,16 @@ _DASHBOARD_REQUEST_MILLIS = 256
 _DASHBOARD_LIMIT_MILLIS = 1000
 # One agent pod (base + dashboard + hermes-bridge) as requested.
 _AGENT_POD_REQUEST_MILLIS = 1756
+# The agent pod's ephemeral-storage request, the only one among the operator-rendered
+# workloads that ever sizes a surge.
+_AGENT_POD_EPHEMERAL_REQUEST_BYTES = 3 * 1024**3
 # The replica count at which the operator switches the gateway Deployment from Recreate to
 # RollingUpdate (resolveDeploymentReplicasAndStrategy), and so the first one whose rollout
 # creates a surge Pod.
 _HA_REPLICAS = 2
-# The largest pod that rolls with a surge Pod at defaults: credential-proxy, at a 500m CPU request.
-# The agent pod is larger (1756m) but rolls with Recreate at the default single replica.
-_LARGEST_SURGING_REQUEST_MILLIS = 500
+# The largest pod that rolls with a surge Pod at defaults: LiteLLM, at a 100m CPU request.
+# The agent pod is larger but rolls with Recreate at the default single replica.
+_LARGEST_SURGING_REQUEST_MILLIS = 100
 # The operator's own request, sized to be livable as the limit an Autopilot cluster without
 # bursting clamps to, and inside the band GKE Autopilot admits unchanged beside 256Mi.
 _OPERATOR_REQUEST_MILLIS = 100
@@ -2277,8 +2280,9 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_the_patch_leaves_ephemeral_room_for_a_surge_pod(self) -> None:
         """A surge Pod brings its ephemeral storage with it, same as its CPU and memory.
 
-        Under active-standby RollingUpdate, credential-proxy carries the largest
-        ephemeral-storage surge (8Gi, above the 3Gi agent pod even at two replicas).
+        Asserted at two replicas because the agent pod is the only workload in the release
+        that requests ephemeral storage, and it rolls with a surge Pod only there: at the
+        default single replica the operator renders `strategy: Recreate`.
         """
         sets = [f"platformAgent.deployment.availability.replicas={_HA_REPLICAS}"]
         required = self._requirements(sets)
@@ -2291,7 +2295,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertIsNotNone(patch, f"no ephemeral patch value in:\n{res.stderr}")
         self.assertEqual(
             _parse_gib_or_mib(patch.group(1)),
-            required["requestsEphemeral"] + _PROXY_EPHEMERAL_LIMIT_BYTES,
+            required["requestsEphemeral"] + _AGENT_POD_EPHEMERAL_REQUEST_BYTES,
             "the patch must leave room for the surge Pod it promises",
         )
 
@@ -2401,7 +2405,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"45050m"', res.stderr)
+        self.assertIn('"limits.cpu":"43550m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -2421,8 +2425,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        # The release's 26368Mi, the session pods at the cap included, plus credential-proxy's 8Gi surge Pod.
-        self.assertIn('"limits.ephemeral-storage":"34560Mi"', res.stderr)
+        # The release's 26368Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"limits.ephemeral-storage":"27Gi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -2431,8 +2435,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 5936m, the session pods at the cap included, plus credential-proxy's 500m surge Pod.
-        self.assertIn('"cpu":"6436m"', res.stderr)
+        # The release's 5936m, the session pods at the cap included, plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"6036m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -2453,8 +2457,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        # The release's 26368Mi, the session pods at the cap included, plus credential-proxy's 8Gi surge Pod.
-        self.assertIn('"ephemeral-storage":"34560Mi"', res.stderr)
+        # The release's 26368Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"ephemeral-storage":"27Gi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""

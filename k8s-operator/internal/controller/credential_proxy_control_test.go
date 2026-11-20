@@ -30,6 +30,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -244,7 +246,7 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 		targetDep := buildCredentialProxyDeployment(agent, "hash-medium")
 		tOld := metav1.NewTime(time.Now().Add(-10 * time.Minute))
 		tNew := metav1.NewTime(time.Now())
-		oldDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil), "hash-small")
+		oldDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil), "hash-small")
 		oldPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              credentialProxyName(agent) + "-old",
@@ -392,7 +394,7 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 		})
 
 		targetDep := buildCredentialProxyDeployment(agent, "hash-medium")
-		oldDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil), "hash-small")
+		oldDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil), "hash-small")
 		oldPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        credentialProxyName(agent) + "-old",
@@ -547,7 +549,7 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 	t.Run("non-resource rollout with LimitRanger pod mutation cuts over and rollback ignores drained pod", func(t *testing.T) {
 		t.Parallel()
 		scheme := setupScheme()
-		agent := sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil)
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
 		rSeed := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 		if err := rSeed.ensureCredentialProxyControlSecret(context.Background(), agent); err != nil {
@@ -672,7 +674,7 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 	t.Run("rollback after drain with no active candidate deletes drained pod instead of deadlocking", func(t *testing.T) {
 		t.Parallel()
 		scheme := setupScheme()
-		agent := sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil)
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
 		rSeed := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 		if err := rSeed.ensureCredentialProxyControlSecret(context.Background(), agent); err != nil {
@@ -694,7 +696,7 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 		})
 
 		revertedDep := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
-		newDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileMedium, sizingProfileMedium, nil, nil), brokerTestPolicyHash)
+		newDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileAuto, sizingProfileMedium, nil, nil), brokerTestPolicyHash)
 		// OldPod matches the reverted template (Deployment will NOT replace it while it looks Ready),
 		// while the rolled-back surge pod has DeletionTimestamp set.
 		oldPod := &corev1.Pod{
@@ -763,17 +765,19 @@ func TestCredentialProxyOffClusterOperatorSkipsStandbyAndHandoff(t *testing.T) {
 
 	for _, tc := range []struct {
 		name              string
+		sizingProfile     string
 		operatorNamespace string
 		wantStandby       bool
 	}{
-		{name: "unset operator namespace", operatorNamespace: "", wantStandby: false},
-		{name: "invalid DNS-1123 operator namespace", operatorNamespace: "Bad_Namespace", wantStandby: false},
-		{name: "valid in-cluster operator namespace", operatorNamespace: "kubeagents-system", wantStandby: true},
+		{name: "auto unset operator namespace", sizingProfile: sizingProfileAuto, operatorNamespace: "", wantStandby: false},
+		{name: "auto invalid DNS-1123 operator namespace", sizingProfile: sizingProfileAuto, operatorNamespace: "Bad_Namespace", wantStandby: false},
+		{name: "auto valid in-cluster operator namespace", sizingProfile: sizingProfileAuto, operatorNamespace: "kubeagents-system", wantStandby: true},
+		{name: "fixed small in-cluster stays Recreate", sizingProfile: sizingProfileSmall, operatorNamespace: "kubeagents-system", wantStandby: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			scheme := setupScheme()
-			agent := sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil)
+			agent := sizingAgent(tc.sizingProfile, sizingProfileSmall, nil, nil)
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(agent).
@@ -811,9 +815,17 @@ func TestCredentialProxyOffClusterOperatorSkipsStandbyAndHandoff(t *testing.T) {
 				t.Fatalf("Deployment strategy = %s, want %s", dep.Spec.Strategy.Type, wantStrategy)
 			}
 
-			// When off-cluster (!tc.wantStandby), even a live pod must not trigger
-			// 2s handoff requeues or standby probing; in-cluster with a valid
-			// namespace proceeds to probe the standby pod via BrokerControlClient.
+			if !tc.wantStandby {
+				for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+					if env.Name == credentialProxyPeerHealthURLEnv {
+						t.Fatalf("Recreate broker must not carry %s", credentialProxyPeerHealthURLEnv)
+					}
+				}
+			}
+
+			// When off-cluster or fixed profile (!tc.wantStandby), even a live pod
+			// must not trigger 2s handoff requeues or standby probing; in-cluster
+			// under sizingProfile: auto proceeds to probe via BrokerControlClient.
 			livePod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        credentialProxyName(agent) + "-live",
@@ -856,15 +868,12 @@ func TestCredentialProxyOffClusterOperatorSkipsStandbyAndHandoff(t *testing.T) {
 					t.Fatalf("in-cluster warm standby pod state = %q, want active", srv.currentState())
 				}
 			} else {
-				if r.canControlBroker() {
-					t.Fatalf("expected canControlBroker() == false for off-cluster operatorNamespace %q", tc.operatorNamespace)
-				}
 				handoffReq, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, dep)
 				if err != nil {
 					t.Fatalf("reconcileCredentialProxyHandoff: %v", err)
 				}
 				if handoffReq != 0 || req != 0 {
-					t.Fatalf("off-cluster requeues handoff=%v initial=%v, want 0", handoffReq, req)
+					t.Fatalf("non-standby requeues handoff=%v initial=%v, want 0", handoffReq, req)
 				}
 			}
 		})
@@ -878,7 +887,7 @@ func TestCredentialProxyHandoffTransfersProfileTaskWrites(t *testing.T) {
 		t.Parallel()
 		for _, asyncDrain := range []bool{false, true} {
 			scheme := setupScheme()
-			agent := sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil)
+			agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
 			bearer := "test-control-secret-task-writes"
 			controlSecret := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -974,4 +983,90 @@ func TestCredentialProxyHandoffTransfersProfileTaskWrites(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestCredentialProxyLegacyUpgradeUsesRecreateUntilStandbyReady(t *testing.T) {
+	t.Parallel()
+	scheme := setupScheme()
+	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
+	legacyDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil), brokerTestPolicyHash)
+	legacyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      credentialProxyName(agent) + "-legacy",
+			Namespace: agent.Namespace,
+			Labels:    credentialProxySelector(agent),
+		},
+		Spec:   *legacyDep.Spec.Template.Spec.DeepCopy(),
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.41"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, legacyPod).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{
+		Client:            cl,
+		APIReader:         cl,
+		Scheme:            scheme,
+		OperatorNamespace: "kubeagents-system",
+	}
+
+	if _, err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
+		t.Fatalf("reconcile with legacy pod: %v", err)
+	}
+	dep := &appsv1.Deployment{}
+	depKey := types.NamespacedName{Name: credentialProxyName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), depKey, dep); err != nil {
+		t.Fatal(err)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Fatalf("strategy with live legacy pod = %s, want Recreate so old ReplicaSet scales to 0 without recreating active peer", dep.Spec.Strategy.Type)
+	}
+	hasStandby := false
+	for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == credentialProxyStandbyEnv && env.Value == credentialProxyStandbyEnabledValue {
+			hasStandby = true
+		}
+	}
+	if !hasStandby {
+		t.Fatalf("template during legacy upgrade lost %s=1", credentialProxyStandbyEnv)
+	}
+	templateHashDuringLegacy := dep.Spec.Template.Annotations[credentialProxyTemplateHashAnnotation]
+
+	if err := cl.Delete(context.Background(), legacyPod); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
+		t.Fatalf("reconcile after legacy pod deleted: %v", err)
+	}
+	if err := cl.Get(context.Background(), depKey, dep); err != nil {
+		t.Fatal(err)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Fatalf("strategy once legacy pod gone = %s, want RollingUpdate", dep.Spec.Strategy.Type)
+	}
+	if gotHash := dep.Spec.Template.Annotations[credentialProxyTemplateHashAnnotation]; gotHash != templateHashDuringLegacy {
+		t.Fatalf("strategy transition changed template hash %q -> %q", templateHashDuringLegacy, gotHash)
+	}
+}
+
+func TestCredentialProxyAutoNetworkPolicyAdmitsSiblingPeer(t *testing.T) {
+	t.Parallel()
+	defaultNP := buildCredentialProxyNetworkPolicy(sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil))
+	autoNP := buildCredentialProxyNetworkPolicy(sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil))
+
+	hasBrokerSelfPeer := func(peers []networkingv1.NetworkPolicyPeer) bool {
+		for _, p := range peers {
+			if p.PodSelector != nil && equality.Semantic.DeepEqual(p.PodSelector.MatchLabels, credentialProxySelector(sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil))) {
+				return true
+			}
+		}
+		return false
+	}
+	if hasBrokerSelfPeer(defaultNP.Spec.Ingress[0].From) {
+		t.Fatalf("fixed/default NetworkPolicy unexpectedly includes sibling credential-proxy peer")
+	}
+	if !hasBrokerSelfPeer(autoNP.Spec.Ingress[0].From) {
+		t.Fatalf("sizingProfile: auto NetworkPolicy missing sibling credential-proxy peer on port %d for standby peer health probe", credentialProxyPort)
+	}
 }

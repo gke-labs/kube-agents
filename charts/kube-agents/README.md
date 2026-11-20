@@ -749,7 +749,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation, request and version-control metrics from its port 8766 (which also serves bearer-authenticated `/control/*` handoff endpoints), and the A2A
+tool-invocation, request and version-control metrics from its port 8766 (which also serves bearer-authenticated `/control/*` handoff endpoints under `sizingProfile: auto` in-cluster), and the A2A
 gateway pod, so it scrapes the gateway's inbound-message,
 task terminal and Google Chat pull counters from its metrics-only port 9096.
 The operator's policies on all three pods admit the
@@ -1133,7 +1133,7 @@ tier at a time when shrinking dimensions remain at or below 55% of the lower row
 has each row's figures and the auto rules. The three per-key overrides (the two
 above and `platformAgent.deployment.agentAPIAuth.resources`, the sidecar's) are
 applied over the preset, so an explicit key wins. The quota preflight counts
-`medium` and `fleet` at their rows and `auto` at the small row it starts from. The
+`medium` and `fleet` at their rows and `auto` at the small row it starts from (with no `credential-proxy` surge headroom in chart preflight). The
 same CRD guard fails the upgrade when the installed CRD predates the field.
 
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
@@ -1567,9 +1567,7 @@ not on upgrade or for claim-shaped keys, where `used` already holds the release'
 running pods or retained PVCs. Claim counts and `requests.storage` get no surge allowance,
 because a surge Pod mounts the existing claim rather than creating one. The surge Pod it
 sizes for is the largest one in the release that a rollout actually creates: rollouts are
-per-workload, so room for one at a time is enough. That includes `platform-agent-credential-proxy`
-(`RollingUpdate`, `maxSurge: 1, maxUnavailable: 0` for active-standby cutover). The shell sandbox's StatefulSet and the
-pre-delete cleanup Job never surge, and neither does the agent pod at the default
+per-workload, so room for one at a time is enough. The shell sandbox's StatefulSet, the default/`Recreate` credential proxy, and the pre-delete cleanup Job do not surge in chart preflight, and neither does the agent pod at the default
 `platformAgent.deployment.availability.replicas` of one, where the operator rolls the
 gateway Deployment with `strategy: Recreate`. The check counts an agent-pod surge from two
 replicas up, which the operator no longer renders: it runs the gateway as a single replica

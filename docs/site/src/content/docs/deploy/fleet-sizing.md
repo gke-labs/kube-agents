@@ -162,11 +162,9 @@ through the inputs, or add pools beside the managed ones.
 
 Resize or add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
 the system DaemonSets take theirs, so the example's 4 vCPU proxy request fits on none of them.
-The proxy Deployment rolls with `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated
-active-standby handoff: if the new surge pod stays `Pending`, the existing active broker pod keeps serving. Only a fresh install with no running pod stays unavailable until a node fits.
+On default and fixed profiles (`""`, `small`, `medium`, `fleet`), the proxy Deployment recreates its pod (`Recreate`) and leaves the new proxy pod `Pending` until a node fits.
 
-The same holds under `spec.deployment.sizingProfile: auto`, which sets a cluster-count floor (`medium` at 10
-clusters, `fleet` at 25) and promotes or steps down proactively from live pod and broker metrics with no human in the loop.
+Under `spec.deployment.sizingProfile: auto`, the cluster-count floor sets `medium` at 10 clusters and `fleet` at 25. It also promotes or steps down proactively from live pod and broker metrics with no human in the loop. Under `auto` in-cluster, the proxy Deployment rolls with active-standby `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`): if the new surge pod stays `Pending`, the existing active broker pod keeps serving. Only a fresh install with no running pod stays unavailable until a node fits.
 
 Before each tier transition, the operator checks
 the namespace's `ResourceQuota` (including the broker's surge pod) and `LimitRange` bounds, not node

@@ -55,6 +55,7 @@ const (
 	credentialProxyControlFileKey      = "token"                               // #nosec G101 -- Projected file path component, not a credential.
 	credentialProxyStandbyEnv          = "CREDENTIAL_PROXY_STANDBY"            // #nosec G101 -- Environment variable name, not a credential.
 	credentialProxyControlFileEnv      = "CREDENTIAL_PROXY_CONTROL_FILE"       // #nosec G101 -- Environment variable name, not a credential.
+	credentialProxyPeerHealthURLEnv    = "CREDENTIAL_PROXY_PEER_HEALTH_URL"    // #nosec G101 -- Environment variable name, not a credential.
 	credentialProxyStandbyEnabledValue = "1"
 
 	credentialProxyTemplateHashAnnotation = "kubeagents.x-k8s.io/proxy-template-hash" // #nosec G101 -- Annotation key name, not a credential.
@@ -125,10 +126,27 @@ func credentialProxyControlFilePath() string {
 	return path.Join(credentialProxyControlMountPath, credentialProxyControlFileKey)
 }
 
-func credentialProxyControlEnv() []corev1.EnvVar {
+const (
+	credentialProxyHealthzPath         = "/healthz"
+	credentialProxyPeerHealthURLFormat = "http://%s.%s.svc.cluster.local:%d%s"
+)
+
+func credentialProxyPeerHealthURL(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf(credentialProxyPeerHealthURLFormat, credentialProxyName(agent), agent.Namespace, credentialProxyPort, credentialProxyHealthzPath)
+}
+
+// credentialProxyActiveStandby reports whether the broker uses active-standby
+// RollingUpdate (maxSurge=1, maxUnavailable=0) instead of Recreate. Only
+// sizingProfile: auto enables it so default and fixed profiles keep Recreate.
+func credentialProxyActiveStandby(agent *agentv1alpha1.PlatformAgent) bool {
+	return agent != nil && agent.Spec.Deployment != nil && agent.Spec.Deployment.SizingProfile == sizingProfileAuto
+}
+
+func credentialProxyControlEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: credentialProxyStandbyEnv, Value: credentialProxyStandbyEnabledValue},
 		{Name: credentialProxyControlFileEnv, Value: credentialProxyControlFilePath()},
+		{Name: credentialProxyPeerHealthURLEnv, Value: credentialProxyPeerHealthURL(agent)},
 	}
 }
 
@@ -144,29 +162,89 @@ func (r *PlatformAgentReconciler) canControlBroker() bool {
 	return reachable
 }
 
-// disableCredentialProxyStandby strips CREDENTIAL_PROXY_STANDBY and reverts the
-// Deployment strategy to Recreate when the operator cannot reach port 8766, so
-// the broker boots directly into active mode instead of stalling in standby.
-func disableCredentialProxyStandby(dep *appsv1.Deployment) {
+// keepCredentialProxyStrategyRecreate switches only the Deployment strategy to
+// Recreate without stripping standby env vars from the pod template, so a
+// legacy pre-standby ReplicaSet scales to zero before the standby pod boots.
+func keepCredentialProxyStrategyRecreate(dep *appsv1.Deployment) {
 	if dep == nil {
 		return
 	}
 	dep.Spec.Strategy = appsv1.DeploymentStrategy{
 		Type: appsv1.RecreateDeploymentStrategyType,
 	}
+}
+
+// disableCredentialProxyStandby strips standby env vars, control Secret mount,
+// and control Secret volume, and reverts the Deployment strategy to Recreate
+// when the operator cannot reach port 8766, so the broker boots directly into
+// active mode without mounting an uncreated control Secret.
+func disableCredentialProxyStandby(dep *appsv1.Deployment) {
+	if dep == nil {
+		return
+	}
+	keepCredentialProxyStrategyRecreate(dep)
 	for i := range dep.Spec.Template.Spec.Containers {
 		c := &dep.Spec.Template.Spec.Containers[i]
 		if c.Name != credentialProxyContainerName {
 			continue
 		}
-		filtered := make([]corev1.EnvVar, 0, len(c.Env))
+		filteredEnv := make([]corev1.EnvVar, 0, len(c.Env))
 		for _, env := range c.Env {
-			if env.Name != credentialProxyStandbyEnv {
-				filtered = append(filtered, env)
+			if env.Name != credentialProxyStandbyEnv &&
+				env.Name != credentialProxyPeerHealthURLEnv &&
+				env.Name != credentialProxyControlFileEnv {
+				filteredEnv = append(filteredEnv, env)
 			}
 		}
-		c.Env = filtered
+		c.Env = filteredEnv
+		filteredMounts := make([]corev1.VolumeMount, 0, len(c.VolumeMounts))
+		for _, mount := range c.VolumeMounts {
+			if mount.Name != credentialProxyControlVolume {
+				filteredMounts = append(filteredMounts, mount)
+			}
+		}
+		c.VolumeMounts = filteredMounts
 	}
+	filteredVolumes := make([]corev1.Volume, 0, len(dep.Spec.Template.Spec.Volumes))
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		if vol.Name != credentialProxyControlVolume {
+			filteredVolumes = append(filteredVolumes, vol)
+		}
+	}
+	dep.Spec.Template.Spec.Volumes = filteredVolumes
+}
+
+// hasLegacyCredentialProxyPod reports whether any live or terminating broker
+// pod still runs without CREDENTIAL_PROXY_STANDBY=1, requiring a Recreate hop
+// before RollingUpdate so the old ReplicaSet cannot recreate an active peer.
+func (r *PlatformAgentReconciler) hasLegacyCredentialProxyPod(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	pods := &corev1.PodList{}
+	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err != nil {
+		return false, fmt.Errorf("listing credential-proxy pods: %w", err)
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if !podHasCredentialProxyStandby(pod) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func podHasCredentialProxyStandby(pod *corev1.Pod) bool {
+	c := brokerPodContainer(pod)
+	if c == nil {
+		return false
+	}
+	for _, env := range c.Env {
+		if env.Name == credentialProxyStandbyEnv && env.Value == credentialProxyStandbyEnabledValue {
+			return true
+		}
+	}
+	return false
 }
 
 func credentialProxyControlVolumeSpec(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
@@ -496,7 +574,7 @@ type brokerPodProbe struct {
 // for credential-proxy across surge rollouts and cold starts without giving
 // the broker pod Kubernetes API credentials.
 func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Context, agent *agentv1alpha1.PlatformAgent, proxyDep *appsv1.Deployment) (time.Duration, error) {
-	if !r.canControlBroker() {
+	if !credentialProxyActiveStandby(agent) || !r.canControlBroker() {
 		return 0, nil
 	}
 	pods := &corev1.PodList{}

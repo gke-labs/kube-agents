@@ -63,7 +63,8 @@ spec:
 ---
 {{- /*
 The credential broker's `cred-metrics` listener (credentialProxyMetricsPort in the
-operator, serving `/metrics` plus bearer-authenticated `/control/*` handoffs):
+operator, serving `/metrics` plus bearer-authenticated `/control/*` handoffs under
+`sizingProfile: auto` in-cluster, or `404` otherwise):
 brokered tool invocations by tool, subcommand and outcome, their latency, and the
 credentialed listener's request counts. Its own PodMonitoring because the broker is
 its own pod with its own labels; the same switch, because an install scrapes the

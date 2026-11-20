@@ -173,7 +173,8 @@ in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. Se
 The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
 every caller of its credentialed listener with a `TokenReview` over an audience-bound
 projected token (on port 8766, [Architecture](#architecture), `/metrics` serves counters
-unauthenticated while `/control/*` requires bearer auth against `<name>-credential-proxy-control`), and
+unauthenticated while `/control/*` requires bearer auth against `<name>-credential-proxy-control`
+under `sizingProfile: auto` in-cluster and returns `404` otherwise), and
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
 which one presented it; what does vary the policy is the audience the token was minted for
 and the route table it feeds
@@ -239,7 +240,8 @@ listener is at its thread cap; the operator's readiness probe reads `/healthz`
 through Envoy's health listener on 8768 instead (below), and the broker's
 NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The second listener on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
 set by the operator) serves Prometheus series whose label values are
-static enums and closed vocabularies on `/metrics` (unauthenticated) plus bearer-authenticated active-standby handoff endpoints (`/control/status`, `/control/activate`, `/control/drain`, authenticated against `CREDENTIAL_PROXY_CONTROL_FILE`), holds no workload route or upstream credential,
+static enums and closed vocabularies on `/metrics` (unauthenticated) plus, under
+`sizingProfile: auto` in-cluster, bearer-authenticated active-standby handoff endpoints (`/control/status`, `/control/activate`, `/control/drain`, authenticated against `CREDENTIAL_PROXY_CONTROL_FILE`; `404` otherwise), holds no workload route or upstream credential,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
 process, so a peer that reaches the port cannot spend its threads), and is
@@ -271,17 +273,16 @@ a NetworkPolicy is what keeps it off the wire elsewhere.
 
 Envoy opens a second listener, on port 8768 (`credentialProxyHealthPort` in the operator,
 the container port `cred-health`), where the broker Pod's `readinessProbe` reads `/healthz`.
-The credentialed listener sends every path through the `credential_runtime` cluster, and
-every open cluster watch holds one of that cluster's connections, so a probe through it is
-refused with the watches' 503 once the fleet reaches the cluster's connection ceiling, and
-three refusals remove the Pod from the Service. That ceiling is declared rather than
+The credentialed listener sends every credentialed path through the `credential_runtime` cluster, and
+every open cluster watch holds one of that cluster's connections, so routing general traffic there would starve probes with 503s once the fleet reaches the cluster's connection ceiling, and
+three readiness refusals would remove the Pod from the Service. That ceiling is declared rather than
 inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
 requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
 backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
 refuses first, and the runtime's thread cap is derived from the same thresholds at startup
-(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. The health listener routes `/healthz` alone to a `credential_health` cluster
+(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. Both the dedicated health listener (all requests) and exact `/healthz` on `:8765` route to the `credential_health` cluster
 on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
-no watch can mark the Pod unready; any other path on it is a 404. The Service and the
+no watch can starve readiness or warm-standby peer health probes; any other path on `:8768` is a 404. The Service and the
 NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
 `start-services.sh` rebinds both listeners off loopback together, to the address the operator
 passes (`0.0.0.0`, so the Pod IP answers), and refuses to start Envoy if a render leaves one

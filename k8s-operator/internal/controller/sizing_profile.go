@@ -1719,7 +1719,7 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 		return nil
 	}
 	recorded := sizingCappedCondition(agent).message
-	canSurge := r.canControlBroker()
+	canSurge := r.canControlBroker() && credentialProxyActiveStandby(agent)
 	for _, workload := range sized {
 		dep := &appsv1.Deployment{}
 		if err := r.Get(ctx, workload.key, dep); err != nil {
@@ -1885,7 +1885,7 @@ type sizingSurgeStall struct {
 }
 
 func (r *PlatformAgentReconciler) sizingSurgeStalled(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier, now time.Time) (*sizingSurgeStall, time.Duration) {
-	if !r.canControlBroker() {
+	if !r.canControlBroker() || !credentialProxyActiveStandby(agent) {
 		return nil, 0
 	}
 	autopilot := r.sizingAutopilot(ctx, agent)
@@ -2279,7 +2279,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 							"name", agent.Name, "namespace", agent.Namespace, "tier", running.String(), "desired", desired.String(),
 							"clusters", count)
 					default:
-						canSurge := r.canControlBroker()
+						canSurge := r.canControlBroker() && credentialProxyActiveStandby(agent)
 						templates := map[string]corev1.PodTemplateSpec{}
 						if len(ranges) > 0 {
 							templates = r.sizedPodTemplates(ctx, agent)

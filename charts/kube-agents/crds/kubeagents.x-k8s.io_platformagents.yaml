@@ -1268,7 +1268,8 @@ spec:
                             one that was valid, renders the proxy Deployment at the sizing
                             profile's row (the operator's defaults under small), not at the last
                             accepted override, until it is corrected,
-                            which rolls the proxy Deployment via active-standby handoff once; the
+                            which rolls the proxy Deployment once (active-standby RollingUpdate under
+                            sizingProfile: auto in-cluster, or Recreate otherwise); the
                             operator reports Degraded with reason InvalidCredentialProxyResources
                             when no higher-ranked Degraded cause is present, the agent staying
                             Ready, whether or not the validating webhook is enabled. Where the
@@ -9290,12 +9291,15 @@ spec:
                         step refused, naming the quota, LimitRange, or pending surge capacity. If
                         a surge pod stays unschedulable past the warm timeout or is refused by
                         admission, the operator rolls back to the active running tier without
-                        terminating the healthy active broker. An explicit tier is applied as
-                        written, without either check. The agent container's own resources are
-                        not part of a profile. A change of tier rolls credential-proxy with
-                        active-standby maxSurge 1 / maxUnavailable 0 handoff and restarts the
-                        gateway (every tier change) and the shell pod (on fleet transitions only),
-                        while fixed-2Gi credential-proxy-exec pods keep their 8-slot cap unchanged.
+                        terminating the healthy active broker. An explicit tier ("small", "medium",
+                        "fleet") or unset default renders credential-proxy with Recreate and is
+                        applied as written, without either check. The agent container's own
+                        resources are not part of a profile. Under "auto", a change of tier rolls
+                        credential-proxy in-cluster with active-standby maxSurge 1 / maxUnavailable 0
+                        handoff (after one Recreate hop on upgrade from a pre-standby pod) and
+                        restarts the gateway (every tier change) and the shell pod (on fleet
+                        transitions only), while fixed-2Gi credential-proxy-exec pods keep their
+                        8-slot cap unchanged.
                       enum:
                         - small
                         - medium

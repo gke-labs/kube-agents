@@ -71,6 +71,7 @@ const (
 	mcpRelayRetryBackoffBase   = 2 * time.Second
 	mcpRelayRetryBackoffCap    = 16 * time.Second
 	mcpRelayRetryAfterCap      = 30 * time.Second
+	mcpRelayRetryAfterHeader   = "Retry-After"
 	mcpRelayRetryJitterFloor   = 0.5
 	mcpRelayRetryMaxShift      = 10
 )
@@ -363,7 +364,7 @@ func relayOne(ctx context.Context, client *http.Client, u *url.URL, message []by
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		baseErr := fmt.Errorf("the broker answered HTTP %d%s", resp.StatusCode, brokerErrorDetail(body))
 		if isRetryableDrainingBusy(resp.StatusCode, body) {
-			return nil, &errDrainingRetry{err: baseErr, retryAfter: resp.Header.Get("Retry-After")}
+			return nil, &errDrainingRetry{err: baseErr, retryAfter: resp.Header.Get(mcpRelayRetryAfterHeader)}
 		}
 		return nil, baseErr
 	}

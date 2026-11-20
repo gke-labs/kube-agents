@@ -1155,6 +1155,7 @@ HEALTHZ_STANDBY_PAYLOAD = {"status": "standby"}
 STANDBY_MODE_ENV = "CREDENTIAL_PROXY_STANDBY"
 STANDBY_TRUE_VALUES = frozenset({"1", "true", "yes"})
 CONTROL_FILE_ENV = "CREDENTIAL_PROXY_CONTROL_FILE"
+PEER_HEALTH_URL_ENV = "CREDENTIAL_PROXY_PEER_HEALTH_URL"
 CONTROL_STATUS_PATH = "/control/status"
 CONTROL_ACTIVATE_PATH = "/control/activate"
 CONTROL_DRAIN_PATH = "/control/drain"
@@ -1183,15 +1184,23 @@ BROKER_STATE_STANDBY = "standby"
 BROKER_STATE_ACTIVE = "active"
 BROKER_STATE_DRAINING = "draining"
 BROKER_STATE_DRAINED = "drained"
-HANDOFF_DRAIN_SECONDS = 10.0
+HANDOFF_DRAIN_SECONDS = float(SHUTDOWN_DRAIN_SECONDS)
 # Backoff hints returned with pre-admission 503 bound="draining" refusals.
-# Once DRAINED, only Lease swap and readiness remain (~2-4s); while DRAINING,
-# settle (3s) + drain (10s) + end_wait (5s) + cutover can take up to ~22s, so
-# 12s guarantees four jittered [6s, 12s] retries outlast the worst-case drain.
-HANDOFF_DRAINING_RETRY_AFTER_SECONDS = 12
-HANDOFF_DRAINED_RETRY_AFTER_SECONDS = 3
+# Once DRAINED, operator requeue (2s) + kubelet readinessPeriodSeconds (10s)
+# take up to ~12s; while DRAINING, settle (3s) + drain (30s) + end_wait (5s) +
+# cutover (~12s) can take up to ~50s, so 18s keeps four jittered [9s, 18s]
+# retries spanning [36s, 72s] and 5s avoids immediate post-drain storms.
+HANDOFF_DRAINING_RETRY_AFTER_SECONDS = 18
+HANDOFF_DRAINED_RETRY_AFTER_SECONDS = 5
 HANDOFF_SETTLE_POLL_SECONDS = 0.05
 HANDOFF_THREAD_NAME = "broker-handoff-drain"
+STANDBY_PEER_PROBE_INTERVAL_SECONDS = 3.0
+STANDBY_PEER_PROBE_TIMEOUT_SECONDS = 2.0
+# Match credentialProxyTerminationGraceSeconds (45s), exceeding both a 30s+5s
+# terminating pod drain and a 3x10s readiness probe flap, so a standby pod
+# never self-activates while a draining or transiently unready peer still runs.
+STANDBY_SELF_ACTIVATE_GRACE_SECONDS = 45.0
+STANDBY_WATCHDOG_THREAD_NAME = "broker-standby-watchdog"
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -14629,6 +14638,49 @@ def control_file_from_env() -> Path | None:
     return Path(raw) if raw else None
 
 
+def peer_health_url_from_env() -> str:
+    """Service /healthz URL polled in standby for self-recovery, or '' when unset."""
+    return os.getenv(PEER_HEALTH_URL_ENV, "").strip()
+
+
+STANDBY_PEER_ALLOWED_SCHEMES = frozenset({"http", "https"})
+HTTP_DEFAULT_PORT = 80
+HTTPS_DEFAULT_PORT = 443
+PEER_PROBE_METHOD = "GET"
+PEER_PROBE_HEADERS = {"Connection": "close"}
+
+
+def _probe_peer_healthz(
+    url: str, timeout: float = STANDBY_PEER_PROBE_TIMEOUT_SECONDS
+) -> bool:
+    """Return True iff an active/draining peer answers 200 on the broker Service."""
+    if not url:
+        return False
+    conn: http.client.HTTPConnection | None = None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in STANDBY_PEER_ALLOWED_SCHEMES or not parts.hostname:
+            return False
+        target = parts.path or HEALTHZ_PATH
+        if parts.query:
+            target = f"{target}?{parts.query}"
+        port = parts.port or (HTTPS_DEFAULT_PORT if parts.scheme == "https" else HTTP_DEFAULT_PORT)
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(parts.hostname, port, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(parts.hostname, port, timeout=timeout)
+        conn.request(PEER_PROBE_METHOD, target, headers=PEER_PROBE_HEADERS)
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status == HTTPStatus.OK
+    except (OSError, http.client.HTTPException, ValueError):
+        return False
+    finally:
+        if conn is not None:
+            with contextlib.suppress(OSError):
+                conn.close()
+
+
 class BrokerLifecycle:
     """State machine for warm standby startup, operator activation, and handoff drain."""
 
@@ -14643,6 +14695,12 @@ class BrokerLifecycle:
         drain_seconds: float = HANDOFF_DRAIN_SECONDS,
         settle_seconds: float = SHUTDOWN_SETTLE_SECONDS,
         end_wait_seconds: float = SHUTDOWN_END_WAIT_SECONDS,
+        peer_health_url: str = "",
+        peer_active_probe: Callable[[], bool] | None = None,
+        peer_probe_interval_seconds: float = STANDBY_PEER_PROBE_INTERVAL_SECONDS,
+        self_activate_grace_seconds: float = STANDBY_SELF_ACTIVATE_GRACE_SECONDS,
+        external_stop: threading.Event | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.enabled = enabled
         self.control_file = control_file
@@ -14654,11 +14712,67 @@ class BrokerLifecycle:
         self._drain_seconds = drain_seconds
         self._settle_seconds = settle_seconds
         self._end_wait_seconds = end_wait_seconds
+        if peer_active_probe is None and peer_health_url:
+            peer_active_probe = lambda: _probe_peer_healthz(peer_health_url)
+        self._peer_active_probe = peer_active_probe
+        self._peer_probe_interval_seconds = peer_probe_interval_seconds
+        self._self_activate_grace_seconds = self_activate_grace_seconds
+        self._external_stop = external_stop
+        self._watchdog_stop = threading.Event()
+        self._watchdog_started = False
+        self._clock = clock
         self._lock = threading.Lock()
         self._warm = False
         self._state = BROKER_STATE_STANDBY if enabled else BROKER_STATE_ACTIVE
         self._on_activate: Callable[[], None] | None = None
         self._drain_started = False
+
+    def _run_standby_watchdog(self) -> None:
+        no_peer_since: float | None = None
+        while not self._watchdog_stop.is_set() and (
+            self._external_stop is None or not self._external_stop.is_set()
+        ):
+            with self._lock:
+                still_standby = (
+                    self.enabled and self._warm and self._state == BROKER_STATE_STANDBY
+                )
+            if not still_standby:
+                return
+            probe = self._peer_active_probe
+            if probe is None:
+                return
+            try:
+                healthy = probe()
+            except Exception as exc:
+                LOGGER.warning(
+                    "standby watchdog peer health probe raised %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                healthy = False
+            if self._watchdog_stop.is_set() or (
+                self._external_stop is not None and self._external_stop.is_set()
+            ):
+                return
+            if healthy:
+                no_peer_since = None
+            else:
+                now = self._clock()
+                if no_peer_since is None:
+                    no_peer_since = now
+                elif now - no_peer_since >= self._self_activate_grace_seconds:
+                    status, _ = self.activate()
+                    if status == HTTPStatus.OK:
+                        LOGGER.warning(
+                            "credential proxy self-activated from standby after %.1fs with no active peer",
+                            self._self_activate_grace_seconds,
+                        )
+                    return
+            self._watchdog_stop.wait(self._peer_probe_interval_seconds)
+
+    def stop_watchdog(self) -> None:
+        """Stop the standby peer-health watchdog if running."""
+        self._watchdog_stop.set()
 
     def _in_memory_relays(self) -> tuple[Any, ...]:
         if self._in_memory_relays_override is not None:
@@ -14692,12 +14806,27 @@ class BrokerLifecycle:
 
     def set_warm(self, on_activate: Callable[[], None] | None = None) -> None:
         cb: Callable[[], None] | None = None
+        start_watchdog = False
         with self._lock:
             self._warm = True
             self._on_activate = on_activate
             if not self.enabled and self._state == BROKER_STATE_ACTIVE:
                 cb = self._on_activate
                 self._on_activate = None
+            elif (
+                self.enabled
+                and self._state == BROKER_STATE_STANDBY
+                and self._peer_active_probe is not None
+                and not self._watchdog_started
+            ):
+                self._watchdog_started = True
+                start_watchdog = True
+        if start_watchdog:
+            threading.Thread(
+                target=self._run_standby_watchdog,
+                name=STANDBY_WATCHDOG_THREAD_NAME,
+                daemon=True,
+            ).start()
         if cb is not None:
             cb()
 
@@ -14710,6 +14839,8 @@ class BrokerLifecycle:
         cb: Callable[[], None] | None = None
         unsettled = sum(1 for r in self._relays if r.has_unsettled())
         with self._lock:
+            if self._external_stop is not None and self._external_stop.is_set():
+                return HTTPStatus.CONFLICT, {**self._locked_snapshot(unsettled=unsettled), "error": "pod is shutting down"}
             if self._state in (BROKER_STATE_DRAINING, BROKER_STATE_DRAINED):
                 return HTTPStatus.CONFLICT, {**self._locked_snapshot(unsettled=unsettled), "error": "pod is draining"}
             if not self._warm:
@@ -14721,6 +14852,7 @@ class BrokerLifecycle:
                     except ValueError as exc:
                         return HTTPStatus.BAD_REQUEST, {**self._locked_snapshot(unsettled=unsettled), "error": str(exc)}
                 self._state = BROKER_STATE_ACTIVE
+                self._watchdog_stop.set()
                 cb = self._on_activate
                 self._on_activate = None
         if cb is not None:
@@ -14768,6 +14900,7 @@ class BrokerLifecycle:
             if self._state == BROKER_STATE_DRAINED:
                 return HTTPStatus.OK, self._locked_snapshot()
             self._state = BROKER_STATE_DRAINING
+            self._watchdog_stop.set()
             self._on_activate = None
         CredentialProxyHandler.draining.set()
         CredentialProxyHandler.handoff_draining.set()
@@ -19359,6 +19492,9 @@ def install_shutdown_handler(
         if CredentialProxyHandler.shutting_down.is_set():
             return
         CredentialProxyHandler.shutting_down.set()
+        lifecycle = CredentialProxyHandler.lifecycle
+        if lifecycle is not None:
+            lifecycle.stop_watchdog()
         if drain_seconds > 0:
             CredentialProxyHandler.draining.set()
             LOGGER.info(
@@ -19613,6 +19749,8 @@ def serve(args: argparse.Namespace) -> None:
         control_file=control_file_from_env(),
         relays=active_relays,
         executor=executor,
+        peer_health_url=peer_health_url_from_env(),
+        external_stop=CredentialProxyHandler.shutting_down,
     )
     CredentialProxyHandler.lifecycle = lifecycle
 

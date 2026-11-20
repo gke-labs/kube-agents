@@ -23,11 +23,11 @@
         "sessionRequestsCpu": 1500,
         "sessionRequestsEphemeral": 11408506880,
         "sessionRequestsMemory": 3355443200,
-        "surgeLimitsCpu": 2000,
-        "surgeLimitsEphemeral": 8589934592,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
         "surgeLimitsMemory": 3221225472,
-        "surgeRequestsCpu": 500,
-        "surgeRequestsEphemeral": 8589934592,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
       "sessionQuotaPods": 39
@@ -55,11 +55,11 @@
         "sessionRequestsCpu": 2500,
         "sessionRequestsEphemeral": 11408506880,
         "sessionRequestsMemory": 5368709120,
-        "surgeLimitsCpu": 2000,
-        "surgeLimitsEphemeral": 8589934592,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
         "surgeLimitsMemory": 3221225472,
-        "surgeRequestsCpu": 2000,
-        "surgeRequestsEphemeral": 8589934592,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
       "sessionQuotaPods": 39
@@ -89,11 +89,11 @@
         "sessionRequestsCpu": 1500,
         "sessionRequestsEphemeral": 11408506880,
         "sessionRequestsMemory": 3355443200,
-        "surgeLimitsCpu": 2000,
-        "surgeLimitsEphemeral": 8589934592,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
         "surgeLimitsMemory": 3221225472,
-        "surgeRequestsCpu": 500,
-        "surgeRequestsEphemeral": 8589934592,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
       "sessionQuotaPods": 37
@@ -125,10 +125,10 @@
         "sessionRequestsEphemeral": 11408506880,
         "sessionRequestsMemory": 3355443200,
         "surgeLimitsCpu": 4000,
-        "surgeLimitsEphemeral": 8589934592,
+        "surgeLimitsEphemeral": 1342177280,
         "surgeLimitsMemory": 4294967296,
         "surgeRequestsCpu": 500,
-        "surgeRequestsEphemeral": 8589934592,
+        "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
       "sessionQuotaPods": 45
@@ -163,10 +163,10 @@
         "sessionRequestsEphemeral": 11408506880,
         "sessionRequestsMemory": 5368709120,
         "surgeLimitsCpu": 4000,
-        "surgeLimitsEphemeral": 8589934592,
+        "surgeLimitsEphemeral": 1342177280,
         "surgeLimitsMemory": 4294967296,
-        "surgeRequestsCpu": 2000,
-        "surgeRequestsEphemeral": 8589934592,
+        "surgeRequestsCpu": 500,
+        "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
       "sessionQuotaPods": 47
@@ -201,10 +201,10 @@
         "sessionRequestsEphemeral": 11408506880,
         "sessionRequestsMemory": 3355443200,
         "surgeLimitsCpu": 4000,
-        "surgeLimitsEphemeral": 8589934592,
+        "surgeLimitsEphemeral": 1342177280,
         "surgeLimitsMemory": 4294967296,
         "surgeRequestsCpu": 500,
-        "surgeRequestsEphemeral": 8589934592,
+        "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
       "sessionQuotaPods": 47

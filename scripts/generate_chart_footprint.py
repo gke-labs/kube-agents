@@ -763,7 +763,6 @@ def _extract(golden: pathlib.Path) -> dict:
                 c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
             }
             cred_proxy_replicas = _replicas(doc)
-            cred_proxy_surges = _rolls_with_a_surge_pod(doc)
         elif kind == _KIND_DEPLOYMENT and name == _KUBE_PROXY_WORKLOAD:
             kube_proxy_containers = {
                 c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
@@ -891,14 +890,11 @@ def _extract(golden: pathlib.Path) -> dict:
         _SHELL_SANDBOX: _workload_entry(
             [shell_containers[_SHELL_CONTAINER]], pods=1, replicas=shell_replicas
         ),
-        _CREDENTIAL_PROXY: {
-            **_workload_entry(
-                [cred_proxy_containers[_CRED_PROXY_CONTAINER]],
-                pods=1,
-                replicas=cred_proxy_replicas,
-            ),
-            _SURGES: cred_proxy_surges,
-        },
+        _CREDENTIAL_PROXY: _workload_entry(
+            [cred_proxy_containers[_CRED_PROXY_CONTAINER]],
+            pods=1,
+            replicas=cred_proxy_replicas,
+        ),
         _KUBE_PROXY: _workload_entry(
             [kube_proxy_containers[_KUBE_PROXY_CONTAINER]],
             pods=1,

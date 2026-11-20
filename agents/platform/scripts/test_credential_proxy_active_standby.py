@@ -212,7 +212,10 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
         self.assertEqual((503, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), _request(health_port, "GET", "/healthz"))
 
     def test_handoff_draining_and_drained_refusals_set_expected_retry_after_headers(self) -> None:
-        self.assertEqual(10.0, credential_proxy.HANDOFF_DRAIN_SECONDS)
+        self.assertEqual(30.0, credential_proxy.HANDOFF_DRAIN_SECONDS)
+        self.assertEqual(18, credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)
+        self.assertEqual(5, credential_proxy.HANDOFF_DRAINED_RETRY_AFTER_SECONDS)
+        self.assertEqual(45.0, credential_proxy.STANDBY_SELF_ACTIVATE_GRACE_SECONDS)
         fake_relay = _FakeRelay(unsettled=1)
         lifecycle = BrokerLifecycle(
             enabled=True,
@@ -545,6 +548,171 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
         st_other, pl_other = call_vcs("proposal-update", {"number": 18, "title": "stolen"})
         self.assertEqual(HTTPStatus.FORBIDDEN, st_other)
         self.assertEqual(credential_proxy.PROPOSAL_NOT_THIS_TASKS_CODE, pl_other["code"])
+
+    def test_drain_reports_draining_while_in_flight_work_remains(self) -> None:
+        CredentialProxyHandler.in_flight.enter()
+        left = False
+        try:
+            lifecycle = BrokerLifecycle(
+                enabled=True,
+                control_file=self.token_path,
+                drain_seconds=1.0,
+                settle_seconds=0.05,
+                end_wait_seconds=0.1,
+            )
+            lifecycle.set_warm()
+            status, activate_snap = lifecycle.activate()
+            self.assertEqual(HTTPStatus.OK, status)
+            self.assertEqual(BROKER_STATE_ACTIVE, activate_snap["state"])
+
+            status, drain_snap = lifecycle.drain()
+            self.assertEqual(HTTPStatus.OK, status)
+            self.assertEqual(BROKER_STATE_DRAINING, drain_snap["state"])
+            self.assertEqual(1, drain_snap["in_flight"])
+            self.assertEqual((HTTPStatus.CONFLICT, BROKER_STATE_DRAINING), (lifecycle.activate()[0], lifecycle.state))
+        finally:
+            if not left:
+                CredentialProxyHandler.in_flight.leave()
+                left = True
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and lifecycle.state != BROKER_STATE_DRAINED:
+            time.sleep(0.02)
+        self.assertEqual(BROKER_STATE_DRAINED, lifecycle.state)
+
+    def test_standby_self_activates_when_no_active_peer_answers_200(self) -> None:
+        activated: list[str] = []
+        lifecycle = BrokerLifecycle(
+            enabled=True,
+            control_file=self.token_path,
+            peer_active_probe=lambda: False,
+            peer_probe_interval_seconds=0.01,
+            self_activate_grace_seconds=0.04,
+        )
+        self.addCleanup(lifecycle.stop_watchdog)
+        self.assertEqual(BROKER_STATE_STANDBY, lifecycle.state)
+        lifecycle.set_warm(on_activate=lambda: activated.append("started"))
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and lifecycle.state != BROKER_STATE_ACTIVE:
+            time.sleep(0.01)
+        self.assertEqual(BROKER_STATE_ACTIVE, lifecycle.state)
+        self.assertEqual(["started"], activated)
+
+    def test_standby_waits_while_peer_healthz_is_200_then_recovers_if_peer_dies(self) -> None:
+        peer_alive = threading.Event()
+        peer_alive.set()
+        peer_status_code = [HTTPStatus.OK]
+
+        class _PeerHandler(credential_proxy.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                code = peer_status_code[0] if peer_alive.is_set() else HTTPStatus.SERVICE_UNAVAILABLE
+                self.send_response(code)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        peer_srv = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), _PeerHandler)
+        threading.Thread(target=peer_srv.serve_forever, daemon=True).start()
+        self.addCleanup(peer_srv.shutdown)
+        self.addCleanup(peer_srv.server_close)
+        peer_url = f"http://127.0.0.1:{peer_srv.server_address[1]}/healthz"
+
+        activated: list[str] = []
+        lifecycle = BrokerLifecycle(
+            enabled=True,
+            control_file=self.token_path,
+            peer_health_url=peer_url,
+            peer_probe_interval_seconds=0.01,
+            self_activate_grace_seconds=0.05,
+        )
+        self.addCleanup(lifecycle.stop_watchdog)
+        lifecycle.set_warm(on_activate=lambda: activated.append("recovered"))
+
+        time.sleep(0.12)
+        self.assertEqual(BROKER_STATE_STANDBY, lifecycle.state)
+        self.assertEqual([], activated)
+
+        # Peer returns non-200 / goes away -> standby self-activates after grace elapses.
+        peer_alive.clear()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and lifecycle.state != BROKER_STATE_ACTIVE:
+            time.sleep(0.01)
+        self.assertEqual(BROKER_STATE_ACTIVE, lifecycle.state)
+        self.assertEqual(["recovered"], activated)
+
+    def test_standby_watchdog_survives_http_exceptions_and_probe_errors(self) -> None:
+        # Malformed HTTP responses (BadStatusLine/IncompleteRead) or URL ValueErrors
+        # must return False rather than killing _run_standby_watchdog.
+        with mock.patch("http.client.HTTPConnection.request", side_effect=http.client.BadStatusLine("bad")), \
+                mock.patch("http.client.HTTPConnection.close"):
+            self.assertFalse(credential_proxy._probe_peer_healthz("http://127.0.0.1:8765/healthz", 0.5))
+        self.assertFalse(credential_proxy._probe_peer_healthz("http://[::1:8765/healthz", 0.5))
+
+        calls = [0]
+
+        def flaky_probe() -> bool:
+            calls[0] += 1
+            if calls[0] <= 2:
+                raise http.client.IncompleteRead(b"partial")
+            return False
+
+        activated: list[str] = []
+        lifecycle = BrokerLifecycle(
+            enabled=True,
+            control_file=self.token_path,
+            peer_active_probe=flaky_probe,
+            peer_probe_interval_seconds=0.01,
+            self_activate_grace_seconds=0.04,
+        )
+        self.addCleanup(lifecycle.stop_watchdog)
+        lifecycle.set_warm(on_activate=lambda: activated.append("survived"))
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and lifecycle.state != BROKER_STATE_ACTIVE:
+            time.sleep(0.01)
+        self.assertEqual(BROKER_STATE_ACTIVE, lifecycle.state)
+        self.assertEqual(["survived"], activated)
+        self.assertGreaterEqual(calls[0], 3)
+
+    def test_activate_refuses_while_shutting_down_and_sigterm_stops_watchdog(self) -> None:
+        external_stop = threading.Event()
+        activated: list[str] = []
+        lifecycle = BrokerLifecycle(
+            enabled=True,
+            control_file=self.token_path,
+            peer_active_probe=lambda: False,
+            peer_probe_interval_seconds=0.01,
+            self_activate_grace_seconds=0.02,
+            external_stop=external_stop,
+        )
+        self.addCleanup(lifecycle.stop_watchdog)
+        lifecycle.set_warm(on_activate=lambda: activated.append("should-not-run"))
+        external_stop.set()
+        status, snap = lifecycle.activate()
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(BROKER_STATE_STANDBY, snap["state"])
+        self.assertEqual([], activated)
+
+        # Even if install_shutdown_handler catches SIGTERM, watchdog stops immediately.
+        prev_lifecycle = CredentialProxyHandler.lifecycle
+        prev_shutting_down = CredentialProxyHandler.shutting_down.is_set()
+        CredentialProxyHandler.shutting_down.clear()
+        CredentialProxyHandler.lifecycle = lifecycle
+        self.addCleanup(lambda: setattr(CredentialProxyHandler, "lifecycle", prev_lifecycle))
+        self.addCleanup(
+            lambda: CredentialProxyHandler.shutting_down.set()
+            if prev_shutting_down
+            else CredentialProxyHandler.shutting_down.clear()
+        )
+        dummy_server = SimpleNamespace(shutdown=lambda: None)
+        with mock.patch("signal.signal") as mock_signal:
+            credential_proxy.install_shutdown_handler(dummy_server, [], drain_seconds=0.0, settle_seconds=0.0)
+            on_sigterm = mock_signal.call_args.args[1]
+            on_sigterm(15, None)
+        self.assertTrue(lifecycle._watchdog_stop.is_set())
 
 
 if __name__ == "__main__":

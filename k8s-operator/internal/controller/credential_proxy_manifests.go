@@ -69,10 +69,10 @@ const (
 	credentialProxyMaxSurge       = int32(1)
 	credentialProxyMaxUnavailable = int32(0)
 
-	credentialProxyReadinessInitialDelaySeconds = int32(2)
-	credentialProxyReadinessPeriodSeconds       = int32(2)
-	credentialProxyReadinessTimeoutSeconds      = int32(2)
-	credentialProxyReadinessFailureThreshold    = int32(2)
+	credentialProxyReadinessInitialDelaySeconds = int32(5)
+	credentialProxyReadinessPeriodSeconds       = int32(10)
+	credentialProxyReadinessTimeoutSeconds      = int32(5)
+	credentialProxyReadinessFailureThreshold    = int32(3)
 )
 
 // credentialProxyClusterTypeAnnotation records, on the proxy Deployment's own
@@ -535,12 +535,16 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 
 // buildCredentialProxyDeploymentForPlugins renders the standalone proxy pod.
 //
+// Default and fixed profiles (small, medium, fleet) keep Recreate so the
+// single-replica broker keeps its existing rollout and self-recovery behaviour.
+// Under sizingProfile: auto with an in-cluster operator, it renders
 // RollingUpdate (maxSurge=1, maxUnavailable=0) with operator-coordinated
 // active-standby handoff (credential_proxy_control.go): the replacement pod
 // warms in standby (503 /healthz) while the old pod stays active; once warm,
-// the operator drains the old pod, transfers the Lease, and activates the new
-// pod so single-pod stateful routes (Google Chat acks, Slack Socket Mode,
-// scope MemberWindow) never split across two active brokers.
+// the operator drains the old pod, transfers ProfileTaskWrites and the Lease,
+// and activates the new pod so single-pod stateful routes (Google Chat acks,
+// Slack Socket Mode, ProfileTaskWrites, scope MemberWindow) never split
+// across two active brokers.
 //
 // One active replica, by design (see docs/designs/credential-proxy-single-pod.md
 // and docs/designs/proactive-utilization-sizing.md); only the exec route scales
@@ -584,6 +588,18 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 	if autopilot {
 		clusterType = credentialProxyClusterTypeAutopilot
 	}
+	strategy := appsv1.DeploymentStrategy{
+		Type: appsv1.RecreateDeploymentStrategyType,
+	}
+	if credentialProxyActiveStandby(agent) {
+		strategy = appsv1.DeploymentStrategy{
+			Type: appsv1.RollingUpdateDeploymentStrategyType,
+			RollingUpdate: &appsv1.RollingUpdateDeployment{
+				MaxSurge:       ptr.To(intstr.FromInt32(credentialProxyMaxSurge)),
+				MaxUnavailable: ptr.To(intstr.FromInt32(credentialProxyMaxUnavailable)),
+			},
+		}
+	}
 	dep := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -594,20 +610,14 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 		Spec: appsv1.DeploymentSpec{
 			// One active pod at a time: the broker keeps a process-local record of
 			// which profile task made which branch and proposal (ProfileTaskWrites in
-			// agents/platform/scripts/credential_proxy.py, #6400). In-cluster
-			// RollingUpdate (maxSurge=1, maxUnavailable=0) keeps the surge standby
-			// pod on 503 standby until the outgoing pod is drained (in_flight=0) and
-			// transfers ProfileTaskWrites across /control/drain -> /control/activate;
-			// off-cluster falls back via disableCredentialProxyStandby to Recreate
-			// (TestTheStatefulBrokerIsOnePodAndARolloutNeverOverlaps).
+			// agents/platform/scripts/credential_proxy.py, #6400). Default and fixed
+			// profiles roll with Recreate (TestTheStatefulBrokerIsOnePodAndARolloutNeverOverlaps);
+			// sizingProfile: auto in-cluster uses RollingUpdate (maxSurge=1, maxUnavailable=0)
+			// keeping the surge pod on 503 standby until the outgoing pod drains
+			// (in_flight=0) and transfers ProfileTaskWrites across /control/drain ->
+			// /control/activate, while off-cluster and legacy upgrade hops use Recreate.
 			Replicas: ptr.To(int32(1)),
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-				RollingUpdate: &appsv1.RollingUpdateDeployment{
-					MaxSurge:       ptr.To(intstr.FromInt32(credentialProxyMaxSurge)),
-					MaxUnavailable: ptr.To(intstr.FromInt32(credentialProxyMaxUnavailable)),
-				},
-			},
+			Strategy: strategy,
 			Selector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -704,7 +714,9 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 	// after the merge with spec.deployment.env, which reserves both names, as
 	// the federation pair below is.
 	envVars = append(envVars, auditReportStoreBrokerEnv(agent)...)
-	envVars = append(envVars, credentialProxyControlEnv()...)
+	if credentialProxyActiveStandby(agent) {
+		envVars = append(envVars, credentialProxyControlEnv(agent)...)
+	}
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -824,7 +836,9 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The token for the audit-report store and nothing else
 	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
 	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
-	mounts = append(mounts, credentialProxyControlMountSpec())
+	if credentialProxyActiveStandby(agent) {
+		mounts = append(mounts, credentialProxyControlMountSpec())
+	}
 	_, tiersMount, _ := a2aTiersVolumeAndMount(agent)
 	mounts = append(mounts, tiersMount)
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
@@ -947,6 +961,12 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 	// beside their place on allowedBrokerCallers (scopeBrokerPeers).
 	callers = append(callers, scopeBrokerPeers(agent)...)
 	callers = append(callers, a2aCuratorBrokerPeers(agent)...)
+	if credentialProxyActiveStandby(agent) {
+		// Allow standby surge pods to probe GET /healthz over the Service IP.
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+		})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -1050,7 +1070,9 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	// The token the broker presents to the audit-report store.
 	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)
-	volumes = append(volumes, credentialProxyControlVolumeSpec(agent))
+	if credentialProxyActiveStandby(agent) {
+		volumes = append(volumes, credentialProxyControlVolumeSpec(agent))
+	}
 	// The install's tier table (#6091): the operator's rendered, non-secret
 	// tiers ConfigMap, mounted read-only.
 	tiersVolume, _, _ := a2aTiersVolumeAndMount(agent)

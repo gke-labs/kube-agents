@@ -69,8 +69,8 @@ const (
 // ApiSession whose connect fails stays on the stateful broker for the rest of
 // the session (credential_proxy_client.py), and CredentialProxyExecReady would
 // flip on each miss. The 2s timeout is ample for a handler that returns a
-// constant. The stateful broker uses a tighter 2s/2s/2-failure readiness probe
-// for fast active-standby RollingUpdate cutover.
+// constant. The stateful broker keeps its own 5s/10s/5s/3 probe (under
+// sizingProfile: auto it uses active-standby RollingUpdate on :8766 handoff).
 const (
 	credentialProxyExecTierReadinessPeriodSeconds    int32 = 3
 	credentialProxyExecTierReadinessTimeoutSeconds   int32 = 2
@@ -176,6 +176,7 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	credentialProxyA2AChatAudienceEnvVar: true,
 	credentialProxyStandbyEnv:            true,
 	credentialProxyControlFileEnv:        true,
+	credentialProxyPeerHealthURLEnv:      true,
 	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
 	// allowed callers, the A2A gateway among them on every install, and
 	// the binding is what holds that account to the a2a-chat audience. The

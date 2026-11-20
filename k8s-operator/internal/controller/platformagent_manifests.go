@@ -5359,6 +5359,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	}
 	reserved[credentialProxyStandbyEnv] = struct{}{}
 	reserved[credentialProxyControlFileEnv] = struct{}{}
+	reserved[credentialProxyPeerHealthURLEnv] = struct{}{}
 
 	result := append([]corev1.EnvVar{}, managed...)
 	for _, env := range custom {

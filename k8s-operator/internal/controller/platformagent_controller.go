@@ -3700,8 +3700,10 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
 func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership) (time.Duration, error) {
-	if err := r.ensureCredentialProxyControlSecret(ctx, agent); err != nil {
-		return 0, fmt.Errorf("failed to ensure credential proxy control Secret: %w", err)
+	if credentialProxyActiveStandby(agent) && r.canControlBroker() {
+		if err := r.ensureCredentialProxyControlSecret(ctx, agent); err != nil {
+			return 0, fmt.Errorf("failed to ensure credential proxy control Secret: %w", err)
+		}
 	}
 	objs := []client.Object{buildCredentialProxyService(agent)}
 	// The resources override is checked here as well as at admission, because
@@ -3767,6 +3769,16 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	}
 	if !r.canControlBroker() {
 		disableCredentialProxyStandby(proxy)
+	} else if credentialProxyActiveStandby(agent) {
+		hasLegacy, err := r.hasLegacyCredentialProxyPod(ctx, agent)
+		if err != nil {
+			return 0, err
+		}
+		if hasLegacy {
+			// Keep Recreate (with standby env on template) until pre-standby pods
+			// are gone so the old ReplicaSet scales to 0 instead of recreating an active peer.
+			keepCredentialProxyStrategyRecreate(proxy)
+		}
 	}
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return 0, err

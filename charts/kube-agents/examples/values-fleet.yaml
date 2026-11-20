@@ -94,11 +94,12 @@ platformAgent:
       # default. The CPU request is the CPU it runs at on Autopilot without
       # bursting; on Standard or with bursting it may reach 8 vCPU. On
       # Standard the 4 vCPU request needs a node with more than that
-      # allocatable; the composition's default e2-standard-4 pool has less. The
-      # proxy Deployment rolls via RollingUpdate active-standby handoff, so an
-      # existing active broker pod keeps serving while a new surge pod stays
-      # Pending, but a fresh install with no running pod stays Pending until a
-      # larger pool is added before passing this file.
+      # allocatable; the composition's default e2-standard-4 pool has less. Since
+      # this file leaves sizingProfile unset, the proxy Deployment uses Recreate
+      # and waits Pending until a larger node pool fits; setting sizingProfile to
+      # auto uses active-standby RollingUpdate so an existing broker keeps
+      # serving while a surge pod stays Pending (a fresh install still waits for
+      # a larger pool before passing this file).
       # ephemeral-storage keeps the operator's 8Gi default, under Autopilot's
       # 10 GiB per-pod ceiling.
       resources:
