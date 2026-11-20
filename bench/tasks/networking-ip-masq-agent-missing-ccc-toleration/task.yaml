@@ -22,11 +22,13 @@
 # the default pool's nodes alone; `idle-batch-pool` and
 # `pinned-inference-pool` carry a NoSchedule taint it does not tolerate, while
 # every GKE-managed DaemonSet covers every node. Check 3.27 reads every
-# DaemonSet on the node's network, or mounting a network plug-in directory, in
-# kube-system and outside the system namespaces of a Standard cluster, against
-# the taints of the nodes its own selector admits, from the dump the audit
-# already takes; it is not scoped to DaemonSets named `ip-masq-agent*`, to
-# kube-system, or to the compute-class taint key, so it reads this fixture.
+# DaemonSet that mounts a network plug-in directory, or is on the node's
+# network with the NET_ADMIN or NET_RAW capability (as the documented
+# ip-masq-agent is), in kube-system and outside the system namespaces of a
+# Standard cluster, against the taints of the nodes its own selector admits,
+# from the dump the audit already takes; it is not scoped to DaemonSets named
+# `ip-masq-agent*`, to kube-system, or to the compute-class taint key. The
+# fixture is read through its mount of the node's CNI configuration.
 # The networking fabric audit reads the VPC with no cluster read at all. The
 # id keeps the scenario's name. Domain `fleet-audits` as the other networking
 # cases; the capability row is the networking fabric audit.

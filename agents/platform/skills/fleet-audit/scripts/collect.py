@@ -376,7 +376,16 @@ CONTEXT_RAW_WORKLOADS = "raw_workloads"
 # The most host mounts the excerpt names as the reason a DaemonSet was checked.
 NETWORK_DAEMONSET_MAX_MOUNTS_NAMED = 4
 NETWORK_DAEMONSET_MORE_MOUNTS = "{more} more plug-in mount{plural}"
-NETWORK_DAEMONSET_MARK_HOST_NETWORK = "hostNetwork: true"
+NETWORK_DAEMONSET_MARK_HOST_NETWORK = "hostNetwork: true with {capabilities}"
+# The Linux capabilities that let a container change the node's packet rules
+# and interfaces. Host networking alone is how many log, metrics and security
+# agents reach the node's ports, so it marks a node-networking agent only
+# together with one of these: GKE's documented ip-masq-agent manifest adds
+# both ("add: [\"NET_ADMIN\", \"NET_RAW\"]",
+# docs.cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent).
+# `privileged: true` is not read as one: it is how security agents run too.
+NETWORK_CAPABILITIES = ("NET_ADMIN", "NET_RAW")
+NETWORK_DAEMONSET_CAPABILITY_JOIN = ", "
 NETWORK_DAEMONSET_MARK_CNI_MOUNT = "mounts {path} from the node"
 # How the excerpt names the nodes that carry no node pool label.
 NETWORK_DAEMONSET_UNLABELLED_NODES = "nodes with no node pool label"
@@ -5256,10 +5265,21 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 def _node_networking_marks(template: dict) -> list[str]:
     """What makes this pod template a node-networking agent, as the excerpt
-    states it; empty when nothing does."""
+    states it; empty when nothing does: the host network together with a
+    network capability, or a host mount of a network plug-in directory."""
     marks = []
     if template.get("hostNetwork") is True:
-        marks.append(NETWORK_DAEMONSET_MARK_HOST_NETWORK)
+        added = set()
+        for container in (template.get("containers") or []) + (template.get("initContainers") or []):
+            if not isinstance(container, dict):
+                continue
+            capabilities = (container.get("securityContext") or {}).get("capabilities") or {}
+            added.update(str(c) for c in capabilities.get("add") or [])
+        held = [c for c in NETWORK_CAPABILITIES if c in added]
+        if held:
+            marks.append(
+                NETWORK_DAEMONSET_MARK_HOST_NETWORK.format(capabilities=NETWORK_DAEMONSET_CAPABILITY_JOIN.join(held))
+            )
     mounts = []
     for volume in template.get("volumes") or []:
         if not isinstance(volume, dict) or not isinstance(volume.get(HOST_PATH_VOLUME), dict):

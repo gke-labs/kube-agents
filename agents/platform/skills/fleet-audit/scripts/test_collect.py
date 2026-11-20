@@ -5020,7 +5020,7 @@ class TestNetworkDaemonsetMissingToleration(unittest.TestCase):
         self.assertEqual((hit["namespace"], hit["object"]), ("seeded-shapes", "DaemonSet/cni-shaped-agent"))
         self.assertEqual(
             hit["excerpt"],
-            "DaemonSet (checked here because of: hostNetwork: true; mounts /etc/cni/net.d from the node) "
+            "DaemonSet (checked here because of: mounts /etc/cni/net.d from the node) "
             "cannot be placed on 2 of the cluster's 5 nodes. "
             "It reports 3 of 3 pods ready, which counts only the nodes it can be placed on. "
             "It has no toleration for seeded-role=idle-batch:NoSchedule (node pool idle-batch-pool, 1 node); "
@@ -5032,7 +5032,7 @@ class TestNetworkDaemonsetMissingToleration(unittest.TestCase):
         agent = node_agent("ip-masq-agent", "kube-system", host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
         hits = self.hits(agent)
         self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("kube-system", "DaemonSet/ip-masq-agent")])
-        self.assertIn("(checked here because of: hostNetwork: true)", hits[0]["excerpt"])
+        self.assertIn("(checked here because of: hostNetwork: true with NET_ADMIN, NET_RAW)", hits[0]["excerpt"])
 
     def test_kube_system_is_the_one_system_namespace_read(self):
         """GKE's documented manifest is applied to `kube-system` by the owner.
@@ -5042,6 +5042,40 @@ class TestNetworkDaemonsetMissingToleration(unittest.TestCase):
             with self.subTest(namespace=ns):
                 self.assertEqual(self.hits(node_agent("collector", ns)), [])
         self.assertEqual(len(self.hits(node_agent("ip-masq-agent", "kube-system", capabilities=IP_MASQ_CAPABILITIES))), 1)
+
+    def test_the_host_network_alone_does_not_make_a_node_networking_agent(self):
+        """Log, metrics and security agents use the host network to reach the
+        node's ports. Without a network capability or a plug-in mount they are
+        not this check's subject, in any namespace and whatever the taint."""
+        gpu = {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}
+        evict = {"key": "dedicated", "value": "batch", "effect": "NoExecute"}
+        nodes = [cluster_node("n1"), cluster_node("g1", pool="gpu-pool", taints=[gpu]), cluster_node("e1", pool="evict-pool", taints=[evict])]
+        privileged = node_agent("security-agent", "security", host_paths=())
+        privileged["spec"]["template"]["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        for agent in (
+            node_agent("filebeat", "kube-system", host_paths=()),
+            node_agent("node-exporter", "monitoring", host_paths=(), tolerations=[{"effect": "NoSchedule", "operator": "Exists"}]),
+            node_agent("otel-agent", "observability", host_paths=(), capabilities=("SYS_PTRACE",)),
+            privileged,
+        ):
+            with self.subTest(agent=agent["metadata"]["name"]):
+                self.assertEqual(self.hits(agent, nodes=nodes), [])
+
+    def test_the_host_network_with_a_network_capability_is_flagged(self):
+        for capabilities in (("NET_ADMIN",), ("NET_RAW",), ("NET_ADMIN", "NET_RAW"), ("SYS_TIME", "NET_ADMIN")):
+            with self.subTest(capabilities=capabilities):
+                hits = self.hits(node_agent("snat-agent", "kube-system", host_paths=(), capabilities=capabilities))
+                self.assertEqual(len(hits), 1)
+                named = ", ".join(c for c in ("NET_ADMIN", "NET_RAW") if c in capabilities)
+                self.assertIn(f"(checked here because of: hostNetwork: true with {named})", hits[0]["excerpt"])
+        # The capability on an init container counts: it sets the rules before the agent starts.
+        agent = node_agent("snat-agent", "kube-system", host_paths=())
+        agent["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "rules", "securityContext": {"capabilities": {"add": ["NET_ADMIN"]}}}
+        ]
+        self.assertEqual(len(self.hits(agent)), 1)
+        # The capability without the host network is not the mark.
+        self.assertEqual(self.hits(node_agent("in-pod", "apps", host_network=False, host_paths=(), capabilities=("NET_ADMIN",))), [])
 
     def test_a_network_plugin_mount_without_host_network_is_flagged(self):
         for path in ("/etc/cni/net.d", "/opt/cni/bin", "/home/kubernetes/bin", "/etc/cni/net.d/"):
