@@ -444,7 +444,7 @@ class Retired(Base):
         self.assertEqual(code, 0)
         self.assertEqual(
             chat,
-            "**The upgrade readiness check couldn't read every project today.** Not read: p1. The clusters there keep any earlier results "
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p1. The clusters there keep any earlier results "
             "until it reads them again. It will try again at its next scheduled run. The details are in the agent's log.\n",
         )
         self.assertEqual(
@@ -1061,7 +1061,7 @@ class Budget(Base):
             code, chat, log = run_main_split(sandbox)
         self.assertEqual(code, 0)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["123456"], "one project, one table run")
-        self.assertEqual(chat, "**The upgrade readiness check can read every project again.**\n")
+        self.assertEqual(chat, "**The upgrade readiness check can read the whole fleet again.**\n")
         self.assertEqual(log, "upgrade readiness watch: the version table reads every project again\n")
         self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj", "my-proj": "my-proj"})
 
@@ -3228,15 +3228,16 @@ class ChatWording(Base):
         sandbox = FakeSandbox(envelope([member(m["cluster"], "lagging") for m in members]), envelope(members))
         code, chat, log = run_main_split(sandbox)
         self.assertEqual(code, 0)
-        shown_freeze = ("year-end freeze " + "x" * watch.CHAT_NAME_MAX_CHARS)[: watch.CHAT_NAME_MAX_CHARS - 1] + watch.ELLIPSIS
+        shown_freeze = "`" + ("year-end freeze " + "x" * watch.CHAT_NAME_MAX_CHARS)[: watch.CHAT_NAME_MAX_CHARS - 1] + watch.ELLIPSIS + "`"
         self.assertEqual(
             chat,
             f"**5 clusters aren't ready for GKE {TARGET} yet.**\n"
             "- batch: A served API version is removed.\n"
-            "- east: PodDisruptionBudget shop/checkout allows no evictions. Fix: let it evict at least one pod. Plus 1 more problem.\n"
+            "- east: PodDisruptionBudget `shop/checkout` allows no evictions. Fix: let it evict at least one pod. Plus 1 more problem.\n"
             f"- freeze: maintenance exclusion {shown_freeze} holds upgrades until December 2. Fix: end it early if the freeze is over.\n"
-            "- gpu: node pool gpu-pool (1.32.9-gke.100) is too far behind. Fix: upgrade the node pool first.\n"
-            "- west: admission webhook policy-gate fails closed and its backend is unreachable. Fix: restore the backend, or set its failurePolicy to Ignore.\n"
+            "- gpu: node pool `gpu-pool` (1.32.9-gke.100) is too far behind. Fix: upgrade the node pool first.\n"
+            "- west: admission webhook `policy-gate` fails closed and its backend is unreachable. Fix: restore the backend, or set its failurePolicy to Ignore "
+            "if it is not a security control.\n"
             "2 more are ready. 1 cluster couldn't be fully checked. The next report is due on October 15.\n",
         )
         self.assert_plain(chat)
@@ -3258,7 +3259,7 @@ class ChatWording(Base):
     def test_a_report_with_nothing_blocked_leads_with_what_is_ready_or_unchecked(self) -> None:
         cases = (
             ([member("a", "lagging", readiness="ready"), member("b", "lagging", readiness="ready")], f"**2 clusters are ready for GKE {TARGET}.**\nThe next report is due on October 15.\n"),
-            ([member("a", "lagging", readiness="ready"), member("b", "lagging")], f"**1 cluster is ready for GKE {TARGET}.**\n1 cluster couldn't be fully checked. The next report is due on October 15.\n"),
+            ([member("a", "lagging", readiness="ready"), member("b", "lagging")], f"**1 cluster is ready for GKE {TARGET}, and 1 couldn't be fully checked.**\nThe next report is due on October 15.\n"),
             ([member("a", "lagging", readiness="unknown")], f"**1 cluster couldn't be fully checked for GKE {TARGET}.**\nThe next report is due on October 15.\n"),
         )
         for graded, expected in cases:
@@ -3314,7 +3315,7 @@ class ChatWording(Base):
         self.assertEqual(code, 0)
         self.assertEqual(
             chat,
-            f"**1 cluster is ready for GKE {TARGET}.**\n1 cluster couldn't be fully checked. The next report is due on October 15. The details are in the agent's log.\n",
+            f"**1 cluster is ready for GKE {TARGET}, and 1 couldn't be fully checked.**\nThe next report is due on October 15. The details are in the agent's log.\n",
         )
         self.assert_plain(chat)
         self.assertIn("next refresh after 2026-10-15; readiness run for p2 failed: sandbox exited 255 without a report: ssh: lost connection", log)
@@ -3344,7 +3345,7 @@ class ChatWording(Base):
             self.assertEqual(code, 0)
             self.assertEqual(
                 chat,
-                "**The upgrade readiness check couldn't read every project today.** Not read: p2. The clusters there keep any earlier results until it reads "
+                "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p2. The clusters there keep any earlier results until it reads "
                 "them again. An admin needs to fix this first; the details are in the agent's log.\n\n" + admin,
             )
             self.assert_plain(chat)
@@ -3361,7 +3362,7 @@ class ChatWording(Base):
         self.assertEqual(code, 0)
         self.assertEqual(
             chat,
-            "**The upgrade readiness check couldn't read every project today.** Not read: p2. The clusters there keep any earlier results until it reads "
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p2. The clusters there keep any earlier results until it reads "
             "them again. It will try again at its next scheduled run. The details are in the agent's log.\n\n"
             f"**The upgrade readiness check couldn't read the cluster due for GKE {OLDER_TARGET}.** It will try again at its next scheduled run. "
             "The details are in the agent's log.\n",
@@ -3378,7 +3379,7 @@ class ChatWording(Base):
             chat.split(watch.CHAT_ITEM_SEPARATOR),
             [
                 f"**1 cluster is ready for GKE {OLDER_TARGET}.**\nThe next report is due on October 15.",
-                "**The upgrade readiness check couldn't read every project today.** Not read: 123456. The clusters there keep any earlier results until it "
+                "**The upgrade readiness check couldn't read part of the fleet today.** Not read: 123456. The clusters there keep any earlier results until it "
                 "reads them again. An admin needs to fix this first; the details are in the agent's log.\n",
             ],
         )
@@ -3412,10 +3413,31 @@ class ChatWording(Base):
         self.assertEqual(code, 0)
         self.assertEqual(
             chat,
-            "**The upgrade readiness check couldn't read every project today.** Not read: the install's declared scope. The clusters there keep any earlier "
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: the install's declared scope. The clusters there keep any earlier "
             "results until it reads them again. An admin needs to fix this first; the details are in the agent's log.\n",
         )
         self.assert_plain(chat)
+
+    def test_a_location_whose_read_failed_is_named_as_that_location_not_its_project(self) -> None:
+        errors = [{"project": "p1", "location": "europe-west1", "message": "get-server-config failed: 503"}]
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, chat, log = run_main_split(FakeSandbox(envelope([member("a", "current")], errors=errors, exit_code=1), table_failing_projects={"p2"}))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p2, p1 in europe-west1. The clusters there keep any earlier "
+            "results until it reads them again. It will try again at its next scheduled run. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn("p1: get-server-config failed: 503", log)
+        self.assertEqual(watch.unread_places(errors + [{"project": "p1", "message": "clusters list failed"}]), ["p1"], "a project not read covers its locations")
+
+    def test_the_post_s_ceiling_is_the_gateway_s(self) -> None:
+        # The gateway posts a notify longer than its chunk in pieces (a2a/gateway/relay.go); the watch fits its post to the same figure.
+        relay = (Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "relay.go").read_text(encoding="utf-8")
+        match = re.search(r"^const discordChunk = (\d+)$", relay, re.MULTILINE)
+        self.assertIsNotNone(match, "the gateway's chunk constant moved; find it and keep CHAT_POST_MAX_BYTES equal to it")
+        self.assertEqual(int(match.group(1)), watch.CHAT_POST_MAX_BYTES)
 
     def test_each_line_of_a_post_is_its_own_paragraph(self) -> None:
         self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
@@ -3426,15 +3448,19 @@ class ChatWording(Base):
         self.assertEqual(
             chat,
             f"**No cluster is due for GKE {OLDER_TARGET} any more.** The upgrade readiness check stops tracking it.\n\n"
-            "**The upgrade readiness check can read every project again.**\n",
+            "**The upgrade readiness check can read the whole fleet again.**\n",
         )
         self.assert_plain(chat)
         self.assertEqual(len(log.splitlines()), 2, "each chat line's technical line, one per line")
 
-    def test_a_name_a_tenant_wrote_stays_on_one_line_and_short(self) -> None:
-        self.assertEqual(watch.chat_name("year-end\nfreeze  now"), "year-end freeze now")
+    def test_a_name_a_tenant_wrote_stays_on_one_line_and_short_and_renders_nothing(self) -> None:
+        self.assertEqual(watch.chat_name("year-end\nfreeze  now"), "`year-end freeze now`")
         long_name = "x" * (watch.CHAT_NAME_MAX_CHARS + 10)
-        self.assertEqual(watch.chat_name(long_name), "x" * (watch.CHAT_NAME_MAX_CHARS - 1) + watch.ELLIPSIS)
+        self.assertEqual(watch.chat_name(long_name), "`" + "x" * (watch.CHAT_NAME_MAX_CHARS - 1) + watch.ELLIPSIS + "`")
+        # Set as code, a link or emphasis in a name is text; a backtick cannot close the span early.
+        self.assertEqual(watch.chat_name("[runbook](https://example.com/x)"), "`[runbook](https://example.com/x)`")
+        self.assertEqual(watch.chat_name("**loud** `x`"), "`**loud** x`")
+        self.assertEqual(watch.chat_name(None), "")
         self.assertEqual(watch.plain_date(datetime(2027, 1, 5, 18, 27, tzinfo=timezone.utc), NOW), "January 5, 2027")
         self.assertEqual(watch.plain_date(datetime(2026, 12, 2, tzinfo=timezone.utc), NOW), "December 2")
 

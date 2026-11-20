@@ -4,8 +4,8 @@ cluster graded, every finding registered on the findings queue, one technical
 report written, nothing said in chat.
 
 The daily ``upgrade-readiness-watch`` reads a cluster only while a release
-channel offers it a version it is below, and posts a short message about the
-report it wrote. This job runs once a week, on Saturday, over every cluster in the
+channel offers it a version it is below, and posts one short message a tick
+about the reports it wrote. This job runs once a week, on Saturday, over every cluster in the
 install's scope whatever its version, and feeds what the readiness report
 finds into the findings queue (``findings_queue.py``, the store behind the
 ``register_findings`` tool and the hourly ``findings-morning-nudge``). The
@@ -418,13 +418,16 @@ PARTIAL_LINE = (
 )
 REGISTRATION_LINE = "**Part of this week's upgrade readiness review didn't reach the findings queue.** {what}"
 REGISTRATION_ROWS = "{findings} didn't arrive."
-REGISTRATION_CLAIMS = "{clusters} keep last week's findings as they were."
+REGISTRATION_CLAIMS = "{clusters} {verb} last week's findings as they were."
+KEEP_FORMS = ("keeps", "keep")
 REGISTRATION_IN_REPORT_LINE = "The weekly report has them, and the weekly brief says so."
 REGISTRATION_NO_RECORD_LINE = "The weekly report couldn't be saved either."
 FINDING_FORMS = ("finding", "findings")
+# The copy is retried by the next review, which copies afresh; until then the
+# agent's answers and the weekly brief read whatever copy is there.
 COPY_FAILED_LINE = (
-    "**The agent can't read this week's upgrade readiness report.** Copying it for the agent failed, "
-    "so the agent reads last week's report until the next review. " + watch.DETAILS_IN_LOG
+    "**The weekly upgrade readiness review couldn't copy this week's report for the agent.** "
+    "The agent reads the previous copy, if there is one, until the next review copies again. " + watch.DETAILS_IN_LOG
 )
 # A failure is announced once per distinct cause: the marker keeps the failure's text
 # with every number replaced, so a timeout that reads 1187s one week and 1203s the
@@ -508,8 +511,7 @@ def rubric(values: tuple[int, int, int, int, int]) -> dict:
 
 
 def clip(text: object, limit: int = MAX_TEXT_CHARS) -> str:
-    text = " ".join(str(text or "").split())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+    return watch.clip_text(text, limit)
 
 
 def entry_title(entry: int | None) -> str:
@@ -1524,6 +1526,9 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str]]:
         # member projects out of the roster: the week is partial, said as such,
         # not a complete review of the live projects alone.
         failures[str(gap[watch.MEMBER_ID_KEYS[0]])] = str(gap[watch.MESSAGE_KEY])
+        # As the watch says it: a resolved scope the install cannot use needs a person.
+        if watch.errors_need_admin([gap]):
+            needs_admin.add(str(gap[watch.MEMBER_ID_KEYS[0]]))
     if failures and not read_ids:
         raise ProjectsFailed(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN), failures, bool(needs_admin))
     report_path = home / stamp / REPORT_MD_NAME
@@ -1551,7 +1556,7 @@ def review(dry_run: bool = False) -> tuple[list[str], list[str]]:
         failed_rows = sum(1 for outcome in outcomes.values() if outcome == REGISTRATION_FAILED)
         failed_claims = sum(1 for problem in problems if CLAIM_FAILED_MARK in problem)
         what = [REGISTRATION_ROWS.format(findings=watch.counted(failed_rows, FINDING_FORMS))] if failed_rows else []
-        what += [REGISTRATION_CLAIMS.format(clusters=watch.counted(failed_claims, watch.CLUSTER_FORMS))] if failed_claims else []
+        what += [REGISTRATION_CLAIMS.format(clusters=watch.counted(failed_claims, watch.CLUSTER_FORMS), verb=watch.plural(failed_claims, KEEP_FORMS))] if failed_claims else []
         chat = REGISTRATION_LINE.format(what=watch.SENTENCE_SEPARATOR.join([*what, where, watch.DETAILS_IN_LOG]))
         return [chat], [REGISTRATION_FAILED_LOG_LINE.format(prefix=LOG_PREFIX, rows=failed_rows, claims=failed_claims, detail=shown(problems, MAX_PROBLEMS_IN_LINE), where=where_log)]
 

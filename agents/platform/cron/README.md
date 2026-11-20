@@ -229,9 +229,10 @@ jsonpath projection; StorageClasses and PersistentVolumes), plus
 `gcloud logging read` over the Admin Activity log when a registered rule reads
 it; the saved report names those objects, pods and nodes among them, and a
 fail-closed webhook with no reachable backend names its configuration and its
-Service, which is tenant-written text, and the chat message names the budget,
-webhook configuration, maintenance exclusion or node pool that blocks each
-blocked cluster it lists, so the entry declares `risk: high` as `stall-watch` does. A project
+Service, which is tenant-written text, and the chat message names the first
+budget, webhook configuration, maintenance exclusion, node pool or readiness
+rule that blocks each blocked cluster it lists, so the entry declares
+`risk: high` as `stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -275,7 +276,7 @@ first-run baseline, not a week-over-week comparison. Its stdout is what
 counts the clusters not ready for the version yet (or the ready ones, when
 none is blocked), one line per blocked cluster naming the first thing that
 blocks it and the fix where its kind has one (five, fewer when the whole post
-would pass the 1,900 bytes the gateway posts as one message, then a count),
+would pass the 1,900 bytes the A2A gateway posts as one message, then a count),
 how many more are ready or could not be fully checked, and the date the next
 report is due. The reports come first, then the lines about reads that
 failed, then the notices. The agent's own tools run in
@@ -297,7 +298,7 @@ hour Hermes gives a `no_agent` script: the version table and the readiness
 runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
-line names each project with a read error, and its log line the reason (the budget, the
+line names the projects, or the locations in them, with a read error (six, then a count), and its log line the reason (the budget, the
 sandbox's error, a failed listing, an unresolved project number, a refusal under the
 declared scope with the install's remedy), the
 ledger's `table_errors` keeps the last tick's, and a version's own line, or its log line, names
@@ -341,7 +342,7 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 ## `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief` are one Saturday in two jobs
 
 The daily watch reads a cluster only while a release channel offers it a version it is below, and
-posts a short message per report. The weekly pair reads every cluster of the roster's projects whatever its
+posts one short message a tick, a few lines per report. The weekly pair reads every cluster of the roster's projects whatever its
 version (a declared scope refuses a project outside it), and ends in one message a person reads.
 
 `upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the
@@ -383,7 +384,7 @@ nothing on success: the brief speaks for the week and the queue for each finding
 not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
 is one line each, since both leave the week's findings where the brief cannot act on them; a
 failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
-on the next clean run. Each line is plain words; the reasons per project, the queue's refusals and
+on the next clean run; a record it cannot write is said every run. Each line is plain words; the reasons per project, the queue's refusals and
 the copy's error go to `logs/upgrade_readiness_review.log` under the agent home. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
 
 `upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its

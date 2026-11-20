@@ -346,10 +346,11 @@ REMEDY_RETIRING_EXCLUDED = (
 )
 REMEDY_READ_ACCESS = INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY
 REMEDY_CAP = INSTALL_REMEDY_PREFIX + "raise spec.scope.maxProjects, " + ROSTER_REMEDY
-# A remedy states no cadence: the same detail reaches the partial line (posted
-# once per cause), the all-refused line and the readiness hop's ungraded line,
-# which repeats weekly once parked. So the text says what clears the cause and
-# that another outcome is named here, never when the line returns.
+# A remedy states no cadence: the same detail reaches the log lines of the
+# partial table (posted once per cause), the all-refused tick and the readiness
+# hop's ungraded version, which repeats weekly once parked. So the text says
+# what clears the cause and that another outcome is named there, never when
+# the line returns.
 REMEDY_UNRESOLVED = (
     "the reconcile has not resolved it yet; the next tick that does reads it; the project stays "
     "unread until a reconcile tick lists it, and another outcome the reconcile records for it is named here with its remedy"
@@ -576,7 +577,7 @@ LAST_TICK_KEY = "last_tick"
 TABLE_RUNS_KEY = "table_runs"
 READINESS_RUNS_KEY = "readiness_runs"
 # The last tick's version-table read errors, reason included, so a cause the
-# partial line posted once is readable afterwards.
+# partial table's log line said once is readable afterwards.
 TABLE_ERRORS_KEY = "table_errors"
 # The projects the watch last filed as outside the resolved scope, each with
 # the folders, organisations and selectors the declaration named then
@@ -650,6 +651,8 @@ RETIRED_LINE = "**No cluster is due for GKE {version} any more.** The upgrade re
 # "can't upgrade" would be false for them.
 REPORT_BLOCKED_HEADLINE = "**{clusters} {verb} ready for GKE {version} yet.**"
 REPORT_READY_HEADLINE = "**{clusters} {verb} ready for GKE {version}.**"
+# Nothing blocked, but not every cluster checked: a reader who stops at the bold line sees both.
+REPORT_READY_UNCHECKED_HEADLINE = "**{clusters} {verb} ready for GKE {version}, and {unchecked} couldn't be fully checked.**"
 REPORT_UNCHECKED_HEADLINE = "**{clusters} couldn't be fully checked for GKE {version}.**"
 REPORT_MORE_READY = "{count} more {verb} ready."
 REPORT_UNCHECKED = "{clusters} couldn't be fully checked."
@@ -659,8 +662,9 @@ REPORT_NEXT = "The next report is due on {date}."
 # the report grades them (budgets, webhooks, exclusions, pool skew, the
 # readiness rules), with a short fix where the kind has one. A rule's blocker
 # is named by its catalogue entry's title; its fix depends on the finding,
-# which the saved report holds. A name a tenant wrote is put on one line and
-# cut to `CHAT_NAME_MAX_CHARS`.
+# which the saved report holds. A name the report carries, often one a tenant
+# wrote, is put on one line, cut to `CHAT_NAME_MAX_CHARS` and set as code, so
+# no Markdown in it (a link, emphasis) renders in the post.
 MAX_BLOCKED_CLUSTERS_SHOWN = 5
 BLOCKED_CLUSTER_LINE = "- {cluster}: {reason}"
 BLOCKED_CLUSTER_BARE = "- {cluster}"
@@ -668,7 +672,10 @@ BLOCKED_CLUSTERS_MORE = "- and {count} more"
 # A cluster name the lines shown repeat across projects is told apart by its project.
 CLUSTER_IN_PROJECT = "{cluster} in {project}"
 BLOCKER_BUDGET = "PodDisruptionBudget {pdb} allows no evictions. Fix: let it evict at least one pod."
-BLOCKER_WEBHOOK = "admission webhook {config} fails closed and its backend is unreachable. Fix: restore the backend, or set its failurePolicy to Ignore."
+BLOCKER_WEBHOOK = (
+    "admission webhook {config} fails closed and its backend is unreachable. "
+    "Fix: restore the backend, or set its failurePolicy to Ignore if it is not a security control."
+)
 BLOCKER_EXCLUSION = "maintenance exclusion {name} holds upgrades{until}. Fix: end it early if the freeze is over."
 BLOCKER_EXCLUSION_UNTIL = " until {date}"
 BLOCKER_SKEW = "node pool {pool} ({version}) is too far behind. Fix: upgrade the node pool first."
@@ -677,6 +684,8 @@ BLOCKER_RULE_UNTITLED = "a readiness rule blocks it."
 BLOCKER_MORE = " Plus {count} more {noun}."
 CHAT_NAME_MAX_CHARS = 60
 ELLIPSIS = "…"
+CODE_SPAN = "`{text}`"
+BACKTICK = "`"
 # Counted nouns, singular and plural, as chat reads them ("1 cluster", "3 clusters").
 COUNTED = "{count} {noun}"
 CLUSTER_FORMS = ("cluster", "clusters")
@@ -695,6 +704,7 @@ CHAT_ITEM_SEPARATOR = "\n\n"
 DRY_RUN_LINE_SEPARATOR = "\n"
 MESSAGE_LINE_SEPARATOR = "\n"
 SENTENCE_SEPARATOR = " "
+WORD_SEPARATOR = " "
 # The gateway posts a notify longer than this in pieces, the rest as replies in
 # a thread (`discordChunk` in a2a/gateway/relay.go, which `chatChunks` counts in
 # bytes), so the reports show fewer blocked clusters each until the post fits.
@@ -751,14 +761,17 @@ PARTIAL_LOG_LINE = (
 PARTIAL_REASON = "{project}: {message}"
 REASONS_SEPARATOR = "; "
 PARTIAL_CLEARED_LOG_LINE = "{prefix} watch: the version table reads every project again"
-# The partial table in chat names the projects it did not read; the read
-# under spec.mode: next that names no member project is the install's scope.
+# The partial table in chat names the projects, and the locations of others,
+# it did not read (`unread_places`); the read under spec.mode: next that names
+# no member project is the install's scope.
 PARTIAL_LINE = (
-    "**The upgrade readiness check couldn't read every project today.** Not read: {names}. "
+    "**The upgrade readiness check couldn't read part of the fleet today.** Not read: {names}. "
     "The clusters there keep any earlier results until it reads them again. {next}"
 )
 PARTIAL_SCOPE_GAP_NAME = "the install's declared scope"
-PARTIAL_CLEARED_LINE = "**The upgrade readiness check can read every project again.**"
+# A read error with a location is that location's, not the whole project's.
+PARTIAL_LOCATION_NAME = "{project} in {location}"
+PARTIAL_CLEARED_LINE = "**The upgrade readiness check can read the whole fleet again.**"
 # What happens after a read that failed: a person acts first, for a refusal no
 # retry clears, a project number that does not resolve or a resolved scope
 # the install cannot use (as for a scope render this pod cannot read), else
@@ -2121,11 +2134,19 @@ def plain_date(moment: datetime, now: datetime) -> str:
     return text if moment.year == now.year else PLAIN_DATE_WITH_YEAR.format(date=text, year=moment.year)
 
 
+def clip_text(value: object, limit: int) -> str:
+    """``value`` on one line, cut to ``limit`` characters with an ellipsis."""
+    text = WORD_SEPARATOR.join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - len(ELLIPSIS)].rstrip() + ELLIPSIS
+
+
 def chat_name(value: object) -> str:
-    """A name the report carries, often one a tenant wrote, on one line and cut
-    to `CHAT_NAME_MAX_CHARS`, so it cannot break the message's lines."""
-    text = " ".join(str(value or "").split())
-    return text if len(text) <= CHAT_NAME_MAX_CHARS else text[: CHAT_NAME_MAX_CHARS - len(ELLIPSIS)] + ELLIPSIS
+    """A name the report carries, often one a tenant wrote, as chat shows it:
+    on one line, cut to `CHAT_NAME_MAX_CHARS`, and set as code with any
+    backtick dropped, so it cannot break the message's lines or render as a
+    link or emphasis."""
+    text = clip_text(str(value or "").replace(BACKTICK, ""), CHAT_NAME_MAX_CHARS)
+    return CODE_SPAN.format(text=text) if text else text
 
 
 def clusters_due(count: int, version: str) -> str:
@@ -2136,6 +2157,20 @@ def chat_project_names(projects: list[str]) -> str:
     """Projects as chat names them, the first few and a count of the rest; the
     read that names no member project under spec.mode: next is the scope's."""
     return shown_names([PARTIAL_SCOPE_GAP_NAME if p == fleet_scope_targets.UNRESOLVED_SCOPE_ROW else p for p in projects])
+
+
+def unread_places(read_errors: list) -> list[str]:
+    """What the version table did not read, as chat names it: each project with
+    a read error of its own, then each location of another project whose read
+    failed (a server config), in project order; the scope's gap is named as
+    the scope (`chat_project_names`)."""
+    whole = {str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors if not e.get(MEMBER_ID_KEYS[1])}
+    located = {
+        PARTIAL_LOCATION_NAME.format(project=e.get(MEMBER_ID_KEYS[0]), location=e.get(MEMBER_ID_KEYS[1]))
+        for e in read_errors
+        if e.get(MEMBER_ID_KEYS[1]) and str(e.get(MEMBER_ID_KEYS[0])) not in whole
+    }
+    return sorted(whole) + sorted(located)
 
 
 def refusals_need_admin(causes) -> bool:
@@ -2179,7 +2214,7 @@ def blocker_reasons(readiness: dict, now: datetime) -> list[str]:
             until = BLOCKER_EXCLUSION_UNTIL.format(date=plain_date(end, now)) if end else ""
             reasons.append(BLOCKER_EXCLUSION.format(name=chat_name(exclusion.get(NAME_KEY)), until=until))
     reasons += [
-        BLOCKER_SKEW.format(pool=chat_name(pool.get(NAME_KEY)), version=chat_name(pool.get(POOL_VERSION_KEY)))
+        BLOCKER_SKEW.format(pool=chat_name(pool.get(NAME_KEY)), version=clip_text(pool.get(POOL_VERSION_KEY), CHAT_NAME_MAX_CHARS))
         for pool in dict_items(dict_of(readiness.get(SKEW_KEY)).get(POOLS_KEY))
         if pool.get(VERDICT_KEY) == SKEW_VERDICT_BLOCKS
     ]
@@ -2244,6 +2279,11 @@ def report_message(entry: Report, now: datetime, shown: int = MAX_BLOCKED_CLUSTE
             lines.append(BLOCKED_CLUSTERS_MORE.format(count=len(blocked) - len(keys)))
         if ready:
             tail.append(REPORT_MORE_READY.format(count=len(ready), verb=plural(len(ready), BE_FORMS)))
+    elif ready and unchecked:
+        lines.append(
+            REPORT_READY_UNCHECKED_HEADLINE.format(clusters=counted(len(ready), CLUSTER_FORMS), verb=plural(len(ready), BE_FORMS), version=version, unchecked=unchecked)
+        )
+        unchecked = 0
     elif ready:
         lines.append(REPORT_READY_HEADLINE.format(clusters=counted(len(ready), CLUSTER_FORMS), verb=plural(len(ready), BE_FORMS), version=version))
     else:
@@ -2566,9 +2606,9 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> tuple[list
     if signature and signature != already:
         # Counted by project, as the key and the reasons are: both spellings of one project,
         # run on the tick its id is learned, are one read error.
-        unread_projects = sorted({str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors})
-        failed_reads.append(PARTIAL_LINE.format(names=chat_project_names(unread_projects), next=failure_next(errors_need_admin(read_errors))))
-        log.append(PARTIAL_LOG_LINE.format(prefix=LINE_PREFIX, errors=len(unread_projects), code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
+        errors = len({str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors})
+        failed_reads.append(PARTIAL_LINE.format(names=chat_project_names(unread_places(read_errors)), next=failure_next(errors_need_admin(read_errors))))
+        log.append(PARTIAL_LOG_LINE.format(prefix=LINE_PREFIX, errors=errors, code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
     elif complete and already:
         notices.append(PARTIAL_CLEARED_LINE)
         log.append(PARTIAL_CLEARED_LOG_LINE.format(prefix=LINE_PREFIX))

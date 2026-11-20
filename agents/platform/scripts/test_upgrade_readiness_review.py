@@ -1108,11 +1108,18 @@ class TheTick(unittest.TestCase):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: PROJECT}), mock.patch.object(
             fst, "list_scope_clusters", return_value=unusable
         ) as read:
-            code, out = self.run_main()
+            code, chat, log = self.run_main_split()
         self.assertEqual(code, 0)
         self.assertEqual(read.call_count, 1)
         self.assertEqual(self.asked[0], [PROJECT])
-        self.assertIn(f"1 project(s) not read this week: {fst.UNRESOLVED_SCOPE_ROW}: the resolved scope at /r.json is in state 'too-large'", out)
+        # As the daily watch says it: a resolved scope the install cannot use needs a person, not a retry.
+        self.assertEqual(
+            chat,
+            "**The weekly upgrade readiness review couldn't read every project.** Not read: the install's declared scope. The clusters there keep "
+            "last week's findings, and this week's counts leave them out. An admin needs to fix this first; the details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn(f"1 project(s) not read this week: {fst.UNRESOLVED_SCOPE_ROW}: the resolved scope at /r.json is in state 'too-large'", log)
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertIn(fst.UNRESOLVED_SCOPE_ROW, latest["project_failures"])
 
@@ -1453,14 +1460,29 @@ class TheTick(unittest.TestCase):
         self.assertEqual(chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR), [review.COPY_FAILED_LINE, review.RECOVERED_LINE])
         self.assert_plain(chat)
 
-    def test_a_copy_that_failed_says_the_agent_reads_last_week_s_report(self):
+    def test_one_cluster_s_claim_is_said_in_the_singular(self):
+        def kv(path, body, timeout=None):
+            # An answer with no results: seeded-b's batch of rows and its claim go unacknowledged,
+            # while seeded-c's empty batch needs no result and its claim lands.
+            return {"results": [], "downgraded": 0}
+
+        with mock.patch.object(review, "kv_request", side_effect=kv):
+            code, chat, _ = self.run_main_split()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**Part of this week's upgrade readiness review didn't reach the findings queue.** 5 findings didn't arrive. 1 cluster keeps last week's "
+            "findings as they were. The weekly report has them, and the weekly brief says so. The details are in the agent's log.\n",
+        )
+
+    def test_a_copy_that_failed_says_the_agent_reads_the_previous_copy(self):
         with mock.patch.object(review, "copy_to_sandbox", return_value="the sandbox exited 1: /opt/data/upgrade-readiness/weekly is read-only"):
             code, chat, log = self.run_main_split()
         self.assertEqual(code, 0)
         self.assertEqual(
             chat,
-            "**The agent can't read this week's upgrade readiness report.** Copying it for the agent failed, so the agent reads last week's report "
-            "until the next review. The details are in the agent's log.\n",
+            "**The weekly upgrade readiness review couldn't copy this week's report for the agent.** The agent reads the previous copy, if there is "
+            "one, until the next review copies again. The details are in the agent's log.\n",
         )
         self.assert_plain(chat)
         self.assertIn("the sandbox copy failed: the sandbox exited 1: /opt/data/upgrade-readiness/weekly is read-only", log)
