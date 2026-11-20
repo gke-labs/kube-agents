@@ -94,7 +94,8 @@ func (c scriptFileCheck) withDefaults() scriptFileCheck {
 
 // resolve is the real path of the script at path, or why it can't run. The
 // path has ScriptPath's shape under the root; its real path lies under the
-// root too; every directory from the root down to it, and the file itself,
+// root too; every directory from the root down to it, and down to the named
+// path (where none may be a symlink), and the file itself,
 // is owned by the owner and writable by no group or other; the file is a
 // regular file; and the worker isn't the owner, so it can't have written
 // it. The root's own ancestors are image layers, which the build-time check
@@ -116,16 +117,9 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 	if !strings.HasPrefix(real, root) {
 		return "", fmt.Errorf("%s resolves to %s, outside %s", path, real, root)
 	}
-	dirs := []string{strings.TrimSuffix(root, "/")}
-	rel := strings.TrimPrefix(filepath.Dir(real), root)
-	if filepath.Dir(real)+"/" != root {
-		cur := strings.TrimSuffix(root, "/")
-		for _, seg := range strings.Split(rel, "/") {
-			cur = cur + "/" + seg
-			dirs = append(dirs, cur)
-		}
-	}
-	for _, d := range dirs {
+	// Both chains: the resolved file's, and the named path's, so a directory on the way that is a
+	// symlink or writable by someone else is refused even when the file it leads to passes.
+	for _, d := range append(dirChain(root, path), dirChain(root, real)...) {
 		if err := c.ownedAndUnwritable(d, true); err != nil {
 			return "", err
 		}
@@ -134,6 +128,21 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 		return "", err
 	}
 	return real, nil
+}
+
+// dirChain is every directory from root (which ends in "/") down to file's
+// own, root first.
+func dirChain(root, file string) []string {
+	dirs := []string{strings.TrimSuffix(root, "/")}
+	if filepath.Dir(file)+"/" == root {
+		return dirs
+	}
+	cur := strings.TrimSuffix(root, "/")
+	for _, seg := range strings.Split(strings.TrimPrefix(filepath.Dir(file), root), "/") {
+		cur = cur + "/" + seg
+		dirs = append(dirs, cur)
+	}
+	return dirs
 }
 
 func (c scriptFileCheck) ownedAndUnwritable(path string, dir bool) error {
