@@ -823,6 +823,8 @@ The onboarding delivery stage waits a day for a human to connect over chat. Then
 
 Read it there with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md`, or in the issue afterwards. The file is renamed `INVENTORY.delivered.md` once filed or retired.
 
+Or ask through any of these doors. `what did onboarding find?` answers from that report, `show me the full inventory` from the sweep's complete findings, and `was the first-run report delivered?` says where it went: the chat where the first person wrote, the issue, or retired after a week with nobody arriving.
+
 ## Where to go next
 
 - [Overview → Proactive autonomy](/kube-agents/overview/proactive-autonomy/) — what fires the outbound alerts.

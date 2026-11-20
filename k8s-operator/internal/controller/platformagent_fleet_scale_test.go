@@ -420,7 +420,7 @@ func TestTheDispatchConfigMapUnderJobModeAtScale(t *testing.T) {
 	for i := 0; i < jobModeScaleProfiles; i++ {
 		profiles = append(profiles, unattendedProfile(agent, fmt.Sprintf("u%04d", i)))
 	}
-	templates := dispatchJobTemplates(agent, profiles, false)
+	templates := dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder)
 	if len(templates) != jobModeScaleProfiles {
 		t.Fatalf("%d Job templates rendered for %d unattended profiles", len(templates), jobModeScaleProfiles)
 	}

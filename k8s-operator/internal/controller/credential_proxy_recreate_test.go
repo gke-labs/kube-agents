@@ -262,3 +262,19 @@ func TestTheBrokerRecreationGivesTheReconcileBackWhenTheDeleteHangs(t *testing.T
 		t.Fatal("a wait that cannot finish must return an error, not report the object gone")
 	}
 }
+
+// The stateful broker is one pod, and a rollout never runs two. The broker's
+// per-task record of which profile task made which branch and proposal
+// (ProfileTaskWrites in agents/platform/scripts/credential_proxy.py, #6400) is
+// process-local, and is only right because one process serves /v1/vcs/. If
+// this ever changes, that record moves to shared state first; until then this
+// test is the tripwire, so a scale-out can't quietly let two pods disagree.
+func TestTheStatefulBrokerIsOnePodAndARolloutNeverOverlaps(t *testing.T) {
+	deploy := buildCredentialProxyDeployment(a2aTestAgent(), "hash")
+	if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 1 {
+		t.Fatalf("the stateful broker renders %v replicas; it must be exactly 1 while ProfileTaskWrites is process-local (#6400)", deploy.Spec.Replicas)
+	}
+	if deploy.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Fatalf("the stateful broker rolls out with %q; it must be Recreate, so no two pods serve /v1/vcs/ at once (#6400)", deploy.Spec.Strategy.Type)
+	}
+}

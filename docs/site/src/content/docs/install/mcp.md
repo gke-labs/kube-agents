@@ -125,7 +125,9 @@ The module needs Go 1.27; an older `go` command fetches the right toolchain by i
 kube-agents-mcp --version
 ```
 
-It prints `kube-agents` and the bridge's version. Note the binary's full path (`command -v kube-agents-mcp`): your host starts it by that path.
+It prints `kube-agents-mcp` and a version: the release for a binary from a release archive, or for a build from source the module version Go recorded (a pseudo-version for `@main`; `dev` when it recorded none). Note the binary's full path (`command -v kube-agents-mcp`): your host starts it by that path.
+
+Newer GitHub Releases also attach the bridge prebuilt for macOS and Linux on amd64 and arm64, as `kube-agents-mcp_<version>_<os>_<arch>.tar.gz`, covered by the release's `checksums.txt`. Releases from before those archives began carry none, so build from source when yours has none.
 
 ## Configure your MCP host
 
