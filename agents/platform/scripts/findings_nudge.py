@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 import chat_message
 import findings_nudge_card as nudge_card
 import findings_queue as fq
+import slack_audit_report
 import slack_presenter
 
 JOB_ID = nudge_card.JOB_ID
@@ -169,7 +170,7 @@ CLI_TOOLS_PATTERN = r"(?:kubectl|gcloud|helm|git|gh|terraform|tofu|docker)"
 PAREN_CLI_RE = re.compile(
     rf"\s*\((?i:e\.g\.?,?\s*|for example,?\s*|run\s+)?`?{CLI_TOOLS_PATTERN}\b(?:[^()]|\([^()]*\))*\)",
 )
-EXAMPLE_CLI_RE = re.compile(rf"(?i:,?\s*(?:e\.g\.?|for example|such as),?)\s*`{CLI_TOOLS_PATTERN}\b[^`]*`")
+EXAMPLE_CLI_RE = re.compile(rf"(?i:[,;]?\s*(?:e\.g\.?|for example|such as),?)\s*`{CLI_TOOLS_PATTERN}\b[^`]*`")
 RUN_CLI_TO_RE = re.compile(rf"^\s*(?i:run)\s+`?{CLI_TOOLS_PATTERN}\s+[^`]+?`?\s+to\s+(.+)$")
 # The plain form only: a flag is not a kind, and a condition after it is not dropped.
 KUBECTL_DELETE_RE = re.compile(
@@ -187,6 +188,16 @@ COMMAND_LEFT_RE = re.compile(
 SPACE_BEFORE_MARK_RE = re.compile(r"\s+(?=[,.;:!?](?:\s|$))")
 # One word left of "Run <command> to <goal>" says nothing ("Check.").
 ACTION_MIN_WORDS = 2
+# What is left of a sentence a command was cut out of has to stand: three words
+# or more, and no end on a word or a mark the command hung from ("Do not.",
+# "Do not run.", "Scale the pool;").
+CUT_MIN_WORDS = 3
+CUT_DANGLING_WORDS = ("not", "run")
+CUT_DANGLING_MARK = ";"
+# A step a removed command would take that the words left must still name: with
+# "Run `terraform destroy` to start over." the reader of "Start over." is not
+# told what the fix destroys. A force flag counts.
+DESTRUCTIVE_WORDS = ("delete", "destroy", "drain", "uninstall", "rollback", "reset", "purge", "force")
 # In place of a recommendation that cannot be shown without its command. It
 # states no action of its own: the source's action is the command.
 FALLBACK_ACTION = "The recommended fix is a command, which is not shown here."
@@ -421,13 +432,23 @@ def _one_line(text: str) -> str:
     return " ".join((text or "").split())
 
 
+def _plain(text: str) -> str:
+    """One line of a finding's text with no live mention or link in it.
+
+    A title or a recommendation is text a detector or a model wrote, and the
+    fallback goes out as plain text: `<!channel>` loses its brackets and a link
+    keeps its label, as the fleet-audit card's rows do.
+    """
+    return slack_audit_report._row_text(_one_line(text))
+
+
 def _fix_singular_plurals(text: str) -> str:
     return ONE_PLURAL_RE.sub(lambda m: f"1 {m.group(1)[:-1]}", text)
 
 
 def clean_title(raw_title: str) -> str:
     """Strip check entry numbers, raw scores, and awkward pod/replica phrasing from a title."""
-    cleaned = LEADING_NUMBER_RE.sub("", _one_line(raw_title))
+    cleaned = LEADING_NUMBER_RE.sub("", _plain(raw_title))
     cleaned = EXPECTED_PODS_RE.sub(
         lambda m: EXPECTED_PODS_PLAIN.format(pods=_plural(int(m.group(1)), *POD_NOUN)),
         cleaned,
@@ -453,26 +474,61 @@ def clean_action(raw_action: str) -> str:
     `kubectl delete`; and `FALLBACK_ACTION` for every other action with a
     command in it, so no sentence is edited around one.
     """
-    original = _one_line(raw_action)
+    original = _plain(raw_action)
     if not original:
         return ""
     delete_match = KUBECTL_DELETE_RE.match(original)
     if delete_match:
         return REMOVE_ACTION.format(kind=delete_match.group(1), name=delete_match.group(2))
     text = original
+    removed: list[str] = []
+
+    def take(match: re.Match) -> str:
+        removed.append(match.group(0))
+        return ""
+
     run_match = RUN_CLI_TO_RE.match(text)
     if run_match:
+        removed.append(text[: run_match.start(1)])
         goal = run_match.group(1).strip()
-        if len(goal.rstrip("".join(SENTENCE_ENDINGS)).split()) < ACTION_MIN_WORDS:
+        if _word_count(goal) < ACTION_MIN_WORDS:
             return FALLBACK_ACTION
         text = goal[:1].upper() + goal[1:]
-    text = EXAMPLE_CLI_RE.sub("", PAREN_CLI_RE.sub("", text))
+    cut = len(removed)
+    text = EXAMPLE_CLI_RE.sub(take, PAREN_CLI_RE.sub(take, text))
     if COMMAND_LEFT_RE.search(text):
         return FALLBACK_ACTION
-    if text != original:
+    if removed:
         text = SPACE_BEFORE_MARK_RE.sub("", _one_line(text))
+        if _hides_a_destructive_step(removed, text) or (len(removed) > cut and _is_stub(text)):
+            return FALLBACK_ACTION
     text = _fix_singular_plurals(_one_line(text)).strip(ACTION_EDGE_CHARS)
     return _ensure_period(text) if text else FALLBACK_ACTION
+
+
+def _word_count(text: str) -> int:
+    return len(text.rstrip("".join(SENTENCE_ENDINGS)).split())
+
+
+def _is_stub(text: str) -> bool:
+    """Whether what a cut left cannot stand as a sentence."""
+    body = text.rstrip("".join(SENTENCE_ENDINGS) + " ")
+    words = body.split()
+    return (
+        len(words) < CUT_MIN_WORDS
+        or body.endswith(CUT_DANGLING_MARK)
+        or words[-1].lower() in CUT_DANGLING_WORDS
+    )
+
+
+def _hides_a_destructive_step(removed: list[str], kept: str) -> bool:
+    """Whether a removed command takes a destructive step the kept words do not name."""
+    kept_lower = kept.lower()
+    return any(
+        word in span.lower() and word not in kept_lower
+        for span in removed
+        for word in DESTRUCTIVE_WORDS
+    )
 
 
 def ambiguous_clusters(rows: list[dict]) -> frozenset[str]:

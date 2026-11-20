@@ -461,6 +461,50 @@ class DetectorWordingTests(unittest.TestCase):
         ):
             self.assertEqual(nudge.clean_action(raw), nudge.FALLBACK_ACTION, raw)
 
+    def test_a_removed_command_does_not_hide_a_destructive_step(self):
+        # "Start over." does not say that the fix destroys something.
+        for raw in (
+            "Run `terraform destroy` to start over.",
+            "Run kubectl delete namespace prod --wait=false to clean up.",
+            "Run `kubectl drain node-1 --force --delete-emptydir-data` to free the node.",
+            "Clean up (run `kubectl delete namespace prod`).",
+            "Tidy the old release, e.g. `helm uninstall api -n shop`, before the upgrade.",
+        ):
+            self.assertEqual(nudge.clean_action(raw), nudge.FALLBACK_ACTION, raw)
+        # The words that are left name the step themselves: nothing is hidden.
+        self.assertEqual(
+            nudge.clean_action("Delete the orphan Node object (kubectl delete node <name>); nothing runs on it."),
+            "Delete the orphan Node object; nothing runs on it.",
+        )
+
+    def test_a_cut_that_leaves_a_stub_gives_the_fallback(self):
+        for raw in (
+            "Do not, for example, `kubectl delete pod web-0`.",
+            "Do not run e.g. `kubectl get pdb x`.",
+            "Run, e.g., `kubectl get pods`.",
+            "Try e.g. `kubectl rollout restart deploy/web`.",
+            "Check it (kubectl get pdb -A).",
+        ):
+            self.assertEqual(nudge.clean_action(raw), nudge.FALLBACK_ACTION, raw)
+        self.assertEqual(
+            nudge.clean_action("Scale the pool to 3 nodes; e.g. `gcloud container clusters resize c --num-nodes 3`."),
+            "Scale the pool to 3 nodes.",
+        )
+
+    def test_a_mention_or_a_link_in_a_findings_text_is_not_live(self):
+        row = finding(
+            title="<!channel> api has no limits, see <https://evil.example|the runbook>",
+            recommendation={"action": "Ask <@U123ABC> or <!here> to set limits on [api](https://evil.example)."},
+        )
+        other = finding(id="q", check_slug="q", severity="minor", title="<!channel> has no quota")
+        bundle = nudge.build_nudge(plan_for([row, other]), 2, False, rows=[row, other])
+        chat, _ = nudge_card.chat_from_card(bundle.card)
+        shown = "\n".join([bundle.text, json.dumps(chat), json.dumps(nudge_card.blocks_from_card(bundle.card)[0])])
+        for live in ("<!channel>", "<!here>", "<@U123ABC>", "<https://", "](https://"):
+            self.assertNotIn(live, shown)
+        self.assertIn("!channel api has no limits, see the runbook", bundle.text)
+        self.assertIn("Ask @U123ABC or !here to set limits on api.", bundle.text)
+
     def test_the_fallback_states_no_action_of_its_own(self):
         self.assertEqual(nudge.FALLBACK_ACTION, "The recommended fix is a command, which is not shown here.")
 
