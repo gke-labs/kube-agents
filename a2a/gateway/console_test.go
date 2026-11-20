@@ -392,14 +392,14 @@ func TestConsoleNotifyArrivesAsANotifyFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = r.browser.Flush()
-	id, err := r.adapter.PostNotifyFrame("console:tab-8", "", "the report", "task-7", false)
+	id, err := r.adapter.PostNotifyFrame("console:tab-8", "", "the report", "task-7", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(id, consoleNotifyIDPrefix) {
 		t.Errorf("minted id %q lacks the %q prefix", id, consoleNotifyIDPrefix)
 	}
-	if _, err := r.adapter.PostNotifyFrame("console:tab-8", id, "the report, updated", "task-7", true); err != nil {
+	if _, err := r.adapter.PostNotifyFrame("console:tab-8", id, "the report, updated", "task-7", true, true); err != nil {
 		t.Fatal(err)
 	}
 	var raw []string
@@ -410,10 +410,10 @@ func TestConsoleNotifyArrivesAsANotifyFrame(t *testing.T) {
 		}
 		raw = append(raw, string(msg.Data))
 	}
-	if want := `{"messageId":"` + id + `","text":"the report","kind":"notify","replyTo":"task-7"}`; raw[0] != want {
+	if want := `{"messageId":"` + id + `","text":"the report","kind":"notify","replyTo":"task-7","report":true}`; raw[0] != want {
 		t.Errorf("notify frame = %s, want %s", raw[0], want)
 	}
-	if want := `{"messageId":"` + id + `","text":"the report, updated","edit":true,"kind":"notify","replyTo":"task-7"}`; raw[1] != want {
+	if want := `{"messageId":"` + id + `","text":"the report, updated","edit":true,"kind":"notify","replyTo":"task-7","report":true}`; raw[1] != want {
 		t.Errorf("edit frame = %s, want %s", raw[1], want)
 	}
 }
@@ -881,7 +881,7 @@ func TestAConsoleNotifyFrameCutSaysTheReportWasCut(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = r.browser.Flush()
-	if _, err := r.adapter.PostNotifyFrame("console:tab-11", "", strings.Repeat("<", consoleResultTextCap), "task-1", false); err != nil {
+	if _, err := r.adapter.PostNotifyFrame("console:tab-11", "", strings.Repeat("<", consoleResultTextCap), "task-1", true, false); err != nil {
 		t.Fatal(err)
 	}
 	msg, err := sub.NextMsg(5 * time.Second)

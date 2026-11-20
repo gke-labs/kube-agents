@@ -1018,7 +1018,9 @@ export function reduce(state: UiState, event: BusEvent): UiState {
             session: GATEWAY_SESSION,
             text: event.frame.text,
             correlationId: event.conversation,
-            ...(event.frame.replyTo !== undefined ? { replyTo: event.frame.replyTo } : {}),
+            // The reply target is the report's alone: a card's progress note
+            // and plan line name the same task, with no report kept under them.
+            ...(event.frame.replyTo !== undefined && event.frame.report === true ? { replyTo: event.frame.replyTo } : {}),
           },
         ],
       };

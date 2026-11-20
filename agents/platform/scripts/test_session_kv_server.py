@@ -1329,6 +1329,46 @@ class TestAlertGoesToTheFirstHomePostPlatform(unittest.TestCase):
         session_kv_server._register_session_routing.assert_called_once()
         self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], "slack")
 
+    # (A2A_NOTIFY_PLATFORM, slack_home, gchat_home, the platform picked): a
+    # configured home before a learned one, Chat before Slack when alike.
+    PICKS = (
+        ("slack", "", "spaces/AAA\n", "slack"),
+        ("google_chat", "C1\n", "", "google_chat"),
+        ("", "C1\n", "spaces/AAA\n", "google_chat"),
+        ("google_chat,slack", "", "", "google_chat"),
+    )
+
+    def _homes(self, listed, slack_file, gchat_file):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = listed
+        self._write_home_file(slack_file)
+        with open(os.path.join(self.dir, chat_notify.GCHAT_HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(gchat_file)
+
+    def test_the_alert_takes_a_configured_home_ahead_of_a_learned_one(self):
+        for listed, slack_file, gchat_file, picked in self.PICKS:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._homes(listed, slack_file, gchat_file)
+                session_kv_server._register_session_routing.reset_mock()
+                thread = "spaces/AAA/threads/T1" if picked == "google_chat" else "1712345678.000100"
+                legs = self._run(lambda argv: session_kv_server.subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": thread}), stderr=""))
+                self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", picked]])
+                self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], picked)
+
+    def test_every_single_destination_reader_takes_the_same_platform(self):
+        # The pick the alert and the drift digest make, and the first platform
+        # the data-volume warning and send_notification try.
+        import chat_platforms
+        for listed, slack_file, gchat_file, picked in self.PICKS:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._homes(listed, slack_file, gchat_file)
+                platforms = session_kv_server.enabled_chat_platforms()
+                self.assertEqual(platforms, chat_notify.routed_platforms())
+                self.assertEqual(session_kv_server.get_active_platform(platforms), picked)
+                with patch.object(chat_platforms, "MANAGED_CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+                     patch.object(chat_platforms, "CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"):
+                    self.assertEqual(chat_platforms.enabled_chat_platforms()[0], picked)
+
     def test_with_no_home_the_alert_goes_to_chat_and_is_kept(self):
         self._write_home_file("")
 
@@ -12899,6 +12939,26 @@ class TestDriftBacklog(unittest.TestCase):
         off.start()
         self.addCleanup(enabled.stop)
         self.addCleanup(off.stop)
+
+    def test_the_digest_takes_a_configured_home_ahead_of_a_learned_one(self):
+        # Slack's home on the CR, Chat's only learned: the digest goes to Slack.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        with open(os.path.join(directory, chat_notify.GCHAT_HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write("spaces/AAA\n")
+        with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write("")
+        self._burst()
+        sent = []
+        with patch.object(chat_notify, "HOME_FILE_DIR", directory), \
+             patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "slack",
+                                     chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack"}), \
+             patch.object(session_kv_server, "MANAGED_CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+             patch.object(session_kv_server, "CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+             patch.object(session_kv_server, "_send_drift_backlog_digest",
+                          side_effect=lambda platform, _message: sent.append(platform) or True):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual(sent, ["slack"])
 
     def test_one_digest_names_the_count_and_the_principals(self):
         self._chat()
