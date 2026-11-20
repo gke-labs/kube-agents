@@ -204,3 +204,77 @@ func TestTheRestorePodWidensForwardAndNotOnTheWayBack(t *testing.T) {
 		}
 	}
 }
+
+// The restore's drift warnings are of the stream as it is restored. Going
+// forward, a policy that renders max_consumers decides it: a TASKS widened
+// to the render, kept wider than it, or widened to a CR's width above the
+// fresh install's (the reference's 110) is not drift. The way back, which
+// restores the snapshot's width, reports that width against the reference.
+func TestTheDriftWarningIsOfTheRestoredWidth(t *testing.T) {
+	ctx := context.Background()
+	widthWarnings := func(warnings []string) []string {
+		var got []string
+		for _, w := range warnings {
+			if strings.HasPrefix(w, "stream TASKS: max_consumers") {
+				got = append(got, w)
+			}
+		}
+		return got
+	}
+	for _, c := range []struct {
+		snapshot, rendered, replicas int
+		want                         string // the TASKS max_consumers warning, "" for none
+	}{
+		{64, 110, 3, ""},
+		{200, 110, 3, ""},
+		{110, 150, 3, ""}, // a CR rendering above the fresh install's width
+		{64, 110, 1, "stream TASKS: max_consumers is 64; a fresh install has 110"},
+		{64, 0, 3, "stream TASKS: max_consumers is 64; a fresh install has 110"}, // a run file with no width: as before
+	} {
+		meta, data := snapshotTasks(t)
+		meta.Config.MaxConsumers = c.snapshot
+		policy := policyOf(meta.Config)
+		policy.MaxConsumers = c.rendered
+		dir, run := stageTasks(t, meta, data, policy)
+		var nc *nats.Conn
+		var stop func()
+		if c.replicas == 3 {
+			base := t.TempDir()
+			s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+			s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+			s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+			stop = func() { shutdown(s2, s1, s0) }
+			conn, err := nats.Connect(s1.ClientURL())
+			if err != nil {
+				t.Fatal(err)
+			}
+			nc = conn
+			js, _ := nc.JetStream()
+			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+				if _, err := js.AccountInfo(); err == nil {
+					break
+				} else if time.Now().After(deadline) {
+					t.Fatalf("the cluster's JetStream never came up: %v", err)
+				}
+			}
+		} else {
+			dst := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+			stop = func() { shutdown(dst) }
+			conn, err := nats.Connect(dst.ClientURL())
+			if err != nil {
+				t.Fatal(err)
+			}
+			nc = conn
+		}
+		warnings, _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, c.replicas)
+		nc.Close()
+		stop()
+		if err != nil {
+			t.Fatalf("snapshot %d, render %d, into %d: %v", c.snapshot, c.rendered, c.replicas, err)
+		}
+		got := widthWarnings(warnings)
+		if (c.want == "" && len(got) != 0) || (c.want != "" && (len(got) != 1 || got[0] != c.want)) {
+			t.Errorf("snapshot %d, render %d, into %d servers: width warnings %q, want %q", c.snapshot, c.rendered, c.replicas, got, c.want)
+		}
+	}
+}
