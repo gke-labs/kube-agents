@@ -8595,7 +8595,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
-        "ingress-gateway-healthcheck-mismatch",
+        "ingress-gateway-healthcheck-mismatch", "network-daemonset-missing-ccc-toleration",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
