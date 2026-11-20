@@ -875,3 +875,23 @@ func TestShippedWorkloadSkillsCarrySessionReportNote(t *testing.T) {
 		}
 	}
 }
+
+// A request's report format wins over "keep it short" (#6538): the session
+// front door's answer to a request that spells out a template (an incident's
+// lettered options and its `To authorize:` line) follows the template, as the
+// cluster agents' answers do, and stays short otherwise.
+func TestPersonaLetsARequestedReportFormatWin(t *testing.T) {
+	data, err := os.ReadFile(repoPersona)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persona := string(data)
+	formatWins := strings.Index(persona, "The format the person asked for wins over")
+	short := strings.Index(persona, "- Otherwise keep it short.")
+	if formatWins < 0 || short < 0 || short < formatWins {
+		t.Fatalf("the persona's How to answer must say a requested report format wins, then \"Otherwise keep it short\"")
+	}
+	if strings.Contains(persona, "- Keep it short. This is chat, not a report.") {
+		t.Fatal("an unconditional \"Keep it short\" overrides a requested report format")
+	}
+}
