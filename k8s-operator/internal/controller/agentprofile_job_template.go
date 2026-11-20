@@ -45,12 +45,12 @@ import (
 // Job mode (#3655 PR 6, per tier since #5646). The dispatcher runs each
 // unattended task, and at any tier each permit-carrying task, as a Job in the
 // profile namespace, from a pod template the operator renders per profile
-// and tier. The same template goes two places: into the
-// dispatch config (a2aDispatchProfile.JobTemplate), which the dispatcher
-// stamps a Job from, and, defaulted by a server-side dry run, into a
-// DispatchJobTemplate in the profile namespace, which the admission policy
+// and tier. The template, defaulted by a server-side dry run, goes into a
+// DispatchJobTemplate in the profile namespace, which the dispatcher stamps a
+// Job from and the admission policy
 // (config/admission/a2a-dispatcher-job-policy.yaml) holds every dispatcher
-// Job to. An index DispatchJobTemplate lists the ServiceAccounts those
+// Job to. The dispatch config carries only the renderings' hash
+// (a2aDispatchProfile.JobTemplateRef). An index DispatchJobTemplate lists the ServiceAccounts those
 // templates run as, so a Job running as any other is denied. Only the
 // operator writes DispatchJobTemplates.
 const (

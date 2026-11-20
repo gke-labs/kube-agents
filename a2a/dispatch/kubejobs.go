@@ -39,9 +39,8 @@ const (
 
 // KubeJobs is the binary's JobRunner: one Job per unattended task in the
 // profile namespace, from the profile's Job template. The template is the
-// DispatchJobTemplate the config names (JobTemplateRef), read when the Job is
-// launched, or the copy inline in the config from an operator that predates
-// the reference. It is used exactly as the operator rendered it, since the
+// profile's own DispatchJobTemplate, at the rendering the config's
+// JobTemplateRef names, read when the Job is launched. It is used exactly as the operator rendered it, since the
 // Job admission policy admits only that; the Job gets a name, the config's
 // jobLabels, and the shape the policy requires (backoffLimit 0, one pod, a
 // deadline, a TTL). The pod the task is offered to is the Job's own, by

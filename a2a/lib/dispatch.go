@@ -536,10 +536,10 @@ type DispatchProfile struct {
 	// script not listed here. A script-run task's path comes from here,
 	// never from the task.
 	Scripts []DispatchScript `json:"scripts,omitempty"`
-	// JobTemplateRef names the DispatchJobTemplate in the profile namespace
-	// that holds the profile's Job template, in place of JobTemplate. The
-	// operator writes that object, the admission policy's param, before the
-	// config that names it. The dispatcher reads the template from there
+	// JobTemplateRef says which rendering of the profile's own
+	// DispatchJobTemplates in the profile namespace holds its Job template.
+	// The operator writes those objects, the admission policy's params,
+	// before the config that refers to them. The dispatcher reads the template from there
 	// only when the object's DispatchJobTemplateHashAnnotation equals Hash,
 	// so it never builds a Job from a template the config has moved past.
 	// Absent, the profile's unattended tasks have no worker (the operator
