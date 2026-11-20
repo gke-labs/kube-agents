@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -22,6 +23,16 @@ import (
 // automatic: the freeze is a person's to schedule.
 const a2aBusReshapeAnnotation = "kubeagents.x-k8s.io/bus-reshape"
 
+// a2aBusReshapeConsumedAnnotation, on the bus StatefulSet, records the
+// last bus-reshape request a run was started for (busReshapeNonceHash),
+// like #5708's restart record: on the StatefulSet because a later run of
+// any leg replaces status.busMigration, and with it the run ID's record,
+// while the StatefulSet's annotations stay. A request it names never
+// starts a second reshape, whatever ran since: without it, a value left on
+// the CR after a later run that left TASKS as it was, and a render that
+// then grew, would start a reshape, and a write freeze, no one asked for.
+const a2aBusReshapeConsumedAnnotation = "kubeagents.x-k8s.io/a2a-reshape-consumed"
+
 // reasonA2ABusReshapeNotStarted is the Event for a reshape request that
 // started nothing, and why.
 const reasonA2ABusReshapeNotStarted = "A2ABusReshapeNotStarted"
@@ -32,8 +43,44 @@ const reasonA2ABusReshapeNotStarted = "A2ABusReshapeNotStarted"
 // that does not know the field (#6479's hold keeps the run as it is, but an
 // older operator's status writes drop fields it does not know).
 func busReshapeRunSuffix(nonce string) string {
+	return "-r" + busReshapeNonceHash(nonce)
+}
+
+// busReshapeNonceHash is the first 8 hex of the request's SHA-256, the form
+// both records keep it in.
+func busReshapeNonceHash(nonce string) string {
 	sum := sha256.Sum256([]byte(nonce))
-	return "-r" + hex.EncodeToString(sum[:])[:8]
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+// busReshapeConsumed reports whether the bus StatefulSet records nonce as
+// already started (a2aBusReshapeConsumedAnnotation). A StatefulSet that
+// can't be read records nothing.
+func (r *PlatformAgentReconciler) busReshapeConsumed(ctx context.Context, agent *agentv1alpha1.PlatformAgent, nonce string) bool {
+	sts := &appsv1.StatefulSet{}
+	if err := r.a2aReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		return false
+	}
+	return sts.Annotations[a2aBusReshapeConsumedAnnotation] == busReshapeNonceHash(nonce)
+}
+
+// recordBusReshapeConsumed writes nonce's hash to the bus StatefulSet's
+// record, if it isn't there already.
+func (r *PlatformAgentReconciler) recordBusReshapeConsumed(ctx context.Context, agent *agentv1alpha1.PlatformAgent, nonce string) error {
+	sts := &appsv1.StatefulSet{}
+	if err := r.a2aReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	want := busReshapeNonceHash(nonce)
+	if sts.Annotations[a2aBusReshapeConsumedAnnotation] == want {
+		return nil
+	}
+	patch := client.MergeFrom(sts.DeepCopy())
+	if sts.Annotations == nil {
+		sts.Annotations = map[string]string{}
+	}
+	sts.Annotations[a2aBusReshapeConsumedAnnotation] = want
+	return r.Patch(ctx, sts, patch)
 }
 
 // busReshapeServers is the count a reshape runs at: the count the bus runs,
@@ -49,21 +96,20 @@ func busReshapeServers(agent *agentv1alpha1.PlatformAgent) int {
 // "" when it can, and kind, a short name for the reason that keys its Event.
 // In order:
 //   - the request was answered already, which the last run's ID records
-//     (busReshapeRunSuffix), whether that run is still under way or not;
+//     (busReshapeRunSuffix), whether that run is still under way or not,
+//     and the bus StatefulSet records after any later run has replaced
+//     that one (a2aBusReshapeConsumedAnnotation);
 //   - a run under way, or a Failed run not given up;
 //   - the bus must be provisioned, and the operator must have its own image
 //     to run the work;
 //   - the served CRD must keep status.busMigration, or a run started here
 //     would be gone by the next pass;
-//   - the live TASKS must be narrower than the CR renders. This is the
-//     primary guard, the run ID's record the secondary one: once a reshape
+//   - the live TASKS must be narrower than the CR renders: once a reshape
 //     (or a one to three migration) has widened TASKS, a value left in place
-//     finds it at the width and does nothing, even after a later run has
-//     replaced the record of the one that answered it. It is not a
-//     complete guard: if that later run left TASKS as it was and the render
-//     then grew (maxSessions raised), the old value would start a reshape
-//     no one asked for again. So the docs say to remove the annotation once
-//     the reshape is done. A TASKS with no limit is never narrower;
+//     finds it at the width and does nothing. The records above cover the
+//     case this guard alone does not (a later run that left TASKS as it
+//     was, then a render that grew). A TASKS with no limit is never
+//     narrower;
 //   - TASKS must fit the limits the restore puts on it, as one to three
 //     checks every stream.
 func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *agentv1alpha1.PlatformAgent, nonce string) (refusal, kind string, answered bool) {
@@ -71,6 +117,11 @@ func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *
 		if busMigrationLeg(run.Leg) == busMigrationReshape && strings.HasSuffix(run.RunID, busReshapeRunSuffix(nonce)) {
 			return "", "", true
 		}
+	}
+	if r.busReshapeConsumed(ctx, agent, nonce) {
+		return "", "", true
+	}
+	if run := agent.Status.BusMigration; run != nil {
 		phase := busMigrationPhase(run.Phase)
 		if !busMigrationTerminal(phase) {
 			return "a bus migration is under way", "running", false
@@ -121,6 +172,11 @@ func (r *PlatformAgentReconciler) maybeStartBusReshape(ctx context.Context, agen
 	}
 	refusal, kind, answered := r.busReshapeRefusal(ctx, agent, nonce)
 	if answered {
+		// The run that answered it writes the StatefulSet's record; a pass
+		// that started it and failed to write it writes it now.
+		if run := agent.Status.BusMigration; run != nil && busMigrationLeg(run.Leg) == busMigrationReshape && strings.HasSuffix(run.RunID, busReshapeRunSuffix(nonce)) {
+			return r.recordBusReshapeConsumed(ctx, agent, nonce)
+		}
 		return nil
 	}
 	if refusal != "" {
@@ -132,7 +188,10 @@ func (r *PlatformAgentReconciler) maybeStartBusReshape(ctx context.Context, agen
 		}
 		return nil
 	}
-	return r.persistBusMigrationStart(ctx, agent, func() { startBusReshape(agent, running, nonce, metav1.Now()) })
+	if err := r.persistBusMigrationStart(ctx, agent, func() { startBusReshape(agent, running, nonce, metav1.Now()) }); err != nil {
+		return err
+	}
+	return r.recordBusReshapeConsumed(ctx, agent, nonce)
 }
 
 // startBusReshape records a reshape run at the count the bus runs, its ID

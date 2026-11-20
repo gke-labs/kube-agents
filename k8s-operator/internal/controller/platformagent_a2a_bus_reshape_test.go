@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -416,5 +417,72 @@ func TestAnUnreadableBusIsOneReshapeEvent(t *testing.T) {
 	}
 	if ev := m.reshapeEvents(); len(ev) != 1 {
 		t.Errorf("%d Events over three passes with varying errors, want 1: %q", len(ev), ev)
+	}
+}
+
+// stsReshapeRecord reads the bus StatefulSet's consumed-request record.
+func (m *migrationRig) stsReshapeRecord() string {
+	m.t.Helper()
+	sts := &appsv1.StatefulSet{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), sts); err != nil {
+		m.t.Fatal(err)
+	}
+	return sts.Annotations[a2aBusReshapeConsumedAnnotation]
+}
+
+// Starting a reshape records its request on the bus StatefulSet, and a pass
+// that finds a reshape run without that record writes it.
+func TestAReshapeRecordsItsRequestOnTheStatefulSet(t *testing.T) {
+	m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
+	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "first"}
+	m.pass(busMigrationFreezing, 1)
+	if got := m.stsReshapeRecord(); got != busReshapeNonceHash("first") {
+		t.Fatalf("StatefulSet record %q after the start, want %q", got, busReshapeNonceHash("first"))
+	}
+	// Lost (a failed write after the start): the next pass writes it.
+	sts := &appsv1.StatefulSet{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), sts); err != nil {
+		t.Fatal(err)
+	}
+	delete(sts.Annotations, a2aBusReshapeConsumedAnnotation)
+	if err := m.cl.Update(context.Background(), sts); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(busMigrationFreezing, 1)
+	if got := m.stsReshapeRecord(); got != busReshapeNonceHash("first") {
+		t.Errorf("StatefulSet record %q after a pass over the run, want it written back", got)
+	}
+}
+
+// The case the width guard alone misses: a reshape answered a request, a
+// later run that left TASKS as it was replaced its record in status, and
+// the render then grew past TASKS. The value still on the CR starts
+// nothing: the StatefulSet's record names it. A new value starts one.
+func TestAStaleReshapeRequestAfterALaterRunAndAWiderRenderStartsNothing(t *testing.T) {
+	rendered := a2aTasksMaxConsumers(a2aTestAgent())
+	m := reshapeTrigger(t, rendered-20) // narrower than the render again
+	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "old"}
+	sts := &appsv1.StatefulSet{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), sts); err != nil {
+		t.Fatal(err)
+	}
+	if sts.Annotations == nil {
+		sts.Annotations = map[string]string{}
+	}
+	sts.Annotations[a2aBusReshapeConsumedAnnotation] = busReshapeNonceHash("old")
+	if err := m.cl.Update(context.Background(), sts); err != nil {
+		t.Fatal(err)
+	}
+	m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "9-1", Phase: string(busMigrationDone)}
+	for i := 0; i < 2; i++ {
+		m.pass(busMigrationDone, 1)
+	}
+	if ev := m.reshapeEvents(); len(ev) != 0 {
+		t.Errorf("events %q for a request already started, want none", ev)
+	}
+	m.agent.Annotations[a2aBusReshapeAnnotation] = "new"
+	m.pass(busMigrationFreezing, 1)
+	if run := m.agent.Status.BusMigration; run.Leg != string(busMigrationReshape) {
+		t.Errorf("a new value started %+v, want a reshape", run)
 	}
 }

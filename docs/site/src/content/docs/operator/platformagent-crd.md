@@ -117,7 +117,7 @@ It starts only when all of these hold. Otherwise a Normal `A2ABusReshapeNotStart
 - the live TASKS is narrower than the width this PlatformAgent renders. A TASKS with no limit is never narrower;
 - TASKS fits the limits the restore puts on it, as for one to three.
 
-A value already acted on starts nothing again while the record of its run is the last one, and an annotation left in place does nothing while TASKS is wide enough. Remove the annotation once the reshape is done: if a later migration left TASKS as it was and the render then grew, a value left in place would start a reshape again. To ask again, after a reshape that was undone, set a new value. An operator rolled back to a release before reshapes holds a reshape under way ([below](#a-run-this-operator-does-not-run)), so roll back only to a release that has that hold.
+A value already acted on never starts a second reshape: the operator records it on the bus StatefulSet (`kubeagents.x-k8s.io/a2a-reshape-consumed`), where later migrations don't replace it. An annotation left in place is therefore inert. To ask again, after a reshape that was undone, set a new value. An operator rolled back to a release before reshapes holds a reshape under way ([below](#a-run-this-operator-does-not-run)), so roll back only to a release that has that hold.
 
 #### A run this operator does not run
 
