@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,29 @@ FORGE_ENV_VARS = (
 @pytest.fixture(autouse=True)
 def _no_forge_from_the_shell(monkeypatch):
     for name in FORGE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+#: What a `kubectl` without a kubeconfig reads next: the in-cluster service of a
+#: pod, and a default server.
+KUBECTL_FALLBACK_ENV_VARS = ("KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "KUBERNETES_MASTER")
+
+
+@pytest.fixture(autouse=True)
+def _no_cluster_from_the_shell(monkeypatch):
+    """`make test-bench` runs with the caller's environment, and some tests start
+    the host's `kubectl` (the harness reads the agent through `kubectl exec`).
+    With the caller's kubeconfig, which is KUBECONFIG or `~/.kube/config` when
+    that is unset, such a call goes to the cluster of the caller's current
+    context. Each test gets KUBECONFIG set to the null device, which names no
+    cluster and keeps no write, and loses the variables in
+    KUBECTL_FALLBACK_ENV_VARS. A test that needs a kubeconfig sets its own.
+
+    This covers a test's own time only, not an import or a session fixture, and
+    a `kubectl` with no cluster still tries `localhost:8080`. A test that would
+    start `kubectl` must stub the call."""
+    monkeypatch.setenv("KUBECONFIG", os.devnull)
+    for name in KUBECTL_FALLBACK_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 
 
