@@ -14831,7 +14831,8 @@ class TestProposalOrigin(unittest.TestCase):
         )
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
-        self.assertEqual(set(plugin.POST_MERGE_KINDS), set(session_kv_server.POST_MERGE_KINDS))
+        self.assertEqual(plugin.post_merge_kinds(), frozenset(session_kv_server.POST_MERGE_KINDS))
+        self.assertIn("no-pdb", session_kv_server.POST_MERGE_KINDS)
         self.assertEqual(plugin.POST_MERGE_PATH, "/v1/post-merge/records")
 
     def test_post_merge_record_refuses_what_is_not_a_known_fix_pull_request(self):
