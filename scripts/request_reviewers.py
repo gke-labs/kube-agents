@@ -186,6 +186,8 @@ AWAY_ENV = "REVIEWERS_AWAY"
 AWAY_LOGIN_KEY = "login"
 AWAY_FROM_KEY = "from"
 AWAY_BACK_KEY = "back"
+# `date.fromisoformat` alone also takes `20270105` and week dates, on some Pythons.
+AWAY_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # Config keys the action supports and this port does not. Silently ignoring one
 # would hand the reviewer selection a rule nobody applied, so they are refused.
@@ -492,7 +494,7 @@ def matches_any(pattern, paths):
 def _away_date(entry, key):
     """The date under `key` of an away-list entry, or None when it is not one."""
     value = entry.get(key)
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not AWAY_DATE_RE.fullmatch(value):
         return None
     try:
         return datetime.date.fromisoformat(value)
@@ -516,7 +518,7 @@ def parse_away(raw, today):
         return {}
     try:
         entries = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         entries = None
     if not isinstance(entries, list):
         log(f"{WORKFLOW_WARNING_PREFIX}{AWAY_ENV} is not a JSON list; treating nobody as away")
@@ -549,10 +551,23 @@ def parse_away(raw, today):
 
 
 def split_away(names, away):
-    """`names` as those who are here and those who are away, the away ones soonest back first."""
+    """`names` as those who are here and those who are away, each in the order given."""
     here = [name for name in names if name.lower() not in away]
-    gone = sorted((name for name in names if name.lower() in away), key=lambda name: away[name.lower()])
+    gone = [name for name in names if name.lower() in away]
     return here, gone
+
+
+def back_soonest(names, away, rng=random):
+    """The one of `names`, all away, who is back first, or None for no names.
+
+    Drawn at random among those who share that day: over a holiday most of
+    the roster returns together, and the first name in config order would
+    otherwise be handed every request made in the meantime.
+    """
+    if not names:
+        return None
+    soonest = min(away[name.lower()] for name in names)
+    return rng.choice([name for name in names if away[name.lower()] == soonest])
 
 
 def _expand_groups(names, config):
@@ -610,7 +625,7 @@ def uncovered_files(approvers_by_file, logins):
     return {path: approvers for path, approvers in approvers_by_file.items() if approvers and not approvers & logins}
 
 
-def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last_resort=()):
+def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last_resort=(), away=None):
     """Approvers drawn from `pool` until every changed file has one asked.
 
     Prow's `approved` is per file, so a reviewer drawn from the union of the
@@ -624,9 +639,9 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last
     a roster file routes to eval-crew alone, and its root-owned half would
     otherwise get a root approver only while some member happens to be one.
     A file neither approves is drawn for from `last_resort`, its approvers who
-    are away, soonest back first: the first of them is asked, since a request
-    that waits for a return beats one made of nobody. A file none of the three
-    approves is a config shape, logged and left out.
+    are away (`away` holds the day each is back): the one back soonest is
+    asked, since a request that waits for a return beats one made of nobody.
+    A file none of the three approves is a config shape, logged and left out.
     """
     uncovered = list(uncovered_files(approvers_by_file, {author.lower()}).values())
     picked = []
@@ -638,7 +653,8 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last
             if candidates:
                 log(f"Nobody in the pool approves a file only {', '.join(sorted(narrowest))} can; drawing from the default reviewers")
         if not candidates:
-            candidates = [name for name in last_resort if name.lower() in narrowest][:1]
+            waited_for = back_soonest([name for name in last_resort if name.lower() in narrowest], away, rng)
+            candidates = [waited_for] if waited_for else []
             if candidates:
                 log(f"Everyone here who approves a file is away; drawing {candidates[0]}, back soonest")
         if not candidates:
@@ -672,9 +688,10 @@ def select_reviewers(config, changed_files, author, rng=random, approvers_by_fil
 
     `away`, {lower-cased login: the day they are back} from `parse_away`, is
     who not to ask today. They leave the pool and the defaults before any
-    draw. Where that leaves nobody -- for the whole pool, or for a file only
-    they approve -- the one back soonest is asked, since a pull request with
-    nobody requested waits on its author and tells nobody.
+    draw. Where that leaves nobody in the pool, the default reviewers who
+    are here are drawn from. Where it leaves nobody at all -- there, or for a
+    file only they approve -- the one back soonest is asked, since a pull
+    request with nobody requested waits on its author and tells nobody.
     """
     away = away or {}
     pool = reviewers_by_changed_files(config, changed_files, author)
@@ -686,8 +703,7 @@ def select_reviewers(config, changed_files, author, rng=random, approvers_by_fil
 
     reviewers, gone = split_away(pool, away)
     if gone:
-        # In the pool's order, not `gone`'s: the order of return is a date of a kind.
-        log(f"Not drawing {', '.join(name for name in pool if name in gone)}: away")
+        log(f"Not drawing {', '.join(gone)}: away")
     defaults_here, defaults_gone = split_away(default_reviewers(config, author), away)
 
     covering = []
@@ -695,26 +711,33 @@ def select_reviewers(config, changed_files, author, rng=random, approvers_by_fil
         approvers = set().union(*approvers_by_file.values())
         narrowed = [name for name in reviewers if name.lower() in approvers]
         fallback = [name for name in defaults_here if name.lower() in approvers]
-        last_resort = split_away(_dedupe(gone + defaults_gone, None), away)[1]
+        last_resort = _dedupe(gone + defaults_gone, None)
         if narrowed:
             dropped = [name for name in reviewers if name not in narrowed]
             if dropped:
                 log(f"Not drawing {', '.join(dropped)}: not an OWNERS approver for the change")
             reviewers = narrowed
-            covering = draw_covering(reviewers, approvers_by_file, author, rng, fallback, last_resort)
+            covering = draw_covering(reviewers, approvers_by_file, author, rng, fallback, last_resort, away)
         else:
             # The glob pool approves none of the files still owed -- after a
             # partial approval, say -- so the defaults are tried before it is
             # drawn from whole.
-            covering = draw_covering([], approvers_by_file, author, rng, fallback, last_resort)
+            covering = draw_covering([], approvers_by_file, author, rng, fallback, last_resort, away)
             if covering:
                 reviewers = covering
             elif reviewers:
                 log(f"The pool is {', '.join(reviewers)} and none of them is an OWNERS approver for the change; drawing from it anyway")
 
     if not reviewers and gone:
-        reviewers = gone[:1]
-        log(f"Everyone in the pool is away; drawing {reviewers[0]}, back soonest")
+        # Nobody the change routes to is here. The default reviewers who are
+        # can still give the `lgtm`, as they do for a file the pool cannot
+        # approve; only with them away too is someone away asked.
+        if defaults_here:
+            reviewers = defaults_here
+            log("Everyone in the pool is away; drawing from the default reviewers")
+        else:
+            reviewers = [back_soonest(_dedupe(gone + defaults_gone, None), away, rng)]
+            log(f"Everyone in the pool and the defaults is away; drawing {reviewers[0]}, back soonest")
 
     number = (config.get("options") or {}).get("number_of_reviewers")
     if number is not None and reviewers:

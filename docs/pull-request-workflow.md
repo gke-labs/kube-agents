@@ -716,7 +716,8 @@ only `lgtm`, so the draw is the whole pool at equal weight; any other change sti
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files, and
 `approved` is per file, so it takes as many of them as it needs to cover every file: first one for
 the file with the fewest approvers, then one more for whatever that person cannot approve, from
-the default reviewers when nobody the glob matched can approve it. A change
+the default reviewers when nobody the glob matched can approve it. Neither draw takes a reviewer
+who is away ([who owns an open pull request](#who-owns-an-open-pull-request)). A change
 to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
 unless that member is one. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
@@ -1035,13 +1036,18 @@ who can `/approve`. Of these reasons, `/request-review`
 skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
-naming the reason.
+naming the reason. A periodic
+triage sweep applies the wider rule and messages whoever owns each pull request, both parties on
+one they share; it runs outside this repository (`triage/` in the internal `gke-labs/kube-agents-bot`,
+with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above
+is all this page can state about it.
 
 Neither path asks a reviewer who is away. The `REVIEWERS_AWAY` repository secret holds a JSON list
-of who is away and until when, and the script leaves them out of the draw. When everyone who could
-be asked is away, it asks the one back soonest, so a pull request is never left with nobody. A
-request already made stays with its reviewer. A maintainer sets the list, and each set replaces all
-of it:
+of who is away and until when, and the script leaves them out of the draw. When everyone the
+change routes to is away, it draws from the default reviewers who are not. When they are away too,
+it asks whoever is back soonest, so a pull request is never left with nobody. A request already
+made stays with its reviewer. A maintainer sets the list, on one line, and each set replaces all of
+it:
 
 ```bash
 # `back` is the first day the person reviews again; `from` is optional. Dates are UTC.
@@ -1053,12 +1059,6 @@ gh secret delete REVIEWERS_AWAY --repo gke-labs/kube-agents
 
 GitHub does not show a secret back, so keep the list you set. The run log names who was passed over
 and never a date.
-
-A periodic
-triage sweep applies the wider rule and messages whoever owns each pull request, both parties on
-one they share; it runs outside this repository (`triage/` in the internal `gke-labs/kube-agents-bot`,
-with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above
-is all this page can state about it.
 
 ```bash
 # Whose move is it: draft, conflicts, verdict, and who is on the hook now.

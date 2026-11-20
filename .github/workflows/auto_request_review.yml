@@ -29,7 +29,8 @@ on:
     types: [completed]
   # zizmor: ignore[dangerous-triggers] - the escape hatch has to run on fork PRs, and only
   # issue_comment keeps a write token there; the checkout is the default branch, so no
-  # pull-request code is fetched or executed and no other secret is exposed
+  # pull-request code is fetched or executed; the one other secret, REVIEWERS_AWAY, reaches
+  # only the script from that checkout, which prints nothing the secret holds but a login
   issue_comment:
     types: [created]
 

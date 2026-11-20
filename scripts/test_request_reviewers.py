@@ -618,6 +618,49 @@ class SelectionTest(unittest.TestCase):
             self.assertEqual(len(picked), 2, seed)
             self.assertIn(picked[1], set(OWNERS) - {"jayantid"}, seed)
 
+    def test_a_shared_return_day_is_drawn_at_random(self):
+        # Over a holiday most of the roster is back on one day. The first name
+        # in config order must not be handed every request made meanwhile.
+        away = {name.lower(): AWAY_BACK for name in POOL}
+        approvers = {name.lower() for name in OWNERS}
+        with contextlib.redirect_stderr(io.StringIO()):
+            whole = {rr.select_reviewers(CONFIG, ["README.md"], "bradhoekstra", rng=random.Random(seed), away=away)[0] for seed in range(80)}
+            narrowed = {
+                rr.select_reviewers(
+                    CONFIG, ["README.md"], "author", rng=random.Random(seed), approvers_by_file={"README.md": approvers}, away=away
+                )[0]
+                for seed in range(80)
+            }
+        self.assertEqual(whole, set(POOL) - {"bradhoekstra"})
+        self.assertEqual(narrowed, set(OWNERS))
+
+    def test_a_matched_pool_that_is_all_away_draws_a_default_reviewer_who_is_here(self):
+        # jayantid's own roster change needs lgtm alone and routes to
+        # eval-crew, whose other member is away. Any default reviewer can
+        # give that lgtm, so one who is here is asked.
+        away = {"lapis2002": AWAY_BACK, "bnaylor": AWAY_BACK}
+        here = set(POOL) - {"jayantid", "lapis2002", "bnaylor"}
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            picked = {
+                rr.select_reviewers(CONFIG, ["hack/eval/presubmit-cases.txt"], "jayantid", rng=random.Random(seed), away=away)[0]
+                for seed in range(80)
+            }
+        self.assertEqual(picked, here)
+        self.assertIn("drawing from the default reviewers", stderr.getvalue())
+
+    def test_an_away_default_reviewer_is_the_last_resort_for_a_file_the_pool_cannot_approve(self):
+        # The roster glob routes the change to lapis2002 alone, who cannot
+        # approve the README half. Every root approver is away, so the one
+        # back soonest is asked for it, though the glob never matched them.
+        config = dict(CONFIG, reviewers=dict(CONFIG["reviewers"], groups=dict(CONFIG["reviewers"]["groups"], **{"eval-crew": ["lapis2002"]})))
+        by_file = {"README.md": {name.lower() for name in OWNERS}, "hack/eval/presubmit-cases.txt": {"lapis2002"}}
+        away = {name.lower(): AWAY_BACK for name in OWNERS}
+        away["dshnayder"] = AWAY_BACK_SOONER
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.select_reviewers(config, list(by_file), "author", rng=random.Random(seed), approvers_by_file=by_file, away=away)
+            self.assertEqual(picked, ["lapis2002", "dshnayder"], seed)
+
     def test_no_away_list_draws_as_before(self):
         for seed in range(20):
             self.assertEqual(
@@ -675,6 +718,10 @@ class AwayListTest(unittest.TestCase):
                 self.assertEqual(self.parse(raw), {})
                 self.assertIn(rr.WORKFLOW_WARNING_PREFIX, self.log)
 
+    def test_a_list_nested_too_deep_to_parse_is_nobody_away(self):
+        self.assertEqual(self.parse("[" * 200000), {})
+        self.assertIn(rr.WORKFLOW_WARNING_PREFIX, self.log)
+
     def test_a_malformed_entry_is_dropped_with_a_warning_and_the_rest_stand(self):
         good = {"login": "jayantid", "back": "2027-01-05"}
         for bad in (
@@ -684,6 +731,9 @@ class AwayListTest(unittest.TestCase):
             {"login": "bnaylor"},
             {"login": "bnaylor", "back": "January"},
             {"login": "bnaylor", "back": 20270105},
+            {"login": "bnaylor", "back": "20270105"},
+            {"login": "bnaylor", "back": "2027-W01-2"},
+            {"login": "bnaylor", "back": "2027-1-5"},
             {"login": "bnaylor", "from": "soon", "back": "2027-01-05"},
             {"login": "bnaylor", "from": "2027-01-05", "back": "2027-01-05"},
         ):
@@ -1261,18 +1311,32 @@ class AwayMainTest(_MainHarness):
 
     FAR_BACK = "9999-12-31"
 
-    def away(self, *logins):
-        patcher = mock.patch.dict(os.environ, {rr.AWAY_ENV: json.dumps([{"login": login, "back": self.FAR_BACK} for login in logins])})
+    def away(self, *logins, **dates):
+        dates = dates or {"back": self.FAR_BACK}
+        patcher = mock.patch.dict(os.environ, {rr.AWAY_ENV: json.dumps([dict(dates, login=login) for login in logins])})
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def test_the_check_run_path_does_not_ask_an_approver_who_is_away(self):
         # The fixture tree's root approvers are AntonTyb, bradhoekstra and
         # jayantid, and the live roster holds the last two.
-        self.away("bradhoekstra")
+        # jayantid is who this seed draws with nobody away, which the two
+        # tests below pin: the list is what moves the request.
+        self.away("jayantid")
+        self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
+        self.assertEqual(self.requested(), ["bradhoekstra"])
+        self.assertNotIn(self.FAR_BACK, self.stderr.getvalue() + self.stdout.getvalue())
+
+    def test_a_reviewer_who_is_back_already_is_asked(self):
+        # Read against today's date: a return in the past is nobody away.
+        self.away("jayantid", back="2000-01-01")
         self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
         self.assertEqual(self.requested(), ["jayantid"])
-        self.assertNotIn(self.FAR_BACK, self.stderr.getvalue() + self.stdout.getvalue())
+
+    def test_a_reviewer_whose_time_away_has_not_started_is_asked(self):
+        self.away("jayantid", **{"from": "9999-01-01", "back": self.FAR_BACK})
+        self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
+        self.assertEqual(self.requested(), ["jayantid"])
 
     def test_the_override_does_not_ask_an_approver_who_is_away(self):
         self.away("jayantid")
