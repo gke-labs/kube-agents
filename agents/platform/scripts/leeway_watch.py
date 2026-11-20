@@ -499,9 +499,9 @@ CHAT_LINE_SEPARATOR = "\n"
 MAX_CHAT_ITEMS = 3
 CHAT_NAME_MAX_CHARS = 60
 CHAT_ITEM_MAX_CHARS = 160
-# An over-long item is cut in its subject, before the cluster it names, so the
-# cluster and the share and cause that follow survive; what is cut keeps at
-# least this much.
+# An over-long item is cut in its name first and then, if it is still too long,
+# in its cluster, so the share and cause that follow always survive; each part
+# cut keeps at least this much.
 CHAT_SUBJECT_MIN_CHARS = 20
 # Every subject template ends "... on {cluster}".
 SUBJECT_CLUSTER_JOIN = " on "
@@ -1322,9 +1322,13 @@ def due_chat_item(item: dict[str, Any]) -> str:
         text = ITEM_CLUSTER_WIDE.format(subject=subject, pct=pct, cause=cause)
     if len(text) > CHAT_ITEM_MAX_CHARS:
         head, join, cluster = subject.rpartition(SUBJECT_CLUSTER_JOIN)
-        tail = join + cluster + text[len(subject) :]
-        room = max(CHAT_ITEM_MAX_CHARS - len(tail), CHAT_SUBJECT_MIN_CHARS)
-        text = clip_text(head, room) + tail
+        rest = text[len(subject) :]
+        room = max(CHAT_ITEM_MAX_CHARS - len(join + cluster + rest), CHAT_SUBJECT_MIN_CHARS)
+        head = clip_text(head, room)
+        over = len(head + join + cluster + rest) - CHAT_ITEM_MAX_CHARS
+        if over > 0:
+            cluster = clip_text(cluster, max(len(cluster) - over, CHAT_SUBJECT_MIN_CHARS))
+        text = head + join + cluster + rest
     return clip_text(text, CHAT_ITEM_MAX_CHARS)
 
 

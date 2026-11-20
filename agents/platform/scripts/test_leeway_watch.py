@@ -1578,6 +1578,20 @@ class ChatMessageTests(unittest.TestCase):
             text.endswith(" on " + "c" * 40 + ": 100% of its pods in one zone; its zone spread rule is not being kept"), text
         )
         self.assertIn(watch.CHAT_ELLIPSIS, text)
+        # A cluster name past GKE's 40-character cap, with the longest causes:
+        # the cluster is cut too, never the share or the cause.
+        long_cluster = "p1/us-central1/" + "k" * 60
+        for item, ending in (
+            (chat_item(name="n" * 60, namespace="s" * 60, cluster=long_cluster, cause="wedged"),
+             ": 100% of its pods in one zone; pods are stuck with no allowed machines to run on"),
+            (chat_item(name="g" * 60, namespace="_cluster", kind="leeway.rank_degraded", subject_kind="ComputeClass",
+                       cluster=long_cluster, cause="no-migration", share=1.0),
+             ": not moving back to its preferred machines (last choice 100% of the time)"),
+        ):
+            text = watch.due_chat_item(item)
+            self.assertLessEqual(len(text), watch.CHAT_ITEM_MAX_CHARS)
+            self.assertTrue(text.endswith(ending), text)
+            self.assertIn(" on kkkk", text)
         # The issue's own workload, with the longest workload cause, fits whole.
         gateway = chat_item(name="platform-agent-a2a-gateway", namespace="kubeagents-system",
                             cluster="p1/us-central1/platform-agent-host", cause="taint_exclusion")
