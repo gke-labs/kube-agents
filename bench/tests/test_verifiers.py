@@ -8746,8 +8746,8 @@ def _run_objective(command: str) -> str:
         (f"watch -n 300 python3 {_SCRIPT_PATH} --readiness", True),
         (f"flock /tmp/readiness.lock python3 {_SCRIPT_PATH} --readiness", True),
         (f"poetry run python3 {_SCRIPT_PATH} --readiness", True),
-        # eval is refused under the literal rule
-        (f'eval "python3 {_SCRIPT_PATH} --readiness"', False),
+        # eval runs its words as a command line of its own, as the GitHub-write attribution reads it
+        (f'eval "python3 {_SCRIPT_PATH} --readiness"', True),
         (f'eval "echo python3 {_SCRIPT_PATH} --readiness"', False),
         (f"xargs ls {_SCRIPT_PATH} --readiness", False),
         # which flags take a value is tabled, so a valueless flag like sudo -n does not eat the command
@@ -9413,6 +9413,10 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _command_word_index(["time", "-p", "!", "python3", "audit_report.py", "start"], script="audit_report.py") is None
     assert _shell_argvs_with_exit_propagation("time ! python3 audit_report.py start") == [
         (["time", "!", "python3", "audit_report.py", "start"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('eval "python3 collect.py compliance-audit"') == [
+        (["eval", "python3 collect.py compliance-audit"], True),
+        (["python3", "collect.py", "compliance-audit"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n") == [
         (["python3", "f.py", "--readiness"], True),

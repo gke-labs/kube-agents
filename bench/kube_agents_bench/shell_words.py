@@ -44,6 +44,7 @@ _OPERATOR_MARK = "\x00O{index}\x00"
 _OPERATOR_MARK_RE = re.compile(r"^\x00O(\d+)\x00$")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 # `eval` runs its words, joined by spaces, as a command line of its own (`eval "git push ..."`).
+_SHELL_EVAL = "eval"
 # A shell program is unwrapped only where the shell would run it: as the segment's command word,
 # or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
@@ -708,6 +709,9 @@ def _shell_argvs(command: str) -> list[list[str]]:
         argv.append(word)
     for argv in list(argvs):
         index = _command_word_index(argv)
+        if index is not None and argv[index] == _SHELL_EVAL:
+            argvs.extend(_shell_argvs(" ".join(argv[index + 1:])))
+            continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
         cmd_string, _, _ = _extract_shell_command_string(argv, index + 1)
@@ -746,6 +750,7 @@ def _command_word_index(
         base in _SHELL_PROGRAMS_WITH_COMMAND_STRING
         or _INTERPRETER_RE.match(base)
         or (script and base == script)
+        or word == _SHELL_EVAL
     ):
         return cmd_index
     return None
