@@ -10,6 +10,7 @@ deployments continue to use the direct path.
 import argparse
 import email.message
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -154,10 +155,32 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 #: Opened without a proxy and without following redirects: the broker forwards
-#: HTTP_PROXY into this helper for its GitHub and Minty traffic, and a
-#: link-local metadata address must never be sent through it or lead anywhere
-#: else. Module-level so a test can stand in for it.
+#: HTTP_PROXY into this helper for its traffic to GitHub and to a token minter
+#: outside the cluster, and a link-local metadata address must never be sent
+#: through it or lead anywhere else. Module-level so a test can stand in for it.
 metadata_open = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
+
+#: The host name suffixes of a Service of this cluster, the two that the
+#: suggested NO_PROXY names, and the name of the loopback host.
+CLUSTER_HOST_SUFFIXES = (".svc", ".cluster.local")
+LOOPBACK_HOST_NAME = "localhost"
+
+#: Opened without a proxy: the credential broker, and a token minter that is a
+#: Service of this cluster or on this pod. urllib does not leave out a cluster
+#: or a loopback host by itself, and for an http URL the proxy would get the
+#: request with its token.
+_IN_CLUSTER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _inside_the_cluster(url: str) -> bool:
+    """Whether `url` names a Service of this cluster or a loopback address, which no egress proxy serves."""
+    host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == LOOPBACK_HOST_NAME or host.endswith(CLUSTER_HOST_SUFFIXES):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 #: How the broker identity token was minted on this run, for the one line the
 #: refresh writes last: the sidecar logs the tail of this helper's output, so
@@ -621,9 +644,14 @@ def request_minty_token(
             req = urllib.request.Request(
                 TOKEN_BROKER_URL, data=req_data, headers=headers, method="POST"
             )
-            with urllib.request.urlopen(
-                req, timeout=MINTY_REQUEST_TIMEOUT_SECONDS
-            ) as response:
+            # The operator's minter is a Service of this cluster and takes no
+            # proxy; a minter outside the cluster keeps the environment's.
+            opened = (
+                _IN_CLUSTER_OPENER.open(req, timeout=MINTY_REQUEST_TIMEOUT_SECONDS)
+                if _inside_the_cluster(TOKEN_BROKER_URL)
+                else urllib.request.urlopen(req, timeout=MINTY_REQUEST_TIMEOUT_SECONDS)
+            )
+            with opened as response:
                 if response.status == 200:
                     token = response.read().decode("utf-8").strip()
                     break
@@ -861,7 +889,7 @@ def refresh_git_credentials(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=SIDECAR_REFRESH_TIMEOUT_SECONDS) as response:
+            with _IN_CLUSTER_OPENER.open(request, timeout=SIDECAR_REFRESH_TIMEOUT_SECONDS) as response:
                 if response.status == 200:
                     log(
                         f"GitHub credentials refreshed in credential sidecar for {repository}."

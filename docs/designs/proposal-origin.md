@@ -174,7 +174,7 @@ origin). Under the experimental platform-profile front door a chat turn does run
 terminal; its session record then resolves it, `chat` with its platform. A Prometheus reader can split chat by platform; the status does not. The hook is enabled on every profile that has the terminal.
 
 What the count misses, stated so the numbers are read right: a pull request opened by a
-background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output, or past its claim budget; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
+background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output, or past its claim budget; one whose broker answer the client refused as nested too deep, which writes no record line; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
 instead of `vcs_client.call`. Three windows in the mechanism lose a count too. A claim that
 succeeds and a ledger write that then fails loses that proposal's count, since the token is
 spent. A broker restart between the mint and the claim loses the claims in flight, since the

@@ -51,8 +51,12 @@ the shape anywhere, and a guess encoded as tested code looks like a fact:
 
 - **3.10(b)**, a `ComputeClass` targeting a reservation that does not exist or
   sits in an unreachable zone. `check_reservation_affinity` covers 3.10(a) and
-  `check_reservation` covers 3.10(c); resolving a named reservation against the
-  zones a cluster can actually reach is the part nothing here does.
+  `check_reservation` covers 3.10(c); resolving a ComputeClass's named
+  reservation against the zones a cluster can actually reach is the part
+  nothing here does. The node pool form is 3.10(d), `file_reserved_pools`: its
+  pool and reservation shapes
+  are pinned by `test_fleet_stockout.py` against responses read from a
+  throwaway cluster (GKE 1.35.8) on 2026-11-18.
 
 The rest need a read this collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
@@ -517,6 +521,29 @@ _CEILING_SUPPLY_CLAUSE = (
 # §3.10(a): the reservation affinities that silently bypass a ComputeClass's
 # priority chain.
 BYPASSING_RESERVATION_AFFINITIES = ("AnyBestEffort", "Automatic")
+# §3.10(d): the node pool affinity that consumes named reservations and nothing
+# else, so a pool that carries it has no on-demand fallback.
+POOL_SPECIFIC_RESERVATION = "SPECIFIC_RESERVATION"
+# The path segments that come before the owner project and before the name in
+# an affinity value that is a path: `projects/<owner>/reservations/<name>`.
+RESERVATION_OWNER_SEGMENT = "projects"
+RESERVATION_NAME_SEGMENT = "reservations"
+MISSING_RESERVATION_SEVERITY = "critical"
+MISSING_RESERVATION_IMPACT = (
+    "This node pool can consume only the named reservation, and that reservation does not exist in any of the "
+    "pool's zones, so the pool cannot add a node; with autoscaling on, the autoscaler reports "
+    "`scale.up.error.reservation.not.found`."
+)
+# The `needs_triage` marker on a §3.10(d) finding: each fix creates billed
+# capacity or replaces the node pool, so the automatic sweep opens no pull
+# request for it even if the published remediation is a manifest. Read by
+# `triage_markers` in audit_report.py, as `NEW_COMPUTE_CLASS_TRIAGE` is.
+RESERVED_POOL_TRIAGE = "reserved-pool"
+# Entry keys that carry the two halves of §3.10(d) to `collect_fleet`, which
+# removes them: a cluster's pools bound to named reservations, and a project's
+# `{reservation name: zones}`.
+RESERVED_POOLS_KEY = "_reserved_pools"
+RESERVATION_ZONES_KEY = "_reservation_zones"
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
 # API server stays up, it is transient and ordinary, and excluding it dropped
@@ -1845,6 +1872,121 @@ def check_reservation_affinity(cc: dict) -> dict | None:
     return None
 
 
+def reservations_argv(project: str) -> list[str]:
+    return ["gcloud", "compute", "reservations", "list", "--project", project, "--format", "json"]
+
+
+def reserved_pool(pool: dict, project: str) -> dict | None:
+    """The zones and the `(owner project, name)` reservations of a production
+    node pool that consumes only named reservations (§3.10(d)); None for every
+    other pool. Run inside `collect_cluster`, so a value it cannot read costs
+    that cluster and not the fleet."""
+    config = pool.get("config") or {}
+    affinity = config.get("reservationAffinity") or {}
+    if affinity.get("consumeReservationType") != POOL_SPECIFIC_RESERVATION:
+        return None
+    zones, values = pool.get("locations") or [], affinity.get("values") or []
+    if not zones or not values:
+        return None
+    # §3.10 does not flag non-production.
+    if is_non_production(pool.get("name", ""), {**(config.get("resourceLabels") or {}), **(config.get("labels") or {})}):
+        return None
+    return {"pool": pool.get("name", ""), "zones": sorted(zones), "reservations": sorted(reservation_owner(value, project) for value in values)}
+
+
+def reservation_owner(value: str, project: str) -> tuple[str, str]:
+    """`(owner project, reservation name)` of one affinity value. A bare name
+    is a reservation of the cluster's own project; a shared reservation is
+    named `projects/<owner>/reservations/<name>`. Either form can carry more
+    segments (`<name>/reservationBlocks/<block>`, a full URL), which name a
+    part of the same reservation. A path with no project
+    (`zones/<zone>/reservations/<name>`) is a reservation of the cluster's own
+    project."""
+    parts = value.split("/")
+    if RESERVATION_NAME_SEGMENT not in parts[:-1]:
+        return project, parts[0]
+    name = parts[parts.index(RESERVATION_NAME_SEGMENT) + 1]
+    if RESERVATION_OWNER_SEGMENT in parts[:-1]:
+        return parts[parts.index(RESERVATION_OWNER_SEGMENT) + 1], name
+    return project, name
+
+
+def reservation_zones(reservations: list[dict]) -> dict[str, list[str]]:
+    """`{reservation name: its zones}` over one project's `reservations list`.
+    Every reservation counts, non-production too: a pool that names one is
+    not missing it."""
+    from fleet_waste import _location_of  # as `check_reservation` reads the zone
+
+    zones: dict[str, list[str]] = {}
+    for reservation in reservations:
+        zones.setdefault(reservation.get("name", ""), []).append(_location_of(reservation))
+    return zones
+
+
+def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[str]]], swept: frozenset[str]) -> None:
+    """§3.10(d) for one cluster entry: a node pool that consumes only named
+    reservations, none of which exists in any of the pool's zones.
+
+    Run by `collect_fleet` after the cluster reads and the project reads, since
+    each holds one half. `zones_by_project` has the projects whose reservations
+    were read; `swept` has every project of the run."""
+    slug = "reservation-mismatch-risk"
+    unread: list[str] = []
+    outside: list[str] = []
+    for reserved in entry.pop(RESERVED_POOLS_KEY, []):
+        found = [(owner, name, zones_by_project.get(owner, {}).get(name, [])) for owner, name in reserved["reservations"]]
+        if any(set(zones) & set(reserved["zones"]) for _, _, zones in found):
+            # One zone that holds a named reservation is enough to add a node.
+            continue
+        owners = sorted({owner for owner, _, _ in found})
+        unread_owners = [owner for owner in owners if owner in swept and owner not in zones_by_project]
+        outside_owners = [owner for owner in owners if owner not in swept]
+        if unread_owners:
+            unread.append(f"{reserved['pool']} (project {', '.join(unread_owners)})")
+        elif outside_owners:
+            outside.append(f"{reserved['pool']} (project {', '.join(outside_owners)})")
+        else:
+            where = "; ".join(
+                f"reservation {name}: found {'only in ' + ', '.join(sorted(zones)) if zones else 'in no zone'} of project {owner}"
+                for owner, name, zones in found
+            )
+            entry["candidates"].append(
+                _emit(
+                    slug,
+                    {
+                        "object": f"NodePool/{reserved['pool']}",
+                        "severity": MISSING_RESERVATION_SEVERITY,
+                        "excerpt": f"reservationAffinity={POOL_SPECIFIC_RESERVATION}, pool zones {', '.join(reserved['zones'])}; {where}",
+                        "impact": MISSING_RESERVATION_IMPACT,
+                        "needs_triage": RESERVED_POOL_TRIAGE,
+                        # Both reads: the pool's affinity and zones, then the
+                        # reservations of each owner project.
+                        "command": "; ".join([reserved["command"], *(shlex.join(reservations_argv(owner)) for owner in owners)]),
+                    },
+                )
+            )
+    limitations: list[str] = []
+    if unread:
+        # Unevaluated, as a failed read is everywhere else here: the check
+        # recorded as run would publish these pools as compared and clean.
+        reason = (
+            f"these node pools consume only a named reservation, and the reservations of its owner "
+            f"project were not read in this run: {', '.join(unread)}"
+        )
+        entry["checks_unevaluated"] = sorted(
+            [*entry.get("checks_unevaluated", []), {"check": slug, "reason": reason}], key=lambda e: e["check"]
+        )
+        entry["commands"] = [c for c in entry["commands"] if c["check"] != slug]
+        limitations.append(f"{slug} could not be judged: {reason}")
+    if outside:
+        limitations.append(
+            f"{slug} did not compare these node pools with the reservation they name, because its "
+            f"owner project is not a project ID of this run: {', '.join(outside)}"
+        )
+    if limitations:
+        entry["limitations"] = "; ".join([*filter(None, [entry.get("limitations")]), *limitations])
+
+
 # --------------------------------------------------------------------------- #
 # 3.7 quota-exhaustion-risk
 # --------------------------------------------------------------------------- #
@@ -2456,7 +2598,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         if not non_production:
             for hit in [check_reservation_affinity(cc)]:
                 if hit:
-                    candidates.append(_emit("reservation-mismatch-risk", hit))
+                    # Stamped: an unread pool list or an unread owner project
+                    # drops this slug's record (§3.10(d)).
+                    candidates.append(_emit("reservation-mismatch-risk", {**hit, "command": dump_record["command"]}))
         for hit in [check_compute_class_status(cc)]:
             if hit:
                 # Stamped, as the workload arms below are: a failed pool list pops
@@ -2560,11 +2704,18 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 f"were not read: {pools_failure}"
             )
             commands.pop("dangling-compute-class", None)
+        # §3.10(d) compares each pool with the reservation it names, so that
+        # arm did not run either; the affinity arm's findings still file.
+        unevaluated["reservation-mismatch-risk"] = (
+            f"the node pools were not read, so no pool was compared with the reservation it names: {pools_failure}"
+        )
+        commands.pop("reservation-mismatch-risk", None)
         limitations.append(
             f"single-zone-nodepool could not be measured on this cluster: "
             f"{pools_failure}. The same failure left dangling-compute-class "
             f"without node pool labels, so its nodePoolAutoCreation arm did not "
-            f"run either, and spot-scarcity-risk read no Spot node pool"
+            f"run either, spot-scarcity-risk read no Spot node pool, and "
+            f"reservation-mismatch-risk compared no node pool with the reservation it names"
         )
         if manual_fallback_unread:
             # No class in scope is an answer the dump alone gives; a class in
@@ -2870,6 +3021,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     if cluster.get(kcc_health.ADDON_FIELD):
         # Read first by the Config Connector read after the sweep.
         entry[kcc_health.ADDON_FIELD] = True
+    reserved_pools = [{**reserved, "command": pools_record["command"]} for pool in node_pools for reserved in [reserved_pool(pool, project)] if reserved]
+    if reserved_pools:
+        entry[RESERVED_POOLS_KEY] = reserved_pools
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
     if unevaluated:
@@ -2882,7 +3036,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
 
 
 def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> dict | None:
-    res_argv = ["gcloud", "compute", "reservations", "list", "--project", project, "--format", "json"]
+    res_argv = reservations_argv(project)
     reservations, res_result = run_and_gate(res_argv, run=run)
     if not cluster_regions and reservations is None and _api_disabled(res_result) and refusal_names_project(project, res_result.stderr, run=run):
         # No Compute Engine and no cluster: no reservation or regional quota
@@ -2967,6 +3121,8 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
         "commands": commands,
         "candidates": candidates,
     }
+    if reservations_read:
+        entry[RESERVATION_ZONES_KEY] = reservation_zones(reservations)
     if not cluster_regions:
         # The quota reads are per cluster region, so with no cluster there
         # is none to make. Declared, because a check that neither ran nor
@@ -3144,6 +3300,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     ]
 
     returned_clusters = [e for e in cluster_entries if e]
+    zones_by_project = {e["project"]: e.pop(RESERVATION_ZONES_KEY) for e in project_entries if RESERVATION_ZONES_KEY in e}
+    for cluster_entry in returned_clusters:
+        file_reserved_pools(cluster_entry, zones_by_project, frozenset(projects))
     entries = returned_clusters + project_entries + failed_entries + not_running + discovery_entries
     # An unreachable cluster evaluated no check, so it leaves `scope.clusters`
     # as empty as no cluster at all; a gate-failed one stays eligible, since
