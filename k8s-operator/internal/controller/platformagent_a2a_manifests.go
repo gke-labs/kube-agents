@@ -5430,10 +5430,13 @@ func a2aWarmSessionsAt(warm, sessions int) int {
 // (a2aTasksConsumerBudget) and a pod each in the session quota. On the
 // session route it is status.effectiveWarmSessions (the spare consumers the
 // fit found, a2aWarmSessionsFit), held to the requested count and the
-// effective cap in case either was lowered since; before any fit has run it
-// is what a new stream is created with room for (a2aWarmSessionsAt at the
-// effective cap). On the platform route no conversation is a session by
-// default, so it is 0.
+// effective cap in case either was lowered since. With none stored it is
+// what a new stream is created with room for (a2aWarmSessionsAt at the
+// effective cap) only on a bus never provisioned (a2aBusExisted), whose
+// TASKS the provision Job will create at that width; on a bus that exists
+// and whose width hasn't been read it is 0, since that stream may fund
+// none. On the platform route no conversation is a session by default, so
+// it is 0.
 func resolveA2AWarmSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
 		return 0
@@ -5441,6 +5444,9 @@ func resolveA2AWarmSessions(agent *agentv1alpha1.PlatformAgent) int {
 	at := a2aWarmSessionsAt(resolveA2AWarmSessionsRequested(agent), resolveA2AEffectiveSessions(agent))
 	if stored := agent.Status.EffectiveWarmSessions; stored != nil {
 		return max(0, min(*stored, at))
+	}
+	if a2aBusExisted(agent) {
+		return 0
 	}
 	return at
 }

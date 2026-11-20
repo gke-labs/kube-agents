@@ -29,6 +29,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -365,4 +366,30 @@ func TestThePlatformRouteRendersNoWarmPod(t *testing.T) {
 			a.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{WarmSessions: ptr.To(3)}}
 		})
 	})
+}
+
+// With no warm count stored, the render runs the warm pods a new stream is
+// created with room for only on a bus never provisioned. On a bus that exists
+// and whose width hasn't been read (the session cap waiting on it), the
+// stream may fund none, so no warm pod renders until the fit says.
+func TestNoStoredWarmCountRendersNoneOnABusThatExists(t *testing.T) {
+	fresh := warmAgent(nil)
+	if got := resolveA2AWarmSessions(fresh); got != agentv1alpha1.DefaultWarmSessions {
+		t.Fatalf("a bus never provisioned: warm pods %d, want the default %d", got, agentv1alpha1.DefaultWarmSessions)
+	}
+	existing := warmAgent(nil)
+	setBusProvisionedCondition(existing, true, "provision-job", metav1.Now())
+	if !a2aBusExisted(existing) {
+		t.Fatal("precondition: the bus does not read as provisioned")
+	}
+	if got := resolveA2AWarmSessions(existing); got != 0 {
+		t.Fatalf("a provisioned bus with no stored warm count: warm pods %d, want 0", got)
+	}
+	if got := gatewayEnv(t, existing, a2aWarmSessionsEnvVar); got != "0" {
+		t.Fatalf("%s = %q, want 0", a2aWarmSessionsEnvVar, got)
+	}
+	existing.Status.EffectiveWarmSessions = ptr.To(1)
+	if got := resolveA2AWarmSessions(existing); got != 1 {
+		t.Fatalf("a provisioned bus with a stored warm count of 1: warm pods %d, want 1", got)
+	}
 }
