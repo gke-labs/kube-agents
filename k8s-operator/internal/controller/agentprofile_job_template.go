@@ -92,6 +92,10 @@ const (
 	// dispatchJobLabel marks a Job the dispatcher created (lib.DispatchJobLabel),
 	// so a teardown can find them.
 	dispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
+
+	// profileWorkerTaskSigningKeysEnvVar is the callout's and the proxy's
+	// variable, read the same way by the worker (#5622).
+	profileWorkerTaskSigningKeysEnvVar = a2aCalloutTaskSigningKeysEnvVar
 )
 
 // profileWorkerPodSpecForJob is the worker pod a profile's Job runs: the warm
@@ -106,12 +110,18 @@ func profileWorkerPodSpecForJob(agent *agentv1alpha1.PlatformAgent, p *agentv1al
 // run: buildProfileJobTemplateAt its one unattended-mode tier
 // (unattendedTierOf): unattended itself, or a Tier resource whose mode is
 // unattended (#3659).
-func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, imageVolumes bool) *corev1.PodTemplateSpec {
+//
+// taskSigningPublic is the task-signing public key, the one the callout and
+// the credential proxy are rendered from: a script-run task's worker
+// verifies its task credential against it before it runs a script (#5622),
+// and refuses without it. Public, so a plain value, and a rotated key
+// changes the template, as it rolls the proxy.
+func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, imageVolumes bool, taskSigningPublic string) *corev1.PodTemplateSpec {
 	tier := unattendedTierOf(p)
 	if tier == "" {
 		tier = agentv1alpha1.AgentProfileTierUnattended
 	}
-	return buildProfileJobTemplateAt(agent, p, tier, imageVolumes)
+	return buildProfileJobTemplateAt(agent, p, tier, imageVolumes, taskSigningPublic)
 }
 
 // buildProfileJobTemplateAt is the pod template a profile's Jobs at tier
@@ -119,9 +129,13 @@ func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha
 // whose restartPolicy is Never (a Job's pod must not restart, and a
 // PodTemplate defaults it to Always, which would break the policy's exact
 // comparison), with the worker labels for that tier. At a tier that isn't
-// unattended only permit-carrying tasks run on it (#5646).
-func buildProfileJobTemplateAt(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, tier string, imageVolumes bool) *corev1.PodTemplateSpec {
+// unattended only permit-carrying tasks run on it (#5646). Every tier's
+// carries the task-signing key, as a script-run task may run at any of them.
+func buildProfileJobTemplateAt(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, tier string, imageVolumes bool, taskSigningPublic string) *corev1.PodTemplateSpec {
 	spec := profileWorkerPodSpecForJob(agent, p, tier, imageVolumes)
+	if taskSigningPublic != "" {
+		spec.Containers[0].Env = append(spec.Containers[0].Env, corev1.EnvVar{Name: profileWorkerTaskSigningKeysEnvVar, Value: taskSigningPublic})
+	}
 	settleForPlatformMutation(&spec, p)
 	return &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
@@ -284,7 +298,7 @@ func dispatchJobParamName(p *agentv1alpha1.AgentProfile, tier string) string {
 // none, so no new Job starts there (#5638). A profile whose worker would
 // never schedule (profileWorkerToolsProblem) gets none, as it gets no pool;
 // dispatchJobToolsProblems says why.
-func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) map[string]profileJobTemplates {
+func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool, taskSigningPublic string) map[string]profileJobTemplates {
 	if !dispatcherJobPolicyRendered() {
 		return nil
 	}
@@ -298,7 +312,7 @@ func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		}
 		set := profileJobTemplates{}
 		for _, tier := range dispatchJobTiersOf(p, res) {
-			set[dispatchJobParamName(p, tier)] = buildProfileJobTemplateAt(agent, p, tier, imageVolumes)
+			set[dispatchJobParamName(p, tier)] = buildProfileJobTemplateAt(agent, p, tier, imageVolumes, taskSigningPublic)
 		}
 		if len(set) > 0 {
 			out[p.Name] = set

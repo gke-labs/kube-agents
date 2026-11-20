@@ -588,6 +588,30 @@ func TestScriptPathIsTheCRDs(t *testing.T) {
 	}
 }
 
+// A script rides on a confirm only, and only one that could run: a name
+// that's a subject token, a path under the script root, and a timeout
+// (#5622). The worker checks the message before it reads the script.
+func TestADispatchMessagesScriptIsChecked(t *testing.T) {
+	good := &DispatchScript{Name: "stall-watch", Path: ScriptRoot + "stall_watch.py", TimeoutSeconds: 60}
+	if err := (DispatchMessage{Type: DispatchConfirm, TaskID: "t1", Script: good}).Validate(); err != nil {
+		t.Fatalf("a confirm with a good script: %v", err)
+	}
+	for name, m := range map[string]DispatchMessage{
+		"on an offer": {Type: DispatchOffer, TaskID: "t1", Kind: SubmitKindTop, Envelope: json.RawMessage(`{}`),
+			Deadline: time.Now(), LeaseSeconds: 90, RenewSeconds: 20, AcceptSeconds: 10, Script: good},
+		"on an abandon":      {Type: DispatchAbandon, TaskID: "t1", Reason: "x", Script: good},
+		"a path outside":     {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: "/bin/sh", TimeoutSeconds: 60}},
+		"a dot-dot path":     {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: ScriptRoot + "../x", TimeoutSeconds: 60}},
+		"a dotted name":      {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s.x", Path: ScriptRoot + "a.py", TimeoutSeconds: 60}},
+		"no timeout":         {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: ScriptRoot + "a.py"}},
+		"an endless timeout": {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: ScriptRoot + "a.py", TimeoutSeconds: MaxDispatchSeconds + 1}},
+	} {
+		if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "script") {
+			t.Errorf("%s: Validate = %v, want a script error", name, err)
+		}
+	}
+}
+
 // A profile names its Job template by reference or carries it inline, never
 // both, and a reference needs an object name and a hash.
 // A hash-only ref is valid from #5479 (TestAJobTemplateRefMayCarryOnlyItsHash).

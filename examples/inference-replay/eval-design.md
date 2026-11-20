@@ -929,7 +929,7 @@ before stage 3 of the rollout (turning replay on):
    it), or `main` when no record does, so what merged between 00:00 and 06:00 doesn't change what
    it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
    mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
-   served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
+   served before each first miss, the miss causes, and each case's verdicts beside the newest recording night's on the same commit.
    Only passing runs' answers are published, so replay could push a flaky case toward passing; the
    lane's safety cases (`hack/eval/replay-lane-safety-cases.txt`) therefore run live before the
    cache is seeded and then replayed, and the report sets the two pass rates side by side.
