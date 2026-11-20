@@ -307,10 +307,10 @@ times. It rides with the audits stage, whose eval case covers both.
   sweep was filed and whose summary was not posted, whether the stage started it, held it, gave up on
   it or skipped the chain, with a request that fetches those reports (`bootstrap_delivery._lost_audits`).
   The lost-summaries stage (`bootstrap_delivery.resend_lost_summaries`) posts a first-run audit's
-  report after all once the operator projects a Slack home channel into the pod, by asking the chat
+  report after all once the operator projects a Slack or Google Chat home channel into the pod, by asking the chat
   relay to post it as a scheduled delivery would, while the run's claim is under
   `RESEND_WINDOW_SECONDS` (the relay posts a record older than two hours as a "did not finish" notice).
-  An audit outside the chain, a first mention later than that, and Google Chat keep the
+  An audit outside the chain and a first mention later than that keep the
   request sentence.
 - **An install self-check.** Not asked for by any issue.
 

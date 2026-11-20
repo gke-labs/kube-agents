@@ -657,8 +657,8 @@ neither Google Chat nor Slack, or one whose home channel is malformed, which rou
 nothing — the relay answers 502 without posting, and the detail says that no route
 exists. The operator names every armed platform in `A2A_NOTIFY_CONVERSATIONS` and every
 armed platform with a home channel set on the CR in `A2A_NOTIFY_PLATFORM` (each a
-comma-separated list of platform names). The agent adds Slack when the gateway learned a
-channel, and sends home posts to every armed platform when no platform has a home
+comma-separated list of platform names). The agent adds a platform whose home the gateway
+learned, and sends home posts to every armed platform when no platform has a home
 (`chat_notify.routed_platforms()`). So an install whose gateway holds no platform
 with a home channel is routed anyway: the relay sends to every armed platform, and the
 gateway refuses the post and keeps it for the digest it posts once a home channel is set
@@ -717,7 +717,8 @@ path — `trigger_agent_troubleshooter`, which drives `_post_initial_alert`. An
 incident alert registers the thread it gets back as the session's routing and
 the triage card's completion is addressed there, so two threads on two platforms
 would leave the report addressable to only one. It returns the first enabled
-platform and logs a warning naming the platforms that will not receive the
+platform (a home channel configured on the PlatformAgent ahead of one the gateway learned, Google
+Chat before Slack when they are alike) and logs a warning naming the platforms that will not receive the
 message — and the alert path then tries each enabled platform in turn until one
 accepts, so a broken first leg costs a retry rather than the alert. Ordering
 alone would have mirrored #1094 onto whichever installs have the _other_

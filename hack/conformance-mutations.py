@@ -2854,6 +2854,23 @@ Mutation(
         "because neither names the other's spelling",
     ),
     Mutation(
+        "C1-tier-membership-env-renamed-on-the-gateway-side",
+        "a2a/gateway/tier_membership.go",
+        ('const EnvTierMembership = "A2A_TIER_MEMBERSHIP"', 'const EnvTierMembership = "A2A_TIER_MEMBERS"'),
+        "test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary",
+        "rename the membership variable in the module that reads it. The "
+        "operator still renders the old name, so the gateway reads no "
+        "membership and every person runs at read",
+    ),
+    Mutation(
+        "C1-tier-membership-env-renamed-on-the-operator-side",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP"', 'a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP_LIST"'),
+        "test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary",
+        "rename the membership variable in the module that renders it; the "
+        "gateway keeps reading the old name and sees no membership",
+    ),
+    Mutation(
         "C1-target-allowlist-env-renamed-on-the-gateway-side",
         "a2a/gateway/allowlist.go",
         ('EnvTargetAllowedUsersGchat = "A2A_TARGET_ALLOWED_USERS_GCHAT"', 'EnvTargetAllowedUsersGchat = "A2A_TARGET_ALLOWEDUSERS_GCHAT"'),

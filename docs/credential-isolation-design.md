@@ -164,8 +164,8 @@ policies selecting one Pod are unioned and the API has no deny rule — and the 
 is already selected for egress
 by the `<agent>-gateway-netpol` this same operator renders (unless
 `spec.networkPolicy.enabled: false` withholds it, the one shape where the allowlist
-stands alone and enforces), which permits the metadata
-path. So enabling the allowlist widens what the Pod may send and narrows nothing; it is
+stands alone and enforces), which permits TCP 443 to any
+address outside the private, link-local and shared ranges. So enabling the allowlist widens what the Pod may send and narrows nothing; it is
 an auditable object rather than a control until that gateway policy is narrowed. It would
 in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. See
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).

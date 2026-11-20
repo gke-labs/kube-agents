@@ -63,8 +63,10 @@ export interface ConsoleOutFrame {
   kind?: string;
   /** The A2A state a terminal frame's task ended in (the pane does not read it). */
   state?: string;
-  /** On a notify frame, the root task whose turn filed the card this report answers (a2a/gateway/console.go). */
+  /** On a notify frame, the root task whose turn filed the card this post reports on (a2a/gateway/console.go). */
   replyTo?: string;
+  /** On a notify frame, true when the post is a card's report: the one post a reply can go under. */
+  report?: boolean;
 }
 
 /** The kind the gateway gives a task's terminal frame (a2a/gateway/console.go). */
@@ -145,6 +147,7 @@ export function parseOutFrame(data: Uint8Array | string): ConsoleOutFrame | null
   if (r.kind === "notify" && typeof r.replyTo === "string" && TOKEN_RE.test(r.replyTo)) {
     frame.replyTo = r.replyTo;
   }
+  if (r.kind === "notify" && r.report === true) frame.report = true;
   return frame;
 }
 

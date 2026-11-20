@@ -119,6 +119,15 @@
             }
           }
         },
+        "cardStop": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "slackTestUsers": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
@@ -2054,6 +2063,10 @@
                 },
                 "answerFeedback": {
                   "type": "boolean"
+                },
+                "homeChannelPolicy": {
+                  "type": "string",
+                  "enum": ["", "auto", "manual"]
                 }
               }
             },

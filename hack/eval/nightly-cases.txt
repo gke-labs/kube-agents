@@ -1345,6 +1345,18 @@
 # from neither exclusion list; CI nightlies run over inject).
 ./tasks/list-gitops-repos/task.yaml
 
+# The networking stream's declared-intent case (#1408): the project's
+# mtu-peer-declared network at MTU 8896, peered both ways with default at
+# 1460 (role declared-mtu-peering), is the 2.4 peered-MTU posture the same
+# knowledge/ note declares. It runs the networking audit and grades its
+# ledger: no finding id for the declared peering, the world-open firewall
+# rule still a finding, and a Declared intent row naming the note. The red
+# on main's images (the finding published) and the three greens on the
+# branch's are the loop its pull request records before it is marked ready;
+# the first objective holds whole for a project id of at most 24
+# characters. deployer: noop, read-only on the project.
+./tasks/networking-declared-intent-no-finding/task.yaml
+
 # The networking audit's firewall-world-open-ingress check over a standing
 # plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
 # the internet on one VM with an external IP. deployer: noop, read-only on the
@@ -1398,6 +1410,13 @@
 # carry on their roster entries (#1947). deployer: noop, no fixture; the run
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
+
+# post-merge-verified-fixed: the post-merge check's verify-after-merge loop
+# (#6343 case 1), the eval record for #6311. A writer: the check merges the
+# agent's no-pdb fix, applies it and drives the cron's ticks (post_merge.py).
+# Cost: each repetition holds a serial writers slot for the agent's turn plus
+# up to 15 minutes of ticks, about 45 minutes a night across three.
+./tasks/post-merge-verified-fixed/task.yaml
 
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease

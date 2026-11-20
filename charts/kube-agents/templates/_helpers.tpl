@@ -255,6 +255,10 @@ keeps the container's env free of a duplicate name. `| default dict` because
 - name: A2A_PROFILE_DISPATCHER
   value: "false"
 {{- end -}}
+{{- if and (.Values.operator.cardStop | default dict).enabled (not (hasKey $named "A2A_CARD_STOP")) }}
+- name: A2A_CARD_STOP
+  value: "true"
+{{- end -}}
 {{- with (.Values.operator.slackTestUsers | default list) }}
 {{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
 - name: A2A_SLACK_TEST_USERS

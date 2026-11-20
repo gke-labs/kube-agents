@@ -121,7 +121,7 @@ describe("App", () => {
     act(() =>
       captured!.dispatch({
         type: "notice",
-        frame: { messageId: "n-1", text: "two pods pending", edit: false, kind: "notify", replyTo: "task-root" },
+        frame: { messageId: "n-1", text: "two pods pending", edit: false, kind: "notify", replyTo: "task-root", report: true },
         conversation: first,
         at: 1,
       }),

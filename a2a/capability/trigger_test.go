@@ -31,6 +31,26 @@ func TestATriggerIsForTheUnattendedTierAlone(t *testing.T) {
 	mustRefuse(t, triggeredGrant(&bad).Validate(), "trigger")
 }
 
+// A loaded tier in unattended mode may have any name, but only the built-in
+// unattended tier binds a trigger. The broker's report credential (#5619)
+// rests on that: taskcred and the Python verifier take a credential with no
+// target only at the literal tier "unattended", so a trigger at an
+// unattended-mode tier of another name would be a credential they refuse. If
+// this ever has to change, those two rules move with it.
+func TestOnlyTheBuiltinUnattendedTierBindsATrigger(t *testing.T) {
+	restoreTiers(t)
+	if skipped := LoadTiers([]TierDefinition{{Name: "nightly", Mode: TierModeUnattended}}); len(skipped) != 0 {
+		t.Fatalf("skipped %v", skipped)
+	}
+	ok := scheduleTrigger
+	nightly := profileGrant("nightly", "fleet-audit")
+	if err := nightly.Validate(); err != nil {
+		t.Fatalf("an unattended-mode grant with no trigger should validate: %v", err)
+	}
+	nightly.Trigger = &ok
+	mustRefuse(t, nightly.Validate(), "trigger at a tier that is not unattended")
+}
+
 // profile.run permits only when the request's trigger is the grant's, both
 // ways: a different one, one the grant lacks, and one the grant has but the
 // request omits are each refused.
