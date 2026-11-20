@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -97,13 +98,17 @@ const (
 
 // Condition reasons.
 const (
-	reasonAgentProfileRendered        = "Rendered"
-	reasonAgentProfileNoAgent         = "NoPlatformAgent"
-	reasonAgentProfileManyAgents      = "MultiplePlatformAgents"
-	reasonAgentProfileRefused         = "ServiceAccountRefused"
-	reasonAgentProfileInvalid         = "InvalidProfile"
-	reasonAgentProfileSANotFound      = "ServiceAccountNotFound"
-	reasonAgentProfilePublished       = "Published"
+	reasonAgentProfileRendered   = "Rendered"
+	reasonAgentProfileNoAgent    = "NoPlatformAgent"
+	reasonAgentProfileManyAgents = "MultiplePlatformAgents"
+	reasonAgentProfileRefused    = "ServiceAccountRefused"
+	reasonAgentProfileInvalid    = "InvalidProfile"
+	reasonAgentProfileSANotFound = "ServiceAccountNotFound"
+	reasonAgentProfilePublished  = "Published"
+	// reasonAgentProfileDurableRecheck: the card is published and a
+	// durable that existed answered "not found"; the operator looks again
+	// a bus retry later before re-creating it (#6283).
+	reasonAgentProfileDurableRecheck  = "DurableRecheck"
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
@@ -125,24 +130,67 @@ type AgentProfileReconciler struct {
 	// TiersUnreadable is set when the role can't read Tiers: the tier
 	// catalog is then the built-ins alone (agentprofile_tiers.go).
 	TiersUnreadable bool
+	// Recorder records the end-tier-drain lever's events on the profile
+	// (consumeEndTierDrain). Nil records none (tests).
+	Recorder record.EventRecorder
 }
 
 // Every verb has a caller (tests/test_operator_secrets_grant.py names them): the reads are the
-// For() informer, the identity map's List and r.Get; `patch` is patchFinalizers' merge patch,
-// the one write to the profile itself (an Update would drop spec fields a newer CRD added,
-// which is why there is no `update` here); the status is written with Status().Update. There
+// For() informer, the identity map's List and r.Get; `patch` is patchFinalizers' merge patch
+// and consumeEndTierDrain's, the writes to the profile itself (an Update would drop spec
+// fields a newer CRD added, which is why there is no `update` here); the status is written with Status().Update. There
 // is no `agentprofiles/finalizers` verb: nothing the operator renders carries an owner
 // reference to a profile (the profile's ServiceAccounts carry labels only and outlive it), so
 // owner-references admission never asks for it, and the finalizer itself is a field of the
 // main resource, written by the merge patch above. The one `get` on the
 // bus StatefulSet's ControllerRevisions reads which profiles every server has
-// loaded (a2aClusterLoadedProfiles).
+// loaded (a2aRevisionLoadedProfiles).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get
 
+// profilePass is what one pass learns that decides when the next one runs.
+type profilePass struct {
+	// drainEnd is the earliest end of a tier this profile drains; zero for
+	// none.
+	drainEnd time.Time
+	// leverPending is set when the end-tier-drain annotation outlived the
+	// pass's consumeEndTierDrain: the applied dispatch config doesn't carry
+	// the end yet, or the patch lost a conflict.
+	leverPending bool
+}
+
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var pass profilePass
+	res, err := r.reconcile(ctx, req, &pass)
+	if err != nil {
+		return res, err
+	}
+	// A tier this profile drains is torn down (its ServiceAccounts and
+	// durables) by the first pass after its end, and nothing watched moves
+	// when the end passes: come back just after it (#3659, #5850).
+	if !pass.drainEnd.IsZero() {
+		wait := max(time.Until(pass.drainEnd)+time.Second, time.Second)
+		if res.RequeueAfter == 0 || res.RequeueAfter > wait {
+			res.RequeueAfter = wait
+		}
+	}
+	// The end-tier-drain lever is consumed once the applied dispatch config
+	// carries it (consumeEndTierDrain), and nothing this controller watches
+	// moves when that config is written. Come back soon while it is pending,
+	// so the entry is consumed within the drain's grace rather than at the
+	// next resync, after the tier has gone (#5850). A pass that never reached
+	// the consume (an unbound profile, a finalizer pass) doesn't poll.
+	if pass.leverPending {
+		if res.RequeueAfter == 0 || res.RequeueAfter > endTierDrainRecheck {
+			res.RequeueAfter = endTierDrainRecheck
+		}
+	}
+	return res, nil
+}
+
+func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request, pass *profilePass) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// The namespace-only request SetupWithManager sends when a PlatformAgent
@@ -196,6 +244,17 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	verdict := verdicts[profile.Name]
+	for _, until := range verdict.draining {
+		if pass.drainEnd.IsZero() || until.Before(pass.drainEnd) {
+			pass.drainEnd = until
+		}
+	}
+	// The end-tier-drain lever, consumed once the applied dispatch config
+	// carries it (agentprofile_tier_drain.go, #5850).
+	if err := r.consumeEndTierDrain(ctx, &profile, verdict); err != nil {
+		return ctrl.Result{}, err
+	}
+	pass.leverPending = len(endTierDrainRequested(&profile)) > 0
 	bound, err := withoutForeignServiceAccounts(ctx, r.Client, renderable)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -441,6 +500,12 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 			return reasonAgentProfileBusError, "the agent card is published, but its durables are not: " + err.Error(), err
 		}
 		if err := r.cards().SyncDurables(ctx, agent, p.Name, desiredProfileDurables(p), probe); err != nil {
+			if errors.Is(err, errDurableAwaitingRecheck) {
+				// Not the connection's fault: the bus answered. The bus
+				// retry comes back and re-creates the durable if it is
+				// still missing (#6283).
+				return reasonAgentProfileDurableRecheck, "the agent card is published; a durable is being re-checked before it is re-created: " + err.Error(), err
+			}
 			// Drop the connection: callout grants are fixed when it opens,
 			// and one opened before the callout served the map that grants
 			// the operator its durables would be refused forever. The retry
@@ -722,6 +787,19 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		Message:            idMsg,
 		ObservedGeneration: p.Generation,
 	})
+	// The durables' tiers: written only by a pass whose durable sync
+	// succeeded (the card reads Published with the dispatcher on), so a pass
+	// the bus refused, as during a bus migration's write freeze, leaves the
+	// record of durables that existed in place (#6283).
+	if verdict != nil && cardReason == reasonAgentProfilePublished && a2aDispatcherEnabled() {
+		p.Status.DurableTiers = durableTiersOf(*verdict)
+	}
+	// A withdrawn card (IdentityNotRendered, from withdrawCard) deleted the
+	// profile's durables, so none existed any more: when the profile
+	// recovers, its durables are made at once, not after a re-check.
+	if cardReason == reasonAgentProfileIdentityMissing && a2aDispatcherEnabled() {
+		p.Status.DurableTiers = nil
+	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               agentv1alpha1.AgentProfileConditionCardPublished,
 		Status:             conditionStatus(cardReason == reasonAgentProfilePublished),
@@ -741,6 +819,7 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		fitOn = p.DeepCopy()
 		delete(fitOn.Annotations, renderedTierModesAnnotation)
 		delete(fitOn.Annotations, drainingTiersAnnotation)
+		delete(fitOn.Annotations, endingTiersAnnotation)
 	}
 	if problem := autopilotRatioProblem(fitOn); problem != "" {
 		fitReason, fitMsg = reasonAgentProfileOutsideAutopilotRatio, problem
@@ -769,7 +848,8 @@ func conditionStatus(ok bool) metav1.ConditionStatus {
 // times, which SetStatusCondition preserves when nothing else changed.
 func equalAgentProfileStatus(a, b *agentv1alpha1.AgentProfileStatus) bool {
 	if a.ObservedGeneration != b.ObservedGeneration || a.AgentRef != b.AgentRef || a.ServiceAccountName != b.ServiceAccountName ||
-		!slices.Equal(a.RenderedTiers, b.RenderedTiers) || len(a.Conditions) != len(b.Conditions) {
+		!slices.Equal(a.RenderedTiers, b.RenderedTiers) || !slices.Equal(a.DurableTiers, b.DurableTiers) ||
+		len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
 	for _, c := range b.Conditions {

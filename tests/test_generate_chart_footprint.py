@@ -17,6 +17,7 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -414,7 +415,7 @@ class ExtractFootprintTest(unittest.TestCase):
         # The agent's data claim, the image-tree cache, the shell's two claims and one
         # JetStream claim per NATS server.
         self.assertEqual(self.op["storage"]["persistentVolumeClaims"], 7)
-        self.assertEqual(self.op["storage"]["storageBytesRequest"], 222 * _GIB)
+        self.assertEqual(self.op["storage"]["storageBytesRequest"], 228 * _GIB)
 
     def test_the_two_data_claims_and_their_default_size_are_recorded(self):
         """The agent's data claim and the sandbox's, which spec.storage.size sizes together."""
@@ -449,12 +450,12 @@ class ExtractFootprintTest(unittest.TestCase):
         self.assertEqual(shell["pods"], 2)
         self.assertEqual(shell["cpuMillisRequest"], baseline_shell["cpuMillisRequest"] * 2)
         self.assertEqual(shell["memoryBytesRequest"], baseline_shell["memoryBytesRequest"] * 2)
-        # Shell StatefulSet has 2 volumeClaimTemplates (data=50Gi, sshd=1Gi), so scaling from
-        # 1 to 2 replicas adds 2 claims (baseline 7 -> 9) and 51Gi storage (baseline 222Gi -> 273Gi).
+        # Shell StatefulSet has 2 volumeClaimTemplates (data=50Gi, sshd=4Gi), so scaling from
+        # 1 to 2 replicas adds 2 claims (baseline 7 -> 9) and 54Gi storage (baseline 228Gi -> 282Gi).
         self.assertEqual(data["operatorRendered"]["storage"]["persistentVolumeClaims"], 9)
         self.assertEqual(
             data["operatorRendered"]["storage"]["storageBytesRequest"],
-            self.op["storage"]["storageBytesRequest"] + 51 * _GIB,
+            self.op["storage"]["storageBytesRequest"] + 54 * _GIB,
         )
         # Each sandbox replica's data claim follows spec.storage.size too.
         self.assertEqual(data["operatorRendered"]["storage"]["dataClaims"], 3)
@@ -580,7 +581,7 @@ class A2AStackFootprintTest(unittest.TestCase):
         self.assertEqual(storage["busClaimBytesRequest"], 3 * 40 * _GIB)
         self.assertEqual(storage["busClaimRequest"], "120Gi")
         self.assertEqual(storage["persistentVolumeClaims"], 4 + 3)
-        self.assertEqual(storage["storageBytesRequest"], 102 * _GIB + 3 * 40 * _GIB)
+        self.assertEqual(storage["storageBytesRequest"], 108 * _GIB + 3 * 40 * _GIB)
         # The data claims are the two spec.storage.size sizes, not the bus's.
         self.assertEqual(storage["dataClaims"], 2)
 
@@ -931,3 +932,74 @@ class ExecTierFootprintTest(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     gcf._exec_tier_entry()
         self.assertIn("new-sidecar", str(caught.exception))
+
+
+def _a2a_gateway_env(docs):
+    doc = _find_doc(docs, "Deployment", gcf._A2A_WORKLOADS[gcf._A2A_GATEWAY][1])
+    for container in doc["spec"]["template"]["spec"]["containers"]:
+        if container["name"] == gcf._A2A_WORKLOADS[gcf._A2A_GATEWAY][2][0]:
+            return container["env"]
+    raise AssertionError("the A2A gateway container is not in the golden")
+
+
+class SessionPodFootprintTest(unittest.TestCase):
+    """#6028: one session pod, read from the session env the operator renders on the
+    A2A gateway, the source the gateway itself sizes the pods from."""
+
+    def test_the_entry_is_the_gateways_session_env(self):
+        data = gcf.extract_footprint()
+        self.assertNotIn("sessionPod", data["operatorRendered"])
+        entry = data["operatorRenderedPerReplica"]["sessionPod"]
+        env = {
+            var["name"]: var["value"]
+            for var in _a2a_gateway_env(list(yaml.safe_load_all(gcf._GOLDEN_MANIFEST.read_text())))
+            if "value" in var
+        }
+        self.assertEqual(entry["requests"]["cpu"], env["A2A_SESSION_CPU_REQUEST"])
+        self.assertEqual(entry["requests"]["memory"], env["A2A_SESSION_MEMORY_REQUEST"])
+        self.assertEqual(entry["limits"]["cpu"], env["A2A_SESSION_CPU_LIMIT"])
+        self.assertEqual(entry["limits"]["memory"], env["A2A_SESSION_MEMORY_LIMIT"])
+        self.assertEqual(entry["maxSessionsDefault"], int(env["A2A_MAX_SESSIONS"]))
+        self.assertEqual(entry["pods"], 1)
+        self.assertEqual(entry["ephemeralStorageBytesRequest"], 1088 * _MIB)
+        self.assertEqual(entry["ephemeralStorageBytesLimit"], 1088 * _MIB)
+
+    def test_a_changed_env_value_moves_the_entry(self):
+        """The entry follows the golden, not a copy of today's numbers."""
+        def lower(docs):
+            for var in _a2a_gateway_env(docs):
+                if var["name"] == "A2A_SESSION_CPU_REQUEST":
+                    var["value"] = "150m"
+                if var["name"] == "A2A_MAX_SESSIONS":
+                    var["value"] = "25"
+        with _golden_with(lower):
+            entry = gcf.extract_footprint()["operatorRenderedPerReplica"]["sessionPod"]
+        self.assertEqual(entry["cpuMillisRequest"], 150)
+        self.assertEqual(entry["maxSessionsDefault"], 25)
+
+    def test_a_golden_without_the_session_env_is_an_error(self):
+        for name in ("A2A_SESSION_MEMORY_LIMIT", "A2A_MAX_SESSIONS"):
+            with self.subTest(name=name):
+                def drop(docs, name=name):
+                    env = _a2a_gateway_env(docs)
+                    env[:] = [var for var in env if var["name"] != name]
+                with _golden_with(drop):
+                    with self.assertRaises(ValueError) as caught:
+                        gcf.extract_footprint()
+                self.assertIn(name, str(caught.exception))
+
+    def test_the_ephemeral_figure_is_read_from_its_constant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            api = pathlib.Path(tmp)
+            (api / "a.go").write_text('package v1alpha1\n\nconst DefaultSessionEphemeralStorage = "2Gi"\n')
+            self.assertEqual(gcf._session_ephemeral_storage(api), "2Gi")
+            (api / "a.go").write_text("package v1alpha1\n")
+            with self.assertRaises(ValueError):
+                gcf._session_ephemeral_storage(api)
+
+    def test_the_ephemeral_constant_matches_the_gateways(self):
+        """The gateway still sets the pod's ephemeral storage from its own constant."""
+        spawn = (gcf._ROOT / "a2a" / "gateway" / "spawn.go").read_text()
+        match = re.search(r'workerEphemeralStorageRequest\s*=\s*"([^"]+)"', spawn)
+        self.assertIsNotNone(match)
+        self.assertEqual(gcf._session_ephemeral_storage(), match.group(1))

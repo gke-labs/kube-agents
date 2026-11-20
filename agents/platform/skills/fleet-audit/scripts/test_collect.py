@@ -13,6 +13,7 @@ import importlib
 import inspect
 import io
 import json
+import time
 import os
 import re
 import shlex
@@ -1530,6 +1531,259 @@ class TestHpaFloorsAtOne(unittest.TestCase):
         }
         hits = collect.check_hpa_floors_at_one(ctx)
         self.assertIsNotNone(hits[0]["reconciler"])
+
+
+class TestHpaAggressiveScaledown(unittest.TestCase):
+    """§3.25 — aggressive HPA scale-down with no preStop hook."""
+
+    def ctx(
+        self,
+        *,
+        ns="seeded-autoscaling",
+        workload_kind="Deployment",
+        replicas=2,
+        min_replicas=2,
+        max_replicas=10,
+        stabilization=0,
+        policies="planted",
+        select_policy="Max",
+        containers=None,
+        grace=None,
+        target=None,
+        owned=False,
+        hpa_labels=None,
+        workload_labels=None,
+    ):
+        d = deployment("web-api-server", ns=ns, kind=workload_kind, **{"spec.replicas": replicas})
+        if workload_labels is not None:
+            d["metadata"]["labels"] = workload_labels
+        if containers is not None:
+            d["spec"]["template"]["spec"]["containers"] = containers
+        if grace is not None:
+            d["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = grace
+
+        h = hpa(
+            "web-api-server-hpa",
+            ns=ns,
+            min_replicas=min_replicas if min_replicas is not None else 1,
+            max_replicas=max_replicas,
+            target=target or {"apiVersion": "apps/v1", "kind": workload_kind, "name": "web-api-server"},
+            owned=owned,
+        )
+        if min_replicas is None:
+            del h["spec"]["minReplicas"]
+        if hpa_labels is not None:
+            h["metadata"]["labels"] = hpa_labels
+        if stabilization != "absent_behavior":
+            scale_down = {}
+            if stabilization is not None:
+                scale_down["stabilizationWindowSeconds"] = stabilization
+            if select_policy is not None:
+                scale_down["selectPolicy"] = select_policy
+            if policies == "planted":
+                scale_down["policies"] = [{"type": "Percent", "value": 100, "periodSeconds": 15}]
+            elif policies is not None:
+                scale_down["policies"] = policies
+            h["spec"]["behavior"] = {"scaleDown": scale_down}
+        return context_of(dump_of(d, h))
+
+    def test_zero_stabilization_and_hundred_percent_without_prestop_flags_hpa(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "HorizontalPodAutoscaler/web-api-server-hpa")
+        self.assertEqual(hits[0]["namespace"], "seeded-autoscaling")
+        self.assertIn("stabilizationWindowSeconds=0", hits[0]["excerpt"])
+        self.assertIn("selectPolicy=Max", hits[0]["excerpt"])
+        self.assertIn("policies=100% per 15s", hits[0]["excerpt"])
+        self.assertIn("scaling Deployment/web-api-server (minReplicas=2, maxReplicas=10)", hits[0]["excerpt"])
+        self.assertIn("target containers with no preStop hook: app (terminationGracePeriodSeconds=30)", hits[0]["excerpt"])
+
+    def test_collect_cluster_grades_it_major_without_requiring_a_service(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "hpa-aggressive-scaledown")
+        self.assertEqual(spec.severity, "major")
+        hits = spec.run(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+
+    def test_omitted_policies_with_short_window_use_kubernetes_default_hundred_percent(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=15, policies=None, select_policy=None))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("policies=100% per 15s (API default)", hits[0]["excerpt"])
+
+    def test_default_or_sixty_second_stabilization_window_is_not_flagged(self):
+        for window in ("absent_behavior", None, 60, 300):
+            with self.subTest(window=window):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=window)), [])
+
+    def test_disabled_select_policy_is_not_flagged(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(select_policy="Disabled")), [])
+
+    def test_bounded_percent_or_pods_policy_is_not_flagged(self):
+        bounded = [
+            [{"type": "Percent", "value": 25, "periodSeconds": 60}],
+            [{"type": "Percent", "value": 49, "periodSeconds": 15}],
+            [{"type": "Pods", "value": 1, "periodSeconds": 60}],
+        ]
+        for pol in bounded:
+            with self.subTest(policies=pol):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=pol)), [])
+
+    def test_select_policy_max_vs_min_handles_mixed_policy_lists(self):
+        mixed = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Pods", "value": 1, "periodSeconds": 60},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Max"))), 1)
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Min")), [])
+        all_aggressive = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Percent", "value": 50, "periodSeconds": 30},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=all_aggressive, select_policy="Min"))), 1)
+
+    def test_container_prestop_hook_clears_it_while_self_health_sidecar_is_ignored(self):
+        containers = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+            {"name": "istio-proxy", "image": "proxyv2"},
+        ]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(containers=containers)), [])
+
+    def test_serving_service_narrows_to_containers_in_its_target_port_path(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "web-api-server"}}
+        d["spec"]["template"]["spec"]["containers"] = [
+            {
+                "name": "app",
+                "image": "pause",
+                "ports": [{"containerPort": 8080}],
+                "lifecycle": {"preStop": {"sleep": {"seconds": 15}}},
+            },
+            {"name": "fluent-bit", "image": "fluent-bit"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        svc = service(
+            "web-api-server",
+            ns="seeded-autoscaling",
+            selector={"app": "web-api-server"},
+            ports=[{"name": "http", "port": 80, "targetPort": 8080}],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h, svc))), [])
+
+    def test_native_sidecar_without_prestop_is_flagged_while_plain_init_container_is_not(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["spec"]["containers"] = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+        ]
+        d["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "migrate", "image": "busybox"},
+            {"name": "envoy-proxy", "image": "envoy", "restartPolicy": "Always"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        hits = collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("target containers with no preStop hook: envoy-proxy", hits[0]["excerpt"])
+
+        d["spec"]["template"]["spec"]["initContainers"] = [{"name": "migrate", "image": "busybox"}]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h))), [])
+
+    def test_daemonset_target_is_not_flagged(self):
+        ds = deployment("node-agent", ns="seeded-autoscaling")
+        ds["kind"] = "DaemonSet"
+        ds["spec"].pop("replicas", None)
+        h = hpa(
+            "node-agent-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "DaemonSet", "name": "node-agent"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(ds, h))), [])
+
+    def test_omitted_min_replicas_defaults_floor_to_one_and_statefulset_target_is_flagged(self):
+        hits = collect.check_hpa_aggressive_scaledown(
+            self.ctx(min_replicas=None, max_replicas=5, workload_kind="StatefulSet", grace=45)
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("scaling StatefulSet/web-api-server (minReplicas=1, maxReplicas=5)", hits[0]["excerpt"])
+        self.assertIn("terminationGracePeriodSeconds=45", hits[0]["excerpt"])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=None, max_replicas=1)), [])
+
+    def test_standard_and_hpa_exclusions_hold(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(ns="kube-system")), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(hpa_labels={collect._ADDON_MANAGER_MODE_LABEL: "Reconcile"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(owned=True)), [])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=5, max_replicas=5)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(workload_labels={collect.OPT_OUT_KEY: "exempt"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(replicas=0)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "missing"})
+            ),
+            [],
+        )
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "custom.io/v1", "kind": "Deployment", "name": "web-api-server"})
+            ),
+            [],
+        )
 
 
 class TestSingleReplicaDefersToTheHpaCheck(unittest.TestCase):
@@ -4213,10 +4467,11 @@ class TestCollectCluster(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         na = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
         workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
-        # The three cluster-kind checks that grade against the workload set
+        # The four cluster-kind checks that grade against the workload set
         # examined nothing either: a PDB is only graded against the workload
-        # it covers, an HPA's floor only against a Service-backed workload.
-        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one"}
+        # it covers, an HPA's floor or scale-down behavior only against the
+        # workload it scales.
+        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one", "hpa-aggressive-scaledown"}
         self.assertEqual(set(na), workload_slugs | anchored)
         # The cluster-scoped checks still ran: an HPA pointing at a workload
         # that no longer exists, a PDB nothing can satisfy, a CronJob that has
@@ -4882,6 +5137,10 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # answers with one healthy object: served and empty would
                 # declare `configsync-reconciler-stalled` inapplicable.
                 return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.SERVICEENTRY_KIND:
+                # One ServiceEntry, for the same reason: served and empty would
+                # declare `serviceentry-host-collision` inapplicable.
+                return Run(argv, 0, projected(service_entry("egress", "team-a", ["api.example.com"])), "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
             if argv[:3] == ["gcloud", "container", "clusters"]:
@@ -5045,6 +5304,31 @@ def configsync_object(kind, name, ns="config-management-system", stalled="False"
     for stage, errors in (stage_errors or {}).items():
         doc["status"][stage] = {"errors": errors, "errorSummary": {"totalCount": len(errors)}}
     return doc
+
+
+def service_entry(name, ns, hosts, export_to=None, addresses=(), ports=((443, "TLS"),), resolution="DNS", endpoints=()):
+    """An Istio ServiceEntry as `kubectl get serviceentries.networking.istio.io -A -o json`
+    returns it. `export_to=None` omits the field, which exports to every namespace."""
+    spec = {
+        "hosts": list(hosts),
+        "ports": [{"number": n, "name": f"p{n}", "protocol": proto} for n, proto in ports],
+        "resolution": resolution,
+    }
+    if export_to is not None:
+        spec["exportTo"] = list(export_to)
+    if addresses:
+        spec["addresses"] = list(addresses)
+    if endpoints:
+        spec["endpoints"] = [{"address": a} for a in endpoints]
+    return {"apiVersion": "networking.istio.io/v1", "kind": "ServiceEntry", "metadata": {"namespace": ns, "name": name}, "spec": spec}
+
+
+def projected(*entries):
+    """ServiceEntries as the collector's jsonpath projection prints them: one
+    `<namespace>\\t<name>\\t<spec JSON>` line each, nothing for none."""
+    return "".join(
+        f"{e['metadata']['namespace']}\t{e['metadata']['name']}\t{json.dumps(e['spec'])}\n" for e in entries
+    )
 
 
 def compliance_workload(kind, name, ns="default"):
@@ -7941,7 +8225,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, serviceentry_items=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -7998,6 +8282,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
                         # "one served, one unserved" arm has to accept.
                         return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds.split(".")[0]}" in group "configsync.gke.io"', 0.05)
                     return Run(argv, 0, json.dumps(dump_of(*configsync_items)), "", 0.05)
+                if kinds == collect.SERVICEENTRY_KIND:
+                    if callable(serviceentry_items):
+                        return serviceentry_items(argv, **kwargs)
+                    if serviceentry_items is None:
+                        # A cluster without Istio, which is most of a fleet
+                        # and the default here.
+                        return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "serviceentries" in group "networking.istio.io"', 0.05)
+                    return Run(argv, 0, projected(*serviceentry_items), "", 0.05)
                 if kinds in collect.AUTOPILOT_ALLOWLIST_KINDS:
                     if callable(allowlist_items):
                         return allowlist_items(argv, **kwargs)
@@ -8206,13 +8498,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # Config Connector does. It is declared by the collector rather
             # than by the Autopilot table, so it is not part of what this test
             # is about -- see `test_a_cluster_without_config_connector_...`.
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
-            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"):
                 continue
             self.assertIn("Autopilot", entry["reason"])
 
@@ -8230,7 +8522,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # wrote it: an unfalsifiable claim is the defect, not Autopilot's
             # phrasing of one.
             self.assertNotIn("cannot exist", entry["reason"])
-            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"):
                 continue
             # Scoped to the workloads the audit can see, and to the admission
             # policy holding -- both halves, on every Autopilot reason.
@@ -8248,7 +8540,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
         )
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"}
         )
         # And they report as what they are: checks that ran and found nothing.
         command_slugs = {c["check"] for c in result["commands"]}
@@ -8267,7 +8559,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
 
     def test_a_standard_cluster_never_reads_for_allowlists(self):
@@ -8288,7 +8580,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(result["outcome"], "collected")
-        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"})
+        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"})
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"},
             {c["check"] for c in result["commands"]},
@@ -8306,7 +8598,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
 
     def test_standard_cluster_declares_only_the_config_connector_check(self):
@@ -8320,7 +8612,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         and just as good at teaching a reader to ignore the column."""
         result = self.run_with()
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"}
         )
 
     def kcc_reason(self, result):
@@ -8526,7 +8818,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # Nor are the other two, though they found nothing: all three rest on
         # one admission rule, and a privileged pod says it is not holding on
         # this cluster, so a hostPath or host-namespace pod could be there too.
-        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled"})
+        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"})
         self.assertLessEqual({"host-namespace", "hostpath-mount"}, {c["check"] for c in result["commands"]})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
@@ -8574,15 +8866,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Eighteen checks minus the three Autopilot rules out and the two no
-        cluster without Config Connector or Config Sync can run is thirteen, each
-        with a command behind it, and the five dispositioned rather than silently absent --
-        absent is what §6 reads as a coverage gap."""
+        Nineteen checks minus the three Autopilot rules out and the three no
+        cluster without Config Connector, Config Sync or Istio can run is thirteen,
+        each with a command behind it, and the six dispositioned rather than silently
+        absent -- absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(len(command_slugs), 13)
-        self.assertEqual(len(na_slugs), 5)
+        self.assertEqual(len(na_slugs), 6)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 
@@ -13203,6 +13495,9 @@ class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
                 return Run(argv, 0, json.dumps(dump_of(self.COMPUTE_CLASS)), "", 0.05)
             if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
                 return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.SERVICEENTRY_KIND:
+                # Served and empty: the projection prints nothing.
+                return Run(argv, 0, "", "", 0.05)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.1)
             if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
@@ -13429,6 +13724,309 @@ class TestWebhookBackendUnreachable(unittest.TestCase):
         readiness = collect._upgrade_readiness()
         self.assertTrue(hasattr(readiness, "backend_problem"))
         self.assertEqual(readiness.__file__, str(collect.UPGRADE_READINESS_SCRIPTS / "upgrade_readiness.py"))
+
+
+class TestServiceEntryHostCollision(unittest.TestCase):
+    """§2.19. One host declared by ServiceEntries in two namespaces, where a third
+    namespace sees more than one of them and so routes by Istio's pick."""
+
+    HOST = "api.example.com"
+    # Well under audit_report's 2000-character excerpt trim: the line stays
+    # readable whatever the number of declarers.
+    BOUNDED_EXCERPT_CHARS = 1500
+
+    def hits(self, *entries):
+        return collect.check_serviceentry_host_collision({"serviceentries": list(entries)})
+
+    def test_two_teams_exporting_one_host_everywhere_is_one_finding_on_the_host(self):
+        hits = self.hits(
+            service_entry("payments", "team-a", [self.HOST], addresses=["10.0.0.1"]),
+            service_entry("payments", "team-b", [self.HOST], export_to=["*"], addresses=["10.0.0.2"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], f"ServiceEntry host {self.HOST}")
+        self.assertEqual(hits[0]["namespace"], "")
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        self.assertIn("team-a/payments", hits[0]["excerpt"])
+        self.assertIn("team-b/payments", hits[0]["excerpt"])
+        self.assertIn("every namespace that declares none of them", hits[0]["excerpt"])
+        self.assertIn("10.0.0.1", hits[0]["excerpt"])
+        self.assertIn("10.0.0.2", hits[0]["excerpt"])
+
+    def test_identical_copies_are_minor(self):
+        hits = self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-b", [self.HOST]))
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
+        self.assertIn("identical", hits[0]["excerpt"])
+
+    def test_entries_that_differ_only_in_location_or_target_port_are_not_identical(self):
+        a = service_entry("a", "team-a", [self.HOST], addresses=["10.0.0.1"])
+        b = service_entry("b", "team-b", [self.HOST], addresses=["10.0.0.1"])
+        b["spec"]["location"] = "MESH_INTERNAL"
+        self.assertEqual(self.hits(a, b)[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        c = service_entry("c", "team-c", [self.HOST], addresses=["10.0.0.1"])
+        c["spec"]["ports"][0]["targetPort"] = 8443
+        hits = self.hits(a, c)
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        self.assertIn("8443", hits[0]["excerpt"])
+
+    def test_identical_copies_with_ports_listed_in_another_order_are_minor(self):
+        a = service_entry("a", "team-a", [self.HOST], ports=((443, "TLS"), (80, "HTTP")))
+        b = service_entry("b", "team-b", [self.HOST], ports=((80, "HTTP"), (443, "TLS")))
+        self.assertEqual(self.hits(a, b)[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
+
+    def test_namespace_local_entries_do_not_collide(self):
+        self.assertEqual(
+            self.hits(
+                service_entry("a", "team-a", [self.HOST], export_to=["."]),
+                service_entry("b", "team-b", [self.HOST], export_to=["."], addresses=["10.0.0.9"]),
+            ),
+            [],
+        )
+
+    def test_one_public_entry_beside_a_local_one_has_one_answer_everywhere(self):
+        """team-b sees both and keeps its own; every other namespace sees only team-a's."""
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-b", [self.HOST], export_to=["."])),
+            [],
+        )
+
+    def test_a_declaring_namespace_that_sees_the_other_entry_keeps_its_own(self):
+        self.assertEqual(
+            self.hits(
+                service_entry("a", "team-a", [self.HOST], export_to=[".", "team-b"]),
+                service_entry("b", "team-b", [self.HOST], export_to=[".", "team-a"]),
+            ),
+            [],
+        )
+
+    def test_two_explicit_lists_naming_one_third_namespace_collide_there(self):
+        hits = self.hits(
+            service_entry("a", "team-a", [self.HOST], export_to=[".", "shared"]),
+            service_entry("b", "team-b", [self.HOST], export_to=[".", "shared", "only-b"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("namespace shared sees", hits[0]["excerpt"])
+        self.assertNotIn("only-b", hits[0]["excerpt"])
+
+    def test_a_public_entry_and_a_list_naming_a_third_namespace_collide_there(self):
+        hits = self.hits(
+            service_entry("a", "team-a", [self.HOST]),
+            service_entry("b", "team-b", [self.HOST], export_to=["team-c"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("namespace team-c sees", hits[0]["excerpt"])
+
+    def test_an_entry_exported_to_no_namespace_collides_with_nothing(self):
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-b", [self.HOST], export_to=["~"])),
+            [],
+        )
+
+    def test_a_declarer_whose_entry_is_hidden_from_itself_is_not_exempt(self):
+        """team-n's own entry is exported nowhere, so its sidecars choose between
+        team-p's public entry and team-q's, which names team-n."""
+        hits = self.hits(
+            service_entry("n", "team-n", [self.HOST], export_to=["~"]),
+            service_entry("p", "team-p", [self.HOST], addresses=["10.0.0.1"]),
+            service_entry("q", "team-q", [self.HOST], export_to=["team-n"], addresses=["10.0.0.2"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("namespace team-n sees", hits[0]["excerpt"])
+
+    def test_an_entry_no_colliding_viewer_sees_is_not_named_and_does_not_set_severity(self):
+        """team-a's local-only entry is exported to team-a alone, so no namespace
+        that sees two copies sees it: the copies it sees are identical."""
+        hits = self.hits(
+            service_entry("local-only", "team-a", [self.HOST], export_to=["."], addresses=["10.0.0.99"]),
+            service_entry("exported", "team-a", [self.HOST], export_to=["*"], addresses=["10.0.0.1"]),
+            service_entry("exported", "team-b", [self.HOST], export_to=["*"], addresses=["10.0.0.1"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
+        self.assertNotIn("local-only", hits[0]["excerpt"])
+        self.assertIn("team-a/exported", hits[0]["excerpt"])
+
+    def test_two_entries_in_one_namespace_are_one_declarer(self):
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-a", [self.HOST], addresses=["10.0.0.3"])),
+            [],
+        )
+
+    def test_hosts_match_case_insensitively(self):
+        self.assertEqual(len(self.hits(service_entry("a", "team-a", ["API.example.com"]), service_entry("b", "team-b", [self.HOST]))), 1)
+
+    def test_a_wildcard_beside_a_specific_host_is_not_a_collision(self):
+        self.assertEqual(
+            self.hits(service_entry("a", "team-a", ["*.example.com"]), service_entry("b", "team-b", [self.HOST])),
+            [],
+        )
+
+    def test_a_malformed_entry_is_skipped_not_fatal(self):
+        self.assertEqual(self.hits({"kind": "ServiceEntry"}, "not-a-dict", service_entry("a", "team-a", [self.HOST])), [])
+
+    def test_a_host_declared_in_hundreds_of_namespaces_stays_one_bounded_line(self):
+        entries = [service_entry("e", f"team-{i:03d}", [self.HOST], addresses=[f"10.0.{i // 250}.{i % 250}"]) for i in range(300)]
+        hits = self.hits(*entries)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("300 namespaces", hits[0]["excerpt"])
+        self.assertIn(f"and {300 - collect.MAX_SERVICEENTRY_NAMED} more", hits[0]["excerpt"])
+        self.assertLess(len(hits[0]["excerpt"]), self.BOUNDED_EXCERPT_CHARS)
+
+
+class TestServiceEntryHostCollisionAtScale(unittest.TestCase):
+    """The check reads ServiceEntries only, so pods and nodes cost it nothing; what
+    grows is entries per cluster and clusters per fleet. Both bounds below are an
+    order of magnitude over a pairwise compare's cost would allow, so a regression
+    to comparing every entry with every other fails here rather than in a fleet."""
+
+    # Entries in one cluster, and namespaces they spread over. 20k entries is
+    # past any mesh this repo has seen by two orders of magnitude.
+    ENTRIES = 20_000
+    NAMESPACES = 2_000
+    COLLIDING_HOSTS = 50
+    # Generous: the linear pass runs in well under a second on a laptop; a
+    # pairwise compare over 20k entries is 200M pairs.
+    SECONDS_BUDGET = 10.0
+    CLUSTERS = 40
+    ENTRIES_PER_CLUSTER = 2_000
+
+    def entries(self, count, namespaces, colliding):
+        out = []
+        for i in range(count):
+            ns = f"ns-{i % namespaces:04d}"
+            # The first `colliding` hosts are each declared from two namespaces.
+            host = f"shared-{i % colliding}.example.com" if i < 2 * colliding else f"svc-{i}.example.com"
+            out.append(service_entry(f"se-{i}", ns, [host], export_to=["*"] if i % 3 else None, addresses=[f"10.{i % 250}.0.1"]))
+        return out
+
+    def test_one_cluster_with_twenty_thousand_entries(self):
+        entries = self.entries(self.ENTRIES, self.NAMESPACES, self.COLLIDING_HOSTS)
+        started = time.monotonic()
+        hits = collect.check_serviceentry_host_collision({"serviceentries": entries})
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(hits), self.COLLIDING_HOSTS)
+        self.assertLess(elapsed, self.SECONDS_BUDGET)
+
+    def test_one_host_declared_from_every_namespace_with_long_export_lists(self):
+        """The pathological shape for a per-namespace walk: one host, 2,000
+        declarers, each exporting to 50 named namespaces."""
+        entries = [
+            service_entry("e", f"ns-{i:04d}", ["hot.example.com"], export_to=[f"consumer-{(i + k) % 500}" for k in range(50)])
+            for i in range(self.NAMESPACES)
+        ]
+        started = time.monotonic()
+        hits = collect.check_serviceentry_host_collision({"serviceentries": entries})
+        self.assertLess(time.monotonic() - started, self.SECONDS_BUDGET)
+        self.assertEqual(len(hits), 1)
+
+    def test_a_fleet_of_clusters_collects_each_through_the_real_sweep(self):
+        """`collect_fleet` over 40 clusters of 2,000 entries each: every cluster is
+        collected, records the read, and reports its own two collisions."""
+        clusters = [{"name": f"c{i:02d}", "location": "us-central1", "status": "RUNNING"} for i in range(self.CLUSTERS)]
+        payload = projected(*self.entries(self.ENTRIES_PER_CLUSTER, 200, 2))
+
+        def run(argv, **kwargs):
+            if discovered := discovery_of_acme(argv):
+                return discovered
+            if "list" in argv and "clusters" in argv:
+                return Run(argv, 0, json.dumps(clusters), "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.SERVICEENTRY_KIND:
+                return Run(argv, 0, payload, "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "x"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, "[]", "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        started = time.monotonic()
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            manifest = collect.collect_fleet("compliance-audit", run=run)
+        self.assertLess(time.monotonic() - started, self.SECONDS_BUDGET * 3)
+        targets = [t for t in manifest["clusters"] if t["outcome"] == collect.OUTCOME_COLLECTED]
+        self.assertEqual(len(targets), self.CLUSTERS)
+        for target in targets:
+            found = [c for c in target["candidates"] if c["check"] == collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+            self.assertEqual(len(found), 2, target["name"])
+            self.assertIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in target["commands"]})
+
+
+class TestServiceEntryCollection(unittest.TestCase):
+    """§2.19's read inside `_collect_compliance`: unserved is inapplicable, a failed
+    read is undetermined, and a planted pair is a candidate held for triage."""
+
+    def compliance(self, **kw):
+        return TestComplianceCollectCluster().run_with(**kw)
+
+    def reason(self, result):
+        for entry in (result.get("checks_not_applicable") or []) + (result.get("checks_unevaluated") or []):
+            if entry["check"] == collect.SERVICEENTRY_HOST_COLLISION_SLUG:
+                return entry["reason"]
+        return None
+
+    def test_a_cluster_without_istio_is_inapplicable_and_records_no_command(self):
+        result = self.compliance()
+        self.assertIn("Istio is not installed", self.reason(result))
+        self.assertNotIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in result["commands"]})
+        self.assertNotIn("checks_unevaluated", result)
+
+    def test_served_but_empty_is_inapplicable_not_clean(self):
+        result = self.compliance(serviceentry_items=[])
+        self.assertIn("no namespace declares one", self.reason(result))
+        self.assertNotIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in result["commands"]})
+
+    def test_a_forbidden_read_is_undetermined_and_the_other_checks_still_run(self):
+        result = self.compliance(
+            serviceentry_items=lambda argv, **kw: Run(argv, 1, "", "Error from server (Forbidden): serviceentries.networking.istio.io is forbidden", 0.1)
+        )
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated[collect.SERVICEENTRY_HOST_COLLISION_SLUG])
+        self.assertIn("Forbidden", unevaluated[collect.SERVICEENTRY_HOST_COLLISION_SLUG])
+        self.assertIn("lb-world-open", {c["check"] for c in result["commands"]})
+
+    def test_a_timed_out_read_is_undetermined(self):
+        result = self.compliance(serviceentry_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        self.assertIn("did not finish", self.reason(result))
+
+    def test_an_unparseable_read_is_undetermined(self):
+        result = self.compliance(serviceentry_items=lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1))
+        self.assertIn("could not read", self.reason(result))
+
+    def test_a_reply_cut_mid_line_is_undetermined_not_a_shorter_list(self):
+        whole = projected(service_entry("a", "team-a", ["api.example.com"]), service_entry("b", "team-b", ["api.example.com"]))
+        result = self.compliance(serviceentry_items=lambda argv, **kw: Run(argv, 0, whole[: len(whole) - 10], "", 0.1))
+        self.assertIn("could not read", self.reason(result))
+        self.assertNotIn(collect.SERVICEENTRY_HOST_COLLISION_SLUG, {c["check"] for c in result["candidates"]})
+
+    def test_the_read_is_a_projection_not_a_full_object_list(self):
+        result = self.compliance(serviceentry_items=[service_entry("a", "team-a", ["api.example.com"])])
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+        self.assertIn("jsonpath=", command)
+        self.assertNotIn("-o json", command)
+
+    def test_a_planted_pair_is_a_candidate_held_for_triage_with_its_read_recorded(self):
+        result = self.compliance(
+            serviceentry_items=[
+                service_entry("external-api", "team-a", ["api.example.com"], export_to=["*"], addresses=["240.0.0.1"]),
+                service_entry("external-api", "team-b", ["api.example.com"], export_to=["*"], addresses=["240.0.0.2"]),
+                service_entry("scoped-api", "team-c", ["scoped.example.com"], export_to=["."]),
+                service_entry("scoped-api", "team-d", ["scoped.example.com"], export_to=["."]),
+            ]
+        )
+        found = [c for c in result["candidates"] if c["check"] == collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["object"], "ServiceEntry host api.example.com")
+        self.assertEqual(found[0]["severity"], "major")
+        self.assertEqual(found[0]["needs_triage"], collect.SERVICEENTRY_OWNER_TRIAGE)
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.SERVICEENTRY_HOST_COLLISION_SLUG]
+        self.assertIn(collect.SERVICEENTRY_KIND, command)
+        self.assertIsNone(self.reason(result))
 
 
 if __name__ == "__main__":

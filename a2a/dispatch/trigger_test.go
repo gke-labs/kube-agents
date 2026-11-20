@@ -308,6 +308,7 @@ func TestANullAuthorityIsRefusedAsNoCapability(t *testing.T) {
 // whole, script included: the copy into the credential drops no field.
 func TestAdmissionCarriesTheTriggersScriptIntoTheCredential(t *testing.T) {
 	d, v, snap, prof, hk := triggerAdmission(t)
+	prof.Scripts = []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
 	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
 	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
 	adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
@@ -320,5 +321,35 @@ func TestAdmissionCarriesTheTriggersScriptIntoTheCredential(t *testing.T) {
 	want := taskcred.Trigger{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}
 	if adm.trigger == nil || *adm.trigger != want {
 		t.Errorf("admission handed on trigger %+v; want %+v", adm.trigger, want)
+	}
+}
+
+// A script the profile doesn't allowlist is refused at admission, before the
+// verifier is asked, whatever the grant says (#5622): the profile's list is
+// where a script-run task's path comes from. A trigger with no script is
+// untouched by the list.
+func TestAdmissionRefusesAScriptTheProfileDoesNotAllowlist(t *testing.T) {
+	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
+	for name, scripts := range map[string][]lib.DispatchScript{
+		"no scripts":     nil,
+		"another script": {{Name: "stall-watch", Path: lib.ScriptRoot + "stall_watch.py", TimeoutSeconds: 60}},
+	} {
+		d, v, snap, prof, hk := triggerAdmission(t)
+		prof.Scripts = scripts
+		del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
+		_, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+		if err != nil || ref == nil || ref.reason != ReasonScriptNotAllowed {
+			t.Errorf("%s: refusal %+v, err %v; want %s", name, ref, err, ReasonScriptNotAllowed)
+		}
+		if got := v.triggerList(); len(got) != 0 {
+			t.Errorf("%s: the verifier was asked (%d time(s)) about a script the profile doesn't list", name, len(got))
+		}
+	}
+
+	d, _, snap, prof, hk := triggerAdmission(t)
+	prof.Scripts = []lib.DispatchScript{{Name: "stall-watch", Path: lib.ScriptRoot + "stall_watch.py", TimeoutSeconds: 60}}
+	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scheduleTriggerJSON, clusterParams)}
+	if _, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now()); err != nil || ref != nil {
+		t.Fatalf("a trigger without a script: refusal %+v, err %v", ref, err)
 	}
 }

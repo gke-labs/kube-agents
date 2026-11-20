@@ -27,6 +27,8 @@ import (
 	container "google.golang.org/api/container/v1"
 	"google.golang.org/api/option"
 	"k8s.io/client-go/rest"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 const (
@@ -50,10 +52,16 @@ const (
 	// path on Host as a prefix).
 	brokerK8sPathFormat = "%s/v1/k8s/%s/%s/%s"
 
-	// ContainerAPIHost and PubsubAPIHost are the Google APIs the proxy's
-	// watcher route forwards to, named as the proxy's path names them.
+	// ContainerAPIHost and PubsubAPIHost are the default commercial Google APIs
+	// the proxy's watcher route forwards to, named as the proxy's path names them.
 	ContainerAPIHost = "container.googleapis.com"
 	PubsubAPIHost    = "pubsub.googleapis.com"
+
+	// UniverseDomainEnv is the standard Google Cloud environment variable naming
+	// a custom universe domain (defaulting to DefaultUniverseDomain when unset).
+	UniverseDomainEnv     = agentv1alpha1.GoogleCloudUniverseDomainEnv
+	DefaultUniverseDomain = agentv1alpha1.DefaultUniverseDomain
+	commercialAPISuffix   = "." + DefaultUniverseDomain
 
 	// authorizationHeader and bearerScheme carry the projected ServiceAccount
 	// token the proxy authenticates this pod with.
@@ -82,6 +90,9 @@ type Broker struct {
 	// TokenFile is the projected ServiceAccount token. The kubelet rotates it
 	// in place, so it is read per request rather than once.
 	TokenFile string
+	// UniverseDomain is the Google Cloud API universe domain; empty or
+	// DefaultUniverseDomain ("googleapis.com") leaves commercial API hosts as-is.
+	UniverseDomain string
 }
 
 // BrokerFromEnv returns the proxy BrokerURLEnv and BrokerTokenFileEnv name, or
@@ -105,7 +116,30 @@ func BrokerFromEnv() (*Broker, error) {
 	if err != nil || !brokerSchemes[u.Scheme] || u.Host == "" {
 		return nil, fmt.Errorf("%s=%q is not an http(s) URL", BrokerURLEnv, base)
 	}
-	return &Broker{URL: base, TokenFile: tokenFile}, nil
+	rawUniverse := strings.TrimSpace(os.Getenv(UniverseDomainEnv))
+	universe := ""
+	if rawUniverse != "" {
+		normalized, ok := agentv1alpha1.NormalizeUniverseDomain(rawUniverse)
+		if !ok {
+			return nil, fmt.Errorf("%s=%q is not a valid universe domain: a DNS domain that is not under %s",
+				UniverseDomainEnv, rawUniverse, agentv1alpha1.DefaultUniverseDomain)
+		}
+		universe = normalized
+	}
+	return &Broker{URL: base, TokenFile: tokenFile, UniverseDomain: universe}, nil
+}
+
+// ResolveAPIHost maps a commercial <service>.googleapis.com host onto the
+// broker's configured UniverseDomain when set to a custom domain.
+func (b *Broker) ResolveAPIHost(apiHost string) string {
+	domain := strings.ToLower(strings.TrimSpace(b.UniverseDomain))
+	if domain == "" || domain == DefaultUniverseDomain {
+		return apiHost
+	}
+	if service, ok := strings.CutSuffix(apiHost, commercialAPISuffix); ok && service != "" {
+		return service + "." + domain
+	}
+	return apiHost
 }
 
 // HTTPClient returns a client that sends the current projected token on every
@@ -115,12 +149,14 @@ func (b *Broker) HTTPClient() *http.Client {
 }
 
 // GoogleAPIOptions points a google.golang.org/api client at the proxy's route
-// for apiHost. WithHTTPClient alone already bypasses Application Default
-// Credentials (transport/http.NewClient returns the supplied client as is);
-// WithoutAuthentication states it, so a later option cannot bring ADC back.
+// for apiHost (resolved against b.UniverseDomain). WithHTTPClient alone already
+// bypasses Application Default Credentials (transport/http.NewClient returns
+// the supplied client as is); WithoutAuthentication states it, so a later
+// option cannot bring ADC back.
 func (b *Broker) GoogleAPIOptions(apiHost string) []option.ClientOption {
+	resolvedHost := b.ResolveAPIHost(apiHost)
 	return []option.ClientOption{
-		option.WithEndpoint(fmt.Sprintf(brokerGCPPathFormat, b.URL, apiHost)),
+		option.WithEndpoint(fmt.Sprintf(brokerGCPPathFormat, b.URL, resolvedHost)),
 		option.WithHTTPClient(b.HTTPClient()),
 		option.WithoutAuthentication(),
 	}

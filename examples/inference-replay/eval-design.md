@@ -56,8 +56,9 @@ flowchart LR
 Three properties make this sound for grading:
 
 - **A hit means the model saw the same input.** The key covers the whole request: system prompt,
-  tool schemas, the model alias, and every message so far, including every tool result, with one
-  exception (the recent-work digest, below). That includes settings like temperature, max tokens,
+  tool schemas, the model alias, and every message so far, including every tool result, except
+  what the [normalization rules](#normalization) drop or fix (the recent-work digest, the sandbox
+  kernel, and the others listed there). That includes settings like temperature, max tokens,
   reasoning settings and tool choice; only fields that change how the answer is delivered
   (`stream`) or who is asking (`user`, `metadata`) are left out. A stored answer is a real sample from the model for
   that exact input. What serving it loses is independence between samples, and under pass-only
@@ -118,8 +119,8 @@ flowchart LR
 
 The rules that keep this safe:
 
-- **Identifiers only, never state.** Counts, statuses, restart numbers, versions, scores and
-  zones stay literal; they are what the agent reasons about. A crashlooping pod's restart count
+- **Identifiers only, never state.** Counts, statuses, restart numbers, versions (bar the sandbox
+  kernel in the system prompt, below), scores and zones stay literal; they are what the agent reasons about. A crashlooping pod's restart count
   rises between runs, so cases with a live defect replay less, and that is correct.
 - **Only real ages are treated as ages, and they keep their unit.** `5m` and `3d` get different
   placeholders, because a pod being minutes old instead of days old can be the whole finding. And
@@ -234,6 +235,25 @@ The rules that keep this safe:
   same small number would refuse about one answer in five after a queued card, and none of the
   64,027 distinct assistant messages stored from the Nov 7 nightlies and presubmits mentions a
   queued event.
+- **The front door's `kanban_create` queue fields are dropped from the key.** When the new card's
+  class has no free worker slot at that moment, the result carries `"queued": true` and
+  `"queue": {"running": N, "limit": M}`, and neither key otherwise; being queued doesn't change
+  the card's status (only a `ready` card can carry the fields), and the thread hears about the wait from the dispatcher's queued event above, not
+  from the model. So in a tool message answering a `kanban_create` call, a result holding
+  `task_id` and `subscribed` keys the same queued or not, also when Hermes has appended a warning
+  after it. Any other tool's result, and any other JSON holding `queued`, keeps it. In 9,780
+  front-door answers after a create in the nightly and presubmit stores kept locally (4,281
+  queued, counted once per distinct answer) none mentioned a queue, so the model does not
+  read the fields. `running` and `limit` count against an answer as a dropped queued event's
+  payload numbers do. And when the dropped `queued` was true, an answer that talks about a queue or
+  a slot at all ("queued", "frees up", "slot", "in use", "board is full", "waiting for a worker")
+  isn't saved, with or without a number: served to a run whose card had a free slot, it would
+  announce a wait that run doesn't have. That is the only direction the drop opens that could
+  mislead: an answer recorded without the fields came from a model never told of a wait, and a
+  queued run's thread hears of its wait from the dispatcher, so nothing more is checked at replay.
+  It would refuse none of the 4,358 answers (counted once per build) that came straight after a queued create in the Nov 6–14
+  nightly and presubmit stores, nor any of the up to twelve answers after each before the next user
+  turn.
 - **A missing file's list of similar names is dropped from the key.** When `read_file` can't find
   a file, Hermes lists up to five names like it from the same directory (`similar_files`), as the
   directory stood at that moment, and leaves the list out when nothing is like it. Whether another
@@ -292,6 +312,18 @@ The rules that keep this safe:
   output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
   difference cost the obtainability case the rest of its conversation in the replay lane. When a text is one JSON document with `WARNING: ` lines before or after it (each with any indented lines that continue it), the key puts the warnings after the JSON. Any other text keeps its order, because there the order can mean something: `WARNING: disk pressure` then `Pod evicted` is not the same story told backwards. The text the agent sees isn't touched.
 - **A skill's file listing doesn't change the key by its order.** Hermes' `skill_view` result lists the skill's `linked_files` (and, for a missing file, `available_files`) in directory order, which differs from pod to pod, so in a tool message answering a `skill_view` call the key sorts each of those lists, also when Hermes has appended a notice after the result, and leaves every other field, and every other tool's output, in its order. A result too large to send whole, which Hermes cuts to a preview, keeps its order.
+- **The sandbox's kernel version in the system prompt doesn't change the key.** Hermes ends its
+  system prompt with a runtime environment block whose `OS: Linux 6.12.105+` line is the kernel of
+  the node the sandbox landed on. Nodes of one pool can run different patch versions: on the Nov 18
+  recording night 3 of 8 nightly shards ran on `6.12.110+`, and their requests could never match a
+  lane on `6.12.105+`. So in a system message, on that block's `OS:` line only, the kernel becomes
+  a fixed `⟦KERNEL⟧`. It is the one exception to versions staying literal: a kernel anywhere else,
+  in `uname -r`, a node's `Kernel Version` or a `kubectl get nodes -o wide` column, is about a node
+  the agent may be debugging and stays literal. The token is bound to no value, so no answer is
+  rewritten with it: an answer rarely names a kernel, and then one it read in a tool result the key
+  keeps. The match starts at the block's last heading, as Hermes reads it, so prose quoting the
+  heading earlier in the prompt is left alone. The block's other lines (user, home,
+  working directory) are the same on every node or already keyed.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
@@ -381,7 +413,7 @@ requests of one conversation served through the second key described under "Diff
 same answer". The trial ran that key with the earlier answers' tool calls blanked whole; the key as
 it now stands, with only `kanban_show`'s arguments blanked, serves the same six requests (checked
 offline against the trial's saved requests, with each recorded answer noted and checked the way the
-proxy now does).
+proxy did before it timed that check by the whole prefix rather than its last message).
 
 Every run passed, recordings and replays. And every replayed conversation that was served saved
 answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the
@@ -624,7 +656,10 @@ that misses on the exact key can still be served from the second one, but only i
 
 - every earlier answer in it is one the model really gave to that same point in a recording, and
   that the proxy itself recorded and could have stored: never one the client wrote into the history,
-  and never an answer from a fallback;
+  and never an answer from a fallback. That point is read as of when the proxy first saw it whole
+  (the settings and every message up to it), as the recording read it. When the proxy first saw its
+  last message would not do: a skill's text is the same in every conversation, so that time can be
+  another conversation's, minutes earlier, and this run's timestamps before it would read as future;
 - the agent did the same things: every tool call matches by name, and by arguments unless the tool
   only reads. A different action that happened to get the same output (`{"ok": true}` from
   completing a card rather than commenting on it) is still a miss, and so is any other tool called

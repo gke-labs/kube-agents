@@ -97,6 +97,14 @@
       "description": "The cluster agent's persona (agents/cluster/persona) as a persona image (a2a/Dockerfile.persona-cluster): the manifest, instructions, MCP servers and skills under /files, on busybox for the staging copy."
     },
     {
+      "name": "persona-tse",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/persona-tse",
+      "tagPolicy": "release",
+      "pulledBy": "The worker pods of the tse AgentProfile, when the chart's profiles.tse.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
+      "description": "The GKE Support Agent's persona (agents/tse/persona) as a persona image (a2a/Dockerfile.persona-tse): the manifest, instructions, MCP servers and skill under /files, on busybox for the staging copy."
+    },
+    {
       "name": "a2a-authcallout",
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-authcallout",
@@ -111,8 +119,8 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-console",
       "tagPolicy": "release",
       "override": "A2A_CONSOLE_IMAGE",
-      "pulledBy": "The console server Deployment the operator renders.",
-      "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus (a2a/Dockerfile.console)."
+      "pulledBy": "The console server Deployment the operator renders (and the opt-in MCP server and OKF memory curator Deployments when A2A_MCP_DOOR or A2A_CURATOR is set).",
+      "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus, plus /mcp and /curator for the opt-in MCP server and OKF memory curator pods (a2a/Dockerfile.console)."
     },
     {
       "name": "a2a-verifier",
@@ -138,7 +146,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
       "tagPolicy": "release",
       "override": "A2A_BRIDGE_IMAGE",
-      "pulledBy": "The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's.",
+      "pulledBy": "The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) when that image is the release platform-agent image by tag, else from the operator's release set, unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's.",
       "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
     },
     {
@@ -173,7 +181,7 @@
       "repository": "docker.io/library/nats",
       "tag": "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
       "override": "A2A_NATS_IMAGE",
-      "pulledBy": "The NATS StatefulSet the operator renders.",
+      "pulledBy": "The NATS StatefulSet the operator renders. A one-server bus also runs its `stale-cluster-meta` init step on this image, which needs a shell with `du` and `cut`: mirror an `-alpine` tag, not the scratch-based `nats` tags.",
       "description": "The JetStream bus behind the A2A stack, which every install runs. The chart sets the env var from a2aBus.images.nats, under global.thirdPartyImageRegistry when that is set; the operator's compiled default is the same pin, for an operator rendered outside the chart."
     },
     {

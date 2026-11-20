@@ -230,6 +230,13 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
+	// triggerLimits is the trigger ingress's per-trigger rate cap, made on
+	// first use (triggerLimiter).
+	triggerLimiterOnce sync.Once
+	triggerLimits      *triggerRateLimiter
+	// reports keeps the notify route's posts into conversations for the
+	// replies under them (reports.go).
+	reports pushedReports
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -273,10 +280,10 @@ type Gateway struct {
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
 	consoleResults consoleResultStash
-	// consoleCardsPending marks a console chain end whose task handed work
-	// to kanban cards (lib.ArtifactHandoff), from the relay's terminal to
-	// the frame (consoleFrame); the value is unused.
-	consoleCardsPending consoleResultStash
+	// beforeBatchChild, when set, runs before each child of a batch is
+	// minted, with the entry's index; true stops the mint there, as a
+	// gateway that died partway through a batch would (tests only).
+	beforeBatchChild func(i int) bool
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -944,6 +951,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	}()
 
 	g.startProfileDirectory(ctx)
+	g.startTriggerIngress(ctx)
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
@@ -1470,6 +1478,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
+	case msg.Intent == "" && active != nil && chattext.IsStatusQuery(msg.Text, wideStatus) && rec.fanOutPending(active.TaskID):
+		// A turn whose batch runs answers from the tree: each child still
+		// running, by addressee and target, with its state.
+		parent, _ := rec.TaskRefFor(active.TaskID)
+		g.answerFanOutStatus(ctx, rec, parent)
 	case msg.Intent == "" && active != nil && chattext.IsStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
 	case msg.Intent == "" && msg.TopLevel && active == nil && chattext.IsStatusQuery(msg.Text, false):
@@ -1567,6 +1580,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// follow-up to whatever runs here; steering it in would drop the
 		// profile and its parameters without a word.
 		g.post(rec.Key, noticeTurnNotStarted+noticeProfileWhileRunning)
+	case active != nil && !active.Detached && rec.fanOutPending(active.TaskID):
+		// Text while a batch runs steers nothing: the turn that asked has
+		// ended, and which child it was meant for isn't for the gateway to
+		// guess.
+		parent, _ := rec.TaskRefFor(active.TaskID)
+		g.refuseFanOutSteer(rec, parent)
 	case active != nil && !active.Detached:
 		// The one routing decision with no other log line: a new task logs
 		// "ingress", a heal logs itself, but a steer used to be silent, and
@@ -1784,6 +1803,14 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	if active == nil || active.Detached {
 		return
 	}
+	// A turn whose batch is on the record whole and still running holds the
+	// conversation for its children: they are what is healed, not its own
+	// hand-off line (healFanOut). A batch cut short heals below, where its
+	// request is read back from the stream and finished (delegationHandled).
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
+		g.healFanOut(ctx, rec, active, ref)
+		return
+	}
 	// The addressee the task's own subjects carry, as probeConversation
 	// reads it. For a non-detached active task it equals rec.Addressee
 	// today, because every write to rec.Addressee sits in the routing
@@ -1877,7 +1904,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// handoff too, so a heal-found end is not the one path without it.
 		if isConsoleConversation(rec.Key) && handedOff(task.State, foldHandedOff(task)) {
 			root, _ := rec.observedAs(active.TaskID)
-			g.consoleCardsPending.put(root, "")
+			rec.markCardsPending(root)
 		}
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
@@ -2571,7 +2598,14 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		rec.Profile = sessionProfile
 	}
 	g.log.Info("session route on", "conversation", rec.Key, "firstTurn", rest != "", "taskRunning", running)
+	fanOutRunning := running && rec.fanOutPending(rec.ActiveTask.TaskID)
 	switch {
+	case rest == "" && fanOutRunning:
+		// A message while the batch runs is refused, not a steer, so the
+		// running-task promise below would be false.
+		parent, _ := rec.TaskRefFor(rec.ActiveTask.TaskID)
+		g.post(rec.Key, fmt.Sprintf(noticeSessionOnDuringFanOut, rec.batchLeft(parent), g.cfg.DefaultAddressee))
+		return true
 	case rest == "" && running:
 		// Truthful about the order: the next message steers the running
 		// task (the steer case below), so it is the one after the task
@@ -2580,6 +2614,12 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		return true
 	case rest == "":
 		g.post(rec.Key, sessionOnAck(backend, rec.Kind, conversationIsOwnThread(backend, rec.Key), g.cfg.DefaultAddressee))
+		return true
+	case fanOutRunning && rec.AddressedToOwnSession():
+		// The steer case's text during a batch: refused as a plain message
+		// is (routeTurn), never steered into the parent's ended turn.
+		parent, _ := rec.TaskRefFor(rec.ActiveTask.TaskID)
+		g.refuseFanOutSteer(rec, parent)
 		return true
 	case running && rec.AddressedToOwnSession():
 		// Already on the route with its own task running: the text is what
@@ -2795,7 +2835,9 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 		return
 	}
 	delivered, ok := g.consoleResults.take(taskID)
-	_, cardsPending := g.consoleCardsPending.take(taskID)
+	// The chain's mark is on its root's entry (TaskRef.CardsPending), taken
+	// here once; the caller writes the record.
+	cardsPending := rec.takeCardsPending(taskID)
 	text := terminalNotice(state, reason)
 	// An end the gateway declared itself carries no executor reason; its
 	// frame says what the page's notice says rather than the bare line.
@@ -3084,6 +3126,10 @@ func isMaxBytes(err error) bool {
 type taskStart struct {
 	// Text is the turn's ask.
 	Text string
+	// ReplyTo is InboundMessage's: the task whose report the turn answers,
+	// put on the submission as a replyTo part. Empty on a turn the gateway
+	// starts on its own.
+	ReplyTo string
 	// MessageID and Principal feed only the ingress log: the backend message
 	// id the audit chain joins on, and the plaintext principal. A turn the
 	// gateway starts on its own (a child, a wake) has no backend message.
@@ -3147,6 +3193,11 @@ type taskStart struct {
 	// where the relay closes it on the task's terminal. Set for a batch
 	// child only.
 	KeepActive bool
+	// BatchIndex and Target are a batch child's place in its batch, from 1,
+	// and its parameters as the wake names them (TaskRef.BatchIndex). Set
+	// for a child of a batch of two or more only.
+	BatchIndex int
+	Target     string
 	// Route, when set, addresses the task to an AgentProfile: the grant is
 	// minted against the resolved profile at the requester's tier with the
 	// target in scope, and the submission goes on the profile's submission
@@ -3163,6 +3214,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Route:     route,
 		Text:      agentText(msg),
+		ReplyTo:   msg.ReplyTo,
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
@@ -3255,6 +3307,37 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			extra = append(extra, part)
 		}
 	}
+	// A turn answering a report its client named carries the task that
+	// filed it, so the executor can read the report stored for that turn.
+	// One that is not a task id's shape is dropped here, the one check on
+	// the way out, and the turn still starts: the report is a help to the
+	// answer, not a condition of it.
+	if ts.ReplyTo != "" {
+		// The value is sender-chosen, so the line carries it bounded, as the
+		// console door logs its other frame fields; the error quotes it whole.
+		if part, err := lib.ReplyToPart(lib.ReplyTo{TaskID: ts.ReplyTo}); err != nil {
+			g.log.Warn("replyTo dropped: not a task id; the turn runs without the report it answers",
+				"taskId", taskID, "replyTo", truncateRunes(ts.ReplyTo, consoleMessageIDCap), "bytes", len(ts.ReplyTo))
+		} else {
+			extra = append(extra, part)
+		}
+	}
+	// A human turn under a report the notify route posted carries that
+	// report, on every route (pushedReports); the replyTo part above stays
+	// its fallback. Every executor a human turn reaches reads text parts
+	// only and ignores a data part it does not know: the hermes-bridge
+	// (promptFromMessage) frames this one; the a2a-worker (textFromParts),
+	// which runs session pods and profile tasks, does not read it yet; the
+	// dispatcher reads taskParameters alone (dispatch/admission.go).
+	if ts.Role == "" {
+		if report, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+			if part, err := lib.PushedReportPart(report); err != nil {
+				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
+			} else {
+				extra = append(extra, part)
+			}
+		}
+	}
 	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, extra...)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
@@ -3286,9 +3369,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
 	// None on a backend that shows the task's status itself (StatusShower).
 	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
-	if !lineless {
+	// A trigger's conversation has no chat backend: no placeholder there
+	// (unpostableTrigger), for a child or a wake started on its record.
+	if !lineless && !g.unpostableTrigger(rec.Key) {
 		var err error
-		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID})
+		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID, Profile: topProfile(ts.Route), InReplyTo: topInReplyTo(ts)})
 		if err != nil {
 			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
 		}
@@ -3332,6 +3417,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if ts.KeepActive {
 		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
+	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
 		// The message the chain's mark is drawn on (mark.go).
@@ -3364,9 +3450,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		rec.addTurnToSession(requester, ref.SteerAuthors, ref.SteerAuthorsOverflow)
 	}
 	rec.LastTaskActivity = time.Now().UTC()
-	if len(rec.Tasks) > taskHistoryCap {
-		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
-	}
+	rec.trimHistory()
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
 	g.relays[taskID] = &relayState{local: true}
@@ -3536,6 +3620,13 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		return
 	}
 	g.noteUnreadQuote(rec.Key, msg)
+	// A steer carries no replyTo: the executor attaches a stored report on
+	// an opening turn only, so a reply that names one while the turn still
+	// runs is steered into it without the report.
+	if msg.ReplyTo != "" {
+		g.log.Warn("replyTo not carried: the turn is still running and the message is steered into it; a report is attached on an opening turn only",
+			"taskId", active.TaskID, "replyTo", truncateRunes(msg.ReplyTo, consoleMessageIDCap), "bytes", len(msg.ReplyTo), "conversation", rec.Key)
+	}
 	payload, err := messagePayload(agentText(msg), active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)

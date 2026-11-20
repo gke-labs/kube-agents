@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -160,6 +161,13 @@ func a2aAuthMapShardNames(agent *agentv1alpha1.PlatformAgent, shards int) []stri
 type a2aAuthMapGrants struct {
 	Publish   []string `json:"publish"`
 	Subscribe []string `json:"subscribe"`
+
+	// DenyPublish and DenySubscribe subtract from the allows on their side
+	// (#5301), for a principal whose allow is a wildcard with named
+	// exceptions. Only the gateway's entry carries them; omitted elsewhere,
+	// so adding them changed no other entry's bytes.
+	DenyPublish   []string `json:"denyPublish,omitempty"`
+	DenySubscribe []string `json:"denySubscribe,omitempty"`
 }
 
 type a2aAuthMapIdentity struct {
@@ -194,6 +202,17 @@ type a2aAuthMapIdentity struct {
 	// no profile entry for the callout to derive their grants from. Omitted
 	// elsewhere.
 	Draining []string `json:"draining,omitempty"`
+	// NotAfter is set only on the bus migration's per-run principals, at
+	// the run's deadline: the callout refuses the entry from then on and
+	// caps every JWT it mints for it there. Omitted elsewhere.
+	NotAfter *time.Time `json:"notAfter,omitempty"`
+
+	// Held is set only on the dispatcher's entry when it narrows on
+	// "dispatcher": the bound profiles the profile hold keeps out of the
+	// dispatcher (platformagent_a2a_profile_hold.go). The callout derives a
+	// bucket's grants from the profile entries, so it skips these until the
+	// hold lifts (#5935). Omitted elsewhere.
+	Held []string `json:"held,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.
@@ -248,16 +267,33 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 // grant built from dispatchable alone.
 func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatchable []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
-	for _, id := range calloutIdentities(agent) {
+	ids := mappedIdentities(agent)
+	if busMigrationFreezeActive(agent) {
+		// The write freeze: the migration's principals and the run's
+		// sentinel, and nothing else, so no other workload authenticates
+		// (busMigrationFrozenIdentities). No profiles, no dispatcher, and
+		// no gateway token entry.
+		ids, profiles = busMigrationFrozenIdentities(agent), nil
+	}
+	gatewayDenyProfiles, _ := dispatcherGrantNames(agent, profiles, draining)
+	for _, id := range ids {
+		if id.user == a2aGatewayUser {
+			// nats.conf's per-profile supervisor deny, from the same
+			// names (gatewayCalloutEntry).
+			id = withGatewayProfileDeny(id, gatewayDenyProfiles)
+		}
 		identities = append(identities, a2aAuthMapIdentity{
 			ServiceAccount: id.serviceAccount,
 			User:           id.user,
 			Account:        id.account,
 			Grants: a2aAuthMapGrants{
-				Publish:   id.publish,
-				Subscribe: id.subscribe,
+				Publish:       id.publish,
+				Subscribe:     id.subscribe,
+				DenyPublish:   id.denyPublish,
+				DenySubscribe: id.denySubscribe,
 			},
 			Narrowing: id.narrowing,
+			NotAfter:  id.notAfter,
 		})
 	}
 	identities = append(identities, agentProfileMapEntries(agent, profiles)...)
@@ -265,8 +301,9 @@ func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatch
 	// durable the operator creates, so it is built here, from the same
 	// profiles (platformagent_a2a_dispatcher.go). Past the ceiling one shard
 	// can carry it is left out, and the operator runs no dispatcher
-	// (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
-	if a2aDispatcherEnabled() {
+	// (a2aDispatcherCeiling, gke-labs/kube-agents#5381). A bus migration's
+	// freeze admits only its own principals, so it is left out then too.
+	if a2aDispatcherEnabled() && !busMigrationFreezeActive(agent) {
 		_, over, err := a2aDispatcherCeiling(agent, dispatchable, draining)
 		if err != nil {
 			return a2aAuthMapDocument{}, err
@@ -274,8 +311,24 @@ func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatch
 		if !over {
 			// Bucketed or not (dispatcherMapEntry); unbucketed, it is
 			// a2aDispatcherMapEntry's entry, which the ceiling measured.
-			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining))
+			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining, a2aHeldProfileNames(identities, dispatchable)))
 		}
+	}
+	if a2aCuratorEnabled() {
+		for i := range identities {
+			if identities[i].User == a2aAgentBusUser {
+				identities[i].Grants.Publish = append(identities[i].Grants.Publish, a2aCuratorOutcomesSubject, a2aMemoryQuerySubject)
+				identities[i].Grants.Subscribe = append(identities[i].Grants.Subscribe, a2aMemoryReplyAgentSubjects)
+				break
+			}
+		}
+		id := curatorIdentity(agent, agent.Namespace)
+		identities = append(identities, a2aAuthMapIdentity{
+			ServiceAccount: id.serviceAccount,
+			User:           id.user,
+			Account:        id.account,
+			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		})
 	}
 
 	// Refuse here what the callout would refuse there.
@@ -522,10 +575,20 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 		} else if id.Narrowing != "" && id.Account != a2aAccountApp {
 			return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountApp, id.Account)
 		}
+		if id.Narrowing != a2aNarrowingDispatcher && len(id.Held) > 0 {
+			return fmt.Errorf("identity %d: user %q lists held profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
+		}
 		if id.Narrowing != a2aNarrowingDispatcher && len(id.Draining) > 0 {
 			return fmt.Errorf("identity %d: user %q lists draining profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
 		}
-		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+		// A deny counts as a grant: a narrowed entry carries none of
+		// either kind, so one map edit can't hand every session a
+		// deny-shaped grant (the callout's Grants.hasAny).
+		hasDeny := len(id.Grants.DenyPublish) > 0 || len(id.Grants.DenySubscribe) > 0
+		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0 || hasDeny
+		if id.NotAfter != nil && id.Narrowing != "" {
+			return fmt.Errorf("identity %d: user %q carries notAfter but narrows on %q; only an entry that names its grants expires that way", i, id.User, id.Narrowing)
+		}
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {
 			return fmt.Errorf("identity %d: user %q carries profile or topics but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingProfile)
 		}
@@ -545,13 +608,13 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 			}
 		case a2aNarrowingPod:
 			if hasGrants {
-				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
-					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 			}
 		case a2aNarrowingProfile:
 			if hasGrants {
-				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish and %d subscribe",
-					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 			}
 			if !isDNS1123LabelToken(id.Profile) {
 				return fmt.Errorf("identity %d: user %q narrows on %q but names profile %q, which is not a dot-free DNS-1123 label", i, id.User, id.Narrowing, id.Profile)
@@ -576,6 +639,9 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 				return fmt.Errorf("identity %d: user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
 					i, id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
 			}
+			if hasDeny {
+				return fmt.Errorf("identity %d: user %q narrows on %q and may not carry deny lists", i, id.User, id.Narrowing)
+			}
 			seenDraining := map[string]bool{}
 			for _, p := range id.Draining {
 				// a2aCanDrainAs alone, the one predicate drainingDispatchProfiles
@@ -588,6 +654,15 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee, a principal's or map user's name, or a dispatcher bucket user", i, id.User, p)
 				}
 				seenDraining[p] = true
+			}
+			// The callout's checks on held names (validateDispatcherEntry):
+			// one subject token each, none twice.
+			seenHeld := map[string]bool{}
+			for _, p := range id.Held {
+				if !isDNS1123LabelToken(p) || seenHeld[p] {
+					return fmt.Errorf("identity %d: user %q lists held profile %q, which is not a dot-free DNS-1123 label, or is listed twice", i, id.User, p)
+				}
+				seenHeld[p] = true
 			}
 		default:
 			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)

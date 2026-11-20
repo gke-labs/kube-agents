@@ -31,7 +31,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 import pool_pressure  # the holder map's keys, pinned against health's
-from eval_dashboard import health, post_health, vertex_429
+from eval_dashboard import classify, health, post_health, vertex_429
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
@@ -94,6 +94,26 @@ def _scorer_ceiling_marker() -> str:
 SCORER_CEILING_MARKER = _scorer_ceiling_marker()
 CEILING = f"{SCORER_CEILING_MARKER}: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
 
+# The 2026-11-16/17 shape (#6105): the GitHub-write safeguard, catastrophic,
+# errored on the grading App's spent budget and stayed on rung 2.
+FORGE_CHECK = "no-github-writes-the-case-did-not-request"
+FORGE_LEAF = "KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied the pull-request list on o/r"
+SAFEGUARD_MARKER = next(
+    line.split("=", 1)[1].strip().strip('"')
+    for line in (SCORER.parent / "forges.py").read_text(encoding="utf-8").splitlines()
+    if line.startswith("FORGE_SAFEGUARD_MARKER = ")
+)
+BARE_RUNG_2 = f"checks errored rather than ran: ['{FORGE_CHECK}'] -- {FORGE_CHECK}: {FORGE_LEAF}"
+FORGE_RUNG_2 = f"{SAFEGUARD_MARKER}: {BARE_RUNG_2}"
+# Rung-2 reasons and whether each is a forge rep: classify.py must agree. The
+# scorer marks only a block the forge alone explains; an unmarked one may hide
+# a failed check beside the errored safeguard.
+RUNG_2_CASES = (
+    (FORGE_RUNG_2, True),
+    (BARE_RUNG_2, False),
+    (f"{BARE_RUNG_2} ({SAFEGUARD_MARKER} quoted)", False),
+)
+
 
 # --------------------------------------------------------------------------- #
 # Synthetic data.json builders
@@ -105,6 +125,7 @@ REP_LETTER = {
     "i": {"result": "infra", "reason": RETRIES},
     "e": {"result": "fail", "reason": EMPTY_RECORD},
     "c": {"result": "infra", "reason": CEILING},
+    "g": {"result": "fail", "reason": FORGE_RUNG_2},
 }
 
 
@@ -196,6 +217,17 @@ class RepKinds(unittest.TestCase):
         # The scorer gives each errored check's reason, which can quote a 429.
         reason = "blocked -- checks errored rather than ran: ['either-read'] -- either-read: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub said API rate limit exceeded / GitHub denied ..."
         self.assertEqual(health.rep_kind({"result": "fail", "reason": reason}), "fail")
+
+    def test_the_safeguard_marker_is_the_bench_modules(self):
+        self.assertEqual((health.FORGE_SAFEGUARD_MARKER, classify.FORGE_SAFEGUARD_MARKER), (SAFEGUARD_MARKER, SAFEGUARD_MARKER))
+
+    def test_a_rung_2_block_the_scorer_marked_as_the_forges_is_a_forge_rep(self):
+        for reason, forge in RUNG_2_CASES:
+            with self.subTest(reason=reason):
+                self.assertEqual(health.rep_kind({"result": "fail", "reason": reason}), "forge" if forge else "fail")
+                self.assertEqual(classify.rep_kind({"result": "fail", "reason": reason}), "forge" if forge else "fail")
+        t = health.Task(task("x", "ggg"))
+        self.assertEqual((t.forges, t.fails, t.graded, t.collapsed), (3, 0, 0, False))
 
     def test_a_broken_replay_is_a_graded_fail_not_a_storm(self):
         broken_reasons = (
@@ -806,6 +838,41 @@ class DelegationCeiling(unittest.TestCase):
             for i in range(3)
         ]
         self.assertEqual((adjudicate(doc, later, held)["state"], adjudicate(doc, later, held)["recovering"]), ("DEGRADED", True))
+
+
+class ForgeOutage(unittest.TestCase):
+    """Rule 2c (#6105): a spent GitHub App budget is named, not read as reds."""
+
+    def wave(self, prs, letters):
+        tasks = [task("case-a", letters), task("case-b", letters)] + [task(name, "ppp") for name in sorted(ADMITTED)]
+        return data(*(run(100 + i, pr, T0 - timedelta(minutes=20 * i), result="FAILURE", tasks=tasks) for i, pr in enumerate(prs)))
+
+    def test_six_forge_reps_across_two_prs_degrade_under_their_own_name(self):
+        result = adjudicate(self.wave([1, 2], "ggp"), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "forge_outage"))
+        self.assertRegex(result["cause"], r"^forge outage: grading's GitHub reads failed on 2 PRs \d\d:\d\d–\d\d:\d\d UTC$")
+        self.assertIn("forge outage: 8 reps across 2 PRs", result["evidence"][0])
+        self.assertEqual(result["failing_cases"], [])
+        self.assertEqual(result["advice"], health.ADVICE_FORGE)
+        self.assertIn("rate limit", result["advice"])
+        self.assertIn("#6105", result["advice"])
+        message = post_health.render_change(result, None)
+        self.assertIn("#6105", message)
+        self.assertIn("grading could not read GitHub on 2 PRs", message)
+        self.assertNotIn("rep", post_health.cause_sentence(result), "no repetition count on a public sentence")
+
+    def test_it_does_not_fire_on_one_pr_or_too_few_reps(self):
+        self.assertEqual(assess(self.wave([1, 1, 1], "ggg"), T0)["state"], "GREEN", "one PR")
+        self.assertEqual(assess(self.wave([1, 2], "gpp"), T0)["state"], "GREEN", "4 reps")
+        self.assertEqual(assess(self.wave([1, 2], "ffp"), T0)["state"], "GREEN", "graded fails are not forge reps")
+
+    def test_the_ceiling_outranks_it_and_keeps_it_as_evidence(self):
+        doc = self.wave([1, 2], "ggg")
+        doc["runs"] += DelegationCeiling().wave([3, 4, 5], 6)["runs"]
+        result = assess(doc, T0)
+        self.assertEqual(result["condition"], "delegation_ceiling")
+        self.assertTrue(any(line.startswith("forge outage: 12 reps") for line in result["evidence"]), result["evidence"])
+        self.assertIn("forge_outage", result["open_conditions"])
 
 
 # --------------------------------------------------------------------------- #

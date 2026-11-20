@@ -195,7 +195,10 @@ layout and are collected from the moment they start running.
       rate limit on grading's own token). The same readers count it apart
       from the storm and outside every pass-rate denominator, and
       `classify.py` classes a case whose ungraded reps are forge reps, with no
-      storm rep beside them, `forge-unavailable`.
+      storm rep beside them, `forge-unavailable`. A `fail` rep whose `reason`
+      leads with `KUBE_AGENTS_FORGE_SAFEGUARD` is a forge rep too: the scorer
+      kept it on rung 2 only because an errored catastrophic safeguard was
+      among the checks the forge outage errored.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `block wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -1355,7 +1358,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|forge_outage|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `near_deadline`, `pool`, `generated_at`, `tick`. A `tracking_issues`
 entry is `#N` for an issue of this repository (one `case-notes.yaml` names,
@@ -1553,7 +1556,7 @@ projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
-failure for the certification slice and the replay lane, and for the reconciles
+failure for the validated-capabilities slices and the replay lane, and for the reconciles
 the first failure that owes a hand step, otherwise a project at `PERSISTENT_AFTER`
 consecutive runs: [`ci-health.md`](../../docs/ci-health.md), "The watched
 periodics"), and the poster treats a told job as recovered only

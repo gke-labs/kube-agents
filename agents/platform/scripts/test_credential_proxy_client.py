@@ -8,6 +8,7 @@ Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
 import base64
+import contextlib
 import http.client
 import http.server
 import io
@@ -1000,6 +1001,13 @@ class StdinGateTest(unittest.TestCase):
         self.assertEqual(captured["body"]["stdin"], "kind: X\n")
 
 
+class BodyThatDrops(io.BytesIO):
+    """A refusal body whose connection closes while it is read."""
+
+    def read(self, *args):
+        raise http.client.IncompleteRead(b"")
+
+
 class VcsCallErrorTest(unittest.TestCase):
     """`vcs_call` hands a refusal through whole, and tells "not built" from "no"."""
 
@@ -1026,6 +1034,112 @@ class VcsCallErrorTest(unittest.TestCase):
         with self._refuse(404, {"error": "not available", "code": "VCS_UNAVAILABLE"}):
             with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
                 credential_proxy_client.vcs_call(self.endpoint, "snapshot", {})
+
+    def _held_refusal(self, status, stream):
+        """An HTTPError the test keeps hold of. Held, it is not collected, so a body
+        that reads as closed was closed by `vcs_call` and not by the interpreter."""
+        error = urllib.error.HTTPError(self.endpoint + "/v1/vcs/publish", status, "refused", {}, stream)
+        self.addCleanup(error.close)
+        return error
+
+    def test_the_refusal_is_closed_once_its_body_is_read_on_every_way_out(self):
+        cases = (
+            ("a refusal", 409, io.BytesIO(b'{"error": "the base branch moved", "code": "BASE_MOVED"}'),
+             credential_proxy_client.WorkspaceRequestError),
+            ("no version control", 404, io.BytesIO(b'{"error": "not available", "code": "VCS_UNAVAILABLE"}'),
+             credential_proxy_client.WorkspaceUnavailable),
+            ("a body that is not JSON", 502, io.BytesIO(b"<html>bad gateway</html>"),
+             credential_proxy_client.WorkspaceRequestError),
+            ("a body that drops", 500, BodyThatDrops(), credential_proxy_client.BrokerDisconnected),
+        )
+        for name, status, stream, raised in cases:
+            with self.subTest(name):
+                error = self._held_refusal(status, stream)
+                with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                    with self.assertRaises(raised) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertTrue(stream.closed, "vcs_call left the refusal open")
+                if raised is credential_proxy_client.WorkspaceRequestError:
+                    # The status is read off the error after the close.
+                    self.assertEqual(caught.exception.status, status)
+
+    def test_a_refusal_whose_json_body_is_not_an_object_is_the_status_alone(self):
+        # Valid JSON, but no refusal document: something between the client and
+        # the broker answered. The caller gets the same error as for a body
+        # that is not JSON, and the refusal is closed.
+        for body in (b"[]", b'"busy"', b"503", b"true", b"null"):
+            for status in (404, 502):
+                with self.subTest(body=body, status=status):
+                    stream = io.BytesIO(body)
+                    error = self._held_refusal(status, stream)
+                    with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                        with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                            credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                    self.assertEqual(caught.exception.status, status)
+                    self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
+                    self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
+    # No token file: the call sends no header, whatever the shell exports.
+    _no_token_file = patch.dict("os.environ", {"CREDENTIAL_PROXY_TOKEN_FILE": ""})
+
+    @staticmethod
+    def _answer(body):
+        """A 2xx reply with `body`."""
+
+        def answer(request, *args, **kwargs):
+            return io.BytesIO(body)
+
+        return patch.object(credential_proxy_client, "open_broker_request", answer)
+
+    def test_a_2xx_answer_whose_json_body_is_not_an_object_is_a_value_error(self):
+        # Valid JSON of another type, from something between the client and the
+        # broker, or a broker fault. Every consumer reads the answer as an
+        # object. A ValueError is what a 2xx body that does not parse leaves
+        # as, and `vcs_client.call` has an arm for it.
+        # Each type that `json.load` gives, apart from an object.
+        bodies = (
+            (b"[]", "list"), (b'"busy"', "str"), (b"503", "int"), (b"1.5", "float"), (b"true", "bool"),
+            (b"null", "NoneType"),
+        )
+        for body, type_name in bodies:
+            with self.subTest(body=body):
+                with self._no_token_file, self._answer(body), self.assertRaises(ValueError) as caught:
+                    credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                # The type's name, and nothing of the body.
+                self.assertIn(type_name, str(caught.exception))
+                for content in ("busy", "503", "1.5"):
+                    self.assertNotIn(content, str(caught.exception))
+
+    # `json.load` raises RecursionError for a body nested very deep. The depth
+    # where it stops depends on the Python version, so the tests give the
+    # parser's error directly.
+    _too_deep_for_the_parser = patch.object(
+        credential_proxy_client.json, "load", side_effect=RecursionError("maximum recursion depth exceeded")
+    )
+
+    def test_a_2xx_answer_nested_too_deep_for_the_parser_is_a_value_error(self):
+        with self._no_token_file, self._answer(b"[]"), self._too_deep_for_the_parser:
+            with self.assertRaises(ValueError) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+        self.assertIsInstance(caught.exception.__cause__, RecursionError)
+
+    def test_a_refusal_nested_too_deep_for_the_parser_is_the_status_alone(self):
+        for status in (404, 502):
+            with self.subTest(status=status):
+                stream = io.BytesIO(b"[]")
+                error = self._held_refusal(status, stream)
+                with patch.object(credential_proxy_client, "open_broker_request", side_effect=error), \
+                        self._too_deep_for_the_parser:
+                    with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertEqual(caught.exception.status, status)
+                self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
+                self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
+    def test_a_2xx_answer_that_is_an_object_comes_back_as_it_is(self):
+        for answer in ({}, {"baseBranch": "main", "entries": [1, 2]}):
+            with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
+                self.assertEqual(credential_proxy_client.vcs_call(self.endpoint, "capabilities", {}), answer)
 
 
 class TestCallerCredential(SubmittedPayloadTestCase):
@@ -1149,6 +1263,32 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         sent = self.run_shim(["kubectl", "get", "pods"], self.task_env())
         self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
         self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def run_vcs_call(self, environ):
+        captured = {}
+
+        def fake_open(request, *args, **kwargs):
+            captured["request"] = request
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return RecordingResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                captured["answer"] = credential_proxy_client.vcs_call(
+                    self.LOCAL_ENDPOINT, "proposal-create", {"repository": "acme/infra"}
+                )
+        return captured
+
+    def test_a_vcs_call_sends_the_credential_in_its_header(self):
+        # The broker refuses a profile caller's version-control verbs without
+        # it, and reads the write permit off it (#3993).
+        sent = self.run_vcs_call(self.task_env())
+        self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
+        self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def test_a_vcs_call_outside_a_task_sends_no_credential(self):
+        sent = self.run_vcs_call({credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
 
     def test_the_credential_is_read_on_every_call(self):
         # A warm pod's next task writes its own credential to the same file.
@@ -1516,6 +1656,10 @@ class ApiSessionTest(unittest.TestCase):
             self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
             return "upstream-response"
 
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            self.calls.append({"method": "POST", "url": url, "json": json, "headers": headers, "timeout": timeout})
+            return "upstream-response"
+
     def setUp(self):
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
@@ -1544,6 +1688,24 @@ class ApiSessionTest(unittest.TestCase):
             self.http.calls,
         )
         self.assertEqual(credential_proxy_client.authorization_headers(), self.http.calls[0]["headers"])
+
+    def test_post_sends_the_json_body_to_the_relayed_url_with_the_caller_token(self):
+        session = credential_proxy_client.ApiSession(http=self.http)
+        body = {"resourceNames": ["projects/kagents-dev"], "filter": "severity>=ERROR", "pageSize": 1000}
+        self.assertEqual(
+            "upstream-response",
+            session.post("https://logging.googleapis.com/v2/entries:list", json=body, timeout=120),
+        )
+        self.assertEqual(
+            [{
+                "method": "POST",
+                "url": f"{self.ENDPOINT}/v1/gcp/logging.googleapis.com/v2/entries:list",
+                "json": body,
+                "headers": {"Authorization": "Bearer caller-token"},
+                "timeout": 120,
+            }],
+            self.http.calls,
+        )
 
     def test_the_relay_prefix_is_the_shared_constant(self):
         session = credential_proxy_client.ApiSession(http=self.http)
@@ -2015,9 +2177,14 @@ class TestBrokerUnreachable(unittest.TestCase):
         """A caller that reads only the URLError (vcs, workspaces) sees no change."""
         import socket
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind(probe.getsockname())
         request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exec", data=b"{}", method="POST")
         with self.assertRaises(urllib.error.URLError) as caught:
             credential_proxy_client.open_broker_request(request)
@@ -2034,6 +2201,7 @@ class TestApiSessionExecTier(unittest.TestCase):
     class FlakyHttp:
         def __init__(self, unreachable_hosts=()):
             self.calls = []
+            self.posted = []
             self.unreachable_hosts = set(unreachable_hosts)
 
         def get(self, url, *, params=None, headers=None, timeout=None):
@@ -2041,6 +2209,10 @@ class TestApiSessionExecTier(unittest.TestCase):
             if urllib.parse.urlsplit(url).netloc in self.unreachable_hosts:
                 raise ConnectionError(f"cannot connect to {url}")
             return "upstream-response"
+
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            self.posted.append(json)
+            return self.get(url, headers=headers, timeout=timeout)
 
     def setUp(self):
         directory = Path(tempfile.mkdtemp())
@@ -2102,6 +2274,27 @@ class TestApiSessionExecTier(unittest.TestCase):
             [urllib.parse.urlsplit(url).netloc for url in http_.calls],
         )
         self.assertEqual(1, stderr.getvalue().count(credential_proxy_client.EXEC_FALLBACK_NOTICE))
+
+    def test_a_post_falls_back_with_its_body_when_the_exec_tier_is_down(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        body = {"resourceNames": ["projects/p"]}
+        with patch("sys.stderr", new=io.StringIO()):
+            answer = credential_proxy_client.ApiSession(http=http_).post(
+                "https://logging.googleapis.com/v2/entries:list", json=body
+            )
+        self.assertEqual("upstream-response", answer)
+        self.assertEqual(["exec-tier:8765", "stateful:8765"], [urllib.parse.urlsplit(url).netloc for url in http_.calls])
+        self.assertEqual([body, body], http_.posted, "both attempts are POSTs that carry the body")
+
+    def test_a_post_in_a_custom_universe_goes_to_that_universes_host_on_both_attempts(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_UNIVERSE_DOMAIN": "apis-tpczero.example"}), \
+                patch("sys.stderr", new=io.StringIO()):
+            credential_proxy_client.ApiSession(http=http_).post(
+                "https://logging.googleapis.com/v2/entries:list", json={"resourceNames": ["projects/p"]}
+            )
+        relayed = f"{credential_proxy_client.API_RELAY_PREFIX}logging.apis-tpczero.example/v2/entries:list"
+        self.assertEqual([self.EXEC + relayed, self.STATEFUL + relayed], http_.calls)
 
     def test_the_exec_attempt_gets_the_shims_connect_bound_and_the_callers_read_timeout(self):
         seen = []
@@ -2238,9 +2431,10 @@ class TestShimEntryRouting(unittest.TestCase):
         self.shim = self.root / "credential-proxy-exec"
         shutil.copy(credential_proxy_client.__file__, self.shim)
         (self.root / "kubectl").symlink_to(self.shim)
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
         self.live = f"http://127.0.0.1:{self.server.server_address[1]}"
         type(self).answers.clear()
         type(self).requests.clear()
@@ -2311,6 +2505,17 @@ class TestShimEntryRouting(unittest.TestCase):
         refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
         self.assertEqual(2, refused.returncode)
         self.assertIn("invalid choice", refused.stderr)
+
+    def test_the_unreachable_port_stays_reserved_during_the_test(self):
+        """Holding the probe socket bound without listening refuses connects while
+        preventing another process from taking the port (#6044)."""
+        import socket
+
+        parsed = urllib.parse.urlsplit(self.closed)
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind((parsed.hostname, parsed.port))
 
 
 class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):
@@ -2895,6 +3100,79 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertIn("the command may have run", err)
         self.assertNotIn("retrying", err)
 
+    def test_a_2xx_answer_that_cannot_be_read_is_one_line_and_exit_1_and_is_never_sent_again(self):
+        """The broker ran the command before it answered. The line names the shape, never the body."""
+        not_json = credential_proxy_client.NON_JSON_RESPONSE_TEXT
+        shapes = {
+            "<html>upstream answer</html>": not_json,
+            "": not_json,
+            "[1, 2]": "the response is JSON of type list, not an object",
+            "null": "the response is JSON of type NoneType, not an object",
+            "7": "the response is JSON of type int, not an object",
+            '"NAME STATUS"': "the response is JSON of type str, not an object",
+            "true": "the response is JSON of type bool, not an object",
+        }
+        for body, shape in shapes.items():
+            with self.subTest(body=body):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, body), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+        # The status in the line is the answer's own.
+        _, _, err = self.run_shim(self.broker([(201, {}, "[1, 2]")]))
+        self.assertIn("credential proxy error (HTTP 201): ", err)
+
+    def test_an_answer_that_cannot_be_read_is_not_sent_to_the_fallback(self):
+        """With an exec-tier target and a stateful fallback, the command stays where it may have run."""
+        for body in ("not json", "null"):
+            with self.subTest(body=body):
+                exec_tier, stateful = self.broker([(200, {}, body)]), self.broker([(200, {}, OK)])
+                out, err = io.StringIO(), io.StringIO()
+                with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+                    code = credential_proxy_client.execute(
+                        exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                        sleep_fn=self.sleeps.append, rng=self.rng,
+                    )
+                self.assertEqual(1, code)
+                self.assertEqual("", out.getvalue())
+                self.assertEqual(1, len(exec_tier.requests))
+                self.assertEqual([], stateful.requests)
+                self.assertNotIn(credential_proxy_client.EXEC_FALLBACK_NOTICE, err.getvalue())
+                self.assertIn("the command may have run", err.getvalue())
+
+    def test_the_line_for_an_answer_that_cannot_be_read_is_the_shim_s_own_for_the_failure_classifiers(self):
+        import cluster_agent_profile
+
+        for body in ("not json", "[1, 2]"):
+            with self.subTest(body=body):
+                _, _, err = self.run_shim(self.broker([(200, {}, body)]))
+                self.assertIsNotNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(err), err)
+                self.assertIsNone(cluster_agent_profile.CONNECTIVITY_FAILURE_RE.search(err), err)
+
+    def test_a_2xx_body_that_breaks_while_it_is_read_is_still_a_dropped_connection(self):
+        """Only the parse is guarded: a read that ends early is not an answer of the wrong shape."""
+
+        class BrokenBody(RecordingResponse):
+            status = 200
+
+            def read(self, *_args):
+                raise http.client.IncompleteRead(b'{"stdout": "NAME')
+
+        err = io.StringIO()
+        with patch.object(credential_proxy_client, "open_broker_request", lambda _request: BrokenBody()), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                "http://broker.invalid:8765", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        self.assertEqual(1, code)
+        self.assertEqual([], self.sleeps)
+        self.assertIn("the connection dropped after the request was sent", err.getvalue())
+        self.assertNotIn("HTTP 200", err.getvalue())
+
     def test_a_policy_block_still_exits_77_at_once(self):
         blocked = {"code": "SECURITY_POLICY_BLOCKED", "message": "Command blocked.", "rule": "no-delete"}
         broker = self.broker([(403, {}, blocked), (200, {}, OK)])
@@ -2917,6 +3195,78 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual(1, len(broker.requests))
         self.assertEqual("argv is required", err.strip())
+
+    def held_refusal(self, status, body, headers=None):
+        """An HTTPError the test keeps hold of, and its body. Held, the error is not
+        collected, so a body that reads as closed was closed by the shim and not by the
+        interpreter."""
+        stream = body if isinstance(body, io.BytesIO) else io.BytesIO(
+            body if isinstance(body, bytes) else json.dumps(body).encode()
+        )
+        error = urllib.error.HTTPError("http://broker.invalid/v1/exec", status, "refused", headers or {}, stream)
+        self.addCleanup(error.close)
+        return error, stream
+
+    def run_shim_over(self, replies):
+        """The shim over `replies`, each an HTTPError it raises or a reply body it reads."""
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=replies), \
+                patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                "http://broker.invalid", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_printed_refusal_is_closed_and_its_text_was_read_first(self):
+        error, stream = self.held_refusal(400, {"error": "argv is required"})
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertEqual("argv is required", err.strip())
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_with_no_json_body_is_closed(self):
+        error, stream = self.held_refusal(500, b"<html>internal error</html>")
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("credential proxy error (HTTP 500): non-JSON response", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_a_refusal_whose_body_drops_is_closed(self):
+        error, stream = self.held_refusal(503, BodyThatDrops())
+        code, _, err = self.run_shim_over([error])
+        self.assertEqual(1, code)
+        self.assertIn("the connection dropped while the refusal was read", err)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_each_retried_refusal_is_closed_and_its_retry_after_still_sets_the_wait(self):
+        # Five 429s: four waits, then the throttling line. The status and the
+        # Retry-After header are read off each error after it is closed.
+        held = [self.held_refusal(429, PRESSURE, {"Retry-After": "4"}) for _ in range(5)]
+        code, _, err = self.run_shim_over([error for error, _ in held])
+        self.assertEqual(1, code)
+        self.assertEqual(4, len(self.sleeps))
+        for delay in self.sleeps:
+            self.assertGreaterEqual(delay, 2.0)
+            self.assertLessEqual(delay, 4.0)
+        self.assertIn("gave up after 5 attempts (HTTP 429)", err.strip().splitlines()[-1])
+        self.assertEqual([True] * 5, [stream.closed for _, stream in held], "the shim left a refusal open")
+
+    def test_a_refusal_that_is_retried_into_a_reply_is_closed(self):
+        error, stream = self.held_refusal(503, BUSY_SLOT)
+        code, out, err = self.run_shim_over([error, io.BytesIO(json.dumps(OK).encode())])
+        self.assertEqual(0, code, err)
+        self.assertEqual(OK["stdout"], out)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+
+    def test_the_status_headers_and_payload_stay_on_a_closed_refusal(self):
+        error, stream = self.held_refusal(429, PRESSURE, {"Retry-After": "4"})
+        payload = credential_proxy_client._refusal_payload(error)
+        self.assertTrue(stream.closed)
+        self.assertEqual(PRESSURE, payload)
+        self.assertEqual(PRESSURE, error.shim_payload)
+        self.assertFalse(error.shim_dropped)
+        self.assertEqual(429, error.code)
+        self.assertEqual("4", error.headers.get("Retry-After"))
 
 
 class RetryScheduleTest(unittest.TestCase):
@@ -3329,6 +3679,110 @@ class KubeconfigLockOwnerTest(unittest.TestCase):
         self.root.chmod(0o500)
         self.addCleanup(self.root.chmod, 0o700)
         self.assertIn(f"{self.lock}: Permission denied; context {self.TARGET_CTX} was not checked or registered", self.merge())
+
+
+class DefaultKubeconfigFolderOwnerTest(unittest.TestCase):
+    """A caller creates its default kubeconfig only in a folder that it owns. Root in the shell
+    pod has the agent's shared file as its default: a file that root made there was one whose
+    contexts the agent could never register, because only a kubeconfig's owner changes it."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+    ENV = {
+        "KUBE_PROXY_URL": PROXY_URL, "KUBE_PROXY_HOST_CONTEXT": HOST_CTX, "KUBE_PROXY_CA_FILE": CA_FILE,
+        "CREDENTIAL_PROXY_TOKEN_FILE": TOKEN_FILE, "KUBECONFIG": "",
+    }
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.folder = self.root / "opt" / "data"
+        self.folder.mkdir(parents=True)
+        self.kubeconfig = self.folder / ".kubeconfig"
+        self.worker_home = self.root / "home" / "node"
+        self.worker_kubeconfig = self.worker_home / ".kube" / "config"
+
+    def caller(self, uid, worker_uid=-2):
+        """`uid` as the caller, with the test's folders as the sandbox's. No caller is hermes,
+        and none is a worker unless `worker_uid` says so."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.dict("os.environ", self.ENV, clear=False))
+        stack.enter_context(patch.object(credential_proxy_client.os, "geteuid", return_value=uid))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", worker_uid))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.kubeconfig))
+        return stack
+
+    def kubectl_with_a_context(self):
+        """What the sandbox's kubectl wrapper runs for `kubectl --context <ctx>`."""
+        credential_proxy_client.ensure_kube_proxy_context_for_argv(["kubectl", f"--context={self.TARGET_CTX}", "get", "pods"])
+
+    def test_the_merge_creates_nothing_for_a_caller_that_does_not_own_the_folder(self):
+        with self.caller(os.geteuid() + 1):
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                self.kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        self.assertEqual([], list(self.folder.iterdir()), "no kubeconfig, no lock, no record")
+
+    def test_the_host_kubeconfig_is_not_made_for_a_caller_that_does_not_own_the_folder(self):
+        with self.caller(os.geteuid() + 1):
+            credential_proxy_client._ensure_host_kubeconfig_initialized(self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE)
+        self.assertEqual([], list(self.folder.iterdir()))
+
+    @unittest.skipIf(os.geteuid() == 0, "root owns the test's folder")
+    def test_root_creates_nothing_in_a_folder_that_another_uid_owns(self):
+        with self.caller(0):
+            self.kubectl_with_a_context()
+        self.assertEqual([], list(self.folder.iterdir()))
+
+    def test_after_a_kubectl_by_another_caller_the_owners_kubectl_creates_and_registers(self):
+        with self.caller(os.geteuid() + 1):
+            self.kubectl_with_a_context()
+        self.assertEqual([], list(self.folder.iterdir()), "the other caller left nothing for the owner to trip on")
+        with self.caller(os.geteuid()):
+            self.kubectl_with_a_context()
+        text = self.kubeconfig.read_text(encoding="utf-8")
+        self.assertIn(f"current-context: {self.HOST_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+    @contextlib.contextmanager
+    def a_worker_whose_home_another_uid_owns(self):
+        """A worker's home can be an emptyDir with an fsGroup: root owns the mount point, and the
+        worker makes `.kube` in it. The rule asks who owns the folder that holds the file, and
+        not who owns the folder above it."""
+        self.worker_home.mkdir(parents=True)
+
+        def with_another_owner_of_the_home(real):
+            def stand_in(path, *args, **kwargs):
+                info = real(path, *args, **kwargs)
+                if not isinstance(path, (str, os.PathLike)) or Path(path) != self.worker_home:
+                    return info
+                fields = list(info)
+                fields[4] = info.st_uid + 1  # index 4 of a stat result is st_uid
+                return os.stat_result(fields)
+            return stand_in
+
+        with self.caller(os.geteuid(), worker_uid=os.geteuid()), \
+                patch.object(os, "stat", with_another_owner_of_the_home(os.stat)), \
+                patch.object(os, "lstat", with_another_owner_of_the_home(os.lstat)):
+            self.assertEqual(os.geteuid() + 1, self.worker_home.stat().st_uid, "the stand-in owner is in force")
+            yield
+
+    def test_a_worker_whose_home_another_uid_owns_still_gets_its_host_kubeconfig(self):
+        with self.a_worker_whose_home_another_uid_owns():
+            credential_proxy_client._ensure_host_kubeconfig_initialized(self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE)
+        self.assertIn(f"current-context: {self.HOST_CTX}", self.worker_kubeconfig.read_text(encoding="utf-8"))
+
+    def test_the_merge_still_creates_the_kubeconfig_of_such_a_worker(self):
+        with self.a_worker_whose_home_another_uid_owns():
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                self.worker_kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        self.assertIn(f"current-context: {self.TARGET_CTX}", self.worker_kubeconfig.read_text(encoding="utf-8"))
 
 
 class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):

@@ -347,6 +347,9 @@ exit 2
 #: Terraform directory, found by name.
 TERRAFORM_WORKFLOW = "validate.yml"
 TERRAFORM_STEP = "Validate Terraform Modules"
+#: The terraform-floor job's copy of the loop, without the fmt check, run the
+#: same way so the two cannot drift apart unnoticed.
+TERRAFORM_FLOOR_STEP = "Initialise and validate on the floor"
 
 #: The tree the step walks in place of the checkout's: a module and an example,
 #: walked in that order, and a file beside them that the step skips. The root's
@@ -1630,9 +1633,14 @@ class TerraformInitRetryTest(unittest.TestCase):
     either is a verdict, and each still runs once.
     """
 
+    STEP = TERRAFORM_STEP
+    #: The calls the step makes before the first init: the validate job's
+    #: step checks formatting first, the floor job's does not.
+    LEADING = ["fmt checkout"]
+
     def setUp(self):
-        steps = [step for step in _steps(_load_workflow(TERRAFORM_WORKFLOW)) if step.get("name") == TERRAFORM_STEP]
-        self.assertEqual(len(steps), 1, "%s should have exactly one %r step" % (TERRAFORM_WORKFLOW, TERRAFORM_STEP))
+        steps = [step for step in _steps(_load_workflow(TERRAFORM_WORKFLOW)) if step.get("name") == self.STEP]
+        self.assertEqual(len(steps), 1, "%s should have exactly one %r step" % (TERRAFORM_WORKFLOW, self.STEP))
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="terraform-init-retry-")).resolve()
         self.calls = self.tmp / "calls"
         self.sleeps = self.tmp / "sleeps"
@@ -1669,7 +1677,7 @@ class TerraformInitRetryTest(unittest.TestCase):
         attempts, delay = _declared_retry_schedule()
         result = self._run(NEVER_SUCCEEDS)
         self.assertNotEqual(result.returncode, 0, "exhausting the attempts must fail the step")
-        self.assertEqual(self._calls(), ["fmt checkout"] + ["init alpha"] * attempts, result.stdout + result.stderr)
+        self.assertEqual(self._calls(), self.LEADING + ["init alpha"] * attempts, result.stdout + result.stderr)
         self.assertEqual(self._delays(), [delay * 2**i for i in range(attempts - 1)], "the step's delays should follow the Makefile's")
         self.assertIn("::error::", result.stdout)
 
@@ -1679,18 +1687,28 @@ class TerraformInitRetryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             self._calls(),
-            ["fmt checkout"] + ["init alpha"] * 3 + ["validate alpha"] + ["init beta"] * 3 + ["validate beta"],
+            self.LEADING + ["init alpha"] * 3 + ["validate alpha"] + ["init beta"] * 3 + ["validate beta"],
         )
         self.assertEqual(self._delays(), [delay, delay * 2] * 2)
         self.assertEqual(result.stdout.count("::warning::"), 4, "each retry should leave a warning, the record of a rescued attempt")
 
     def test_a_failing_fmt_or_validate_fails_the_step_without_a_retry(self):
-        for verb, calls in (("fmt", ["fmt checkout"]), ("validate", ["fmt checkout", "init alpha", "validate alpha"])):
+        cases = [("validate", self.LEADING + ["init alpha", "validate alpha"])]
+        if self.LEADING:
+            cases.insert(0, ("fmt", self.LEADING))
+        for verb, calls in cases:
             with self.subTest(verb=verb):
                 result = self._run(0, **{"%s_status" % verb: 1})
                 self.assertNotEqual(result.returncode, 0, "a failed %s must fail the step" % verb)
                 self.assertEqual(self._calls(), calls, "%s makes no network call, so it runs once" % verb)
                 self.assertEqual(self._delays(), [])
+
+
+class TerraformFloorInitRetryTest(TerraformInitRetryTest):
+    """The terraform-floor job's loop retries init on the same schedule."""
+
+    STEP = TERRAFORM_FLOOR_STEP
+    LEADING = []
 
 
 if __name__ == "__main__":

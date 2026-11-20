@@ -78,7 +78,9 @@ _COMMENT_LINE_RE = re.compile(r"(?m)^\s*#.*$")
 # followed by `=` (not `==`, `!=`, `<=`, `>=`, nor the `=>` of a `for` map
 # expression) is a map key; `{` opens an object, `[` a list or an index, `(` a
 # call or a ternary's parentheses.
-_HCL_COMPOSITION_RESOURCE = 'resource "helm_release" "kube_agents"'
+# The local the kube-agents release and output.kube_agents_helm_values both read
+# (full-install's tftests/infra_only.tftest.hcl holds the three equal).
+_HCL_COMPOSITION_RESOURCE = "kube_agents_helm_values = ["
 _HCL_VALUES_OPENER = "yamlencode({"
 _HCL_KEY_RE = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*=(?![=>])")
 _HCL_OPENERS = "{[("
@@ -452,7 +454,7 @@ class ResolverTest(unittest.TestCase):
 
     def test_hcl_walker_skips_for_expression_arrows(self) -> None:
         paths = _composition_value_paths(
-            'resource "helm_release" "kube_agents" {\n  values = [yamlencode({\n'
+            'locals {\n  kube_agents_helm_values = [yamlencode({\n'
             "    platformAgent = { integration = { slack = { for k, v in var.s : k => v } } }\n"
             "  })]\n}\n"
         )

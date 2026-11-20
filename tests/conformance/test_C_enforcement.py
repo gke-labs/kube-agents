@@ -1108,13 +1108,17 @@ class C1IsolationIsStructural(unittest.TestCase):
         )
         gateway = gateways[0]
         pod_labels = gateway["spec"]["template"]["metadata"]["labels"]
+        # Every port entry on the store's port or carrying its name: a second name
+        # on 8700 would let a rule admitting that name reach the store unseen.
         declared = [
-            (c["name"], p["containerPort"])
+            (c["name"], p.get("name"), p.get("containerPort"))
             for c in h.containers_of(gateway)
             for p in c.get("ports") or []
-            if p.get("name") == port_name
+            if p.get("name") == port_name or p.get("containerPort") == port
         ]
-        self.assertEqual(declared, [("agent-api-auth", port)], "the store's port is not agent-api-auth's alone")
+        self.assertEqual(
+            declared, [("agent-api-auth", port_name, port)], "the store's port is not agent-api-auth's alone"
+        )
 
         brokers = [
             d for d in h.objects_of_kind(documents, "Deployment")
@@ -1130,8 +1134,14 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         def selects_gateway(policy: dict) -> bool:
             chosen = policy["spec"].get("podSelector") or {}
+            # Not evaluated, so refused outright: a policy selecting the gateway
+            # by matchExpressions could admit any peer to the store unseen.
+            self.assertFalse(
+                chosen.get("matchExpressions"),
+                f"{policy['metadata']['name']} uses matchExpressions, which this check does not evaluate",
+            )
             labels = chosen.get("matchLabels") or {}
-            return not chosen.get("matchExpressions") and labels == {k: pod_labels.get(k) for k in labels}
+            return labels == {k: pod_labels.get(k) for k in labels}
 
         isolating = [
             p for p in h.objects_of_kind(documents, "NetworkPolicy")
@@ -1996,7 +2006,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         # The gateway's half is lib's shared validator, since a request may be
         # one task or a batch (#5682): handleDelegateRequest ignores any
         # request lib.ValidateDelegateRequest refuses, and the validator caps
-        # the single task's text and every batch entry's.
+        # the single task's text and every batch entry's. The call is a
+        # disjunct of the malformed-request guard in its own right, straight
+        # after !parsed and followed only by another || or the block: the
+        # guard has other terms (a resumed batch's size check), and a call
+        # ANDed with one of them would still read "ValidateDelegateRequest(req)
+        # != nil" while checking only the requests that term selects.
         gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
         # Followed only by `||` or the block: an `&&` after the call (a
         # condition on it) would validate only some requests and mint the rest.
@@ -2689,6 +2704,96 @@ class C2FailClosed(unittest.TestCase):
                 "present, so a missing key degrades to an unauthenticated request",
             )
 
+    def test_C2_custom_universe_refuses_commercial_googleapis_relays(self) -> None:
+        """A broker in a custom universe refuses every `*.googleapis.com` relay host.
+
+        A custom-universe bearer token sent to commercial `*.googleapis.com`
+        crosses a sovereign trust boundary. Each relay evaluator must admit
+        `<service>.<universe_domain>` and refuse `<service>.googleapis.com`
+        whenever `universe_domain` is not `googleapis.com`.
+        """
+        custom = "universe.example.test"
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            if not route.host.endswith(".googleapis.com"):
+                continue
+            with self.subTest(api_host=route.host, rule=route.rule_id):
+                decision = api.evaluate(
+                    "GET",
+                    route.host,
+                    "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                    "",
+                    universe_domain=custom,
+                )
+                self.assertFalse(
+                    decision.allowed,
+                    f"api_policy admitted commercial {route.host} under custom universe {custom}",
+                )
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+
+        sub = "projects/sample-project/subscriptions/drift-sub"
+        self.assertFalse(
+            h.watcher_policy.evaluate_gcp(
+                "GET",
+                "container.googleapis.com",
+                "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                b"",
+                sub,
+                universe_domain=custom,
+            ).allowed
+        )
+        self.assertFalse(
+            h.watcher_policy.evaluate_pubsub(
+                "POST",
+                "pubsub.googleapis.com",
+                f"v1/{sub}:pull",
+                b'{"maxMessages":1}',
+                frozenset({sub}),
+                universe_domain=custom,
+            ).allowed
+        )
+        for srv in h.mcp_policy.MCP_SERVERS:
+            resolved = h.mcp_policy.server(srv.name, universe_domain=custom)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertFalse(
+                resolved.host.endswith(".googleapis.com"),
+                f"mcp_policy resolved {srv.name} to commercial {resolved.host} under {custom}",
+            )
+
+    def test_C2_a_universe_domain_under_googleapis_com_is_refused(self) -> None:
+        """A universe domain under `googleapis.com` is refused, and no relay serves its hosts.
+
+        `<service>.mtls.googleapis.com` is a host of the commercial universe.
+        As a universe domain, `mtls.googleapis.com` would pass the rule that a
+        custom universe refuses the commercial hosts while every request stays
+        in the commercial universe under other host names. The value is refused
+        where every reader normalises it, so the broker does not start with it,
+        and the relay evaluators have no host for it.
+        """
+        under = "mtls.googleapis.com"
+        client = h.credential_proxy.credential_proxy_client
+        with self.assertRaises(ValueError):
+            client.normalize_universe_domain(under)
+        with self.assertRaises(ValueError):
+            h.credential_proxy.resolve_universe_domain(environ={client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV: under})
+
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            host = route.host.replace(".googleapis.com", f".{under}")
+            with self.subTest(api_host=host, rule=route.rule_id):
+                decision = api.evaluate("GET", host, "no/such/path", "", universe_domain=under)
+                self.assertFalse(decision.allowed)
+                # gcp.api.path here would mean the policy has a route for this host.
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+        for srv in h.mcp_policy.MCP_SERVERS:
+            self.assertIsNone(
+                h.mcp_policy.server(srv.name, universe_domain=under),
+                f"mcp_policy resolved {srv.name} under {under}",
+            )
+        # The commercial domain itself is still the default universe.
+        self.assertEqual(client.DEFAULT_UNIVERSE_DOMAIN, client.normalize_universe_domain("googleapis.com"))
+
 
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""
@@ -3128,7 +3233,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("rbac.authorization.k8s.io", "roles"),
     })
     OPERATOR_NAMESPACED_READ_KINDS = frozenset()
-    # The two namespaces the chart binds the Role in under mode next: the
+    # The two namespaces the chart binds the Role in, in every mode: the
     # release namespace and its profile namespace.
     OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
     HELM_MODE_NEXT = "platformAgent.mode=next"

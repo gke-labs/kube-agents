@@ -48,13 +48,13 @@ declared column from the two files and fails when the page falls behind them.
 | Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                                | Ephemeral (declared)     | Persistent                                               |
 | ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ---------------------------------------------- | ------------------------ | -------------------------------------------------------- |
 | Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 2 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 5 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
-| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 5 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 4 GiB metadata |
+| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 4 GiB for `sshd`       |
 | Kubernetes API proxy                                         | 2    | standard                                                               | 0.1 / 0.5 then 1 / 1, each          | unchanged                                      | none declared            | none                                                     |
 | Operator                                                     | 1    | standard                                                               | 0.1 / 0.25 then 0.5 / 0.5           | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **222 GiB default, 322 GiB fleet**                       |
+| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **228 GiB default, 328 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -76,12 +76,29 @@ up to about 6 GiB of container memory
 
 The shell sandbox's 2 vCPU and 2 GiB limits are the operator's defaults.
 [`shellSandbox.resources`](/kube-agents/operator/platformagent-crd/#shellsandbox) raises them one
-key at a time; the example leaves them, so a fleet audit that needs more memory in the sandbox is
-bounded by `maxInProgress`, which the example lowers to 3. The sandbox runs on the node's default
-runtime unless
+key at a time. The sandbox runs on the node's default runtime unless
 [`spec.harness.experimental.shellSandbox.runtimeClassName`](/kube-agents/operator/platformagent-crd/#shellsandbox)
 names `gvisor`; the gateway pod's class is the separate `availability.runtimeClassName`, which
 the installer sets.
+
+`maxInProgress` counts kanban workers, not the memory of one command. A single
+`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 14 GiB.
+
+The sandbox's memory guard acts at its limit less the larger of 256 MiB and an eighth of the limit
+(at most a quarter). It stops the largest commands of at least 64 MiB, as many as bring it back
+under that mark. Those commands fail, and the sandbox and its other sessions stay up. Each stop is a
+JSON line with the program and its size in the sandbox's log
+(`kubectl -n kubeagents-system logs <name>-shell-0`). A read that large fails at any limit below its
+size; narrow it to a namespace or a batch of clusters.
+
+Many small commands are bounded by the kubectl admission instead. Its limits come from the
+sandbox's memory limit: at the default 2 GiB, 13 kubectl reads run at once and 13 more may wait
+(fewer under gVisor). A read that finds both full fails at once with a `capacity:` reason.
+
+The shell's kubectl admission refuses such a read before it starts, with a reason that names a
+narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet
+whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
+[`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
 
 Two more stacks add to the total:
 
@@ -91,7 +108,9 @@ Two more stacks add to the total:
 - **The A2A stack**, on every install: its standing pods, a container in the agent pod and a
   JetStream claim per NATS server. Each delegation adds a session pod, up to `maxSessions` at
   once. The prerequisites page's [Footprint](/kube-agents/install/prerequisites/#footprint)
-  gives the totals and each pod's requests and limits, generated from the chart.
+  gives the totals and each pod's requests and limits, generated from the chart. The totals
+  include the session pods at the cap, and say how much of each is theirs; `maxSessions`
+  scales that share, so a host or quota budget follows it.
 
   Each NATS server's metrics exporter is sized for up to about 2,000 JetStream consumers, which
   is about 1,000 clusters at two consumers per AgentProfile. Its memory and CPU grow with the
@@ -119,7 +138,7 @@ table above means there:
   proxy's 8 GiB is the largest declared; raising `limits.ephemeral-storage` past 10 GiB leaves
   the pod unschedulable.
 
-Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 322 GiB of `pd-balanced`
+Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 328 GiB of `pd-balanced`
 (modeled, without bursting). At `us-central1` list prices that is about $400 to $500 a month
 including the cluster fee; modeled, so check the pricing calculator against your region.
 
@@ -231,9 +250,10 @@ caveat beside it:
   `platformAgent.deployment.incidentWorkloadDedupSeconds`, the key that turns it off.
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
-its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
-run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. The name in the example reaches the container that reads it.
+its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
+the shell sandbox, where the audits run, and passes every name it does not reserve to the
+credential proxy and `agent-api-auth` containers. The name in the example reaches the container
+that reads it.
 
 A process tunable such as `MALLOC_ARENA_MAX` is not on the agent container's allowlist. A values
 file that sets it renders credential proxy and `agent-api-auth` containers that carry it, and an

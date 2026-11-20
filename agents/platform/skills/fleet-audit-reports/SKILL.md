@@ -176,8 +176,9 @@ python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_qu
 python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
 ```
 
-The ledger names findings it has no room to show in full on one line each, as far as the room left
-after the criticals' full blocks allows, then drops the least-severe ones and its evidence table whole, to stay inside GitHub's
+The ledger names findings it has no room to show in full on one line each, trading full blocks past
+the first finding so names continue down every severity band as far as room allows, then drops the
+least-severe tail and its evidence table whole to stay inside GitHub's
 body limit, and says so in a notice that points here. `findings` lists every finding the run
 carried. `checks` is one row per check the run says it performed, with the command that performed
 it, plus each `checks_not_applicable` exclusion and its reason; filter by cluster or check — a

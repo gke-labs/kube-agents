@@ -256,15 +256,14 @@ class CredentialProxyEvidenceTest(unittest.TestCase):
         self.assertNotIn("--context", first)
 
     def test_a_second_call_in_the_same_process_keeps_the_first_capture(self):
-        """ci-eval-pr.sh takes the evidence before the rollback round trip
-        re-renders the proxy; a later call in the same process must not
-        overwrite the eval's capture with the replacement pod's."""
+        """ci-eval-pr.sh takes the evidence once; a later call in the same
+        process must not overwrite the eval's capture with a replacement pod's."""
         proc, artifacts = run_collect(f"STUB_LINES=7 {FUNCTION}", 'echo "SECOND STATUS: $?"', STUB_LINES="3")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SECOND STATUS: 0", proc.stdout)
         self.assertEqual(len((artifacts / LOG_ARTIFACT).read_text(encoding="utf-8").splitlines()), 4)
 
-    def test_the_eval_trap_the_round_trip_and_the_failure_dumper_all_call_it(self):
+    def test_the_eval_trap_and_the_failure_dumper_both_call_it(self):
         env_src = ENV_SCRIPT.read_text(encoding="utf-8")
         eval_src = EVAL_SCRIPT.read_text(encoding="utf-8")
         dumper = re.search(r"^dump_prow_artifacts_on_failure\(\) \{\n.*?^\}$", env_src, re.DOTALL | re.MULTILINE)
@@ -273,8 +272,6 @@ class CredentialProxyEvidenceTest(unittest.TestCase):
         self.assertIsNotNone(trap)
         self.assertIn(f"    {FUNCTION}\n", dumper.group(0))
         self.assertIn(f"  {FUNCTION}\n", trap.group(0))
-        # Before the rollback round trip as well, beside the gateway log.
-        self.assertRegex(eval_src, r"collect_agent_pod_diagnostics --keep-watch\n  " + FUNCTION + r"\n")
         # The dumper's own tail of the same file is gone: it would overwrite
         # the every-run capture with a later pod's on a red run.
         self.assertNotIn(f"> \"${{artifact_dir}}/{LOG_ARTIFACT}\"", dumper.group(0))

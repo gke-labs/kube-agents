@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Entrypoint for the credential-proxy container.
 #
-# Four peer services live here, not one service with helpers. They share a
+# Five peer services live here, not one service with helpers. They share a
 # container because they all need credentials, and credentials are deliberately
 # kept out of the agent sandbox — not because any of them belongs to another:
 #
@@ -10,6 +10,8 @@
 #   k8s-event-watcher     watches cluster API servers and reports events
 #   drift-detector        reads GKE admin-activity audit records from Pub/Sub
 #                         and reports the ones a person made outside git
+#   audit_report_store.py the broker-only audit-report store listener, in the
+#                         api-proxy role only (start_audit_report_store)
 #
 # CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
 # run in the same pod. It is the same variable and the same four values
@@ -89,6 +91,17 @@ DRIFT_HEALTHY_RUN_SECONDS="${DRIFT_HEALTHY_RUN_SECONDS:-120}"
 # consequence rather than logged as an exit. Three, as for the watcher: one is
 # ordinary during startup, and by the third the cause is not transient.
 DRIFT_SHORT_EXIT_ALERT_COUNT="${DRIFT_SHORT_EXIT_ALERT_COUNT:-3}"
+
+# The audit-report store listener's restart policy (start_audit_report_store),
+# retried in place like the watcher. Fixed, not read from the environment:
+# spec.deployment.env reaches this container unfiltered.
+readonly AUDIT_REPORT_STORE_RETRY_MIN_SECONDS=5
+readonly AUDIT_REPORT_STORE_RETRY_MAX_SECONDS=300
+readonly AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS=60
+# The listener itself. Run as a script, which binds port 8700
+# (audit_report_store.LISTEN_PORT, auditReportStorePort in the operator) so
+# that a port another process in the pod already holds is a loud ALERT naming it.
+readonly AUDIT_REPORT_STORE_SCRIPT=/opt/defaults/scripts/audit_report_store.py
 
 # Where the watcher and the detector post. Not overridable, unlike the values
 # above: it is the Session KV server on this pod's loopback, fixed by where those
@@ -618,12 +631,13 @@ WATCHER_ALERT_EXCLUDE_FILE="${WATCHER_ALERT_EXCLUDE_FILE:-}"
 
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
-# from; the two proxy scripts import nothing outside the standard library, so
-# what is in it does not matter to them, only that it exists. The audit-report
-# store listener is the exception: it runs under uvicorn and verifies with
+# from; the two proxy scripts (wif_credentials.py and credential_proxy.py)
+# import nothing outside the standard library, so what is in it does not
+# matter to them, only that it exists. The audit-report store listener, the
+# third caller, is the exception: it runs under uvicorn and verifies with
 # cryptography, both of which this venv carries. Named once because a wrong
 # path here is a container that exits 127 with one line of output and no
-# indication of which of the two callers below asked for it.
+# indication of which of the three callers below asked for it.
 PROXY_PYTHON="${PROXY_PYTHON:-/opt/hermes/.venv/bin/python3}"
 
 runtime_pid=""
@@ -655,7 +669,9 @@ store_pid=""
 # The drift-detector's handler NACKs the records it has not finished with so that
 # they redeliver rather than each costing a duplicate inject, and the watcher's
 # writes its dedup snapshot so that a restart does not replay every event still
-# inside the API server's TTL. Both take seconds; this script exits milliseconds
+# inside the API server's TTL; the audit-report store's uvicorn finishes the
+# requests it is serving, so a write is not cut between its temp file and the
+# rename. Each can take seconds; this script exits milliseconds
 # after terminate() returns, and takes the PID namespace with it.
 #
 # **The wait watches the supervisors, not their children.** With the trap above, a
@@ -736,7 +752,7 @@ terminate() {
   [[ -z "${watcher_pid}" ]] || supervisors+=("${watcher_pid}")
   [[ -z "${drift_pid}" ]] || supervisors+=("${drift_pid}")
   [[ -z "${store_pid}" ]] || supervisors+=("${store_pid}")
-  # One shared drain budget, not one each: the two run concurrently and the pod's
+  # One shared drain budget, not one each: the three run concurrently and the pod's
   # grace period does not grow with the number of processes in the container.
   [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
 
@@ -1259,12 +1275,11 @@ start_drift_detector() {
 #
 # On only where the operator says so, which it does on every install that
 # renders the store (with the A2A stack), and only with exactly `1`: off is the
-# state under an operator that predates the store, so it is silent. Supervised and restarted in place like the watcher, and like
-# it not on the credential path, so its exit never ends the container. It logs
-# to the container's stderr with the other supervised processes.
-readonly AUDIT_REPORT_STORE_RETRY_MIN_SECONDS=5
-readonly AUDIT_REPORT_STORE_RETRY_MAX_SECONDS=300
-readonly AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS=60
+# state under an operator that predates the store, so it is silent. Supervised
+# and restarted in place like the watcher (AUDIT_REPORT_STORE_RETRY_* at the
+# top), and like it not on the credential path, so its exit never ends the
+# container. It logs to the container's stderr with the other supervised
+# processes.
 
 start_audit_report_store() {
   [[ "${AUDIT_REPORT_STORE_ENABLED:-}" == "1" ]] || return 0
@@ -1279,10 +1294,8 @@ start_audit_report_store() {
     delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"
     while true; do
       started=$SECONDS
-      # Run as a script, which binds port 8700 itself (audit_report_store.LISTEN_PORT,
-      # auditReportStorePort in the operator) so that a port another
-      # process in the pod already holds is a loud ALERT naming it.
-      "${PROXY_PYTHON}" /opt/defaults/scripts/audit_report_store.py || true
+      # See AUDIT_REPORT_STORE_SCRIPT for why it runs as a script.
+      "${PROXY_PYTHON}" "${AUDIT_REPORT_STORE_SCRIPT}" || true
       ran=$((SECONDS - started))
       if [[ "${ran}" -ge "${AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS}" ]]; then
         delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"

@@ -12,3 +12,6 @@ uv.lock
 .terraform.lock.hcl
 !tf/fleet/.terraform.lock.hcl
 kind-kubeconfig.yaml
+
+# The OOM reproduction harness's default output: PlatformAgent snapshots, kubeconfigs, process command lines.
+oom-repro-out/
