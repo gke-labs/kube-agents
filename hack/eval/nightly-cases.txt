@@ -1096,6 +1096,17 @@
 # 200s default until it has a record.
 ./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
 
+# The user gives a line for the Platform Agent's task, word for word, that
+# names an assignee no profile has, in the composed form of #3786; the
+# investigation must still reach the Cluster Agent of the cluster that runs
+# payments-api (worker_agents). A card for a name that is no profile is never
+# dispatched; `kanban_create` refuses it and lists the profiles, and this case
+# is where the model reads that refusal. The fixture and four checks of
+# cluster-agent-delegation-profile-lookup, and its prompt plus that line.
+# deployer: noop, read-only; `validated: false`; 200s default until it has a
+# record.
+./tasks/cluster-agent-delegation-wrong-profile-name/task.yaml
+
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
 # one worker runs workload_triage.py, the healthy-cluster worker (seeded-b;
 # seeded-c's ComputeClass workloads sit Unschedulable on some pool projects,
