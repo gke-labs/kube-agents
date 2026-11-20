@@ -16,8 +16,8 @@ time that will not parse is not asked.
 
 ``post_merge_edited.py fill`` is one tick, at most
 ``post_merge_check.READS_PER_TICK`` pull requests, newest merge first. It reads
-nothing while ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``. Nothing schedules it
-yet. No model is involved, and nothing here posts.
+nothing while ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``. The ``post-merge-check`` cron job runs it
+(``post_merge_outcome.tick``). No model is involved, and nothing here posts.
 """
 
 from __future__ import annotations

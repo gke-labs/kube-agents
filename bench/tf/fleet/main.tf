@@ -156,7 +156,8 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # every gcloud read as this account, so the presence probe and the state pass
 # list instances, firewall rules, networks and snapshots as it (#2483, #2682),
 # and the state pass reads the startup-fail VM's serial port output and lists
-# the snapshots' source disks as it.
+# the snapshots' source disks as it. It also lists the project's reservations
+# as it, for the missing-reservation-pool role (compute.reservations.list).
 # roles/compute.viewer is get and list on Compute Engine resources, with no
 # create, update or delete. It does show instance metadata and serial port
 # output (compute.instances.getSerialPortOutput), so no secret goes in this

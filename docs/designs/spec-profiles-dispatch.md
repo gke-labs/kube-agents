@@ -374,7 +374,7 @@ leave open:
   mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
-  admission, and a task that names no cluster gets none. When an unattended trigger submitted the
+  admission. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
   found equal to the grant's at admission (added 11/11, #4685). A `script` must also be one
   the profile allowlists in `spec.scripts`, which the operator renders into the dispatch config with
@@ -382,10 +382,14 @@ leave open:
   task. Every path lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the
   worker image. The CRD and the dispatcher's config check both hold paths to it, and
   `deploy/docker/test_script_root_ownership.py` keeps what a Dockerfile puts there root-owned and not
-  group- or world-writable (#5622). The broker also accepts a
-  `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
-  credential, which reaches only the audit-report routes and is refused on every other route,
-  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. When the submission's
+  group- or world-writable (#5622). A task that names no cluster gets
+  no `proxyToken`, except an `unattended` task a trigger started: it gets a report credential, a
+  `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
+  the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
+  only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
+  Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
+  trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
+  binds a trigger at. When the submission's
   `taskParameters.changeRequested` is true, the `proxyToken` also carries
   `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
   broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod, at

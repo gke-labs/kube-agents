@@ -639,7 +639,7 @@ class ConditionsBlockTest(unittest.TestCase):
         self.assertIn("`A2AVerifier`", types)
         self.assertEqual(len(types), len(set(types)))
         degraded = next(line for line in lines if line.startswith("| `Degraded`"))
-        self.assertIn("`InvalidCredentialProxyExec` or `RBACIncomplete`", degraded)
+        self.assertIn("`InvalidCredentialProxyExec`, `InvalidKanbanAdmission` or `RBACIncomplete`", degraded)
         self.assertNotIn(generate_docs.CONDITIONS_REASONS_PLACEHOLDER, "\n".join(lines))
 
     @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")

@@ -319,6 +319,21 @@ type GoogleChatSpec struct {
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
 
+	// HomeChannelPolicy ("auto", also absent, or "manual") says whether the
+	// A2A gateway may learn the Google Chat home space when HomeChannel is
+	// empty. Under "auto" the space of the first top-level mention of the
+	// agent in a named space, never a direct message or a group chat, becomes
+	// the home channel: the gateway records it in the <agent>-home-channel
+	// ConfigMap, the operator projects it into the <agent>-chat-home
+	// ConfigMap it mounts as a directory in the agent pod and the gateway
+	// pod, both read the file within about a minute with no pod restarted,
+	// and HomeChannelUnset clears. Under "manual" HomeChannel alone decides.
+	// A set HomeChannel wins under either. No schema default, as on Slack:
+	// absent is read as "auto" by the operator.
+	// +kubebuilder:validation:Enum=auto;manual
+	// +optional
+	HomeChannelPolicy string `json:"homeChannelPolicy,omitempty"`
+
 	// Mode controls output verbosity in Google Chat ("default" or "debug").
 	// "default": Quiet mode (silences memory reviews, approval cards, and tool progress).
 	// "debug": Full verbosity (surfaces tool progress, memory reviews, interim messages, and approval cards).

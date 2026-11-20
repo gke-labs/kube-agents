@@ -92,7 +92,9 @@ def scope_refusal_for(scope) -> ScopeRefusal:
         if not reason:
             return None
         known = set(scope.projects or []) | {unread for unread, _ in scope.unread}
-        if scope.sweep_is_declared() and project not in known:
+        # A project number is never in ``known`` (it lists ids), and the scope cannot say which id it
+        # names, so it is unknown, as ``override_error`` itself says: never out of scope.
+        if scope.sweep_is_declared() and not project.isdigit() and project not in known:
             return reason
         return UNKNOWN_PREFIX + reason
 
