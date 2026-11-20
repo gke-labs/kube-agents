@@ -6136,7 +6136,8 @@ class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
                       "\treturn found && id != \"\" && !strings.Contains(id, \"/\")\n}\n", gateway)
         operator = (_REPO_ROOT / "k8s-operator/internal/controller/platformagent_a2a_manifests.go").read_text()
         self.assertRegex(operator, r'\n\ta2aGchatSpacePrefix\s*=\s*"spaces/"\n')
-        self.assertIn("\thome := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)\n"
+        self.assertIn("\treturn gchatSpaceName(agent.Spec.Integration.GoogleChat.HomeChannel)\n", operator)
+        self.assertIn("\thome := strings.TrimSpace(s)\n"
                       "\tid, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)\n"
                       "\tif !ok || id == \"\" || strings.Contains(id, \"/\") {\n", operator)
         shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
@@ -6189,6 +6190,8 @@ class GatewayHomeChannelUnsetWarningTest(unittest.TestCase):
         proc = self._run(slack="false", chat="true")
         self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
+        # As for Slack: the learn is offered beside the key.
+        self.assertIn("under homeChannelPolicy auto (the default), mention the agent once, top-level, in the named space you want", proc.stdout)
 
     def test_both_platforms_share_the_gateway(self):
         # Each backend needs its own home; with both unset both keys are named, Chat first.
@@ -6380,6 +6383,54 @@ class SlackHomeChannelPolicyTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
         self.assertIsNone(content, "the file must be left untouched")
+
+class GoogleChatHomeChannelPolicyTest(unittest.TestCase):
+    """GOOGLE_CHAT_HOME_CHANNEL_POLICY renders
+    spec.integration.googleChat.homeChannelPolicy on SLACK_HOME_CHANNEL_POLICY's
+    terms: the same exact enum, refused by the generator before a file is
+    written."""
+
+    _run = InstallerCommonTest._run
+    _tfvars = SlackHomeChannelPolicyTest._tfvars
+
+    def _check(self, value, flags=""):
+        return self._run(f'require_google_chat_home_channel_policy {shlex.quote(value)} {flags}; echo "rc=$?"')
+
+    def test_the_three_accepted_values_pass_silently(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertNotIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY", proc.stdout + proc.stderr)
+
+    def test_any_other_spelling_is_refused_as_the_crd_would(self):
+        for value in ("Auto", " auto", "manual ", "MANUAL", "sometimes"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(f"GOOGLE_CHAT_HOME_CHANNEL_POLICY is '{value}', which is not auto or manual (empty means auto)", out)
+                self.assertIn("spec.integration.googleChat.homeChannelPolicy", out)
+                self.assertIn("Set it in install.env and run again", out)
+                self.assertNotIn("--google-chat-home-channel-policy", out)
+
+    def test_the_remedy_names_the_flag_when_install_sh_can_set_it(self):
+        proc = self._check("sometimes", "flags")
+        self.assertIn("Set it in install.env or --google-chat-home-channel-policy and run again", proc.stdout + proc.stderr)
+
+    def test_the_generator_renders_the_policy_beside_the_chat_home_channel(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc, content = self._tfvars({"GOOGLE_CHAT_HOME_CHANNEL_POLICY": value})
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f'google_chat_home_channel  = ""\ngoogle_chat_home_channel_policy = "{value}"\n', content)
+
+    def test_the_generator_refuses_a_policy_outside_the_enum_with_no_file_written(self):
+        proc, content = self._tfvars({"GOOGLE_CHAT_HOME_CHANNEL_POLICY": "sometimes"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
+        self.assertIsNone(content, "the file must be left untouched")
+
 
 # ── print_footprint_summary: the step 11 footprint and modeled-cost block ───
 

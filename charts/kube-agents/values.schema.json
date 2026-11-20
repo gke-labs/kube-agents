@@ -2073,6 +2073,10 @@
                 },
                 "answerFeedback": {
                   "type": "boolean"
+                },
+                "homeChannelPolicy": {
+                  "type": "string",
+                  "enum": ["", "auto", "manual"]
                 }
               }
             },

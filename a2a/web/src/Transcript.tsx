@@ -39,8 +39,8 @@ const COPY_FAILED_LABEL = "copy failed";
 const COPY_TITLE = "copy the block, without its fences, to the clipboard";
 const COPIED_RESET_MS = 2000;
 /**
- * A card's report (a notice whose frame names the turn that filed the card)
- * gets a reply button under its text: the pane's next typed turn then
+ * A card's report (a notice whose frame carries the report mark and names
+ * the turn that filed the card) gets a reply button under its text: the pane's next typed turn then
  * carries that task as the frame's `replyTo`. Only a pane that can send, and
  * only for the conversation it is on, offers it; the session view renders the
  * same list read-only. The button's accessible name carries the report's

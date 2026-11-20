@@ -229,8 +229,9 @@ var SensitiveEnvVars = map[string]struct{}{
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
 	// the gateway's chat.notify route. It holds every platform whose route is
 	// armed under the next stack with a home channel set on the CR,
-	// comma-separated, Chat first; the agent adds a learned Slack channel and
-	// sends home posts to every armed route when no platform has a home. An
+	// comma-separated, Chat first; the agent adds a learned Slack channel or
+	// Chat space after those and sends home posts to every armed route when
+	// no platform has a home. An
 	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,
@@ -3066,10 +3067,12 @@ type BusMigrationRetry struct {
 // and three.
 type BusMigrationStatus struct {
 	// Leg is the direction: OneToThree (snapshot and restore, behind a write
-	// freeze) or ThreeToOne (in place). Reshape is reserved for a later
-	// release's leg; nothing in this one starts it, and a run of a leg this
-	// operator does not run is held (A2ABusMigrationLegUnknown) until the
-	// operator that started it carries it on or a person abandons it.
+	// freeze), ThreeToOne (in place), or Reshape (TASKS alone recreated at
+	// the width the CR renders, at the count the bus runs, behind a write
+	// freeze; started only by the kubeagents.x-k8s.io/bus-reshape
+	// annotation). A run of a leg this operator does not run is held
+	// (A2ABusMigrationLegUnknown) until the operator that started it carries
+	// it on or a person abandons it.
 	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne;Reshape
 	Leg string `json:"leg"`
 

@@ -116,21 +116,32 @@ NO_PROC_STATUS = (
     "this machine has no /proc/self/status: the test reads the kernel's own cpu list or "
     "ignored-signal mask there, to show what the script pinned, clamped to or left ignored"
 )
-RUN_STARTS_WITH_SIGINT_IGNORED = (
-    "this machine has setsid and a bash that does not restore SIGINT in an async subshell, "
-    "as bash 3.2 does not: the run starts with Ctrl-C ignored, and the test shows the "
-    "command's own answer to Ctrl-C reaching its log"
-)
-# A command started the way the script starts a run where the machine has setsid: an
-# async subshell that restores SIGINT and execs. The command traps SIGINT, signals itself,
-# and prints the mark from the trap; a command that started with SIGINT ignored cannot
-# trap it and prints nothing.
+# A command started the way the script starts a run under setsid: an async subshell that
+# restores SIGINT and execs. The command traps SIGINT, signals itself, and prints the mark
+# from the trap; a command that started with SIGINT ignored cannot trap it and prints
+# nothing. The script makes the same probe of its own bash before it uses setsid.
 SIGINT_RESTORED_MARK = "restored"
 SIGINT_RESTORE_PROBE = (
     f"( trap - INT QUIT; exec bash -c 'trap \"echo {SIGINT_RESTORED_MARK}\" INT; kill -INT $$; :' ) "
     "</dev/null & wait $!"
 )
 SIGINT_PROBE_DEADLINE_SECONDS = 20
+# A stand-in for setsid that records its use in the file SETSID_MARK_ENV names, then runs
+# the command in a new session: through the real setsid where REAL_SETSID_ENV names one,
+# else with a session of its own making. Without the new session the run would stay in
+# the script's process group, and a test's Ctrl-C to that group would reach it two times.
+SETSID_MARK_ENV = "REPEAT_UNDER_LOAD_TEST_SETSID_MARK"
+REAL_SETSID_ENV = "REPEAT_UNDER_LOAD_TEST_REAL_SETSID"
+SETSID_STAND_IN = (
+    f"#!{sys.executable}\n"
+    "import os, sys\n"
+    f'open(os.environ["{SETSID_MARK_ENV}"], "w").close()\n'
+    f'real = os.environ.get("{REAL_SETSID_ENV}")\n'
+    "if real:\n"
+    "    os.execv(real, [real, *sys.argv[1:]])\n"
+    "os.setsid()\n"
+    "os.execvp(sys.argv[1], sys.argv[1:])\n"
+)
 # Builtins that bash 4 added and macOS's /bin/bash 3.2 lacks.
 BASH_4_BUILTINS = ("mapfile", "readarray")
 # A cpu count below the cores the fallback test asks for, so the clamp shows.
@@ -140,10 +151,9 @@ ASKED_CORES_ABOVE_STAND_IN = "8"
 
 def sigint_at_its_default():
     """Run in a child before it starts: SIGINT at its default, whatever the test runner
-    inherited. A runner started in the background of a non-interactive shell (or under
-    this script on bash 3.2 with setsid) hands SIGINT on ignored, and a shell cannot trap
-    a signal it started with ignored, so the script under test could not answer Ctrl-C at
-    all."""
+    inherited. A runner started in the background of a non-interactive shell hands SIGINT
+    on ignored, and a shell cannot trap a signal it started with ignored, so the script
+    under test could not answer Ctrl-C at all."""
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
@@ -220,8 +230,8 @@ def add_stand_in(bin_dir, name, script):
 
 
 def run_starts_with_sigint_ignored():
-    """Whether a command started the way the script starts a run with setsid has SIGINT
-    ignored."""
+    """Whether a command started the way the script starts a run under setsid has SIGINT
+    ignored, on the bash that the script runs on here."""
     probe = subprocess.run(
         ["bash", "-c", SIGINT_RESTORE_PROBE],
         capture_output=True,
@@ -231,12 +241,6 @@ def run_starts_with_sigint_ignored():
         preexec_fn=sigint_at_its_default,
     )
     return SIGINT_RESTORED_MARK not in probe.stdout
-
-
-# Probed once, for the skips below and for the test that holds the probe to the kernel.
-# Without setsid the script starts a run under job control, and no skip applies: there a
-# run that starts with SIGINT ignored fails the tests.
-RUN_SIGINT_IGNORED = shutil.which("setsid") is not None and run_starts_with_sigint_ignored()
 
 
 def allowed_cpus(status_text):
@@ -496,7 +500,6 @@ class RepeatUnderLoadTest(unittest.TestCase):
         # bash's own "Terminated" line for the sleep may precede the command's answer.
         self.assertEqual(log.split()[-1:], ["termed"], f"the command was killed before it could answer TERM: {log!r}")
 
-    @unittest.skipIf(RUN_SIGINT_IGNORED, RUN_STARTS_WITH_SIGINT_IGNORED)
     def test_a_child_that_outlives_the_leader_finishes_its_own_report(self):
         returncode, log, _, stderr = self.interrupt_after_ready(CHILD_OUTLIVES_LEADER)
         self.assertEqual(returncode, SIGINT_EXIT_CODE, stderr)
@@ -556,13 +559,14 @@ class RepeatUnderLoadTest(unittest.TestCase):
         for pid in pids:
             self.assertTrue(wait_until(lambda: not pid_alive(pid)), f"busy loop {pid} outlived a killed script")
 
-    @unittest.skipIf(RUN_SIGINT_IGNORED, RUN_STARTS_WITH_SIGINT_IGNORED)
-    def test_an_interrupt_lets_the_command_finish_its_own_report(self):
+    def interrupted_report(self, env=None):
+        """Start the script over INTERRUPT_REPORT, Ctrl-C it once `ready` exists, and return
+        (returncode, run-1 log text)."""
         with TemporaryDirectory() as tmp:
             proc = subprocess.Popen(
                 [str(SCRIPT), "-n", "2", *LIGHT_LOAD, "--", sys.executable, "-c", INTERRUPT_REPORT],
                 cwd=tmp,
-                env=dict(os.environ, TMPDIR=tmp),
+                env=dict(os.environ, TMPDIR=tmp, **(env or {})),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -581,8 +585,57 @@ class RepeatUnderLoadTest(unittest.TestCase):
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate()
             log = next(Path(tmp).glob("repeat-under-load.*/run-1.log")).read_text()
-        self.assertEqual(proc.returncode, SIGINT_EXIT_CODE)
+        return proc.returncode, log
+
+    def test_an_interrupt_lets_the_command_finish_its_own_report(self):
+        returncode, log = self.interrupted_report()
+        self.assertEqual(returncode, SIGINT_EXIT_CODE)
         self.assertEqual(log.split(), ["first", "second"], "the command's interrupt report was cut short")
+
+    def test_with_setsid_on_the_path_a_run_still_starts_with_ctrl_c_at_its_default(self):
+        """A bash that does not restore SIGINT in an async subshell, as bash 3.2 does not, would
+        start a run under setsid with Ctrl-C ignored. The script uses setsid only where this
+        bash restores it, and job control elsewhere; the command's own report arrives either way."""
+        real_setsid = shutil.which("setsid") or ""
+        bin_dir, path = path_hiding("setsid")
+        try:
+            add_stand_in(bin_dir, "setsid", SETSID_STAND_IN)
+            with TemporaryDirectory() as marks:
+                mark = Path(marks) / "setsid.used"
+                env = {"PATH": path, SETSID_MARK_ENV: str(mark), REAL_SETSID_ENV: real_setsid}
+                returncode, log = self.interrupted_report(env=env)
+                used = mark.exists()
+        finally:
+            shutil.rmtree(bin_dir)
+        self.assertEqual(returncode, SIGINT_EXIT_CODE)
+        self.assertEqual(log.split(), ["first", "second"], "the command's interrupt report did not arrive whole")
+        self.assertEqual(used, not run_starts_with_sigint_ignored(), "setsid is for a bash that restores SIGINT only")
+
+    def test_a_script_that_started_with_ctrl_c_ignored_keeps_setsid(self):
+        """Job control repairs one state: a bash that keeps SIGINT ignored in an async subshell.
+        A script that itself started with SIGINT ignored gains nothing from it on any bash, so
+        it keeps setsid, with which a command that opens the terminal fails and does not stop."""
+        real_setsid = shutil.which("setsid") or ""
+        bin_dir, path = path_hiding("setsid")
+        try:
+            add_stand_in(bin_dir, "setsid", SETSID_STAND_IN)
+            with TemporaryDirectory() as tmp:
+                mark = Path(tmp) / "setsid.used"
+                result = subprocess.run(
+                    [str(SCRIPT), "-n", "1", *LIGHT_LOAD, "--", "true"],
+                    cwd=tmp,
+                    env=dict(os.environ, TMPDIR=tmp, PATH=path, **{SETSID_MARK_ENV: str(mark), REAL_SETSID_ENV: real_setsid}),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=SCRIPT_DEADLINE_SECONDS,
+                    preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+                )
+                used = mark.exists()
+        finally:
+            shutil.rmtree(bin_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(used, "the script left setsid for job control, which cannot restore SIGINT here")
 
     @unittest.skipUnless(PROC_STATUS.exists(), NO_PROC_STATUS)
     def test_the_command_can_still_be_interrupted_by_sigint(self):
@@ -594,8 +647,6 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         ignored = int(log.split(":", 1)[1].strip(), 16)
         self.assertFalse(ignored & (1 << (signal.SIGINT - 1)), f"SIGINT is ignored under the script: {log.strip()}")
-        # The probe that skips the interrupt-report tests must agree with the kernel here.
-        self.assertFalse(RUN_SIGINT_IGNORED, "the SIGINT probe says ignored where the kernel says it is not")
 
     def test_a_flag_as_a_flag_value_prints_usage(self):
         with TemporaryDirectory() as tmp:

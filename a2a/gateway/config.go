@@ -96,17 +96,21 @@ const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
 // has it.
 const EnvSlackTestUsers = "A2A_SLACK_TEST_USERS"
 
-// The learned-home contract (slack_home_channel.go): the operator renders the
-// policy from slack.homeChannelPolicy, the record ConfigMap's name, the
+// The learned-home contract (home_channel.go): the operator renders each
+// backend's policy from its homeChannelPolicy, the record ConfigMap's name, the
 // gateway's own image for the record's writer and reader keys, and the one
 // switch that arms the learn, which only an operator that also admits the
 // record renders.
 const (
 	envSlackHomePolicy    = "A2A_SLACK_HOME_POLICY"
+	envGchatHomePolicy    = "A2A_GCHAT_HOME_POLICY"
 	envHomeChannelRecord  = "A2A_HOME_CHANNEL_RECORD"
 	envSelfImage          = "A2A_SELF_IMAGE"
 	envHomeChannelLearn   = "A2A_HOME_CHANNEL_LEARN"
 	slackHomePolicyManual = "manual"
+	// gchatHomePolicyManual is googleChat.homeChannelPolicy's "manual", the
+	// same word as Slack's.
+	gchatHomePolicyManual = slackHomePolicyManual
 	envTrue               = "true"
 )
 
@@ -285,6 +289,9 @@ type Config struct {
 	// SlackHomePolicy is slack.homeChannelPolicy as the operator renders it:
 	// "manual" keeps the home channel the CR's alone; anything else is auto.
 	SlackHomePolicy string
+	// GchatHomePolicy is googleChat.homeChannelPolicy as the operator renders
+	// it: "auto" (also absent) or "manual".
+	GchatHomePolicy string
 	// HomeChannelRecord names the ConfigMap a learned home channel is
 	// recorded in, and SelfImage the gateway's own image reference, which it
 	// stamps into that record. HomeChannelLearn is the switch that arms the
@@ -842,6 +849,29 @@ func (c *Config) HomeLearnArmed() bool {
 		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
 }
 
+// GchatHomeLearnArmed is HomeLearnArmed for the Google Chat home space: the
+// Chat backend is armed (beside any other), the CR names no home channel,
+// the policy is auto, a record is named, and the operator has armed the
+// learn. The switch is the one Slack's learn reads: an operator that renders
+// it without projecting Chat's file leaves the file absent, and an absent
+// file learns nothing (homeLearner.learn).
+func (c *Config) GchatHomeLearnArmed() bool {
+	return c.GchatRelayURL != "" && c.GchatHomeChannel == "" &&
+		c.GchatHomePolicy != gchatHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
+}
+
+// HomeLearnArmedFor is the learn's gate for one backend by name
+// (BackendSlack, BackendGchat); no other backend learns a home.
+func (c *Config) HomeLearnArmedFor(backend string) bool {
+	switch backend {
+	case BackendSlack:
+		return c.HomeLearnArmed()
+	case BackendGchat:
+		return c.GchatHomeLearnArmed()
+	}
+	return false
+}
+
 // Elected reports whether this gateway runs under the election (election.go).
 func (c *Config) Elected() bool { return c.GatewayLease != "" }
 
@@ -912,6 +942,7 @@ func FromEnv() (*Config, error) {
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
+	cfg.GchatHomePolicy = strings.TrimSpace(os.Getenv(envGchatHomePolicy))
 	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
 	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
 	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
