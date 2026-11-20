@@ -97,7 +97,7 @@ The module needs Go 1.27; an older `go` command fetches the right toolchain by i
 kube-agents-mcp --version
 ```
 
-It prints `kube-agents` and the bridge's version. Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
+It prints `kube-agents-mcp` and a version: the release for a binary from a release archive, or for a build from source the module version Go recorded (a pseudo-version for `@main`; `dev` when it recorded none). Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
 
 ## Configure Antigravity
 
@@ -124,13 +124,14 @@ Replace both paths with your own. The entry carries no token: the bridge reads i
 - **`env.PATH`** must include the directory of any credential plugin your kubeconfig runs, such as `gke-gcloud-auth-plugin` for a GKE context. An editor started from the desktop does not always inherit your shell's `PATH`, and without the plugin every cluster call fails.
 - **`timeoutSeconds`** raises Antigravity's per-call limit, 180 seconds by default. A `send_message` call waits up to 150 seconds for an answer by default and 300 at most, plus up to 40 seconds for the gateway to take the turn. If Antigravity gives up on a call and cancels it, the bridge stops the turn in the cluster, so keep this above 340.
 
-Three optional settings go in `env` or `args`:
+Four optional settings go in `env` or `args`:
 
-| Setting                                                  | What it does                                                                                                                                               |
-| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KUBECONFIG`                                             | The kubeconfig the bridge reads, as for `kubectl`. Point it at a file holding only the contexts you want scanned.                                          |
-| `KUBE_AGENTS_MCP_CONFIG`, or `--config <path>` in `args` | The bridge's state file, `~/.config/kube-agents/mcp-config.json` by default. A separate file per workspace keeps each workspace's saved installs apart.    |
-| `GH_TOKEN` or `GITHUB_TOKEN`                             | The GitHub token the bridge's `inspect_pr` tool uses to fetch a pull request; without one it falls back to the `github.com` entry in `~/.git-credentials`. |
+| Setting                                                              | What it does                                                                                                                                                                                                                                                                                               |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KUBECONFIG`                                                         | The kubeconfig the bridge reads, as for `kubectl`. Point it at a file holding only the contexts you want scanned.                                                                                                                                                                                          |
+| `KUBE_AGENTS_MCP_CONFIG`, or `--config <path>` in `args`             | The bridge's state file, `~/.config/kube-agents/mcp-config.json` by default. A separate file per workspace keeps each workspace's saved installs apart.                                                                                                                                                    |
+| `GH_TOKEN` or `GITHUB_TOKEN`                                         | The GitHub token the bridge's `inspect_pr` tool uses to fetch a pull request; without one it falls back to the `github.com` entry in `~/.git-credentials`.                                                                                                                                                 |
+| `KUBE_AGENTS_MCP_STREAM_STEPS`, or `--stream-steps <mode>` in `args` | Whether `send_message` and `task_control` return a turn step by step. `auto`, the default, does so for a host that sends a conversation id, as Antigravity does. `off` always returns one plain answer, for a host that shows a running step but never asks for the next one. `on` streams for every host. |
 
 Save the file, then reload it: type `/mcp` in the agent panel, or refresh the list under **Manage MCP Servers**. The `kube-agents` server should list eight tools.
 

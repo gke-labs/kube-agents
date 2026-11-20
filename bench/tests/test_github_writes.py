@@ -1278,3 +1278,14 @@ def test_a_limit_marked_only_in_its_headers_is_a_limit_to_the_client():
         client.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
     assert "rate-limited" in str(exc.value)
     verifiers._last_forge_error_headers.set(None)
+
+
+def test_a_heredoc_inside_an_open_substitution_is_found_on_a_line_with_a_nul_character():
+    """The shell reader writes a NUL character of the line as its literal mark, and
+    ``_opens_heredoc`` compares the reader's text with the line's own text. So the line's text
+    goes through the same form, and the body of the heredoc is still text, not a write."""
+    assert github_writes._opens_heredoc("x=$(cat \x00 ") is True
+    assert github_writes.writing_segments("x=$(cat \x00 <<EOF\ngit push origin HEAD:refs/heads/foo\nEOF\n)") == []
+    # the same line with no NUL character, which no change touches
+    assert github_writes._opens_heredoc("x=$(cat ") is True
+    assert github_writes.writing_segments("x=$(cat <<EOF\ngit push origin HEAD:refs/heads/foo\nEOF\n)") == []

@@ -5,8 +5,6 @@ import (
 	"os"
 	"testing"
 
-	"k8s.io/utils/ptr"
-
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
@@ -25,7 +23,7 @@ func TestMain(m *testing.M) {
 	// stream seam reads a bus whose TASKS has no consumer limit, so the
 	// session cap is maxSessions; tests of the cap set busStreamState.
 	a2aBusStreamStateDefault = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
-		return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: ptr.To(-1)}}, nil
+		return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: -1}}, nil
 	}
 	os.Exit(m.Run())
 }

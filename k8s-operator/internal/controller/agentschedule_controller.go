@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -63,6 +64,22 @@ const (
 	agentScheduleReasonProfileNotFound   = "ProfileNotFound"
 	agentScheduleReasonProfileDisallowed = "ProfileTierDisallowed"
 	agentScheduleReasonNoPlatformAgent   = "NoPlatformAgent"
+	// agentScheduleReasonUserDeferred: a schedule the PlatformAgent didn't
+	// render. User schedules are deferred to Track 7 (#5624; decided B on
+	// #5635): which identity the gateway resolves a creator's tier from is
+	// open, so none fires, and the gateway refuses origin user anyway.
+	agentScheduleReasonUserDeferred = "UserSchedulesDeferred"
+	// agentScheduleReasonInvalidName: a name the run's trigger can't carry.
+	// The trigger name is schedule/<name>, and the gateway holds <name> to a
+	// dot-free DNS-1123 label, so any other name would be refused at every
+	// slot.
+	agentScheduleReasonInvalidName = "InvalidName"
+)
+
+// The Submitted condition's reasons.
+const (
+	agentScheduleReasonSubmitted      = "RunSubmitted"
+	agentScheduleReasonGatewayRefused = "GatewayRefused"
 )
 
 const (
@@ -119,6 +136,9 @@ type ScheduleTaskState struct {
 	Outcome string
 	// CompletedAt is when it ended.
 	CompletedAt time.Time
+	// Delivery is how its report was delivered (an AgentScheduleReport*
+	// value), or empty while the gateway has no record of it.
+	Delivery string
 }
 
 // ScheduleTaskTracker reports on a run in flight.
@@ -133,6 +153,7 @@ const (
 	agentScheduleSkipMissedWindow       = "missed_window"
 	agentScheduleSkipGatewayUnavailable = "gateway_unavailable"
 	agentScheduleSkipRateLimited        = "rate_limited"
+	agentScheduleSkipRefused            = "refused"
 	agentScheduleRunSubmitted           = "submitted"
 )
 
@@ -237,7 +258,13 @@ func runNowKey(sched *agentv1alpha1.AgentSchedule, token string) string {
 func (r *AgentScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var sched agentv1alpha1.AgentSchedule
 	if err := r.Get(ctx, req.NamespacedName, &sched); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// A deleted PlatformAgent's built-in schedules are collected
+			// with it; the last one gone is the cue to close its bus
+			// connection, which reconnects forever otherwise.
+			return ctrl.Result{}, r.forgetIfNoAgent(ctx, req.Namespace)
+		}
+		return ctrl.Result{}, err
 	}
 	pass := &schedulePass{stored: *sched.Status.DeepCopy()}
 	cronSched, agent, accepted, err := r.accept(ctx, &sched, pass)
@@ -261,6 +288,27 @@ func (r *AgentScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return r.fire(ctx, &sched, cronSched, agent, pass)
 }
 
+// forgetIfNoAgent closes the submitter's bus connection for namespace when no
+// PlatformAgent is left there.
+func (r *AgentScheduleReconciler) forgetIfNoAgent(ctx context.Context, namespace string) error {
+	var agents agentv1alpha1.PlatformAgentList
+	if err := r.List(ctx, &agents, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	if len(agents.Items) == 0 {
+		r.forgetNamespace(namespace)
+	}
+	return nil
+}
+
+// forgetNamespace closes the submitter's bus connection for namespace, when
+// the submitter holds one (the bus submitter does; a test's fake doesn't).
+func (r *AgentScheduleReconciler) forgetNamespace(namespace string) {
+	if f, ok := r.Submitter.(interface{ forget(namespace string) }); ok {
+		f.forget(namespace)
+	}
+}
+
 // accept sets the Accepted condition: the schedule parses, and its profile
 // exists and allows the unattended tier. The gateway checks the tier again at
 // every submission, since a profile can change after this ran.
@@ -280,6 +328,12 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		meta.SetStatusCondition(&sched.Status.Conditions, cond)
 		return nil, nil, false, nil
 	}
+	if errs := validation.IsDNS1123Label(sched.Name); len(errs) > 0 {
+		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonInvalidName
+		cond.Message = fmt.Sprintf("the name must be a dot-free DNS-1123 label, since the run's trigger is schedule/<name>: %s", strings.Join(errs, "; "))
+		meta.SetStatusCondition(&sched.Status.Conditions, cond)
+		return nil, nil, false, nil
+	}
 	// A schedule fires only in an install's namespace: one PlatformAgent per
 	// cluster, whose gateway takes its runs. Elsewhere it would submit as the
 	// install's trigger under a name nothing there owns.
@@ -288,12 +342,19 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		return nil, nil, false, err
 	}
 	if len(agents.Items) == 0 {
+		r.forgetNamespace(sched.Namespace)
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonNoPlatformAgent
 		cond.Message = "no PlatformAgent in this namespace: schedules run only in an install's namespace"
 		meta.SetStatusCondition(&sched.Status.Conditions, cond)
 		return nil, nil, false, nil
 	}
 	agent := &agents.Items[0]
+	if agentScheduleOrigin(sched, agent) != agentv1alpha1.AgentScheduleOriginBuiltin {
+		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonUserDeferred
+		cond.Message = "only schedules the PlatformAgent renders run for now; user schedules wait on Track 7 (#5624)"
+		meta.SetStatusCondition(&sched.Status.Conditions, cond)
+		return nil, nil, false, nil
+	}
 	var profile agentv1alpha1.AgentProfile
 	err := r.Get(ctx, types.NamespacedName{Namespace: sched.Namespace, Name: sched.Spec.ProfileRef.Name}, &profile)
 	switch {
@@ -323,7 +384,12 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 	now := r.now()
 	startingDeadline := durationOr(sched.Spec.StartingDeadlineSeconds, agentScheduleDefaultStartingDeadline)
 
-	// 1. A run in flight: did it end, or vanish, or outlive its deadline?
+	// 1. Runs that ended on an earlier pass: how was each one's report
+	// delivered? Asked before the run in flight is tracked, so a run that
+	// ends on this pass, whose answer was just read, isn't asked again until
+	// the next one.
+	r.trackDeliveries(ctx, sched, now)
+	// 1b. A run in flight: did it end, or vanish, or outlive its deadline?
 	if st.ActiveTaskID != "" {
 		r.trackActive(ctx, sched, now, pass)
 	}
@@ -431,11 +497,68 @@ func (r *AgentScheduleReconciler) trackActive(ctx context.Context, sched *agentv
 	}
 	switch {
 	case state.Found && state.Terminal:
+		taskID := st.ActiveTaskID
 		r.settle(pass, sched, state.Outcome, state.CompletedAt)
+		recordDelivery(st, taskID, state.Delivery)
 	case !state.Found:
 		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
 	case st.ActiveTaskStartedAt != nil && now.Sub(st.ActiveTaskStartedAt.UTC()) > deadline+agentScheduleLostGrace:
 		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+	}
+}
+
+// agentScheduleDeliveryWindow is how long after a run ends the reconciler
+// keeps asking how its report was delivered: the relay's redeliveries finish
+// well inside it, and past it the run keeps an empty Delivery.
+const agentScheduleDeliveryWindow = 10 * time.Minute
+
+// awaitingDelivery reports whether run ended recently enough, and with a task
+// the gateway may still hold, for its delivery to be asked after.
+func awaitingDelivery(run agentv1alpha1.AgentScheduleRun, active string, now time.Time) bool {
+	return run.Delivery == "" && run.TaskID != active && run.CompletionTime != nil &&
+		run.Outcome != agentv1alpha1.AgentScheduleOutcomeLost &&
+		now.Sub(run.CompletionTime.UTC()) <= agentScheduleDeliveryWindow
+}
+
+// trackDeliveries asks the gateway, for each recent run still awaiting it, how
+// its report was delivered, and records a final answer. A run settles when it
+// ends, so this never holds up the next slot.
+func (r *AgentScheduleReconciler) trackDeliveries(ctx context.Context, sched *agentv1alpha1.AgentSchedule, now time.Time) {
+	st := &sched.Status
+	for i := range st.RecentRuns {
+		if !awaitingDelivery(st.RecentRuns[i], st.ActiveTaskID, now) {
+			continue
+		}
+		state, err := r.Tracker.State(ctx, sched, st.RecentRuns[i].TaskID)
+		if err != nil {
+			logf.FromContext(ctx).Error(err, "reading a scheduled run's delivery", "schedule", sched.Name, "task", st.RecentRuns[i].TaskID)
+			return
+		}
+		recordDelivery(st, st.RecentRuns[i].TaskID, state.Delivery)
+	}
+}
+
+// recordDelivery stores delivery on taskID's run when it is final and one the
+// status's enum admits, once, counting post_failed and post_unknown. posting, empty or an
+// unknown spelling leaves the run as it was.
+func recordDelivery(st *agentv1alpha1.AgentScheduleStatus, taskID, delivery string) {
+	switch delivery {
+	case agentv1alpha1.AgentScheduleReportNone, agentv1alpha1.AgentScheduleReportLocal, agentv1alpha1.AgentScheduleReportSilent,
+		agentv1alpha1.AgentScheduleReportStoredNoHome, agentv1alpha1.AgentScheduleReportPosted, agentv1alpha1.AgentScheduleReportPostFailed,
+		agentv1alpha1.AgentScheduleReportPostUnknown:
+	default:
+		return
+	}
+	for i := range st.RecentRuns {
+		if st.RecentRuns[i].TaskID == taskID && st.RecentRuns[i].Delivery == "" {
+			st.RecentRuns[i].Delivery = delivery
+			switch delivery {
+			case agentv1alpha1.AgentScheduleReportPostFailed:
+				st.PostFailed++
+			case agentv1alpha1.AgentScheduleReportPostUnknown:
+				st.PostUnknown++
+			}
+		}
 	}
 }
 
@@ -501,10 +624,27 @@ func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agen
 			st.NextScheduleTime = ptrTime(cronSched.Next(now))
 		}
 		pass.count(agentScheduleRunsTotal.WithLabelValues(sched.Name, agentScheduleRunSubmitted))
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+			Type: agentv1alpha1.AgentScheduleConditionSubmitted, Status: metav1.ConditionTrue,
+			Reason: agentScheduleReasonSubmitted, Message: "the gateway took the last run", ObservedGeneration: sched.Generation,
+		})
 		st.PendingSlot = nil
 		return false, nil
 	case errors.Is(err, ErrScheduleRateLimited):
 		r.skip(pass, sched, agentScheduleSkipRateLimited, &st.SkipCounts.RateLimited)
+		r.dropPending(sched, cronSched, now)
+		return false, nil
+	case errors.Is(err, errTriggerRefused):
+		// The gateway refused the submission itself (invalid,
+		// profile_unknown, tier_not_allowed): sending it again won't help, so
+		// the slot is dropped at once and the refusal is shown. The next slot
+		// tries again, since a profile still being published can clear.
+		logf.FromContext(ctx).Error(err, "the gateway refused a scheduled run", "schedule", sched.Name, "key", p.IdempotencyKey)
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+			Type: agentv1alpha1.AgentScheduleConditionSubmitted, Status: metav1.ConditionFalse,
+			Reason: agentScheduleReasonGatewayRefused, Message: agentScheduleRefusalMessage(err), ObservedGeneration: sched.Generation,
+		})
+		pass.count(agentScheduleSkipsTotal.WithLabelValues(sched.Name, agentScheduleSkipRefused))
 		r.dropPending(sched, cronSched, now)
 		return false, nil
 	default:
@@ -527,6 +667,21 @@ func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agen
 		}
 		return true, nil
 	}
+}
+
+// agentScheduleRefusalMaxRunes bounds the refusal shown on the Submitted
+// condition: the gateway's detail is its own text, and a condition message
+// has to fit the API server's limit.
+const agentScheduleRefusalMaxRunes = 1024
+
+// agentScheduleRefusalMessage is a refusal as the Submitted condition shows
+// it.
+func agentScheduleRefusalMessage(err error) string {
+	msg := []rune(err.Error())
+	if len(msg) > agentScheduleRefusalMaxRunes {
+		return string(msg[:agentScheduleRefusalMaxRunes]) + "…"
+	}
+	return string(msg)
 }
 
 // dropPending abandons the claimed slot: a run-now token is marked handled,
@@ -557,6 +712,11 @@ func (r *AgentScheduleReconciler) requeueAfter(sched *agentv1alpha1.AgentSchedul
 	}
 	if sched.Status.ActiveTaskID != "" && agentScheduleActivePoll < d {
 		d = agentScheduleActivePoll
+	}
+	for _, run := range sched.Status.RecentRuns {
+		if awaitingDelivery(run, sched.Status.ActiveTaskID, now) && agentScheduleActivePoll < d {
+			d = agentScheduleActivePoll
+		}
 	}
 	if d < time.Second {
 		d = time.Second
@@ -630,6 +790,18 @@ func (r *AgentScheduleReconciler) schedulesInNamespace(ctx context.Context, obj 
 }
 
 func (r *AgentScheduleReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// The bus side, unless a test injected its own: submissions and status
+	// queries to the gateway's trigger ingress on the operator's own bus
+	// connection (agentschedule_submitter.go).
+	if r.Submitter == nil || r.Tracker == nil {
+		bus := newNATSScheduleSubmitter(newNATSCardPublisher(mgr.GetClient()), mgr.GetClient())
+		if r.Submitter == nil {
+			r.Submitter = bus
+		}
+		if r.Tracker == nil {
+			r.Tracker = bus
+		}
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.AgentSchedule{}).
 		// Only spec changes matter here (a profile's tiers, an install

@@ -54,6 +54,7 @@ EXPECTED_TOOLS = {
     "record_finding_verification",
     "findings_publication",
     "get_first_run_report",
+    "get_alert_history",
 }
 
 

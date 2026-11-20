@@ -60,7 +60,7 @@ func (m *migrationRig) workloadCount() int {
 // phase that has one, and one Warning names the leg and both ways out.
 func TestAnUnknownLegIsHeldInEveryPhase(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
-	for _, leg := range []busMigrationLeg{"Reshape", "Sideways"} {
+	for _, leg := range []busMigrationLeg{"Sideways", "Teleport"} {
 		for _, running := range []int32{1, 3} {
 			for _, phase := range append(append([]busMigrationPhase{}, busMigrationLivePhases...), "Reshaping") {
 				m := newMigrationRig(t, leg, phase, running, time.Now().Add(-time.Hour))
@@ -120,7 +120,7 @@ func TestTheKnownLegsAreNotHeld(t *testing.T) {
 			t.Errorf("OneToThree frozen in %s: %v, want %v", phase, !want, want)
 		}
 	}
-	if !busMigrationLegKnown(busMigrationGrow) || !busMigrationLegKnown(busMigrationShrink) || busMigrationLegKnown("Reshape") || busMigrationLegKnown("") {
+	if !busMigrationLegKnown(busMigrationGrow) || !busMigrationLegKnown(busMigrationShrink) || busMigrationLegKnown("Sideways") || busMigrationLegKnown("") {
 		t.Error("busMigrationLegKnown misreads a leg")
 	}
 	// A known leg's pass is the run's own, not the hold: one to three in
@@ -142,7 +142,7 @@ func TestTheKnownLegsAreNotHeld(t *testing.T) {
 // and offers no retry: only the leg's own operator knows its way back.
 func TestAHeldUnknownLegIsGivenUpByTheAbandonAnnotation(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
-	m := newMigrationRig(t, "Reshape", busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m := newMigrationRig(t, "Sideways", busMigrationRestoring, 3, time.Now().Add(time.Hour))
 	m.agent.Status.BusMigration.Cleared = []string{"TASKS"}
 	meta.SetStatusCondition(&m.agent.Status.Conditions, metav1.Condition{Type: busProvisionedConditionType, Status: metav1.ConditionTrue, Reason: "ProvisionJobComplete"})
 	m.pass(busMigrationRestoring, 3)
@@ -178,7 +178,7 @@ func TestAHeldUnknownLegIsGivenUpByTheAbandonAnnotation(t *testing.T) {
 // the test can tell.
 func TestAFailedUnknownLegTakesNoRetry(t *testing.T) {
 	for _, failedIn := range []busMigrationPhase{busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationClearing, busMigrationUnpinning} {
-		for _, leg := range []busMigrationLeg{busMigrationGrow, "Reshape"} {
+		for _, leg := range []busMigrationLeg{busMigrationGrow, "Sideways"} {
 			m := newMigrationRig(t, leg, busMigrationFailed, 3, time.Now().Add(time.Hour))
 			run := m.agent.Status.BusMigration
 			run.FailedIn = string(failedIn)
@@ -198,7 +198,7 @@ func TestAFailedUnknownLegTakesNoRetry(t *testing.T) {
 // "keep their data".
 func TestAnUnknownLegGivenUpEarlySaysStreamsAreRecreated(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
-	m := newMigrationRig(t, "Reshape", busMigrationHashing, 1, time.Now().Add(time.Hour))
+	m := newMigrationRig(t, "Sideways", busMigrationHashing, 1, time.Now().Add(time.Hour))
 	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
 	m.pass(busMigrationFailed, 1)
 	m.pass(busMigrationFailed, 1)
@@ -211,7 +211,7 @@ func TestAnUnknownLegGivenUpEarlySaysStreamsAreRecreated(t *testing.T) {
 // passes is not.
 func TestTheHoldWarnsOncePerPhase(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
-	m := newMigrationRig(t, "Reshape", busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	m := newMigrationRig(t, "Sideways", busMigrationSnapshot, 1, time.Now().Add(time.Hour))
 	m.pass(busMigrationSnapshot, 1)
 	m.pass(busMigrationSnapshot, 1)
 	m.agent.Status.BusMigration.Phase = string(busMigrationHashing) // the newer operator moved it on, then was rolled back again
@@ -226,7 +226,7 @@ func TestTheHoldWarnsOncePerPhase(t *testing.T) {
 // last pass recorded.
 func TestTheHoldKeepsTheRecordedCountWithNoStatefulSet(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
-	m := newMigrationRig(t, "Reshape", busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m := newMigrationRig(t, "Sideways", busMigrationRestoring, 3, time.Now().Add(time.Hour))
 	if err := m.cl.Delete(context.Background(), m.sts); err != nil {
 		t.Fatal(err)
 	}
@@ -240,9 +240,9 @@ func TestAnEndedUnknownLegDoesNotGateTheNextRun(t *testing.T) {
 	for _, phase := range []busMigrationPhase{busMigrationDone, busMigrationAbandoned} {
 		for _, want := range []int{1, 3} {
 			agent := a2aTestAgent()
-			agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "Reshape", RunID: "3-1", Phase: string(phase)}
+			agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "Sideways", RunID: "3-1", Phase: string(phase)}
 			if !busMigrationWouldStart(agent, want) {
-				t.Errorf("after a %s Reshape run, a change to %d starts nothing", phase, want)
+				t.Errorf("after a %s Sideways run, a change to %d starts nothing", phase, want)
 			}
 		}
 	}
@@ -258,9 +258,9 @@ func TestAnEndedUnknownLegDoesNotGateTheNextRun(t *testing.T) {
 // An unknown leg that ended Abandoned says so, as a known leg's does.
 func TestAnAbandonedUnknownLegHasACondition(t *testing.T) {
 	agent := a2aTestAgent()
-	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "Reshape", RunID: "3-1", Phase: string(busMigrationAbandoned), Cause: "the Restoring phase failed"}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "Sideways", RunID: "3-1", Phase: string(busMigrationAbandoned), Cause: "the Restoring phase failed"}
 	cond, ok := busMigratingCondition(agent)
-	if !ok || cond.Status != metav1.ConditionFalse || cond.Reason != "Abandoned" || !strings.Contains(cond.Message, "Reshape") {
+	if !ok || cond.Status != metav1.ConditionFalse || cond.Reason != "Abandoned" || !strings.Contains(cond.Message, "Sideways") {
 		t.Errorf("condition %+v (%v), want False Abandoned naming the leg", cond, ok)
 	}
 	agent.Status.BusMigration.Phase = string(busMigrationDone)

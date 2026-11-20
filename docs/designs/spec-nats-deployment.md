@@ -82,6 +82,13 @@ another `busReplicas` change while one runs.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.
+- **Reshape**, on request only (the `kubeagents.x-k8s.io/bus-reshape` annotation): TASKS alone is
+  snapshotted, deleted and restored at the width the CR renders, at the count the bus runs,
+  behind the same write freeze as one to three, with the same way back. It starts only on a
+  provisioned bus whose live TASKS is narrower than the render, and never twice for one
+  annotation value, which the bus StatefulSet records. The run's phases are only names the hold below
+  knows, so an operator rolled back to the release that added the hold holds a reshape too
+  (amended 11/19).
 - **A run of a leg this operator does not run** (one a later release started, found after a
   rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
   the bus keeps its count, until the operator that started it is back or a person gives it up
@@ -795,6 +802,14 @@ Layout:
   the provision Job is untouched and an existing install picks the door up on operator
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
+
+  **Amended 10/30 (#3993):** a confirm has a subject of its own, `chat.console.*.confirm`:
+  a frame there is the same ask as one on `.in`, which the gateway submits with
+  `TaskParameters.ChangeRequested`, the one way a task is granted the permit to make a
+  change. `console` is its only publisher and the gateway its only subscriber (the grants
+  arrive with the account split; see the 11/3 amendment below for `console-mcp`, which holds
+  `.in` and not `.confirm`). The gateway's console adapter subscribes it beside `.in`. A
+  frame on `.in` never carries a confirm, whatever its `kind` says.
 
   **Amended 9/24:** the page is served by an operator-rendered console server
   (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
