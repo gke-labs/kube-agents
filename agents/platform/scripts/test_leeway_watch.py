@@ -3056,5 +3056,256 @@ class ResolvedScopeTests(unittest.TestCase):
         ))
 
 
+
+# The operator's nats.conf render, byte for byte (the operator's
+# TestRenderedNATSConfMatchesTheCalloutFixture holds it to the render).
+NATS_CONF_FIXTURE = Path(__file__).resolve().parents[3] / "a2a" / "authcallout" / "testdata" / "rendered-nats.conf"
+# The NATS server's max_payload when the config sets none.
+NATS_SERVER_DEFAULT_MAX_PAYLOAD = 1024 * 1024
+# How many bytes the sizing pass's widest counts may exceed the final ones by.
+COUNT_DIGITS_SLACK = 32
+
+
+def padded_finding(name: str, severity: str = "warning", tier: str = "B") -> dict:
+    """A topology finding about the size of a real one (2.0-2.4 KB compact)."""
+    finding = make_topology_finding(name=name, severity=severity, tier=tier)
+    finding["contributingFactors"].append("x" * 900)
+    return finding
+
+
+def report_with(findings_per_cluster: list[list[dict]]) -> dict:
+    return make_report(
+        [
+            {"cluster": f"p1/us-central1/c{i:03d}", "status": "ok", "topology_findings": findings}
+            for i, findings in enumerate(findings_per_cluster)
+        ]
+    )
+
+
+class TopicPublishCapTests(unittest.TestCase):
+    """The topic write fits one bus message: a report too large is published
+    capped to its most severe findings, never refused by the bus."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def publish(
+        self, report: dict, text: str = "leeway: report", path: Path | None = None
+    ) -> tuple[list[str], str | None]:
+        if path is None:
+            path = self.dir / "report.json"
+            path.write_text(json.dumps(report, indent=watch.JSON_INDENT, sort_keys=True) + "\n", encoding="utf-8")
+        calls: list[tuple[list[str], str | None]] = []
+
+        def fake_run(argv, **kw):
+            calls.append((list(argv), kw.get("input")))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(watch.subprocess, "run", side_effect=fake_run):
+            published, err = watch.publish_blackboard_topic(text, path)
+        self.assertTrue(published)
+        self.assertIsNone(err)
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def capped(self, argv: list[str], stdin: str | None) -> tuple[str, dict]:
+        self.assertEqual(argv[argv.index(watch.A2A_DATA_FLAG) + 1], watch.A2A_DATA_STDIN)
+        self.assertIsNotNone(stdin)
+        return argv[argv.index(watch.A2A_TEXT_FLAG) + 1], json.loads(stdin)
+
+    def assert_fits_one_message(self, text: str, doc: dict) -> None:
+        wire = watch.topic_artifact_size(text, doc) + watch.A2A_ENVELOPE_RESERVE_BYTES
+        self.assertLess(wire, watch.NATS_MAX_PAYLOAD_BYTES)
+        self.assertLessEqual(watch.topic_artifact_size(text, doc), watch.TOPIC_ARTIFACT_BUDGET_BYTES)
+
+    def test_the_limit_is_the_rendered_buses_max_payload(self) -> None:
+        conf = NATS_CONF_FIXTURE.read_text(encoding="utf-8")
+        values = []
+        for line in conf.splitlines():
+            stripped = line.split("#", 1)[0].strip()
+            key, sep, value = stripped.partition(":")
+            if not sep:
+                key, sep, value = stripped.partition("=")
+            if sep and key.strip() == "max_payload":
+                values.append(value.strip())
+        self.assertLessEqual(len(values), 1)
+        limit = int(values[0]) if values else NATS_SERVER_DEFAULT_MAX_PAYLOAD
+        self.assertEqual(watch.NATS_MAX_PAYLOAD_BYTES, limit)
+
+    def test_a_report_under_the_limit_is_published_from_its_file_unchanged(self) -> None:
+        report = report_with([[padded_finding(f"w{j}") for j in range(20)] for _ in range(3)])
+        argv, stdin = self.publish(report)
+        path = self.dir / "report.json"
+        self.assertEqual(argv[argv.index(watch.A2A_DATA_FLAG) + 1], f"@{path}")
+        self.assertIsNone(stdin)
+        self.assertEqual(argv[argv.index(watch.A2A_TEXT_FLAG) + 1], "leeway: report")
+
+    def test_a_report_over_the_limit_is_published_capped_and_fits_one_message(self) -> None:
+        # 16 clusters x 30 findings: about 1.1 MB compact, over the limit.
+        report = report_with([[padded_finding(f"c{i}-w{j}") for j in range(30)] for i in range(16)])
+        self.assertGreater(watch.topic_artifact_size("leeway: report", report), watch.NATS_MAX_PAYLOAD_BYTES)
+        text, doc = self.capped(*self.publish(report))
+        self.assert_fits_one_message(text, doc)
+        # Still a leeway.report/v1alpha1 document a reader of the full one reads.
+        self.assertEqual(doc["schema_version"], watch.SCHEMA_VERSION_VALUE)
+        self.assertEqual(doc["generated_at"], report["generated_at"])
+        self.assertEqual(doc["summary"], report["summary"], "the summary stays the full report's")
+        self.assertEqual([c["cluster"] for c in doc["clusters"]], [c["cluster"] for c in report["clusters"]])
+        for capped_cluster, full_cluster in zip(doc["clusters"], report["clusters"]):
+            kept = capped_cluster["topology_findings"]
+            full = full_cluster["topology_findings"]
+            self.assertEqual(kept, [f for f in full if f in kept], "kept findings stay in report order")
+        findings, ok_clusters, _ = watch.extract_findings(doc)
+        self.assertEqual(len(ok_clusters), 16)
+        truncated = doc[watch.TRUNCATED_FIELD]
+        self.assertEqual(truncated[watch.TRUNCATED_FINDINGS_TOTAL_FIELD], 480)
+        self.assertEqual(truncated[watch.TRUNCATED_FINDINGS_PUBLISHED_FIELD], len(findings))
+        self.assertGreater(len(findings), 0)
+        self.assertEqual(
+            truncated[watch.TRUNCATED_FINDINGS_PUBLISHED_FIELD] + truncated[watch.TRUNCATED_FINDINGS_OMITTED_FIELD], 480
+        )
+        self.assertEqual(
+            truncated[watch.TRUNCATED_OMITTED_BY_SEVERITY_FIELD],
+            {"warning": truncated[watch.TRUNCATED_FINDINGS_OMITTED_FIELD]},
+        )
+        self.assertEqual(truncated[watch.TRUNCATED_FULL_REPORT_FIELD], str((self.dir / "report.json").resolve()))
+        self.assertNotIn(watch.TRUNCATED_CLUSTERS_OMITTED_FIELD, truncated)
+        self.assertTrue(text.startswith("leeway: report (topic copy capped at "))
+        self.assertIn("of 480 findings", text)
+        # The cap fills the budget: the next finding would not have fitted.
+        # (The sizing pass counts every number at its widest, a few bytes over.)
+        kept = report_findings(doc)
+        next_finding = next(f for f in report_findings(report) if f not in kept)
+        self.assertGreater(
+            watch.topic_artifact_size(text, doc) + watch.a2a_encoded_size(next_finding) + COUNT_DIGITS_SLACK,
+            watch.TOPIC_ARTIFACT_BUDGET_BYTES,
+        )
+
+    def test_the_boundary_is_the_artifact_budget(self) -> None:
+        text = "leeway: report"
+        report = report_with([[padded_finding(f"w{j}") for j in range(30)] for _ in range(12)])
+        report["clusters"][0]["topology_findings"][0]["contributingFactors"].append("")
+        pad = report["clusters"][0]["topology_findings"][0]["contributingFactors"]
+        pad[-1] = "y" * (watch.TOPIC_ARTIFACT_BUDGET_BYTES - watch.topic_artifact_size(text, report))
+        self.assertEqual(watch.topic_artifact_size(text, report), watch.TOPIC_ARTIFACT_BUDGET_BYTES)
+        argv, stdin = self.publish(report, text)
+        self.assertIsNone(stdin, "a report exactly at the budget is published unchanged")
+        pad[-1] += "y"
+        argv, stdin = self.publish(report, text)
+        capped_text, doc = self.capped(argv, stdin)
+        self.assert_fits_one_message(capped_text, doc)
+
+    def test_the_cap_keeps_the_most_severe_findings(self) -> None:
+        # Criticals sit last in report order, infos first; tiers vary within each severity.
+        clusters = []
+        for i in range(16):
+            row = [padded_finding(f"c{i}-info{j}", "info", "A") for j in range(10)]
+            row += [padded_finding(f"c{i}-warn{j}", "warning", "BC"[j % 2]) for j in range(10)]
+            row += [padded_finding(f"c{i}-crit{j}", "critical", "CA"[j % 2]) for j in range(10)]
+            clusters.append(row)
+        report = report_with(clusters)
+        text, doc = self.capped(*self.publish(report))
+        self.assert_fits_one_message(text, doc)
+        kept = [f for c in doc["clusters"] for f in c["topology_findings"]]
+        kept_names = {f["subject"]["name"] for f in kept}
+        omitted = [f for c in report["clusters"] for f in c["topology_findings"] if f["subject"]["name"] not in kept_names]
+        self.assertTrue(kept and omitted)
+        self.assertEqual(sum(1 for f in kept if f["severity"] == "critical"), 160, "every critical fits and is kept")
+        rank = watch.finding_sort_key
+        self.assertLessEqual(max(rank(f) for f in kept), min(rank(f) for f in omitted))
+        omitted_by_severity = doc[watch.TRUNCATED_FIELD][watch.TRUNCATED_OMITTED_BY_SEVERITY_FIELD]
+        self.assertNotIn("critical", omitted_by_severity)
+        self.assertEqual(sum(omitted_by_severity.values()), len(omitted))
+
+    def test_clusters_too_many_to_fit_are_left_out_and_counted(self) -> None:
+        report = report_with([[padded_finding(f"c{i}")] for i in range(40)])
+        # Room for a quarter of the clusters with their findings stripped, so
+        # even the bare cluster entries do not fit and are left out.
+        bare = [{**c, "topology_findings": []} for c in report["clusters"]]
+        budget = watch.topic_artifact_size("t", {**report, "clusters": bare[:10]})
+        with mock.patch.object(watch, "TOPIC_ARTIFACT_BUDGET_BYTES", budget):
+            text, doc = self.capped(*self.publish(report, "t"))
+            self.assertLessEqual(watch.topic_artifact_size(text, doc), budget)
+        self.assertEqual(doc["clusters"], [])
+        self.assertEqual(doc["summary"], report["summary"])
+        truncated = doc[watch.TRUNCATED_FIELD]
+        self.assertEqual(truncated[watch.TRUNCATED_CLUSTERS_OMITTED_FIELD], 40)
+        self.assertEqual(truncated[watch.TRUNCATED_FINDINGS_PUBLISHED_FIELD], 0)
+        self.assertEqual(truncated[watch.TRUNCATED_FINDINGS_OMITTED_FIELD], 40)
+
+    def test_a_smaller_less_severe_finding_never_takes_the_place_of_a_more_severe_one(self) -> None:
+        small_critical = padded_finding("small-crit", "critical", "A")
+        large_critical = padded_finding("large-crit", "critical", "B")
+        large_critical["contributingFactors"].append("z" * 50000)
+        small_warning = padded_finding("small-warn", "warning", "A")
+        report = report_with([[small_critical, large_critical, small_warning]])
+        # Room for both small findings and the truncated block, not the large one.
+        both_small = report_with([[small_critical, small_warning]])
+        budget = watch.topic_artifact_size("t", both_small) + 5000
+        self.assertGreater(watch.topic_artifact_size("t", report), budget)
+        with mock.patch.object(watch, "TOPIC_ARTIFACT_BUDGET_BYTES", budget):
+            text, doc = self.capped(*self.publish(report, "t"))
+            self.assertLessEqual(watch.topic_artifact_size(text, doc), budget)
+        self.assertEqual([f["subject"]["name"] for f in report_findings(doc)], ["small-crit"])
+        self.assertEqual(
+            doc[watch.TRUNCATED_FIELD][watch.TRUNCATED_OMITTED_BY_SEVERITY_FIELD], {"critical": 1, "warning": 1}
+        )
+
+    def test_one_severity_is_kept_tier_a_then_b_then_c(self) -> None:
+        report = report_with([[padded_finding(f"tier-{t}", "warning", t)] for t in "CBA"])
+        bare = report_with([[] for _ in "CBA"])
+        full = watch.topic_artifact_size("t", report) + 2000
+        admitted: list[str] = []
+        for budget in range(watch.topic_artifact_size("t", bare), full, 100):
+            with mock.patch.object(watch, "TOPIC_ARTIFACT_BUDGET_BYTES", budget):
+                _, doc = watch.cap_topic_report(report, "t", self.dir / "report.json")
+            for f in report_findings(doc):
+                if f["tier"] not in admitted:
+                    admitted.append(f["tier"])
+        self.assertEqual(admitted, ["A", "B", "C"])
+
+    def test_the_text_part_counts_toward_the_size(self) -> None:
+        doc = report_with([[padded_finding("w0")]])
+        base = watch.topic_artifact_size("", doc)
+        short = watch.topic_artifact_size("x" * 100, doc) - base
+        long = watch.topic_artifact_size("x" * 200, doc) - base
+        self.assertGreater(short, 100)
+        self.assertEqual(long - short, 100)
+
+    def test_the_cap_leaves_room_for_a_large_summary_text(self) -> None:
+        # A summary tens of KB long must come out of the findings' share: the
+        # capped artifact, text included, still fits the budget.
+        report = report_with([[padded_finding(f"c{i}-w{j}") for j in range(30)] for i in range(16)])
+        text, doc = self.capped(*self.publish(report, text="x" * 40000))
+        self.assertLessEqual(watch.topic_artifact_size(text, doc), watch.TOPIC_ARTIFACT_BUDGET_BYTES)
+
+    def test_full_report_names_the_timestamped_file_behind_latest_json(self) -> None:
+        report = report_with([[padded_finding(f"c{i}-w{j}") for j in range(30)] for i in range(16)])
+        target = self.dir / "20261118T000000Z.json"
+        target.write_text(json.dumps(report, indent=watch.JSON_INDENT, sort_keys=True) + "\n", encoding="utf-8")
+        link = self.dir / watch.LATEST_JSON_LINK_NAME
+        link.symlink_to(target.name)
+        text, doc = self.capped(*self.publish(report, path=link))
+        full_report = doc[watch.TRUNCATED_FIELD][watch.TRUNCATED_FULL_REPORT_FIELD]
+        self.assertEqual(full_report, str(target.resolve()))
+        self.assertNotEqual(full_report, str(link))
+        self.assertIn(str(target.resolve()), text)
+
+    def test_the_size_counts_what_gos_encoder_escapes(self) -> None:
+        self.assertEqual(watch.a2a_encoded_size({"a": "x"}), len('{"a":"x"}'))
+        self.assertEqual(watch.a2a_encoded_size("<>&"), len('"\\u003c\\u003e\\u0026"'))
+        line_separators = chr(0x2028) + chr(0x2029)
+        self.assertEqual(watch.a2a_encoded_size(line_separators), len('"\\u2028\\u2029"'))
+        self.assertEqual(watch.a2a_encoded_size("é"), len('"é"'.encode("utf-8")))
+
+
+def report_findings(report: dict) -> list[dict]:
+    return [f for c in report["clusters"] for f in c.get("topology_findings") or []]
+
+
 if __name__ == "__main__":
     unittest.main()

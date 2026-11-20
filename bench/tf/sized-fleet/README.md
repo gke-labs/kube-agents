@@ -26,9 +26,13 @@ python3 hack/sized_fleet.py verify --size M   # the designed state and the churn
 python3 hack/sized_fleet.py down   --size M   # delete it all
 ```
 
+A run on a built fleet: `run --size M --down` resets the host install, runs the burst and soak windows, writes the records, and deletes the fleet when it ends; `--eval-cases` adds the soak window's eval cases. `install` puts the host on the newest `main` commit whose images are all published, and `sweep` deletes a fleet an aborted run left. `hack/ci-scale-nightly.sh` runs `sweep`, `install`, `up` and `run` in that order, as the nightly does.
+
 Each size is its own state, in the project's `<project>-tf-state` bucket under the prefix `sized-fleet-<size>`, so `down` from any checkout deletes a fleet a crashed run left. `up` writes the clusters' credentials to a private kubeconfig in the temp directory (`--kubeconfig` moves it).
 
 ## One-time setup in a project
+
+`hack/sized_fleet_testbed.sh --project-id=<project>` does all of this section, idempotently, and labels the host cluster `purpose=harness-scale` once kube-agents is installed on it. The steps by hand:
 
 The nodes run as a service account created once, outside the stack, so the identity that applies the stack needs no right to create service accounts. Its roles are the node-agent minimum, as the seeded fleet's nodes have:
 
