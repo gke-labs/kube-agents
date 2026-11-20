@@ -1660,20 +1660,15 @@ start_ledger_token_renewal() { # <label> <file>
   (
     waited=0
     failures=0
-    nap="" starting="" stopping=""
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
-    # command only once it has returned. While the nap is being started its
-    # pid is not known yet, so the trap only marks the stop and the line after
-    # the fork ends that nap.
-    trap 'if [ -n "${starting}" ]; then stopping=1; else [ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0; fi' TERM
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
+    # a TERM to arrive ahead of.
+    napping=""
+    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
     while :; do
-      starting=1
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
-      nap=$!
-      starting=""
-      [ -z "${stopping}" ] || { kill "${nap}" 2>/dev/null || true; exit 0; }
-      wait "${nap}" 2>/dev/null || true
-      nap=""
+      wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
@@ -1702,10 +1697,13 @@ start_ledger_token_renewal() { # <label> <file>
 
 # Ends the renewer and removes the file. The renewer traps TERM, and bash runs a
 # trap only once the foreground command returns, so the wait below outlasts the
-# one command under way (a mint call, a retry sleep, a write or an mv) and the
-# renewer runs nothing after it: a mint in progress is abandoned there, and the
-# rm is final. Killed outright, the renewer would leave that command running to
-# write a live token after the rm.
+# one command under way and the renewer runs nothing after it: the rm is final.
+# Killed outright, the renewer would leave that command running to write a live
+# token after the rm. A mint under way here is abandoned after its current
+# command (a mint call or a retry sleep), which leaves mint_ledger_token's
+# diagnostics file behind. The GitOps write token's mint is one command
+# substitution, so its whole retry ladder finishes first and its token is
+# dropped unwritten.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
@@ -1785,20 +1783,15 @@ start_gitops_write_token() { # <label> <file>
   (
     waited=0
     failures=0
-    nap="" starting="" stopping=""
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
-    # command only once it has returned. While the nap is being started its
-    # pid is not known yet, so the trap only marks the stop and the line after
-    # the fork ends that nap.
-    trap 'if [ -n "${starting}" ]; then stopping=1; else [ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0; fi' TERM
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
+    # a TERM to arrive ahead of.
+    napping=""
+    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
     while :; do
-      starting=1
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
-      nap=$!
-      starting=""
-      [ -z "${stopping}" ] || { kill "${nap}" 2>/dev/null || true; exit 0; }
-      wait "${nap}" 2>/dev/null || true
-      nap=""
+      wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
