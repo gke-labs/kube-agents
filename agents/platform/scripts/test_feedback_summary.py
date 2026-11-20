@@ -94,6 +94,20 @@ OTHER_LITELLM_CONFIG_YAML = """model_list:
       model: openai/gpt-4o
 """
 
+EFFORT_LITELLM_CONFIG_YAML = """model_list:
+  - model_name: model-default
+    litellm_params:
+      model: openai/gpt-4o
+      reasoning_effort: "medium"
+"""
+
+EFFORT_FIRST_LITELLM_CONFIG_YAML = """model_list:
+  - model_name: model-default
+    litellm_params:
+      reasoning_effort: medium
+      model: openai/gpt-4o
+"""
+
 SERVER_VERSION = {"serverVersion": {"gitVersion": "v1.33.4-gke.1234000"}}
 
 
@@ -355,6 +369,39 @@ class RenderTest(unittest.TestCase):
         del cr["status"]["inference"]
         text = fs.render(full_snapshot(cr=cr, litellm_config=OTHER_LITELLM_CONFIG_YAML))
         self.assertIn("\n  model: openai/gpt-4o\n", text)
+
+    def test_the_reasoning_effort_line_reads_status_inference(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"]["reasoningEffort"] = "high"
+        text = fs.render(full_snapshot(cr=cr))
+        self.assertIn("\n  model: vertex_ai/claude-opus-5\n  reasoning effort: high\n", text)
+
+    def test_an_unset_reasoning_effort_prints_unset_beside_a_known_model(self):
+        text = fs.render(full_snapshot())
+        self.assertIn("\n  model: vertex_ai/claude-opus-5\n  reasoning effort: unset\n", text)
+
+    def test_the_reasoning_effort_is_unavailable_when_the_model_is(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"] = {}
+        text = fs.render(full_snapshot(cr=cr))
+        self.assertIn("\n  model: unavailable\n  reasoning effort: unavailable\n", text)
+        cr["status"]["inference"] = {"provider": "vertex_ai", "reasoningEffort": "high"}
+        self.assertIn("\n  reasoning effort: unavailable\n", fs.render(full_snapshot(cr=cr)))
+
+    def test_an_absent_inference_key_reads_the_effort_from_the_model_default_entry(self):
+        cr = json.loads(json.dumps(CR))
+        del cr["status"]["inference"]
+        text = fs.render(full_snapshot(cr=cr, litellm_config=EFFORT_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  model: openai/gpt-4o\n  reasoning effort: medium\n", text)
+        text = fs.render(full_snapshot(cr=cr, litellm_config=EFFORT_FIRST_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  reasoning effort: medium\n", text)
+        text = fs.render(full_snapshot(cr=cr, litellm_config=OTHER_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  reasoning effort: unset\n", text)
+
+    def test_the_effort_is_unavailable_when_the_first_qualified_scan_answered(self):
+        config = "model_list:\n- model_name: x\n  litellm_params:\n    model: gemini/g\n    reasoning_effort: high\n"
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(config), fs.UNAVAILABLE)
+        self.assertEqual(fs.reasoning_effort_from_litellm_config(None), fs.UNAVAILABLE)
 
     def test_the_environment_lines_print_in_the_shared_key_order(self):
         text = fs.render(full_snapshot(scale=None))

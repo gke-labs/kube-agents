@@ -17,8 +17,9 @@ module assembles that block from four sources and nothing else:
   stands in, rendered the same way the chat gateway's ``/feedback summary``
   renders it;
 * ``kubectl version`` and cluster object counts for the Kubernetes version and the
-  cluster scale line (optional); the model name is the resource's ``status.inference``,
-  and the gateway's ConfigMap whenever the status has no ``inference`` key (optional):
+  cluster scale line (optional); the model name and its reasoning effort are the
+  resource's ``status.inference``, and the gateway's ConfigMap whenever the status has
+  no ``inference`` key (optional):
   under an operator older than the field, before this operator's first Ready write
   (so for a CR Degraded since it was created), and under a served CRD that prunes
   the field.
@@ -54,7 +55,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextI
 
 # Independent of the gateway's usageSummaryMaxLines: this block has lines the
 # gateway's lacks.
-SUMMARY_MAX_LINES = 59
+SUMMARY_MAX_LINES = 60
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
@@ -291,11 +292,16 @@ PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^
 LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
 #: The environment lines, in the order the block prints them; the gateway's
 #: usageSummaryEnvironmentKeys verbatim.
-ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "kubernetes", "installed", "interfaces")
-#: ``status.inference``: the operator's reading of the install's default model.
+ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "reasoning effort", "kubernetes", "installed", "interfaces")
+#: ``status.inference``: the operator's reading of the install's default model, and
+#: of the reasoning effort configured on it.
 INFERENCE_STATUS_KEY = "inference"
 INFERENCE_PROVIDER_FIELD = "provider"
 INFERENCE_MODEL_FIELD = "model"
+INFERENCE_REASONING_EFFORT_FIELD = "reasoningEffort"
+#: The ``reasoning effort`` line's value when the model is known and the config
+#: states no effort, so the model thinks at its own default.
+REASONING_EFFORT_UNSET = "unset"
 #: The model line's start; the audit runs over the block without this line.
 MODEL_LINE_PREFIX = "  model: "
 #: The lines printed by design, each removed (its first occurrence) before the audit.
@@ -338,6 +344,15 @@ LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     r"[ \t]+litellm_params:[ \t]*(?:#[^\n]*)?\n"
     r"(?:(?:[ \t]+(?![ \t-])(?!model:)[^\n]*)?\n)*?"
     r"[ \t]+model:[ \t]*(?P<mq>['\"]?)(?P<model>[^'\"\s#]*)(?P=mq)",
+    re.MULTILINE,
+)
+#: The same entry's ``reasoning_effort:`` line, quoted or bare, before or after its
+#: ``model:`` line, captured possibly empty; read on the same fallback path, and only
+#: when the ``model-default`` entry is the one that answered the model line.
+LITELLM_DEFAULT_ENTRY_REASONING_EFFORT = re.compile(
+    LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
+    r"(?:(?:[ \t]+(?![ \t-])(?!reasoning_effort:)[^\n]*)?\n)*?"
+    r"[ \t]+reasoning_effort:[ \t]*(?P<eq>['\"]?)(?P<effort>[^'\"\s#]*)(?P=eq)",
     re.MULTILINE,
 )
 #: A CRLF line end, normalised to LF before the LiteLLM regexes run: MULTILINE ``$``
@@ -601,6 +616,21 @@ def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
     return None
 
 
+def reasoning_effort_from_litellm_config(config_yaml: Optional[str]) -> str:
+    """The ``reasoning effort`` line on the fallback path: the ``reasoning_effort`` of
+    the ``model-default`` entry when that entry answers the model line (UNSET when it
+    states none), UNAVAILABLE otherwise, the first-qualified scan included, whose
+    entry this reader does not know."""
+    if not config_yaml:
+        return UNAVAILABLE
+    config_yaml = config_yaml.replace(CRLF_LINE_END, LF_LINE_END)
+    if not LITELLM_DEFAULT_NAME_LINE.search(config_yaml) or model_from_litellm_config(config_yaml) is None:
+        return UNAVAILABLE
+    match = LITELLM_DEFAULT_ENTRY_REASONING_EFFORT.search(config_yaml)
+    effort = match.group("effort") if match else ""
+    return effort or REASONING_EFFORT_UNSET
+
+
 def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
     """``provider/model`` from ``status.inference``; UNAVAILABLE when the key is
     present without both fields (the operator's definite negative); None when the
@@ -615,6 +645,21 @@ def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
     if isinstance(provider, str) and isinstance(model, str) and provider and model:
         return f"{provider}{MODEL_SEGMENT_SEPARATOR}{model}"
     return UNAVAILABLE
+
+
+def reasoning_effort_from_status(status: Mapping[str, Any]) -> Optional[str]:
+    """The ``reasoning effort`` line from ``status.inference``: None when the key is
+    absent (the fallback path answers); UNAVAILABLE whenever the model line is; UNSET
+    when the pair is present without an effort; the effort as written otherwise."""
+    model = model_from_status(status)
+    if model is None:
+        return None
+    if model == UNAVAILABLE:
+        return UNAVAILABLE
+    effort = status[INFERENCE_STATUS_KEY].get(INFERENCE_REASONING_EFFORT_FIELD)
+    if isinstance(effort, str) and effort:
+        return effort
+    return REASONING_EFFORT_UNSET
 
 
 # --- the roll-up ----------------------------------------------------------------
@@ -858,13 +903,16 @@ def render(snapshot: Snapshot) -> str:
     usage = status.get("usage") or {}
     lines: List[str] = ["```", f"{SUMMARY_TITLE} ({now.strftime('%Y-%m-%d')})", "environment:"]
     model = model_from_status(status)
+    effort = reasoning_effort_from_status(status)
     if model is None:
         model = model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE
+        effort = reasoning_effort_from_litellm_config(snapshot.litellm_config)
     interfaces = usage.get("activeInterfaces") or []
     environment = {
         "version": (spec.get("deployment") or {}).get("tag") or UNKNOWN,
         "mode": spec.get("mode") or DEFAULT_MODE,
         "model": model,
+        "reasoning effort": effort,
         "kubernetes": _server_version(snapshot.server_version),
         "installed": f"{_install_age(cr, now)}; ready: {_ready(cr)}",
         "interfaces": ", ".join(sorted(str(i) for i in interfaces)) or NONE,
