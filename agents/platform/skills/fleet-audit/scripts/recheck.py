@@ -362,7 +362,7 @@ def read_target(
 
     `dump` is None when nothing was read or the read failed its gate, and
     `reason` then says why; `command` is the read as run, or "" when it never
-    ran. Shared with `pdb_safety`, which reads the same namespace before a
+    ran. Shared with `fix_preflight`, which reads the same namespace before a
     budget's pull request opens.
     """
     parts = cluster_parts(target.cluster)

@@ -4,30 +4,30 @@ The recipe interface (`fix_recipes/registry.checks_module`): :data:`read_kinds`
 is the one namespace read the checks need, and :func:`checks` takes the fix
 (`change`: the workload, namespace, budget name and selector) and that read
 (`live`) and returns one named result per check, each `pass`, `fail` or
-`unknown`. The credential broker's label gate (`vcs_broker`) reads both
-through the registry rather than naming this module.
+`unknown`. Two callers run it, each on its own read: the credential broker's
+label gate (`vcs_broker`) and the sandbox's pre-flight before the pull request
+opens (`fleet-audit/scripts/fix_preflight.py`), which writes the answer into
+the body. Both load it through the registry rather than naming this module.
 
-Before the broker may mark a fleet-audit `no-pdb` fix as one a pipeline could
-merge without a review, it runs the checks the sandbox's `pdb_safety.py` runs for
-the pull request's body itself, on one namespace read with its own credential,
-because nothing the sandbox reports can be trusted for that: `replicas-ready`
-(with an autoscaler's floor), `no-overlapping-budget` and `selector-matches`
-(Jobs and CronJobs included), behind the audit's scope rules S1-S5
-(`in_scope`): a workload the audit would not read is never eligible. The
-caller owns two things this cannot see. Whether the cluster is inside the
-install's declared scope, before it reads anything. And whether the read is
-whole: `judge` cannot tell "no budgets or autoscalers" from "not read", so a
-partial read (a failed or forbidden kind) must be refused before it gets here,
-as the sandbox's `recheck._gate` does. The budget file's own shape is
-`automerge_eligibility.parse_budget`'s.
+The checks: `replicas-ready` (with an autoscaler's floor),
+`no-overlapping-budget` and `selector-matches` (Jobs and CronJobs included),
+behind the audit's scope rules S1-S5 (`in_scope`): a workload the audit would
+not read is never eligible. The broker cannot trust what the sandbox reports,
+so it reads the namespace again with its own credential. The caller owns two
+things this cannot see. Whether the cluster is inside the install's declared
+scope, before it reads anything. And whether the read is whole: `judge` cannot
+tell "no budgets or autoscalers" from "not read", so a partial read (a failed
+or forbidden kind) must be refused before it gets here, as
+`recheck.read_target` does for the sandbox. The budget file's own shape is
+`automerge_eligibility.parse_budget`'s in the broker and
+`fix_preflight.budget_from_text`'s in the sandbox.
 
-One deliberate difference from the sandbox: a live budget whose selector this
-cannot read (an operator it does not know) counts as overlapping, where
-`collect.selector_matches` skips the unknown term. The broker's answer is the
-stricter one.
+A live budget whose selector this cannot read (an operator it does not know)
+counts as overlapping, where `collect.selector_matches` skips the unknown
+term: the stricter answer, for both callers.
 
-`fleet-audit/scripts/test_broker_checks_parity.py` holds the verdicts and the
-copied rules to the sandbox's own. Stdlib only: the credential-proxy image ships
+`fleet-audit/scripts/test_broker_checks_parity.py` holds the copied scope rules
+to the audit's own (`collect`). Stdlib only: the credential-proxy image ships
 the scripts directory, this recipe's included, and nothing from the fleet-audit
 skill.
 """
@@ -51,7 +51,9 @@ WORKLOAD_API_VERSION = "apps/v1"
 #: The kinds one namespace read needs: the targets, every other pod template a
 #: selector could reach (Jobs and CronJobs too), the autoscalers, and the
 #: budgets already there.
-READ_KINDS = "deployments,statefulsets,daemonsets,cronjobs,jobs,poddisruptionbudgets,horizontalpodautoscalers"
+# In the order the sandbox's pre-flight has always read them, since the PR
+# body shows the read as a command to reproduce.
+READ_KINDS = "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers,cronjobs,jobs"
 #: The recipe interface's name for the same read.
 read_kinds = READ_KINDS
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
@@ -174,12 +176,13 @@ def judge(dump: dict, obj: str, namespace: str, budget_name: str, selector: dict
     kind, _, name = obj.partition("/")
     items = [i for i in dump.get("items") or [] if (i.get("metadata") or {}).get("namespace") == namespace]
     workload = next((i for i in items if i.get("kind") == kind and _name(i) == name), None)
+    # The sandbox pre-flight's wording (`recheck.in_scope_workload`), which the PR body shows.
     if workload is None or kind not in BUDGET_TARGET_KINDS:
-        return unanswered(f"{obj} in {namespace} was not found")
+        return unanswered(f"{obj} in {namespace} was not found, so no-pdb was not re-derived")
     if not in_scope(workload):
         return unanswered(
-            f"{obj} in {namespace} is outside the audit's scope (scaled to zero, opted out, "
-            "owned by another controller, or in a system namespace)"
+            f"{obj} in {namespace} is present but outside the audit's scope (scaled to zero, opted out, "
+            "owned by another controller, or in a system namespace), so no-pdb was not re-derived"
         )
     spec = workload.get("spec") or {}
     status = workload.get("status") or {}
@@ -233,8 +236,10 @@ def judge(dump: dict, obj: str, namespace: str, budget_name: str, selector: dict
         and (template := _pod_template_labels(i)) is not None
         and selector_matches(selector, template)
     )
-    if not any(selector.get(key) for key in SELECTOR_KEYS) or set(selector) - set(SELECTOR_KEYS):
-        why = "the budget's selector is empty or has keys policy/v1 does not take"
+    if not any(selector.get(key) for key in SELECTOR_KEYS):
+        why = "the budget's selector is empty and would select every pod in the namespace"
+    elif set(selector) - set(SELECTOR_KEYS):
+        why = "the budget's selector has keys policy/v1 does not take"
     elif not selector_matches(selector, labels):
         why = "the budget's selector does not select the workload's pods"
     elif selector != own:
