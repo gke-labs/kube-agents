@@ -569,3 +569,19 @@ func TestAnInvalidByteEarlyInACappedOutputKeepsTheRest(t *testing.T) {
 		t.Errorf("text starts %q, want the script's bytes as written", got[:8])
 	}
 }
+
+// A script that exits 0 while a child it started still holds its stdout, with its bound passing
+// before the worker stops waiting on the pipe, is reported by its exit, not as a timeout: the
+// script finished inside its bound.
+func TestAScriptThatExitsZeroWithAChildHoldingItsOutputIsNotATimeout(t *testing.T) {
+	root, _ := scriptRoot(t)
+	p := filepath.Join(root, "linger.sh")
+	writeScript(t, p, "#!/bin/sh\nsleep 30 &\necho done\nexit 0\n", 0o755)
+	// The bound is shorter than the grace the worker gives a held pipe, so it passes while the
+	// child holds stdout.
+	timeout := scriptKillGrace / 4
+	r := execScript(context.Background(), &scriptRun{name: "linger", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: timeout}, scriptSignals{})
+	if r.timedOut || r.exitCode != 0 || r.startErr != nil || !strings.HasPrefix(r.stdout, "done") {
+		t.Errorf("timedOut %v exit %d startErr %v stdout %q; want a success by its exit", r.timedOut, r.exitCode, r.startErr, r.stdout)
+	}
+}

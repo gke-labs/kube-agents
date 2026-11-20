@@ -338,11 +338,15 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	<-watchDone
 	res.abandoned, res.canceled = watchedAbandon, watchedCancel
 	res.stdout, res.stderr = stdout.text(), stderr.String()
+	// A script that exited on its own (not killed by a signal) finished inside its bound, even when
+	// the bound passed while the worker waited, up to scriptKillGrace, on a pipe a child it started
+	// still held: its exit status, not the timeout, is how it ended.
+	exitedOnItsOwn := cmd.ProcessState != nil && cmd.ProcessState.Exited()
 	switch {
 	case res.abandoned, res.canceled:
 	case ctx.Err() != nil:
 		res.stopped = true
-	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
+	case errors.Is(runCtx.Err(), context.DeadlineExceeded) && !exitedOnItsOwn:
 		res.timedOut = true
 	}
 	var exitErr *exec.ExitError
