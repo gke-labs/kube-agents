@@ -5448,14 +5448,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// telemetry and policy results, which take a discovery to produce.
 	newActiveInterfaces := resolveActiveInterfaces(agent)
 
-	// The install's default model, read from its LiteLLM config. A negative clears
-	// both fields; a failed read keeps the pair the status carries, so a transient
+	// The install's default model, read from its LiteLLM config, with the reasoning
+	// effort its entry states (empty on a found read when it states none). A negative
+	// clears every field; a failed read keeps what the status carries, so a transient
 	// error never blanks it. Gated like activeInterfaces while the served CRD
-	// prunes the block.
+	// prunes the block or the effort.
 	newInference := agent.Status.Inference
 	switch model, read := r.readInferenceModel(ctx, agent); read {
 	case inferenceReadFound:
-		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model}
+		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model, ReasoningEffort: model.ReasoningEffort}
 	case inferenceReadNegative:
 		newInference = &agentv1alpha1.InferenceStatus{}
 	}
@@ -5610,7 +5611,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Copied before the write: decoding the response may reuse the pointer's target.
 	var wroteInference *inferenceModel
 	if newInference != nil {
-		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
+		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model, ReasoningEffort: newInference.ReasoningEffort}
 	}
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, a2aTasksWaitRequeue, err

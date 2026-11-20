@@ -629,3 +629,89 @@ func TestParseLiteLLMDefaultModelReadsTheReasoningEffort(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateStatusReadyWritesAndClearsTheReasoningEffort(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	cm := litellmConfigMap("litellm-config", time.Now(), "vertex_ai/gemini-3.8-flash")
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "vertex_ai/gemini-3.8-flash", "reasoning_effort: high")
+	r := inferenceReconciler(t, nil, agent, cm)
+
+	settleReady(t, r, agent)
+	stored := readBack(t, r, agent)
+	want := &agentv1alpha1.InferenceStatus{Provider: "vertex_ai", Model: "gemini-3.8-flash", ReasoningEffort: "high"}
+	if !inferenceStatusEqual(stored.Status.Inference, want) {
+		t.Fatalf("status.inference = %+v, want %+v", stored.Status.Inference, want)
+	}
+
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfg(agentModelName, "vertex_ai/gemini-3.8-flash")
+	if err := r.Update(context.Background(), cm); err != nil {
+		t.Fatal(err)
+	}
+	settleReady(t, r, stored)
+	stored = readBack(t, r, agent)
+	want.ReasoningEffort = ""
+	if !inferenceStatusEqual(stored.Status.Inference, want) {
+		t.Fatalf("status.inference = %+v after the key was removed, want %+v", stored.Status.Inference, want)
+	}
+}
+
+// A served CRD from before reasoningEffort keeps the pair and drops the effort. The echo
+// is recorded like a pruned block, so the gate holds until the record ages rather than
+// writing the effort back on every pass.
+func TestUpdateStatusReadyRecordsAPrunedReasoningEffort(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	counter := &statusWriteCounter{}
+	funcs := counter.interceptors()
+	persist := funcs.SubResourceUpdate
+	pruning := true
+	funcs.SubResourceUpdate = func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && pruning && pa.Status.Inference != nil {
+			pa.Status.Inference.ReasoningEffort = ""
+		}
+		return persist(ctx, cl, subResourceName, obj, opts...)
+	}
+	cm := litellmConfigMap("litellm-config", time.Now(), "gemini/gemini-3.5-flash")
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "gemini/gemini-3.5-flash", "reasoning_effort: high")
+	r := inferenceReconciler(t, &funcs, agent, cm)
+
+	settleReady(t, r, agent)
+	pair := &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}
+	if !inferenceStatusEqual(agent.Status.Inference, pair) {
+		t.Fatalf("the fixture did not prune the effort alone (got %+v)", agent.Status.Inference)
+	}
+	if !r.inferencePruned(agent) {
+		t.Fatal("the echo dropped reasoningEffort and no record was kept")
+	}
+	settleReady(t, r, agent)
+	settleReady(t, r, agent)
+	if counter.writes != 1 {
+		t.Errorf("%d status writes across three passes under a pruning CRD, want 1", counter.writes)
+	}
+
+	age := func() {
+		r.prunedNewerFieldsMu.Lock()
+		r.prunedNewerFields[usagePollKey(agent)][inferenceNewerField] = time.Now().Add(-2 * usageStatusReprobeInterval)
+		r.prunedNewerFieldsMu.Unlock()
+	}
+	age()
+	settleReady(t, r, agent)
+	settleReady(t, r, agent)
+	if counter.writes != 2 {
+		t.Errorf("%d writes after the record aged under a still-pruning CRD, want 2", counter.writes)
+	}
+
+	pruning = false
+	age()
+	settleReady(t, r, agent)
+	full := &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash", ReasoningEffort: "high"}
+	if counter.writes != 3 || !inferenceStatusEqual(agent.Status.Inference, full) {
+		t.Fatalf("after the CRD was applied: %d writes, status.inference=%+v; want 3 and %+v", counter.writes, agent.Status.Inference, full)
+	}
+	if r.inferencePruned(agent) {
+		t.Error("the echo carried the effort and the record was not cleared")
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 3 {
+		t.Errorf("%d writes on an unchanged pass, want 3", counter.writes)
+	}
+}

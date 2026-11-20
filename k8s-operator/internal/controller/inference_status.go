@@ -337,8 +337,10 @@ func (r *PlatformAgentReconciler) inferencePruned(agent *agentv1alpha1.PlatformA
 // is nil when the write carried no block. A block written that comes back absent is
 // the served CRD pruning it, the empty pair (a definite negative) included: a CRD that
 // serves the field round-trips {} as a present empty object. A non-empty pair that
-// comes back with both fields empty is pruning too. Either is recorded, and logged
-// once per record. An echo that carries the written pair clears the record.
+// comes back with both fields empty is pruning too, and so is the written pair coming
+// back with the reasoning effort alone dropped: a served CRD from before that field
+// keeps the pair and prunes the effort. Each is recorded under the one record, and
+// logged once per record. An echo that carries everything written clears the record.
 func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wrote *inferenceModel) {
 	if wrote == nil {
 		return
@@ -347,11 +349,13 @@ func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *
 	key := usagePollKey(agent)
 	r.prunedNewerFieldsMu.Lock()
 	defer r.prunedNewerFieldsMu.Unlock()
-	if echoed != nil && echoed.Provider == wrote.Provider && echoed.Model == wrote.Model {
+	if echoed != nil && *echoed == (agentv1alpha1.InferenceStatus{Provider: wrote.Provider, Model: wrote.Model, ReasoningEffort: wrote.ReasoningEffort}) {
 		delete(r.prunedNewerFields[key], inferenceNewerField)
 		return
 	}
-	if echoed != nil && *echoed != (agentv1alpha1.InferenceStatus{}) {
+	effortPruned := echoed != nil && echoed.Provider == wrote.Provider && echoed.Model == wrote.Model &&
+		echoed.ReasoningEffort == "" && wrote.ReasoningEffort != ""
+	if echoed != nil && *echoed != (agentv1alpha1.InferenceStatus{}) && !effortPruned {
 		return
 	}
 	if r.prunedNewerFields == nil {
