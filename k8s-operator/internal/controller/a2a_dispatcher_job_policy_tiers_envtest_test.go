@@ -23,7 +23,7 @@ import (
 // the API server, under its profile's one hash, then the index.
 func envtestTierParams(ctx context.Context, t *testing.T, admin client.Client, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[string]profileJobTemplates {
 	t.Helper()
-	templates := dispatchJobTemplates(agent, profiles, false)
+	templates := dispatchJobTemplates(agent, profiles, false, "")
 	r := &PlatformAgentReconciler{Client: admin}
 	for _, set := range templates {
 		hash := dispatchJobTemplatesHash(set)

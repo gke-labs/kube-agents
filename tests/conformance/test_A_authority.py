@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
+import json
 import dataclasses
 import email.message
 import io
@@ -555,14 +557,21 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             ),
             proposal_update=lambda payload: ran.append(payload) or {"proposal": proposals[payload["number"]]},
         )
-        permitted = types.SimpleNamespace(permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        permitted = types.SimpleNamespace(
+            task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})
+        )
         principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
         principal = dataclasses.replace(principal, task=permitted)
+        # Every proposal here is this task's own (#6400), so only the ownership read can refuse one.
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(Forge(), repo)
+        for number in proposals:
+            record.record_proposal("task-1", 4_000_000_000, key, number)
 
         def update(number: int) -> list:
             body = json.dumps({"repository": f"https://github.com/{repo}", "number": number, "title": "t"}).encode()
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
-            handler.principal, handler.vcs = principal, vcs
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
             handler.headers = email.message.Message()
             handler.headers["Content-Length"] = str(len(body))
             handler.rfile = io.BytesIO(body)
@@ -582,6 +591,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 replies = update(number)
                 self.assertEqual(403, replies[0][0], replies)
                 self.assertEqual(cp.RULE_CALLER_VCS_OWNERSHIP, replies[0][1]["rule"])
+                self.assertNotEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1].get("code"), replies)
         self.assertEqual(1, len(ran), "a refused update reached the forge")
 
     def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
@@ -639,6 +649,68 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         self.assertIsNotNone(cp.report_write_permitted(
             cp.CALLER_ROLE_PROFILE, "fleet-audit", trigger(), audit, "acme%2Fterraform", key, allowlist, registered
         ))
+
+    def test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work(self) -> None:
+        # #6400: the permit is per task, so under it a profile worker writes only
+        # on what that task made. Another open proposal of the install's, one
+        # the ownership check admits, is refused when a different task opened
+        # it. Driven through the handler's own dispatch, so a dispatch that
+        # stops asking the task bar is red, not only the record.
+        cp = h.credential_proxy
+        repo = "acme/infra"
+        ran: list = []
+
+        class Vcs(types.SimpleNamespace):
+            def __getattr__(self, name):
+                return lambda payload: {}
+
+        vcs = Vcs(
+            registry=types.SimpleNamespace(resolve=lambda named: (types.SimpleNamespace(name="github"), repo)),
+            snapshot_source=lambda named: (named, None),
+            require_agent_proposal=lambda verb, payload: None,  # the install's own: the ownership bar passes
+            proposal_update=lambda payload: ran.append(payload) or {"proposal": {"number": payload["number"]}},
+        )
+        task = types.SimpleNamespace(task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        principal = dataclasses.replace(
+            cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u"), task=task
+        )
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(types.SimpleNamespace(name="github"), repo)
+        record.record_proposal("task-1", 4_000_000_000, key, 7)
+        record.record_proposal("task-2", 4_000_000_000, key, 8)
+
+        def update(number: int) -> list:
+            return write("proposal-update", {"number": number, "title": "t"})
+
+        def write(verb: str, fields: dict) -> list:
+            body = json.dumps({"repository": f"https://github.com/{repo}", **fields}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda role: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler._repository_is_permitted = lambda repository, forge: True
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._dispatch_vcs_post(verb)
+            return replies
+
+        self.assertEqual(200, update(7)[0][0], "the task's own proposal must stay updatable")
+        replies = update(8)
+        self.assertEqual(403, replies[0][0], replies)
+        self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
+        self.assertEqual([7], [payload["number"] for payload in ran], "another task's proposal reached the forge")
+        # And the other two writes: a publish to, and a proposal from, another task's branch.
+        allowed, _ = record.claim_branch("task-2", 4_000_000_000, key, "platform-agent/theirs", lambda: False)
+        self.assertTrue(allowed)
+        for verb, field in (("publish", "branch"), ("proposal-create", "source")):
+            with self.subTest(verb=verb):
+                replies = write(verb, {field: "platform-agent/theirs", "title": "t", "target": "main"})
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
 
     def test_A3_only_a_profile_learns_the_managed_list_from_identity(self) -> None:
         # #6389: a profile task that names no repository may ask `identity` with
@@ -813,9 +885,9 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         relayed: list = []
 
         class Store:
-            def relay(self, method, path, body):
+            def relay(self, method, path, body, writer=None):
                 relayed.append((method, path))
-                return 200, b"{}"
+                return 200, b"{}", None
 
         def handle(method: str, path: str, role: str = reader) -> list:
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
@@ -826,7 +898,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             replies: list = []
             handler._json = lambda status, body: replies.append(int(status))
             handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
-            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
             handler._handle_audit_reports()
             return replies
 
@@ -915,9 +987,9 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         relayed: list = []
 
         class Store:
-            def relay(self, method, path, body):
+            def relay(self, method, path, body, writer=None):
                 relayed.append((method, path))
-                return 200, b"{}"
+                return 200, b"{}", None
 
         def handle(method: str, path: str) -> list:
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
@@ -927,7 +999,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             handler.report_profiles = frozenset()
             replies: list = []
             handler._json = lambda status, body: replies.append(int(status))
-            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
             handler._handle_audit_reports()
             return replies
 
@@ -949,6 +1021,81 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             with self.subTest(exec_pod=method):
                 self.assertFalse(cp.exec_pod_serves(method, path))
                 self.assertFalse(cp.exec_pod_serves(method, f"{stream}/runs/20261113T120000.123456Z"))
+
+    def test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller(self) -> None:
+        # Who wrote a stored run (#5619, fleet-audit-report-store.md §3): on the
+        # PUT of a ring entry the broker sends X-Report-Writer, `shell` for the
+        # shell and `builtin-schedule:<audit>:<task>` for a profile task, the
+        # task id its verified credential's own claim. A caller's header of the
+        # name, in any case and on any route, is stripped and never relayed; and
+        # of the store's answer only the writer comes back. The A2A gateway's
+        # report relay trusts a report on this stamp alone.
+        cp = h.credential_proxy
+        received: list = []
+        answer_writer = ["builtin-schedule:compliance-audit:task-1"]
+
+        class Store:
+            def relay(self, method, path, body, writer=None):
+                received.append((method, writer))
+                return 200, b"{}", answer_writer[0] if method == "GET" else None
+
+        publish = "acme%2Fgitops"
+        stream = f"/v1/audit-reports/compliance-audit/{publish}"
+        run = f"{stream}/runs/20261113T120000.123456Z"
+        grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+        shell = cp.Principal(workload="shell", uid="u", role=cp.CALLER_ROLE_SHELL)
+        profile = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                               task=types.SimpleNamespace(task="task-7f3a", profile="fleet-audit", trigger=grant))
+
+        def handle(method: str, path: str, principal, forged: dict) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.headers = email.message.Message()
+            for name, value in forged.items():
+                handler.headers[name] = value
+            handler.principal = principal
+            handler.report_store = Store()
+            handler.report_profiles = frozenset({"fleet-audit"})
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._read_audit_report_body = lambda: b"{}"
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append((int(status), writer))
+            handler._handle_audit_reports()
+            self.assertIsNone(handler.headers.get(cp.REPORT_WRITER_HEADER), "a caller's writer header survived")
+            return replies
+
+        forgeries = ({}, {"X-Report-Writer": "shell"}, {"x-report-writer": "builtin-schedule:compliance-audit:forged"},
+                     {"X-REPORT-WRITER": "builtin-schedule:compliance-audit:task-7f3a"})
+        with mock.patch.object(cp, "report_install_store_keys", return_value=(publish, frozenset({publish}))):
+            for principal, want in ((shell, "shell"), (profile, "builtin-schedule:compliance-audit:task-7f3a")):
+                for forged in forgeries:
+                    with self.subTest(writer=want, forged=forged):
+                        received.clear()
+                        self.assertEqual([(200, None)], handle("PUT", run, principal, forged))
+                        self.assertEqual([("PUT", want)], received)
+                        # No other route sends a writer, a read least of all.
+                        received.clear()
+                        for method, path in (("PUT", f"{stream}/latest"), ("DELETE", f"{stream}/latest"),
+                                             ("GET", f"{stream}/latest"), ("GET", run), ("GET", "/v1/audit-reports")):
+                            handle(method, path, principal, forged)
+                        self.assertEqual([None] * 5, [writer for _, writer in received])
+            # The store's writer reaches the caller, the a2a-reports reader included.
+            reader = cp.Principal(workload="gateway", uid="u", role=cp.CALLER_ROLE_A2A_REPORTS)
+            with mock.patch.object(cp, "report_publish_store_key", return_value=publish):
+                for principal, path in ((shell, run), (profile, f"{stream}/latest"),
+                                        (reader, "/v1/audit-reports/compliance-audit/publish/latest")):
+                    with self.subTest(reads=principal.role):
+                        self.assertEqual([(200, answer_writer[0])], handle("GET", path, principal, {}))
+            # A profile task with no task id a writer can be made of is refused, unrelayed.
+            received.clear()
+            nameless = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                                    task=types.SimpleNamespace(task=None, profile="fleet-audit", trigger=grant))
+            self.assertEqual([(403, cp.RULE_REPORT_WRITER)], handle("PUT", run, nameless, {"X-Report-Writer": "shell"}))
+            self.assertEqual([], received)
+        # And the relay itself sends the stamp it is given and nothing of the caller's.
+        self.assertEqual("shell", cp.report_writer_for(cp.CALLER_ROLE_SHELL, profile.task, "compliance-audit"))
+        self.assertIsNone(cp.report_writer_for(cp.CALLER_ROLE_A2A_REPORTS, profile.task, "compliance-audit"))
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches

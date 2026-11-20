@@ -118,8 +118,10 @@ const (
 	// The scratch emptyDir is the harness's working directory (the worker
 	// adapter's defaultWorkdir), so files the model writes land there, as
 	// do the delegate socket and, with SessionClusterView, HERMES_HOME's
-	// kubeconfig files. No clone can: the image carries no git, and the
-	// agent SDK keeps its transcripts under $HOME, in the writable layer.
+	// kubeconfig files. No clone lands here: the image carries git, for a
+	// profile persona's version-control skill, but a session pod's broker
+	// role reaches no /v1/vcs/ route, so it has nothing to clone from; and
+	// the agent SDK keeps its transcripts under $HOME, in the writable layer.
 	// Sessions measured on dev lanes over seven days (2026-10-22, 30-40
 	// minutes each) left it at 4 KiB. 1Gi is the floor for a workspace an
 	// agent writes into, and Autopilot's default ephemeral-storage request

@@ -58,7 +58,9 @@ gitops-repo/
   declaration covers the zone-locked arm of 3.9 alone, and a pool at its autoscaling ceiling stays a
   finding), and a snapshot kept after its source disk is gone (`gce_compute_fleet_sop.md` §2a,
   object `Snapshot/<name>` with `namespace: ""`, and `cluster` the finding's `project/<id>` when the
-  choice is one project's).
+  choice is one project's), and two peered networks kept at different MTUs on purpose
+  (`gcp_networking_fabric_sop.md` §2a, object `NetworkPeering/<a>--<b>` as the finding spells it,
+  `namespace: ""`, and `cluster` the finding's `project/<id>` when the choice is one project's).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and

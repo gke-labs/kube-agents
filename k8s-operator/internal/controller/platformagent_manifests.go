@@ -3672,11 +3672,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// card's report back to the conversation it was filed in, and
 	// onboarding's first report, need no home. A2A_NOTIFY_PLATFORM names the
 	// armed routes whose home channel the CR sets, and is absent when none
-	// is. The agent adds Slack when the projected file below names a channel
-	// the gateway learned, and sends home posts to every armed route when no
+	// is. The agent adds Slack or Chat when its projected file below names a
+	// channel the gateway learned, and sends home posts to every armed route when no
 	// platform has a home; the gateway keeps a home-less platform's posts for
 	// the digest it posts once a channel is set (a2a/gateway/notify_refused.go).
-	// The alert picks one of those on its own, Chat first. Both lists read CR
+	// The alert picks the first of those: a configured home before a learned
+	// one, Chat before Slack within each. Both lists read CR
 	// fields only, so a learn rolls no pod.
 	notify := strings.Join(a2aNotifyHomePlatforms(agent), a2aNotifyPlatformSeparator)
 	conversations := strings.Join(a2aNotifyPlatforms(agent), a2aNotifyPlatformSeparator)
@@ -3868,7 +3869,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	volumes = append(volumes, buildWatcherTokenVolume())
-	if a2aSlackArmed(agent) {
+	if a2aHomeChannelProjected(agent) {
 		// The home-channel projection (platformagent_home_channel_record.go):
 		// Optional and out of the pod-template hashes, so its content rolls
 		// no pod; the agent's readers follow the file within a kubelet sync.
@@ -5508,6 +5509,26 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
 		"FINDINGS_NONCRITICAL_MAX":        {},
 
+		// The daily `leeway-watch` sweep's alert thresholds (`leeway_watch.py`,
+		// a `no_agent` cron script): the lowest severity it reports, the
+		// lowest drift and fullest-zone share a topology finding needs, how far
+		// past its pigeonhole floor an unknown-cause skew must be, and how many
+		// days pass before an open finding is posted again. Each is a severity
+		// word or a number checked against a range, and a value that does not
+		// parse or is out of range means its default, so an arbitrary value
+		// only filters which findings the sweep posts and keeps in its report
+		// (and the `topology-skew` topic that carries the report), and how
+		// often it re-posts them, at most once per daily run. That is the
+		// point of setting them, and it reaches nothing else: no value names a
+		// cluster, a path or a credential. LEEWAY_WATCH_CLUSTERS and
+		// LEEWAY_WATCH_PROJECTS, which choose what the sweep reads, and
+		// LEEWAY_WATCH_HOME, a path, are deliberately not here.
+		"LEEWAY_WATCH_MIN_DRIFT":             {},
+		"LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR": {},
+		"LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE":  {},
+		"LEEWAY_WATCH_MIN_SEVERITY":          {},
+		"LEEWAY_WATCH_REFRESH_DAYS":          {},
+
 		// Seconds a workload's admitted event folds its later events into
 		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
 		// session_kv_server.py). The container carries the default
@@ -5850,7 +5871,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
 	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
-	if a2aSlackArmed(agent) {
+	if a2aHomeChannelProjected(agent) {
 		volumeMounts = append(volumeMounts, homeChannelProjectionMount(agentChatHomeDir))
 	}
 

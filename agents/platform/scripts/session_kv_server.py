@@ -39,6 +39,7 @@ import board_snapshot
 import chat_notify
 import clean_merges
 import dial_state
+from fix_recipes import registry as fix_recipes_registry
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -93,9 +94,9 @@ PROPOSAL_OPENED_AT_MAX_CHARS = 64
 # claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
 # fix the check knows, by the fleet audit's check id, which is the first segment
 # of its finding id (`<check>.<cluster>.<namespace>.<object>`); the kind is
-# derived from that id here, never taken from the caller. The pr_opened plugin
-# holds a copy (POST_MERGE_KINDS), which a test pins to this one.
-POST_MERGE_KINDS = ("no-pdb",)
+# derived from that id here, never taken from the caller. Both this and the
+# pr_opened plugin read the kinds from fix_recipes/registry.py.
+POST_MERGE_KINDS = tuple(sorted(fix_recipes_registry.kinds()))
 POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
@@ -253,6 +254,8 @@ SQLITE_INT64_MAX = (1 << 63) - 1
 # task's full report in one response.
 FEED_EVENTS_DEFAULT_LIMIT = 50
 FEED_EVENTS_MAX_LIMIT = 500
+# `since` on the feed: the ledger's own `created_at` form, UTC, no zone.
+FEED_EVENTS_SINCE_FORMAT = "%Y-%m-%d %H:%M:%S"
 FEED_TASKS_DEFAULT_LIMIT = 50
 FEED_TASKS_MAX_LIMIT = 200
 # Per-task child rows `GET /v1/tasks/{id}` returns, the same ceilings the admin
@@ -2832,7 +2835,9 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
 
 # The chat platforms this harness ships an egress path for, in the order a
 # message is posted to them and in the order a single-destination caller picks
-# one. Google Chat leads, and the ordering is the whole of #1094.
+# one. Google Chat leads, and the ordering is the whole of #1094. On an install
+# the A2A gateway serves, chat_notify.in_routed_order then puts a configured
+# home ahead of a learned one.
 #
 # #855 put Slack first, on the reasoning that a dual-platform install "resolves
 # the same way whichever branch answers". It does — and the answer it resolves
@@ -2976,7 +2981,7 @@ def _slack_home_channel() -> str:
 
 
 def enabled_chat_platforms() -> list[str]:
-    """Every chat platform this install posts to, in CHAT_PLATFORMS order.
+    """Every chat platform this install posts to, in CHAT_PLATFORMS order, the routed ones in routing order.
 
     Three sources, most specific first, resolved **per platform** rather than
     per source — so a file that names one platform cannot silence another that
@@ -3007,9 +3012,11 @@ def enabled_chat_platforms() -> list[str]:
     A2A gateway holds its backend, and posts to it go through the gateway
     instead, so each is still a platform this install posts to. The operator
     lists the armed routes with a CR home channel; ``routed_platforms()`` adds
-    Slack when the file names a channel, and takes every armed route when no
+    a platform whose projected file names a learned home, after those, and takes every armed route when no
     platform has a home, the gateway keeping the refused posts for a digest.
-    The alert takes the first of them. The variables are the operator's, and
+    The routed platforms come back in that order (``chat_notify.in_routed_order``),
+    and the alert takes the first of them, so a configured home is picked
+    ahead of a learned one. The variables are the operator's, and
     they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
@@ -3086,7 +3093,9 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
             )
         if enabled:
             resolved.append(name)
-    return resolved, explicit
+    # The routed platforms in the routing rule's order, so every caller that
+    # takes one destination takes a configured home ahead of a learned one.
+    return chat_notify.in_routed_order(resolved), explicit
 
 
 def _chat_platforms_disabled() -> bool:
@@ -9029,28 +9038,56 @@ def _feed_status(
 def list_intercepted_events(
     since_id: Optional[int] = None,
     limit: int = FEED_EVENTS_DEFAULT_LIMIT,
+    since: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The event ledger, one row per event a producer forwarded.
 
     Without `since_id`, the newest `limit` rows, newest first — what a page
     shows on load. With `since_id` (including `since_id=0` after an empty
     initial poll), the rows after that id, oldest first, so a poller passes
-    back `next_since_id` and sees each row once, in order. `truncated` says
-    more rows matched than were returned.
+    back `next_since_id` and sees each row once, in order. `since`, a UTC
+    time in the ledger's own `created_at` form (`YYYY-MM-DD HH:MM:SS`),
+    keeps rows from that time on in either order; `truncated` says more rows
+    matched than were returned, counting the window's rows only.
     """
     if since_id is not None:
         since_id = _validate_non_negative_int64(since_id, "since_id")
+    if since is not None:
+        try:
+            # Re-rendered, so an unpadded field cannot reach the string compare.
+            since = datetime.strptime(since, FEED_EVENTS_SINCE_FORMAT).strftime(FEED_EVENTS_SINCE_FORMAT)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="since must be a UTC time of the form YYYY-MM-DD HH:MM:SS",
+            )
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
+    # `created_at` is the same text form, so the string compare is the time
+    # compare and the window is a range of idx_intercepted_events_created_at.
+    # Newest first within a window is read off that index backwards, with the
+    # id as the tie-break inside a second; without a window, by id as before.
+    # One literal statement per shape, so scripts/check_sqlite_query_plans.py
+    # reads each plan (a statement assembled from parts is one it cannot judge).
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
         "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request, "
         "excluded"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
-        if since_id is not None:
+        if since is not None and since_id is not None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE created_at >= ? AND id > ? ORDER BY id ASC LIMIT ?",
+                (since, since_id, limit + 1),
+            ).fetchall()
+        elif since_id is not None:
             rows = conn.execute(
                 f"SELECT {columns} FROM intercepted_events WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (since_id, limit + 1),
+            ).fetchall()
+        elif since is not None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (since, limit + 1),
             ).fetchall()
         else:
             rows = conn.execute(

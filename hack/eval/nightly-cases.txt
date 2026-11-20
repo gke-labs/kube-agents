@@ -896,6 +896,14 @@
 # ai-security-planted-model-audit's 1450s hint.
 ./tasks/ai-security-manual-names-reconciler/task.yaml
 
+# "What alerts fired overnight?" answered from the event ledger through the
+# `get_alert_history` tool (#4056): prebuilt/alert-history-ledger posts two
+# Info events to the daemon (two `filtered` rows, no card, no chat post), and
+# the case grades the worker's tool call and both workload names in the
+# reply. A stack, so it takes lock-infra; the plant is two loopback posts,
+# priced at the 200s default. Nightly from its first merge.
+./tasks/alert-history-overnight-from-ledger/task.yaml
+
 # A crash loop that outlasts the settle period is forwarded, the pod recovers,
 # and 15m after its last event the watcher's quiet follow-up lands on the
 # alert's thread and card ("Quiet since HH:MM UTC", #612). deployer: tofu, the
@@ -1112,6 +1120,15 @@
 # missing, and a report naming the storage kinds. deployer: noop, read-only, no
 # fixture, 200s default until it has a record.
 ./tasks/cluster-agent-storage-audit-collector/task.yaml
+
+# The cluster profile's version-control write path (#6380): a task submitted
+# as a structured confirm ([bench:profile ... intent=confirm]) asks the
+# `cluster` profile to open a pull request adding a PodDisruptionBudget for
+# the no-pdb-workload fixture on the job's GitOps repository, graded on that
+# pull request (pull_request_opened, the budget file only) and an unchanged
+# cluster. deployer: noop. Red until #4457 (the structured confirm) and #6168
+# (the persona's version-control skill) land; its record shows when they do.
+./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
@@ -1337,6 +1354,18 @@
 # from neither exclusion list; CI nightlies run over inject).
 ./tasks/list-gitops-repos/task.yaml
 
+# The networking stream's declared-intent case (#1408): the project's
+# mtu-peer-declared network at MTU 8896, peered both ways with default at
+# 1460 (role declared-mtu-peering), is the 2.4 peered-MTU posture the same
+# knowledge/ note declares. It runs the networking audit and grades its
+# ledger: no finding id for the declared peering, the world-open firewall
+# rule still a finding, and a Declared intent row naming the note. The red
+# on main's images (the finding published) and the three greens on the
+# branch's are the loop its pull request records before it is marked ready;
+# the first objective holds whole for a project id of at most 24
+# characters. deployer: noop, read-only on the project.
+./tasks/networking-declared-intent-no-finding/task.yaml
+
 # The networking audit's firewall-world-open-ingress check over a standing
 # plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
 # the internet on one VM with an external IP. deployer: noop, read-only on the
@@ -1363,6 +1392,18 @@
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
 
+# The front door is running the plugins its image ships: an exec into the
+# agent container reads each plugin directory under /opt/defaults/plugins
+# against /opt/data/plugins (agent-owned, every shipped file present and
+# unchanged; an entry only the volume has is reported), after one front-door
+# turn that the roster block should answer without a card. Written for
+# #6279, where a root-owned /opt/data/plugins on a new data volume left the
+# front door with none of its plugins while the gate stayed green; the fix
+# (the agent Pod's first init container makes the directory) is #6357's.
+# deployer: noop, no fixtures, one model turn and one exec. Nightly from its
+# first merge; a presubmit seat waits on its record.
+./tasks/platform-agent-shipped-plugins-loaded/task.yaml
+
 # A card that asks only for the install's usage summary is answered by the
 # kube-agents-feedback skill's summary subcommand (docs/designs/
 # chat-feedback-command.md §8, #4723): the result carries the script's
@@ -1378,6 +1419,13 @@
 # carry on their roster entries (#1947). deployer: noop, no fixture; the run
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
+
+# post-merge-verified-fixed: the post-merge check's verify-after-merge loop
+# (#6343 case 1), the eval record for #6311. A writer: the check merges the
+# agent's no-pdb fix, applies it and drives the cron's ticks (post_merge.py).
+# Cost: each repetition holds a serial writers slot for the agent's turn plus
+# up to 15 minutes of ticks, about 45 minutes a night across three.
+./tasks/post-merge-verified-fixed/task.yaml
 
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease

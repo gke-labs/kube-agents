@@ -169,7 +169,8 @@ a build —
 and `make bench-case-check` checks it in about a second before you push. The target itself
 runs in no workflow: `scripts/test_task_registration.py` calls the same validator and
 asserts it returned no findings, and that lint is what gates, through `PYTHON_TEST_DIRS`
-and `python-tests.yml`. Read the contract before writing a case;
+and `python-tests.yml`; the one rule that needs the harness's parser gates through
+`bench/tests/test_case_entries_load.py`. Read the contract before writing a case;
 [`bench/CUSTOM-TASKS.md`](../bench/CUSTOM-TASKS.md) is the walkthrough that sits under it.
 
 ## The trap that spans every tier

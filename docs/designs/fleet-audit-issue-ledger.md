@@ -551,7 +551,7 @@ the `repo`, `path` and `excerpt` of the declaration — validated for scope, a n
 identity, a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
 beside the roster; a fault check or a stream with no declared-intent step is rejected), and an
 `object` of a kind the check files where the check fixes one (`DECLARABLE_OBJECT_KINDS`: the cost
-checks' kinds, `NodePool/` for the stockout pool check and `Snapshot/` for the compute snapshot check), and never
+checks' kinds, `NodePool/` for the stockout pool check, `Snapshot/` for the compute snapshot check and `NetworkPeering/` for the networking peering check), and never
 given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
 the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
 the list's length as `declared`.

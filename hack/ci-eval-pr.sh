@@ -1259,7 +1259,8 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # Read-only: every call is a `kubectl get` through the role kubeconfigs (the
 # fleet reader's token), a `gcloud container clusters describe` on this job's
 # own credential, which already lists the same clusters above, a `gcloud
-# compute ... list` of a project-scoped role's objects, a `gcloud compute
+# compute ... list` of a project-scoped role's objects or of the project's
+# reservations (the missing-reservation-pool role), a `gcloud compute
 # instances get-serial-port-output` of the startup-fail VM, on the same
 # credential, or one GET of the leased repository's declared-intent note
 # (the catalog's `repository/...` assertions, #5827) with the grading read

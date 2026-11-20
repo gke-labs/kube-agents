@@ -414,7 +414,13 @@ What the operator renders per profile, as built (amended 10/6):
     claim is a closed list of strings, allowed only on the `credential-proxy` audience: an
     unknown permit, a malformed list or a `permits` key on a `nats` credential refuses the
     token, in both verifiers. The permit names no repository; the managed list bounds where
-    every verb lands, a permitted write included. Under the permit the writes are still held
+    every verb lands, a permitted write included. The permit names one task, so its writes
+    reach only what that task made (#6400): `publish` a branch the task already published, or
+    one absent from the remote, claimed by the first task to publish it; `proposal-create`
+    only from a branch the task published; `proposal-update` only on a proposal the task
+    opened (`PROPOSAL_NOT_THIS_TASKS`, rule `caller.vcs-ownership`). The record is the one
+    stateful broker pod's own memory, so a restart refuses a task's later writes rather than
+    permitting anyone's. Under the permit the writes are also held
     to the install's own work (`VcsBroker.require_agent_proposal`, profile role only, rule
     `caller.vcs-ownership`): `proposal-update` only on a proposal `forge.is_agent_pull_request`
     calls the install's (opened by the credential's login, from a branch under
@@ -434,8 +440,9 @@ What the operator renders per profile, as built (amended 10/6):
     The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
     `capabilities`, which skip the managed list, and every other write, `branch-delete`
     among them. The shim sends the credential on these calls as it does on an exec. Known
-    limits: a task that names no cluster gets no `proxyToken`, so it reaches no
-    version-control verb at all; and `submit-suggestion` deletes a spent branch with
+    limits: a task that names no cluster gets no targeted `proxyToken` (at most a report
+    credential, which the broker refuses here), so it reaches no version-control verb at
+    all; and `submit-suggestion` deletes a spent branch with
     `branch-delete`, so on a profile worker that one path is refused.
   - A report credential (no target, the `unattended` tier and a trigger; #5619) is refused on
     `/v1/exec` and the MCP relay before any of this runs.
@@ -663,7 +670,8 @@ is the harness process itself, and its death is the orphan path.
 
 The platform agent is the privileged doer - provisioning, fleet audits, the GitOps write
 path - and today it is also a kanban worker like any other when the front door delegates
-to it. As a profile:
+to it. Everything it does today, and what a profile still lacks for each, is in
+[the platform-as-profile inventory](platform-as-profile-inventory.md). As a profile:
 
 ```yaml
 apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -731,17 +739,18 @@ metadata:
     kubeagents.x-k8s.io/persona: cluster
 spec:
   description: >-
-    Read-only SRE scoped to exactly one GKE cluster.  Live runtime state and workload
-    debugging: crash loops, OOMKills, unschedulable pods, autoscaling behavior, storage
-    binding.  Returns a grounded RCA and a proposed manifest patch; never mutates, never
-    opens PRs.
+    SRE scoped to exactly one GKE cluster, read-only on it.  Live runtime state and
+    workload debugging: crash loops, OOMKills, unschedulable pods, autoscaling behavior,
+    storage binding.  Returns a grounded RCA and a proposed manifest patch; never mutates
+    the cluster, and opens a PR only when the task asks for that change.
   clusterRef:
     projectId: acme-prod
     cluster: prod-a
     location: us-east1
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
-    # /files: persona.yaml, instructions.md, the gke-* debugging skills, mcp.yaml
+    # /files: persona.yaml, instructions.md, the gke-* debugging skills, the
+    # version-control skill, mcp.yaml
     # (developer_knowledge only: profile workers are refused gke and platform_control)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
