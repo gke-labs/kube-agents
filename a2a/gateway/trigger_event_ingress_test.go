@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -159,5 +160,26 @@ func TestTwoRunsOfOneEventKindKeepTheirOwnDelivery(t *testing.T) {
 		if err != nil || rec == nil || rec.Delivery == nil || *rec.Delivery != s.Delivery || len(rec.TriggerRuns) != 1 {
 			t.Errorf("record for %s = %+v, %v", s.IdempotencyKey, rec, err)
 		}
+	}
+}
+
+// A failed mint hands an event run's token back to its kind's bucket, as it
+// does a schedule's (#5923): more failed retries than the kind's cap are each
+// refused unavailable, never rate_limited, and the run then starts.
+func TestAFailedEventMintSpendsNoRateToken(t *testing.T) {
+	tr := startTriggerRig(t, func(c *Config) {
+		c.TriggerEventKinds = []string{"event-watcher/k8s-event"}
+		c.TriggerEventRatePerHour = 2
+	})
+	s := goodEventSubmit("k8s-event", "a")
+	fail := 3
+	failingMint(tr, &fail, errors.New("cap bucket unavailable"))
+	for i := 0; i < 3; i++ {
+		if r := tr.submit(t, "event-watcher", s); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedUnavailable {
+			t.Fatalf("failed attempt %d = %+v, want unavailable", i+1, r)
+		}
+	}
+	if r := tr.submit(t, "event-watcher", s); r.Refused != nil || r.TaskID == "" {
+		t.Fatalf("after the failures = %+v, want the run started", r)
 	}
 }
