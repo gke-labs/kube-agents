@@ -47,7 +47,8 @@ if [ -z "${relabelled}" ]; then
   exit 0
 fi
 
-# A label wider than the column changes its alignment; prettier puts the table back as CI checks it.
+# The upgrade table itself is out of Prettier (prettier-ignore, #6286), so this formats the rest of the page
+# only; a wider label stays as the relabel wrote it.
 env -u GH_TOKEN npx --yes "prettier@${PRETTIER_VERSION}" --write "${UPGRADE_PAGE}" >/dev/null
 
 if git diff --quiet -- "${UPGRADE_PAGE}"; then
@@ -93,7 +94,7 @@ Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentati
 
 ## What Changed
 
-\`${UPGRADE_PAGE}\`: the Release cells of these rows change, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`), and the table's rows go back in newest-first order, which the check also holds it to. The change stays inside the breaking-changes table; \`prettier\` then restores the table's formatting, which can touch other rows of it.
+\`${UPGRADE_PAGE}\`: the Release cells of these rows change, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`), and the table's rows go back in newest-first order, which the check also holds it to. The change stays inside the breaking-changes table, which is out of \`prettier\` (\`prettier-ignore\`), so no other row of it changes.
 
 ${rows}
 
