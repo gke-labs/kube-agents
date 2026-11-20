@@ -218,7 +218,9 @@ CI enforcement: `make docs-check` runs the same checks as
   once a release is tagged, every row of the upgrade page's breaking-changes
   table labelled with it must come from a commit the tag contains (or sit in the
   tag's own copy of the table). Write `pending` for a new row; it fails once a
-  release contains it, and the message names the release to write. The release job opens a pull request that relabels such rows once a release is tagged (`scripts/release/open_upgrade_relabel_pr.sh`). For a
+  release contains it, and the message names the release to write. The release job opens a pull request that relabels such rows once a release is tagged (`scripts/release/open_upgrade_relabel_pr.sh`);
+  while that release is under 48 hours old, a push to `main` or a local run
+  with no base prints the row as a warning, and fails it after. For a
   reworded shipped row or a row added after its release was tagged,
   `scripts/upgrade_table_traces.txt` names the commit that shipped the change,
   and the tag must contain that commit instead. A pull request or merge group
@@ -227,8 +229,9 @@ CI enforcement: `make docs-check` runs the same checks as
   removal needs a relabel first; while an open release candidate (a
   `staging_*` tag no release contains yet) holds the row, the text stays until
   the release is tagged. A wrong label fails a push to
-  `main` and a pull request that adds or relabels the row or edits its entry;
-  on any other pull request it is a warning. It reads the history and the
+  `main` (after the grace above, for a `pending` row) and a pull request that
+  adds or relabels the row or edits its entry; on any other pull request it is
+  a warning. It reads the history and the
   release tags, so it fails on a shallow or tagless clone; run
   `git fetch --tags --unshallow` first.
 - `docs-check-cron-inventory` — `scripts/check_cron_inventory.py`; every job on
