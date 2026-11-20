@@ -143,8 +143,9 @@ func TestAThreadRecordThatCannotBeReadRefusesAsUnavailable(t *testing.T) {
 	}
 }
 
-// TestAKeyedHomePostRecordsItsThread: a keyed home post (an alert's) tells
-// the recorder the thread it landed in; an unkeyed one does not.
+// TestAKeyedHomePostRecordsItsThread: a keyed home post (an alert's) that
+// opens a thread tells the recorder; an unkeyed one, or a keyed reply into
+// a thread the request named, does not.
 func TestAKeyedHomePostRecordsItsThread(t *testing.T) {
 	p := &fakeNotifyPoster{landsIn: testHome + "/threads/T1"}
 	n := newTestNotifier(t, p)
@@ -161,6 +162,13 @@ func TestAKeyedHomePostRecordsItsThread(t *testing.T) {
 	}
 	if want := lib.NotifyPlatformGchat + "|" + testHome + "|" + testHome + "/threads/T1"; len(got) != 1 || got[0] != want {
 		t.Fatalf("recorded = %v, want [%s]", got, want)
+	}
+	// A keyed reply into a thread the request names opened nothing.
+	if r := serveJSON(t, n, lib.NotifyRequest{Text: "Reply.", Thread: testHome + "/threads/T9", Update: "alert-s2"}); r.Error != "" {
+		t.Fatalf("keyed reply: %+v", r)
+	}
+	if len(got) != 1 {
+		t.Fatalf("a keyed reply into a named thread was recorded: %v", got)
 	}
 }
 

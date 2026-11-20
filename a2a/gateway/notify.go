@@ -236,8 +236,9 @@ type Notifier struct {
 	// channel-qualified thread to its bare ts); nil leaves it as it is.
 	threadTS func(string) string
 	// threadRecorder, when set, is told the thread every keyed home post
-	// landed in: the gateway's record of the threads it opened, which a
-	// thread delivery must name (notify_threads.go). Set before Start.
+	// that named no thread opened: the gateway's record of the threads it
+	// opened, which a thread delivery must name (notify_threads.go). Set
+	// before Start.
 	threadRecorder func(platform, chatID, thread string)
 	// convPrefix is the conversation-key prefix of this backend, and conv
 	// the gateway's conversations; nil leaves conversation requests refused.
@@ -1185,7 +1186,10 @@ func (n *Notifier) postHome(job notifyJob) bool {
 		landed = thread
 	}
 	if landed != "" {
-		if n.threadRecorder != nil {
+		if n.threadRecorder != nil && thread == "" {
+			// Only a thread this post opened: a reply into a thread the
+			// request named puts nothing on the record, so no notify
+			// caller can add an existing thread to it.
 			n.threadRecorder(n.backend, home, landed)
 		}
 		n.updates.put(notifyHomeKeyPrefix+landed, key, message)
