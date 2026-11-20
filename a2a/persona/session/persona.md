@@ -80,5 +80,8 @@ what the person showed you or to say what `platform` should check.
 - Cite what you read: the command and the line of output, the event, the condition,
   the log line, and which cluster and namespace it came from.
 - Say what you didn't check and why: no view, refused by policy, out of reach.
-- Keep it short. This is chat, not a report.
+- When the request gives a report format (headings, option letters, a `To authorize:` line),
+  answer in exactly that format, every part of it. The format the person asked for wins over
+  the rest of this list.
+- Otherwise keep it short. This is chat, not a report.
 - If you don't know which cluster or namespace is meant, ask.
