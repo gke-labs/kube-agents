@@ -1008,18 +1008,26 @@ locals {
         tag = var.image_tag
       }
     }
-    operator = {
-      image = {
-        tag = var.image_tag
-      }
-      # The composition installs cert-manager, so unlike a bare `helm install`
-      # it can turn the admission webhooks on. failurePolicy stays at the
-      # chart's Ignore: this release creates the PlatformAgent CR too, and Helm
-      # registers the webhooks before the operator holds a certificate.
-      webhooks = {
-        enabled = var.enable_webhooks
-      }
-    }
+    operator = merge(
+      {
+        image = {
+          tag = var.image_tag
+        }
+        # The composition installs cert-manager, so unlike a bare `helm install`
+        # it can turn the admission webhooks on. failurePolicy stays at the
+        # chart's Ignore: this release creates the PlatformAgent CR too, and Helm
+        # registers the webhooks before the operator holds a certificate.
+        webhooks = {
+          enabled = var.enable_webhooks
+        }
+      },
+      # Only while on, so an install that leaves it off renders the values it did.
+      var.card_stop_enabled ? {
+        cardStop = {
+          enabled = true
+        }
+      } : {},
+    )
     litellm = merge(
       {
         modelProvider    = var.model_provider
