@@ -11,6 +11,7 @@ import (
 func proxyClaims(now time.Time) Claims {
 	c := validClaims(now)
 	c.Audience = AudienceCredentialProxy
+	c.Target = &Target{Project: "my-project", Location: "us-central1", Cluster: "prod-1"}
 	return c
 }
 

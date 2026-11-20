@@ -258,6 +258,14 @@ type Trigger struct {
 // TriggerOriginBuiltin is the one trigger origin a credential may name, lib's.
 const TriggerOriginBuiltin = lib.TriggerOriginBuiltin
 
+// ReportTier is the one tier an AudienceCredentialProxy credential with no
+// Target may name, and only with a Trigger: a report credential (#5619), what
+// an unattended task a trigger started gets when it names no cluster. It
+// confines nothing, so the broker holds it to the audit-report routes alone.
+// It is capability.TierUnattended, the only tier a grant may bind a trigger
+// at, and the Python verifier's REPORT_TIER.
+const ReportTier = "unattended"
+
 // Claims is a task credential's content.
 type Claims struct {
 	// Task is the task id: a2a.tasks.<Profile>.<Task>.… on the bus.
@@ -274,7 +282,8 @@ type Claims struct {
 	Audience Audience
 	Expires  time.Time
 
-	// Target is for AudienceCredentialProxy only, and optional there.
+	// Target is for AudienceCredentialProxy only, and required there except
+	// on a report credential (ReportTier).
 	Target *Target
 
 	// Permits is for AudienceCredentialProxy only: each a known Permit, none
@@ -385,8 +394,10 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 //     DNS-1123 labels: no ".", "*", ">" or whitespace, at most 63 bytes), and
 //     pod_uid a bounded UID.
 //   - target, permits and trigger may appear only under
-//     AudienceCredentialProxy, and permits, when present, is a non-empty list
-//     of known permits, none twice.
+//     AudienceCredentialProxy; permits, when present, is a non-empty list of
+//     known permits, none twice; and an AudienceCredentialProxy credential
+//     with no target must be a report credential: tier ReportTier and a
+//     trigger.
 func Verify(token string, trusted []string, aud Audience, now time.Time, maxLifetime, skew time.Duration) (Claims, error) {
 	if !aud.known() {
 		return Claims{}, fmt.Errorf("audience %q is not one this package verifies", aud)
@@ -548,6 +559,12 @@ func (c Claims) validate() error {
 		if err := c.Trigger.validate(); err != nil {
 			return err
 		}
+	}
+	// A proxy credential with no target confines nothing, so only a report
+	// credential may omit it: the Python verifier's rule, held here too so
+	// Mint never makes a shape the broker refuses (#5619).
+	if c.Audience == AudienceCredentialProxy && c.Target == nil && (c.Tier != ReportTier || c.Trigger == nil) {
+		return fmt.Errorf("a %q task credential names no target; only a %q task started by a trigger may omit it", AudienceCredentialProxy, ReportTier)
 	}
 	return nil
 }
