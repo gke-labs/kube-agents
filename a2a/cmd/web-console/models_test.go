@@ -225,11 +225,10 @@ func TestModelsTestEndpoint(t *testing.T) {
 	}
 }
 
-// The model probe calls the inference gateway keyless: the agent API key is not
-// a gateway key, and the gateway's caller-auth hook refuses a key it does not
-// know, which would mark every model unverified and refuse every switch. Both
-// requests are covered: the first try, and the alias fallback testModel sends
-// when the target is not mapped in the gateway.
+// The model probe calls the inference gateway keyless: the agent API key is the
+// agent's own, not a gateway credential. Both requests are covered: the first
+// try, and the alias fallback testModel sends when the target is not mapped in
+// the gateway.
 func TestModelsTestSendsTheGatewayNoAgentKey(t *testing.T) {
 	var models, auths []string
 	fakeGateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

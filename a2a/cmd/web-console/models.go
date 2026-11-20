@@ -211,9 +211,9 @@ func (s *server) testModel(ctx context.Context, modelID, target string) error {
 		if err != nil {
 			return err
 		}
-		// No Authorization: the agent API key is the agent's, not a gateway key,
-		// and the gateway's caller-auth hook refuses a key it does not know. The
-		// console calls the gateway keyless, as assist.go and insights.go do.
+		// No Authorization: the agent API key is the agent's own, not a gateway
+		// credential. The console calls the gateway keyless, as assist.go and
+		// insights.go do.
 		req.Header.Set("Content-Type", contentTypeJSON)
 		resp, err := s.client.Do(req)
 		if err != nil {
