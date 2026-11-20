@@ -313,13 +313,19 @@ const (
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
 	// homeChannelUnsetToGchat and homeChannelUnsetToSlackRoute are the
 	// meanwhile when the other armed backend has a home: the agent sends
-	// home posts only to the platforms with one, the CR's list plus a
-	// learned Slack channel (agents/platform/scripts/chat_notify.py,
+	// home posts only to the platforms with one, the CR's list and then a
+	// learned channel or space (agents/platform/scripts/chat_notify.py,
 	// routed_platforms).
 	homeChannelUnsetToGchat      = "go to Google Chat's home channel meanwhile"
 	homeChannelUnsetToSlackRoute = "go to Slack's home channel meanwhile"
 	// homeChannelUnsetJoin joins the sentences when both backends lack a home.
 	homeChannelUnsetJoin = " "
+	// What homeChannelUnsetMessageFormat takes for Google Chat: the backend,
+	// the CR field, the install.env key and what the field holds.
+	homeChannelUnsetGchatBackend = "Google Chat"
+	homeChannelUnsetGchatField   = "spec.integration.googleChat.homeChannel"
+	homeChannelUnsetGchatEnvKey  = "GOOGLE_CHAT_HOME_CHANNEL"
+	homeChannelUnsetGchatHolds   = "a Chat space name (spaces/<id>)"
 
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
@@ -537,6 +543,18 @@ type PlatformAgentReconciler struct {
 	// writers leave the field out of their unchanged checks, so the write the
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
+	// heldBusMigrationWarned records, per CR, the run and phase of an
+	// unknown-leg run whose hold Warning this process has sent, so the
+	// Warning goes once per run and phase rather than once per pass. Kept
+	// here and not in status, so nothing the run's own operator reads changes
+	// while it is held (holdUnknownBusMigrationLeg). A restart sends it once
+	// more. Keyed by ObjectKey, value "<run>/<phase>".
+	heldBusMigrationWarned sync.Map
+	// busReshapeRefused records, per CR, the bus-reshape request and the
+	// reason this process last reported for not starting it, so the Event
+	// goes once per request and kind of reason, not once per pass. Keyed by
+	// ObjectKey, value "<nonce>/<kind>".
+	busReshapeRefused sync.Map
 	// prunedBusMigrationStatus records, per CR, that a status write carrying
 	// status.busMigration came back without it: the served CRD predates the
 	// field. A run the API server drops is gone by the next pass, which would
@@ -617,6 +635,12 @@ type PlatformAgentReconciler struct {
 	// when the CR is deleted. Its own gate, as the two above: the overrides
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
+
+	// kanbanAdmissionWarningsLogged records, per CR, the spec generation whose
+	// zero-slot kanban.admission warning reconcileConfigMap last logged, so each
+	// generation logs it once. Keyed by ObjectKey, value int64; cleared when
+	// the CR is fixed or deleted.
+	kanbanAdmissionWarningsLogged sync.Map
 
 	// a2aChartPodsWarned records, per CR, the spec generation and the
 	// chart-pods Warning last reported (a2aQuotaAgent), so each generation and
@@ -1888,6 +1912,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.kanbanAdmissionWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
@@ -1991,6 +2016,18 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 }
 
 func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) (string, error) {
+	key := client.ObjectKeyFromObject(agent)
+	if refusal := kanbanAdmissionRefusal(agent); refusal != "" {
+		if logged, ok := r.kanbanAdmissionWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
+			logf.FromContext(ctx).Info("kanban.admission sets memoryBudgetMiB below workerRssCapMiB; single worker RSS cap exceeds pod admission budget until resolved",
+				"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+			r.kanbanAdmissionWarningsLogged.Store(key, agent.Generation)
+		}
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidKanbanAdmission, refusal)
+	} else {
+		r.kanbanAdmissionWarningsLogged.Delete(key)
+	}
+
 	cm := buildConfigMap(agent, agentPlugins)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
@@ -4041,7 +4078,9 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 	log.Info("agent Pod egress is default-deny with an allowlist; the metadata server is not on it. "+
 		"This does nothing unless the cluster CNI enforces NetworkPolicy, which the operator cannot "+
 		"detect, and it is unioned with every other policy selecting this Pod — including the "+
-		"gateway policy this operator renders, which does permit the metadata server.",
+		"gateway policy this operator renders unless spec.networkPolicy.enabled is false, which "+
+		"permits TCP 443 to any address outside the private, link-local and shared ranges unless an "+
+		"FQDNNetworkPolicy is applied in its place.",
 		"policy", policy.Name, "rules", len(policy.Spec.Egress))
 	return nil
 }
@@ -5293,8 +5332,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedReason = conditionReasonA2AGatewayWaitingForTasks
 		degradedMsg = a2aTasksWaitMsg
 	} else if reason, msg := specResourceDegraded(agent); reason != "" {
-		// The spec's resource and exec-tier refusals, last: each leaves its
-		// workload at the operator's defaults, and the reasons above report
+		// The spec's resource, exec-tier, and admission refusals, last: the
+		// resource and exec checks leave workloads at the operator's defaults,
+		// InvalidKanbanAdmission keeps rendering the resolved budget (so a low
+		// resource limit never spawns into OOM), and the reasons above report
 		// lost function and must not be masked by them (specResourceDegraded).
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = reason
@@ -5712,6 +5753,8 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
+	r.heldBusMigrationWarned.Delete(client.ObjectKeyFromObject(agent))
+	r.busReshapeRefused.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
 	delete(r.prunedNewerFields, usagePollKey(agent))
 	r.prunedNewerFieldsMu.Unlock()
@@ -5720,28 +5763,48 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
 // spec and the home-channel record, or "" when the condition is to be absent:
 // the A2A stack holds no chat backend, or each one it holds has a home
-// channel, from the CR or (Slack) admitted from the record. With both
+// channel, from the CR or admitted from the record. With both
 // backends lacking one, the message carries both sentences, Chat first, and
 // each says the gateway keeps the posts; with one lacking it, its sentence
 // says the posts go to the other's home channel meanwhile. A
 // malformed home channel is not this condition's: the gateway refuses it at
-// start and says so. On Slack with the CR field empty the base sentence
+// start and says so. With the CR field empty each backend's base sentence
 // carries at most one more: why the record did not stand in (manual, not an
 // id, refused), or that a mention sets it.
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	var parts []string
-	if a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" {
-		meanwhile := homeChannelUnsetKept
-		if a2aSlackHasHome(agent, rec) {
-			meanwhile = homeChannelUnsetToSlackRoute
-		}
-		parts = append(parts, fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile))
+	if msg := gchatHomeChannelUnsetMessage(agent, rec); msg != "" {
+		parts = append(parts, msg)
 	}
 	if msg := slackHomeChannelUnsetMessage(agent, rec); msg != "" {
 		parts = append(parts, msg)
 	}
 	return strings.Join(parts, homeChannelUnsetJoin)
+}
+
+// gchatHomeChannelUnsetMessage is homeChannelUnsetMessage's Google Chat
+// sentence, or "" when Chat is not armed or has a home channel.
+func gchatHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
+	if !a2aChatArmed(agent) || strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) != "" || rec.gchat.space != "" {
+		return ""
+	}
+	meanwhile := homeChannelUnsetKept
+	if a2aSlackHasHome(agent, rec) {
+		meanwhile = homeChannelUnsetToSlackRoute
+	}
+	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, homeChannelUnsetGchatBackend,
+		homeChannelUnsetGchatField, homeChannelUnsetGchatEnvKey, homeChannelUnsetGchatHolds, meanwhile)
+	switch {
+	case gchatHomeChannelPolicy(agent) == gchatHomeChannelPolicyManual:
+		return msg + homeChannelUnsetManualSuffix
+	case rec.gchat.recorded == homeChannelRecordMalformed:
+		return msg + gchatHomeChannelUnsetMalformedSuffix
+	case rec.gchat.recorded != "" && rec.gchat.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.gchat.recorded, rec.gchat.refused)
+	case rec.gchat.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.gchat.refused)
+	}
+	return msg + gchatHomeChannelUnsetLearnSuffix
 }
 
 // slackHomeChannelUnsetMessage is homeChannelUnsetMessage's Slack sentence,
@@ -5751,7 +5814,7 @@ func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 		return ""
 	}
 	meanwhile := homeChannelUnsetKept
-	if a2aGchatHasHome(agent) {
+	if a2aGchatHasEffectiveHome(agent, rec) {
 		meanwhile = homeChannelUnsetToGchat
 	}
 	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",

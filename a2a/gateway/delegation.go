@@ -314,7 +314,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		if addressee != targetPlatform {
 			tier := capability.Tier(parent.Tier)
 			if !profileParent {
-				if tier, err = requesterTier(*parent.Requester); err != nil {
+				authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
+				if tier, err = g.tierFor(authors, unknown); err != nil {
 					refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
 					return nil, false
 				}
@@ -430,6 +431,9 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),
+		// The parent's entry, never the request: the request is the
+		// session's, and a task can't raise this for its children.
+		ChangeRequested: parent.ChangeRequested,
 		// The parent's link goes into the same record write as the child's
 		// entry: written after, a restart or a failed relay write in
 		// between would leave the child on record with a parent that looks
@@ -1258,6 +1262,8 @@ func (g *Gateway) startWake(ctx context.Context, rec *SessionRecord, child, pare
 		SteerAuthorsOverflow: steered.SteerAuthorsOverflow,
 		RootTaskID:           child.rootID(),
 		Request:              parent.Request,
+		// The delegating turn's, as the child's was.
+		ChangeRequested: parent.ChangeRequested,
 	})
 	if !ok {
 		// startTaskWith has said why. A wake that never reached the bus

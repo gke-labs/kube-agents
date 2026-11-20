@@ -303,7 +303,7 @@ type SlackAdapter struct {
 	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
 
 	// homeLearn is the learned home channel's state (slack_home_channel.go).
-	homeLearn slackHomeLearn
+	homeLearn homeLearner
 
 	// workspaceURL is the bot's workspace as auth.test names it
 	// ("https://acme.slack.com/"), the root of a message's permalink; home is
@@ -533,7 +533,8 @@ func (s *SlackAdapter) expireMark(key string) {
 
 // ShowsTaskStatus is the StatusShower answer: with Agent Sessions wired the
 // thread's Working… status, the ask's reaction and the plan rows are the
-// task's status, so the relay posts no rolling line. An adapter built
+// task's status, so the relay posts no rolling line, except for a child
+// delegated to an AgentProfile (childKeepsLine, #6532). An adapter built
 // without them (a test that fakes no sessions API) keeps the line, and so
 // does a conversation with no thread (a legacy top-level DM key), which
 // gets no Agent Session.

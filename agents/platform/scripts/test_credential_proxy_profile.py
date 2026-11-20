@@ -1524,6 +1524,124 @@ PROFILE_VCS_READS = frozenset(
 )
 PROFILE_VCS_WRITES = frozenset({"publish", "proposal-create", "proposal-update"})
 PERMIT = CASES["a permit"]
+# The task both fixture credentials name, and an expiry well past any test's clock.
+TASK_ID = PERMIT["claims"]["task"]
+FAR = 4_000_000_000.0
+
+
+class ProfileTaskWritesTest(unittest.TestCase):
+    """The per-task record on its own (#6400): the race, expiry, eviction and a restart."""
+
+    def test_of_two_tasks_publishing_the_same_new_name_the_first_wins(self):
+        record = credential_proxy.ProfileTaskWrites()
+        asked = []
+
+        def absent_while_the_second_task_arrives():
+            # The first task's remote lookup is in flight when the second claims.
+            asked.append("first")
+            second = record.claim_branch("task-2", FAR, "r", "platform-agent/x", lambda: False)
+            self.assertEqual((False, False), second)
+            return False
+
+        self.assertEqual((True, True), record.claim_branch("task-1", FAR, "r", "platform-agent/x", absent_while_the_second_task_arrives))
+        self.assertEqual(["first"], asked)
+        self.assertTrue(record.owns_branch("task-1", "r", "platform-agent/x"))
+        self.assertFalse(record.owns_branch("task-2", "r", "platform-agent/x"))
+        # The owner publishes again: allowed, not fresh.
+        self.assertEqual((True, False), record.claim_branch("task-1", FAR, "r", "platform-agent/x", lambda: True))
+
+    def test_entries_expire_with_the_task(self):
+        now = [1000.0]
+        record = credential_proxy.ProfileTaskWrites(clock=lambda: now[0])
+        record.claim_branch("t", 1100.0, "r", "b", lambda: False)
+        record.record_proposal("t", 1100.0, "r", 5)
+        self.assertTrue(record.owns_branch("t", "r", "b") and record.owns_proposal("t", "r", 5))
+        now[0] = 1100.0
+        self.assertFalse(record.owns_branch("t", "r", "b"))
+        self.assertFalse(record.owns_proposal("t", "r", 5))
+
+    def test_a_fresh_record_owns_nothing(self):
+        record = credential_proxy.ProfileTaskWrites()
+        self.assertFalse(record.owns_branch("t", "r", "b"))
+        self.assertFalse(record.owns_proposal("t", "r", 1))
+
+    def test_past_the_cap_a_newcomer_is_refused_and_no_live_entry_is_dropped(self):
+        record = credential_proxy.ProfileTaskWrites(max_entries=2)
+        record.record_proposal("t1", FAR, "r", 1)
+        record.claim_branch("t1", FAR, "r", "b1", lambda: False)
+        # Full: another task's new proposal goes unrecorded, its new claim is refused.
+        record.record_proposal("t2", FAR, "r", 2)
+        self.assertEqual((False, False), record.claim_branch("t2", FAR, "r", "b2", lambda: False))
+        self.assertFalse(record.owns_proposal("t2", "r", 2))
+        self.assertFalse(record.owns_branch("t2", "r", "b2"))
+        # The first task's live entries are all still there.
+        self.assertTrue(record.owns_proposal("t1", "r", 1) and record.owns_branch("t1", "r", "b1"))
+
+    def test_an_expired_entry_makes_room(self):
+        now = [1000.0]
+        record = credential_proxy.ProfileTaskWrites(clock=lambda: now[0], max_entries=1)
+        record.record_proposal("t1", 1100.0, "r", 1)
+        now[0] = 1200.0
+        record.record_proposal("t2", 2000.0, "r", 2)
+        self.assertTrue(record.owns_proposal("t2", "r", 2))
+
+    def test_ownership_is_per_repository(self):
+        # The same number or branch name in another repository is another task's question.
+        record = credential_proxy.ProfileTaskWrites()
+        record.record_proposal("t", FAR, "acme/infra", 5)
+        record.claim_branch("t", FAR, "acme/infra", "platform-agent/x", lambda: False)
+        self.assertTrue(record.owns_proposal("t", "acme/infra", 5))
+        self.assertFalse(record.owns_proposal("t", "acme/other", 5))
+        self.assertFalse(record.owns_branch("t", "acme/other", "platform-agent/x"))
+
+    def test_a_pending_claim_admits_nobody_until_the_remote_says_free(self):
+        # Two publishes of one new name from the same task: while the first's
+        # lookup is in flight, the second is refused, so it can't ride a claim
+        # the lookup is about to drop (the branch turned out to be on the remote).
+        record = credential_proxy.ProfileTaskWrites()
+        seen = []
+
+        def present_and_raced():
+            seen.append(record.claim_branch("t1", FAR, "r", "platform-agent/x", lambda: False))
+            seen.append(record.owns_branch("t1", "r", "platform-agent/x"))
+            return True
+
+        self.assertEqual((False, False), record.claim_branch("t1", FAR, "r", "platform-agent/x", present_and_raced))
+        self.assertEqual([(False, False), False], seen)
+        self.assertFalse(record.owns_branch("t1", "r", "platform-agent/x"))
+
+    def test_a_lookup_that_raises_releases_the_claim_and_raises(self):
+        record = credential_proxy.ProfileTaskWrites()
+
+        def broken():
+            raise OSError("forge down")
+
+        with self.assertRaises(OSError):
+            record.claim_branch("t", FAR, "r", "b", broken)
+        self.assertEqual((True, True), record.claim_branch("t2", FAR, "r", "b", lambda: False))
+
+    def test_a_lookup_never_confirms_a_claim_that_replaced_its_own(self):
+        # The first claim expires while its remote lookup is in flight, and the
+        # same task claims the name afresh (and has it confirmed). The first
+        # lookup returning must not count the replacement as its own.
+        now = [1000.0]
+        record = credential_proxy.ProfileTaskWrites(clock=lambda: now[0])
+
+        def expire_and_replace():
+            now[0] = 1200.0
+            self.assertEqual((True, True), record.claim_branch("t", 5000.0, "r", "b", lambda: False))
+            return False
+
+        self.assertEqual((False, False), record.claim_branch("t", 1100.0, "r", "b", expire_and_replace))
+        self.assertTrue(record.owns_branch("t", "r", "b"))
+
+    def test_a_release_drops_only_the_holders_claim(self):
+        record = credential_proxy.ProfileTaskWrites()
+        record.claim_branch("t1", FAR, "r", "b", lambda: False)
+        record.release_branch("t2", "r", "b")
+        self.assertTrue(record.owns_branch("t1", "r", "b"))
+        record.release_branch("t1", "r", "b")
+        self.assertFalse(record.owns_branch("t1", "r", "b"))
 
 
 class ProfileVcsRouteTest(unittest.TestCase):
@@ -1555,6 +1673,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
         vcs.snapshot_source.side_effect = lambda repository: (repository, None)
         forge = mock.Mock()
         forge.name = "github"
+        forge.hosts = ("github.com",)
+        self.forge_stub = forge
         vcs.registry.resolve.return_value = (forge, "acme/infra")
         CredentialProxyHandler.vcs = vcs
         self.vcs = vcs
@@ -1574,6 +1694,20 @@ class ProfileVcsRouteTest(unittest.TestCase):
         patcher = mock.patch.object(credential_proxy, "repository_is_managed", self.managed)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The task bar (#6400): a fresh record per test, seeded with what the
+        # permit's task made, so the write tests below write on its own work.
+        self.record = credential_proxy.ProfileTaskWrites()
+        patcher = mock.patch.object(CredentialProxyHandler, "profile_task_writes", self.record)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.key = credential_proxy.task_repository_key(forge, "acme/infra")
+        for branch in ("platform-agent/fix", "platform-agent/new-change"):
+            self.own_branch(branch)
+        self.record.record_proposal(TASK_ID, FAR, self.key, 7)
+
+    def own_branch(self, branch, task=None):
+        allowed, _ = self.record.claim_branch(task or TASK_ID, FAR, self.key, branch, lambda: False)
+        assert allowed
 
     # proposal-create from a profile task carries only the fields every adapter
     # reads, so it gets a payload of its own.
@@ -1735,6 +1869,111 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.assertNotIn(credential_proxy.PROFILE_IDENTITY_MANAGED_KEY, body)
         self.vcs.registry.resolve.assert_called_once()
         listed.assert_not_called()
+
+    # -- the task bar: only what this task made (#6400) -------------------------
+
+    def assert_not_this_tasks(self, verb, status, body):
+        self.assertEqual(403, status, body)
+        self.assertEqual(credential_proxy.PROPOSAL_NOT_THIS_TASKS_CODE, body.get("code"), body)
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_OWNERSHIP, body["rule"])
+        self.routes[verb].assert_not_called()
+
+    def test_a_task_publishes_a_new_branch_opens_its_proposal_and_updates_it(self):
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/fresh", "exists": False}}
+        self.routes["proposal-create"].return_value = {"proposal": {"number": 9, "url": "https://github.com/acme/infra/pull/9"}}
+        status, body = self.post_with("publish", branch="platform-agent/fresh")
+        self.assertEqual(200, status, body)
+        status, body = self.post_with("proposal-create", source="platform-agent/fresh")
+        self.assertEqual(200, status, body)
+        self.forge.proposals[9] = _proposal(9, "platform-agent/fresh")
+        status, body = self.post_with("proposal-update", number=9)
+        self.assertEqual(200, status, body)
+
+    def test_another_tasks_proposal_is_refused(self):
+        # The install's own (it passes the ownership bar), but another task opened it.
+        self.forge.proposals[8] = _proposal(8, "platform-agent/incident")
+        self.record.record_proposal("task-2", FAR, self.key, 8)
+        status, body = self.post_with("proposal-update", number=8)
+        self.assert_not_this_tasks("proposal-update", status, body)
+
+    def test_a_proposal_no_task_recorded_is_refused(self):
+        # A restart drops the record: refused, never permitted.
+        self.forge.proposals[8] = _proposal(8, "platform-agent/incident")
+        status, body = self.post_with("proposal-update", number=8)
+        self.assert_not_this_tasks("proposal-update", status, body)
+
+    def test_proposal_create_from_a_branch_this_task_did_not_publish_is_refused(self):
+        self.own_branch("platform-agent/incident", task="task-2")
+        for source in ("platform-agent/incident", "platform-agent/never-published"):
+            with self.subTest(source=source):
+                self.reset()
+                status, body = self.post_with("proposal-create", source=source)
+                self.assert_not_this_tasks("proposal-create", status, body)
+
+    def test_the_key_holds_the_host_and_the_path(self):
+        github, enterprise = mock.Mock(), mock.Mock()
+        github.name = enterprise.name = "github"
+        github.hosts, enterprise.hosts = ("github.com",), ("github.example.com",)
+        key = credential_proxy.task_repository_key
+        # The same provider and path on two hosts, and two paths on one host, are four records.
+        self.assertEqual(4, len({key(f, p) for f in (github, enterprise) for p in ("acme/infra", "acme/other")}))
+
+    def test_the_same_path_on_another_forge_is_another_record(self):
+        # The task opened #7 on github.com's acme/infra; GitLab's acme/infra #7,
+        # also the install's, is not this task's.
+        other = mock.Mock()
+        other.name = "gitlab"
+        other.hosts = ("gitlab.example.com",)
+        self.vcs.registry.resolve.return_value = (other, "acme/infra")
+        self.forge.proposals[7] = _proposal(7, "platform-agent/fix")
+        status, body = self.post_with("proposal-update", number=7)
+        self.assert_not_this_tasks("proposal-update", status, body)
+        self.assertNotEqual(
+            credential_proxy.task_repository_key(self.forge_stub, "acme/infra"),
+            credential_proxy.task_repository_key(other, "acme/infra"),
+        )
+        self.assertEqual(
+            credential_proxy.task_repository_key(self.forge_stub, "Acme/Infra"),
+            credential_proxy.task_repository_key(self.forge_stub, "acme/infra"),
+        )
+
+    def test_a_task_advances_its_own_branch_after_opening_its_proposal(self):
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/fix", "exists": True}}
+        status, body = self.post_with("publish", branch="platform-agent/fix", advance=True)
+        self.assertEqual(200, status, body)
+
+    def test_publish_to_a_branch_already_on_the_remote_is_refused(self):
+        # Unclaimed but present: another task's, or one from before a restart.
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/old", "exists": True}}
+        status, body = self.post_with("publish", branch="platform-agent/old")
+        self.assert_not_this_tasks("publish", status, body)
+        self.assertFalse(self.record.owns_branch(TASK_ID, self.key, "platform-agent/old"))
+
+    def test_publish_to_a_branch_another_task_claimed_is_refused(self):
+        self.own_branch("platform-agent/theirs", task="task-2")
+        status, body = self.post_with("publish", branch="platform-agent/theirs")
+        self.assert_not_this_tasks("publish", status, body)
+
+    def test_a_remote_lookup_that_fails_is_the_forges_answer(self):
+        # Not "another task published it first": the forge's own status, nothing written.
+        self.routes["branch-view"].side_effect = credential_proxy.providers.WorkspaceError("forge down", status=502)
+        status, body = self.post_with("publish", branch="platform-agent/fresh")
+        self.assertEqual(502, status, body)
+        self.assertNotEqual(credential_proxy.PROPOSAL_NOT_THIS_TASKS_CODE, body.get("code"))
+        self.routes["publish"].assert_not_called()
+        self.assertFalse(self.record.owns_branch(TASK_ID, self.key, "platform-agent/fresh"))
+
+    def test_a_branch_name_with_white_space_is_the_same_branch(self):
+        self.own_branch("platform-agent/theirs", task="task-2")
+        status, body = self.post_with("publish", branch="platform-agent/theirs ")
+        self.assert_not_this_tasks("publish", status, body)
+
+    def test_a_failed_publish_releases_its_new_claim(self):
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/fresh", "exists": False}}
+        self.routes["publish"].side_effect = credential_proxy.providers.WorkspaceError("push rejected", status=409)
+        status, _ = self.post_with("publish", branch="platform-agent/fresh")
+        self.assertEqual(409, status)
+        self.assertFalse(self.record.owns_branch(TASK_ID, self.key, "platform-agent/fresh"))
 
     def test_every_read_verb_runs_with_the_permit_too(self):
         for verb in sorted(PROFILE_VCS_READS):

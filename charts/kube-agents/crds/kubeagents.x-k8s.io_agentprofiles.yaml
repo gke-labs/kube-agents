@@ -559,6 +559,11 @@ spec:
                 is the executor for that addressee"
               rule: self.metadata.name != 'platform'
             - message:
+                "AgentProfile name 'session' is reserved: it is the A2A gateway's
+                session route"
+              optionalOldSelf: true
+              rule: oldSelf.hasValue() || self.metadata.name != 'session'
+            - message:
                 "AgentProfile name is too long for its tiers: each tier's bus
                 identity is profile-<name>-<tier>, which must fit one 63-character label,
                 so the name plus its longest allowed tier is at most 54 characters (50

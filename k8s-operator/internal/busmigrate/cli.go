@@ -93,6 +93,7 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 	replicas := fs.Int("replicas", 3, "unpin, restore: the replica count each stream ends at")
 	dir := fs.String("dir", "", "snapshot, restore: the staging directory")
 	runFile := fs.String("run-file", "", "restore: the operator's digests and policies (RunFile JSON)")
+	direction := fs.String("direction", "", "restore: forward (the rendered limits) or back (each stream as it was); empty is forward into more than one server, back into one")
 	report := fs.String("termination-log", DefaultTerminationLog, "restore, clear: where its report is written")
 	settle := fs.Duration("settle", 2*time.Second, "pin: the wait after each step-down or update")
 	if err := fs.Parse(args); err != nil {
@@ -116,6 +117,13 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 	case leg == "restore" && (*dir == "" || *runFile == ""):
 		fmt.Fprintln(stderr, "restore: --dir and --run-file are required")
 		return 2
+	case *direction != "" && *direction != "forward" && *direction != "back":
+		fmt.Fprintf(stderr, "restore: --direction %q is neither forward nor back\n", *direction)
+		return 2
+	}
+	forward := *replicas > 1
+	if *direction != "" {
+		forward = *direction == "forward"
 	}
 	var run RunFile
 	if leg == "restore" {
@@ -143,8 +151,9 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 		err = snapshotAll(ctx, nc, streams, *dir)
 	case "restore":
 		var warnings []string
-		warnings, err = restoreAll(ctx, nc, streams, *dir, run, *replicas)
-		r := Report{Warnings: warnings}
+		var settled time.Duration
+		warnings, settled, err = restoreAllDirected(ctx, nc, streams, *dir, run, *replicas, forward)
+		r := Report{Warnings: warnings, SettleSeconds: settled.Seconds()}
 		if err != nil {
 			r.Error = err.Error()
 		}
@@ -212,7 +221,11 @@ type Report struct {
 	// Cleared lists the streams a clear deleted, or found already gone.
 	Cleared  []string `json:"cleared,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
-	Error    string   `json:"error,omitempty"`
+	// SettleSeconds is how long the forward restore waited, from raising the
+	// last stream to three replicas, for every stream to settle
+	// (WaitRestored); zero on the way back to one server and on a failure.
+	SettleSeconds float64 `json:"settleSeconds,omitempty"`
+	Error         string  `json:"error,omitempty"`
 }
 
 // terminationMessageLimit is the kubelet's cap on a termination message.
@@ -254,39 +267,62 @@ func writeReport(path string, r Report) error {
 // a digest or policy refusal is never retried.
 const restoreRetries = 30
 
+// restoreSettleTimeout bounds the forward restore's wait for its raised
+// streams to settle (WaitRestored), all streams together. A var so tests can
+// shorten it.
+var restoreSettleTimeout = 5 * time.Minute
+
+// restoreAssignTimeout bounds, per stream, the wait before its raise for the
+// server to assign the consumers it restored (AssignedDurables), which takes
+// about a second. A var so tests can shorten it.
+var restoreAssignTimeout = time.Minute
+
 // restoreLog takes each failed attempt's error, which the run's report
 // otherwise loses to the last one.
 var restoreLog io.Writer = os.Stderr
 
 // restoreAll restores every named stream from dir, checking each staged
 // metadata file against the operator's digest before reading it, then
-// raises each to replicas. It returns the warnings found on the way.
-func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string, run RunFile, replicas int) ([]string, error) {
+// raises each to replicas. It returns the warnings found on the way. Into
+// more than one server it is the forward restore, into one the way back
+// (restoreAllDirected names the direction).
+func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string, run RunFile, replicas int) ([]string, time.Duration, error) {
+	return restoreAllDirected(ctx, nc, streams, dir, run, replicas, replicas > 1)
+}
+
+// restoreAllDirected is restoreAll in a named direction: forward restores
+// at the rendered limits (RestoreVerified), back restores each stream as
+// the snapshot recorded it (RestoreAsItWas), at either server count. A
+// reshape, which restores into the bus at the count it runs, can be one
+// server going forward.
+func restoreAllDirected(ctx context.Context, nc *nats.Conn, streams []string, dir string, run RunFile, replicas int, forward bool) ([]string, time.Duration, error) {
 	fresh, err := LoadFreshStreams()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	policies := map[string]StreamPolicy{}
 	for _, p := range run.Policies {
 		policies[p.Name] = p
 	}
 	var warnings []string
+	// Each stream's durables from its snapshot, for the settle wait.
+	durables := map[string][]DurableSpec{}
 	for _, name := range streams {
 		want, ok := run.Digests[name]
 		policy, hasPolicy := policies[name]
 		if !ok || !hasPolicy {
-			return warnings, fmt.Errorf("stream %s: the run file has no digest or no policy for it", name)
+			return warnings, 0, fmt.Errorf("stream %s: the run file has no digest or no policy for it", name)
 		}
 		metaBytes, err := os.ReadFile(filepath.Join(dir, name, SnapshotMetaFile)) // #nosec G304 -- under the Job's own --snapshot-dir; name is a stream from the run file
 		if err != nil {
-			return warnings, fmt.Errorf("stream %s: %w", name, err)
+			return warnings, 0, fmt.Errorf("stream %s: %w", name, err)
 		}
 		if Digest(metaBytes) != want.Meta {
-			return warnings, fmt.Errorf("stream %s: metadata %w", name, ErrDigestMismatch)
+			return warnings, 0, fmt.Errorf("stream %s: metadata %w", name, ErrDigestMismatch)
 		}
 		var meta Metadata
 		if err := json.Unmarshal(metaBytes, &meta); err != nil {
-			return warnings, fmt.Errorf("stream %s: %w", name, err)
+			return warnings, 0, fmt.Errorf("stream %s: %w", name, err)
 		}
 		warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
 		warnings = append(warnings, fresh.OutsidePolicyDrift(meta.Config)...)
@@ -295,9 +331,15 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		// forward, the snapshot's own on the way back (RestoreAsItWas).
 		built := policy
 		built.MaxConsumers = widenedMaxConsumers(meta.Config.MaxConsumers, policy.MaxConsumers)
-		if replicas <= 1 {
+		if !forward {
 			built.MaxBytes, built.MaxAge, built.MaxConsumers = meta.Config.MaxBytes, meta.Config.MaxAge, meta.Config.MaxConsumers
 		}
+		// How many consumers the restore brought back, by the server's
+		// final answer; unknown (-1) for a stream an earlier attempt or pod
+		// run built. An attempt that counted and then failed failed its
+		// read-back, so its stream was deleted or is outside policy and is
+		// restored again, never taken as already restored.
+		restored := -1
 		for attempt := 1; ; attempt++ {
 			if alreadyRestored(ctx, nc, built, meta.State, replicas) {
 				// Built by an earlier attempt (a finish that timed out
@@ -307,13 +349,18 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 				err = nil
 				break
 			}
-			// Into three servers, the forward restore: the rendered limits,
-			// and a snapshot that does not fit them refused. Into one, the
-			// way back: the stream as it was.
-			if replicas > 1 {
-				err = RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, open, want.Data, policy)
+			// Forward: the rendered limits, and a snapshot that does not fit
+			// them refused. Back: the stream as it was. Either way the
+			// stream is restored at one replica and raised after, as the
+			// operator's policy says (a2aStreamPolicies at one replica): a
+			// snapshot of a three-server bus, which a reshape takes,
+			// records three.
+			cfg := meta.Config
+			cfg.Replicas = 1
+			if forward {
+				restored, err = RestoreVerifiedCounting(ctx, nc, cfg, meta.State, meta.TakenAt, open, want.Data, policy)
 			} else {
-				err = RestoreAsItWas(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
+				restored, err = RestoreAsItWasCounting(ctx, nc, cfg, meta.State, open, want.Data, policy)
 			}
 			if err == nil || errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrOutsidePolicy) || errors.Is(err, ErrOverRenderedLimits) || attempt == restoreRetries {
 				break
@@ -333,20 +380,49 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 			}
 			select {
 			case <-ctx.Done():
-				return warnings, ctx.Err()
+				return warnings, 0, ctx.Err()
 			case <-time.After(2 * time.Second):
 			}
 		}
 		if err != nil {
-			return warnings, err
+			return warnings, 0, err
 		}
 		if replicas > 1 {
+			// The durables the settle wait reads: the raise waits until the
+			// server has assigned every consumer the restore brought back,
+			// or its remap would leave them out.
+			actx, cancel := context.WithTimeout(ctx, restoreAssignTimeout)
+			d, err := AssignedDurables(actx, nc, name, restored, meta.Config, replicas)
+			cancel()
+			if err != nil {
+				return warnings, 0, fmt.Errorf("stream %s: %w", name, err)
+			}
+			durables[name] = d
 			if err := RaiseReplicas(ctx, nc, name, replicas); err != nil {
-				return warnings, fmt.Errorf("stream %s: raising to %d replicas: %w", name, replicas, err)
+				return warnings, 0, fmt.Errorf("stream %s: raising to %d replicas: %w", name, replicas, err)
 			}
 		}
 	}
-	return warnings, nil
+	if replicas <= 1 {
+		return warnings, 0, nil
+	}
+	// Into three servers: the raised streams settle (replicas current, the
+	// restored durables up on their leaders) before the run releases the
+	// freeze. One budget for all of them; a stream that doesn't settle fails
+	// the restore, which takes the run's way back (the snapshot is kept).
+	settleCtx, cancel := context.WithTimeout(ctx, restoreSettleTimeout)
+	defer cancel()
+	// The settle time is from the last raise to every stream settled; a
+	// restore that fails reports none.
+	start := time.Now()
+	for _, name := range streams {
+		took, err := WaitRestored(settleCtx, nc, name, replicas, durables[name])
+		if err != nil {
+			return warnings, 0, fmt.Errorf("stream %s: %w", name, err)
+		}
+		fmt.Fprintf(restoreLog, "restore-window: %s R%d current and %d durables up after %s\n", name, replicas, len(durables[name]), took.Round(time.Millisecond))
+	}
+	return warnings, time.Since(start), nil
 }
 
 // alreadyRestored reports the stream already there as this snapshot built

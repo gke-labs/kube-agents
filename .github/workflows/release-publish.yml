@@ -267,7 +267,7 @@ jobs:
         with:
           syft-version: "v1.51.1"
 
-      # The bundle step builds the k8s-api-proxy release binaries
+      # The bundle step builds the k8s-api-proxy and kube-agents-mcp release binaries
       # (build_release_binaries.sh) with the toolchain main's go.mod pins; the
       # build runs with GOTOOLCHAIN=local, so a release commit needing a newer
       # one fails rather than downloads it. No cache: a release build restores
@@ -308,8 +308,8 @@ jobs:
           fi
 
   # A new release can contain upgrade-table rows still labelled `pending`, and
-  # `make docs-check-upgrade-releases` then fails every push to main until they
-  # are relabelled (#5673). This job opens the pull request that relabels them,
+  # `make docs-check-upgrade-releases` then fails pushes to main once the
+  # release is PENDING_GRACE_HOURS (48 h) old, until they are relabelled. This job opens the pull request that relabels them,
   # by the rule that check uses, minutes after the tag. It writes no commit to
   # main: the pull request goes through review and the merge queue like any
   # other. Its own job, so the publish job's token keeps its permissions and a

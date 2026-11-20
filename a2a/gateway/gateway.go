@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -234,6 +235,9 @@ type Gateway struct {
 	// first use (triggerLimiter).
 	triggerLimiterOnce sync.Once
 	triggerLimits      *triggerRateLimiter
+	// triggerMint, when set, mints trigger run grants in place of the cap
+	// bucket's minter (tests: a mint that fails).
+	triggerMint func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error)
 	// reports keeps the notify route's posts into conversations for the
 	// replies under them (reports.go).
 	reports pushedReports
@@ -381,6 +385,9 @@ type Gateway struct {
 	// targetAllowed is Config.TargetAllowedUsers compiled for lookup: the
 	// platform agent's own lists, checked when a session asks to delegate.
 	targetAllowed targetAllowed
+	// tierMembers is the tier each listed person's AgentProfile tasks run
+	// at, by requester (tier_membership.go, #3659 Tier 2c).
+	tierMembers map[TaskRequester]capability.Tier
 	// slackAllowed and slackAllowAll gate the slack backend's identity
 	// resolution ahead of the principal map (Config.SlackAllowedUsers,
 	// case preserved: Slack member ids compare exactly).
@@ -563,6 +570,10 @@ func New(o Options) (*Gateway, error) {
 		return nil, fmt.Errorf("people keyer: %w", err)
 	}
 	targetAllowed := buildTargetAllowed(o.Config, ps)
+	tierMembers := buildTierMembers(o.Config.TierMembership, ps)
+	if len(tierMembers) > 0 {
+		log.Info("tier membership loaded", "entries", len(tierMembers))
+	}
 	for target, byBackend := range targetAllowed {
 		for b, set := range byBackend {
 			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
@@ -641,6 +652,7 @@ func New(o Options) (*Gateway, error) {
 		gchatAllowed:     gchatAllowed,
 		gchatAllowAll:    o.Config.GchatAllowAllUsers,
 		targetAllowed:    targetAllowed,
+		tierMembers:      tierMembers,
 		slackAllowed:     slackAllowed,
 		slackAllowAll:    o.Config.SlackAllowAllUsers,
 		a2aGoogleAllowed: a2aGoogleAllowed,
@@ -1449,8 +1461,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// An explicit cancel from a backend that can express one is read before
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path. Read after the strip
-	// above, so a post-flip "/session stop" is the stop it unwraps to.
-	stopping := msg.Intent == IntentCancel || chattext.IsStop(msg.Text)
+	// above, so a post-flip "/session stop" is the stop it unwraps to. Any
+	// other intent keeps its own meaning whatever its text says.
+	stopping := msg.Intent == IntentCancel || (msg.Intent == "" && chattext.IsStop(msg.Text))
 	// A program holds a delegation chain's root id only (observedAs), so a
 	// cancel naming the root while the chain runs is a cancel of the task
 	// that is running: the child, or the wake. Published at the root's own
@@ -1595,6 +1608,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// follow-up to whatever runs here; steering it in would drop the
 		// profile and its parameters without a word.
 		g.post(rec.Key, noticeTurnNotStarted+noticeProfileWhileRunning)
+	case active != nil && !active.Detached && msg.Intent == IntentConfirm:
+		// A confirm is a new task's grant, and a steer cannot widen what
+		// the running task was granted: refused rather than steered in as
+		// text that asks for a change the task has no permit to make.
+		g.post(rec.Key, noticeTurnNotStarted+noticeConfirmWhileRunning)
 	case active != nil && !active.Detached && rec.fanOutPending(active.TaskID):
 		// Text while a batch runs steers nothing: the turn that asked has
 		// ended, and which child it was meant for isn't for the gateway to
@@ -1617,7 +1635,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		var route *profileRoute
 		if msg.Profile != "" {
 			requester := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
-			tier, err := requesterTier(requester)
+			// Every author whose text reaches the task, this one included:
+			// a thread runs at its authors' common tier (tierFor).
+			authors, unknown, _ := delegateAuthors(rec, requester)
+			tier, err := g.tierFor(authors, unknown)
 			if err == nil {
 				route, err = g.profileRouteFor(msg.Profile, msg.Parameters, tier, lib.SubmitKindTop)
 			}
@@ -3220,6 +3241,30 @@ type taskStart struct {
 	// "Addressing"). rec.Addressee is the resolved profile. Nil for every
 	// task addressed to platform or a session.
 	Route *profileRoute
+	// ChangeRequested goes onto the entry and, for a profile task, onto
+	// its submission (TaskParameters.ChangeRequested). True for a human
+	// turn only when it arrived with IntentConfirm; a child or a wake
+	// copies its chain's entry, never anything the session wrote.
+	ChangeRequested bool
+}
+
+// childKeepsLine reports whether a task keeps its rolling line on a backend
+// that shows task status itself (StatusShower): a single child delegated to
+// an AgentProfile by a session turn (#6532). The backend's own status says
+// the chain is running, but none of it carries a profile worker's progress:
+// the plan rows come from the platform agent's notices, and the worker's
+// working and progress events render only on a line. Without one the room
+// sees "delegated to <profile>" and then nothing until the answer. A child
+// to platform keeps the platform's own status; a batch child (KeepActive)
+// is left as it is, since the relay doesn't edit its line yet; and a child
+// of a profile task is left lineless, so the room never holds two live
+// lines, its parent's and its own.
+func childKeepsLine(rec *SessionRecord, ts taskStart) bool {
+	if ts.Role != taskRoleChild || ts.Route == nil || ts.KeepActive {
+		return false
+	}
+	parent, ok := rec.TaskRefFor(ts.ParentTaskID)
+	return ok && parent.Tier == ""
 }
 
 // startTask opens a turn for a human message, and returns its task id once
@@ -3237,6 +3282,8 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
+		// A structured confirm action only: free text never sets it.
+		ChangeRequested: msg.Intent == IntentConfirm,
 	})
 	return taskID
 }
@@ -3271,7 +3318,10 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		"backendMessageId", ts.MessageID,
 		"principal", ts.Principal,
 		"conversation", rec.Key,
-		"addressee", addressee)
+		"addressee", addressee,
+		// Whether a human's structured confirm asked for a change: the
+		// audit record of what this task's submission may mint a permit for.
+		"changeRequested", ts.ChangeRequested)
 
 	// The root capability, minted before anything is published. The
 	// gateway allocates the taskId and the addressee in the same breath, so
@@ -3353,7 +3403,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			}
 		}
 	}
-	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, extra...)
+	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, ts.ChangeRequested, extra...)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
 		return "", false
@@ -3382,8 +3432,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	// None on a backend that shows the task's status itself (StatusShower).
-	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
+	// None on a backend that shows the task's status itself (StatusShower),
+	// except for a task delegated to a profile (childKeepsLine).
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key) && !childKeepsLine(rec, ts)
 	// A trigger's conversation has no chat backend: no placeholder there
 	// (unpostableTrigger), for a child or a wake started on its record.
 	if !lineless && !g.unpostableTrigger(rec.Key) {
@@ -3425,6 +3476,8 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Depth:        ts.Depth,
 		RootTaskID:   ts.RootTaskID,
 		Request:      ts.Request,
+		// What a child of this task inherits (handleDelegateRequest).
+		ChangeRequested: ts.ChangeRequested,
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID
@@ -3622,6 +3675,18 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 			g.log.Warn("steer refused", "rule", rule, "taskId", active.TaskID, "conversation", rec.Key,
 				"addressee", rec.Addressee, "steerBackend", author.Backend, "steerAuthor", author.Subject)
 			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
+			return
+		}
+	}
+	// A profile task's grant was minted once, at its authors' tier: a steer
+	// from someone at another tier is refused, before the author is
+	// recorded, rather than left to reach a task that runs at a tier its
+	// author doesn't have (#3659, Tier 2c).
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" {
+		if at := g.tierOf(author); string(at) != ref.Tier {
+			g.log.Warn("steer refused", "rule", ruleSteerTier, "taskId", active.TaskID, "conversation", rec.Key,
+				"taskTier", ref.Tier, "steerTier", at, "steerBackend", author.Backend, "steerAuthor", author.Subject)
+			g.post(rec.Key, fmt.Sprintf(noticeSteerTierDiffers, ref.Tier, at))
 			return
 		}
 	}

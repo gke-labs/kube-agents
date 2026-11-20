@@ -42,6 +42,7 @@ coverage-go.xml
 # The seeded fleet's lock is committed: the scheduled reconcile applies it
 # unattended in every pool project, so provider versions are chosen by a person.
 !bench/tf/fleet/.terraform.lock.hcl
+!bench/tf/sized-fleet/.terraform.lock.hcl
 
 # Terraform state and variable files hold credentials and infrastructure
 # details — never commit them. Committed examples keep the .example suffix.

@@ -1,14 +1,25 @@
 """Saved answers for the proxy's record and replay modes.
 
-Record mode writes one file per fingerprint under the cache directory: the
-answer with the values its request bound swapped for placeholders, its finish
-reason and usage, and the request's hashes for diagnosis. The first write for
-a key wins. Each distinct request message, normalized and scrubbed, is written
-once beside them, so a replay miss can show how a message differed.
+Record mode writes one file per distinct answer to a fingerprint under the
+cache directory, `alts/<fingerprint>/<answer>.json`, named by the hash of the
+answer exactly as stored, opaque ids and signatures aside (stored_hash), so
+two answers that differ in anything served never share a name: the answer
+with the values its request
+bound swapped for placeholders, its finish reason and usage, and the request's
+hashes for diagnosis. Each file is written once; a second delivery of the same
+answer finds it there and writes nothing, and a different answer to the same
+request gets a file of its own. Each distinct request message, normalized and
+scrubbed, is written once beside them, so a replay miss can show how a message
+differed.
 
-Replay mode reads the directory: a hit restores the answer with the current
-request's values (a placeholder the request does not bind makes it a miss)
-and serves it in the shape an OpenAI-compatible client expects.
+Replay mode reads the directory: a hit restores one of the key's answers with
+the current request's values (a placeholder the request does not bind makes it
+a miss) and serves it in the shape an OpenAI-compatible client expects. The
+older layout, one `answers/<fingerprint>.json` per key, is still read: a key
+with no alternates serves that file as its one answer. The replay lane's
+download may write `weights/<fingerprint>.json` beside a key's alternates,
+how often passing runs produced each (AnswerCache.weights), which replay
+serves them in proportion to.
 """
 
 from __future__ import annotations
@@ -24,26 +35,50 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import normalizer
 
+# The older layout: one answer per fingerprint, the first written. Still read
+# (a key with no alternates), never written by record mode.
 ANSWERS_DIR = "answers"
+# Every distinct answer recorded for a fingerprint, one file each:
+# alts/<fingerprint>/<stored answer hash>.json (stored_hash).
+ALTS_DIR = "alts"
 MESSAGES_DIR = "messages"
 # Saved answers by answer-slot key, and the answers recorded for each slot context.
 SLOTS_DIR = "slots"
 VARIANTS_DIR = "variants"
 JSON_SUFFIX = ".json"
 # Every name the cache writes, relative to its directory: one key per file, a
-# variant one directory deeper. The one definition of the layout, which the
-# collector, the publisher and the lane's download check names against.
-# CACHE_LAYOUT_PATTERN holds VARIANT_JOINER where a variant's context and
-# answer meet: "/" on disk (CACHE_REL_RE); the publisher flattens a variant to
-# one object name with its own separator (publish_cache.OBJECT_NAME_RE).
+# variant and an alternate one directory deeper. The one definition of the
+# layout, which the collector, the publisher and the lane's download check
+# names against. CACHE_LAYOUT_PATTERN holds VARIANT_JOINER where a variant's
+# context and answer (or an alternate's fingerprint and answer) meet: "/" on
+# disk (CACHE_REL_RE); the publisher flattens both to one object name with its
+# own separator (publish_cache.OBJECT_NAME_RE).
 CACHE_HEX = r"[0-9a-f]{16,64}"
 VARIANT_JOINER = "<variant-joiner>"
 CACHE_LAYOUT_PATTERN = (
     rf"^(?:(?:{re.escape(ANSWERS_DIR)}|{re.escape(SLOTS_DIR)}|{re.escape(MESSAGES_DIR)})/{CACHE_HEX}{re.escape(JSON_SUFFIX)}"
-    rf"|{re.escape(VARIANTS_DIR)}/{CACHE_HEX}{VARIANT_JOINER}{CACHE_HEX}{re.escape(JSON_SUFFIX)})\Z"
+    rf"|(?:{re.escape(VARIANTS_DIR)}|{re.escape(ALTS_DIR)})/{CACHE_HEX}{VARIANT_JOINER}{CACHE_HEX}{re.escape(JSON_SUFFIX)})\Z"
 )
 DISK_VARIANT_JOINER = "/"
-CACHE_REL_RE = re.compile(CACHE_LAYOUT_PATTERN.replace(VARIANT_JOINER, re.escape(DISK_VARIANT_JOINER)))
+# How often passing runs produced each of a key's alternates,
+# weights/<fingerprint>.json holding {answer identity: count}: written only by
+# the replay lane's download (fetch_cache.py), never by record mode or the
+# publisher, so it is in the directory's layout (CACHE_REL_RE, what the lane
+# seeds) but not among the bucket's objects (CACHE_LAYOUT_PATTERN).
+WEIGHTS_DIR = "weights"
+WEIGHTS_PATTERN = rf"{re.escape(WEIGHTS_DIR)}/{CACHE_HEX}{re.escape(JSON_SUFFIX)}"
+CACHE_REL_RE = re.compile(
+    rf"(?:{CACHE_LAYOUT_PATTERN.replace(VARIANT_JOINER, re.escape(DISK_VARIANT_JOINER))}|^{WEIGHTS_PATTERN}\Z)")
+# The most one answer weighs (AnswerCache.weights): a larger count is read as
+# this, so a key's weighted turn order stays short enough to build per lookup.
+# The busiest keys of the 2026-11-17 and -18 nightlies gave about a hundred
+# producing requests a build.
+MAX_ANSWER_WEIGHT = 1000
+# A fingerprint or an answer identity as one path segment.
+CACHE_HEX_RE = re.compile(rf"^{CACHE_HEX}\Z")
+# The identity AnswerCache.answers gives the older layout's single answer,
+# which is saved under its fingerprint alone.
+LEGACY_ANSWER = ""
 TMP_SUFFIX = ".tmp"
 # Written last by whatever seeds a replay cache from outside the pod
 # (hack/replay-proxy/collect_shadow.py, in the replay lane): a replay proxy
@@ -59,6 +94,7 @@ TEXT_KEY = "text"
 FUNCTION_KEY = "function"
 NAME_KEY = "name"
 ARGUMENTS_KEY = "arguments"
+
 
 # Fields of a saved entry.
 ENTRY_FINGERPRINT = "fingerprint"
@@ -119,6 +155,30 @@ def stored_answer(message: Dict[str, Any], mapping: normalizer.Mapping) -> Dict[
     return normalize_answer(kept, mapping)
 
 
+def _without_opaque(value: Any, key: Optional[str] = None) -> Any:
+    """`value` with every opaque field (ids, signatures) left out, as the normalizer tells them."""
+    if isinstance(value, list):
+        return [{k: _without_opaque(v[k], k) for k in v if not normalizer.Normalizer.is_opaque(k, True)}
+                if key == TOOL_CALLS_KEY and isinstance(v, dict) else _without_opaque(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _without_opaque(v, k) for k, v in value.items() if not normalizer.Normalizer.is_opaque(k, False)}
+    return value
+
+
+def stored_hash(stored: Dict[str, Any], finish_reason: Optional[str]) -> str:
+    """An alternate's name: the hash of the answer exactly as stored (stored_answer) and of the
+    finish reason it is served with, opaque fields aside.
+
+    Everything served counts (text, tool calls, thinking text, a refusal, and
+    the finish reason, read as the DEFAULT_FINISH_REASON a served answer
+    without one gets), so two answers that differ in anything a client reads
+    get different names; only ids and signatures, which differ between two
+    deliveries of the same answer, are left out, so identical answers from
+    different runs share one.
+    """
+    return normalizer.stable_hash([_without_opaque(stored), finish_reason or DEFAULT_FINISH_REASON])
+
+
 def answer_texts(message: Dict[str, Any]) -> List[str]:
     """Every string of an answer the normalizer reads: opaque fields (ids, signatures) left out."""
     found: List[str] = []
@@ -139,7 +199,7 @@ def restore_answer(saved: Dict[str, Any], mapping: normalizer.Mapping) -> Tuple[
 
 
 class AnswerCache:
-    """One directory of saved answers. Writes are atomic and the first one for a key wins."""
+    """One directory of saved answers. Writes are atomic and every file is written once."""
 
     def __init__(self, root: str):
         self.root = root
@@ -154,7 +214,7 @@ class AnswerCache:
         try:
             with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
                 handle.write(data)
-            os.link(tmp, path)  # fails if the key is already there: the first write wins
+            os.link(tmp, path)  # fails if the name is already there, so a file is never rewritten
             return True
         except FileExistsError:
             return False
@@ -168,12 +228,81 @@ class AnswerCache:
         return self._write_once(self._path(ANSWERS_DIR, fingerprint), json.dumps(entry, sort_keys=True, ensure_ascii=True))
 
     def load(self, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """The older layout's answer to a fingerprint (answers/), or None."""
+        return self._load_entry(self._path(ANSWERS_DIR, fingerprint))
+
+    @staticmethod
+    def _load_entry(path: str) -> Optional[Dict[str, Any]]:
         try:
-            with open(self._path(ANSWERS_DIR, fingerprint), encoding=TEXT_ENCODING) as handle:
+            with open(path, encoding=TEXT_ENCODING) as handle:
                 entry = json.load(handle)
-        except (FileNotFoundError, ValueError):
+        except (OSError, ValueError):
             return None
         return entry if isinstance(entry, dict) else None
+
+    def _alternate_path(self, fingerprint: str, answer: str) -> str:
+        return self._path(os.path.join(ALTS_DIR, fingerprint), answer)
+
+    def save_alternate(self, fingerprint: str, answer: str, entry: Dict[str, Any]) -> bool:
+        """Save one answer to a fingerprint under its identity; True when this call wrote it.
+
+        Written once: the same answer delivered again writes nothing, and the
+        file never changes after it is written.
+        """
+        if not (CACHE_HEX_RE.match(fingerprint) and CACHE_HEX_RE.match(answer)):
+            raise ValueError("an alternate is named by two hex digests")
+        return self._write_once(self._alternate_path(fingerprint, answer),
+                                json.dumps(entry, sort_keys=True, ensure_ascii=True))
+
+    def alternate_names(self, fingerprint: str) -> List[str]:
+        """The answer identities saved for a fingerprint, sorted, so every reader sees one order."""
+        if not CACHE_HEX_RE.match(fingerprint):
+            return []
+        try:
+            names = os.listdir(os.path.join(self.root, ALTS_DIR, fingerprint))
+        except OSError:
+            return []
+        return sorted(name[: -len(JSON_SUFFIX)] for name in names
+                      if name.endswith(JSON_SUFFIX) and CACHE_HEX_RE.match(name[: -len(JSON_SUFFIX)]))
+
+    def answers(self, fingerprint: str) -> List[Tuple[str, Optional[Dict[str, Any]]]]:
+        """Every answer saved for a fingerprint, in a fixed order: (identity, entry, or None when unreadable).
+
+        The alternates, by identity; for a key with none, the older layout's
+        answer as (LEGACY_ANSWER, entry). A fingerprint that is not a hex
+        digest (a slot's pointer is read from a file) names nothing.
+        """
+        if not CACHE_HEX_RE.match(fingerprint):
+            return []
+        names = self.alternate_names(fingerprint)
+        if names:
+            return [(name, self._load_entry(self._alternate_path(fingerprint, name))) for name in names]
+        if os.path.exists(self._path(ANSWERS_DIR, fingerprint)):
+            return [(LEGACY_ANSWER, self.load(fingerprint))]
+        return []
+
+    def weights(self, fingerprint: str) -> Dict[str, int]:
+        """How often passing runs produced each alternate of a fingerprint (weights/), by identity.
+
+        Empty when there is no file or it is not a map; an entry that is not
+        a positive integer is left out, and one above MAX_ANSWER_WEIGHT is
+        read as it. An alternate with no entry weighs 1 (the caller's rule).
+        """
+        if not CACHE_HEX_RE.match(fingerprint):
+            return {}
+        found = self._load_entry(self._path(WEIGHTS_DIR, fingerprint))
+        return {name: min(count, MAX_ANSWER_WEIGHT) for name, count in (found or {}).items()
+                if isinstance(name, str) and isinstance(count, int) and not isinstance(count, bool) and count > 0}
+
+    def save_weights(self, fingerprint: str, weights: Dict[str, int]) -> bool:
+        """Write a fingerprint's weights file once (the lane's download); True when this call wrote it."""
+        if not CACHE_HEX_RE.match(fingerprint):
+            raise ValueError("a weights file is named by a hex digest")
+        return self._write_once(self._path(WEIGHTS_DIR, fingerprint), json.dumps(weights, sort_keys=True))
+
+    def has_answer(self, fingerprint: str) -> bool:
+        """Whether a readable answer to the fingerprint is saved, in either layout."""
+        return any(entry is not None for _, entry in self.answers(fingerprint))
 
     def save_slot(self, slot_key: str, fingerprint: str) -> bool:
         """Point a slot at an entry; True when this call wrote the pointer.
@@ -185,7 +314,7 @@ class AnswerCache:
         if self._write_once(path, data):
             return True
         current = self.load_slot(slot_key)
-        if current is not None and self.load(current) is not None:
+        if current is not None and self.has_answer(current):
             return False
         self._replace(path, data)
         return True
@@ -232,14 +361,24 @@ class AnswerCache:
         return text if isinstance(text, str) else None
 
     def entries(self) -> Iterator[Dict[str, Any]]:
-        directory = os.path.join(self.root, ANSWERS_DIR)
-        if not os.path.isdir(directory):
-            return
-        for name in sorted(os.listdir(directory)):
-            if name.endswith(JSON_SUFFIX):
-                entry = self.load(name[: -len(JSON_SUFFIX)])
-                if entry is not None:
-                    yield entry
+        """One readable entry per saved fingerprint, either layout: what the miss index searches.
+
+        The alternates of one fingerprint share its request, so the first is enough.
+        """
+        fingerprints: set = set()
+        for sub in (ALTS_DIR, ANSWERS_DIR):
+            try:
+                names = os.listdir(os.path.join(self.root, sub))
+            except OSError:
+                continue
+            for name in names:
+                key = name if sub == ALTS_DIR else name[: -len(JSON_SUFFIX)] if name.endswith(JSON_SUFFIX) else ""
+                if CACHE_HEX_RE.match(key):
+                    fingerprints.add(key)
+        for fingerprint in sorted(fingerprints):
+            entry = next((entry for _, entry in self.answers(fingerprint) if entry is not None), None)
+            if entry is not None:
+                yield entry
 
 
 def prefix_keys(diag_settings_hash: str, diag_hashes: List[str]) -> Iterator[str]:

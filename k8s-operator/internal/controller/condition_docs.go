@@ -42,6 +42,7 @@ var degradedConditionReasons = []string{
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
 	conditionReasonInvalidCredentialProxyExec,
+	conditionReasonInvalidKanbanAdmission,
 	reasonRBACIncomplete,
 }
 
@@ -135,13 +136,13 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    homeChannelUnsetConditionType,
-		Written: "While the A2A gateway holds a chat backend whose `homeChannel` is empty (Google Chat, Slack, or both; on Slack: and no learned channel is admitted)",
-		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When the other platform has a home channel, proactive posts go there meanwhile. When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
+		Written: "While the A2A gateway holds a chat backend whose `homeChannel` is empty (Google Chat, Slack, or both) and no learned channel is admitted for it",
+		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When the other platform has a home channel, proactive posts go there meanwhile. When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or under `homeChannelPolicy` `auto` mention the agent in a channel or a space, or on Slack pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
 	},
 	{
 		Type:    a2aBusMigratingConditionType,
 		Written: "While a bus migration runs (True), and after one ended without converting the bus (False, `Abandoned`) or stopped for a person (False, `Failed`); absent once one converted the bus, or when none has run",
-		Meaning: "`status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases.",
+		Meaning: "`status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. A reshape (leg `Reshape`, [recreating TASKS wider](#recreating-tasks-wider)) reads the same way, its message naming TASKS rather than a server count. `True`, `LegUnknown`: the run's leg is one this operator does not run, a later release's found after a rollback; it is held where it is, with the freeze, until that release is back or a person abandons it ([a run this operator does not run](#a-run-this-operator-does-not-run)). An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases.",
 	},
 	{
 		Type:    noChatPlatformConditionType,
