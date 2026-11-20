@@ -128,10 +128,6 @@ class AttributeTest(unittest.TestCase):
         self.assertIn("| compliance-audit | 3 |", text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ReadScriptTest(unittest.TestCase):
     """The in-pod read script itself, run here on stores of the live schema's shape."""
 
@@ -363,3 +359,7 @@ class CallsTest(unittest.TestCase):
             out = subprocess.run([sys.executable, "-c", at.READ_SCRIPT, root, "0"], capture_output=True, text=True,
                                  check=True, env={}).stdout
         self.assertEqual(at.decode(out)["calls"], [["platform", "s1", 2, 1, 100, 80, 7]])
+
+
+if __name__ == "__main__":
+    unittest.main()
