@@ -67,7 +67,7 @@ func TestASteerIntoAChangeRequestedTaskIsRefused(t *testing.T) {
 // server publish on the same .in subject as the same author, so a frame from
 // either is a console steer here, and neither reaches a change-requested task.
 func TestAConsoleSteerIntoAChangeRequestedTaskIsRefused(t *testing.T) {
-	r := startProfileRig(t)
+	r := startProfileRigWithLogs(t)
 	conv := "console:tab-steer-cr"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m-a", Text: "open the PR", Intent: IntentConfirm}
 	origin := r.awaitTask(t, "platform")
@@ -78,8 +78,32 @@ func TestAConsoleSteerIntoAChangeRequestedTaskIsRefused(t *testing.T) {
 
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m-b", Text: "also delete the old branch"}
 	waitFor(t, "the refusal", postedContaining(r, noticeSteerChangeRequested))
+	waitFor(t, "the audit line", loggedContaining(r, "steer refused", "rule="+ruleSteerChangeRequested, origin.TaskID))
 	if steersInto(t, r, "platform", origin) {
 		t.Fatal("a console steer reached the change-requested task")
+	}
+	if got := steerAuthors(t, r, conv, origin.TaskID); len(got) != 0 {
+		t.Fatalf("a refused console steer recorded its author: %+v", got)
+	}
+}
+
+// A choice click while a confirmed task runs is a steer too, and is refused
+// the same way: the gateway can't tell who on a door clicked, so a
+// change-requested task takes no mid-run answer of any kind (the spec says
+// so). An input-required answer takes the same path and is refused alike.
+func TestAChoiceClickIntoAChangeRequestedTaskIsRefused(t *testing.T) {
+	r := startProfileRigWithLogs(t)
+	conv := "discord:steer-cr/4"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-a", Text: "open the PR", Intent: IntentConfirm}
+	origin := r.awaitTask(t, "platform")
+	waitForRecord(t, r, conv, "the confirmed entry", func(rec *SessionRecord) bool {
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && ref.ChangeRequested
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-b", Text: "use main", Click: true}
+	waitFor(t, "the refusal", postedContaining(r, noticeSteerChangeRequested))
+	if steersInto(t, r, "platform", origin) {
+		t.Fatal("a click reached the change-requested task")
 	}
 }
 

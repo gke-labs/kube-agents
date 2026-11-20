@@ -287,7 +287,11 @@ after the restart. Each earlier turn's answer posts as it completes; the result 
 last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
 child is checked against the target's list first (rule `delegation.child-steer`);
 refused, it is not published, its author is not recorded, and the room is told the
-target is not reachable from here.
+target is not reachable from here. A steer into a running task that holds `ChangeRequested` (one a
+structured confirm started, or its child or wake) is refused from every door (rule
+`steer-change-requested`): it is not published, its author is not recorded, and the room is
+told to stop the task and confirm again. That covers an `input-required` answer and a choice
+click too, since both arrive as steers.
 
 **The busy notice.** The gateway tells a person when their turn is going to wait, on the
 turn's own status line. Once a fixed-route turn's task is on the bus, the gateway counts the

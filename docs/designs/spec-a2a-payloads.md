@@ -398,7 +398,9 @@ calls and become properties of the stream:
   `kind: message` with the same `taskId` to `…in`. Executor resumes and publishes
   `working`.
 - Steering (added 8/24; refusal posture recorded 8/31): a follow-up `message` on `…in`
-  while the task is `working` is legal. It is steering input - delivered to the
+  while the task is `working` is legal, except into a task that holds `changeRequested`: the
+  gateway sends no steer into one, and so no `input-required` answer or choice click either
+  (#5884). It is steering input - delivered to the
   executor, incorporated at its next turn boundary, no state transition implied. The
   hard interrupt is `cancel`, not a steer. An executor that cannot absorb input mid-turn
   may queue it instead (the standing front door, 10/8): it answers each follow-up with a

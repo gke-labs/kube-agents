@@ -3650,10 +3650,6 @@ var steerRefusalWhy = map[string]string{
 	lib.SteerReasonNoResume:   "this agent's executor can't continue a session, so follow-ups run on the api executor only",
 }
 
-// steerTask forwards a message that arrived while the task runs as a
-// follow-up on the same taskId — injected, absorbed at the executor's next
-// turn boundary (decided 8/24). It reuses the task's correlationId; the
-// steer is attributed by its own envelope and authority block.
 // ruleSteerChangeRequested names the refusal of a steer into a task that
 // holds ChangeRequested (steerTask), and noticeSteerChangeRequested is what
 // its conversation is told.
@@ -3662,6 +3658,10 @@ const (
 	noticeSteerChangeRequested = "⚠️ not sent: the running task is making a confirmed change, and what it's asked to do can't change while it runs. Stop it, then send what you want as a new confirm."
 )
 
+// steerTask forwards a message that arrived while the task runs as a
+// follow-up on the same taskId — injected, absorbed at the executor's next
+// turn boundary (decided 8/24). It reuses the task's correlationId; the
+// steer is attributed by its own envelope and authority block.
 func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend string, authority Authority) {
 	active := rec.ActiveTask
 	// The steer's author is written to the record before the steer is
