@@ -116,7 +116,8 @@ A reshape is a migration run of leg `Reshape`, at the count the bus runs. It fre
 It starts only when all of these hold. Otherwise a Normal `A2ABusReshapeNotStarted` Event says why:
 
 - no migration is under way, and the last one isn't a `Failed` run waiting for a person;
-- the bus is provisioned (`BusProvisioned`), and the operator has its own image (`OPERATOR_IMAGE`);
+- the bus is provisioned (`BusProvisioned`), or its provision Job refused only TASKS's width, as it does after a reshape given up with TASKS still narrow;
+- the operator has its own image (`OPERATOR_IMAGE`);
 - the live TASKS is narrower than the width this PlatformAgent renders. A TASKS with no limit is never narrower;
 - TASKS fits the limits the restore puts on it, as for one to three.
 

@@ -20,6 +20,10 @@ from slack_relay_patch import is_silent_text
 
 
 LOGGER = logging.getLogger("google-chat-relay-patch")
+# The relay is the credential broker, an in-cluster Service: a proxy from the
+# environment must not get this request and its bearer token, and urllib does
+# not leave out a cluster host by itself.
+_RELAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Below: what ``hermes send`` needs to reach Chat from a process with no
 # credential of its own.
@@ -303,7 +307,7 @@ def install() -> None:
             headers=headers,
             method="GET" if body is None else "POST",
         )
-        with urllib.request.urlopen(req, timeout=35) as response:
+        with _RELAY_OPENER.open(req, timeout=35) as response:
             return json.load(response)
 
     class RelayMessage:

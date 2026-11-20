@@ -51,12 +51,16 @@ code, which cannot travel on a `python3 -I -` stdin the way `stall_report.py`
 does (it reads its own `__file__` and imports its siblings). From a shell the
 CLI reads with the local `kubectl`.
 
-Only `no-pdb` is registered. A re-check is the kinds it reads in the target
-namespace and a tuple of small steps, each of which ends the re-check with a
-verdict or hands on: find the target as the audit's scope leaves it, run one
-collector check by id on it, narrow a cluster check to the objects that select
-it. Another check id joins `RECHECKS` as a new tuple of those steps, plus any
-new step it needs.
+A re-check is the kinds it reads in the target namespace and a tuple of small
+steps, each of which ends the re-check with a verdict or hands on: find the
+target as the audit's scope leaves it, run one collector check by id on it,
+narrow a cluster check to the objects that select it. `RECHECKS` is built from
+the fix recipes (`fix_recipes/<kind>/recipe.yaml`, `recheck_kinds` and
+`recheck_siblings`); only `no-pdb` declares one. A recipe adds a re-check in its
+recipe file, plus a `CHECK_NEEDS` entry saying what its own check reads, and a
+`SIBLING_NARROWING` entry for a sibling check not yet there. A read short of
+either fails at import.
+Only collector workload checks are re-checked; readiness rules are not yet.
 
 Exit codes: 0 clean, 1 reproduces, 2 unchecked (a failed read, a crash inside
 the re-check, or a usage error). The JSON on stdout carries the same answer.
@@ -78,6 +82,9 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 import audit_report
 import collect
+
+# collect.py has put the platform scripts on the path, where the registry lives.
+from fix_recipes import registry  # noqa: E402
 
 OUTCOME_CLEAN = "clean"
 OUTCOME_REPRODUCES = "reproduces"
@@ -268,23 +275,54 @@ def narrowed_cluster_check(slug: str, context_key: str) -> Step:
     return step
 
 
-RECHECKS: dict[str, Recheck] = {
-    "no-pdb": Recheck(
-        # `horizontalpodautoscalers`: `blocking-pdb` compares against an
-        # autoscaler's floor rather than `spec.replicas`.
-        "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers",
-        (
-            in_scope_workload,
-            workload_check("no-pdb"),
-            # A second budget over the same pods makes the eviction API refuse
-            # them all, so a fix that adds one beside another is not clean.
-            select_target_workload,
-            narrowed_cluster_check("pdb-overlapping", "workloads"),
-            select_budgets,
-            narrowed_cluster_check("blocking-pdb", "pdbs"),
-        ),
-    ),
+#: How a sibling check a fix could trip is narrowed to the target: the step
+#: that selects what it may see, the context key that selection replaces, and
+#: the kinds the read must include for the check to judge rightly. A recipe
+#: naming a sibling not here, or reading too little for it, fails at import.
+#: Every workload kind a budget can select. Both PDB siblings count the
+#: namespace's workloads: `blocking-pdb` reads whether a budget also selects a
+#: DaemonSet (which makes it unscalable) and sums the floors of every workload
+#: it selects, and `pdb-overlapping` matches budgets against workloads.
+#: Leaving one out of the read turns a drain-blocking budget into `clean`.
+WORKLOAD_KINDS = frozenset({"deployments", "statefulsets", "daemonsets"})
+SIBLING_NARROWING: dict[str, tuple[Step, str, frozenset[str]]] = {
+    # A second budget over the same pods makes the eviction API refuse them
+    # all, so a fix that adds one beside another is not clean.
+    "pdb-overlapping": (select_target_workload, "workloads", WORKLOAD_KINDS | {"poddisruptionbudgets"}),
+    # Without autoscalers read, `blocking-pdb` compares against `spec.replicas`
+    # rather than the autoscaler's floor.
+    "blocking-pdb": (select_budgets, "pdbs", WORKLOAD_KINDS | {"poddisruptionbudgets", "horizontalpodautoscalers"}),
 }
+
+
+#: The kinds a recipe's own check needs in the read: every workload kind, so
+#: `in_scope_workload` can find a target of any of them, plus what the check
+#: itself looks up. Without budgets read, `no-pdb` finds none and reports a
+#: fixed workload as `reproduces`. A recipe whose check is not here fails at
+#: import, so a new check declares what it reads before it can be re-checked.
+CHECK_NEEDS: dict[str, frozenset[str]] = {
+    "no-pdb": WORKLOAD_KINDS | {"poddisruptionbudgets"},
+}
+
+
+def recheck_for(recipe: registry.Recipe) -> Recheck:
+    """A workload-scoped recipe's re-check: find the target, run its own check, then each sibling narrowed."""
+    # `poddisruptionbudgets.policy` reads the same kind as `poddisruptionbudgets`.
+    read = {kind.split(".", 1)[0] for kind in recipe.recheck_kinds.split(",")}
+    needs = CHECK_NEEDS[recipe.kind]
+    if not needs <= read:
+        raise ValueError(f"{recipe.kind} needs {', '.join(sorted(needs - read))} in recheck_kinds")
+    steps: list[Step] = [in_scope_workload, workload_check(recipe.kind)]
+    for sibling in recipe.siblings():
+        select, context_key, needs = SIBLING_NARROWING[sibling]
+        if not needs <= read:
+            raise ValueError(f"{recipe.kind}: {sibling} needs {', '.join(sorted(needs - read))} in recheck_kinds")
+        steps += [select, narrowed_cluster_check(sibling, context_key)]
+    return Recheck(recipe.recheck_kinds, tuple(steps))
+
+
+#: One re-check per recipe that declares one (`fix_recipes/<kind>/recipe.yaml`).
+RECHECKS: dict[str, Recheck] = {r.kind: recheck_for(r) for r in registry.recipes() if r.recheck_kinds}
 
 
 def judge(spec: Recheck, target: Target, dump: dict) -> tuple[Verdict, dict]:

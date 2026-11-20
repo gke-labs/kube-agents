@@ -1055,9 +1055,8 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
             if failures:
                 # One line on stdout, which chat posts, and exit 0: a non-zero exit makes the scheduler post
                 # that the check "didn't run" and will retry, where it did run and did the other records.
-                print(f"The post-merge check ran, but {len(failures)} record(s) or step(s) failed: "
-                      f"{', '.join(failures)[:1500]}. Details are in logs/{LOG_FILE} on the agent; "
-                      "each is said once a day while it keeps failing.")
+                print(f"I checked merged fixes, but this failed: {'; '.join(failures)[:1500]}. "
+                      "If it keeps failing, I'll say so again tomorrow.")
     return 0
 
 
