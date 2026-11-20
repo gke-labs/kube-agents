@@ -541,11 +541,21 @@ failure: the refresh after findings retire, a refresh deferred from an
 earlier run, and the one after a threshold override changes. A failed project
 or clusters not reached hold it back. So on a fleet too big for one run,
 `latest.*` and the topic change only when a finding comes due, and otherwise
-keep the previous report. When `NATS_URL` is set, the watch also writes
-`latest.json` to the `topology-skew`
+keep the previous report. When `NATS_URL` is set, the watch also writes the
+JSON report it just saved to the `topology-skew`
 (`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
-fails, it warns once in chat and retries on a later run that reads every
-project in full without a failure, until the write recovers.
+fails, it warns once in chat and retries with `latest.json` on a later run
+that reads every project in full without a failure, until the write recovers.
+A report too large for one bus message (NATS's 1 MiB `max_payload`, less 64
+KiB held back for the envelope and encoding slack) is published capped: the
+same document keeping the fleet's most severe findings in order, up to the
+first that does not fit, each in its own cluster, the full report's `summary`,
+and a `truncated` block counting what was left out. Its `full_report` is the
+timestamped report's path on the Platform Agent profile's disk, which
+leeway-watch prunes once ten newer reports exist. When even the clusters
+stripped of findings do not fit, `clusters` is emptied and counted in
+`truncated.clusters_omitted`. The `--text` summary gains a suffix naming the
+cap.
 
 ## `session-retention` gives every profile's history an end
 

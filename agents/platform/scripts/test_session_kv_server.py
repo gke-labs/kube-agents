@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
@@ -8830,6 +8830,78 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
             ],
         )
         self.assertEqual(polled["next_since_id"], polled["events"][-1]["id"])
+
+    def _ledger_row_aged(self, session_id, hours_ago):
+        """One suppressed row, dated `hours_ago` back in the ledger's own clock."""
+        row_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1", namespace="prod", workload=session_id, object_uid=session_id,
+            object_kind="Pod", reason="BackOff", message="m", severity="Warning",
+            occurrences=1, notified=False, session_id=session_id,
+        )
+        with closing_db() as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE id = ?",
+                (f"-{hours_ago} hours", row_id),
+            )
+            conn.commit()
+        return row_id
+
+    def test_intercepted_events_since_filters_the_newest_first_page(self):
+        for session_id, hours_ago in (("old-a", 72), ("old-b", 48), ("new-c", 1), ("new-d", 0)):
+            self._ledger_row_aged(session_id, hours_ago)
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+        page = self.client.get(f"/v1/intercepted-events?since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in page["events"]], ["new-d"])
+        # `truncated` counts the window's rows only: one more inside it, two outside.
+        self.assertTrue(page["truncated"])
+        full = self.client.get(f"/v1/intercepted-events?since={since}&limit=10").json()
+        self.assertEqual([e["session_id"] for e in full["events"]], ["new-d", "new-c"])
+        self.assertFalse(full["truncated"])
+        self.assertEqual(full["next_since_id"], full["events"][0]["id"])
+        # Without `since` the page is what it always was.
+        self.assertEqual(len(self.client.get("/v1/intercepted-events?limit=10").json()["events"]), 4)
+
+    def test_intercepted_events_since_filters_the_cursor_page(self):
+        ids = {}
+        for session_id, hours_ago in (("old-a", 72), ("old-b", 48), ("new-c", 1), ("new-d", 0)):
+            ids[session_id] = self._ledger_row_aged(session_id, hours_ago)
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+        first = self.client.get(f"/v1/intercepted-events?since_id=0&since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in first["events"]], ["new-c"])
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["next_since_id"], ids["new-c"])
+        rest = self.client.get(f"/v1/intercepted-events?since_id={first['next_since_id']}&since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in rest["events"]], ["new-d"])
+        self.assertFalse(rest["truncated"])
+        # An empty filtered page keeps the cursor where it was.
+        none = self.client.get(f"/v1/intercepted-events?since_id={ids['new-d']}&since={since}").json()
+        self.assertEqual(none, {"events": [], "truncated": False, "next_since_id": ids["new-d"]})
+        # Without `since` the cursor walk starts at the oldest row, as before.
+        self.assertEqual(
+            self.client.get("/v1/intercepted-events?since_id=0&limit=1").json()["events"][0]["session_id"], "old-a"
+        )
+
+    def test_intercepted_events_unpadded_since_is_normalised_before_the_compare(self):
+        """`strptime` takes `9:00:00`; the string compare against zero-padded `created_at`
+        would not (`'12' < '9:'`), so the route re-renders `since` before binding it."""
+        row_id = self._ledger_row_aged("noon", 0)
+        with closing_db() as conn:
+            conn.execute("UPDATE intercepted_events SET created_at = '2026-01-01 12:00:00' WHERE id = ?", (row_id,))
+            conn.commit()
+        for since in ("2026-01-01 9:00:00", "2026-01-01 09:00:00"):
+            with self.subTest(since=since):
+                page = self.client.get("/v1/intercepted-events", params={"since": since}).json()
+                self.assertEqual([e["session_id"] for e in page["events"]], ["noon"])
+
+    def test_intercepted_events_bad_since_is_a_400(self):
+        for bad in ("yesterday", "2026-11-16T00:00:00Z", "2026-11-16", "2026-13-01 00:00:00"):
+            with self.subTest(bad=bad):
+                response = self.client.get(f"/v1/intercepted-events?since={bad}")
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("YYYY-MM-DD HH:MM:SS", response.json()["detail"])
+        self.assertEqual(self.client.get("/v1/intercepted-events?since=2026-11-16 00:00:00").status_code, 200)
 
     def test_kanban_task_feeds_and_detail(self):
         # Before kanban.db exists: empty list feed with board=False, 404 on detail

@@ -254,6 +254,8 @@ SQLITE_INT64_MAX = (1 << 63) - 1
 # task's full report in one response.
 FEED_EVENTS_DEFAULT_LIMIT = 50
 FEED_EVENTS_MAX_LIMIT = 500
+# `since` on the feed: the ledger's own `created_at` form, UTC, no zone.
+FEED_EVENTS_SINCE_FORMAT = "%Y-%m-%d %H:%M:%S"
 FEED_TASKS_DEFAULT_LIMIT = 50
 FEED_TASKS_MAX_LIMIT = 200
 # Per-task child rows `GET /v1/tasks/{id}` returns, the same ceilings the admin
@@ -9030,28 +9032,56 @@ def _feed_status(
 def list_intercepted_events(
     since_id: Optional[int] = None,
     limit: int = FEED_EVENTS_DEFAULT_LIMIT,
+    since: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The event ledger, one row per event a producer forwarded.
 
     Without `since_id`, the newest `limit` rows, newest first — what a page
     shows on load. With `since_id` (including `since_id=0` after an empty
     initial poll), the rows after that id, oldest first, so a poller passes
-    back `next_since_id` and sees each row once, in order. `truncated` says
-    more rows matched than were returned.
+    back `next_since_id` and sees each row once, in order. `since`, a UTC
+    time in the ledger's own `created_at` form (`YYYY-MM-DD HH:MM:SS`),
+    keeps rows from that time on in either order; `truncated` says more rows
+    matched than were returned, counting the window's rows only.
     """
     if since_id is not None:
         since_id = _validate_non_negative_int64(since_id, "since_id")
+    if since is not None:
+        try:
+            # Re-rendered, so an unpadded field cannot reach the string compare.
+            since = datetime.strptime(since, FEED_EVENTS_SINCE_FORMAT).strftime(FEED_EVENTS_SINCE_FORMAT)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="since must be a UTC time of the form YYYY-MM-DD HH:MM:SS",
+            )
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
+    # `created_at` is the same text form, so the string compare is the time
+    # compare and the window is a range of idx_intercepted_events_created_at.
+    # Newest first within a window is read off that index backwards, with the
+    # id as the tie-break inside a second; without a window, by id as before.
+    # One literal statement per shape, so scripts/check_sqlite_query_plans.py
+    # reads each plan (a statement assembled from parts is one it cannot judge).
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
         "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request, "
         "excluded"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
-        if since_id is not None:
+        if since is not None and since_id is not None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE created_at >= ? AND id > ? ORDER BY id ASC LIMIT ?",
+                (since, since_id, limit + 1),
+            ).fetchall()
+        elif since_id is not None:
             rows = conn.execute(
                 f"SELECT {columns} FROM intercepted_events WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (since_id, limit + 1),
+            ).fetchall()
+        elif since is not None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (since, limit + 1),
             ).fetchall()
         else:
             rows = conn.execute(

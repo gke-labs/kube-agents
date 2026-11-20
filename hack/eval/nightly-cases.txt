@@ -896,6 +896,14 @@
 # ai-security-planted-model-audit's 1450s hint.
 ./tasks/ai-security-manual-names-reconciler/task.yaml
 
+# "What alerts fired overnight?" answered from the event ledger through the
+# `get_alert_history` tool (#4056): prebuilt/alert-history-ledger posts two
+# Info events to the daemon (two `filtered` rows, no card, no chat post), and
+# the case grades the worker's tool call and both workload names in the
+# reply. A stack, so it takes lock-infra; the plant is two loopback posts,
+# priced at the 200s default. Nightly from its first merge.
+./tasks/alert-history-overnight-from-ledger/task.yaml
+
 # A crash loop that outlasts the settle period is forwarded, the pod recovers,
 # and 15m after its last event the watcher's quiet follow-up lands on the
 # alert's thread and card ("Quiet since HH:MM UTC", #612). deployer: tofu, the
@@ -1362,6 +1370,18 @@
 # no pool fixture: its first nightly run is the pool proof of the plant and
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
+
+# The front door is running the plugins its image ships: an exec into the
+# agent container reads each plugin directory under /opt/defaults/plugins
+# against /opt/data/plugins (agent-owned, every shipped file present and
+# unchanged; an entry only the volume has is reported), after one front-door
+# turn that the roster block should answer without a card. Written for
+# #6279, where a root-owned /opt/data/plugins on a new data volume left the
+# front door with none of its plugins while the gate stayed green; the fix
+# (the agent Pod's first init container makes the directory) is #6357's.
+# deployer: noop, no fixtures, one model turn and one exec. Nightly from its
+# first merge; a presubmit seat waits on its record.
+./tasks/platform-agent-shipped-plugins-loaded/task.yaml
 
 # A card that asks only for the install's usage summary is answered by the
 # kube-agents-feedback skill's summary subcommand (docs/designs/
