@@ -761,24 +761,26 @@ Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and use
 delegation to profiles onward. The gateway carries a `delegate` request's `parameters` into the
 child's submission once their names pass the target profile's declared ones. These are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
-`taskParameters` parts.
+`taskParameters` parts. Of the task parameters' fields, `changeRequested` is set true only for a
+turn that arrived as a structured confirm.
 
 **Task parameters.** A profile task's submission carries
 `{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
 declares, such as the cluster persona's `project`, `location` and `cluster`. The gateway sets them
 from what the client or the parent task asked. They never ride the authority block. The dispatcher
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
-to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
+to the worker as `PROFILE_TASK_<NAME>`, or to a script-run task's script as `KA_PARAM_<NAME>`
+(`spec-profiles-dispatch.md`, #5622), whose name may be at most 32 characters. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
 
 The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
 request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
 and only for a turn that arrived as a structured confirm action, never from free text or a
-delegation's arguments. A child task carries its parent's value from the gateway's own record and
-cannot raise it. The gateway's half is #4457, which owns both rules; until it lands, nothing sets
-the field and every profile write is refused. Absent means false, so a
-submission that asks for no change is byte-identical to one written before the field existed. The
-dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
+delegation's arguments. A child task or a wake carries its parent's value from the gateway's own
+record and cannot raise it. When it is true the gateway attaches the part even with no parameters.
+Absent means false, so a submission that asks for no change is byte-identical to one written before
+the field existed. The dispatcher turns it into the `vcs:proposal-create` permit on the task's
+credential-proxy token.
 
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
@@ -1076,7 +1078,7 @@ Worked examples:
 | Subject                                       | Class   | Writer                          | Content                                                                                         |
 | --------------------------------------------- | ------- | ------------------------------- | ----------------------------------------------------------------------------------------------- |
 | `a2a.topics.agent.platform.upgrade-readiness` | state   | platform agent                  | DataPart: current per-cluster readiness verdicts                                                |
-| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent                  | DataPart: the latest `leeway.report/v1alpha1` document (per-cluster topology and rank findings) |
+| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent                  | DataPart: the latest `leeway.report/v1alpha1` document; capped when over the message limit      |
 | `a2a.topics.agent.platform.version-skew`      | state   | platform agent                  | DataPart: skew summary across the fleet                                                         |
 | `a2a.topics.shared.blueprint`                 | state   | OKF Curator (`a2a/cmd/curator`) | DataPart: active OKF digest (`kube-agents.memory.blueprint/v1`)                                 |
 | `a2a.topics.shared.annotations`               | journal | any agent                       | TextPart/DataPart: dated observations and candidate proposals (`kube-agents.memory.outcome/v1`) |
@@ -1084,11 +1086,24 @@ Worked examples:
 ### Payload
 
 A `topic-update` envelope carries an A2A `Artifact`: `name` is the topic, parts are
-typically one DataPart (the structured state) with an optional TextPart summary. When the
+typically one DataPart (the structured state) with an optional TextPart summary. The
+`topology-skew` document adds a `coverage` object to the leeway report: `clusters_swept`,
+`clusters_read`, and the projects `not_reached` or with `scan_errors` in that run, each
+mapped to its summary. A cluster absent from `clusters` was not read that run; it is not
+clean. When the
 update happened in the course of a task, the envelope carries that task's `taskId` and
 `correlationId` - which is the audit thread from a user's question to the standing state it
 changed. Updates published on an agent's own schedule carry a `correlationId` minted for
 that run.
+
+`topology-skew` is one artifact, so its report must fit one bus message (NATS's 1 MiB
+`max_payload`, less 64 KiB held back for the envelope and encoding slack). A larger report
+is published capped: the fleet's most severe findings in order, up to the first that does
+not fit, each kept in its cluster; the full report's
+`summary`; and a `truncated` block counting what was left out and giving the full report's
+path on the Platform Agent's disk. When even the clusters without findings do not fit,
+`clusters` is empty and `truncated.clusters_omitted` counts them. The TextPart summary
+gains a suffix naming the cap.
 
 ### Retention classes
 

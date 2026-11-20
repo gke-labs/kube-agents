@@ -453,7 +453,7 @@ read first, and reads nothing while the switch is `off`. `POST_MERGE_READS_PER_T
 schedules the step yet. A merge fills
 `merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
-that it ends with no outcome. Every read stamps `merge_checked_at`. The apply step is
+that it ends with no outcome. Every read stamps `merge_checked_at`. The apply and health steps are
 `post_merge_check.py health`, under the same switch and per-run cap and likewise unscheduled, least
 recently read first by `health_checked_at`. A record whose cluster the install's declared scope leaves out, by the fleet audit's own rule
 (`post_merge_scope.py`), or whose scope cannot be judged, is not read: `sync_state` says why
@@ -468,15 +468,14 @@ path narrows the namespace matches and never empties them, and a diff it cannot 
 no file naming the workload, is said as `the workload's files unknown` in `sync_state`), asking the broker
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
-`sync_state`. Once applied it records `applied_at` and the pods' restart counts
-(`health_baseline`) for the health window, a later step. A workload that is gone or cannot be judged
-fails with the reason in `health_result` and `health_detail`; any other read failure is kept and
-retried. `post_merge_edited.py fill`, under the same switch and per-run cap and likewise unscheduled,
+`sync_state`. Once applied it records `applied_at` and the Ready pods' restart counts
+(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings, each on its own run, with the last one past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under `HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod of the workload (other than one being deleted, or one that has ended in phase `Failed` or `Succeeded`, such as an evicted pod) is Ready, and no container, sidecars and init containers included, restarted past its baseline or was OOMKilled since the apply. A workload scaled to zero replicas is healthy with no pods. A rollout or scale still under way, or a pod that was not Ready at the apply and is still starting, is not settled rather than red: the run waits and the count starts again. A pod that was Ready at the apply, or has been seen Ready since (it then joins `health_baseline`), and is not Ready fails it, even while another pod is starting. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the reason in `health_detail` and the time in `health_at`. A workload that is gone, an unreadable restart baseline or an unreadable apply time fails at once with the reason. Any other read failure is kept, resets the count and is retried. From `HEALTH_SETTLE_LIMIT` (30 minutes) past the window, a run whose own reading is not settled, or fails, fails it as not settled; a healthy reading still counts. `post_merge_edited.py fill`, under the same switch and per-run cap and likewise unscheduled,
 fills `human_edited` for each merged record without one: `1` when anyone but the install, a person or
 another automation such as a dependency bot, committed to the pull request or requested changes on it
 (the pull-request sweep's rule, read through `proposal-commits` and `proposal-reviews`), `0` when
 neither happened, and `NULL` when what was read shows neither but cannot be read in full. It asks again next run, until a day after the
-check noticed the merge (`merge_checked_at`), so a merge noticed late is still asked. The revert and outcome columns are left for the later steps (the follow-ups below write `reverted_at`). `cleanup_old_records` leaves the table: each row
+check noticed the merge (`merge_checked_at`), so a merge noticed late is still asked. The revert and outcome
+columns are left for the later steps (the follow-ups below write `reverted_at`). `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 
 The report step is `post_merge_check.py report` (`post_merge_report.py`), under the same switch and

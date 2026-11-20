@@ -42,6 +42,7 @@ var degradedConditionReasons = []string{
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
 	conditionReasonInvalidCredentialProxyExec,
+	conditionReasonInvalidKanbanAdmission,
 	reasonRBACIncomplete,
 }
 

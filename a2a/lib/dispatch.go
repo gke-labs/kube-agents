@@ -168,6 +168,13 @@ type DispatchMessage struct {
 	// past the configured maximum lifetime.
 	TaskCredential string `json:"taskCredential,omitempty"`
 	ProxyToken     string `json:"proxyToken,omitempty"`
+	// Script is the helper script a script-run task runs (#5622): the entry
+	// of the profile's spec.scripts the task's trigger names, resolved at
+	// admission from the dispatch config the dispatcher checked it against.
+	// A confirm only. The worker runs it in place of the harness, only in
+	// Job mode, and only when the name equals the script in its verified
+	// ProxyToken. The path comes from here, never from the task.
+	Script *DispatchScript `json:"script,omitempty"`
 }
 
 // Validate reports the first way m is malformed, or nil.
@@ -177,6 +184,14 @@ func (m DispatchMessage) Validate() error {
 	}
 	if m.Type != DispatchConfirm && (m.TaskCredential != "" || m.ProxyToken != "") {
 		return fmt.Errorf("dispatch %s: task credentials ride on a confirm only", m.Type)
+	}
+	if m.Script != nil {
+		if m.Type != DispatchConfirm {
+			return fmt.Errorf("dispatch %s: a script rides on a confirm only", m.Type)
+		}
+		if err := m.Script.Validate(); err != nil {
+			return fmt.Errorf("dispatch confirm: %w", err)
+		}
 	}
 	switch m.Type {
 	case DispatchOffer:
@@ -598,6 +613,15 @@ const ScriptRoot = "/opt/kube-agents/scripts/"
 
 var ScriptPath = regexp.MustCompile(`^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$`)
 
+// Validate reports the first way sc can't be run, or nil: a name that's a
+// subject token, a path of ScriptPath's shape, and a positive timeout.
+func (sc DispatchScript) Validate() error {
+	if !ValidSubjectToken(sc.Name) || !ScriptPath.MatchString(sc.Path) || sc.TimeoutSeconds < 1 || sc.TimeoutSeconds > MaxDispatchSeconds {
+		return fmt.Errorf("script %q: not a subject token, a path outside %s, or a timeout outside 1 to %ds", sc.Name, ScriptRoot, MaxDispatchSeconds)
+	}
+	return nil
+}
+
 // Script is the profile's allowlisted script named name, if it lists one.
 func (p DispatchProfile) Script(name string) (DispatchScript, bool) {
 	for _, sc := range p.Scripts {
@@ -724,8 +748,7 @@ func (c DispatchConfig) Validate() error {
 		}
 		scripts := map[string]bool{}
 		for _, sc := range p.Scripts {
-			if !ValidSubjectToken(sc.Name) || scripts[sc.Name] || !ScriptPath.MatchString(sc.Path) ||
-				sc.TimeoutSeconds < 1 || sc.TimeoutSeconds > p.ActiveDeadlineSeconds {
+			if sc.Validate() != nil || scripts[sc.Name] || sc.TimeoutSeconds > p.ActiveDeadlineSeconds {
 				return fmt.Errorf("dispatch config: profile %s script %q is not a subject token, is listed twice, has a path outside %s, or a timeout outside 1 to %ds",
 					p.Name, sc.Name, ScriptRoot, p.ActiveDeadlineSeconds)
 			}
