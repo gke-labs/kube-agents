@@ -6,9 +6,11 @@ rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
 (`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
 Those are the lists; the code that handles one kind's fix is still per kind
-(`automerge_eligibility.FIX_TYPE`, `post_merge_check.DIRECT_OBJECTS`,
-`audit_report.GENERATED_FIX_CHECK`, `recheck.RECHECKS`), so a recipe alone
-gets a dial row and post-merge records but no broker label.
+(`automerge_eligibility.FIX_TYPE`, `audit_report.GENERATED_FIX_CHECK`,
+`recheck.RECHECKS`), so a recipe alone gets a dial row and post-merge records
+but no broker label. How the post-merge check sees the fix applied, and
+whether it holds a health window, is declared here (`applied`, `health`) and
+run by `fix_recipes/probes.py`.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
 through `automation_rules`, and neither may depend on PyYAML being there. So
@@ -21,6 +23,20 @@ Fields: `kind` (the directory's name), `name` (what text kube-agents writes
 calls the fixes), `title` and `dial_environment` (the dial's row), and the
 optional `owner` and `eval_case` (the end-to-end case that grades the fix on
 the cluster after merge).
+
+The verification fields, all optional:
+
+- `applied`: how the post-merge check sees the fix on the cluster when no
+  GitOps reconciler can say. `object_present`: an object of
+  `applied_resource` in the record's namespace, one whose selector selects the
+  workload when the record names a workload, else the object the record names.
+  `field_equals`: the object the record names, read as `applied_resource`, has
+  `applied_field` (a dotted path) equal to `applied_value`. Empty: the fix is
+  seen only through a reconciler. `applied_noun` names the object in the
+  reading (`budget`); it defaults to `object`.
+- `health`: `restart_flat` (the default) holds the health window on the
+  workload the record names; `none` passes the window once the fix is applied,
+  for a fix whose object is not a workload.
 """
 
 from __future__ import annotations
@@ -36,7 +52,17 @@ RECIPE_FILE = "recipe.yaml"
 # Larger than any recipe; a cap so a stray file costs a glance to refuse.
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
-OPTIONAL = ("owner", "eval_case")
+OPTIONAL = ("owner", "eval_case", "applied", "applied_resource", "applied_noun", "applied_field", "applied_value",
+            "health")
+#: The stock probes `fix_recipes/probes.py` runs, and the health windows the post-merge check holds.
+APPLIED_PROBES = ("object_present", "field_equals")
+HEALTH_PROBES = ("restart_flat", "none")
+#: What `applied` needs beside it.
+APPLIED_NEEDS = {"object_present": ("applied_resource",),
+                 "field_equals": ("applied_resource", "applied_field", "applied_value")}
+#: A kubectl resource name (`poddisruptionbudgets.policy`), a dotted field path (`spec.maxUnavailable`).
+RESOURCE_RE = re.compile(r"[a-z0-9]+(?:\.[a-z0-9]+(?:-[a-z0-9]+)*)*")
+FIELD_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*")
 # The same shapes `automation_rules` accepts for a rule's `fix` and `environments`.
 KIND_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ENVIRONMENT_RE = re.compile(r"[a-z0-9]([-_a-z0-9]{0,61}[a-z0-9])?")
@@ -57,6 +83,12 @@ class Recipe(NamedTuple):
     dial_environment: str
     owner: str = ""
     eval_case: str = ""
+    applied: str = ""
+    applied_resource: str = ""
+    applied_noun: str = ""
+    applied_field: str = ""
+    applied_value: str = ""
+    health: str = "restart_flat"
 
 
 def _value(raw: str, where: str) -> str:
@@ -107,7 +139,28 @@ def parse(text: str, where: str = RECIPE_FILE) -> Recipe:
         raise RecipeError(f"{where}: `kind` must be a check id such as `no-pdb`")
     if not ENVIRONMENT_RE.fullmatch(fields["dial_environment"]):
         raise RecipeError(f"{where}: `dial_environment` must be an environment label value such as `dev`")
+    _check_verification(fields, where)
     return Recipe(**fields)
+
+
+def _check_verification(fields: dict[str, str], where: str) -> None:
+    applied = fields.get("applied", "")
+    if applied and applied not in APPLIED_PROBES:
+        raise RecipeError(f"{where}: `applied` must be one of {', '.join(APPLIED_PROBES)}")
+    needed = APPLIED_NEEDS.get(applied, ())
+    for key in ("applied_resource", "applied_field", "applied_value"):
+        if key in needed and not fields.get(key):
+            raise RecipeError(f"{where}: `applied: {applied}` needs `{key}`")
+        if key not in needed and key in fields:
+            raise RecipeError(f"{where}: `{key}` means nothing without an `applied` probe that reads it")
+    if "applied_noun" in fields and not applied:
+        raise RecipeError(f"{where}: `applied_noun` means nothing without `applied`")
+    if fields.get("applied_resource") and not RESOURCE_RE.fullmatch(fields["applied_resource"]):
+        raise RecipeError(f"{where}: `applied_resource` must be a resource name such as `poddisruptionbudgets.policy`")
+    if fields.get("applied_field") and not FIELD_PATH_RE.fullmatch(fields["applied_field"]):
+        raise RecipeError(f"{where}: `applied_field` must be a dotted field path such as `spec.maxUnavailable`")
+    if "health" in fields and fields["health"] not in HEALTH_PROBES:
+        raise RecipeError(f"{where}: `health` must be one of {', '.join(HEALTH_PROBES)}")
 
 
 def load(root: Path = HERE) -> tuple[Recipe, ...]:
@@ -131,3 +184,8 @@ def recipes() -> tuple[Recipe, ...]:
 
 def kinds() -> frozenset[str]:
     return frozenset(recipe.kind for recipe in recipes())
+
+
+def recipe(kind: str) -> Recipe | None:
+    """The recipe for `kind`, or None for a kind the registry does not list."""
+    return next((found for found in recipes() if found.kind == kind), None)
