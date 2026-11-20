@@ -73,6 +73,50 @@ func TestHarnessEnvDefaultsToTheInstallLiteLLM(t *testing.T) {
 	}
 }
 
+// An AgentProfile worker pod sets ANTHROPIC_BASE_URL (the full gateway name)
+// and no ANTHROPIC_API_KEY: a literal key in a pod spec is a finding of the
+// AI workload audit. The adapter must then add the placeholder key to the
+// child env, and keep the base URL that the pod sets. With Vertex or a bearer
+// token, the adapter must not add the key.
+func TestHarnessEnvAddsThePlaceholderKeyWhenThePodSetsNone(t *testing.T) {
+	const podBaseURL = "http://inference-gateway.kubeagents-system.svc.cluster.local"
+	lookup := func(env []string) map[string][]string {
+		got := map[string][]string{}
+		for _, kv := range env {
+			key, value, _ := strings.Cut(kv, "=")
+			got[key] = append(got[key], value)
+		}
+		return got
+	}
+	for name, tc := range map[string]struct {
+		set     map[string]string
+		wantKey []string
+	}{
+		"nothing set":            {set: map[string]string{}, wantKey: []string{"a2a-playground"}},
+		"base URL set, no key":   {set: map[string]string{"ANTHROPIC_BASE_URL": podBaseURL}, wantKey: []string{"a2a-playground"}},
+		"key set":                {set: map[string]string{"ANTHROPIC_BASE_URL": podBaseURL, "ANTHROPIC_API_KEY": "from-a-secret"}, wantKey: []string{"from-a-secret"}},
+		"vertex":                 {set: map[string]string{"CLAUDE_CODE_USE_VERTEX": "1"}, wantKey: nil},
+		"bearer token, base URL": {set: map[string]string{"ANTHROPIC_BASE_URL": podBaseURL, "ANTHROPIC_AUTH_TOKEN": "t"}, wantKey: nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, key := range []string{"ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"} {
+				t.Setenv(key, "")
+				_ = os.Unsetenv(key)
+			}
+			for k, v := range tc.set {
+				t.Setenv(k, v)
+			}
+			got := lookup(harnessEnv())
+			if !reflect.DeepEqual(got["ANTHROPIC_API_KEY"], tc.wantKey) {
+				t.Errorf("ANTHROPIC_API_KEY in the child env = %q, want %q", got["ANTHROPIC_API_KEY"], tc.wantKey)
+			}
+			if base, ok := tc.set["ANTHROPIC_BASE_URL"]; ok && !reflect.DeepEqual(got["ANTHROPIC_BASE_URL"], []string{base}) {
+				t.Errorf("ANTHROPIC_BASE_URL in the child env = %q, want only the pod's %q", got["ANTHROPIC_BASE_URL"], base)
+			}
+		})
+	}
+}
+
 // The default tool surface and the session fence have to agree: a tool that
 // needs egress the policy denies does not fail, it hangs until the connect
 // timeout, spending the task deadline on a black hole.

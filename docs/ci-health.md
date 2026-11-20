@@ -40,7 +40,7 @@ describes it. When the section cannot be built, the digest carries one line on
 the night instead (the cases recorded, how many passed all reps, partial and
 failed, what is newly failing against the night before, the opening chat
 turn's p50 and p95 as advice beside the p95 < 10 s target
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
+([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the nightly
 grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
 the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
@@ -195,8 +195,8 @@ harness wrote them and after the same scrub as the periodics' quoted log line,
 commonest first, so a batch that said `hermes-rate-limited` reads as that and
 not as the bot's guess), a forge outage (6+ forge repetitions,
 below, across 2+ pull requests among the runs that finished in the last 2
-hours: the evals repositories share one GitHub App installation and its
-hourly REST budget, so a second pull request already shows the fleet's
+hours: the evals repositories share one GitHub App installation per shard of ten projects (`hack/eval/ledger-reader-apps.txt`) and its
+hourly REST budget, so a second pull request already shows a shard's
 budget rather than one branch; it ranks below the storm and the ceiling,
 which lose the agent's run rather than its grading), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
@@ -269,8 +269,8 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the forge lanes' runs too, one tier
 each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
 forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
-GitLab repository, with its next-mode nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
-`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
+GitLab repository, with its nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a
 weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
 section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
 "Self-managed lanes" section, a table of their pull-request runs and one of their weekly runs, each row naming its forge.
@@ -1287,7 +1287,7 @@ bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 bar, and who clears it"), and, when the tick read the evidence store (not the
 last published copy written back after a failed read, nor a read stopped at its
 deadline), what the
-store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
+store says at the current version key (`next`; the dashboard falls back to the today-keyed records only when the store holds no `next` record, `coverage_gaps.store_records` and `trend.py`): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
 bar, then by pass rate. The issue's table names the candidates in that order
@@ -1574,7 +1574,7 @@ roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours`
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). One assertion this job never makes: the five `declared-*` roles
+read failed). One assertion this job never makes: the `declared-*` roles
 assert the pool repository's declared-intent note, and the job holds no
 credential for the pool repositories by design, so the state script leaves
 that assertion out, judges those roles on their cluster assertions (healthy,
@@ -1600,7 +1600,8 @@ firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots 
 reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress`,
 `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
-`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
+`compute.instances.getSerialPortOutput`), and the `gcloud compute reservations list` read of the
+cluster role `missing-reservation-pool` (`compute.reservations.list`, in the same role), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
@@ -1876,11 +1877,15 @@ python3 scripts/eval_dashboard/health.py --replay --data data.json --step 30m \
 walks a `data.json` as if the job had run every 30 minutes and prints the state
 timeline. `scripts/test_eval_dashboard_health.py` asserts that timeline for
 2026-09-01 → 2026-09-08 against the incidents filed that week (#1171, #1189,
-#1214, #1269, #1278). The roster history matters: `compliance-rbac-overgrant`
-and `rca-remediation-pr` were admitted when they collapsed and were demoted
-afterwards, so a replay with today's roster would not see the 09-02 outage.
-A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`, is the day
-the build cluster lost five nodes (#1478); the same test file asserts it reads
+#1214, #1269, #1278). The roster history matters: the two cases the fixture
+calls `case-09` and `case-23` were admitted when they collapsed and were
+demoted afterwards, so a replay with today's roster would not see the 09-02
+outage. The fixtures are synthetic cuts of the real weeks (case ids, pull
+request and build numbers and reasons invented; timeline kept: `SCHEMA.md`,
+"Fixtures"), so a replay of a real `data.json` pairs with the real roster, not
+this file. A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`,
+is the day the build cluster lost five nodes (#1478); the same test file
+asserts it reads
 as `lost_pods` with 12 runs on 12 pull requests, and that the setup-death rule
 no longer claims them. A third, `testdata_health/slow-gate-2026-09-14.json.gz`,
 is the week ending 2026-09-14 18:20Z (#1586), the seven days the slow-gate

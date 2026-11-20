@@ -279,6 +279,16 @@ def test_the_card_wait_ignores_the_lanes_transport(card_wait, monkeypatch):
     assert door.cancels == 1
 
 
+def test_the_card_wait_writes_the_eval_run_record(card_wait, monkeypatch, tmp_path):
+    target = tmp_path / "eval_run.json"
+    monkeypatch.setenv("KUBE_AGENTS_EVAL_RUN_FILE", str(target))
+    monkeypatch.setenv("EVAL_CASE_ID", "some-case")
+    monkeypatch.setenv("EVAL_REPETITION", "2")
+    card_wait(["working"], [["a2a-x"]])
+    record = json.loads(target.read_text(encoding="utf-8"))
+    assert record == harness._eval_run_record(record["run_id"], "some-case", "2")
+
+
 def test_a_task_that_ends_before_any_card_is_a_setup_error_not_a_pass(card_wait):
     result, door, _ = card_wait(["working", "completed"], [[]])
     # Infrastructure, and the abandoned task is cancelled so it doesn't run on.
