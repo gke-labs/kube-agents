@@ -133,6 +133,10 @@ var reasonSentences = map[string]string{
 	// The worker adapter passes the harness's own result subtype through as the token.
 	"error_max_turns":        "the agent used up its turns before it answered; ask again with a smaller task",
 	"error_during_execution": "the agent hit an error while it worked and produced no answer",
+	// The Antigravity CLI's own two (#6709): a tool call it could not get
+	// approval for was skipped, and its --print-timeout cut the turn short.
+	"permission-denied": "the agent needed a tool it isn't allowed to use here, so it stopped without finishing",
+	"print-timeout":     "the agent ran out of time before it answered; ask again with a smaller task",
 	// A delegation the gateway could not carry through.
 	"delegation-refused": "the agent could not hand this to another agent",
 	"wake-not-started":   "the agent could not pick the delegated work back up",
