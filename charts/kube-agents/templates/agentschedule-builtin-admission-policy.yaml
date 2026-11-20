@@ -1,0 +1,107 @@
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
+# GENERATED from k8s-operator/config/admission/agentschedule-builtin-policy.yaml — do not edit by hand; run `make chart-sync`.
+# See values.yaml (admissionPolicy) for the gate. The semverCompare half keeps a 1.29 cluster,
+# where ValidatingAdmissionPolicy is not v1 yet, installable.
+# Admission control on what makes an AgentSchedule built-in: one ValidatingAdmissionPolicy and its
+# binding.
+#
+# This file is the source of truth. charts/kube-agents/templates/agentschedule-builtin-admission-policy.yaml
+# holds a generated copy (`make chart-sync`, verified by `make chart-check`), and the chart is what
+# the install engine applies. Edit it here. It is not in config/default's kustomization, like the
+# other policies under config/admission.
+#
+# WHY. The schedule reconciler (agentschedule_controller.go, agentScheduleOrigin) reads a schedule
+# as built-in when the install's PlatformAgent is its controller and its
+# `kubeagents.x-k8s.io/origin` label reads `builtin`. A built-in schedule runs at the unattended tier
+# and may write a built-in audit's report stream, so its baseline decides which findings count as
+# new. Whoever creates an AgentSchedule sets both its labels and its owner references, so RBAC alone
+# can't keep a principal that may write schedules from making one built-in. Design section 6's
+# broker policy keeps the broker to `origin: user`; this one keeps every principal but the
+# operator, which renders the built-in schedules, from making or unmaking a built-in.
+#
+# WHAT IT CHECKS, for a CREATE or UPDATE of an AgentSchedule by anyone but the operator's
+# ServiceAccount:
+#
+#   1. The origin label doesn't become, or stop being, `builtin`: a create may not carry it, and an
+#      update may not add it, change it to it, or change or remove it where it was.
+#   2. The controller references to a PlatformAgent don't change: a create may not carry one, and
+#      an update may not add, change or remove one.
+#
+# Anything else passes, so a person may still annotate a built-in schedule (`run-now`, `stop`) or
+# edit a user schedule. A built-in schedule written before this policy existed isn't refused for
+# that alone: its label and reference pass unchanged. The reconciler is what keeps one the operator
+# didn't write from running as built-in.
+#
+# The operator's identity below is the kustomize path's. The chart's copy names
+# `<release>-operator-sa` in the release namespace instead (hack/sync-chart-manifests.sh, the same
+# substitution agent-rbac-policy.yaml takes). DELETE is not matched: deleting a schedule makes
+# nothing built-in, and the garbage collector deletes a PlatformAgent's schedules.
+#
+# agentschedule_builtin_policy_envtest_test.go runs this file in a real API server.
+#
+# Requires Kubernetes >= 1.30, where ValidatingAdmissionPolicy reached v1.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agentschedule-builtin
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kubeagents.x-k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["agentschedules"]
+  matchConditions:
+    - name: is-not-the-operator
+      expression: >-
+        request.userInfo.username != 'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'
+  variables:
+    - name: originKey
+      expression: "'kubeagents.x-k8s.io/origin'"
+    - name: newOrigin
+      expression: >-
+        has(object.metadata.labels) && variables.originKey in object.metadata.labels ?
+        object.metadata.labels[variables.originKey] : ''
+    - name: oldOrigin
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.labels) &&
+        variables.originKey in oldObject.metadata.labels ?
+        oldObject.metadata.labels[variables.originKey] : ''
+    # Each controller reference to a PlatformAgent, as its name and uid.
+    - name: newControllers
+      expression: >-
+        has(object.metadata.ownerReferences) ?
+        object.metadata.ownerReferences.filter(r,
+          has(r.controller) && r.controller && r.kind == 'PlatformAgent' &&
+          r.apiVersion.startsWith('kubeagents.x-k8s.io/')).map(r, r.name + '/' + r.uid) : []
+    - name: oldControllers
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.ownerReferences) ?
+        oldObject.metadata.ownerReferences.filter(r,
+          has(r.controller) && r.controller && r.kind == 'PlatformAgent' &&
+          r.apiVersion.startsWith('kubeagents.x-k8s.io/')).map(r, r.name + '/' + r.uid) : []
+  validations:
+    - expression: >-
+        variables.newOrigin == variables.oldOrigin ||
+        (variables.newOrigin != 'builtin' && variables.oldOrigin != 'builtin')
+      message: "only the operator may set, change or remove an AgentSchedule's kubeagents.x-k8s.io/origin: builtin label"
+      reason: Forbidden
+    - expression: "variables.newControllers == variables.oldControllers"
+      message: "only the operator may add, change or remove an AgentSchedule's controller reference to a PlatformAgent"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agentschedule-builtin
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  policyName: kube-agents-agentschedule-builtin
+  validationActions: ["Deny"]
+{{- end }}
