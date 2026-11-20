@@ -1,7 +1,7 @@
 {
   "name": "findings-nudge-upgrade-blockers",
-  "source": "agents/platform/scripts/test_findings_nudge.py::CardAndChatUxTests.test_issue_6256_upgrade_blockers_render_cleanly_with_zero_plumbing",
-  "notes": "findings_nudge_card.chat_from_card: daily upgrade-blocking nudge with clean rows, collapsible cluster breakdown table, and queue buttons.",
+  "source": "agents/platform/scripts/test_findings_nudge.py::DetectorWordingTests.test_the_two_findings_of_issue_6256_read_as_sentences",
+  "notes": "findings_nudge_card.chat_from_card: the daily nudge on the upgrade readiness review's own titles and actions (a budget, a cluster-wide finding), with the cluster breakdown table and the queue buttons.",
   "input": {
     "findings_nudge": {
       "now": "2026-10-06T12:00:00Z",
@@ -14,7 +14,7 @@
       "backlog_url": "https://github.com/acme/gitops/issues/42",
       "rows": [
         {
-          "id": "urr-pdb-blocks-drain.kube-agents-gkedemos.prod-central.kube-system.istiod",
+          "id": "upgrade-drain-blocking-budget.kube-agents-gkedemos.prod-central.kube-system.istiod",
           "check_slug": "upgrade-drain-blocking-budget",
           "severity": "critical",
           "rank_score": 150,
@@ -29,9 +29,9 @@
           "cluster": "prod-central",
           "namespace": "kube-system",
           "object": "istiod",
-          "title": "1. PodDisruptionBudget blocks drain: kube-system/istiod (minAvailable: 1 (>= 1 expected pods)) (1 replicas)",
+          "title": "1. A PodDisruptionBudget forbids the eviction: kube-system/istiod (minAvailable: 1 (>= 1 expected pods)) holds the node drain",
           "recommendation": {
-            "action": "Allow at least 1 pod disruption or run at least 2 replicas.",
+            "action": "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replicas) so the budget can be honoured.",
             "rationale": "drain",
             "risk": "upgrade stalled"
           },
@@ -41,8 +41,8 @@
           "actionable": true
         },
         {
-          "id": "urr-orphan-node.kube-agents-gkedemos.prod-central..gke-prod-pool-8f2a",
-          "check_slug": "upgrade-orphan_node_objects",
+          "id": "upgrade-orphan-node-objects.kube-agents-gkedemos.prod-central._.cluster",
+          "check_slug": "upgrade-orphan-node-objects",
           "severity": "critical",
           "rank_score": 150,
           "rubric": {
@@ -55,10 +55,10 @@
           "project": "kube-agents-gkedemos",
           "cluster": "prod-central",
           "namespace": "",
-          "object": "gke-prod-pool-8f2a",
-          "title": "22. Orphan Node objects: gke-prod-pool-8f2a has no backing GCE instance",
+          "object": "Cluster",
+          "title": "22. A Node object outlives its virtual machine: this cluster blocks the upgrade",
           "recommendation": {
-            "action": "Delete the orphan Node object (kubectl delete node gke-prod-pool-8f2a).",
+            "action": "Delete the orphan Node object (kubectl delete node <name>); nothing runs on it.",
             "rationale": "precheck",
             "risk": "upgrade blocked"
           },
@@ -95,7 +95,7 @@
           "actionable": true
         },
         {
-          "id": "q2",
+          "id": "upgrade-fail-closed-webhook.kube-agents-gkedemos.prod-europe._.validatingwebhookconfiguration/authz/gate.authz.example",
           "check_slug": "upgrade-fail-closed-webhook",
           "severity": "major",
           "rank_score": 110,
@@ -109,10 +109,10 @@
           "project": "kube-agents-gkedemos",
           "cluster": "prod-europe",
           "namespace": "",
-          "object": "authz-webhook",
-          "title": "4. Fail-closed webhook: authz-webhook blocks API calls during drain",
+          "object": "validatingwebhookconfiguration/authz/gate.authz.example",
+          "title": "7. A fail-closed webhook whose backend is not up: authz/gate.authz.example fails closed with no backend and refuses writes the upgrade makes",
           "recommendation": {
-            "action": "Run 2 webhook replicas.",
+            "action": "Restore the backend Service authz/authz-webhook or set failurePolicy Ignore on authz/gate.authz.example.",
             "rationale": "api",
             "risk": "outage"
           },
@@ -129,31 +129,31 @@
       "carrier": "notify",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "2 critical issues will block cluster upgrades",
-        "note": "\u00b7 4 open across 2 clusters",
+        "headline": "2 critical issues will delay or block cluster upgrades",
+        "note": "· 4 open across 2 clusters",
         "tone": "critical",
         "rows": [
           {
-            "text": "**kube-system/istiod** on `prod-central` \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)",
+            "text": "**kube-system/istiod** on `prod-central` — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)",
             "severity": "critical",
-            "detail": "Allow at least 1 pod disruption or run at least 2 replicas."
+            "detail": "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replica) so the budget can be honoured."
           },
           {
-            "text": "**gke-prod-pool-8f2a** on `prod-central` \u2014 Orphan Node objects: has no backing GCE instance",
+            "text": "**prod-central** — A Node object outlives its virtual machine: this cluster blocks the upgrade",
             "severity": "critical",
-            "detail": "Delete the orphan Node object."
+            "detail": "Delete the orphan Node object; nothing runs on it."
           }
         ],
-        "after": ["2 more issues are queued (1 critical, 1 lower priority)."],
+        "after": ["2 more issues are open (1 critical, 1 lower priority)."],
         "fold": {
-          "title": "Queue breakdown (2 more queued)",
+          "title": "Queue breakdown (2 more open)",
           "table": {
             "columns": [
               "Cluster",
               "Critical",
               "Major",
               "Minor",
-              "Next queued issue"
+              "Next open issue"
             ],
             "rows": [
               [
@@ -168,7 +168,7 @@
                 "0",
                 "1",
                 "0",
-                "authz-webhook: Fail-closed webhook: blocks API calls during drain"
+                "validatingwebhookconfiguration/authz/gate.authz.example: A fail-closed webhook…"
               ]
             ]
           }
@@ -176,7 +176,7 @@
         "choices": [
           {
             "text": "Fix first issue",
-            "reply": "Fix first issue: kube-system/istiod on prod-central \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)",
+            "reply": "Fix first issue: kube-system/istiod on prod-central — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)",
             "primary": true
           },
           {

@@ -67,7 +67,7 @@ class ComposeTests(unittest.TestCase):
         rows = [finding(id="a"), finding(id="b", check_slug="x", severity="minor")]
         message = nudge.compose(plan_for(rows), 2, False, rows=rows)
         self.assertTrue(message.startswith("**1 new critical issue needs attention** · 2 open across 1 cluster\n\n"))
-        self.assertIn("1 more issue is queued.", message)
+        self.assertIn("1 more issue is open.", message)
         self.assertNotIn("Findings queue", message)
         self.assertNotIn("Ask for the full list", message)
 
@@ -262,7 +262,7 @@ class CardAndChatUxTests(unittest.TestCase):
         chat_cases.check_chat(chat, "nudge")
         self.assertEqual(chat_cases.lint(chat), [])
 
-        self.assertEqual(chat["headline"], "2 critical issues will block cluster upgrades")
+        self.assertEqual(chat["headline"], "2 critical issues will delay or block cluster upgrades")
         self.assertEqual(chat["note"], "· 5 open across 3 clusters")
         self.assertEqual(chat["tone"], "critical")
         self.assertEqual(len(chat["rows"]), 2)
@@ -294,10 +294,10 @@ class CardAndChatUxTests(unittest.TestCase):
             self.assertNotIn(forbidden, visible_serialized)
 
         # The queue breakdown table.
-        self.assertEqual(chat["fold"]["title"], "Queue breakdown (3 more queued)")
+        self.assertEqual(chat["fold"]["title"], "Queue breakdown (3 more open)")
         self.assertEqual(
             chat["fold"]["table"]["columns"],
-            ["Cluster", "Critical", "Major", "Minor", "Next queued issue"],
+            ["Cluster", "Critical", "Major", "Minor", "Next open issue"],
         )
         self.assertEqual(
             chat["fold"]["table"]["rows"],
@@ -451,12 +451,89 @@ class DetectorWordingTests(unittest.TestCase):
             nudge.clean_action("Upgrade with gcloud container clusters upgrade prod --cluster-version=1.33.5; then verify."),
             "Upgrade; then verify.",
         )
-        self.assertEqual(nudge.clean_action("Cordon the node, then run kubectl drain node-1."), "Cordon the node.")
+        self.assertEqual(
+            nudge.clean_action("Cordon the node, then run kubectl drain node-1 --ignore-daemonsets."), "Cordon the node."
+        )
+        self.assertEqual(
+            nudge.clean_action("Upgrade the control plane with gcloud container clusters upgrade c --master, then the pools."),
+            "Upgrade the control plane, then the pools.",
+        )
+
+    def test_prose_that_names_a_tool_is_left_as_written(self):
+        for prose in (
+            "Stop building images with docker socket mounts in the pod spec.",
+            "Deploy via helm charts rather than raw manifests, and pin the chart version.",
+            "Use a pre-helm hook to migrate the CRDs.",
+            "Avoid non-git sources for manifests.",
+            "Rotate the leaked credential; git history still contains it, so rewrite it too.",
+            "Docker Hub images should move to Artifact Registry.",
+            "Terraform owns this pool: change max_surge in the module.",
+            "Roll back via Helm to the previous release, then pin the chart version.",
+            "Fix via git revert of the last change to the overlay.",
+            "Check the release notes: Helm chart 4.2 changes the default.",
+        ):
+            self.assertEqual(nudge.clean_action(prose), prose)
+
+    def test_a_removed_command_leaves_a_sentence_or_the_fallback(self):
+        cases = {
+            "Run `kubectl -n shop get pdb` and raise maxUnavailable to 1": "Raise maxUnavailable to 1.",
+            "Add a LimitRange, e.g. `kubectl apply -f limitrange.yaml`, then re-check.": "Add a LimitRange, then re-check.",
+            "Apply using `helm upgrade api ./chart -f values.prod.yaml`. Then check pods.": "Apply. Then check pods.",
+            "Check the pool version (gcloud container node-pools describe p --format='value(version)') and upgrade it.": (
+                "Check the pool version and upgrade it."
+            ),
+            "Upgrade nodes: Run gcloud container clusters upgrade c --node-pool=p to move the pool.": "Upgrade nodes.",
+            # Nothing but a command, or one word left of it, says nothing: the fallback stands in.
+            "Run `gcloud container clusters update prod --enable-shielded-nodes`": nudge.FALLBACK_ACTION,
+            "Run gcloud container clusters update c --location=l.": nudge.FALLBACK_ACTION,
+            "Run kubectl get pods -n x to check.": nudge.FALLBACK_ACTION,
+            # Only the plain form is reworded; a flag is not a kind, and a condition is not dropped.
+            "kubectl delete pod --all -n shop": nudge.FALLBACK_ACTION,
+            "kubectl delete -f manifests/old.yaml": nudge.FALLBACK_ACTION,
+            "kubectl delete secret sa-key -n billing after moving to Workload Identity": nudge.FALLBACK_ACTION,
+        }
+        for raw, plain in cases.items():
+            self.assertEqual(nudge.clean_action(raw), plain, raw)
+
+    def test_one_of_a_version_is_not_a_count(self):
+        self.assertEqual(
+            nudge.clean_title("Kubelet 1.31.1 nodes lag the control plane"), "Kubelet 1.31.1 nodes lag the control plane"
+        )
+        self.assertEqual(nudge.clean_action("Upgrade the 1.31.1 nodes first"), "Upgrade the 1.31.1 nodes first.")
+
+    def test_a_subject_is_peeled_only_right_after_the_first_colon(self):
+        for obj, title in (
+            ("web", "Missing PDB: web, api and worker"),
+            ("web", "Deployment has no PDB: app: web has 1 replica"),
+        ):
+            row = finding(namespace="", object=obj, title=title, recommendation={})
+            self.assertIn(f"web on prod — {title}", nudge.compose(plan_for([row]), 1, False))
+
+    def test_a_line_names_the_member_its_severity_comes_from(self):
+        # The queue ranks by score, so a high-scoring major can sit ahead of a low-scoring critical.
+        rows = [
+            finding(id="a", object="reporting", severity="major", title="reporting mounts a viewer key",
+                    recommendation={"action": "Rotate the viewer key."}),
+            finding(id="b", object="billing", severity="critical", title="billing mounts an editor key",
+                    recommendation={"action": "Move billing to Workload Identity."}),
+        ]
+        bundle = nudge.build_nudge(plan_for(rows), 1, False, rows=rows)
+        self.assertEqual(
+            bundle.card["rows"],
+            [{
+                "severity": "critical",
+                "text": "**payments/billing** (+1 more) on `prod` — mounts an editor key",
+                "detail": "Move billing to Workload Identity.",
+            }],
+        )
+        self.assertIn("1. [new] id=b members=a,b", bundle.card["thread_context"])
 
     def test_the_fallback_opens_on_a_bold_headline(self):
         rows = self.issue_rows()
         text = nudge.compose(plan_for(rows, added={"critical": 2}), 2, daily=True, rows=rows)
-        self.assertTrue(text.startswith("**2 critical issues will block cluster upgrades** · across 2 clusters\n\n"), text)
+        self.assertTrue(
+            text.startswith("**2 critical issues will delay or block cluster upgrades** · across 2 clusters\n\n"), text
+        )
 
     def test_the_queue_line_and_the_table_use_one_set_of_words(self):
         rows = [
@@ -467,13 +544,13 @@ class DetectorWordingTests(unittest.TestCase):
         ]
         # Two criticals a day: the third waits, and the minor waits behind it.
         bundle = nudge.build_nudge(plan_for(rows), 4, False, rows=rows)
-        self.assertEqual(bundle.card["after"], ["2 more issues are queued (1 critical, 1 lower priority)."])
+        self.assertEqual(bundle.card["after"], ["2 more issues are open (1 critical, 1 lower priority)."])
         self.assertEqual(
-            bundle.card["fold"]["table"]["columns"], ["Cluster", "Critical", "Major", "Minor", "Next queued issue"]
+            bundle.card["fold"]["table"]["columns"], ["Cluster", "Critical", "Major", "Minor", "Next open issue"]
         )
         only_critical = rows[:3]
         bundle = nudge.build_nudge(plan_for(only_critical), 3, False, rows=only_critical)
-        self.assertEqual(bundle.card["after"], ["1 more issue is queued (1 critical)."])
+        self.assertEqual(bundle.card["after"], ["1 more issue is open (1 critical)."])
 
     def test_a_table_cut_short_says_so_in_its_title(self):
         rows = [finding(id="a")] + [
@@ -483,7 +560,7 @@ class DetectorWordingTests(unittest.TestCase):
         fold = bundle.card["fold"]
         self.assertEqual(len(fold["table"]["rows"]), nudge.MAX_FOLD_CLUSTERS)
         self.assertEqual(fold["title"], "Queue breakdown (top 15 clusters)")
-        self.assertEqual(bundle.card["after"], ["20 more issues are queued."])
+        self.assertEqual(bundle.card["after"], ["20 more issues are open."])
         self.assertLessEqual(len(fold["title"]), nudge.chat_message.FOLD_TITLE_MAX)
         chat_cases.check_chat(nudge_card.chat_from_card(bundle.card)[0], "cut table")
 
@@ -792,7 +869,7 @@ class MainTests(NudgeHarness):
         self.run_at(at(6, 12), rows)
         output = self.out.getvalue()
         self.assertIn("· 3 open across 1 cluster", output)
-        self.assertIn("1 more issue is queued", output)
+        self.assertIn("1 more issue is open", output)
 
     def test_the_open_count_counts_provider_managed_observations_by_item(self):
         rows = [finding(id=f"p{i}", object=f"d{i}") for i in range(3)] + [finding(id="x", check_slug="x")]

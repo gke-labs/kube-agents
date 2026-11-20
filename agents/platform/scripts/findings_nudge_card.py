@@ -63,6 +63,16 @@ FOLD_BLOCK_TYPE = _presenter.FOLD_BLOCK
 TABLE_BLOCK_TYPE = "table"
 RAW_TEXT_CELL_TYPE = "raw_text"
 PLAIN_TEXT_TYPE = "plain_text"
+BLOCK_TYPE_KEY = "type"
+BLOCK_TEXT_KEY = "text"
+BLOCK_TITLE_KEY = "title"
+BLOCK_ROWS_KEY = "rows"
+BLOCK_COLLAPSIBLE_KEY = "is_collapsible"
+BLOCK_COLLAPSED_KEY = "default_collapsed"
+BLOCK_CHILDREN_KEY = "child_blocks"
+# The chat message's fields this module reads back to put `tone` and `fold` in spec order.
+CHAT_HEADLINE, CHAT_NOTE, CHAT_DETAIL = "headline", "note", "detail"
+CHAT_ROWS, CHAT_AFTER, CHAT_CHOICES, CHAT_LINKS = "rows", "after", "choices", "links"
 
 HOME_OVERRIDE_ENV = "FINDINGS_NUDGE_HOME"
 PLATFORM_HOME_ENV = "PLATFORM_AGENT_HOME"
@@ -255,15 +265,15 @@ def chat_from_card(card: dict) -> tuple[dict, str]:
     fold = _clean_fold(card.get(FOLD_KEY))
     # Rebuild in spec key order so `tone` and `fold` sit in their canonical positions.
     ordered = _chat.message(
-        headline=chat.get("headline", ""),
-        note=chat.get("note", ""),
-        detail=chat.get("detail", ""),
+        headline=chat.get(CHAT_HEADLINE, ""),
+        note=chat.get(CHAT_NOTE, ""),
+        detail=chat.get(CHAT_DETAIL, ""),
         tone=tone if tone in VALID_TONES else "",
-        rows=chat.get("rows", []),
-        after=chat.get("after", []),
+        rows=chat.get(CHAT_ROWS, []),
+        after=chat.get(CHAT_AFTER, []),
         fold=fold,
-        choices=chat.get("choices", []),
-        links=chat.get("links", []),
+        choices=chat.get(CHAT_CHOICES, []),
+        links=chat.get(CHAT_LINKS, []),
     )
     return ordered, card[TEXT_KEY]
 
@@ -273,15 +283,15 @@ def _fold_container_block(fold: dict) -> dict:
     table = fold[FOLD_TABLE_KEY]
     all_rows = [table[TABLE_COLUMNS_KEY], *table[TABLE_ROWS_KEY]]
     slack_rows = [
-        [{"type": RAW_TEXT_CELL_TYPE, "text": cell} for cell in row]
+        [{BLOCK_TYPE_KEY: RAW_TEXT_CELL_TYPE, BLOCK_TEXT_KEY: cell} for cell in row]
         for row in all_rows
     ]
     return {
-        "type": FOLD_BLOCK_TYPE,
-        "title": {"type": PLAIN_TEXT_TYPE, "text": fold[FOLD_TITLE_KEY]},
-        "is_collapsible": True,
-        "default_collapsed": True,
-        "child_blocks": [{"type": TABLE_BLOCK_TYPE, "rows": slack_rows}],
+        BLOCK_TYPE_KEY: FOLD_BLOCK_TYPE,
+        BLOCK_TITLE_KEY: {BLOCK_TYPE_KEY: PLAIN_TEXT_TYPE, BLOCK_TEXT_KEY: fold[FOLD_TITLE_KEY]},
+        BLOCK_COLLAPSIBLE_KEY: True,
+        BLOCK_COLLAPSED_KEY: True,
+        BLOCK_CHILDREN_KEY: [{BLOCK_TYPE_KEY: TABLE_BLOCK_TYPE, BLOCK_ROWS_KEY: slack_rows}],
     }
 
 
@@ -301,7 +311,7 @@ def blocks_from_card(card: dict) -> tuple[list[dict], str]:
     if fold is not None:
         container = _fold_container_block(fold)
         action_index = next(
-            (idx for idx, block in enumerate(blocks) if block.get("type") == ACTIONS_BLOCK_TYPE),
+            (idx for idx, block in enumerate(blocks) if block.get(BLOCK_TYPE_KEY) == ACTIONS_BLOCK_TYPE),
             len(blocks),
         )
         blocks = [*blocks[:action_index], container, *blocks[action_index:]]

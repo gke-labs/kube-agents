@@ -11,7 +11,7 @@
                 "style": {
                   "bold": true
                 },
-                "text": "2 critical issues will block cluster upgrades",
+                "text": "2 critical issues will delay or block cluster upgrades",
                 "type": "text"
               },
               {
@@ -61,7 +61,7 @@
                 "type": "text"
               },
               {
-                "text": " — PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)",
+                "text": " — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)",
                 "type": "text"
               },
               {
@@ -69,7 +69,7 @@
                 "type": "text"
               },
               {
-                "text": "Allow at least 1 pod disruption or run at least 2 replicas.",
+                "text": "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replica) so the budget can be honoured.",
                 "type": "text"
               }
             ],
@@ -92,22 +92,11 @@
                 "style": {
                   "bold": true
                 },
-                "text": "gke-prod-pool-8f2a",
-                "type": "text"
-              },
-              {
-                "text": " on ",
-                "type": "text"
-              },
-              {
-                "style": {
-                  "code": true
-                },
                 "text": "prod-central",
                 "type": "text"
               },
               {
-                "text": " — Orphan Node objects: has no backing GCE instance",
+                "text": " — A Node object outlives its virtual machine: this cluster blocks the upgrade",
                 "type": "text"
               },
               {
@@ -115,7 +104,7 @@
                 "type": "text"
               },
               {
-                "text": "Delete the orphan Node object.",
+                "text": "Delete the orphan Node object; nothing runs on it.",
                 "type": "text"
               }
             ],
@@ -132,7 +121,7 @@
           {
             "elements": [
               {
-                "text": "2 more issues are queued (1 critical, 1 lower priority).",
+                "text": "2 more issues are open (1 critical, 1 lower priority).",
                 "type": "text"
               }
             ],
@@ -163,7 +152,7 @@
                   "type": "raw_text"
                 },
                 {
-                  "text": "Next queued issue",
+                  "text": "Next open issue",
                   "type": "raw_text"
                 }
               ],
@@ -207,7 +196,7 @@
                   "type": "raw_text"
                 },
                 {
-                  "text": "authz-webhook: Fail-closed webhook: blocks API calls during drain",
+                  "text": "validatingwebhookconfiguration/authz/gate.authz.example: A fail-closed webhook…",
                   "type": "raw_text"
                 }
               ]
@@ -218,7 +207,7 @@
         "default_collapsed": true,
         "is_collapsible": true,
         "title": {
-          "text": "Queue breakdown (2 more queued)",
+          "text": "Queue breakdown (2 more open)",
           "type": "plain_text"
         },
         "type": "container"
@@ -238,7 +227,7 @@
                   "type": "plain_text"
                 },
                 "type": "button",
-                "value": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain (minAvailable: 1, 1 pod expected) (1 replica)"
+                "value": "Fix first issue: kube-system/istiod on prod-central — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)"
               },
               {
                 "action_id": "kage.choice.1",

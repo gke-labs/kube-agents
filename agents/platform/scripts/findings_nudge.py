@@ -154,34 +154,53 @@ EXPECTED_PODS_RE = re.compile(r"\(>=\s*(\d+)\s+expected\s+pods?\)", re.IGNORECAS
 EXPECTED_PODS_PLAIN = "({pods} expected)"
 NESTED_PARENS_RE = re.compile(r"\(([^()]+?)\s+\(([^()]+)\)\)")
 NESTED_PARENS_FLAT = r"(\1, \2)"
-ONE_PLURAL_RE = re.compile(r"\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
+# "1 replicas" is a count; the "1" that ends a version ("1.31.1 nodes") is not.
+ONE_PLURAL_RE = re.compile(r"(?<![\d.])\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
 
+# A command is removed only where it shows itself as one: in backticks, in
+# parentheses, or carrying a flag. A sentence that names a tool ("deploy via
+# helm charts", "Docker Hub images") is prose and is left as written, so the
+# tool names match in lower case only.
 CLI_TOOLS_PATTERN = r"(?:kubectl|gcloud|helm|git|gh|terraform|tofu|docker)"
+# The words that introduce a command, removed with it.
+CLI_LEAD_IN = r"(?i:,?\s+(?:(?:then|and)\s+)?(?:with|via|using|by running|run))"
+CLI_EXAMPLE_LEAD_IN = r"(?i:,?\s*(?:e\.g\.?|for example|such as),?)"
+# A command runs to the end of its sentence or to the next clause: a "." or ";"
+# inside it (a version, a CIDR, a file name) is not the end, one before a space
+# or the end of the text is, and so is ", ".
+CLI_SPAN = r"(?:(?![.;]`?(?:\s|$))(?!,\s).)+"
+CLI_HAS_FLAG = r"(?=(?:(?![.;](?:\s|$))(?!,\s).)*?\s--?[A-Za-z])"
 PAREN_CLI_RE = re.compile(
-    rf"\s*\((?:e\.g\.?,?\s*|for example,?\s*|run\s+)?`?{CLI_TOOLS_PATTERN}\b[^)]*\)",
-    re.IGNORECASE,
+    rf"\s*\((?i:e\.g\.?,?\s*|for example,?\s*|run\s+)?`?{CLI_TOOLS_PATTERN}\b(?:[^()]|\([^()]*\))*\)",
 )
-RUN_CLI_TO_RE = re.compile(
-    rf"^\s*run\s+`?{CLI_TOOLS_PATTERN}\s+[^`]+?`?\s+to\s+(.+)$",
-    re.IGNORECASE,
+RUN_CLI_TO_RE = re.compile(rf"^\s*(?i:run)\s+`?{CLI_TOOLS_PATTERN}\s+[^`]+?`?\s+to\s+(.+)$")
+RUN_BACKTICK_CLI_RE = re.compile(
+    rf"(?:^|(?<=\s))(?i:run)\s+`{CLI_TOOLS_PATTERN}\s+[^`]+`\s*(?i:,?\s*(?:and|then)\s+)?",
 )
-# The command runs to the end of its sentence: a "." or ";" inside it (a
-# version, a CIDR, a file name) is not the end, one before a space or the end is.
+INLINE_BACKTICK_CLI_RE = re.compile(
+    rf"(?:{CLI_EXAMPLE_LEAD_IN}|{CLI_LEAD_IN})?\s*`{CLI_TOOLS_PATTERN}\s+[^`]+`",
+)
 TRAILING_CLI_RE = re.compile(
-    rf"(?:\s*[:;—-]\s*|,?\s+(?:(?:then|and)\s+)?(?:with|via|using|by running|run)\s+)"
-    rf"`?{CLI_TOOLS_PATTERN}\s+(?:(?![.;]`?(?:\s|$)).)+`?",
-    re.IGNORECASE,
+    rf"(?:\s*[:;]\s+|\s+[—-]\s+|(?:{CLI_EXAMPLE_LEAD_IN})?{CLI_LEAD_IN}\s+){CLI_TOOLS_PATTERN}\s+{CLI_HAS_FLAG}{CLI_SPAN}",
 )
-INLINE_BACKTICK_CLI_RE = re.compile(rf"`{CLI_TOOLS_PATTERN}\s+[^`]+`", re.IGNORECASE)
-KUBECTL_DELETE_RE = re.compile(
-    r"^\s*`?kubectl\s+delete\s+([a-z0-9._-]+)\s+([a-z0-9._/-]+).*$",
-    re.IGNORECASE,
-)
-BARE_CLI_RE = re.compile(rf"^\s*`?{CLI_TOOLS_PATTERN}\s+.+$", re.IGNORECASE)
+# The plain form only: a flag is not a kind, and a condition after it is not dropped.
+KUBECTL_DELETE_RE = re.compile(r"^\s*`?kubectl\s+delete\s+([a-z][a-z0-9.]*)\s+([a-z0-9][a-z0-9._-]*)`?\s*\.?\s*$")
+BARE_CLI_RE = re.compile(rf"^\s*(?i:run\s+)?`?{CLI_TOOLS_PATTERN}\s+.+$")
+# What a removed command leaves hanging before the end of its sentence.
+DANGLING_BEFORE_END_RE = re.compile(r"[\s,;:—-]+(?=[.!?](?:\s|$))")
+SPACE_BEFORE_MARK_RE = re.compile(r"\s+(?=[,.;:!?])")
+# One word left of an action says nothing ("Run.", "Check."): the fallback stands in.
+ACTION_MIN_WORDS = 2
 FALLBACK_ACTION = "Review and update the affected resource configuration."
 REMOVE_ACTION = "Remove the {kind} {name}."
 ACTION_EDGE_CHARS = " ,;:-—"
 SUBJECT_EDGE_CHARS = " :—-"
+# A detector's title is "<what is wrong>: <subject> ..."; what may follow the subject's name.
+TITLE_SUBJECT_SEPARATOR = ": "
+SUBJECT_END_CHARS = " (:"
+POD_NOUN = ("pod", "pods")
+CLUSTER_NOUN = ("cluster", "clusters")
+WAITING_JOINER = " and "
 SENTENCE_ENDINGS = (".", "!", "?")
 
 # Card and fallback presentation constants.
@@ -189,9 +208,12 @@ ROLE_NEW = "new"
 ROLE_REMINDER = "reminder"
 ROLE_BLOCKING = "blocking"
 
+# "delay or block": a PodDisruptionBudget holds each node's drain for up to an
+# hour and the upgrade then goes on (GKE's node pool upgrade strategies page),
+# while an orphan Node object stops it.
 HEADLINE_UPGRADE_CRITICAL = (
-    "1 critical issue will block cluster upgrades",
-    "{count} critical issues will block cluster upgrades",
+    "1 critical issue will delay or block cluster upgrades",
+    "{count} critical issues will delay or block cluster upgrades",
 )
 HEADLINE_NEW_CRITICAL = (
     "1 new critical issue needs attention",
@@ -243,20 +265,22 @@ WAITING_PRONOUNS = ("it", "them")
 WAITING_CRITICAL = ("critical issue", "critical issues")
 WAITING_OTHER = ("other issue", "other issues")
 WAITING_PLAIN = ("issue", "issues")
-MORE_QUEUED = ("more issue is", "more issues are")
-QUEUED_WITH_CRITICAL = "{more} queued ({critical} critical, {lower} lower priority)."
-QUEUED_ONLY_CRITICAL = "{more} queued ({critical} critical)."
-QUEUED_PLAIN = "{more} queued."
+# "open", as the note beside the headline says: the rest of the queue holds
+# lines being worked on and lines a message already named, not only queued ones.
+MORE_OPEN = ("more issue is", "more issues are")
+OPEN_WITH_CRITICAL = "{more} open ({critical} critical, {lower} lower priority)."
+OPEN_ONLY_CRITICAL = "{more} open ({critical} critical)."
+OPEN_PLAIN = "{more} open."
 ROLLED_UP_SINGLE = "1 provider-managed finding requires no action from you and is hidden."
 ROLLED_UP_MULTI = "{count} provider-managed findings require no action from you and are hidden."
 
-FOLD_TITLE_TEMPLATE = "Queue breakdown ({count} more queued)"
+FOLD_TITLE_TEMPLATE = "Queue breakdown ({count} more open)"
 # The table lists the first clusters only; its title says so when it is cut
 # (the count is in the line above it, and the title has 40 characters).
 FOLD_TITLE_CUT_TEMPLATE = "Queue breakdown (top {shown} clusters)"
 # One column per severity (`findings_queue.SEVERITIES`), so the line above the
 # table can say "lower priority" for major and minor together.
-FOLD_COLUMNS = ["Cluster", "Critical", "Major", "Minor", "Next queued issue"]
+FOLD_COLUMNS = ["Cluster", "Critical", "Major", "Minor", "Next open issue"]
 FOLD_CRITICAL, FOLD_MAJOR, FOLD_MINOR, FOLD_NEXT = "critical", "major", "minor", "next"
 FOLD_PREVIEW = "{target}: {summary}"
 MAX_FOLD_CLUSTERS = 15
@@ -406,7 +430,7 @@ def clean_title(raw_title: str) -> str:
     """Strip check entry numbers, raw scores, and awkward pod/replica phrasing from a title."""
     cleaned = LEADING_NUMBER_RE.sub("", _one_line(raw_title))
     cleaned = EXPECTED_PODS_RE.sub(
-        lambda m: EXPECTED_PODS_PLAIN.format(pods=_plural(int(m.group(1)), "pod", "pods")),
+        lambda m: EXPECTED_PODS_PLAIN.format(pods=_plural(int(m.group(1)), *POD_NOUN)),
         cleaned,
     )
     cleaned = NESTED_PARENS_RE.sub(NESTED_PARENS_FLAT, cleaned)
@@ -422,23 +446,35 @@ def _ensure_period(sentence: str) -> str:
 
 
 def clean_action(raw_action: str) -> str:
-    """Turn a recommendation action into one plain sentence with no pasted CLI commands."""
-    text = _one_line(raw_action)
-    if not text:
+    """Turn a recommendation action into plain sentences with no pasted CLI commands.
+
+    A command is removed where it is marked as one (backticks, parentheses, a
+    flag); prose that only names a tool is returned as written. An action that
+    is a command and nothing else, or that keeps one word once its command is
+    gone, becomes `FALLBACK_ACTION`.
+    """
+    original = _one_line(raw_action)
+    if not original:
         return ""
+    text = original
     run_match = RUN_CLI_TO_RE.match(text)
     if run_match:
-        goal = run_match.group(1).strip()
-        text = goal[:1].upper() + goal[1:] if goal else FALLBACK_ACTION
+        text = run_match.group(1).strip()
     delete_match = KUBECTL_DELETE_RE.match(text)
     if delete_match:
         return REMOVE_ACTION.format(kind=delete_match.group(1), name=delete_match.group(2))
-    text = PAREN_CLI_RE.sub("", text)
-    text = TRAILING_CLI_RE.sub("", text)
-    text = INLINE_BACKTICK_CLI_RE.sub("", text)
+    for pattern in (PAREN_CLI_RE, RUN_BACKTICK_CLI_RE, INLINE_BACKTICK_CLI_RE, TRAILING_CLI_RE):
+        text = pattern.sub("", text)
+    removed = text != original
+    if removed:
+        text = SPACE_BEFORE_MARK_RE.sub("", DANGLING_BEFORE_END_RE.sub("", _one_line(text)))
     text = _fix_singular_plurals(_one_line(text)).strip(ACTION_EDGE_CHARS)
-    if not text or BARE_CLI_RE.match(text):
+    if BARE_CLI_RE.match(text):
         return FALLBACK_ACTION
+    if removed and len(text.rstrip("".join(SENTENCE_ENDINGS)).split()) < ACTION_MIN_WORDS:
+        return FALLBACK_ACTION
+    if removed:
+        text = text[:1].upper() + text[1:]
     return _ensure_period(text)
 
 
@@ -494,20 +530,22 @@ def _peel_redundant_subject(cleaned_title: str, target: str, obj: str, raw_clust
     A detector's title is `<what is wrong>: <subject> (<its settings>) <what it
     does>`; the settings go last, so what is left still reads as a sentence.
     """
+    category, colon, after = cleaned_title.partition(TITLE_SUBJECT_SEPARATOR)
     for candidate in (target, obj):
-        if not candidate:
+        # Right after the first colon, and the whole name only: `web` is not the
+        # subject of "...: web-frontend", nor of "...: web, api and worker".
+        if not (candidate and colon and after.startswith(candidate)):
             continue
-        # The whole name only: `web` is not the subject of "...: web-frontend".
-        found = re.search(rf": {re.escape(candidate)}(?=$|[\s(:,])", cleaned_title)
-        if found:
-            category = cleaned_title[: found.start()]
-            rest = cleaned_title[found.end() :].lstrip(SUBJECT_EDGE_CHARS)
-            if not rest:
-                return category
-            groups, lead = _leading_groups(rest)
-            if not groups:
-                return f"{category}: {rest}"
-            return f"{category}: {lead} {groups}" if lead else f"{category} {groups}"
+        rest = after[len(candidate) :]
+        if rest and rest[0] not in SUBJECT_END_CHARS:
+            continue
+        rest = rest.lstrip(SUBJECT_EDGE_CHARS)
+        if not rest:
+            return category
+        groups, lead = _leading_groups(rest)
+        if not groups:
+            return f"{category}: {rest}"
+        return f"{category}: {lead} {groups}" if lead else f"{category} {groups}"
     for candidate in (target, obj):
         if candidate and cleaned_title.startswith(f"{candidate} "):
             return cleaned_title[len(candidate) + 1 :].strip()
@@ -530,8 +568,10 @@ def format_item(
     ambiguous: frozenset[str] = frozenset(),
 ) -> FormattedItem:
     """Format one surfaced ``PacedItem`` into card row, plain fallback line, and hidden metadata."""
-    top = item.members[0]
     severity = _best_severity(item.members)
+    # The line's tag and the row under it come from one member: the queue ranks
+    # by score, so the first member is not always the most severe one.
+    top = next((row for row in item.members if row.get("severity") == severity), item.members[0])
     raw_cluster = str(top.get("cluster") or "").strip()
     cluster = cluster_label(top, ambiguous)
     obj = str(top.get("object") or "").strip()
@@ -638,13 +678,13 @@ def _note(open_actionable: int, surfaced_count: int, clusters: list[str]) -> str
         if unique:
             return NOTE_OPEN_ACROSS.format(
                 open_count=open_actionable,
-                clusters=_plural(len(unique), "cluster", "clusters"),
+                clusters=_plural(len(unique), *CLUSTER_NOUN),
             )
         return NOTE_OPEN_ONLY.format(open_count=open_actionable)
     if len(unique) == 1:
         return NOTE_SINGLE_CLUSTER.format(cluster=unique[0])
     if len(unique) > 1:
-        return NOTE_MULTI_CLUSTER.format(clusters=_plural(len(unique), "cluster", "clusters"))
+        return NOTE_MULTI_CLUSTER.format(clusters=_plural(len(unique), *CLUSTER_NOUN))
     return ""
 
 
@@ -660,7 +700,7 @@ def _waiting_phrase(waiting_items: list, blocking_count: int) -> str:
     if waiting_other:
         parts.append(_plural(waiting_other, *(WAITING_OTHER if waiting_critical else WAITING_PLAIN)))
     pronoun = WAITING_PRONOUNS[blocking_count != 1]
-    return WAITING_SUFFIX.format(waiting=" and ".join(parts), pronoun=pronoun)
+    return WAITING_SUFFIX.format(waiting=WAITING_JOINER.join(parts), pronoun=pronoun)
 
 
 def _queue_fold(
@@ -803,16 +843,14 @@ def build_nudge(
         else:
             after_lines.append(BLOCKING_NOTICE_MULTI.format(count=len(blocking), waiting=waiting))
     if remaining > 0:
-        more_words = _plural(remaining, *MORE_QUEUED)
+        more_words = _plural(remaining, *MORE_OPEN)
         lower = max(0, remaining - remaining_critical)
         if rows is not None and remaining_critical > 0 and lower:
-            after_lines.append(
-                QUEUED_WITH_CRITICAL.format(more=more_words, critical=remaining_critical, lower=lower)
-            )
+            after_lines.append(OPEN_WITH_CRITICAL.format(more=more_words, critical=remaining_critical, lower=lower))
         elif rows is not None and remaining_critical > 0:
-            after_lines.append(QUEUED_ONLY_CRITICAL.format(more=more_words, critical=remaining_critical))
+            after_lines.append(OPEN_ONLY_CRITICAL.format(more=more_words, critical=remaining_critical))
         else:
-            after_lines.append(QUEUED_PLAIN.format(more=more_words))
+            after_lines.append(OPEN_PLAIN.format(more=more_words))
     if plan.rolled_up:
         if plan.rolled_up == 1:
             after_lines.append(ROLLED_UP_SINGLE)
