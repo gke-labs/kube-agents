@@ -45,6 +45,13 @@ const LONG_S = /\u017f/g;
 export interface ConsoleInFrame {
   messageId: string;
   text: string;
+  /**
+   * The root task of a card's report this turn answers, taken from that
+   * report's notify frame (`ConsoleOutFrame.replyTo`). The page sends it on a
+   * reply turn only, never empty; the gateway (a2a/gateway/console.go,
+   * `ConsoleInFrame.ReplyTo`) puts that report ahead of the turn.
+   */
+  replyTo?: string;
 }
 
 export interface ConsoleOutFrame {
@@ -56,6 +63,10 @@ export interface ConsoleOutFrame {
   kind?: string;
   /** The A2A state a terminal frame's task ended in (the pane does not read it). */
   state?: string;
+  /** On a notify frame, the root task whose turn filed the card this post reports on (a2a/gateway/console.go). */
+  replyTo?: string;
+  /** On a notify frame, true when the post is a card's report: the one post a reply can go under. */
+  report?: boolean;
 }
 
 /** The kind the gateway gives a task's terminal frame (a2a/gateway/console.go). */
@@ -109,10 +120,12 @@ export function textBytes(text: string): number {
 /**
  * `kind` is left off rather than sent as "text". The gateway treats the two
  * the same, and a field that isn't there can't be misspelled into a silent
- * drop.
+ * drop. `replyTo` goes only when a report was named, never as an empty string.
  */
 export function encodeInFrame(frame: ConsoleInFrame): Uint8Array {
-  return new TextEncoder().encode(JSON.stringify({ messageId: frame.messageId, text: frame.text }));
+  const wire: Record<string, string> = { messageId: frame.messageId, text: frame.text };
+  if (frame.replyTo !== undefined && frame.replyTo !== "") wire.replyTo = frame.replyTo;
+  return new TextEncoder().encode(JSON.stringify(wire));
 }
 
 export function parseOutFrame(data: Uint8Array | string): ConsoleOutFrame | null {
@@ -129,6 +142,12 @@ export function parseOutFrame(data: Uint8Array | string): ConsoleOutFrame | null
   const frame: ConsoleOutFrame = { messageId: r.messageId, text: r.text, edit: r.edit === true };
   if (typeof r.kind === "string") frame.kind = r.kind;
   if (typeof r.state === "string") frame.state = r.state;
+  // Only a notify frame carries a reply target, and it is a task id: anything
+  // else is not the gateway's and would be sent back on the .in frame as one.
+  if (r.kind === "notify" && typeof r.replyTo === "string" && TOKEN_RE.test(r.replyTo)) {
+    frame.replyTo = r.replyTo;
+  }
+  if (r.kind === "notify" && r.report === true) frame.report = true;
   return frame;
 }
 

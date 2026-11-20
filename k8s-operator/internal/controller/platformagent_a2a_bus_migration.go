@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,7 +62,33 @@ const (
 	// busMigrationGrow is one server to three, by snapshot and restore,
 	// behind a write freeze.
 	busMigrationGrow busMigrationLeg = "OneToThree"
+	// busMigrationReshape recreates TASKS at the width the CR renders, at
+	// the server count the bus runs, by snapshot and restore behind a write
+	// freeze: JetStream never changes a stream's max_consumers after it is
+	// created. Started only by a person, with the bus-reshape annotation
+	// (maybeStartBusReshape). Its phases are only names #6479's operator knows
+	// (busReshapePhases), so an operator rolled back to that release holds
+	// the run, with an identity in the frozen map for every pod it has.
+	busMigrationReshape busMigrationLeg = "Reshape"
 )
+
+// busReshapePhases is every phase the Reshape leg may be in: the names the
+// operator that first held unknown legs (#6479) knows, so a rollback to it
+// holds a reshape in any of them. TestTheReshapeLegUsesOnlyPhasesTheHoldKnows
+// holds the step table to it.
+var busReshapePhases = []busMigrationPhase{
+	busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationClearing,
+	busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing,
+	busMigrationDone, busMigrationAbandoned, busMigrationFailed,
+}
+
+// busMigrationLegKnown reports a leg this operator runs. Any other leg is a
+// run a newer operator started (the CRD's enum names legs this one does not
+// run, so a rollback mid-run can find one): it is held, never advanced
+// (holdUnknownBusMigrationLeg).
+func busMigrationLegKnown(leg busMigrationLeg) bool {
+	return leg == busMigrationGrow || leg == busMigrationShrink || leg == busMigrationReshape
+}
 
 // busMigrationPhase is where a run is.
 type busMigrationPhase string
@@ -75,7 +102,7 @@ const (
 	busMigrationHashing           busMigrationPhase = "Hashing"           // grow: the operator's hashing pod digests the stage
 	busMigrationClearing          busMigrationPhase = "Clearing"          // grow: the streams deleted ahead of the conversion, or of the rollback after a failed restore
 	busMigrationConverting        busMigrationPhase = "Converting"        // grow: three servers rendered, waiting for them
-	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores and raises to R3
+	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores, raises to R3 and waits for it to settle
 	busMigrationRollingBack       busMigrationPhase = "RollingBack"       // grow failed in or after the conversion: one server rendered again
 	busMigrationRollbackRestoring busMigrationPhase = "RollbackRestoring" // grow: the same snapshot restored into one server
 	busMigrationReleasing         busMigrationPhase = "Releasing"         // grow: the freeze lifted
@@ -144,6 +171,34 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 			}
 			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "streams pinned to R1 on server 0 could not be raised back to R3; the bus is three servers with some single-copy streams"}
 		}
+	case busMigrationReshape:
+		// One to three's walk without the conversion: TASKS is cleared and
+		// restored at the count the bus runs. The way back is the same
+		// as one to three's, at that count.
+		if phase == busMigrationClearing && ok && !abandoning {
+			return busMigrationStep{next: busMigrationRestoring}
+		}
+		switch phase {
+		case busMigrationClearing:
+			if ok {
+				return busMigrationStep{next: busMigrationRollingBack, abandoning: true}
+			}
+			if abandoning {
+				return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "deleting the partially restored TASKS before the rollback failed; the bus is write-frozen and the snapshot is kept on the staging volume"}
+			}
+			return busMigrationStep{next: busMigrationFailed, manual: "deleting TASKS before its restore failed; the bus is write-frozen and the snapshot is kept on the staging volume"}
+		case busMigrationRollingBack:
+			if ok {
+				return busMigrationStep{next: busMigrationRollbackRestoring, abandoning: true}
+			}
+			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "the bus did not come back up for the rollback; it is write-frozen and the snapshot is kept on the staging volume: check the a2a-nats pods (docs: bus migration runbook)"}
+		case busMigrationRollbackRestoring:
+			if ok {
+				return busMigrationStep{next: busMigrationReleasing, abandoning: true}
+			}
+			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "restoring TASKS as it was failed; the bus is write-frozen and the snapshot is kept on the staging volume: see the bus migration runbook"}
+		}
+		return nextBusMigrationPhase(busMigrationGrow, phase, abandoning, outcome)
 	case busMigrationGrow:
 		switch phase {
 		case busMigrationFreezing, busMigrationSnapshot, busMigrationHashing:
@@ -215,9 +270,12 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 }
 
 // busMigrationFrozen reports whether a phase holds the write freeze: only
-// the migration's principals reach the bus. Three to one never freezes.
+// the migration's principals reach the bus. Three to one never freezes. A
+// leg this operator does not know keeps the freeze in every phase that is
+// not over: it may have deleted streams it has not put back, and lifting
+// the freeze would let the provision Job and the workloads write over them.
 func busMigrationFrozen(leg busMigrationLeg, phase busMigrationPhase) bool {
-	if leg != busMigrationGrow {
+	if leg == busMigrationShrink {
 		return false
 	}
 	switch phase {
@@ -453,7 +511,13 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		case err != nil:
 			return busMigrationPending, false, err
 		}
-		if !busNATSRolledOutAt(sts, int32(busMigrationReplicas(leg, phase, run.Abandoning))) { // #nosec G115 -- 1 or 3
+		want := int32(busMigrationReplicas(leg, phase, run.Abandoning)) // #nosec G115 -- 1 or 3
+		if leg == busMigrationReshape {
+			// A reshape never changes the count: the bus is rolled out at
+			// the count it runs.
+			want = int32(busReshapeServers(agent)) // #nosec G115 -- 1 or 3
+		}
+		if !busNATSRolledOutAt(sts, want) {
 			return busMigrationPending, false, nil
 		}
 		// On the one to three leg the rollout must also be the right side
@@ -461,7 +525,7 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		// freeze, rendered after the callout confirmed it (a restart before
 		// that, a drain say, is not one), the phases inside it keep it, and
 		// Releasing completes only on a restart out of it.
-		if leg == busMigrationGrow {
+		if leg != busMigrationShrink {
 			want := run.RunID
 			if phase == busMigrationReleasing {
 				want = ""
@@ -641,6 +705,12 @@ func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Cond
 		return metav1.Condition{}, false
 	}
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
+	if !busMigrationLegKnown(leg) {
+		return unknownLegCondition(agent, run), phase != busMigrationDone
+	}
+	if leg == busMigrationReshape {
+		return reshapeCondition(agent, run), phase != busMigrationDone
+	}
 	from, to := 3, 1
 	if leg == busMigrationGrow {
 		from, to = 1, 3
@@ -728,15 +798,28 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		step, verbs = busMigrationStreamIdentity, []string{"INFO", "DELETE"}
 	case busMigrationRestoring, busMigrationRollbackRestoring:
 		// The restores create each stream, send its chunks, raise its
-		// replicas, and delete a stream whose restore went wrong.
+		// replicas, and delete a stream whose restore went wrong. The
+		// forward restore then reads each stream's consumers by name, and
+		// changes none, until every durable is up on its leader (#6174):
+		// the stream's own consumer count is the cluster's assignments, not
+		// consumers that answer.
 		step, verbs = busMigrationStreamIdentity, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}
-		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.RESTORE." + stream + ".>"} }
+		extra = func(stream string) []string {
+			return []string{"$JS.SNAPSHOT.RESTORE." + stream + ".>", "$JS.API.CONSUMER.NAMES." + stream, "$JS.API.CONSUMER.INFO." + stream + ".*"}
+		}
 	default:
 		return nil
 	}
 	user := busMigrationPrincipal(step, run.RunID)
 	var publish []string
-	for _, stream := range a2aProvisionedStreams {
+	// The run's own streams only: a reshape's principal reaches TASKS and
+	// nothing else. The other legs' grants keep the provisioned order the
+	// rendered identity map has always had.
+	granted := a2aProvisionedStreams
+	if busMigrationLeg(run.Leg) == busMigrationReshape {
+		granted = a2aBusMigrationStreamsFor(busMigrationReshape)
+	}
+	for _, stream := range granted {
 		for _, verb := range verbs {
 			publish = append(publish, "$JS.API.STREAM."+verb+"."+stream)
 		}
@@ -775,6 +858,16 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 func a2aBusMigrationStreams() []string {
 	streams := slices.DeleteFunc(slices.Clone(a2aProvisionedStreams), func(s string) bool { return s == a2aProfileSubmitStream })
 	return append(streams, a2aProfileSubmitStream)
+}
+
+// a2aBusMigrationStreamsFor is the streams a run of leg snapshots, clears
+// and restores: every provisioned stream, or TASKS alone for a reshape,
+// which indexes nothing and is indexed by nothing.
+func a2aBusMigrationStreamsFor(leg busMigrationLeg) []string {
+	if leg == busMigrationReshape {
+		return []string{"TASKS"}
+	}
+	return a2aBusMigrationStreams()
 }
 
 // busMigrationPrincipal is a migration step's bus user, which is also its
@@ -879,7 +972,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 // mounted read-only, writing the digests to its termination message for the
 // operator to read. It holds no bus credential at all.
 func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.Pod {
-	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aBusMigrationStreams(), ",")}
+	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg)), ",")}
 	volumes := []corev1.Volume{{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
 		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: true},
 	}}}
@@ -940,7 +1033,7 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 		"--ca-file", a2aNATSCAFile(),
 		"--user", busMigrationPrincipal(busMigrationStreamIdentity, run.RunID),
 		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams", strings.Join(a2aBusMigrationStreams(), ","),
+		"--streams", strings.Join(a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg)), ","),
 	}
 	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
 	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
@@ -958,7 +1051,18 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 		if kind == "rollback" {
 			replicas = "1"
 		}
-		command = append(command, "--run-file", busMigrationRunMount+"/"+busMigrationRunKey, "--replicas", replicas)
+		command = append(command, "--run-file", busMigrationRunMount+"/"+busMigrationRunKey)
+		if busMigrationLeg(run.Leg) == busMigrationReshape {
+			// At the count the bus runs, both ways; the direction is named,
+			// since a one-server reshape restores forward.
+			direction := "forward"
+			if kind == "rollback" {
+				direction = "back"
+			}
+			replicas = strconv.Itoa(busReshapeServers(agent))
+			command = append(command, "--direction", direction)
+		}
+		command = append(command, "--replicas", replicas)
 		volumes = append(volumes, corev1.Volume{Name: "run", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 			SecretName: busMigrationRunSecret(agent, run.RunID), DefaultMode: ptr.To(int32(0o440)),
 		}}})
@@ -1081,7 +1185,7 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Cont
 			return err
 		}
 	}
-	if (work.name == "restore" || work.name == "rollback") && !busMigrationClearedAll(run) {
+	if (work.name == "restore" || work.name == "rollback") && !busMigrationClearedAll(run, busMigrationLeg(run.Leg)) {
 		// No restore onto a bus that still holds copies the clear has not
 		// removed: on a converted cluster those are the old server's,
 		// reserving its store twice over, and on the way back the
@@ -1173,7 +1277,7 @@ func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent 
 	if pod == nil {
 		return "the hashing pod is gone", nil
 	}
-	digests, refused := parseBusDigests(terminationMessage(pod))
+	digests, refused := parseBusDigests(terminationMessage(pod), a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg)))
 	if refused != "" {
 		return refused, nil
 	}
@@ -1195,9 +1299,10 @@ func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent 
 	return "", nil
 }
 
-// parseBusDigests reads the hashing pod's report: exactly the provisioned
-// streams, each with a data and a metadata digest of 64 lowercase hex.
-func parseBusDigests(msg string) (map[string]busmigrate.StagedDigest, string) {
+// parseBusDigests reads the hashing pod's report: exactly the run's streams
+// (a2aBusMigrationStreamsFor), each with a data and a metadata digest of 64
+// lowercase hex.
+func parseBusDigests(msg string, streams []string) (map[string]busmigrate.StagedDigest, string) {
 	var digests map[string]busmigrate.StagedDigest
 	if err := json.Unmarshal([]byte(msg), &digests); err != nil {
 		return nil, "it is not a digest report"
@@ -1205,10 +1310,10 @@ func parseBusDigests(msg string) (map[string]busmigrate.StagedDigest, string) {
 	hex64 := func(s string) bool {
 		return len(s) == 64 && strings.Trim(s, "0123456789abcdef") == ""
 	}
-	if len(digests) != len(a2aProvisionedStreams) {
-		return nil, fmt.Sprintf("it names %d streams, not the %d provisioned", len(digests), len(a2aProvisionedStreams))
+	if len(digests) != len(streams) {
+		return nil, fmt.Sprintf("it names %d streams, not the run's %d", len(digests), len(streams))
 	}
-	for _, name := range a2aProvisionedStreams {
+	for _, name := range streams {
 		d, ok := digests[name]
 		if !ok {
 			return nil, "it has no digest for " + name
@@ -1243,6 +1348,15 @@ func (r *PlatformAgentReconciler) recordRestoreReport(ctx context.Context, agent
 	var report busmigrate.Report
 	if err := json.Unmarshal([]byte(msg), &report); err != nil {
 		return "its report could not be read", nil
+	}
+	// Only a restore that finished settled: a failed one is turning back.
+	if report.SettleSeconds > 0 && report.Error == "" && run.SettleTime == "" {
+		settled := time.Duration(report.SettleSeconds * float64(time.Second)).Round(time.Millisecond)
+		run.SettleTime = settled.String()
+		if r.Recorder != nil {
+			r.Recorder.Event(agent, corev1.EventTypeNormal, "BusMigrationSettled",
+				fmt.Sprintf("the A2A bus migration's restored streams reached three replicas, every replica current and every restored durable consumer answering from its leader, %s after the last raise", settled))
+		}
 	}
 	if len(report.Warnings) > 0 && run.Warnings == nil {
 		run.Warnings = report.Warnings
@@ -1365,7 +1479,7 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 // accepted cost. Before the forward clear the single server still holds every
 // stream, and the claim goes as before.
 func busMigrationStageIsTheOnlyCopy(run *agentv1alpha1.BusMigrationStatus) bool {
-	if busMigrationLeg(run.Leg) != busMigrationGrow || !run.GivenUp {
+	if busMigrationLeg(run.Leg) == busMigrationShrink || !run.GivenUp {
 		return false
 	}
 	switch busMigrationPhase(run.FailedIn) {
@@ -1580,6 +1694,10 @@ func busMigrationActOnFailed(agent *agentv1alpha1.PlatformAgent, now metav1.Time
 		return true
 	}
 	retry := busMigrationRetryPhase(busMigrationPhase(run.FailedIn))
+	if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		// Only the operator that knows the leg knows its way back.
+		retry = ""
+	}
 	if retry == "" || len(run.Retries) >= busMigrationMaxRetries || agent.Annotations[a2aBusMigrationRetryAnnotation] != busMigrationRetryValue(run) {
 		return false
 	}
@@ -1595,10 +1713,16 @@ func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 	run := agent.Status.BusMigration
 	if run.GivenUp {
 		if busMigrationStageIsTheOnlyCopy(run) {
+			if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+				// A leg this operator does not run may not have made the claim
+				// or the Secret; what it made is kept all the same.
+				return fmt.Sprintf(" It was given up: the freeze is lifted, and streams it did not put back are recreated empty. Their data may be only on the staging claim %s, if the run made one, which is kept, with the run Secret %s, until a person deletes it, or the PlatformAgent is deleted.",
+					busMigrationStageClaim(agent, run.RunID), busMigrationRunSecret(agent, run.RunID))
+			}
 			return fmt.Sprintf(" It was given up: the freeze is lifted, and streams it did not put back are recreated empty. Their data is only on the staging claim %s, which is kept, with the run Secret %s, until a person deletes it, or the PlatformAgent is deleted.",
 				busMigrationStageClaim(agent, run.RunID), busMigrationRunSecret(agent, run.RunID))
 		}
-		if busMigrationLeg(run.Leg) == busMigrationGrow {
+		if busMigrationLeg(run.Leg) != busMigrationShrink {
 			return " It was given up: the freeze is lifted, and streams it did not put back are recreated empty."
 		}
 		// Three to one never freezes or deletes a stream: its streams are
@@ -1606,7 +1730,7 @@ func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 		return " It was given up; its streams keep their data where the run left them, and another migration may start."
 	}
 	var b strings.Builder
-	if busMigrationRetryPhase(busMigrationPhase(run.FailedIn)) != "" {
+	if busMigrationLegKnown(busMigrationLeg(run.Leg)) && busMigrationRetryPhase(busMigrationPhase(run.FailedIn)) != "" {
 		if left := busMigrationMaxRetries - len(run.Retries); left > 0 {
 			fmt.Fprintf(&b, " To retry (%d of %d left): annotate the PlatformAgent %s=%s.", left, busMigrationMaxRetries, a2aBusMigrationRetryAnnotation, busMigrationRetryValue(run))
 		} else {
@@ -1677,7 +1801,7 @@ func (r *PlatformAgentReconciler) busMigrationSnapshotKept(ctx context.Context, 
 		return "the run Secret cannot be read", nil
 	}
 	b, _ := json.Marshal(file.Digests)
-	if _, bad := parseBusDigests(string(b)); bad != "" {
+	if _, bad := parseBusDigests(string(b), a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg))); bad != "" {
 		return "the run Secret's digests: " + bad, nil
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -1694,9 +1818,9 @@ func (r *PlatformAgentReconciler) busMigrationSnapshotKept(ctx context.Context, 
 }
 
 // busMigrationClearedAll reports the current Clearing having deleted every
-// provisioned stream.
-func busMigrationClearedAll(run *agentv1alpha1.BusMigrationStatus) bool {
-	for _, name := range a2aProvisionedStreams {
+// stream a run of leg clears.
+func busMigrationClearedAll(run *agentv1alpha1.BusMigrationStatus, leg busMigrationLeg) bool {
+	for _, name := range a2aBusMigrationStreamsFor(leg) {
 		if !slices.Contains(run.Cleared, name) {
 			return false
 		}
@@ -1739,7 +1863,7 @@ const reasonA2ABusMigrationStreamsOverCap = "A2ABusMigrationStreamsOverCap"
 // a2aBusJszStreamsPath is the monitoring endpoint's JetStream report, with
 // each stream's state (the meta group check reads the summary alone,
 // a2aBusJszPath).
-const a2aBusJszStreamsPath = "/jsz?streams=true"
+const a2aBusJszStreamsPath = "/jsz?streams=true&config=true"
 
 // a2aBusStream is one stream's state as the bus's /jsz reports it: what
 // the restore's rendered-limit check reads from the snapshot.
@@ -1747,6 +1871,9 @@ type a2aBusStream struct {
 	Bytes     int64
 	Msgs      int64
 	FirstTime time.Time
+	// MaxConsumers is the stream's configured max_consumers, read with
+	// config=true; zero when the server did not report a config.
+	MaxConsumers int
 }
 
 // busMigrationStreamsOverCap says why a one to three migration can't start,
@@ -1760,16 +1887,28 @@ type a2aBusStream struct {
 // closed. A stream the policies don't name isn't judged here; the restore's
 // own checks hold it.
 func (r *PlatformAgentReconciler) busMigrationStreamsOverCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
+	return r.busMigrationStreamsOverCapIn(ctx, agent, a2aProvisionedStreams)
+}
+
+// busMigrationStreamsOverCapIn is busMigrationStreamsOverCap for the named
+// streams only: a reshape restores TASKS alone.
+func (r *PlatformAgentReconciler) busMigrationStreamsOverCapIn(ctx context.Context, agent *agentv1alpha1.PlatformAgent, names []string) string {
 	live, err := r.a2aBusStreamState(ctx, agent)
 	if err != nil {
 		return "the bus's stream sizes could not be read (" + err.Error() + "), and a stream over the limits the restore puts on it would fail the run with writes frozen"
 	}
+	return busMigrationStreamsOverCapFrom(agent, live, names)
+}
+
+// busMigrationStreamsOverCapFrom is the over-cap check against a stream
+// report already read, so a caller that read it once doesn't read it again.
+func busMigrationStreamsOverCapFrom(agent *agentv1alpha1.PlatformAgent, live map[string]a2aBusStream, names []string) string {
 	now := time.Now()
 	var over []string
 	listed := 0
 	for _, p := range a2aStreamPolicies(agent, 1) {
 		st, ok := live[p.Name]
-		if !ok {
+		if !ok || !slices.Contains(names, p.Name) {
 			continue
 		}
 		listed++
@@ -1819,7 +1958,10 @@ func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 	var jsz struct {
 		AccountDetails []struct {
 			Streams []struct {
-				Name  string `json:"name"`
+				Name   string `json:"name"`
+				Config struct {
+					MaxConsumers int `json:"max_consumers"`
+				} `json:"config"`
 				State struct {
 					Bytes     int64     `json:"bytes"`
 					Msgs      int64     `json:"messages"`
@@ -1834,8 +1976,60 @@ func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 	streams := map[string]a2aBusStream{}
 	for _, account := range jsz.AccountDetails {
 		for _, stream := range account.Streams {
-			streams[stream.Name] = a2aBusStream{Bytes: stream.State.Bytes, Msgs: stream.State.Msgs, FirstTime: stream.State.FirstTime}
+			streams[stream.Name] = a2aBusStream{Bytes: stream.State.Bytes, Msgs: stream.State.Msgs, FirstTime: stream.State.FirstTime, MaxConsumers: stream.Config.MaxConsumers}
 		}
 	}
 	return streams, nil
+}
+
+// reasonA2ABusMigrationLegUnknown is the Warning for a run whose leg this
+// operator does not run.
+const reasonA2ABusMigrationLegUnknown = "A2ABusMigrationLegUnknown"
+
+// busMigrationLegUnknownMessage says what holding a run of an unknown leg
+// means, and the two ways out.
+func busMigrationLegUnknownMessage(run *agentv1alpha1.BusMigrationStatus) string {
+	return fmt.Sprintf("unrecognised migration leg %s (run %s, phase %s): holding; nothing advances, the bus keeps its server count and the write freeze, and the provision Job waits. Upgrade the operator to the release that started the run, which carries it on, or turns it back if its deadline has passed meanwhile, or abandon the run: annotate the PlatformAgent %s=%s, which lifts the freeze and recreates every stream the run did not put back, empty",
+		run.Leg, run.RunID, run.Phase, a2aBusMigrationAbandonAnnotation, run.RunID)
+}
+
+// holdUnknownBusMigrationLeg is a pass over a run whose leg this operator
+// does not run: one a newer operator started, found after a rollback. It
+// writes nothing to the run, so nothing the run's own operator reads
+// changes: no phase moves, no pod or Job is made or deleted, the deadline
+// does not apply, and the freeze and the provision hold stay
+// (busMigrationFrozen, busMigrationHoldsProvision). Upgrading back resumes
+// the run where it was. A Warning says so, once per run and phase
+// (heldBusMigrationWarned); the A2ABusMigrating condition says it on every
+// pass (unknownLegCondition). A person who gives the run up with the abandon annotation
+// moves it to Failed, given up, on the next pass, as busMigrationActOnFailed
+// does for any Failed run: the freeze lifts, and the provision Job recreates
+// what the run did not put back.
+func (r *PlatformAgentReconciler) holdUnknownBusMigrationLeg(agent *agentv1alpha1.PlatformAgent) {
+	run := agent.Status.BusMigration
+	if agent.Annotations[a2aBusMigrationAbandonAnnotation] == run.RunID {
+		run.FailedIn, run.Phase = run.Phase, string(busMigrationFailed)
+		run.Cause = fmt.Sprintf("this operator does not run the %s leg", run.Leg)
+		run.Message = "held, then given up by the abandon annotation"
+		return
+	}
+	key, seen := client.ObjectKeyFromObject(agent), run.RunID+"/"+run.Phase
+	if prev, ok := r.heldBusMigrationWarned.Load(key); !ok || prev != seen {
+		r.heldBusMigrationWarned.Store(key, seen)
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationLegUnknown, busMigrationLegUnknownMessage(run))
+	}
+}
+
+// unknownLegCondition is A2ABusMigrating for a run whose leg this operator
+// does not run.
+func unknownLegCondition(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) metav1.Condition {
+	if busMigrationPhase(run.Phase) == busMigrationAbandoned {
+		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Abandoned",
+			Message: fmt.Sprintf("the %s migration %s did not complete and was undone (%s); the bus runs as it did before it", run.Leg, run.RunID, run.Cause)}
+	}
+	if busMigrationPhase(run.Phase) == busMigrationFailed {
+		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Failed",
+			Message: fmt.Sprintf("the %s migration %s stopped (%s): %s.%s", run.Leg, run.RunID, run.Cause, run.Message, busMigrationFailedActions(agent))}
+	}
+	return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionTrue, Reason: "LegUnknown", Message: busMigrationLegUnknownMessage(run)}
 }

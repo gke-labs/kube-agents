@@ -37,6 +37,10 @@ const (
 	// AgentScheduleConditionAccepted reports whether the schedule parses and
 	// its profile allows the unattended tier.
 	AgentScheduleConditionAccepted = "Accepted"
+	// AgentScheduleConditionSubmitted reports how the gateway answered the
+	// schedule's last submission: True once it took a run, False when it
+	// refused one (the reason and the gateway's detail in the message).
+	AgentScheduleConditionSubmitted = "Submitted"
 
 	// AgentScheduleConcurrencyForbid is the one concurrency policy: a run
 	// never starts while the last one is still going.
@@ -56,6 +60,19 @@ const (
 	// AgentScheduleOutcomeLost is a run whose task vanished or outlived its
 	// deadline, so the schedule moved on without its terminal.
 	AgentScheduleOutcomeLost = "Lost"
+)
+
+// How a run's report was delivered, as the gateway's scheduled-reports store
+// records it (Track 3). Every value but posting is final.
+const (
+	AgentScheduleReportNone         = "no_delivery"
+	AgentScheduleReportLocal        = "local"
+	AgentScheduleReportSilent       = "silent"
+	AgentScheduleReportStoredNoHome = "stored_no_home"
+	AgentScheduleReportPosting      = "posting"
+	AgentScheduleReportPosted       = "posted"
+	AgentScheduleReportPostFailed   = "post_failed"
+	AgentScheduleReportPostUnknown  = "post_unknown"
 )
 
 // AgentScheduleProfileRef names the AgentProfile a schedule's runs go to.
@@ -79,9 +96,11 @@ type AgentScheduleDelivery struct {
 	// +optional
 	SilentWhenClean bool `json:"silentWhenClean,omitempty"`
 
-	// JobKey groups a schedule's posts into one thread per UTC day. It
-	// defaults to the schedule's name.
+	// JobKey groups a schedule's posts into one thread per UTC day. It keys
+	// stored reports, so it is a DNS-1123 label. It defaults to the
+	// schedule's name, which a schedule that runs already has to be.
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +optional
 	JobKey string `json:"jobKey,omitempty"`
 }
@@ -112,9 +131,10 @@ type AgentScheduleSpec struct {
 	// +required
 	Prompt string `json:"prompt"`
 
-	// Parameters are passed to each run as task parameters. `stream` names
-	// the run's audit report stream.
-	// +kubebuilder:validation:MaxProperties=32
+	// Parameters are passed to each run as task parameters, at most 16, the
+	// bound every task submission has. A built-in schedule's report stream
+	// is its own name, carried on its trigger, not a parameter.
+	// +kubebuilder:validation:MaxProperties=16
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty"`
 
@@ -204,6 +224,15 @@ type AgentScheduleRun struct {
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// Outcome is how it ended.
 	Outcome string `json:"outcome"`
+	// Delivery is how its report was delivered, once that is final: posted,
+	// stored for want of a home channel, kept local, silent when clean, not
+	// delivered, post_failed when the gateway gave up posting it, or
+	// post_unknown when a post started or timed out with no outcome, so it
+	// may be in the channel and is never retried. Empty until the gateway
+	// reports a final value, and on a run it never does.
+	// +kubebuilder:validation:Enum=no_delivery;local;silent;stored_no_home;posted;post_failed;post_unknown
+	// +optional
+	Delivery string `json:"delivery,omitempty"`
 }
 
 // AgentScheduleStatus is the schedule's run state. It is the run ledger: no
@@ -247,6 +276,15 @@ type AgentScheduleStatus struct {
 	// SkipCounts counts slots that did not run.
 	// +optional
 	SkipCounts AgentScheduleSkipCounts `json:"skipCounts,omitempty"`
+	// PostFailed counts runs whose report the gateway couldn't post to chat
+	// after its redeliveries (Delivery post_failed).
+	// +optional
+	PostFailed int64 `json:"postFailed,omitempty"`
+	// PostUnknown counts runs whose report post started or timed out with no
+	// outcome (Delivery post_unknown): it may be in the channel, and the
+	// gateway never posts it again.
+	// +optional
+	PostUnknown int64 `json:"postUnknown,omitempty"`
 	// RecentRuns are the last ten runs, newest first.
 	// +kubebuilder:validation:MaxItems=10
 	// +optional

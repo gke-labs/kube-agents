@@ -1,11 +1,11 @@
 ---
 name: gcp-networking-fabric-audit
-description: Audits VPC subnet IPAM capacity, Cloud NAT port exhaustion, Private Service Connect routing, VPC peering MTU mismatches, Cloud Armor WAF policies, and management ports open to the whole internet.
+description: Audits VPC subnet IPAM capacity, Cloud NAT port exhaustion, Private Service Connect routing, VPC peering MTU mismatches, Cloud Armor WAF policies, management ports open to the whole internet, and Standard clusters without NodeLocal DNSCache.
 ---
 
 # Task
 
-Audit Google Cloud VPC subnet IPAM allocation headroom, Cloud NAT port capacity, Private Service Connect (PSC) reachability, VPC peering MTU mismatches, Cloud Armor WAF policies and world-open management ports, emitting findings for the `fleet-audit` reporting harness.
+Audit Google Cloud VPC subnet IPAM allocation headroom, Cloud NAT port capacity, Private Service Connect (PSC) reachability, VPC peering MTU mismatches, Cloud Armor WAF policies, world-open management ports and Standard clusters without NodeLocal DNSCache, emitting findings for the `fleet-audit` reporting harness.
 
 # Workflow
 
@@ -23,10 +23,10 @@ python3 /opt/data/profiles/platform/skills/gcp-networking-fabric-audit/scripts/n
 
 ## 2. Evaluate Findings Against SOP Checks
 
-Read the manifest and follow `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `limitations` and `candidates`. All six roster checks are collector-verified; none is yours to hand-run unless a target is `gate-failed` or its `limitations` names a rule as undecided. A check whose read failed is in the target's `checks_unevaluated`, and its `limitations` names that check. Run the collector as the SOP does, without `--check`: that flag narrows a run to the subnet sweep or the project checks, and the manifest it writes leaves the other checks out.
+Read the manifest and follow `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `limitations` and `candidates`. All seven roster checks are collector-verified; none is yours to hand-run unless a target is `gate-failed` or its `limitations` names a rule as undecided. A check whose read failed is in the target's `checks_unevaluated`, and its `limitations` names that check. Run the collector as the SOP does, without `--check`: that flag narrows a run to the subnet sweep or the project checks, and the manifest it writes leaves the other checks out.
 
 - `subnet-ip-exhaustion`, on each `<project>/<region>/<subnet>` target: Pod ranges from GKE's own utilization fields, primary ranges as a lower bound from VM NICs, internal addresses and forwarding rules.
-- `cloud-nat-exhaustion`, `psc-routing-deadlock`, `mtu-packet-fragmentation`, `cloud-armor-false-positive` and `firewall-world-open-ingress`, on each `project/<project>` target.
+- `cloud-nat-exhaustion`, `psc-routing-deadlock`, `mtu-packet-fragmentation`, `cloud-armor-false-positive`, `firewall-world-open-ingress` and `missing-nodelocal-dnscache`, on each `project/<project>` target.
 
 A manifest with a top-level `error` read no target: do not call `finish`, and report the error.
 

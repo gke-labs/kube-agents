@@ -15,13 +15,15 @@ _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "installer-tests-bash-floor.y
 # What counts as a new installer test file here. A test file with another name is not seen.
 _INSTALLER_TEST_GLOB = "tests/test_installer_*.py"
 # The files of the job that the glob does not match: the tests of the three front-door
-# scripts, of lifecycle.sh and of scripts/dev/repeat_under_load.sh.
+# scripts, of lifecycle.sh and of scripts/dev/repeat_under_load.sh, and the helm retry
+# tests of hack/ci-deploy.sh.
 _ALSO_IN_THE_JOB = {
     "tests/test_install_script.py",
     "tests/test_upgrade_script.py",
     "tests/test_uninstall_script.py",
     "tests/test_lifecycle_script.py",
     "tests/test_repeat_under_load.py",
+    "tests/test_ci_deploy_helm_retry.py",
 }
 # An installer test file that the job does not run: its path as the glob gives it
 # ("tests/test_installer_x.py"), and the reason.

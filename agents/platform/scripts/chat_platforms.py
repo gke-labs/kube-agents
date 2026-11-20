@@ -44,6 +44,8 @@ import chat_notify
 # move to it. #1094/#1111 settled the same order for the same reason on the sibling
 # in `session_kv_server`, after #855's Slack-first ordering cost autopush a week of
 # governance reports to a Slack leg with no home channel.
+# On an install the A2A gateway serves, chat_notify.in_routed_order then puts a
+# configured home ahead of a learned one.
 CHAT_PLATFORMS = ("google_chat", "slack")
 
 # The managed scope, mounted read-only by the operator and machine-global — one
@@ -181,7 +183,7 @@ def _env_enabled(platform: str) -> bool:
 
 
 def enabled_chat_platforms() -> list[str]:
-    """Every chat platform this install posts to, in CHAT_PLATFORMS order.
+    """Every chat platform this install posts to, in CHAT_PLATFORMS order, the routed ones in routing order.
 
     Three sources, most specific first, resolved **per platform** rather than per
     source — so a file that names one platform cannot silence another that only a
@@ -226,7 +228,9 @@ def enabled_chat_platforms() -> list[str]:
             enabled = _env_enabled(name)
         if enabled:
             resolved.append(name)
-    return resolved or [DEFAULT_PLATFORM]
+    # The routed platforms in the routing rule's order, as session_kv_server's
+    # resolver returns them: a configured home ahead of a learned one.
+    return chat_notify.in_routed_order(resolved) or [DEFAULT_PLATFORM]
 
 
 __all__ = ["CHAT_PLATFORMS", "DEFAULT_PLATFORM", "enabled_chat_platforms"]

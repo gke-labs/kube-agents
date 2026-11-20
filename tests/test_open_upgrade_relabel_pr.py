@@ -118,7 +118,8 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
         self.assertEqual(len(create), 1, self.calls())
         self.assertIn("--base main", create[0])
         self.assertIn(f"--head {BRANCH}", create[0])
-        self.assertIn("relabel the pending rows 1.0.0 shipped, fixing main's Documentation Checks", create[0])
+        self.assertIn("relabel the pending rows 1.0.0 shipped", create[0])
+        self.assertNotIn("fixing main's Documentation Checks", create[0])
         self.assertIn("`a shipped change` → 1.0.0", self.log.read_text(encoding="utf-8"))
         self.assertTrue(any(c.startswith("npx --yes prettier@3.9.6 --write") for c in self.calls()))
 
