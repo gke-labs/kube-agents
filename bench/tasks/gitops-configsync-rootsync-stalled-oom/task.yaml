@@ -6,25 +6,33 @@
 #
 # What the fixture plants versus the customer failure: the fixture plants one
 # `RootSync/root-sync` in `config-management-system` with the status Config
-# Sync v1.25.2 writes when its reconciler Deployment fails to progress
+# Sync writes when its reconciler Deployment passes its progress deadline
 # (`Stalled` True, reason `Deployment`), on a cluster with no Config Sync,
-# installing a minimal RootSync CRD when the host serves none; the customer
-# failure is the same status on a cluster that runs Config Sync, where the
-# root-reconciler is OOM-killed on a large repository or cannot start. The
-# status names no cause, and the fixture plants none: the case claims that the
-# audit names a RootSync that reports Stalled, not that it finds why.
+# installing a minimal RootSync CRD; the customer failure is the same status
+# on a cluster that runs Config Sync, where the root-reconciler cannot make
+# progress at all (a pod that cannot be scheduled, an image that cannot be
+# pulled). The status names no cause, and the fixture plants none.
 #
-# The status text is copied from the Config Sync source at v1.25.2
-# (rootsync_controller.go, handleReconcileError), not captured from a running
-# Config Sync.
+# The status is a copy of a live object: Config Sync v1.25.2 on a Standard
+# cluster wrote these conditions, field for field, ten minutes after its
+# reconciler became unschedulable.
 #
-# The object exists for the length of the run only. A standing object on the
-# seeded fleet was built and not taken: it adds one critical finding to every
-# compliance audit of every pool project for as long as it stands.
+# What the case does not cover, by the same live test: a reconciler that is
+# OOM-killed in a loop. Each restart counts as progress, so that RootSync
+# reports `Reconciling` True with reason `Deployment` ("InProgress: Available:
+# 0/1") and no `Stalled` condition, and check 2.17 does not read `Reconciling`
+# alone. The scenario's name says "oom"; this case validates its stalled half.
+#
+# The object is planted for one run. A run stopped between plant and removal
+# leaves it on the host until this stack's next plant clears it, and a
+# compliance audit of that install files the finding in the meantime. A
+# standing object on the seeded fleet was built and not taken: it adds one
+# critical finding to every compliance audit of every pool project for as
+# long as it stands.
 #
 # Isolation class: cluster-read-only, GitOps-repo write (every fleet-audit
-# stream's `start` and `finish`), plus the stack's one namespace and at most
-# one CRD on the host.
+# stream's `start` and `finish`), plus the stack's one namespace and one CRD
+# on the host.
 id: gitops-configsync-rootsync-stalled-oom
 name: "Config Sync RootSync Reports Stalled (configsync-reconciler-stalled)"
 domain: security
