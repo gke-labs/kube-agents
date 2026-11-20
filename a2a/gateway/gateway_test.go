@@ -1380,6 +1380,13 @@ type fakeSpawner struct {
 	// started is each pod's start time for PodStarted; startedErr fails it.
 	started    map[string]time.Time
 	startedErr error
+	// warm is what WarmPods lists; warmSpawns records SpawnWarm's names,
+	// each added to warm as a pod not yet Ready; warmSpawnErr fails
+	// SpawnWarm and warmErr fails WarmPods.
+	warm         []warmPod
+	warmSpawns   []string
+	warmSpawnErr error
+	warmErr      error
 }
 
 func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {

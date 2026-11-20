@@ -716,11 +716,35 @@ in the KV only) and its pseudonymized attribution, so a child minted later and t
 it run under the turn that asked. Working
 state richer than the transcript primer rehydrate builds today - what the session has
 discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
-conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is
-paid.
+conversation is a resumed agent.
+
+A new conversation's first turn takes a warm pod when one is ready, so it skips scheduling and
+the image pull; every later turn pays the harness start as before. On the session route the
+leader gateway keeps `A2A_WARM_SESSIONS` warm pods (`spec.harness.tuning.warmSessions`, default 1,
+0 off; the operator renders the variable only where the install resolves to the session route,
+so on platform no warm pod runs), at most
+the cap less one and fewer while live sessions fill the cap (`a2a/gateway/warm_pool.go`). A warm
+pod is the session pod `Spawn` builds, created through the same CREATE-only path and admission
+policy, with no task or conversation annotation and an `a2a.kubeagents.dev/warm` mark. It has a
+freshly minted name, and its adapter starts without `TASK_ID` (`A2A_SESSION_WARM`), opens its
+task watcher on its own `…in` subjects and reports Ready once the watcher's consumer exists. A
+session pod's bus identity is its name, so the gateway claims a warm pod by setting the
+record's bus session and addressee to the pod's name instead of minting one. Nothing is
+re-bound: the capability names the pod, and its grants are what a fresh spawn under that
+name gets, so an unclaimed pod can run nothing. Only a session-routed conversation with no
+earlier turn claims one (a warm pod has no primer, which is read once at start), never a
+one-shot Delegate, and with none ready the turn spawns cold. The gateway cannot patch the
+pod, so the claim goes in the session-state bucket (`warm.<pod>` naming the conversation),
+and the cap count, the cap eviction and both sweeps read the claim in place of the
+annotations; an unclaimed warm pod holds no cap slot and is no stranded orphan. The pool
+replaces an unclaimed pod at 25 minutes; its adapter exits unclaimed at 30, which is what
+frees it under a gateway that predates the pool, whose sweep deletes an ended pod with no
+task annotations. A warm pod's deadline is that 30 minutes plus a reused pod's lifetime, so a
+claimed pod lives as long as a fresh one. Each warm pod takes one `TASKS` consumer and one pod in the session quota, and warm pods use only consumers the session cap leaves spare (`status.effectiveWarmSessions`): the cap is fitted as before, and a stream with none spare runs without a warm pod rather than losing a session. A new `TASKS` is created with room for them. Recycling is quiet: the readiness probe waits out the adapter's start rather than failing during it, and the pool and the sweep log at info and record no Event.
 
 What this costs is pods: one per live conversation, bounded by the session cap and the
-idle TTL. That is the figure to measure before the default flips.
+idle TTL, and the warm pods, one session pod's requests each. That is the figure to measure
+before the default flips.
 
 ## Routing to AgentProfiles (added 10/28)
 

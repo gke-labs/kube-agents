@@ -318,6 +318,10 @@ type Gateway struct {
 	capCheck chan struct{}
 	capMu    sync.Mutex
 	capHolds map[string]capHold
+	// warmMu serializes a claim of a warm pod against the pool's own
+	// deletes, so the pool never deletes a pod a turn is claiming
+	// (warm_pool.go).
+	warmMu sync.Mutex
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
@@ -978,6 +982,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
+	}
+	if g.warmPoolOn() {
+		go g.warmPoolLoop(ctx)
 	}
 
 	// The adapter's delivery goroutines only enqueue (or refuse a console
@@ -1686,6 +1693,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			if rec.Profile == "" {
 				rec.Profile = sessionProfile
 			}
+			// Always minted, never a warm pod: a one-shot Delegate on a
+			// fixed-route conversation must not inherit a reused pod's
+			// lifetime (warmClaimEligible).
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
 			msg = wordsAfter(msg, rest)
@@ -1724,8 +1734,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				}
 				rec.SessionRouted = true
 				rec.Profile = sessionProfile
-				rec.BusSession = mintSessionName(rec.Profile)
-				rec.Addressee = rec.BusSession
+				g.claimOrMint(ctx, rec)
 			}
 		}
 		// The busy notice: counted once the task is on the bus, leaving the
@@ -2546,8 +2555,9 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	if !g.retireIncarnation(ctx, rec, "session route", retireRefusalNotStarted) {
 		return false
 	}
-	rec.BusSession = mintSessionName(rec.Profile)
-	rec.Addressee = rec.BusSession
+	// A new conversation's first turn may be handed a warm pod instead of a
+	// fresh name (warm_pool.go); everything else mints, as before.
+	g.claimOrMint(ctx, rec)
 	return true
 }
 

@@ -142,6 +142,9 @@ const (
 	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
+// warmReadyPoll paces warmReady's look for the ready file.
+const warmReadyPoll = 250 * time.Millisecond
+
 func main() {
 	os.Exit(run())
 }
@@ -175,6 +178,12 @@ func run() int {
 			return 1
 		}
 		return 0
+	}
+	// `worker-adapter warm-ready` is a warm session pod's readiness probe:
+	// exit 0 once the adapter has written lib.SessionWarmReadyFile, which it
+	// does when its task watcher's consumer exists (workeradapter.runWarm).
+	if len(os.Args) > 1 && os.Args[1] == lib.SessionWarmReadyCommand {
+		return warmReady(lib.SessionWarmReadyFile, lib.SessionWarmReadyWaitSeconds*time.Second)
 	}
 	// `worker-adapter mcp` forwards the session's one delegate tool call to
 	// this adapter process over a unix socket (worker-adapter/mcp.go).
@@ -297,12 +306,18 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")
 	natsURL := os.Getenv("NATS_URL")
-	// A profile worker learns each task from the dispatcher's offer, so it
-	// starts with no TASK_ID.
+	// A profile worker learns each task from the dispatcher's offer, and a
+	// warm session pod from the first task addressed to it, so neither
+	// starts with a TASK_ID.
 	profileWorker := os.Getenv(lib.EnvProfileWorker) == "true"
-	if (taskID == "" && !profileWorker) || profile == "" || natsURL == "" {
-		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker needs no TASK_ID")
+	warm := os.Getenv(lib.EnvSessionWarm) == "true"
+	if (taskID == "" && !profileWorker && !warm) || profile == "" || natsURL == "" {
+		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker or a warm session pod needs no TASK_ID")
 		return workeradapter.Config{}, false
+	}
+	warmReadyFile := ""
+	if warm {
+		warmReadyFile = lib.SessionWarmReadyFile
 	}
 
 	// The scope arrives resolved and already validated -- the gateway's
@@ -387,7 +402,43 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		// Literal "true" only, like EnvClusterView; a profile pod never
 		// serves a second task, and validate refuses the pair.
 		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
+		// Literal "true" only, like EnvSessionReuse; validate refuses it
+		// without reuse or beside a TASK_ID.
+		Warm:          warm,
+		WarmIdle:      envDurationOrZero(lib.EnvSessionWarmIdleSeconds),
+		WarmReadyFile: warmReadyFile,
 	}, true
+}
+
+// warmReady is the warm pod's readiness probe: 0 once file exists, waiting up
+// to wait for it (lib.SessionWarmReadyWaitSeconds says why), 1 if it never
+// appears.
+func warmReady(file string, wait time.Duration) int {
+	deadline := time.Now().Add(wait)
+	for {
+		if _, err := os.Stat(file); err == nil {
+			return 0
+		}
+		if !time.Now().Before(deadline) {
+			return 1
+		}
+		time.Sleep(warmReadyPoll)
+	}
+}
+
+// envDurationOrZero reads a positive whole number of seconds from key, or
+// zero when it is unset or not one.
+func envDurationOrZero(key string) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		fmt.Fprintf(os.Stderr, "ignoring bad %s=%q\n", key, v)
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }
 
 // harnessCommand builds the harness argv: the native binary driven over the

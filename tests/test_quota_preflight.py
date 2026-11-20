@@ -116,6 +116,8 @@ data:
 # The session pods at the default cap (#6028): maxSessions (10) times the operator's
 # DefaultSession* figures, 150m / 320Mi requested, 2 CPU / 2Gi limits, 1088Mi ephemeral.
 _DEFAULT_MAX_SESSIONS = 10
+# The operator's DefaultWarmSessions: one warm session pod, on the session route only.
+_DEFAULT_WARM_SESSIONS = 1
 _SESSION_REQUEST_MILLIS = 150
 _SESSION_LIMIT_MILLIS = 2000
 _SESSION_REQUEST_MEMORY_BYTES = 320 * 1024**2
@@ -491,6 +493,32 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(req["maxSessions"], count)
                 for key, field in self._SESSION_KEYS.items():
                     self.assertEqual(req[key], count * pod[field], key)
+
+    def test_the_chart_default_warm_count_is_the_operators(self) -> None:
+        types = (_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go").read_text()
+        match = re.search(r"const DefaultWarmSessions = (\d+)", types)
+        self.assertIsNotNone(match, "DefaultWarmSessions is gone from the API")
+        self.assertEqual(int(match.group(1)), _DEFAULT_WARM_SESSIONS)
+
+    def test_warm_sessions_count_only_on_the_session_route(self) -> None:
+        # warmSessions x one session pod's requests, held to the cap less one, on the session
+        # route only: an unset defaultRoute is platform, where the share is the cap alone.
+        pod = self._session_pod()
+        session = "platformAgent.harness.tuning.defaultRoute=session"
+        for sets, warm in (([], 0),
+                           (["platformAgent.harness.tuning.warmSessions=3"], 0),
+                           (["platformAgent.harness.tuning.defaultRoute=platform"], 0),
+                           ([session], _DEFAULT_WARM_SESSIONS),
+                           ([session, "platformAgent.harness.tuning.warmSessions=0"], 0),
+                           ([session, "platformAgent.harness.tuning.warmSessions=3"], 3),
+                           ([session, "platformAgent.harness.tuning.warmSessions=3",
+                             "platformAgent.harness.tuning.maxSessions=2"], 1),
+                           ([session, "platformAgent.harness.tuning.maxSessions=1"], 0)):
+            with self.subTest(sets=sets):
+                req = self._requirements(sets)
+                self.assertEqual(req.get("warmSessions", 0), warm)
+                self.assertEqual(req["sessionPods"], (req["maxSessions"] + warm) * pod["pods"])
+                self.assertEqual(req["sessionRequestsCpu"], (req["maxSessions"] + warm) * pod["cpuMillisRequest"])
 
     def test_a_session_resources_override_moves_the_share_by_the_cap_times_the_delta(self) -> None:
         base = self._requirements(["platformAgent.harness.tuning.maxSessions=4"])

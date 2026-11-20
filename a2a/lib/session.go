@@ -96,6 +96,38 @@ const (
 	// so a pod from an older spawner, which exits after one task, is never
 	// sent one.
 	EnvSessionReuse = "A2A_SESSION_REUSE"
+	// EnvSessionWarm is "true" on a warm session pod: one the gateway's pool
+	// starts before any conversation needs it, with no TASK_ID and no
+	// conversation of its own. Its adapter opens its task watcher on its own
+	// `…in` subjects and waits there; the gateway makes it a conversation's
+	// session by addressing that conversation's first task to the pod's name.
+	// It needs EnvSessionReuse too: a warm pod serves its conversation the
+	// way a reused pod does.
+	EnvSessionWarm = "A2A_SESSION_WARM"
+	// EnvSessionWarmIdleSeconds is how long a warm pod waits for its first
+	// task before it exits with nothing to publish. It is what bounds an
+	// unclaimed warm pod under a gateway that does not know about warm pods
+	// (a rollback): such a gateway's sweep deletes the exited pod, and the
+	// slot it held is free again.
+	EnvSessionWarmIdleSeconds = "A2A_SESSION_WARM_IDLE_SECONDS"
+	// SessionWarmReadyFile is the file a warm pod's adapter writes once its
+	// task watcher's consumer exists, and the file SessionWarmReadyCommand
+	// checks for the pod's readiness probe. The gateway hands a warm pod a
+	// conversation only once it is Ready, so the first task never waits on a
+	// consumer that is not there yet. It is in the scratch emptyDir, the
+	// pod's one writable place, so a new pod never finds an old one's.
+	SessionWarmReadyFile = "/scratch/.a2a-warm-ready"
+	// SessionWarmReadyCommand is the worker-adapter subcommand the warm
+	// pod's readiness probe runs: exit 0 once SessionWarmReadyFile exists.
+	SessionWarmReadyCommand = "warm-ready"
+	// SessionWarmReadyWaitSeconds is how long SessionWarmReadyCommand waits
+	// for the file before it fails. A probe that failed while the adapter
+	// was still dialling the bus would record a Warning Unhealthy Event for
+	// every warm pod the pool starts, about every half hour on an idle
+	// install, and the cluster's event watcher counts Unhealthy toward an
+	// incident; waiting out the start keeps a routine recycle quiet, and a
+	// watcher still not live after this is a probe failure worth its Event.
+	SessionWarmReadyWaitSeconds = 20
 )
 
 const (

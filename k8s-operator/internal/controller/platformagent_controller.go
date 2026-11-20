@@ -655,9 +655,13 @@ type PlatformAgentReconciler struct {
 	// longer fitted.
 	sessionCapWarned sync.Map
 	// sessionCapPruned records, per CR, when a write's echo came back
-	// without the cap (resolveA2ASessionCap). sessionCapReadings is the last
-	// known reading of each CR's TASKS width (a2aTasksLiveWidth). Both are
-	// keyed by ObjectKey and cleared when the CR is deleted.
+	// without the cap (resolveA2ASessionCap), and sessionWarmPruned when one
+	// came back with the cap but without status.effectiveWarmSessions, which
+	// renders no warm pod until a reprobe finds the field kept.
+	// sessionCapReadings is the last known reading of each CR's TASKS width
+	// (a2aTasksLiveWidth). All three are keyed by ObjectKey and cleared when
+	// the CR is deleted.
+	sessionWarmPruned  sync.Map
 	sessionCapPruned   sync.Map
 	sessionCapReadings sync.Map
 
@@ -1934,6 +1938,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.kanbanAdmissionWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.sessionCapWarned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionWarmPruned.Delete(client.ObjectKeyFromObject(agent))
 		r.sessionCapPruned.Delete(client.ObjectKeyFromObject(agent))
 		r.sessionCapReadings.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))

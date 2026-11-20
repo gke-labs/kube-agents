@@ -194,11 +194,35 @@ const (
 	busTransportLength = 16
 	// natsCAVolume is the session pod's mount of the gateway's CA bundle.
 	natsCAVolume = "nats-ca"
+	// envTaskID is the worker env naming the task a pod is started for.
+	envTaskID = "TASK_ID"
 	// workerContainer is the session pod's one container, the adapter's.
 	workerContainer = "worker"
 	// delegateToolOn is lib.EnvDelegateTool's value for a pod whose adapter
 	// decides the tool per task (delegateToolEnv).
 	delegateToolOn = "on"
+
+	// annoWarm marks a pod the warm pool started (warm_pool.go): no task,
+	// no conversation, waiting for a conversation's first turn to be
+	// addressed to its name. The gateway can't patch it off once claimed, so
+	// a claimed warm pod keeps it, and the claim index in the session-state
+	// bucket says which conversation it now serves (Registry.ClaimWarmPod).
+	annoWarm  = "a2a.kubeagents.dev/warm"
+	warmValue = "true"
+	// workerAdapterPath is the worker image's adapter binary
+	// (a2a/Dockerfile.worker), which the warm pod's readiness probe runs as
+	// `worker-adapter warm-ready`. An image that keeps it elsewhere never
+	// reports ready, so its warm pods are never claimed and every
+	// conversation spawns cold, as without a pool.
+	workerAdapterPath = "/usr/local/bin/worker-adapter"
+	// warmReadinessPeriodSeconds paces the warm pod's readiness probe. It
+	// only decides how soon after start a new warm pod can be claimed.
+	warmReadinessPeriodSeconds = 5
+	// warmReadinessTimeoutMargin is what the probe's timeout adds above the
+	// probe command's own wait for the ready file
+	// (lib.SessionWarmReadyWaitSeconds), so the command answers before the
+	// kubelet gives up on it.
+	warmReadinessTimeoutMargin = 5
 
 	// primerVolume, primerMountPath and primerFileName place the primer
 	// annotation in the worker container as a file.
@@ -237,6 +261,13 @@ type spawner interface {
 	// deleted, with the conversation each belongs to: the session cap's
 	// count, and its eviction's candidates.
 	SessionPods(ctx context.Context) ([]sessionPod, error)
+	// SpawnWarm creates a warm session pod named name (warm_pool.go): the
+	// session pod Spawn builds, through the same create, with no task and
+	// no conversation on it.
+	SpawnWarm(ctx context.Context, name string) error
+	// WarmPods lists the pods carrying the warm mark, claimed or not, in
+	// any phase until they are deleted.
+	WarmPods(ctx context.Context) ([]warmPod, error)
 	// PodStarted is the pod's status.startTime, when the kubelet took it
 	// (before the image pull), which is where activeDeadlineSeconds counts
 	// from. Zero for a pod not yet started or gone; neither is an error.
@@ -251,6 +282,9 @@ type sessionPod struct {
 	// Reuse is the pod's own reuse annotation: it serves every turn, and so
 	// never exits on its own.
 	Reuse bool
+	// Warm is the pod's warm mark (annoWarm). Its SessionKey is empty on the
+	// pod; the gateway reads the claim index for it (Gateway.sessionPods).
+	Warm bool
 }
 
 type orphanPod struct {
@@ -260,6 +294,20 @@ type orphanPod struct {
 	TaskID        string
 	ContextID     string
 	CorrelationID string
+	// Warm is the pod's warm mark, as on sessionPod.
+	Warm bool
+}
+
+// warmPod is one pod with the warm mark as the pool sees it.
+type warmPod struct {
+	Name    string
+	Created time.Time
+	// Ready is a pod a conversation can be handed: running, not being
+	// deleted, its worker running and past its readiness probe (its task
+	// watcher is live), and on this gateway's bus transport.
+	Ready bool
+	// Gone is a pod in a terminal phase or being deleted.
+	Gone bool
 }
 
 // mintSessionName gives an incarnation its bus session name,
@@ -368,6 +416,46 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 // on the agent side is two narrower principals, neither of them reachable
 // from a session pod.
 func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string, originSeq uint64) (string, error) {
+	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, s.sessionPodSpec(rec, taskID, primer, originSeq, false), metav1.CreateOptions{})
+	if err != nil {
+		// AlreadyExists included: session names are minted per incarnation,
+		// so a name collision means the mint raced a terminating predecessor
+		// — surface it rather than adopt a pod that is about to vanish.
+		return "", err
+	}
+	return created.Name, nil
+}
+
+// SpawnWarm creates a warm pod: Spawn's pod for a session-routed, reused
+// session named name, through the same create (so the gateway pod admission
+// policy holds it to the same shape), with these differences and no others:
+//   - no task, context, correlation, conversation or primer annotation, and
+//     no TASK_ID or origin sequence: it has no task yet;
+//   - the warm mark (annoWarm), and lib.EnvSessionWarm with the idle bound
+//     (warmRecycleAge) after which its adapter exits unclaimed;
+//   - a readiness probe that passes once its task watcher is live;
+//   - an activeDeadlineSeconds of warmPodLifetime: the recycle age plus the
+//     lifetime a fresh reused pod gets, so a pod claimed at the end of its
+//     warm window still has a fresh pod's whole life ahead of it.
+//
+// The bus identity is the name, exactly as for a fresh spawn: the projected
+// token is bound to this pod, the callout grants this name's subjects, and a
+// task reaches it only with a capability whose delegate is this name.
+func (s *podSpawner) SpawnWarm(ctx context.Context, name string) error {
+	rec := &SessionRecord{BusSession: name, Addressee: name, Profile: sessionProfile, SessionRouted: true}
+	_, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, s.sessionPodSpec(rec, "", "", 0, true), metav1.CreateOptions{})
+	return err
+}
+
+// warmPodLifetime is a warm pod's activeDeadlineSeconds: its unclaimed
+// window plus the life a reused pod spawned fresh at the claim would get.
+func warmPodLifetime(cfg *Config) time.Duration {
+	return warmRecycleAge + podLifetime(cfg, true)
+}
+
+// sessionPodSpec is the session pod Spawn and SpawnWarm create; warm builds
+// the warm shape SpawnWarm describes.
+func (s *podSpawner) sessionPodSpec(rec *SessionRecord, taskID, primer string, originSeq uint64, warm bool) *corev1.Pod {
 	name := rec.BusSession
 	// The gateway Deployment owns its sessions: when it goes — the CR's
 	// deletion, or any other — Kubernetes GC reaps the pods it
@@ -444,7 +532,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// which is not a profile. No bus credential rides here any
 					// more: it is the projected token mounted below, which is
 					// the whole of gke-labs#1270.
-					{Name: "TASK_ID", Value: taskID},
+					{Name: envTaskID, Value: taskID},
 					{Name: "PROFILE", Value: rec.Profile},
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},
 					{Name: "A2A_SESSION", Value: rec.BusSession},
@@ -622,14 +710,37 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			})
 		}
 	}
-	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		// AlreadyExists included: session names are minted per incarnation,
-		// so a name collision means the mint raced a terminating predecessor
-		// — surface it rather than adopt a pod that is about to vanish.
-		return "", err
+	if warm {
+		makeWarm(pod, s.cfg)
 	}
-	return created.Name, nil
+	return pod
+}
+
+// makeWarm turns Spawn's pod into the warm shape (SpawnWarm).
+func makeWarm(pod *corev1.Pod, cfg *Config) {
+	for _, k := range []string{annoTask, annoContext, annoCorr, annoConvo, annoPrimer} {
+		delete(pod.Annotations, k)
+	}
+	pod.Annotations[annoWarm] = warmValue
+	pod.Spec.ActiveDeadlineSeconds = ptr.To(int64(warmPodLifetime(cfg) / time.Second))
+	c := &pod.Spec.Containers[0]
+	env := c.Env[:0]
+	for _, e := range c.Env {
+		if e.Name != envTaskID && e.Name != lib.EnvOriginSeq {
+			env = append(env, e)
+		}
+	}
+	c.Env = append(env,
+		corev1.EnvVar{Name: lib.EnvSessionWarm, Value: warmValue},
+		corev1.EnvVar{Name: lib.EnvSessionWarmIdleSeconds, Value: strconv.Itoa(int(warmRecycleAge / time.Second))},
+	)
+	c.ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
+			Command: []string{workerAdapterPath, lib.SessionWarmReadyCommand},
+		}},
+		PeriodSeconds:  warmReadinessPeriodSeconds,
+		TimeoutSeconds: lib.SessionWarmReadyWaitSeconds + warmReadinessTimeoutMargin,
+	}
 }
 
 func sessionImagePullRefs(names []string) []corev1.LocalObjectReference {
@@ -786,7 +897,8 @@ func (s *podSpawner) SessionPods(ctx context.Context) ([]sessionPod, error) {
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
 			continue
 		}
-		out = append(out, sessionPod{PodName: p.Name, SessionKey: p.Annotations[annoConvo], Reuse: p.Annotations[annoReuse] == reuseValue})
+		out = append(out, sessionPod{PodName: p.Name, SessionKey: p.Annotations[annoConvo], Reuse: p.Annotations[annoReuse] == reuseValue,
+			Warm: p.Annotations[annoWarm] == warmValue})
 	}
 	return out, nil
 }
@@ -810,9 +922,45 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 			TaskID:        p.Annotations[annoTask],
 			ContextID:     p.Annotations[annoContext],
 			CorrelationID: p.Annotations[annoCorr],
+			Warm:          p.Annotations[annoWarm] == warmValue,
 		})
 	}
 	return out, nil
+}
+
+func (s *podSpawner) WarmPods(ctx context.Context) ([]warmPod, error) {
+	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
+	})
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	var out []warmPod
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Annotations[annoWarm] != warmValue {
+			continue
+		}
+		out = append(out, warmPod{
+			Name:    p.Name,
+			Created: p.CreationTimestamp.Time,
+			Ready:   podReusable(p, s.busTransport(), s.cfg.TaskDeadline, now) && podReady(p),
+			Gone:    p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil,
+		})
+	}
+	return out, nil
+}
+
+// podReady reports the pod's Ready condition: for a warm pod, its readiness
+// probe has seen the task watcher live.
+func podReady(p *corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // refuseAtSessionCap is the usability half of the session-pod bound, checked
@@ -869,7 +1017,7 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	// for a moment, which errs on the safe side. One list serves the count,
 	// the replaced pods and the eviction candidates.
 	holds := g.capHoldSnapshot(rec.Key, time.Now())
-	pods, err := g.spawner.SessionPods(ctx)
+	pods, err := g.sessionPods(ctx)
 	if err != nil {
 		// Proceeding blind would make the cap advisory exactly when the API
 		// is misbehaving; say so instead of dropping the turn silently.
@@ -1016,6 +1164,20 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	// The pod reads the earlier turns, so their people count for a
 	// delegation from it, as the delegating turn's own do.
 	rec.seedSessionAuthors(authors, unknown, since)
+	if pod := rec.warmClaim; pod != "" && pod == rec.BusSession {
+		// A warm pod this turn claimed (claimOrMint) is already running and
+		// takes the task off its own subjects; it only needs recording. The
+		// claim is made only for a conversation with no earlier turn, so
+		// there is no primer for it to have missed.
+		rec.warmClaim = ""
+		if primer != "" {
+			g.log.Warn("a claimed warm pod has no primer, and this turn built one", "session", rec.Key, "pod", pod)
+		}
+		rec.PodName = pod
+		rec.PodReuse = true
+		g.log.Info("handed the conversation a warm session pod", "session", rec.Key, "pod", pod, "task", taskID)
+		return
+	}
 	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer, originSeq)
 	if err != nil {
 		g.log.Error("session pod spawn failed", "session", rec.Key, "err", err)
@@ -1084,12 +1246,23 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 	// itself, and an API blip there must not hold up the other.
 	defer g.sweepUntracked(ctx)
 	orphans, err := g.spawner.TerminalOrphans(ctx)
+	if err == nil {
+		orphans, err = g.claimedOrphans(ctx, orphans)
+	}
 	if err != nil {
 		g.log.Error("sweep: pod list failed", "err", err)
 		return
 	}
 	for _, o := range orphans {
-		if o.TaskID == "" || o.Addressee == "" {
+		if o.Warm && o.SessionKey == "" {
+			// An unclaimed warm pod that exited at its idle bound, or died
+			// before anything was sent to it: no task, no conversation.
+			g.log.Info("sweep: deleting an unclaimed warm pod that ended", "pod", o.PodName)
+			_ = g.spawner.Delete(ctx, o.PodName)
+			continue
+		}
+		claimedWarm := o.Warm && o.SessionKey != ""
+		if (o.TaskID == "" && !claimedWarm) || o.Addressee == "" {
 			g.log.Warn("sweep: terminal pod without task annotations; deleting", "pod", o.PodName)
 			_ = g.spawner.Delete(ctx, o.PodName)
 			g.releaseIncarnation(ctx, o)
@@ -1119,6 +1292,11 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 		}
 		_ = g.spawner.Delete(ctx, o.PodName)
 		g.releaseIncarnation(ctx, o)
+		if claimedWarm {
+			if err := g.reg.DropWarmClaim(ctx, o.PodName); err != nil {
+				g.log.Warn("sweep: warm claim not dropped; the pool's pass drops it", "pod", o.PodName, "err", err)
+			}
+		}
 	}
 }
 
@@ -1133,7 +1311,7 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 // conversation holds the lock, so a pod its record does not name there is
 // untracked rather than one whose spawn is still being written down.
 func (g *Gateway) sweepUntracked(ctx context.Context) {
-	pods, err := g.spawner.SessionPods(ctx)
+	pods, err := g.sessionPods(ctx)
 	if err != nil {
 		g.log.Error("sweep: live pod list failed", "err", err)
 		return
@@ -1192,7 +1370,12 @@ type sweptTask struct {
 // (the gateway holds no patch on pods), and they do not need to be: every
 // earlier turn reached its terminal before the next one was routed here.
 func sweepTasks(o orphanPod, rec *SessionRecord) []sweptTask {
-	tasks := []sweptTask{{ID: o.TaskID, ContextID: o.ContextID, CorrelationID: o.CorrelationID}}
+	var tasks []sweptTask
+	// A claimed warm pod carries no task annotation (claimedOrphans): the
+	// active task below is the one it may owe.
+	if o.TaskID != "" {
+		tasks = append(tasks, sweptTask{ID: o.TaskID, ContextID: o.ContextID, CorrelationID: o.CorrelationID})
+	}
 	if rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID == o.TaskID ||
 		rec.AddresseeFor(rec.ActiveTask.TaskID) != o.Addressee {
 		return tasks

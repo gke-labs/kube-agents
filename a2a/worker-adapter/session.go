@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -37,6 +38,13 @@ const (
 	// a wake's follow-ups do stacks this many behind a submission in the
 	// seconds the watcher may lag.
 	maxPendingBehindSubmission = 32
+	// warmStartSeq is where a warm pod's watcher starts reading: the
+	// stream's first sequence. Its subjects carry its own freshly minted
+	// name, so nothing is there before the pod is.
+	warmStartSeq = 1
+	// warmReadyFileMode is the ready file's mode: an empty marker only
+	// the pod's own user reads.
+	warmReadyFileMode = 0o600
 )
 
 // runSessionLoop is a reused session pod's life after its first task: wait for
@@ -67,15 +75,90 @@ const (
 //     state (turnOutcome.podBroken): every later turn here would be refused
 //     the same way, and a cold start has a clean pod.
 func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask string, firstSeq uint64, first turnOutcome) (Result, error) {
+	w := &taskWatcher{
+		js:      b.js,
+		log:     cfg.Logger,
+		stem:    cfg.consumerStem(),
+		addr:    cfg.Addressee(),
+		next:    firstSeq + 1,
+		handled: map[string]bool{firstTask: true},
+	}
+	return sessionLoop(ctx, cfg, b, w, first)
+}
+
+// runWarm is a warm pod's life (Config.Warm): no task named at start, so it
+// opens the task watcher on its own `…in` subjects from the stream's first
+// sequence, reports itself ready once the watcher's consumer exists
+// (WarmReadyFile, read by the pod's readiness probe), and runs the first
+// task that arrives exactly as a reused pod runs its next turn: the same
+// execute, so the same capability check before any harness starts. From
+// there it is a reused session pod (sessionLoop).
+//
+// Reading from the first sequence reads nothing it should not: the subjects
+// are named for this pod's freshly minted name, so nothing was published
+// there before the pod existed, and the consumer is the one the callout
+// grants every session pod (`<pod>-origin`, filtered `a2a.tasks.<pod>.*.in`).
+//
+// The wait is bounded by WarmIdle. A pod nobody claimed in that time exits
+// with nothing to publish (exit 0): the gateway's pool has replaced it
+// already, and under a gateway that predates warm pods (a rollback) it is
+// what frees the slot, since that gateway's sweep deletes a terminal pod
+// with no task annotations.
+func runWarm(ctx context.Context, cfg Config, b *busConns) (Result, error) {
 	log := cfg.Logger
 	w := &taskWatcher{
 		js:      b.js,
 		log:     log,
 		stem:    cfg.consumerStem(),
 		addr:    cfg.Addressee(),
-		next:    firstSeq + 1,
-		handled: map[string]bool{firstTask: true},
+		next:    warmStartSeq,
+		handled: map[string]bool{},
+		onLive:  func() { markWarmReady(cfg) },
 	}
+	waitCtx, cancelWait := ctx, context.CancelFunc(func() {})
+	if cfg.WarmIdle > 0 {
+		waitCtx, cancelWait = context.WithTimeout(ctx, cfg.WarmIdle)
+	}
+	origin, seq, err := w.nextTask(waitCtx)
+	cancelWait()
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Info("SIGTERM while warm and unclaimed; exiting with nothing to publish")
+			return Result{}, nil
+		}
+		if waitCtx.Err() != nil {
+			log.Info("no conversation claimed this warm pod in time; exiting with nothing to publish", "waited", cfg.WarmIdle)
+			return Result{}, nil
+		}
+		return Result{}, fmt.Errorf("waiting for the first task: %w", err)
+	}
+	log.Info("first task taken by a warm pod", "task", origin.TaskID, "seq", seq)
+	turn := cfg
+	turn.TaskID = origin.TaskID
+	out := newTaskAdapter(turn, b).execute(ctx, origin, seq, turnPlan{primer: cfg.Primer})
+	out.task = origin.TaskID
+	return sessionLoop(ctx, cfg, b, w, out)
+}
+
+// markWarmReady writes the warm pod's ready file. A failure is logged and
+// leaves the pod unready, so the gateway never claims it and its pool
+// replaces it at the recycle age: a pod that is never handed a task is the
+// safe failure.
+func markWarmReady(cfg Config) {
+	if cfg.WarmReadyFile == "" {
+		return
+	}
+	if err := os.WriteFile(cfg.WarmReadyFile, nil, warmReadyFileMode); err != nil {
+		cfg.Logger.Error("could not report this warm pod ready; it will not be claimed", "file", cfg.WarmReadyFile, "err", err)
+		return
+	}
+	cfg.Logger.Info("warm pod ready: its task watcher is live", "file", cfg.WarmReadyFile)
+}
+
+// sessionLoop is runSessionLoop's body over a watcher already positioned,
+// from the outcome of the task the pod has just run.
+func sessionLoop(ctx context.Context, cfg Config, b *busConns, w *taskWatcher, first turnOutcome) (Result, error) {
+	log := cfg.Logger
 	primer, resume := cfg.Primer, ""
 	out := first
 	for {
@@ -149,6 +232,9 @@ type taskWatcher struct {
 	// skips anything.
 	next    uint64
 	handled map[string]bool
+	// onLive, when set, runs once, the first time the watcher's consumer
+	// exists (a warm pod's readiness).
+	onLive func()
 }
 
 // nextTask blocks until a new task's submission arrives, or ctx ends.
@@ -158,6 +244,10 @@ func (w *taskWatcher) nextTask(ctx context.Context) (*lib.Envelope, uint64, erro
 	for {
 		cons, err := w.consumer(ctx, filter)
 		if err == nil {
+			if w.onLive != nil {
+				w.onLive()
+				w.onLive = nil
+			}
 			if failures > 0 {
 				// The pair to the Warn below, so a live run shows the
 				// recovery and not only the loss.

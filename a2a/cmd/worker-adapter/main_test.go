@@ -6,10 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
@@ -695,5 +697,49 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 	}
 	if got := resetPaths(""); len(got) != 0 {
 		t.Errorf("resetPaths(\"\") = %q, want none", got)
+	}
+}
+
+// A warm session pod's env: no TASK_ID, warm and reuse on, the idle bound in
+// seconds, and the pod's ready file. Without the warm switch an empty TASK_ID
+// still refuses to start. The readiness subcommand answers from the file.
+func TestAWarmSessionPodStartsWithNoTaskID(t *testing.T) {
+	quiet := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	t.Setenv("TASK_ID", "")
+	t.Setenv("PROFILE", "chat")
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	t.Setenv(lib.EnvSessionReuse, "true")
+	t.Setenv(lib.EnvSessionWarm, "")
+	if _, ok := configFromEnv(quiet); ok {
+		t.Fatal("an empty TASK_ID started without the warm switch")
+	}
+	t.Setenv(lib.EnvSessionWarm, "true")
+	t.Setenv(lib.EnvSessionWarmIdleSeconds, "1800")
+	cfg, ok := configFromEnv(quiet)
+	if !ok {
+		t.Fatal("a warm pod's environment was refused")
+	}
+	if !cfg.Warm || !cfg.SessionReuse || cfg.WarmIdle != 30*time.Minute || cfg.WarmReadyFile != lib.SessionWarmReadyFile {
+		t.Errorf("warm config = Warm %v SessionReuse %v WarmIdle %v WarmReadyFile %q", cfg.Warm, cfg.SessionReuse, cfg.WarmIdle, cfg.WarmReadyFile)
+	}
+	file := filepath.Join(t.TempDir(), "ready")
+	if warmReady(file, 0) == 0 {
+		t.Error("the readiness probe passed before the file existed")
+	}
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if warmReady(file, 0) != 0 {
+		t.Error("the readiness probe failed with the file there")
+	}
+	// The probe waits out the adapter's start rather than failing during it,
+	// so a routine warm pod start records no Unhealthy Event.
+	later := filepath.Join(t.TempDir(), "later")
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = os.WriteFile(later, nil, 0o600)
+	}()
+	if warmReady(later, 10*time.Second) != 0 {
+		t.Error("the readiness probe failed while the file was on its way")
 	}
 }
