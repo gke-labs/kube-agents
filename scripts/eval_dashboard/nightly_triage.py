@@ -84,12 +84,12 @@ except ImportError:  # run as a script: scripts/eval_dashboard/nightly_triage.py
 
 REPO_ROOT = nightly_bugs.REPO_ROOT
 
-# --- The model: NIGHTLY_TRIAGE_MODEL, a repository variable the workflow
-# passes through. The file carries no default: it is public, and names no
+# --- The model: NIGHTLY_TRIAGE_MODEL, a repository secret the workflow
+# passes through (a secret, so the public job log masks it). The file carries no default: it is public, and names no
 # model. With no name the route falls back
 # to the filer's rule, the way every other model failure does, and says so.
 MODEL_ENV = "NIGHTLY_TRIAGE_MODEL"
-MODEL_MISSING = f"nightly triage: no model; set {MODEL_ENV} (a repository variable; docs/ci-health.md, \"Nightly triage\") or pass --model; routing by the filer's rule"
+MODEL_MISSING = f"nightly triage: no model; set {MODEL_ENV} (a repository secret; docs/ci-health.md, \"Nightly triage\") or pass --model; routing by the filer's rule"
 # Why an issue went by the rule with no model call: switched off, or armed
 # (NIGHTLY_TRIAGE_LIVE, the workflow's switch, passed through the same way)
 # with no model named. The posted comment tells the two apart, so the fix it

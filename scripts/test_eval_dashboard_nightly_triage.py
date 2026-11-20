@@ -818,7 +818,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_the_switch_defaults_off_and_the_model_has_no_default(self):
         self.assertIn("NIGHTLY_TRIAGE_LIVE: ${{ vars.NIGHTLY_TRIAGE_LIVE || 'false' }}", self.text)
-        self.assertEqual(self.doc["env"]["NIGHTLY_TRIAGE_MODEL"], "${{ vars.NIGHTLY_TRIAGE_MODEL }}", "the variable alone: no fallback name in the public file")
+        self.assertEqual(self.doc["env"]["NIGHTLY_TRIAGE_MODEL"], "${{ secrets.NIGHTLY_TRIAGE_MODEL }}", "a secret, so no step header prints it, and no fallback name in the public file")
 
     def test_the_filer_files_for_triage_only_when_both_are_armed(self):
         [step] = [s for s in self.doc["jobs"]["refresh-and-adjudicate"]["steps"] if s.get("id") == "nightly_bugs"]
@@ -837,9 +837,10 @@ class WorkflowTest(unittest.TestCase):
         job = self.doc["jobs"]["nightly-triage"]
         self.assertEqual(job["needs"], "refresh-and-adjudicate")
         for guard in ("github.repository == 'gke-labs/kube-agents'", "github.ref == 'refs/heads/main'", "vars.CI_HEALTH_MUTE != 'true'",
-                      "(vars.NIGHTLY_TRIAGE_LIVE == 'true' && vars.NIGHTLY_BUGS_LIVE == 'true' && vars.NIGHTLY_TRIAGE_MODEL != '')",
-                      "(needs.refresh-and-adjudicate.outputs.filed != '' && vars.NIGHTLY_TRIAGE_MODEL != '')"):
-            self.assertIn(guard, job["if"], "armed, and the unarmed dry run on filed issues, both need a model named")
+                      "(vars.NIGHTLY_TRIAGE_LIVE == 'true' && vars.NIGHTLY_BUGS_LIVE == 'true')",
+                      "needs.refresh-and-adjudicate.outputs.filed != ''"):
+            self.assertIn(guard, job["if"])
+        self.assertNotIn("NIGHTLY_TRIAGE_MODEL", job["if"], "a secret cannot gate a job's if; the steps check it")
         accounts = [s["with"]["service_account"] for s in job["steps"] if "google-github-actions/auth" in str(s.get("uses"))]
         self.assertEqual(accounts, ["${{ env.COLLECT_SA }}", "${{ env.CI_HEALTH_SA }}"], "evidence as the reader, the model as the publisher")
         self.assertNotIn("pull-requests", job["permissions"])

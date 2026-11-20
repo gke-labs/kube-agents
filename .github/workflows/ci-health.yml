@@ -128,7 +128,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # untrusted issue listing in nightly-bugs-state.json beside health.json, and
 # the digest says so once the hold has lasted about two hours. With
 # NIGHTLY_TRIAGE_LIVE `true` as well and a model named in
-# NIGHTLY_TRIAGE_MODEL, it files domain and group bugs for the
+# NIGHTLY_TRIAGE_MODEL (a repository secret, so no step header prints it),
+# it files domain and group bugs for the
 # nightly-triage job below to assign, which comments on them in the issues
 # repository (docs/ci-health.md, "Nightly triage"). The section
 # turns owners' GitHub logins into Chat mentions through the
@@ -218,11 +219,14 @@ env:
   # docs/ci-health.md "Nightly triage"): anything but `true` leaves the filer
   # assigning as before and the triage in dry run. Its model and the project
   # the model call is billed to (which must grant CI_HEALTH_SA
-  # roles/aiplatform.user) are repository variables too. The model has no
-  # default here: the file is public and names no model. Unset, triage stays unarmed: the filer assigns by its rule, the
-  # job runs only on a dispatch, and the backstop's comment says so.
+  # roles/aiplatform.user) is a repository variable too. The model is a
+  # repository SECRET with no default here: the file is public, and a
+  # variable's value would print in every step header of this public log,
+  # where a secret prints as ***. Unset, triage stays unarmed: the filer
+  # assigns by its rule, the job dry-runs by the rule, and the backstop's
+  # comment says so.
   NIGHTLY_TRIAGE_LIVE: ${{ vars.NIGHTLY_TRIAGE_LIVE || 'false' }}
-  NIGHTLY_TRIAGE_MODEL: ${{ vars.NIGHTLY_TRIAGE_MODEL }}
+  NIGHTLY_TRIAGE_MODEL: ${{ secrets.NIGHTLY_TRIAGE_MODEL }}
   NIGHTLY_TRIAGE_PROJECT: ${{ vars.NIGHTLY_TRIAGE_PROJECT || 'kube-agents-prow' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
   # the smoke-test presubmit's archive, the nightly periodic's log prefix
@@ -1065,10 +1069,10 @@ jobs:
   # ---- The nightly triage (docs/ci-health.md, "Nightly triage") ----------
   # After the tick, in a job of its own so a slow model call can never hold
   # the tick's post or run it into its timeout. Armed (NIGHTLY_TRIAGE_LIVE
-  # and NIGHTLY_BUGS_LIVE both `true`, a model named in
-  # NIGHTLY_TRIAGE_MODEL), it triages every issue the filer left
+  # and NIGHTLY_BUGS_LIVE both `true`, a model named in the
+  # NIGHTLY_TRIAGE_MODEL secret), it triages every issue the filer left
   # waiting (`triage:pending`); unarmed, it dry-runs on the issues the filer
-  # filed this tick (with a model named), or on a dispatch's triage_issues, and prints one line
+  # filed this tick, or on a dispatch's triage_issues, and prints one line
   # each with no case name in it (the log is public). Two identities, as in
   # the tick: the evidence (data.json, the nightly transcripts) is read as
   # the archive reader, and the model is called as the publisher, whose
@@ -1080,8 +1084,8 @@ jobs:
     if: >-
       always() && github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
       && needs.refresh-and-adjudicate.result != 'skipped' && vars.CI_HEALTH_MUTE != 'true'
-      && ((vars.NIGHTLY_TRIAGE_LIVE == 'true' && vars.NIGHTLY_BUGS_LIVE == 'true' && vars.NIGHTLY_TRIAGE_MODEL != '')
-      || (needs.refresh-and-adjudicate.outputs.filed != '' && vars.NIGHTLY_TRIAGE_MODEL != '')
+      && ((vars.NIGHTLY_TRIAGE_LIVE == 'true' && vars.NIGHTLY_BUGS_LIVE == 'true')
+      || needs.refresh-and-adjudicate.outputs.filed != ''
       || (github.event_name == 'workflow_dispatch' && inputs.triage_issues != ''))
     runs-on: ubuntu-latest
     # MAX_ISSUES_PER_RUN model calls at MODEL_TIMEOUT_S each, plus setup.

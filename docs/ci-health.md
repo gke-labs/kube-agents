@@ -1090,9 +1090,10 @@ with two identities:
   files and commits on those files merged since the first red night. It writes
   only to the runner's disk.
 - **Route**, as the publisher (`CI_HEALTH_SA`): one call on Vertex AI through
-  the job's Workload Identity to the model the repository variable
-  `NIGHTLY_TRIAGE_MODEL` names (no default: the workflow file is public and
-  names no model), billed to
+  the job's Workload Identity to the model the repository secret
+  `NIGHTLY_TRIAGE_MODEL` names (a secret, not a variable, so the public job
+  log prints it as `***`; no default: the workflow file is public and names
+  no model), billed to
   `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
   capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
   then grading lines) and the answer at 16,384, thinking included. The model returns a
@@ -1143,8 +1144,8 @@ that tick (which the filer assigned as before) and prints what it would assign; 
 workflow with `triage_issues` set to issue numbers of the issues repository
 does the same for those issues. Setting the repository variable
 `NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true` and
-a model named in `NIGHTLY_TRIAGE_MODEL`; without the name the filer keeps
-assigning by its rule, the job runs only on a manual dispatch, and the
+a model named in the `NIGHTLY_TRIAGE_MODEL` secret; without the name the
+filer keeps assigning by its rule, the job dry-runs by the rule, and the
 comment each waiting issue gets names the switch when it is off and the
 missing model name when the switch is on;
 `CI_HEALTH_MUTE=true` disarms the filer and the triage alike. Switched off, or with no model named,
