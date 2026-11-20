@@ -432,38 +432,59 @@ class DetectorWordingTests(unittest.TestCase):
             "x (minAvailable: 50%, rounds up to 2 of 2 expected pods)",
         )
 
-    def test_a_command_with_dots_in_it_is_removed_whole(self):
-        self.assertEqual(
-            nudge.clean_action(
-                "Upgrade the control plane of prod-usc1 with gcloud container clusters upgrade prod-usc1 "
-                "--master --cluster-version=1.33.5-gke.1080000."
-            ),
-            "Upgrade the control plane of prod-usc1.",
-        )
-        self.assertEqual(
-            nudge.clean_action(
-                "Restrict the control-plane endpoint with gcloud container clusters update prod "
-                "--master-authorized-networks=10.20.0.0/16 --no-enable-google-cloud-access."
-            ),
-            "Restrict the control-plane endpoint.",
-        )
-        self.assertEqual(
-            nudge.clean_action("Upgrade with gcloud container clusters upgrade prod --cluster-version=1.33.5; then verify."),
-            "Upgrade; then verify.",
-        )
-        self.assertEqual(
-            nudge.clean_action("Cordon the node, then run kubectl drain node-1 --ignore-daemonsets."), "Cordon the node."
-        )
-        # A ", " does not end a command: a jsonpath or a list of ranges has one.
-        self.assertEqual(
-            nudge.clean_action(
-                "Restrict access with gcloud container clusters update c "
-                "--master-authorized-networks=10.0.0.0/8, 192.168.0.0/16 --enable-master-authorized-networks."
-            ),
-            "Restrict access.",
-        )
+    def test_no_sentence_is_edited_around_a_command(self):
+        # A recommendation is shown whole or not at all: an edit around a command can turn a
+        # warning into its opposite, or hide a destructive step beside the "Fix issue" button.
+        for raw in (
+            "Do not run `kubectl delete pod web-0`, scale the Deployment instead.",
+            "Do not run `kubectl delete pdb jayanti-pdb`.",
+            "Stop: do not `kubectl delete node gke-x`; drain it first.",
+            "Do not run kubectl delete ns shop --force on production.",
+            "Clean up: gcloud container clusters delete prod-usc1 --quiet.",
+            "Run `kubectl delete node gke-old-1` and then recreate the pool.",
+            "Prefer `helm upgrade --atomic` over `helm upgrade`.",
+            "Raise the budget, then run `kubectl get pdb -A`.",
+            "Upgrade the control plane of prod-usc1 with gcloud container clusters upgrade prod-usc1 "
+            "--master --cluster-version=1.33.5-gke.1080000.",
+            "Restrict access with gcloud container clusters update c "
+            "--master-authorized-networks=10.0.0.0/8, 192.168.0.0/16 --enable-master-authorized-networks.",
+            "Gcloud container clusters update c --enable-shielded-nodes",
+            # Nothing but a command.
+            "Run `kubectl get pods`",
+            "Run kubectl delete namespace prod --wait=false",
+            "kubectl delete pod --all -n shop",
+            "kubectl delete -f manifests/old.yaml",
+            "kubectl delete secret sa-key -n billing after moving to Workload Identity",
+            # One word left of "Run <command> to <goal>", or a command in the goal.
+            "Run kubectl get pods -n x to check.",
+            "Run helm upgrade api ./chart to pick up the image and then run kubectl rollout status deploy/api --timeout=60s.",
+        ):
+            self.assertEqual(nudge.clean_action(raw), nudge.FALLBACK_ACTION, raw)
 
-    def test_prose_that_names_a_tool_is_left_as_written(self):
+    def test_the_fallback_states_no_action_of_its_own(self):
+        self.assertEqual(nudge.FALLBACK_ACTION, "The recommended fix is a command, which is not shown here.")
+
+    def test_the_forms_that_keep_the_meaning_come_out(self):
+        cases = {
+            # A command in parentheses, with the sentence around it as written, a negation included.
+            "Do not delete the pod by hand (kubectl delete pod web-0); scale the Deployment instead.": (
+                "Do not delete the pod by hand; scale the Deployment instead."
+            ),
+            "Raise .spec.maxUnavailable to 1 (kubectl edit pdb api -n shop).": "Raise .spec.maxUnavailable to 1.",
+            "Check the pool version (gcloud container node-pools describe p --format='value(version)') and upgrade it.": (
+                "Check the pool version and upgrade it."
+            ),
+            # An example in backticks.
+            "Add a LimitRange, e.g. `kubectl apply -f limitrange.yaml`, then re-check.": "Add a LimitRange, then re-check.",
+            # "Run <command> to <goal>" keeps the goal.
+            "Run `kubectl rollout restart deployment/api` to reload certificates.": "Reload certificates.",
+            # The plain delete, in words.
+            "kubectl delete node gke-prod-pool-8f2a.": "Remove the node gke-prod-pool-8f2a.",
+        }
+        for raw, plain in cases.items():
+            self.assertEqual(nudge.clean_action(raw), plain, raw)
+
+    def test_text_with_no_command_to_find_is_left_as_written(self):
         for prose in (
             "Stop building images with docker socket mounts in the pod spec.",
             "Deploy via helm charts rather than raw manifests, and pin the chart version.",
@@ -476,36 +497,20 @@ class DetectorWordingTests(unittest.TestCase):
             "Fix via git revert of the last change to the overlay.",
             "Check the release notes: Helm chart 4.2 changes the default.",
             "Run helm charts through a linter before merging.",
+            # A command with no flag, written into a sentence, is not told from prose.
+            "Roll back with helm rollback api 3.",
         ):
             self.assertEqual(nudge.clean_action(prose), prose)
 
-    def test_a_removed_command_leaves_a_sentence_or_the_fallback(self):
-        cases = {
-            "Run `kubectl -n shop get pdb` and raise maxUnavailable to 1": "Raise maxUnavailable to 1.",
-            "Add a LimitRange, e.g. `kubectl apply -f limitrange.yaml`, then re-check.": "Add a LimitRange, then re-check.",
-            "Apply using `helm upgrade api ./chart -f values.prod.yaml`. Then check pods.": "Apply. Then check pods.",
-            "Check the pool version (gcloud container node-pools describe p --format='value(version)') and upgrade it.": (
-                "Check the pool version and upgrade it."
-            ),
-            "Upgrade nodes: Run gcloud container clusters upgrade c --node-pool=p to move the pool.": "Upgrade nodes.",
-            "Raise the budget, then run `kubectl get pdb -A`.": "Raise the budget.",
-            "Run `gcloud container clusters update c --enable-shielded-nodes`. GKE recreates the nodes.": (
-                "GKE recreates the nodes."
-            ),
-            "Raise .spec.maxUnavailable to 1 (kubectl edit pdb api -n shop).": "Raise .spec.maxUnavailable to 1.",
-            "`kubectl get pdb` maxUnavailable must be 1 or more.": "maxUnavailable must be 1 or more.",
-            "kubectl delete node gke-prod-pool-8f2a.": "Remove the node gke-prod-pool-8f2a.",
-            # Nothing but a command, or one word left of it, says nothing: the fallback stands in.
-            "Run `gcloud container clusters update prod --enable-shielded-nodes`": nudge.FALLBACK_ACTION,
-            "Run gcloud container clusters update c --location=l.": nudge.FALLBACK_ACTION,
-            "Run kubectl get pods -n x to check.": nudge.FALLBACK_ACTION,
-            # Only the plain form is reworded; a flag is not a kind, and a condition is not dropped.
-            "kubectl delete pod --all -n shop": nudge.FALLBACK_ACTION,
-            "kubectl delete -f manifests/old.yaml": nudge.FALLBACK_ACTION,
-            "kubectl delete secret sa-key -n billing after moving to Workload Identity": nudge.FALLBACK_ACTION,
-        }
-        for raw, plain in cases.items():
-            self.assertEqual(nudge.clean_action(raw), plain, raw)
+    def test_the_readiness_reviews_own_remedies_are_shown_or_replaced_never_edited(self):
+        for entry, remedy in review.ENTRY_MITIGATIONS.items():
+            shown = nudge.clean_action(remedy)
+            written = " ".join(remedy.split())
+            self.assertIn(
+                shown,
+                (written, nudge.FALLBACK_ACTION, nudge.PAREN_CLI_RE.sub("", written)),
+                f"entry {entry}: {shown}",
+            )
 
     def test_one_of_a_version_is_not_a_count(self):
         self.assertEqual(
