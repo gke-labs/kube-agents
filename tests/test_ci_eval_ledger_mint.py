@@ -56,6 +56,21 @@ _TERMINAL_RC = 1
 # ran one file per CPU in three shards.
 _RENEWAL_POLLS = 40
 _RENEWAL_POLL_SECONDS = 0.5
+# How long the stalled renewal write holds, and how long after the stop the test
+# looks again: longer than the stall, so a write the stop left running has landed.
+_WRITE_STALL_SECONDS = 0.5
+_AFTER_STALL_SECONDS = 1.0
+# The renewer's umask, made to hold while STALL exists: its renewal write is then
+# under way (STALLED says so) for as long as the test needs to stop it there.
+_STALLED_WRITE = """\
+umask() {
+  if [ -e "${STALL}" ]; then
+    : > "${STALLED}"
+    command sleep "${WRITE_STALL_SECONDS}"
+  fi
+  builtin umask "$@"
+}
+"""
 
 
 def _extract(pattern, what):
@@ -372,6 +387,33 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertIn("FILE=removed", out)
         self.assertIn("UNSET=\n", out + "\n")
         self.assertNotIn("tok-renewed", proc.stderr, "a renewal never prints the token")
+
+    def test_a_stop_during_a_renewal_write_leaves_no_token_behind(self):
+        # The stop used to kill the renewer outright: its write went on without
+        # it and put a live token back after the stop's rm.
+        proc = self._run(
+            _STALLED_WRITE
+            + textwrap.dedent(
+                """\
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                : > "${STALL}"
+                wait_until test -e "${STALLED}"
+                [ -e "${STALLED}" ] && echo "WRITE=stalled" || echo "WRITE=never"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                command sleep "${AFTER_STALL_SECONDS}"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+                [ -e "${TOKEN_FILE}.next" ] && echo "NEXT=left" || echo "NEXT=removed"
+                """
+            ),
+            STALL=str(self.tmp / "stall"),
+            STALLED=str(self.tmp / "stalled"),
+            WRITE_STALL_SECONDS=str(_WRITE_STALL_SECONDS),
+            AFTER_STALL_SECONDS=str(_AFTER_STALL_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("WRITE=stalled", proc.stdout)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertIn("NEXT=removed", proc.stdout)
 
     def test_a_failed_renewal_is_retried_soon_rather_than_a_period_later(self):
         # Two refusals, then a mint. The renewer sleeps one tick per second:

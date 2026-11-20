@@ -1494,8 +1494,8 @@ LEDGER_RESET_MINT_RETRY_DELAY=2
 # (start_ledger_token_renewal): well inside the hour an installation token
 # lasts, with room for the mint's own retry ladder.
 LEDGER_TOKEN_RENEW_SECONDS=2400
-# The renewer's sleep step. Short, so the sleep a stopped renewer leaves
-# behind ends within seconds rather than holding the unit's output open.
+# The renewer's sleep step. Short, so a renewer whose unit was killed before
+# its stop notices within seconds rather than holding the job's output open.
 LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
@@ -1660,8 +1660,15 @@ start_ledger_token_renewal() { # <label> <file>
   (
     waited=0
     failures=0
+    nap=""
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # step only once it has returned.
+    trap '[ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      nap=$!
+      wait "${nap}" 2>/dev/null || true
+      nap=""
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
@@ -1688,6 +1695,10 @@ start_ledger_token_renewal() { # <label> <file>
   LEDGER_TOKEN_RENEWER=$!
 }
 
+# Ends the renewer and removes the file. The renewer traps TERM, and bash runs a
+# trap only once the foreground command returns, so the wait below outlasts a
+# mint, a write or an mv under way and the rm is final. Killed outright, the
+# renewer would leave that step running to write a live token after the rm.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
@@ -1767,8 +1778,15 @@ start_gitops_write_token() { # <label> <file>
   (
     waited=0
     failures=0
+    nap=""
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # step only once it has returned.
+    trap '[ -z "${nap}" ] || kill "${nap}" 2>/dev/null; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      nap=$!
+      wait "${nap}" 2>/dev/null || true
+      nap=""
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
@@ -1793,7 +1811,8 @@ start_gitops_write_token() { # <label> <file>
   echo "GitOps write token (${label}): minted from App ${EVAL_LEDGER_APP_ID}, narrowed to ${EVAL_LEDGER_REPO} and contents, pull_requests and issues write, in ${file}"
 }
 
-# Ends the renewer and removes the file. A developer's own
+# Ends the renewer, as stop_ledger_token_renewal does and for its reason, and
+# removes the file. A developer's own
 # TF_VAR_bench_gitops_write_token_file (start_gitops_write_token minted nothing) stays as
 # the environment set it.
 stop_gitops_write_token() { # <file>

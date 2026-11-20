@@ -23,6 +23,21 @@ from tests.testing.common import get_isolated_test_env
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 _REPO = "gke-agentic/kube-agents-evals-2-infra"
+# How long the stalled renewal write holds, and how long after the stop the test
+# looks again: longer than the stall, so a write the stop left running has landed.
+_WRITE_STALL_SECONDS = 0.5
+_AFTER_STALL_SECONDS = 1.0
+# The renewer's umask, made to hold while STALL exists: its renewal write is then
+# under way (STALLED says so) for as long as the test needs to stop it there.
+_STALLED_WRITE = """\
+umask() {
+  if [ -e "${STALL}" ]; then
+    : > "${STALLED}"
+    command sleep "${WRITE_STALL_SECONDS}"
+  fi
+  builtin umask "$@"
+}
+"""
 
 
 def _extract(pattern, what):
@@ -157,6 +172,33 @@ class GitopsWriteTokenTest(_Harness):
         body = self._bodies()[0]
         self.assertEqual(body["repositories"], ["kube-agents-evals-2-infra"])
         self.assertEqual(body["permissions"], {"pull_requests": "write", "contents": "write", "issues": "write"})
+
+    def test_a_stop_during_a_renewal_write_leaves_no_token_behind(self):
+        # The stop used to kill the renewer outright: its write went on without
+        # it and put a live token back after the stop's rm.
+        proc = self._run(
+            _STALLED_WRITE
+            + textwrap.dedent(
+                """\
+                start_gitops_write_token "case rep 1" "${TOKEN_FILE}" >/dev/null
+                : > "${STALL}"
+                for _ in $(seq 1 50); do [ -e "${STALLED}" ] && break; command sleep 0.2; done
+                [ -e "${STALLED}" ] && echo "WRITE=stalled" || echo "WRITE=never"
+                stop_gitops_write_token "${TOKEN_FILE}"
+                command sleep "${AFTER_STALL_SECONDS}"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+                [ -e "${TOKEN_FILE}.next" ] && echo "NEXT=left" || echo "NEXT=removed"
+                """
+            ),
+            STALL=str(self.tmp / "stall"),
+            STALLED=str(self.tmp / "stalled"),
+            WRITE_STALL_SECONDS=str(_WRITE_STALL_SECONDS),
+            AFTER_STALL_SECONDS=str(_AFTER_STALL_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("WRITE=stalled", proc.stdout)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertIn("NEXT=removed", proc.stdout)
 
     def test_a_refused_mint_writes_nothing_and_says_so(self):
         proc = self._run(
