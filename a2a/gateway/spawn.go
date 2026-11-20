@@ -1278,9 +1278,11 @@ func isTaskNotFound(err error) bool {
 func (g *Gateway) sweepOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, sweepPassTimeout)
 	defer cancel()
-	// The untracked pass runs whatever the orphan list does: it lists for
-	// itself, and an API blip there must not hold up the other.
+	// The untracked pass and the warm claim drop run whatever the orphan
+	// list does: each lists for itself, and an API blip there must not hold
+	// up the others.
 	defer g.sweepUntracked(ctx)
+	defer g.sweepWarmClaims(ctx)
 	orphans, err := g.spawner.TerminalOrphans(ctx)
 	if err == nil {
 		orphans, err = g.claimedOrphans(ctx, orphans)

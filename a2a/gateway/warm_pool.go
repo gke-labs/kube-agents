@@ -321,6 +321,45 @@ func (g *Gateway) claimedOrphans(ctx context.Context, orphans []orphanPod) ([]or
 	return orphans, nil
 }
 
+// dropGoneWarmClaims removes each claim whose pod the warm pod list lacks.
+// claims must be read before warm: a claim is made only on a listed pod, so
+// a claim that read sees whose pod the later list lacks is a pod gone.
+func (g *Gateway) dropGoneWarmClaims(ctx context.Context, claims map[string]string, warm []warmPod) {
+	present := make(map[string]bool, len(warm))
+	for _, p := range warm {
+		present[p.Name] = true
+	}
+	for pod := range claims {
+		if !present[pod] {
+			if err := g.reg.DropWarmClaim(ctx, pod); err != nil {
+				g.log.Warn("warm pool: stale claim not dropped", "pod", pod, "err", err)
+			}
+		}
+	}
+}
+
+// sweepWarmClaims drops the claims of warm pods that no longer exist, for
+// the sweep, which runs whether or not this gateway keeps a pool: a claimed
+// warm pod deleted by the reap, the cap eviction, the untracked sweep or a
+// retirement leaves its claim behind, and with the pool off (warmSessions
+// lowered to 0, or a cap below two) nothing else would ever remove it. With
+// no claims nothing is listed.
+func (g *Gateway) sweepWarmClaims(ctx context.Context) {
+	claims, err := g.reg.WarmClaims(ctx)
+	if err != nil || len(claims) == 0 {
+		if err != nil {
+			g.log.Warn("sweep: warm claim index read failed", "err", err)
+		}
+		return
+	}
+	warm, err := g.spawner.WarmPods(ctx)
+	if err != nil {
+		g.log.Warn("sweep: warm pod list failed; claims kept", "err", err)
+		return
+	}
+	g.dropGoneWarmClaims(ctx, claims, warm)
+}
+
 // warmPoolLoop is the leader's pool keeper.
 func (g *Gateway) warmPoolLoop(ctx context.Context) {
 	g.warmPoolOnce(ctx)
@@ -358,17 +397,7 @@ func (g *Gateway) warmPoolOnce(ctx context.Context) {
 		g.log.Error("warm pool: pod list failed", "err", err)
 		return
 	}
-	present := make(map[string]bool, len(warm))
-	for _, p := range warm {
-		present[p.Name] = true
-	}
-	for pod := range claims {
-		if !present[pod] {
-			if err := g.reg.DropWarmClaim(ctx, pod); err != nil {
-				g.log.Warn("warm pool: stale claim not dropped", "pod", pod, "err", err)
-			}
-		}
-	}
+	g.dropGoneWarmClaims(ctx, claims, warm)
 	pods, err := g.sessionPods(ctx)
 	if err != nil {
 		g.log.Error("warm pool: live count failed", "err", err)

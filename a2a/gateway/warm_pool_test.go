@@ -901,3 +901,30 @@ func TestAnAgedWarmPodWhoseSubjectsCantBeReadIsNotReplaced(t *testing.T) {
 		t.Fatalf("warm pods created %v beside a pod that may still be there", got)
 	}
 }
+
+// The sweep drops the claim of a warm pod that no longer exists whether or
+// not the gateway keeps a pool: a claimed pod the reap or the cap eviction
+// deleted leaves its claim behind, and with the pool off nothing else
+// removes it. A claim whose pod is still there is kept.
+func TestTheSweepDropsAGoneWarmPodsClaimWithThePoolOff(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	if r.g.warmPoolOn() {
+		t.Fatal("precondition: the reuse rig keeps a pool")
+	}
+	ctx := context.Background()
+	const gone, live = "chat-otter-wreaped", "chat-otter-wkept"
+	spawn.setWarm(readyWarm(live))
+	for pod, key := range map[string]string{gone: "discord:g1/t-reaped", live: "discord:g1/t-kept"} {
+		if err := r.g.reg.ClaimWarmPod(ctx, pod, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.g.sweepOnce(ctx)
+	claims := warmClaims(t, r)
+	if _, ok := claims[gone]; ok {
+		t.Error("the claim of a warm pod that no longer exists was kept")
+	}
+	if claims[live] != "discord:g1/t-kept" {
+		t.Error("the claim of a warm pod that is still there was dropped")
+	}
+}
