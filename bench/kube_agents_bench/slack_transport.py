@@ -245,9 +245,15 @@ def parse_home_post(prompt: str) -> tuple[str, str] | None:
     first = first.strip()
     if not first.startswith(HOME_POST_DIRECTIVE):
         return None
-    if not first.endswith("]"):
+    inner = first[len(HOME_POST_DIRECTIVE):]
+    close = inner.find("]")
+    if close < 0:
         raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] is not closed: {first!r}")
-    marker = first[len(HOME_POST_DIRECTIVE):-1].strip()
+    if inner[close + 1:].strip():
+        # The marker ends at the directive's own "]"; anything after it on the
+        # line is a case written wrong, never more marker.
+        raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] has text after it on its line: {first!r}")
+    marker = inner[:close].strip()
     reply = rest.strip()
     if not marker or not reply:
         raise ValueError(f"{HOME_POST_DIRECTIVE} <marker>] needs a marker and a reply after it")

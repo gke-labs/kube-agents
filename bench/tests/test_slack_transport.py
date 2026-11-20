@@ -380,7 +380,10 @@ class HomeSlack(FakeSlack):
 def test_a_home_post_prompt_is_parsed_and_any_other_is_not():
     assert slack.parse_home_post("how many clusters?") is None
     assert slack.parse_home_post(f"{slack.HOME_POST_DIRECTIVE} {MARKER}]\nhow many findings?\n") == (MARKER, "how many findings?")
-    for bad in (f"{slack.HOME_POST_DIRECTIVE} {MARKER}\nq", f"{slack.HOME_POST_DIRECTIVE} ]\nq", f"{slack.HOME_POST_DIRECTIVE} {MARKER}]\n  "):
+    for bad in (f"{slack.HOME_POST_DIRECTIVE} {MARKER}\nq", f"{slack.HOME_POST_DIRECTIVE} ]\nq", f"{slack.HOME_POST_DIRECTIVE} {MARKER}]\n  ",
+                # Text after the directive's own "]", even text ending in "]" (a folded YAML scalar).
+                f"{slack.HOME_POST_DIRECTIVE} {MARKER}] how many [findings]\nq",
+                f"{slack.HOME_POST_DIRECTIVE} {MARKER}] [x]\nq"):
         with pytest.raises(ValueError):
             slack.parse_home_post(bad)
 
