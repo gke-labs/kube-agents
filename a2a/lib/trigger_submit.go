@@ -2,7 +2,9 @@ package lib
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -77,25 +79,91 @@ type ScheduleDelivery struct {
 	// SilentWhenClean posts nothing for a run that found nothing.
 	SilentWhenClean bool `json:"silentWhenClean,omitempty"`
 	// JobKey groups a schedule's posts into one thread per UTC day; it is
-	// part of KV keys and subjects, so a DNS-1123 label.
+	// part of KV keys and subjects, so a DNS-1123 label. A thread delivery
+	// keeps it as the run's record key and opens no day thread.
 	JobKey string `json:"jobKey"`
+	// Platform, ChatID and ThreadID name, for mode thread alone, the
+	// existing thread the result posts into: a thread the gateway itself
+	// opened with a keyed home post (NotifyThreadsBucket). The gateway
+	// refuses the mode at ingress unless it trusts the submitting source
+	// for it, the chat is its home channel and the thread is on its record.
+	Platform string `json:"platform,omitempty"`
+	ChatID   string `json:"chatId,omitempty"`
+	ThreadID string `json:"threadId,omitempty"`
+	// IncidentSource, for mode thread alone, names the writer on the
+	// incident row the posted result is kept under: a2a- and up to 28 of
+	// a-z, 0-9 and - (ValidIncidentSource). Empty is
+	// ScheduleDeliveryThreadSource.
+	IncidentSource string `json:"incidentSource,omitempty"`
 }
 
-// The two delivery modes.
+// The three delivery modes.
 const (
-	ScheduleDeliveryChat  = "chat"
-	ScheduleDeliveryLocal = "local"
+	ScheduleDeliveryChat   = "chat"
+	ScheduleDeliveryLocal  = "local"
+	ScheduleDeliveryThread = "thread"
 )
 
+// ScheduleDeliveryThreadSource is a thread delivery's incident source when
+// the submission names none.
+const ScheduleDeliveryThreadSource = "a2a-trigger"
+
+// scheduleDeliveryTargetMaxLen bounds a thread delivery's platform, chat
+// and thread ids: a Google Chat thread name is the longest, well under it.
+const scheduleDeliveryTargetMaxLen = 256
+
+// incidentSourcePattern is the gateway's incident sources: session-kv's rule
+// (1-32 of a-z, 0-9 and -) inside an a2a- prefix, so a source a trigger names
+// can only ever be one of the gateway's own writers, and session-kv's
+// replace (same source only) never reaches a row another writer stored.
+var incidentSourcePattern = regexp.MustCompile(`^a2a-[a-z0-9-]{1,28}$`)
+
+// IncidentSourceSchedule is the scheduled reports' incident source, the
+// bridge's default (a2a/hermes-bridge/report_incident.go): reserved, so a
+// thread delivery's rows never replace a scheduled report's.
+const IncidentSourceSchedule = "a2a-schedule"
+
+// ValidIncidentSource reports whether s is an incident source a thread
+// delivery may write under: one of the gateway's, never the scheduled
+// reports'.
+func ValidIncidentSource(s string) bool {
+	return s != IncidentSourceSchedule && incidentSourcePattern.MatchString(s)
+}
+
+// IncidentSourceOf is d's incident source: its own, or the default.
+func (d ScheduleDelivery) IncidentSourceOf() string {
+	if d.IncidentSource != "" {
+		return d.IncidentSource
+	}
+	return ScheduleDeliveryThreadSource
+}
+
 // ValidateScheduleDelivery is the check the gateway makes at ingress and a
-// reader of the recorded copy may repeat: a mode that is exactly chat or
-// local, never empty, and a job key that is a DNS-1123 label.
+// reader of the recorded copy may repeat: a mode that is exactly chat,
+// local or thread, never empty, and a job key that is a DNS-1123 label. A
+// thread delivery names its platform, chat and thread, and the others name
+// none of them. Whether the gateway takes a thread delivery from a given
+// source, chat and thread is its own check, beyond this one.
 func ValidateScheduleDelivery(d ScheduleDelivery) error {
-	if d.Mode != ScheduleDeliveryChat && d.Mode != ScheduleDeliveryLocal {
-		return fmt.Errorf("delivery mode %q is not %q or %q", d.Mode, ScheduleDeliveryChat, ScheduleDeliveryLocal)
+	if d.Mode != ScheduleDeliveryChat && d.Mode != ScheduleDeliveryLocal && d.Mode != ScheduleDeliveryThread {
+		return fmt.Errorf("delivery mode %q is not %q, %q or %q", d.Mode, ScheduleDeliveryChat, ScheduleDeliveryLocal, ScheduleDeliveryThread)
 	}
 	if !validDNS1123Label(d.JobKey) {
 		return fmt.Errorf("delivery job key %q is not a DNS-1123 label", d.JobKey)
+	}
+	if d.Mode != ScheduleDeliveryThread {
+		if d.Platform != "" || d.ChatID != "" || d.ThreadID != "" || d.IncidentSource != "" {
+			return fmt.Errorf("delivery mode %q names a thread; only mode %q does", d.Mode, ScheduleDeliveryThread)
+		}
+		return nil
+	}
+	for _, f := range []struct{ name, v string }{{"platform", d.Platform}, {"chat", d.ChatID}, {"thread", d.ThreadID}} {
+		if f.v == "" || len(f.v) > scheduleDeliveryTargetMaxLen || strings.TrimSpace(f.v) != f.v || strings.ContainsFunc(f.v, unicode.IsControl) {
+			return fmt.Errorf("thread delivery %s %q is empty, longer than %d bytes, or not a plain id", f.name, f.v, scheduleDeliveryTargetMaxLen)
+		}
+	}
+	if d.IncidentSource != "" && !ValidIncidentSource(d.IncidentSource) {
+		return fmt.Errorf("thread delivery incident source %q is not a2a- and up to 28 of a-z, 0-9 and -", d.IncidentSource)
 	}
 	return nil
 }

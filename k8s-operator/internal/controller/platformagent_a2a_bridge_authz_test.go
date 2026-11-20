@@ -300,6 +300,24 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	}); err != nil {
 		t.Fatalf("provision bucket PROFILE_LEASES as seed: %v", err)
 	}
+	// `nats kv add SCHEDULED_REPORTS --max-value-size=262144 --ttl=2160h`: a schedule's runs.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "SCHEDULED_REPORTS", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 268435456, MaxValueSize: 262144, TTL: 2160 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket SCHEDULED_REPORTS as seed: %v", err)
+	}
+	// `nats kv add SCHEDULE_THREADS --max-value-size=4096 --ttl=48h`: a schedule's thread for the day.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "SCHEDULE_THREADS", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 8388608, MaxValueSize: 4096, TTL: 48 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket SCHEDULE_THREADS as seed: %v", err)
+	}
+	// `nats kv add NOTIFY_THREADS --max-value-size=1024 --ttl=168h`: the threads the gateway's keyed notify posts opened.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "NOTIFY_THREADS", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 8388608, MaxValueSize: 1024, TTL: 168 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket NOTIFY_THREADS as seed: %v", err)
+	}
 }
 
 // TestBridgeJetStreamGrantOnARealServer is the refusal proof for the bridge's

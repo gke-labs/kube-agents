@@ -320,7 +320,7 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Six KV buckets ride the same JetStream deployment:
+Nine KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
@@ -355,7 +355,7 @@ Six KV buckets ride the same JetStream deployment:
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
   `a2a/authcallout` against the config the operator renders.
 - `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
-  exchange it rated: user content that can hold cluster data. One of the two buckets with a
+  exchange it rated: user content that can hold cluster data. One of the buckets with a
   max age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
   past it a new rating is refused until older ones expire. The gateway's user is
   the only reader and writer of its records by grant, with the registry's four verbs on
@@ -364,8 +364,8 @@ Six KV buckets ride the same JetStream deployment:
   and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
   same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway
   design owns what a record holds ("Answer feedback").
-- `people` - one hashed key and a last-put time per chat person the gateway has seen. The
-  other bucket with a max age (`--ttl=720h`), which is its retention: NATS deletes a person
+- `people` - one hashed key and a last-put time per chat person the gateway has seen. Another
+  bucket with a max age (`--ttl=720h`), which is its retention: NATS deletes a person
   30 days after their last turn. Capped at 32MiB, about a hundred thousand entries: past it
   a put is refused and the count under-counts. The gateway's user is the only reader and
   writer of its records by grant, with the registry's four verbs on `KV_people`; provision
@@ -383,6 +383,30 @@ Six KV buckets ride the same JetStream deployment:
   dispatcher can still read every lease it has to re-adopt or fail. Provision and seed
   hold CREATE and INFO on it for the info-then-add guard. The dispatcher design owns
   what a record holds (`lib.LeaseRecord`).
+- `SCHEDULED_REPORTS` - one record per finished run of a schedule trigger, keyed
+  `<jobKey>.<taskID>`: the report, its delivery status, and where it was posted. The gateway
+  writes it before any post and is its only writer by grant, with STREAM.INFO and DIRECT.GET
+  on `KV_SCHEDULED_REPORTS` and no consumer verb. A 90-day max age (`--ttl=2160h`), a
+  256KiB value cap (the gateway cuts a report at 24KiB) and a 256MiB bucket cap: it is the
+  durable record later readers enumerate, and without the age a full bucket would refuse
+  every later run's record. Provision and seed hold CREATE and INFO on it for the
+  info-then-add guard. The [scheduling design](scheduling-on-profiles.md) owns what a
+  record holds (section 4).
+- `SCHEDULE_THREADS` - the home-channel thread each schedule posts into for one UTC day,
+  keyed `<jobKey>.<YYYY-MM-DD>`, so a gateway failover keeps posting into the day's
+  thread. The first post of a day claims the key with a create before it posts, so two
+  replicas overlapping on it open one thread. The gateway is its only reader and writer
+  by grant, with STREAM.INFO and DIRECT.GET on `KV_SCHEDULE_THREADS` and no consumer verb.
+  A 48-hour max age (`--ttl=48h`), a 4KiB value cap and an 8MiB bucket cap. Provision and
+  seed hold CREATE and INFO on it for the info-then-add guard. The
+  [scheduling design](scheduling-on-profiles.md) owns what an entry holds (section 4).
+- `NOTIFY_THREADS` - the home-channel threads the gateway opened with a keyed `chat.notify`
+  post (an alert's), keyed `<platform>.<hash of chat and thread>`. A thread delivery may
+  name only a thread on it. The gateway is its only reader and writer by grant, with
+  STREAM.INFO and DIRECT.GET on `KV_NOTIFY_THREADS` and no consumer verb. A 7-day max age
+  (`--ttl=168h`), a 1KiB value cap and an 8MiB bucket cap. Provision and seed hold CREATE
+  and INFO on it for the info-then-add guard. The
+  [scheduling design](scheduling-on-profiles.md) owns what an entry holds (section 4).
 
 ## Accounts and connection-time authorization
 
@@ -870,6 +894,15 @@ Layout:
   card's buttons"), which the bridge relays to session-kv's `POST /v1/board/actions`: the same
   subjects and grants, and only the gateway may publish the request, so no other principal can
   ask the bridge to act; session-kv acts only on cards still `blocked`.
+
+- **The incident route.** A scheduled report the gateway posted, kept in the agent pod's incident
+  store against the thread it landed in (scheduling-on-profiles.md, section 4). The board
+  route's shape: the gateway user gains publish on `chat.incident` and subscribe on
+  `chat.incident.reply.gateway.>`, the bridge user the matching grants, and no other principal
+  holds either, so the gateway gains no session-kv credential. The bridge stores a report only
+  in a thread of a channel this install's chat backend serves (its home channel); it cannot
+  tell whether the gateway posted in that thread, so within the home channel the gateway's word
+  is taken. Core NATS.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for

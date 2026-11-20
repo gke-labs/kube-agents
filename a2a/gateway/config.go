@@ -273,6 +273,12 @@ type Config struct {
 	// GchatTokenPath is the projected ServiceAccount token (a2a-chat audience)
 	// the adapter authenticates to the relay with.
 	GchatTokenPath string
+	// TriggerThreadSources are the trigger sources whose submissions may
+	// name a thread delivery (lib.ScheduleDeliveryThread): the result posts
+	// into an existing thread the gateway opened (notify_threads.go).
+	// A2A_TRIGGER_THREAD_SOURCES, comma-separated; empty, the default,
+	// refuses the mode from every source.
+	TriggerThreadSources []string
 	// GchatAllowedUsers is the ingress allowlist for the gchat backend —
 	// the same gate the legacy path enforces as GOOGLE_CHAT_ALLOWED_USERS.
 	// gchat has no mapping table (the Google-asserted email IS the
@@ -937,6 +943,11 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	for _, src := range strings.Split(os.Getenv("A2A_TRIGGER_THREAD_SOURCES"), ",") {
+		if src = strings.TrimSpace(src); src != "" {
+			cfg.TriggerThreadSources = append(cfg.TriggerThreadSources, src)
+		}
+	}
 	for _, kind := range strings.Split(os.Getenv(envTriggerEventKinds), ",") {
 		if kind = strings.TrimSpace(kind); kind != "" {
 			cfg.TriggerEventKinds = append(cfg.TriggerEventKinds, kind)

@@ -3394,6 +3394,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.cap.reply." + a2aBridgeAddressee + ".>",
 		// The Home tab's board request, which the bridge answers.
 		"chat.board",
+		// The gateway's incident write, which the bridge answers.
+		"chat.incident",
 		"_INBOX." + a2aBridgeUser + ".>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("bridge subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -3410,7 +3412,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// let this principal name itself anything; one subject is what makes
 	// the subject-as-identity check sound. No read on the cap bucket
 	// appears anywhere in this list, and that is the point of asking.
-	want = append(want, "a2a.cap.verify."+a2aBridgeAddressee, "chat.board.reply.gateway.>")
+	want = append(want, "a2a.cap.verify."+a2aBridgeAddressee, "chat.board.reply.gateway.>", "chat.incident.reply.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bridge publish allow-list changed.\n got: %q\nwant: %q", got, want)
 	}
@@ -3710,6 +3712,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// Attested trigger ingress (#5617): every source's submissions and
 		// status queries, read only.
 		"a2a.trigger.*.submit", "a2a.trigger.*.status",
+		"chat.incident.reply.gateway.>",
 		"_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -3725,6 +3728,12 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$KV.session-state.>",
 		"$KV.feedback.>",
 		"$KV.people.>",
+		// A schedule's runs, written before any post.
+		"$KV.SCHEDULED_REPORTS.>",
+		// A schedule's thread for the day.
+		"$KV.SCHEDULE_THREADS.>",
+		// The threads its keyed notify posts opened.
+		"$KV.NOTIFY_THREADS.>",
 		"chat.console.*.out",
 		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
@@ -3736,6 +3745,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// The answers to trigger submissions and status queries, in the
 		// trigger reply namespace and never a source's _INBOX (#5617).
 		"a2a.trigger.reply.>",
+		// A posted scheduled report to keep, answered by the bridge.
+		"chat.incident",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
 	// The profile cards' start-up read: the directory's subject list and a
@@ -3879,6 +3890,15 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
+		// A schedule's runs: bind and read back, no consumer.
+		"$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduledReportsBucket:       true,
+		"$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduledReportsBucket + ".>": true,
+		// A schedule's thread for the day: the same.
+		"$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduleThreadsBucket:       true,
+		"$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduleThreadsBucket + ".>": true,
+		// The threads its keyed notify posts opened: the same.
+		"$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aNotifyThreadsBucket:       true,
+		"$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aNotifyThreadsBucket + ".>": true,
 		// The bind on its own pre-created relay (#4173), by exact name.
 		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay": true,
 	}
@@ -3950,6 +3970,15 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"peopleDesk.follow WatchAll", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
 		{"peopleDesk.follow watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
 		{"purgePeople ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		// gateway scheduled delivery, over the SCHEDULED_REPORTS bucket.
+		{"deliverScheduledReport js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduledReportsBucket},
+		{"getScheduledReport kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduledReportsBucket + ".$KV." + a2aScheduledReportsBucket + ".compliance-audit.task-0123456789abcdef"},
+		// gateway schedule threads, over the SCHEDULE_THREADS bucket.
+		{"threadStore js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aScheduleThreadsBucket},
+		{"getScheduleThread kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aScheduleThreadsBucket + ".$KV." + a2aScheduleThreadsBucket + ".compliance-audit.2026-11-16"},
+		// gateway notify threads, over the NOTIFY_THREADS bucket.
+		{"notifyThreadStore js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aNotifyThreadsBucket},
+		{"notifyThreadKnown kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aNotifyThreadsBucket + ".$KV." + a2aNotifyThreadsBucket + ".slack.0123456789abcdef0123456789abcdef01234567"},
 		// The ack the relay's explicit-ack durable publishes, granted
 		// beside the API list rather than in it.
 		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
@@ -3990,7 +4019,7 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
-	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket} {
+	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket, a2aScheduledReportsBucket, a2aScheduleThreadsBucket, a2aNotifyThreadsBucket} {
 		dataPlane := "$KV." + bucket + ".>"
 		if !slices.Contains(grants, dataPlane) {
 			t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
@@ -4483,6 +4512,13 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// The people count: the same four verbs (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aPeopleBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// A schedule's runs: bind, read back, write; no consumer
+				// (a2aGatewayJetStreamGrants).
+				a2aKVStreamPrefix + a2aScheduledReportsBucket: {"KV", "STREAM.INFO", "DIRECT.GET"},
+				// A schedule's thread for the day: the same three.
+				a2aKVStreamPrefix + a2aScheduleThreadsBucket: {"KV", "STREAM.INFO", "DIRECT.GET"},
+				// The threads its keyed notify posts opened: the same three.
+				a2aKVStreamPrefix + a2aNotifyThreadsBucket: {"KV", "STREAM.INFO", "DIRECT.GET"},
 				// Minting, and only minting. The grant is
 				// `$KV.cap.root.*` -- the root namespace, one token
 				// deep, so one request id and no reach into the hop
@@ -4824,9 +4860,15 @@ const (
 	boardReply   = "chat.board.reply.gateway.>"
 )
 
+// The incident route's two subjects, spelled independently for the same reason.
+const (
+	incidentRequest = "chat.incident"
+	incidentReply   = "chat.incident.reply.gateway.>"
+)
+
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
+var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply, incidentRequest, incidentReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -4865,6 +4907,8 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{notifyRequestSlack, true},
 		{notifyRequestConsole, true},
 		{notifyReply, true},
+		{incidentRequest, true},
+		{incidentReply, true},
 		{"a2a.task.>", true},
 		{"agents.hb.>", true},
 		{"$JS.API.STREAM.INFO.a2a", true},
@@ -4887,6 +4931,9 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{"chat.notify.>", false},
 		{"chat.notify.reply.>", false},
 		{"chat.notify.reply.agent.x", false},
+		// The incident route, likewise: its two subjects and nothing around.
+		{"chat.incident.>", false},
+		{"chat.incident.reply.>", false},
 		{"chat.>", false},
 		{"chat", false},
 		// And the wildcards that cover every namespace at once.
@@ -6430,6 +6477,36 @@ func TestTheExecutorEnvIsNotSharedBetweenSidecars(t *testing.T) {
 	if sources["first"] == sources["second"] {
 		t.Error("both sidecars share one *EnvVarSource for POD_NAMESPACE; build the owed env inside " +
 			"the loop, or the first in-place edit to one container's env reaches the other")
+	}
+}
+
+// TestChatIncidentSubjectsHaveExactlyOneWriterAndOneReader is the incident
+// route's authorization, as the board route's: the gateway alone asks and
+// reads the answers, the bridge alone reads the asks and answers. A second
+// writer on the request subject could have the bridge attach a report to a
+// thread; a second reader would see every report the gateway posts.
+func TestChatIncidentSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
+	ids := a2aIdentities(a2aTestAgent())
+	rules := []struct{ verb, pattern, owner string }{
+		{"publish", incidentRequest, "gateway"},
+		{"subscribe", incidentReply, "gateway"},
+		{"subscribe", incidentRequest, a2aBridgeUser},
+		{"publish", incidentReply, a2aBridgeUser},
+	}
+	for _, r := range rules {
+		var holders []string
+		for _, id := range ids {
+			list := id.publish
+			if r.verb == "subscribe" {
+				list = id.subscribe
+			}
+			if slices.ContainsFunc(list, func(g string) bool { return subjectPatternsOverlap(g, r.pattern) }) {
+				holders = append(holders, id.user)
+			}
+		}
+		if !slices.Equal(holders, []string{r.owner}) {
+			t.Errorf("%s %s is held by %v; want %s alone", r.verb, r.pattern, holders, r.owner)
+		}
 	}
 }
 
