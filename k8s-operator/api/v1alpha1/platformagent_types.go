@@ -467,6 +467,7 @@ type SlackSpec struct {
 
 // TeamsSpec contains the configuration for the Microsoft Teams integration.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef) && has(self.appPasswordSecretRef))",message="appIdSecretRef and appPasswordSecretRef are required when Teams integration is enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.inbound) || !has(self.inbound.enabled) || self.inbound.enabled == false || (has(self.tenantId) && size(self.tenantId) > 0)",message="tenantId is required when integration.teams.inbound is enabled: the receiver serves one tenant"
 type TeamsSpec struct {
 	// Enabled toggles the Microsoft Teams integration.
 	// +kubebuilder:default=false
@@ -517,6 +518,29 @@ type TeamsSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	AdaptiveCards *bool `json:"adaptiveCards,omitempty"`
+
+	// Inbound is the receiver for the messages Microsoft delivers to the
+	// bot. Without it the bot can post to Teams, but a message typed in
+	// Teams does not reach the agent: Bot Framework delivers each message
+	// by an HTTPS request to the address registered for the bot, and no
+	// component of the install listens for it. With it the operator runs a
+	// small pod that verifies Microsoft's signed token on each request,
+	// pins the tenant, and hands the message to the credential broker's
+	// Teams queue; the admin exposes its Service with their own Ingress and
+	// TLS certificate and registers that address with the bot. It needs
+	// tenantId. The receiver holds no credential of the install's own.
+	// +optional
+	Inbound *TeamsInboundSpec `json:"inbound,omitempty"`
+}
+
+// TeamsInboundSpec configures the Teams inbound receiver.
+type TeamsInboundSpec struct {
+	// Enabled runs the receiver. Off by default: the install then accepts
+	// no connection from the internet, as it did before the receiver
+	// existed.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // +kubebuilder:object:root=true

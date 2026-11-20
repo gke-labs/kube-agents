@@ -2117,6 +2117,17 @@ platformAgent:
       homeChannel: ""
       # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
       adaptiveCards: true
+      # The receiver for the messages Microsoft delivers to the bot. Off, the
+      # bot can post to Teams but a message typed in Teams does not reach the
+      # agent: Bot Framework delivers by an HTTPS request to the address
+      # registered for the bot, and nothing in the install listens for it. On,
+      # the operator runs a small pod that verifies Microsoft's signed token on
+      # each request, pins tenantId (required), and hands the message to the
+      # broker's Teams queue; expose its Service (<agent>-teams-inbound, port
+      # 8100, path /api/v1/teams/events) with your own Ingress and TLS
+      # certificate and register that address as the bot's messaging endpoint.
+      inbound:
+        enabled: false
 
 # AgentPlugins deployed into the cluster.
 plugins:

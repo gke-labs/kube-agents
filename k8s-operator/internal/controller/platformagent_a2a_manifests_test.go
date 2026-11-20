@@ -6891,6 +6891,11 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with the dispatcher off = %d, want %d", got, base-1)
 		}
 	})
+	t.Run("the Teams inbound receiver", func(t *testing.T) {
+		if got := a2aStandingPods(teamsInboundTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the Teams inbound receiver = %d, want %d", got, base+1)
+		}
+	})
 }
 
 // One parse decides both the count and the discard (#4893): a value is used

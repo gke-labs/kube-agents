@@ -266,6 +266,11 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if a2aCuratorEnabled() {
 		callers = append(callers, a2aCuratorBrokerCaller(agent))
 	}
+	// The Teams inbound receiver, while it runs: held to the teams-inbound
+	// audience by CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS, rendered beside it.
+	if teamsInboundEnabled(agent) {
+		callers = append(callers, teamsInboundBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
 }
 
