@@ -641,7 +641,7 @@
       "cluster_slot": "d",
       "namespace": "seeded-topology",
       "probes": ["statefulset/zone-bound-store"],
-      "fixture": "zone-bound-store StatefulSet with a standard-rwo PersistentVolumeClaim, so the pod is bound to whichever zone its disk landed in and cannot move",
+      "fixture": "zone-bound-store StatefulSet, two replicas whose PersistentVolumeClaims use seeded-zonal-pd, a class whose allowedTopologies names only the first zone, so both claims bind there and neither pod can change zone without leaving its data",
       "state": [
         {
           "subject": "persistentvolumeclaim?app=zone-bound-store",
@@ -666,7 +666,7 @@
         "deployment/capacity-starved-worker",
         "deployment/first-zone-sponge"
       ],
-      "fixture": "capacity-starved-worker Deployment, four replicas at 120m CPU each against two e2-small nodes, so some pods run and the rest stay Pending with an insufficient-cpu event",
+      "fixture": "capacity-starved-worker Deployment, four replicas at 500m CPU each against the first zone's e2-small, which first-zone-sponge keeps below one replica's worth of free CPU, and the second zone's e2-standard-2, so every replica that runs is in the second zone and the rest stay Pending with an insufficient-cpu event",
       "state": [
         {
           "subject": "pod?app=capacity-starved-worker",
@@ -687,7 +687,7 @@
           "path": "spec.replicas",
           "op": "ge",
           "value": 6,
-          "why": "the asymmetry is planted, not found: this sponge keeps the first zone's node below one worker's worth of free CPU whatever the system set does, so every worker that runs is in the second zone and the surplus is Pending for want of CPU. Scale it down or remove it and a node rebuild that leaves the two nodes evenly loaded spreads one worker per zone, both assertions above pass, and the scan calls a balanced cluster skewed"
+          "why": "the asymmetry is planted, not found: this sponge keeps the first zone's node below one worker's worth of free CPU whatever the system set does, so every worker that runs is in the second zone and the surplus is Pending for want of CPU. Scale it down or remove it and a node rebuild that leaves 500m free on the first zone's e2-small puts a worker there, both assertions above pass, and the scan calls a balanced cluster skewed"
         }
       ]
     },
