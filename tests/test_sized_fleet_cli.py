@@ -263,6 +263,19 @@ class UsageWindowTest(unittest.TestCase):
         self.assertIn("error", usage["soak"])
         self.assertIn("soak window (not read)", cli.attribution.markdown(usage))
 
+    def test_an_unread_memory_base_is_a_note_on_every_window(self):
+        windows = {"burst": {"start": "2026-11-11T19:00:00+00:00", "seconds": 3600, "tokens": {}},
+                   "soak": {"start": "2026-11-11T20:00:00+00:00", "seconds": 3600, "tokens": {}}}
+        with mock.patch.object(cli.attribution, "container_memory", side_effect=RuntimeError("monitoring down")), \
+                mock.patch.object(cli.model_counters, "vertex_tokens", return_value={}), \
+                mock.patch.object(cli.model_counters, "requests_by_account", return_value={}):
+            usage = cli.capability_usage("ctx", "ns", windows, project="p", stores={"sessions": []},
+                                         install=mock.Mock())
+        self.assertEqual(list(usage), ["burst", "soak"])
+        for window in usage.values():
+            self.assertIn("overview", window)
+            self.assertTrue(any(e.startswith("memory base") for e in window["errors"]))
+
 
 class InstallTimeoutTest(unittest.TestCase):
     def test_a_helm_wait_that_runs_out_fails_once_and_is_not_retried(self):

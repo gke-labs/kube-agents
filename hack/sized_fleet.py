@@ -563,9 +563,12 @@ def capability_usage(host_context: str, namespace: str, windows: dict[str, dict]
         stores = attribution.read_stores(host_context, namespace, since=min(starts, default=0.0))
     usage = {}
     # The platform base is each container's idle memory at the run's first window, held for the run.
-    base = None
+    # An unread base is a note on every window; each container then starts from its first sample.
+    base, base_errors = None, []
     if install is not None and starts:
-        first = attribution.container_memory(install, min(starts), min(starts) + MEMORY_BASE_SECONDS)
+        first = sized_records.safe(
+            lambda: attribution.container_memory(install, min(starts), min(starts) + MEMORY_BASE_SECONDS),
+            base_errors, "memory base")
         base = {c: points[0][1] for c, points in first.items() if points}
     for name, window in windows.items():
         try:
@@ -579,6 +582,7 @@ def capability_usage(host_context: str, namespace: str, windows: dict[str, dict]
         except (KeyError, ValueError, OSError, kube.CommandError) as exc:
             # A window whose measurements were not read costs only its own record.
             usage[name] = {"error": f"window not attributed: {exc!r}"}
+        usage[name].setdefault("errors", []).extend(base_errors)
     return usage
 
 

@@ -10,7 +10,6 @@ a named line rather than a gap.
 from __future__ import annotations
 
 import json
-import subprocess
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -74,8 +73,7 @@ def vertex_tokens(project: str, start: float, end: float) -> dict[str, dict[str,
 
 def service_accounts(project: str) -> dict[str, str]:
     """The project's service accounts, unique id to email: the request metric names callers by id."""
-    out = subprocess.run([kube.GCLOUD, "iam", "service-accounts", "list", f"--project={project}",
-                          "--format=json(uniqueId,email)"], capture_output=True, text=True, check=True).stdout
+    out = kube.gcloud("iam", "service-accounts", "list", "--format=json(uniqueId,email)", project=project)
     return {a["uniqueId"]: a["email"] for a in json.loads(out or "[]")}
 
 
@@ -95,6 +93,7 @@ def against_sessions(vertex: dict[str, dict[str, int]], recorded: dict[str, Any]
     """The install's own records (input with cached, and output) against Vertex AI's count for its model."""
     ours = {"input": int(recorded["input"]), "output": int(recorded["output"])}
     theirs = vertex.get(model, {"input": 0, "output": 0})
-    ratio = {k: round(ours[k] / theirs[k], 4) if theirs.get(k) else None for k in ours}
+    # No tokens on either side is a sound period, as in attribution.sum_against_litellm.
+    ratio = {k: round(ours[k] / theirs[k], 4) if theirs.get(k) else (1.0 if not ours[k] else None) for k in ours}
     others = {m: v for m, v in vertex.items() if m != model}
     return {"model": model, "sessions": ours, "vertex": theirs, "ratio": ratio, "other_models": others}

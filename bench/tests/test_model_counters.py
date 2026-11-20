@@ -14,6 +14,18 @@ class AgainstSessionsTest(unittest.TestCase):
         self.assertEqual(check["ratio"], {"input": 1.0, "output": 1.0})
         self.assertEqual(list(check["other_models"]), ["gemini-3.1-pro-preview"])
 
+    def test_no_tokens_on_either_side_is_sound_and_tokens_on_one_side_are_not(self):
+        self.assertEqual(mc.against_sessions({}, {"input": 0, "output": 0}, "m")["ratio"], {"input": 1.0, "output": 1.0})
+        self.assertEqual(mc.against_sessions({}, {"input": 5, "output": 0}, "m")["ratio"], {"input": None, "output": 1.0})
+
+
+class ServiceAccountsTest(unittest.TestCase):
+    def test_the_accounts_are_listed_through_kube_gcloud(self):
+        listed = '[{"uniqueId": "111", "email": "gw@p.iam.gserviceaccount.com"}]'
+        with mock.patch.object(mc.kube, "gcloud", return_value=listed) as gcloud:
+            self.assertEqual(mc.service_accounts("p"), {"111": "gw@p.iam.gserviceaccount.com"})
+        self.assertEqual(gcloud.call_args.kwargs["project"], "p")
+
 
 class RequestsTest(unittest.TestCase):
     def test_callers_are_named_by_the_project_accounts(self):
