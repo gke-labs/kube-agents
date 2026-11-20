@@ -18,6 +18,10 @@ from credential_proxy_client import authorization_headers
 from slack_relay_patch import is_silent_text
 
 LOGGER = logging.getLogger("teams-relay-patch")
+# The relay is the credential broker, an in-cluster Service: a proxy from the
+# environment must not get this request and its bearer token, and urllib does
+# not leave out a cluster host by itself.
+_RELAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULT_RELAY_READY_TIMEOUT = 120.0
 # The activity budget is modelled on Hermes' bundled Teams adapter's 28,000-
 # character limit; Microsoft's own figure is about 100 KB of UTF-16 with 80 KB
@@ -669,7 +673,7 @@ def _build_teams_adapter_and_sender(
             method="GET" if body is None else "POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with _RELAY_OPENER.open(req, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             raise relayed_teams_error(exc) from exc
