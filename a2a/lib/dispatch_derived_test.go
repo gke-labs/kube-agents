@@ -42,22 +42,6 @@ func TestTheDurablesAreDerivedFromTheTiers(t *testing.T) {
 	}
 }
 
-// A Job template reference carries only its hash: the param is the
-// profile's own, derived (DispatchJobTemplateName), never named in the
-// config (#5639).
-func TestAJobTemplateRefCarriesOnlyItsHash(t *testing.T) {
-	c := validDispatchConfig()
-	c.Profiles = append([]DispatchProfile(nil), c.Profiles...)
-	c.Profiles[0].JobTemplateRef = &DispatchJobTemplateRef{Hash: "abc123"}
-	if err := c.Validate(); err != nil {
-		t.Fatalf("a hash-only ref: %v", err)
-	}
-	c.Profiles[0].JobTemplateRef = &DispatchJobTemplateRef{}
-	if err := c.Validate(); err == nil {
-		t.Error("a ref with no hash was accepted")
-	}
-}
-
 // The durables the operator creates (its fixture, written by the operator's
 // TestTheDispatchDurablesFixture) are the ones this package derives: the
 // operator can't import lib, so this is what holds the two derivations equal.

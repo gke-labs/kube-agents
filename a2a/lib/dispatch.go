@@ -743,8 +743,6 @@ func PodTemplateWithContainers(raw json.RawMessage) bool {
 
 // labelValue and labelName are Kubernetes' label value and name syntax.
 var (
-	// objectName is a DNS-1123 subdomain, an object's name.
-	objectName  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
 	labelValue  = regexp.MustCompile(`^(([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9])?$`)
 	labelName   = regexp.MustCompile(`^([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9]$`)
 	labelPrefix = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
