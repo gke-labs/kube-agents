@@ -20,7 +20,9 @@
 # alert into the home channel): the transport waits for the bot's newest
 # top-level post holding <marker>, replies under it with the rest of the
 # prompt, and grades that turn (bench/kube_agents_bench/slack_transport.py,
-# HOME_POST_DIRECTIVE). Such a case takes no "then:" reply. It reads the
+# HOME_POST_DIRECTIVE). Give each such case a marker no other case's post
+# holds: the search is bounded by the case's start, not by which case posted.
+# Such a case takes no "then:" reply. It reads the
 # channel's history with the test user's token, the same scope the thread
 # reads already use.
 

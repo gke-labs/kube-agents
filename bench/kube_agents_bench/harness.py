@@ -3029,7 +3029,7 @@ def _execute_slack(prompt: str) -> AgentResult:
             exchange = turn.run(prompt, timeout)
         else:
             marker, reply = home_post
-            since = case_start or turn.wall() - lookback
+            since = case_start - slack.CASE_START_MARGIN_SECONDS if case_start else turn.wall() - lookback
             post = turn.find_home_post(marker, since, wait, search_errors)
             if post is None:
                 # The agent never posted what the case set it up to post: the

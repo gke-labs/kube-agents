@@ -98,6 +98,11 @@ THEN_ENV = "BENCH_SLACK_THEN"
 # land after the setup returns, read every HOME_POST_POLL_SECONDS.
 HOME_POST_DIRECTIVE = "[reply-under-home-post:"
 CASE_START_ENV = "BENCH_SLACK_CASE_START"
+# Taken off the case's start before it bounds the search: the runner's clock
+# and Slack's timestamps differ, and a post a few seconds after the start must
+# not read as before it. An earlier run's post comes before its own setup, far
+# outside it.
+CASE_START_MARGIN_SECONDS = 60.0
 HOME_POST_LOOKBACK_ENV = "BENCH_SLACK_HOME_POST_LOOKBACK"
 HOME_POST_LOOKBACK_SECONDS = 3600.0
 HOME_POST_WAIT_ENV = "BENCH_SLACK_HOME_POST_WAIT"

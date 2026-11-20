@@ -470,11 +470,12 @@ def test_the_harness_replies_under_the_home_post(monkeypatch, tmp_path):
 
 def test_the_case_start_bounds_the_search_when_the_lane_sets_it(monkeypatch, tmp_path):
     _slack_env(monkeypatch, tmp_path)
-    monkeypatch.setenv(slack.CASE_START_ENV, "1799999990")
+    monkeypatch.setenv(slack.CASE_START_ENV, "1800000050")
     answer = {"ts": "1800000012.000100", "user": BOT, "text": "Two findings."}
     fake = HomeSlack([[HOME_POST]], [{"replies": [answer]}])
     monkeypatch.setattr(slack, "SlackClient", lambda token: fake)
     harness._execute_slack(f"{slack.HOME_POST_DIRECTIVE} {MARKER}]\nhow many findings?")
+    # Less the clock-skew margin.
     assert fake.history_calls[0]["oldest"] == "1799999990.000000"
 
 
