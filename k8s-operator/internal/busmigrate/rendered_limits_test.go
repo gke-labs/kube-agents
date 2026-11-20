@@ -446,9 +446,17 @@ func TestARestoreWaitsForItsConsumersAssignmentsBeforeTheRaise(t *testing.T) {
 	reads := 0
 	defer func(l func(context.Context, *nats.Conn, string) ([]string, error)) { listAssigned = l }(listAssigned)
 	real := listAssigned
+	raisedEarly := false
 	listAssigned = func(ctx context.Context, nc *nats.Conn, stream string) ([]string, error) {
 		reads++
 		if reads <= lagging {
+			// The order the product depends on (#6643): while the restored
+			// consumer isn't assigned yet, the stream is still at one
+			// replica. A raise sent before the assignment can bring the
+			// consumer up on the new replicas without its restored state.
+			if si, err := streamInfo(ctx, nc, stream); err == nil && si.Config.Replicas != 1 {
+				raisedEarly = true
+			}
 			return nil, nil // not assigned yet
 		}
 		return real(ctx, nc, stream)
@@ -463,6 +471,9 @@ func TestARestoreWaitsForItsConsumersAssignmentsBeforeTheRaise(t *testing.T) {
 	}
 	if reads <= lagging {
 		t.Errorf("the consumer list was read %d times, want the raise held past the %d lagging reads", reads, lagging)
+	}
+	if raisedEarly {
+		t.Error("the stream was raised before its restored consumer was assigned")
 	}
 	if !strings.Contains(logged.String(), "restore-window: TASKS R3 current and 1 durables up") {
 		t.Errorf("logged %q, want the worker waited for", logged.String())
