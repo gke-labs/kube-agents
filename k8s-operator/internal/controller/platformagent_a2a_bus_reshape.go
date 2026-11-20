@@ -196,6 +196,14 @@ func (r *PlatformAgentReconciler) maybeStartBusReshape(ctx context.Context, agen
 	if err := r.persistBusMigrationStart(ctx, agent, func() { startBusReshape(agent, running, nonce, metav1.Now()) }); err != nil {
 		return err
 	}
+	// Recorded only for a run the API server kept: on a served CRD that
+	// drops status.busMigration the write came back without it, the run is
+	// gone (persistBusMigrationStart put the old record back), and a record
+	// here would read the request as answered with nothing to show for it.
+	// The next pass refuses it instead, naming the CRD (#6600).
+	if run := agent.Status.BusMigration; run == nil || busMigrationLeg(run.Leg) != busMigrationReshape || !strings.HasSuffix(run.RunID, busReshapeRunSuffix(nonce)) {
+		return nil
+	}
 	return r.recordBusReshapeConsumed(ctx, agent, nonce)
 }
 

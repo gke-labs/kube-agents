@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
@@ -501,5 +502,38 @@ func TestTheReshapeRecordsAreForgottenWithTheCR(t *testing.T) {
 	}
 	if _, ok := r.heldBusMigrationWarned.Load(key); ok {
 		t.Error("the hold Warning record outlived the CR")
+	}
+}
+
+// On a served CRD that drops status.busMigration, the start's write comes
+// back without the run. Nothing is recorded on the StatefulSet, so the
+// request isn't read as answered; the next pass refuses it, naming the CRD
+// (#6600).
+func TestAReshapeStartAPruningCRDDroppedIsNotRecorded(t *testing.T) {
+	m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
+	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "first"}
+	pruning := interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if err := c.SubResource(sub).Patch(ctx, obj, patch, opts...); err != nil {
+				return err
+			}
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && sub == "status" {
+				pa.Status.BusMigration = nil // the served CRD pruned it
+			}
+			return nil
+		},
+	})
+	m.r.Client = pruning
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.stsReshapeRecord(); got != "" {
+		t.Errorf("StatefulSet record %q after a start the CRD dropped, want none", got)
+	}
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	if ev := m.reshapeEvents(); len(ev) != 1 || !strings.Contains(ev[0], "drops status.busMigration") {
+		t.Errorf("events %q, want one naming the CRD that drops status.busMigration", ev)
 	}
 }
