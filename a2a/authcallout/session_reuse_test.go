@@ -94,8 +94,15 @@ echo '{"type":"result","subtype":"success","result":"answered"}'
 		stop()
 		select {
 		case out := <-done:
-			if out.err != nil || out.res != (workeradapter.Result{}) {
-				t.Errorf("SIGTERM while idle: %+v err=%v, want a zero Result", out.res, out.err)
+			// The caller stops the pod once it has read the last turn's
+			// final off the bus, which the adapter publishes before it goes
+			// back to waiting. A SIGTERM in that gap ends the session loop
+			// with the finished turn's Result, not the idle zero one: the
+			// same clean exit, with the turn's terminal already published.
+			idle := out.res == workeradapter.Result{}
+			afterItsTurn := out.res == workeradapter.Result{State: lib.StateCompleted}
+			if out.err != nil || (!idle && !afterItsTurn) {
+				t.Errorf("SIGTERM after the last turn: %+v err=%v, want a zero Result or the completed turn's", out.res, out.err)
 			}
 		case <-time.After(30 * time.Second):
 			t.Fatal("the adapter did not exit on SIGTERM while idle")
@@ -204,11 +211,28 @@ func TestAReusedSessionPodTakesTurnsAcrossItsGrantExpiry(t *testing.T) {
 
 // waitFinal polls the task's events, as the gateway, until a final is among
 // them, and returns its state and status text.
+//
+// Every poll reads over one gateway connection. A connection per poll, each
+// kept until the test ends, is up to five more a second, and under the
+// reconnect test's seconds-long grant every one of them re-authenticates
+// every few seconds for the rest of the test, in the same callout queue as
+// the pod. On a loaded host a new connect then outlasts its own grant or the
+// callout's budget, and the test ends on the reader instead of on the pod
+// (gke-labs#6284). The one connection reconnects at its
+// grant's expiry too, and a read that lands there loses its reply, so a
+// failed read is read again rather than fatal: the reader is the observer
+// here, and the deadline below is what fails a pod that never answers.
 func waitFinal(t *testing.T, h *harness, addressee, taskID string) (lib.TaskState, string) {
 	t.Helper()
+	gateway := gatewayConn(t, h)
+	var readErr error
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, e := range readEvents(t, h, addressee, taskID) {
+		events, err := readEventsOn(t, gateway, addressee, taskID)
+		if err != nil {
+			readErr = err
+		}
+		for _, e := range events {
 			if e.Kind != lib.KindStatusUpdate {
 				continue
 			}
@@ -224,6 +248,6 @@ func waitFinal(t *testing.T, h *harness, addressee, taskID string) (lib.TaskStat
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("%s never reached a final under the session's grants", taskID)
+	t.Fatalf("%s never reached a final under the session's grants (last failed read of its events: %v)", taskID, readErr)
 	return "", ""
 }

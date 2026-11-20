@@ -765,9 +765,21 @@ func publishInboundAs(t *testing.T, h *harness, addressee, taskID, correlationID
 // what the session may only write.
 func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envelope {
 	t.Helper()
-	js, err := jetstream.New(gatewayConn(t, h))
+	out, err := readEventsOn(t, gatewayConn(t, h), addressee, taskID)
 	if err != nil {
-		t.Fatalf("jetstream: %v", err)
+		t.Fatal(err)
+	}
+	return out
+}
+
+// readEventsOn is readEvents over a gateway connection the caller holds. A
+// read that fails is returned rather than ending the test, for a caller that
+// reads again.
+func readEventsOn(t *testing.T, nc *nats.Conn, addressee, taskID string) ([]*lib.Envelope, error) {
+	t.Helper()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, fmt.Errorf("jetstream: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -780,11 +792,11 @@ func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envel
 		AckPolicy:     jetstream.AckNonePolicy,
 	})
 	if err != nil {
-		t.Fatalf("reader consumer: %v", err)
+		return nil, fmt.Errorf("reader consumer: %w", err)
 	}
 	batch, err := cons.FetchNoWait(256)
 	if err != nil {
-		t.Fatalf("fetch: %v", err)
+		return nil, fmt.Errorf("fetch: %w", err)
 	}
 	var out []*lib.Envelope
 	for msg := range batch.Messages() {
@@ -795,7 +807,7 @@ func readEvents(t *testing.T, h *harness, addressee, taskID string) []*lib.Envel
 		}
 		out = append(out, env)
 	}
-	return out
+	return out, nil
 }
 
 func consumerNames(t *testing.T, h *harness) []string {
