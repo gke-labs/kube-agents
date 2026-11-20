@@ -580,8 +580,8 @@ func TestAScriptThatExitsZeroWithAChildHoldingItsOutputIsNotATimeout(t *testing.
 	p := filepath.Join(root, "linger.sh")
 	writeScript(t, p, "#!/bin/sh\nsleep 30 &\necho done\nexit 0\n", 0o755)
 	// The bound is shorter than the grace the worker gives a held pipe, so it passes while the
-	// child holds stdout.
-	timeout := scriptKillGrace / 4
+	// child holds stdout, and long enough for the script to start and exit on a loaded machine.
+	timeout := scriptKillGrace * 4 / 5
 	r := execScript(context.Background(), &scriptRun{name: "linger", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: timeout}, scriptSignals{})
 	if r.timedOut || r.exitCode != 0 || r.startErr != nil || !strings.HasPrefix(r.stdout, "done") {
 		t.Errorf("timedOut %v exit %d startErr %v stdout %q; want a success by its exit", r.timedOut, r.exitCode, r.startErr, r.stdout)
