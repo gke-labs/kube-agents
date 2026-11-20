@@ -189,6 +189,10 @@ AWAY_FROM_KEY = "from"
 AWAY_BACK_KEY = "back"
 # `date.fromisoformat` alone also takes `20270105` and week dates, on some Pythons.
 AWAY_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# What the hand-off comment says beside a reviewer who was asked while away, so
+# the author who is told to wait knows what for. No date: the comment is as
+# public as the log, which names the same login and no more.
+AWAY_HANDOFF_NOTE = " (away; nobody here can approve what they are asked for)"
 
 # Config keys the action supports and this port does not. Silently ignoring one
 # would hand the reviewer selection a rule nobody applied, so they are refused.
@@ -954,14 +958,17 @@ def handed_off(comments):
     )
 
 
-def handoff_comment(users, teams, head_sha, check_run, why):
+def handoff_comment(users, teams, head_sha, check_run, why, away=()):
     """The one comment a request leaves behind, for the author and the reviewer.
 
     No line may start with a slash: Prow reads a command at the start of any
     line of any comment, and the author's agent reads the whole thing as the
-    rule it is to follow from here.
+    rule it is to follow from here. `away`, lower-cased logins, marks who was
+    asked while away: the comment tells the author to wait, and an author
+    waiting on someone who is not there should be told that much.
     """
-    names = [f"@{login}" for login in users] + [f"team {slug}" for slug in teams]
+    names = [f"@{login}{AWAY_HANDOFF_NOTE if login.lower() in away else ''}" for login in users]
+    names += [f"team {slug}" for slug in teams]
     title = ((check_run or {}).get("output") or {}).get("title")
     verdict = f'; the `{AI_REVIEW_CHECK_NAME}` check reads "{title}"' if title else ""
     return (
@@ -1350,7 +1357,7 @@ def main(argv=None):
         try:
             api.post(
                 f"/repos/{args.repo}/issues/{number}/comments",
-                {"body": handoff_comment(users, teams, at, deciding, why)},
+                {"body": handoff_comment(users, teams, at, deciding, why, away)},
             )
         except Exception as exc:  # noqa: BLE001 - any API error; the request stands
             log(f"{WORKFLOW_WARNING_PREFIX}requested a reviewer on #{number} but could not post the hand-off comment: {exc}")

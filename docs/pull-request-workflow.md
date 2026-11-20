@@ -1061,7 +1061,8 @@ gh secret delete REVIEWERS_AWAY --repo gke-labs/kube-agents
 ```
 
 GitHub does not show a secret back, so keep the list you set. The run log names logins
-and never a date.
+and never a date. The hand-off comment says so when the reviewer it names was asked while away, also
+with no date.
 
 ```bash
 # Whose move is it: draft, conflicts, verdict, and who is on the hook now.

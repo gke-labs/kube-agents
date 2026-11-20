@@ -1400,12 +1400,24 @@ class AwayMainTest(_MainHarness):
         self.assertEqual(self.requested(), ["bradhoekstra"])
         self.assertEqual(self.reaction(), [rr.REACTION_ACKNOWLEDGED])
 
-    def test_the_hand_off_comment_says_nothing_of_who_is_away(self):
+    def test_the_hand_off_comment_says_nothing_of_someone_away_who_was_not_asked(self):
         self.away("bradhoekstra")
         self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
         (body,) = [payload["body"] for path, payload in self.api.posts if path == self.HANDOFF]
         self.assertNotIn("away", body)
         self.assertNotIn("bradhoekstra", body)
+
+    def test_the_hand_off_comment_says_the_reviewer_asked_is_away_and_no_date(self):
+        # Both approvers the roster and the fixture tree share are away, so one
+        # of them is asked. The author is told to wait, and for whom.
+        self.away("bradhoekstra", "jayantid")
+        self.run_main(pull_request(), [], "--require-ai-review-pass", check_runs={"deadbeef": [check_run()]})
+        (asked,) = self.requested()
+        (body,) = [payload["body"] for path, payload in self.api.posts if path == self.HANDOFF]
+        self.assertIn(f"Handed to @{asked}{rr.AWAY_HANDOFF_NOTE} at", body)
+        self.assertNotIn(self.FAR_BACK, body)
+        for line in body.splitlines():
+            self.assertFalse(line.startswith("/"), line)
 
     def test_a_list_that_does_not_parse_requests_as_if_there_were_none(self):
         with mock.patch.dict(os.environ, {rr.AWAY_ENV: "{not json"}):
