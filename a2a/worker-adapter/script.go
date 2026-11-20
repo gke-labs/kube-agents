@@ -30,9 +30,10 @@ import (
 //   - its task credential verifies against the install's task-signing keys,
 //     names this task and this pod, and carries a trigger whose script is the
 //     confirm's (so neither the confirm nor the credential alone decides);
-//   - the path resolves, symlinks and all, to a regular file under the script
-//     root, owned by root and writable by no one else, in directories that
-//     are the same.
+//   - the path resolves to a regular file under the script root, owned by
+//     root and writable by no one else, in directories that are the same on
+//     both the named path and the resolved one; the file itself may be a
+//     symlink within the root, and no directory on the named path may be.
 //
 // The script gets a cleared environment: the worker's own PATH and HOME and
 // the broker hand-off (all rendered by the operator), plus the task's
@@ -151,6 +152,8 @@ func (c scriptFileCheck) ownedAndUnwritable(path string, dir bool) error {
 		return fmt.Errorf("reading %s: %w", path, err)
 	}
 	switch {
+	case dir && fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("%s is a symlink, and no directory on a script's path may be one", path)
 	case dir && !fi.IsDir():
 		return fmt.Errorf("%s is not a directory", path)
 	case !dir && !fi.Mode().IsRegular():

@@ -597,8 +597,14 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		// A credential, or the submission's own trigger, naming a script is
 		// a script task's, whatever the confirm says: one never runs as a
 		// model turn. Both are read unverified, which can only make the
-		// worker refuse more.
-		if from, script := scriptMarker(h); script != "" {
+		// worker refuse more, and an authority block that can't be read is
+		// refused too.
+		from, script, err := scriptMarker(h)
+		switch {
+		case err != nil:
+			plan.scriptRefusal = "the submission's authority block can't be read (" + err.Error() + "), so the task may be a script's, and a script task never runs as a model turn"
+			cfg.Logger.Warn("refusing a model turn for a task whose authority block can't be read", "task", cfg.TaskID, "err", err)
+		case script != "":
 			plan.scriptRefusal = fmt.Sprintf("the %s names script %q but the confirm carries none, and a script task never runs as a model turn", from, script)
 			cfg.Logger.Warn("refusing a model turn for a script task", "task", cfg.TaskID, "script", script, "namedBy", from)
 		}
@@ -772,18 +778,24 @@ func taskParameters(origin *lib.Envelope) (map[string]string, error) {
 // it: the task credential's trigger, else the submission's own (its
 // authority block's trigger, which admission checked). Neither is "" for a
 // model task.
-func scriptMarker(h *held) (from, script string) {
+func scriptMarker(h *held) (from, script string, err error) {
 	if h.proxyToken != "" {
 		if tr, err := taskcred.UnverifiedTrigger(h.proxyToken); err == nil && tr != nil && tr.Script != "" {
-			return "task credential", tr.Script
+			return "task credential", tr.Script, nil
 		}
 	}
 	if h.origin != nil {
-		if tr, err := capability.TriggerFromAuthority(h.origin.Authority); err == nil && tr != nil && tr.Script != "" {
-			return "submission's trigger", tr.Script
+		tr, err := capability.TriggerFromAuthority(h.origin.Authority)
+		if err != nil {
+			// Admission refuses such a block, so none should reach here;
+			// one that does may be a script task's, and is refused.
+			return "", "", err
+		}
+		if tr != nil && tr.Script != "" {
+			return "submission's trigger", tr.Script, nil
 		}
 	}
-	return "", ""
+	return "", "", nil
 }
 
 // prepareScript clears a script-run task's script to run, or says why it

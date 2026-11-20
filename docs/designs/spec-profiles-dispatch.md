@@ -415,8 +415,10 @@ leave open:
   - its task credential verifies against `A2A_TASK_SIGNING_PUBLIC_KEYS`, which the operator renders into
     each Job template from the key the callout and the proxy use;
   - the credential names this task and pod, and a trigger whose `script` is the confirm's;
-  - the path resolves, symlinks included, to a regular file under the script root, owned by root and
-    writable by no group or other, in directories that are the same, and the worker isn't its owner.
+  - the path resolves to a regular file under the script root, owned by root and writable by no group
+    or other, in directories that are the same on both the named path and the resolved one, and the
+    worker isn't its owner. The file itself may be a symlink within the root; no directory on the named
+    path may be.
 
   The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
   broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
@@ -426,8 +428,8 @@ leave open:
   completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
   A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose
   name can't be a `KA_PARAM_<NAME>` (upper case, at most 32 characters, where a task parameter may have
-  63), and a confirm with no `script` whose credential names one: a script task never runs as a model
-  turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
+  63), and a confirm with no `script` whose credential or submission's trigger names one, or whose
+  submission's authority block can't be read: a script task never runs as a model turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
   refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
   SIGTERM ends it as `worker-evicted`.
 

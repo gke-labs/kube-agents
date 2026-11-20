@@ -637,10 +637,17 @@ func TestASubmissionNamingAScriptNeverRunsAsAModelTurn(t *testing.T) {
 	_, check := scriptRoot(t)
 	ran := filepath.Join(t.TempDir(), "ran")
 	harness := stub(t, "touch "+ran+"\nexit 7\n")
-	for name, token := range map[string]func(task string) string{
-		"no task credential":                    func(string) string { return "" },
-		"a credential whose trigger names none": func(task string) string { return mintProxy(t, kp, task, pwPod, "", taskcred.AudienceCredentialProxy) },
+	const scriptAuthority = `{"grants":{"capability":{"key":"cap-a","revision":1}},"trigger":{"name":"schedule/stall-watch","origin":"builtin","script":"stall-watch"}}`
+	for name, tc := range map[string]struct {
+		token     func(task string) string
+		authority string
+		want      string
+	}{
+		"no task credential":                    {func(string) string { return "" }, scriptAuthority, "submission's trigger"},
+		"a credential whose trigger names none": {func(task string) string { return mintProxy(t, kp, task, pwPod, "", taskcred.AudienceCredentialProxy) }, scriptAuthority, "submission's trigger"},
+		"an authority block that can't be read": {func(string) string { return "" }, `[1]`, "authority block can't be read"},
 	} {
+		token := tc.token
 		t.Run(name, func(t *testing.T) {
 			_ = os.Remove(ran)
 			url := startServer(t)
@@ -650,7 +657,7 @@ func TestASubmissionNamingAScriptNeverRunsAsAModelTurn(t *testing.T) {
 			startScriptWorker(t, ctx, profileWorkerConfig(t, url, harness), ProfileWorkerConfig{OneShot: true, TaskSigningKeys: pub, scriptCheck: check})
 			task := "task-script-3"
 			origin := profileSubmission(t, task, "run the watch", map[string]string{"cluster": "prod-east"})
-			origin.Authority = []byte(`{"grants":{"capability":{"key":"cap-a","revision":1}},"trigger":{"name":"schedule/stall-watch","origin":"builtin","script":"stall-watch"}}`)
+			origin.Authority = []byte(tc.authority)
 			d.offer(task, origin, 5)
 			if a := d.nextAccept(5 * time.Second); !a.Accepted {
 				t.Fatalf("answer %+v, want an accept", a)
@@ -662,8 +669,8 @@ func TestASubmissionNamingAScriptNeverRunsAsAModelTurn(t *testing.T) {
 			if got := foldTask(t, testClient(t, url), pwProfile, task); got.State != lib.StateRejected {
 				t.Errorf("state %q, want rejected", got.State)
 			}
-			if msg := terminalText(t, url, pwProfile, task); !strings.Contains(msg, "script-refused") || !strings.Contains(msg, "submission's trigger") {
-				t.Errorf("terminal %q, want script-refused for the submission's trigger", msg)
+			if msg := terminalText(t, url, pwProfile, task); !strings.Contains(msg, "script-refused") || !strings.Contains(msg, tc.want) {
+				t.Errorf("terminal %q, want script-refused naming %q", msg, tc.want)
 			}
 			if _, err := os.Stat(ran); err == nil {
 				t.Error("the harness ran a model turn for a script task")
