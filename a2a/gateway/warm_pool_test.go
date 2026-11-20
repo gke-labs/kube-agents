@@ -763,3 +763,90 @@ func TestThePlatformRouteRunsNoWarmPool(t *testing.T) {
 		t.Fatalf("a warm pod was claimed on the platform route: %v", claims)
 	}
 }
+
+// warmPassRig is a gateway that runs no loops of its own, with the pool's
+// config (one warm pod under a cap of four) over a fake spawner, the reuse
+// rig's bus and registry, so a test drives warmPoolOnce alone.
+func warmPassRig(t *testing.T) (*Gateway, *fakeSpawner, *rig) {
+	t.Helper()
+	r, _ := startReuseRig(t)
+	spawn := &fakeSpawner{}
+	g := &Gateway{
+		cfg:          &Config{DefaultAddressee: RouteSession, SessionReuse: true, WarmSessions: 1, MaxSessions: 4},
+		spawner:      spawn,
+		reg:          r.g.reg,
+		client:       r.client,
+		adapter:      r.adapter,
+		log:          slog.Default(),
+		sessionLocks: map[string]*sessionLockEntry{},
+	}
+	return g, spawn, r
+}
+
+// publishTaskTo puts a task submission on pod's subjects, as an earlier pod
+// under the same name would have had one.
+func publishTaskTo(t *testing.T, r *rig, pod, taskID string) {
+	t.Helper()
+	if _, err := r.bus.JetStream().Publish(context.Background(), lib.TaskInSubject(pod, taskID), []byte(`{"kind":"message"}`)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The pool never creates a warm pod under a name TASKS holds a task for: a
+// minted name can repeat an earlier pod's within the stream's retention, so
+// it mints again, and a pass whose every attempt is held creates nothing.
+func TestThePoolNeverMintsANameTasksHolds(t *testing.T) {
+	g, spawn, r := warmPassRig(t)
+	ctx := context.Background()
+	const held, free = "chat-otter-wheld", "chat-otter-wfree"
+	publishTaskTo(t, r, held, "task-old")
+	names := []string{held, free}
+	g.warmMint = func(string) string {
+		n := names[0]
+		if len(names) > 1 {
+			names = names[1:]
+		}
+		return n
+	}
+	g.warmPoolOnce(ctx)
+	if got := spawn.warmSpawned(); !slices.Equal(got, []string{free}) {
+		t.Fatalf("warm pods created %v, want only %s: %s has a task on TASKS", got, free, held)
+	}
+
+	g2, spawn2, r2 := warmPassRig(t)
+	publishTaskTo(t, r2, held, "task-old")
+	mints := 0
+	g2.warmMint = func(string) string { mints++; return held }
+	g2.warmPoolOnce(ctx)
+	if got := spawn2.warmSpawned(); len(got) != 0 {
+		t.Fatalf("warm pods created %v with every minted name held", got)
+	}
+	if mints != warmMintAttempts {
+		t.Fatalf("%d names minted, want the bound of %d", mints, warmMintAttempts)
+	}
+}
+
+// A deposed leader creates no warm pod: a newer term has begun, so the new
+// leader sizes the pool and this one would only overshoot it.
+func TestADeposedLeaderCreatesNoWarmPod(t *testing.T) {
+	g, spawn, _ := warmPassRig(t)
+	ctx := context.Background()
+	kv, err := g.reg.kv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("5")); err != nil {
+		t.Fatal(err)
+	}
+	g.reg = NewRegistry(g.reg.c)
+	g.reg.setEpoch(4)
+	g.warmPoolOnce(ctx)
+	if got := spawn.warmSpawned(); len(got) != 0 {
+		t.Fatalf("a deposed leader created warm pods %v", got)
+	}
+	g.reg.setEpoch(5)
+	g.warmPoolOnce(ctx)
+	if got := spawn.warmSpawned(); len(got) != 1 {
+		t.Fatalf("the leader created %v, want one warm pod", got)
+	}
+}

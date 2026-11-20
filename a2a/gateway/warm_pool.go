@@ -75,6 +75,10 @@ const (
 	// warmMinCap is the smallest session cap the pool runs under: it never
 	// takes the last slot, so below two there is none to spare.
 	warmMinCap = 2
+	// warmMintAttempts bounds how many names one create mints looking for
+	// one TASKS holds nothing for (mintWarmName); past it the pass creates
+	// nothing and the next pass tries again.
+	warmMintAttempts = 4
 )
 
 // warmPoolOn reports whether this gateway keeps a pool and claims from it:
@@ -380,7 +384,16 @@ func (g *Gateway) warmPoolOnce(ctx context.Context) {
 		fresh = fresh[1:]
 	}
 	for n := len(fresh); n < warmPoolSize(g.cfg.WarmSessions, g.cfg.MaxSessions, live); n++ {
-		name := mintSessionName(sessionProfile)
+		// A deposed leader creates nothing: the new one sizes the pool.
+		if !g.reg.StillLeading(ctx) {
+			g.log.Info("warm pool: no longer leading; not creating")
+			return
+		}
+		name, err := g.mintWarmName(ctx)
+		if err != nil {
+			g.log.Error("warm pool: no warm pod name minted", "err", err)
+			return
+		}
 		if err := g.spawner.SpawnWarm(ctx, name); err != nil {
 			// Next pass tries again; a create refused here (the quota, the
 			// admission policy) would be refused for a cold spawn too, and
@@ -390,6 +403,31 @@ func (g *Gateway) warmPoolOnce(ctx context.Context) {
 		}
 		g.log.Info("warm pool: started a warm session pod", "pod", name)
 	}
+}
+
+// mintWarmName mints a name for a new warm pod that TASKS holds nothing for.
+// A minted name can repeat one an earlier pod had within the stream's
+// retention, and a pod under it would be refused every claim (warmPodUsed)
+// and could be handed that earlier pod's unfinished task; so a name that is
+// held is minted again, up to warmMintAttempts. A read that fails mints
+// nothing.
+func (g *Gateway) mintWarmName(ctx context.Context) (string, error) {
+	mint := g.warmMint
+	if mint == nil {
+		mint = mintSessionName
+	}
+	for range warmMintAttempts {
+		name := mint(sessionProfile)
+		used, err := g.warmPodUsed(ctx, name)
+		if err != nil {
+			return "", fmt.Errorf("task subject read for %s: %w", name, err)
+		}
+		if !used {
+			return name, nil
+		}
+		g.log.Info("warm pool: a minted name has tasks on TASKS; minting another", "pod", name)
+	}
+	return "", fmt.Errorf("%d minted names in a row have tasks on TASKS", warmMintAttempts)
 }
 
 // deleteWarmIfUnclaimed deletes an unclaimed warm pod: not while a turn is

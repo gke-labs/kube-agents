@@ -325,6 +325,10 @@ type Gateway struct {
 	warmMu       sync.Mutex
 	warmClaiming map[string]bool
 	warmDeleting map[string]bool
+	// warmMint, when set, mints the warm pool's pod names in place of
+	// mintSessionName: a test hook, so a name TASKS holds can be minted on
+	// purpose.
+	warmMint func(profile string) string
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
