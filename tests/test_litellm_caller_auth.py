@@ -141,8 +141,9 @@ def _digest(key: str) -> str:
 
 
 class _Request:
-    def __init__(self, path: str):
-        self.scope = {"type": "http", "path": path}
+    def __init__(self, path: str, method: str = "POST"):
+        self.scope = {"type": "http", "path": path, "method": method}
+        self.method = method
 
 
 class _HookTestCase(unittest.TestCase):
@@ -165,12 +166,12 @@ class _HookTestCase(unittest.TestCase):
             stat = self.keys_file.stat()
             os.utime(self.keys_file, ns=(stat.st_atime_ns, stat.st_mtime_ns + bump_ns))
 
-    def call(self, key, path="/v1/chat/completions"):
-        return asyncio.run(self.hook.caller_auth(_Request(path), key))
+    def call(self, key, path="/v1/chat/completions", method="POST"):
+        return asyncio.run(self.hook.caller_auth(_Request(path, method), key))
 
-    def refused(self, key, path="/v1/chat/completions") -> HTTPException:
+    def refused(self, key, path="/v1/chat/completions", method="POST") -> HTTPException:
         with self.assertRaises(HTTPException) as caught:
-            self.call(key, path)
+            self.call(key, path, method)
         return caught.exception
 
 
@@ -486,6 +487,44 @@ class TestChartRender(unittest.TestCase):
         self.assertIn("$callerAuthSource", line)
         self.assertEqual(line.count("%s"), len(re.findall(r" \$[A-Za-z]+", line.split('"')[-1])))
 
+
+
+_PROBE_KEY = "sk-probe-key-for-the-operators-readiness-check-0123"
+
+
+class TestTheProbeKeyListsModelsOnly(_HookTestCase):
+    """The operator's readiness probe sends only the gateway-probe key, so a pod it
+    cannot authenticate never receives a caller's key. That key lists models and
+    reaches nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_map({_digest(_PROBE_KEY): "gateway-probe", _digest(_AGENT_KEY): "agent-gateway"})
+
+    def test_the_probe_key_lists_models(self):
+        token = self.call(_PROBE_KEY, "/v1/models", "GET")
+        self.assertEqual(token.key_alias, "gateway-probe")
+        self.assertEqual(token.allowed_routes, ["/v1/models"])
+
+    def test_the_probe_key_is_refused_everywhere_else(self):
+        for path, method in (
+            ("/v1/models", "POST"),
+            ("/models", "GET"),
+            ("/v1/chat/completions", "POST"),
+            ("/chat/completions", "POST"),
+            ("/v1/messages", "POST"),
+            ("/v1/messages/count_tokens", "POST"),
+            ("/model/info", "GET"),
+            ("/v1/model/info", "GET"),
+            ("/health", "GET"),
+            ("/key/list", "GET"),
+            ("/v1/models/model-default", "GET"),
+        ):
+            with self.subTest(path=path, method=method):
+                self.assertEqual(self.refused(_PROBE_KEY, path, method).status_code, 401)
+
+    def test_a_caller_key_is_not_limited_to_the_probe_route(self):
+        self.assertEqual(self.call(_AGENT_KEY, "/v1/chat/completions").key_alias, "agent-gateway")
 
 class TestStandInsDoNotOutliveTheImport(unittest.TestCase):
     """The other LiteLLM suites build their own stand-in only when no litellm module

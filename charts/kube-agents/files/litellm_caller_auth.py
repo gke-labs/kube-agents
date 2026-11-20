@@ -101,6 +101,13 @@ CLASS_NAME_PATTERN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 # Class names the map may not hand out: the keyless class, so a key cannot
 # pass for no key, and the admin's alias.
 RESERVED_CLASSES = frozenset({KEYLESS_CLASS, LITELLM_PROXY_MASTER_KEY_ALIAS})
+# The operator's readiness probe: one key, written in the same map update as
+# the callers' keys, so a pod that admits it has loaded that whole map. It
+# lists models and nothing else, so the probe never sends a caller's key to a
+# pod it cannot authenticate, and a leaked probe key reaches no model.
+PROBE_CLASS = "gateway-probe"
+PROBE_METHOD = "GET"
+PROBE_ROUTE = "/v1/models"
 # What every refused caller is told. Fixed text: LiteLLM logs it.
 REFUSED_STATUS = 401
 REFUSED_KEY_DETAIL = "Authentication Error: this gateway does not recognise the key."
@@ -208,14 +215,14 @@ def _request_route(request: Any) -> str:
         return str(scope.get("path", ""))
 
 
-def _caller(caller_class: str, api_key_label: str) -> UserAPIKeyAuth:
+def _caller(caller_class: str, api_key_label: str, routes: tuple[str, ...] = CALLER_ROUTES) -> UserAPIKeyAuth:
     return UserAPIKeyAuth(
         api_key=api_key_label,
         key_alias=caller_class,
         team_id=caller_class,
         team_alias=caller_class,
         user_role=LitellmUserRoles.INTERNAL_USER,
-        allowed_routes=list(CALLER_ROUTES),
+        allowed_routes=list(routes),
     )
 
 
@@ -244,6 +251,10 @@ def _authenticate(request: Any, api_key: str | None) -> UserAPIKeyAuth:
         caller_class = _caller_keys.lookup(os.environ.get(CALLER_KEYS_FILE_ENV, DEFAULT_CALLER_KEYS_FILE), key_digest)
         if caller_class is None:
             raise HTTPException(status_code=REFUSED_STATUS, detail=REFUSED_KEY_DETAIL)
+        if caller_class == PROBE_CLASS:
+            if _request_route(request) != PROBE_ROUTE or getattr(request, "method", "") != PROBE_METHOD:
+                raise HTTPException(status_code=REFUSED_STATUS, detail=REFUSED_ROUTE_DETAIL)
+            return _caller(caller_class, key_digest, (PROBE_ROUTE,))
         token = _caller(caller_class, key_digest)
     if _request_route(request) not in CALLER_ROUTES:
         raise HTTPException(status_code=REFUSED_STATUS, detail=REFUSED_ROUTE_DETAIL)
