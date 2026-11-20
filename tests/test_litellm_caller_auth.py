@@ -105,9 +105,15 @@ _HAVE_LITELLM = _litellm_installed()
 
 
 def _load_hook():
-    """Import the hook, with stand-ins for the LiteLLM modules it imports when LiteLLM is absent."""
+    """Import the hook, with stand-ins for the LiteLLM modules it imports when LiteLLM is absent.
+
+    The stand-ins are in sys.modules only while the hook imports: the other LiteLLM
+    suites build their own stand-in when no litellm module is present, and one left
+    here (with no litellm.integrations) would break them in a shared process.
+    """
+    stand_ins = {}
     if not _HAVE_LITELLM:
-        litellm = sys.modules.get("litellm") or types.ModuleType("litellm")
+        litellm = types.ModuleType("litellm")
         constants = types.ModuleType("litellm.constants")
         constants.LITELLM_PROXY_MASTER_KEY_ALIAS = "litellm_proxy_master_key"
         constants.LITELLM_PROXY_ADMIN_NAME = "default_user_id"
@@ -115,17 +121,16 @@ def _load_hook():
         proxy_types = types.ModuleType("litellm.proxy._types")
         proxy_types.UserAPIKeyAuth = _StubUserAPIKeyAuth
         proxy_types.LitellmUserRoles = types.SimpleNamespace(PROXY_ADMIN="proxy_admin", INTERNAL_USER="internal_user")
-        sys.modules.update(
-            {
-                "litellm": litellm,
-                "litellm.constants": constants,
-                "litellm.proxy": proxy,
-                "litellm.proxy._types": proxy_types,
-            }
-        )
+        stand_ins = {
+            "litellm": sys.modules.get("litellm") or litellm,
+            "litellm.constants": constants,
+            "litellm.proxy": proxy,
+            "litellm.proxy._types": proxy_types,
+        }
     spec = importlib.util.spec_from_file_location("litellm_caller_auth", _CHART_FILE)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with mock.patch.dict(sys.modules, stand_ins):
+        spec.loader.exec_module(module)
     return module
 
 
@@ -313,6 +318,15 @@ class TestMapReload(_HookTestCase):
             with self.subTest(key=key):
                 self.assertEqual(self.refused(key).status_code, 401)
 
+    def test_an_entry_with_a_trailing_newline_is_dropped(self):
+        # A $ anchor would take both: sha256sum output not stripped, or a class
+        # name that would land in a Prometheus label with its newline.
+        self.write_map({_digest(_AGENT_KEY) + "\n": "agent-gateway", _digest(_OTHER_KEY): "other\n"})
+        with self.assertLogs(self.log, level="WARNING") as logs:
+            self.assertEqual(self.refused(_AGENT_KEY).status_code, 401)
+        self.assertIn("dropped 2 entry(ies)", "\n".join(logs.output))
+        self.assertEqual(self.refused(_OTHER_KEY).status_code, 401)
+
 
 class TestNoRawKeyLeaves(_HookTestCase):
     """LiteLLM puts api_key into the hashed_api_key label unhashed unless it starts
@@ -455,6 +469,18 @@ class TestChartRender(unittest.TestCase):
         line = next(l for l in template.splitlines() if l.startswith("{{- $checksumInput :="))
         self.assertIn("$callerAuthSource", line)
         self.assertEqual(line.count("%s"), len(re.findall(r" \$[A-Za-z]+", line.split('"')[-1])))
+
+
+class TestStandInsDoNotOutliveTheImport(unittest.TestCase):
+    """The other LiteLLM suites build their own stand-in only when no litellm module
+    is in sys.modules; one left behind here would break them in a shared process."""
+
+    @unittest.skipIf(_HAVE_LITELLM, "LiteLLM is installed; no stand-in is used")
+    def test_loading_the_hook_leaves_sys_modules_as_it_found_it(self):
+        before = {name for name in sys.modules if name == "litellm" or name.startswith("litellm.")}
+        _load_hook()
+        after = {name for name in sys.modules if name == "litellm" or name.startswith("litellm.")}
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":

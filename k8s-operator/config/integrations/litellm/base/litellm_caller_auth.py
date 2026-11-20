@@ -90,9 +90,10 @@ CALLER_ROUTES = (
     "/health",
 )
 # A map entry's shape: a sha256 in lowercase hex, and a class name that can
-# stand as a Prometheus label value and a Kubernetes name.
-KEY_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-CLASS_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+# stand as a Prometheus label value and a Kubernetes name. Matched with
+# fullmatch: a $ anchor would also take a trailing newline.
+KEY_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+CLASS_NAME_PATTERN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 # Class names the map may not hand out: the keyless class, so a key cannot
 # pass for no key, and the admin's alias.
 RESERVED_CLASSES = frozenset({KEYLESS_CLASS, LITELLM_PROXY_MASTER_KEY_ALIAS})
@@ -165,9 +166,9 @@ def _read_map(path: str) -> dict[str, str] | None:
     for key_digest, caller_class in raw.items():
         if (
             isinstance(key_digest, str)
-            and KEY_DIGEST_PATTERN.match(key_digest)
+            and KEY_DIGEST_PATTERN.fullmatch(key_digest)
             and isinstance(caller_class, str)
-            and CLASS_NAME_PATTERN.match(caller_class)
+            and CLASS_NAME_PATTERN.fullmatch(caller_class)
             and caller_class not in RESERVED_CLASSES
         ):
             classes[key_digest] = caller_class
