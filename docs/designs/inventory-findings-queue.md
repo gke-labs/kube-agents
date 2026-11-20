@@ -932,9 +932,10 @@ and after it `findings_nudge.py` runs hourly and names only what `findings_queue
 - **Ids stay out of the message:** a line names its object, its cluster and how many other objects
   a decision on it reaches. The id of each line, its members' ids and the split between reported
   and no-longer-reported objects go into the context stored for the message's thread
-  (`findings_nudge_card.thread_context`), which a reply in that thread is answered with. The same
-  context carries the next ten items by rank, one plain line each, for the message's "See next N"
-  button, so that answer needs no read of the queue's rows. That row
+  (`findings_nudge_card.thread_context`), which a reply in that thread is answered with. The message's
+  folded queue breakdown lists the next ten items by rank, one plain line each, above its
+  per-cluster table, and the same lines are in that context, so reading them needs no agent turn
+  and no read of the queue's rows. That row
   holds one report, so a second nudge on the same UTC day, which posts into the same thread,
   replaces the first one's ids. The ids are stored whenever the card file matches the report,
   also on a leg that posts the report as text; a truncated report, or one whose card file is

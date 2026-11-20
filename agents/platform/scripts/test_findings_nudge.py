@@ -311,7 +311,7 @@ class CardAndChatUxTests(unittest.TestCase):
         # Buttons + backlog link.
         self.assertEqual(
             [c["text"] for c in chat["choices"]],
-            ["Fix first issue", "See next 3"],
+            ["Fix first issue"],
         )
         self.assertTrue(chat["choices"][0]["primary"])
         self.assertEqual(chat["links"], [{"text": "Open backlog", "url": "https://github.com/acme/gitops/issues/42"}])
@@ -521,7 +521,7 @@ class DetectorWordingTests(unittest.TestCase):
         named = finding(cluster="<!channel>", namespace="", object="<@U123ABC>", title="x", recommendation={})
         self.assertIn("- critical · @U123ABC on !channel — x", nudge.compose(plan_for([named]), 1, False))
 
-    def test_the_next_issues_are_saved_with_the_message_for_the_see_next_button(self):
+    def test_the_next_issues_are_in_the_folded_breakdown_and_no_button_asks_for_them(self):
         # Two criticals are added; twelve other issues stay behind, each on three objects.
         rows = [finding(id="a"), finding(id="b", check_slug="b")]
         rows += [
@@ -531,36 +531,60 @@ class DetectorWordingTests(unittest.TestCase):
         ]
         bundle = nudge.build_nudge(plan_for(rows), 14, False, rows=rows)
         chat, _ = nudge_card.chat_from_card(bundle.card)
+        chat_cases.check_chat(chat, "fold with text and table")
+        self.assertEqual(chat_cases.lint(chat), [])
         # The count beside the headline says what it covers: objects, not the queue's rows.
         # The 38 rows are 4 objects (payments/api, w0, w1, w2); one object fails many checks.
         self.assertEqual(chat["note"], "· 14 open issues covering 4 objects on 1 cluster")
-        # The button asks for ten, and its message asks for the saved list.
-        self.assertEqual([choice["text"] for choice in chat["choices"]], ["Fix first issue", "See next 10"])
-        self.assertEqual(chat["choices"][1]["reply"], "See next 10 open issues, from the list saved with this message")
-        # The ten are in the stored note, one plain line each, in rank order, and are not posted.
-        saved = bundle.card["thread_context"].split('[Next 10 open issues, for the "See next 10" button]\n', 1)[1].splitlines()
-        # A saved line counts its objects plainly; "(+N more)" is a shown row's, for what a decision reaches.
-        self.assertEqual(saved[0], "- minor · payments/w0 on prod — lacks limit 0 (3 objects)")
-        self.assertEqual(saved[9], "- minor · payments/w0 on prod — lacks limit 9 (3 objects)")
-        self.assertEqual(saved[10], "2 more open after these; the message's queue breakdown counts them by cluster.")
-        self.assertEqual(len(saved), 11)
+        # No button asks an agent for the rest: a press cost a model call or more.
+        self.assertEqual([choice["text"] for choice in chat["choices"]], ["Fix first issue"])
+        # The next ten are in the fold, above its table: a lead, one plain line each in rank order, the rest.
+        self.assertEqual(list(chat["fold"]), ["title", "text", "table"])
+        lines = chat["fold"]["text"].splitlines()
+        self.assertEqual(lines[0], "**Next 10 open issues by rank**")
+        # A line counts its objects plainly; "(+N more)" is a shown row's, for what a decision reaches.
+        self.assertEqual(lines[1], "- minor · payments/w0 on prod — lacks limit 0 (3 objects)")
+        self.assertEqual(lines[10], "- minor · payments/w0 on prod — lacks limit 9 (3 objects)")
+        self.assertEqual(
+            lines[11:],
+            ["", "2 more open after these. The table counts every open issue the message does not show, by cluster."],
+        )
+        # The closed message does not show them, and the stored note keeps them for a typed follow-up.
         self.assertNotIn("lacks limit", bundle.text)
-        self.assertNotIn("|", "\n".join(saved))
+        saved = bundle.card["thread_context"].split("[Next 10 open issues by rank, as the message's queue breakdown lists them]\n", 1)[1]
+        self.assertEqual(saved.splitlines()[:10], lines[1:11])
 
-    def test_the_button_names_how_many_are_left_when_fewer_than_ten(self):
+    def test_the_fold_names_how_many_follow_when_fewer_than_ten(self):
         rows = [finding(id="a"), finding(id="b", check_slug="b"), finding(id="c", check_slug="c"), finding(id="m", check_slug="m")]
         bundle = nudge.build_nudge(plan_for(rows), 4, False, rows=rows)
-        self.assertEqual(bundle.card["choices"], ["Fix first issue", "See next 2"])
+        self.assertEqual(bundle.card["choices"], ["Fix first issue"])
+        lines = bundle.card["fold"]["text"].splitlines()
+        self.assertEqual(lines[0], "**Next 2 open issues by rank**")
+        self.assertEqual(lines[-1], "These are all the open issues the message does not show.")
         one_left = rows[:3]
         single = nudge.build_nudge(plan_for(one_left), 3, False, rows=one_left)
-        self.assertEqual(single.card["replies"]["See next 1"], "See next 1 open issue, from the list saved with this message")
-        self.assertIn('[Next 1 open issue, for the "See next 1" button]\n- critical · payments/api on prod', single.card["thread_context"])
-        self.assertTrue(bundle.card["thread_context"].endswith("These are all the open issues the message did not show."))
-        # Nothing left to show: no button, and no list in the note.
+        self.assertEqual(single.card["fold"]["text"].splitlines()[:2], ["**Next 1 open issue by rank**", "- critical · payments/api on prod — no readinessProbe on api"])
+        # Nothing left to show: no fold, and no list in the note.
         only = rows[:2]
         bundle = nudge.build_nudge(plan_for(only), 2, False, rows=only)
-        self.assertEqual(bundle.card["choices"], ["Fix first issue"])
-        self.assertNotIn("See next", bundle.card["thread_context"])
+        self.assertIsNone(bundle.card["fold"])
+        self.assertNotIn("by rank", bundle.card["thread_context"])
+
+    def test_the_slack_relay_draws_the_folds_text_above_its_table(self):
+        rows = [finding(id="a"), finding(id="b", check_slug="b"), finding(id="c", check_slug="c", title="<x> & co lack a limit")]
+        bundle = nudge.build_nudge(plan_for(rows), 3, False, rows=rows)
+        blocks, _ = nudge_card.blocks_from_card(bundle.card)
+        container = next(block for block in blocks if block["type"] == "container")
+        self.assertEqual([child["type"] for child in container["child_blocks"]], ["section", "table"])
+        self.assertEqual(
+            container["child_blocks"][0]["text"],
+            {
+                "type": "mrkdwn",
+                "text": "*Next 1 open issue by rank*\n• critical · payments/api on prod — x &amp; co lack a limit\n\n"
+                "These are all the open issues the message does not show.",
+            },
+        )
+        self.assertNotIn("actions", [block["type"] for block in blocks][: blocks.index(container)])
 
     def test_one_of_a_version_is_not_a_count(self):
         self.assertEqual(

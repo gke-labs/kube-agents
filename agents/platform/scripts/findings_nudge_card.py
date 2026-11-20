@@ -46,6 +46,7 @@ AFTER_KEY = "after"
 FOLD_KEY = "fold"
 FOLD_TITLE_KEY = "title"
 FOLD_TABLE_KEY = "table"
+FOLD_TEXT_KEY = "text"
 TABLE_COLUMNS_KEY = "columns"
 TABLE_ROWS_KEY = "rows"
 CHOICES_KEY = "choices"
@@ -62,6 +63,12 @@ ACTIONS_BLOCK_TYPE = "actions"
 FOLD_BLOCK_TYPE = _presenter.FOLD_BLOCK
 TABLE_BLOCK_TYPE = "table"
 RAW_TEXT_CELL_TYPE = "raw_text"
+SECTION_BLOCK_TYPE = "section"
+MRKDWN_TYPE = "mrkdwn"
+# What one section's text may hold (Slack's limit, as `slackChatSectionMax` in a2a/gateway/slack_chat.go has it).
+SECTION_TEXT_MAX = 3000
+MARKDOWN_BOLD, MRKDWN_BOLD = "**", "*"
+MARKDOWN_BULLET, MRKDWN_BULLET = "- ", "• "
 PLAIN_TEXT_TYPE = "plain_text"
 BLOCK_TYPE_KEY = "type"
 BLOCK_TEXT_KEY = "text"
@@ -149,6 +156,9 @@ def _fold_ok(fold: Any) -> bool:
     # so the report posts as its text, whole.
     title = fold.get(FOLD_TITLE_KEY)
     if not isinstance(title, str) or not title.strip() or len(title) > _chat.FOLD_TITLE_MAX:
+        return False
+    text = fold.get(FOLD_TEXT_KEY, "")
+    if not isinstance(text, str) or len(text) > _chat.FOLD_TEXT_MAX:
         return False
     table = fold.get(FOLD_TABLE_KEY)
     if not isinstance(table, dict):
@@ -240,13 +250,18 @@ def _clean_fold(fold: dict | None) -> dict | None:
     title = _presenter._clip(_chat._line(fold.get(FOLD_TITLE_KEY) or ""), _chat.FOLD_TITLE_MAX)
     if not title:
         return None
-    return {
+    cleaned = {
         FOLD_TITLE_KEY: title,
         FOLD_TABLE_KEY: {
             TABLE_COLUMNS_KEY: columns,
             TABLE_ROWS_KEY: rows,
         },
     }
+    text = str(fold.get(FOLD_TEXT_KEY) or "").strip()
+    if text:
+        # In spec key order: title, text, table.
+        cleaned = {FOLD_TITLE_KEY: title, FOLD_TEXT_KEY: text, FOLD_TABLE_KEY: cleaned[FOLD_TABLE_KEY]}
+    return cleaned
 
 
 def chat_from_card(card: dict) -> tuple[dict, str]:
@@ -286,13 +301,43 @@ def _fold_container_block(fold: dict) -> dict:
         [{BLOCK_TYPE_KEY: RAW_TEXT_CELL_TYPE, BLOCK_TEXT_KEY: cell} for cell in row]
         for row in all_rows
     ]
+    children = [
+        {BLOCK_TYPE_KEY: SECTION_BLOCK_TYPE, BLOCK_TEXT_KEY: {BLOCK_TYPE_KEY: MRKDWN_TYPE, BLOCK_TEXT_KEY: chunk}}
+        for chunk in _mrkdwn_chunks(fold.get(FOLD_TEXT_KEY) or "")
+    ]
+    children.append({BLOCK_TYPE_KEY: TABLE_BLOCK_TYPE, BLOCK_ROWS_KEY: slack_rows})
     return {
         BLOCK_TYPE_KEY: FOLD_BLOCK_TYPE,
         BLOCK_TITLE_KEY: {BLOCK_TYPE_KEY: PLAIN_TEXT_TYPE, BLOCK_TEXT_KEY: fold[FOLD_TITLE_KEY]},
         BLOCK_COLLAPSIBLE_KEY: True,
         BLOCK_COLLAPSED_KEY: True,
-        BLOCK_CHILDREN_KEY: [{BLOCK_TYPE_KEY: TABLE_BLOCK_TYPE, BLOCK_ROWS_KEY: slack_rows}],
+        BLOCK_CHILDREN_KEY: children,
     }
+
+
+def _mrkdwn_chunks(text: str) -> list[str]:
+    """A fold's text as Slack mrkdwn, in pieces of whole lines no longer than one section holds.
+
+    The text is the emitter's: a bold lead (`**...**`), bullet lines (`- ...`)
+    and plain lines. Only the markup changes; no word does.
+    """
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        line = _presenter._escape(line)
+        if line.startswith(MARKDOWN_BOLD) and line.endswith(MARKDOWN_BOLD) and len(line) > 2 * len(MARKDOWN_BOLD):
+            line = MRKDWN_BOLD + line[len(MARKDOWN_BOLD) : -len(MARKDOWN_BOLD)] + MRKDWN_BOLD
+        elif line.startswith(MARKDOWN_BULLET):
+            line = MRKDWN_BULLET + line[len(MARKDOWN_BULLET) :]
+        line = line[:SECTION_TEXT_MAX]
+        if current and len(current) + 1 + len(line) > SECTION_TEXT_MAX:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current.strip():
+        chunks.append(current)
+    return chunks
 
 
 def blocks_from_card(card: dict) -> tuple[list[dict], str]:

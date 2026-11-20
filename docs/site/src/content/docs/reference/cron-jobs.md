@@ -42,7 +42,7 @@ On an install nobody has messaged for a week the dispatcher thins this roster's 
 
 Once a UTC day, on its first run at or after 12:00 UTC, it repeats up to `FINDINGS_DAILY_CRITICALS` of the undecided critical findings it named before. It also surfaces any non-critical finding that is holding new findings back and notes that new additions are paused until it is resolved, snoozed or dismissed; accepting it lifts the pause too. While a critical finding it named is undecided, non-critical findings wait without a separate hold notice.
 
-Where [cards are on](/kube-agents/concepts/chatops/#reactions) and more findings are open, each message carries a breakdown table of up to 15 clusters and a "See next" button. The button asks for the next ten findings by rank, which the message saved with its thread. The table is collapsed on Slack and an open monospace block on Google Chat.
+Where [cards are on](/kube-agents/concepts/chatops/#reactions) and more findings are open, each message carries a queue breakdown: the next ten findings by rank, one line each, and a table of up to 15 clusters. The breakdown is collapsed on Slack and open on Google Chat, where the table is a monospace block.
 
 One check failing on several objects in one cluster counts as one finding, and its line says how many other objects it covers. The message shows no finding ID: reply in its thread and name the finding by its workload and cluster, with the decision (dismiss, snooze until a date, or accept). The agent reads the IDs from what it stored for that thread's latest message.
 

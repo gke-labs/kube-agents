@@ -252,20 +252,22 @@ FIX_SINGLE_LABEL = "Fix issue"
 FIX_FIRST_LABEL = "Fix first issue"
 REVIEW_SINGLE_LABEL = "Review item"
 REVIEW_FIRST_LABEL = "Review first item"
-# The button asks for the next issues by rank, and the answer is saved with the
-# message: the lines below go into the thread's stored note when the message is
-# built, so answering a press needs no fetch of the queue's rows (a queue of 40
-# issues is 449 rows, and listing those took an agent turn of several minutes).
-SEE_NEXT_LABEL = "See next {count}"
-SEE_NEXT_REPLY = "See next {issues}, from the list saved with this message"
+# The next issues by rank are in the message itself, as plain lines inside the
+# folded queue breakdown, above its per-cluster table: one click opens them and
+# no agent turn is needed. A button for them cost a turn each press (a list of
+# the whole queue took several minutes, a list answered from saved text half a
+# minute). The same lines go into the thread's stored note, for a typed
+# follow-up.
 NEXT_ITEMS_MAX = 10
-NEXT_ITEMS_HEADER = '[Next {issues}, for the "See next {count}" button]'
+NEXT_ITEMS_HEADER = "[Next {issues} by rank, as the message's queue breakdown lists them]"
+# The line that opens the list inside the fold.
+NEXT_ITEMS_LEAD = "**Next {issues} by rank**"
 # A saved line gives the objects its issue covers as a plain count. "(+N more)"
 # is a shown row's, where it says what a decision on the row reaches.
 NEXT_ITEM_LINE = "- {severity} · {summary}"
 NEXT_ITEM_LINE_MANY = "- {severity} · {summary} ({objects})"
-NEXT_ITEMS_REST = "{rest} more open after these; the message's queue breakdown counts them by cluster."
-NEXT_ITEMS_LAST = "These are all the open issues the message did not show."
+NEXT_ITEMS_REST = "{rest} more open after these. The table counts every open issue the message does not show, by cluster."
+NEXT_ITEMS_LAST = "These are all the open issues the message does not show."
 BACKLOG_LINK_LABEL = "Open backlog"
 BACKLOG_TEXT_LINE = "Open backlog: {url}"
 CHOICE_REPLY_FORMAT = "{label}: {summary}"
@@ -918,13 +920,15 @@ def build_nudge(
         )
     }
     next_lines: list[str] = []
-    next_rest = 0
+    next_closing = ""
     if remaining > 0 and rows is not None:
         next_lines, next_rest = _next_items(rows, surfaced_keys, ambiguous)
-    if next_lines:
-        see_next = SEE_NEXT_LABEL.format(count=len(next_lines))
-        choices.append(see_next)
-        replies[see_next] = SEE_NEXT_REPLY.format(issues=_plural(len(next_lines), *OPEN_ISSUE_NOUN))
+        next_closing = NEXT_ITEMS_REST.format(rest=next_rest) if next_rest else NEXT_ITEMS_LAST
+    next_issues = _plural(len(next_lines), *OPEN_ISSUE_NOUN)
+    if next_lines and fold is not None:
+        fold[nudge_card.FOLD_TEXT_KEY] = "\n".join(
+            [NEXT_ITEMS_LEAD.format(issues=next_issues), *next_lines, "", next_closing]
+        )
 
     clean_backlog = backlog_url.strip() if backlog_url and backlog_url.strip().startswith(HTTP_SCHEMES) else ""
     links = [[BACKLOG_LINK_LABEL, clean_backlog]] if clean_backlog else []
@@ -944,13 +948,8 @@ def build_nudge(
         + "\n".join(entry.metadata_line for entry in formatted)
     )
     if next_lines:
-        closing = NEXT_ITEMS_REST.format(rest=next_rest) if next_rest else NEXT_ITEMS_LAST
         thread_context += (
-            "\n\n"
-            + NEXT_ITEMS_HEADER.format(issues=_plural(len(next_lines), *OPEN_ISSUE_NOUN), count=len(next_lines))
-            + "\n"
-            + "\n".join(next_lines)
-            + f"\n{closing}"
+            "\n\n" + NEXT_ITEMS_HEADER.format(issues=next_issues) + "\n" + "\n".join(next_lines) + f"\n{next_closing}"
         )
     tone = (
         chat_message.TONE_CRITICAL

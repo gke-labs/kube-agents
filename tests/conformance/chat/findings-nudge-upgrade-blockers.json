@@ -1,7 +1,7 @@
 {
   "name": "findings-nudge-upgrade-blockers",
   "source": "agents/platform/scripts/test_findings_nudge.py::DetectorWordingTests.test_the_two_findings_of_issue_6256_read_as_sentences",
-  "notes": "findings_nudge_card.chat_from_card: the daily nudge on the upgrade readiness review's own titles and actions (a budget, and a cluster-wide finding whose remedy names a command, so the neutral line stands in), with the cluster breakdown table and the queue buttons.",
+  "notes": "findings_nudge_card.chat_from_card: the daily nudge on the upgrade readiness review's own titles and actions (a budget, and a cluster-wide finding whose remedy names a command, so the neutral line stands in), with the next issues and the cluster breakdown table in the fold, and the fix button.",
   "input": {
     "findings_nudge": {
       "now": "2026-10-06T12:00:00Z",
@@ -147,6 +147,7 @@
         "after": ["2 more issues are open (1 critical, 1 lower priority)."],
         "fold": {
           "title": "Queue breakdown (2 more open)",
+          "text": "**Next 2 open issues by rank**\n- critical · billing/invoice-worker on prod-central — mounts a static GCP key\n- major · validatingwebhookconfiguration/authz/gate.authz.example on prod-europe — A fail-closed webhook whose backend is not up: authz/gate.authz.example fails closed with no backend and refuses writes the upgrade makes\n\nThese are all the open issues the message does not show.",
           "table": {
             "columns": [
               "Cluster",
@@ -178,10 +179,6 @@
             "text": "Fix first issue",
             "reply": "Fix first issue: kube-system/istiod on prod-central — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)",
             "primary": true
-          },
-          {
-            "text": "See next 2",
-            "reply": "See next 2 open issues, from the list saved with this message"
           }
         ],
         "links": [

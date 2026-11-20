@@ -133,6 +133,57 @@
       {
         "child_blocks": [
           {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Next 2 open issues by rank",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "text": "critical · billing/invoice-worker on prod-central — mounts a static GCP key",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "text": "major · validatingwebhookconfiguration/authz/gate.authz.example on prod-europe — A fail-closed webhook whose backend is not up: authz/gate.authz.example fails closed with no backend and refuses writes the upgrade makes",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "These are all the open issues the message does not show.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          },
+          {
             "rows": [
               [
                 {
@@ -228,16 +279,6 @@
                 },
                 "type": "button",
                 "value": "Fix first issue: kube-system/istiod on prod-central — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)"
-              },
-              {
-                "action_id": "kage.choice.1",
-                "text": {
-                  "emoji": true,
-                  "text": "See next 2",
-                  "type": "plain_text"
-                },
-                "type": "button",
-                "value": "See next 2 open issues, from the list saved with this message"
               },
               {
                 "action_id": "kage.link.0",
