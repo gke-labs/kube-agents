@@ -20,7 +20,9 @@ these tests pin, with ``kubectl``, ``gcloud`` and ``gh`` stubbed:
   outlier (slot c) is past the drift SOP's 24-hour age gate, which never
   holds a ``--wait``;
 * a re-run that finds a role converged removes a stale ``.drift`` file;
-* a malformed catalog or a directory the runner did not write is exit 1.
+* a malformed catalog or a directory the runner did not write is exit 1;
+* a tool that is not installed comes back as exit status 127 and a tool that
+  runs past its timeout as 124, and a read that got either is "not checked".
 
 The stubs answer from a JSON "world" file so each test names only its own
 defect; a key whose value is a list (a kubectl subject or a describe) is
@@ -1009,6 +1011,51 @@ class CatalogTest(unittest.TestCase):
             for entry in cases:
                 with self.subTest(entry=entry), self.assertRaises(ffs.CatalogError):
                     ffs.load_assertions(self._catalog_with(pathlib.Path(tmp), entry))
+
+
+class RunCommandTest(unittest.TestCase):
+    """`_run` turns a tool that is not installed and a tool that runs too long
+    into exit statuses.
+
+    The statuses are the shell's: 127 for a command that is not found, 124 for
+    one that `timeout` stopped. Each real process here is this interpreter or a
+    path that does not exist, so no test starts `kubectl`, `gcloud` or `gh`.
+    """
+
+    #: Short enough to keep the test fast, and a child that sleeps far longer.
+    TIMEOUT_SECONDS = 0.2
+    CHILD_SLEEP_SECONDS = 30
+
+    def test_a_tool_that_is_not_installed_is_status_127(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(pathlib.Path(tmp) / "no-such-tool")
+            rc, out, err = ffs._run([missing, "get", "pods"], self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (127, ""))
+        self.assertIn(missing, err)
+
+    def test_a_tool_that_runs_past_its_timeout_is_status_124(self):
+        cmd = [sys.executable, "-c", f"import time; time.sleep({self.CHILD_SLEEP_SECONDS})"]
+        rc, out, err = ffs._run(cmd, self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (124, ""))
+        self.assertEqual(err, f"timed out after {self.TIMEOUT_SECONDS:g}s: {' '.join(cmd)}")
+
+    def test_a_tool_that_answers_keeps_its_status_and_both_streams(self):
+        cmd = [sys.executable, "-c", "import sys; print('to stdout'); print('to stderr', file=sys.stderr); sys.exit(3)"]
+        self.assertEqual(ffs._run(cmd, 30), (3, "to stdout\n", "to stderr\n"))
+
+    def test_a_read_that_got_either_status_is_unreadable_and_names_it(self):
+        """A caller reports the status, so "not installed" and "too slow" read
+        apart in the "not checked" line, and neither is taken for drift."""
+        failures = (
+            (FileNotFoundError(2, "No such file or directory", "kubectl"), 127, "No such file or directory"),
+            (subprocess.TimeoutExpired(["kubectl"], ffs.KUBECTL_TIMEOUT_SECONDS), 124, "timed out after"),
+        )
+        for failure, status, text in failures:
+            with self.subTest(status=status), mock.patch.object(subprocess, "run", side_effect=failure):
+                with self.assertRaises(ffs.Unreadable) as caught:
+                    ffs.read_kubectl(pathlib.Path("kubeconfig"), None, "deployment/x")
+                self.assertIn(f"({status})", str(caught.exception))
+                self.assertIn(text, str(caught.exception))
 
 
 class EvaluateTest(unittest.TestCase):

@@ -39,6 +39,7 @@ import board_snapshot
 import chat_notify
 import clean_merges
 import dial_state
+from fix_recipes import registry as fix_recipes_registry
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -93,9 +94,9 @@ PROPOSAL_OPENED_AT_MAX_CHARS = 64
 # claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
 # fix the check knows, by the fleet audit's check id, which is the first segment
 # of its finding id (`<check>.<cluster>.<namespace>.<object>`); the kind is
-# derived from that id here, never taken from the caller. The pr_opened plugin
-# holds a copy (POST_MERGE_KINDS), which a test pins to this one.
-POST_MERGE_KINDS = ("no-pdb",)
+# derived from that id here, never taken from the caller. Both this and the
+# pr_opened plugin read the kinds from fix_recipes/registry.py.
+POST_MERGE_KINDS = tuple(sorted(fix_recipes_registry.kinds()))
 POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.

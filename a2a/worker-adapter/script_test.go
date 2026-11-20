@@ -1,7 +1,10 @@
 package workeradapter
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -528,4 +531,251 @@ func TestACappedOutputIsCutOnACharacterBoundary(t *testing.T) {
 	if want := "abcd" + scriptTruncated; got != want {
 		t.Errorf("text = %q, want %q", got, want)
 	}
+}
+
+// Only an incomplete character at the cut is trimmed, by at most three bytes, whatever its width
+// and wherever the cut falls inside it.
+func TestACappedOutputTrimsAtMostThreeBytesAtTheCut(t *testing.T) {
+	for _, r := range []string{"\u00e9", "\u20ac", "\U0001F600"} { // two, three and four bytes
+		for split := 1; split < len(r); split++ {
+			prefix := strings.Repeat("a", 10)
+			b := &cappedBuffer{max: len(prefix) + split}
+			_, _ = b.Write([]byte(prefix + r + "tail"))
+			got := strings.TrimSuffix(b.text(), scriptTruncated)
+			if got != prefix {
+				t.Errorf("%q cut after %d of its %d bytes: kept %q, want %q", r, split, len(r), got, prefix)
+			}
+			if trimmed := b.max - len(got); trimmed > utf8.UTFMax-1 {
+				t.Errorf("%q cut after %d bytes: trimmed %d bytes, more than %d", r, split, trimmed, utf8.UTFMax-1)
+			}
+		}
+		// A whole character at the cut is kept.
+		b := &cappedBuffer{max: len(r)}
+		_, _ = b.Write([]byte(r + "tail"))
+		if got := b.text(); got != r+scriptTruncated {
+			t.Errorf("%q whole at the cut: text %q, want it kept", r, got)
+		}
+	}
+}
+
+// An invalid byte early in a capped output doesn't cost the output after it: the result keeps
+// the full cap.
+func TestAnInvalidByteEarlyInACappedOutputKeepsTheRest(t *testing.T) {
+	b := &cappedBuffer{max: scriptStdoutCap}
+	_, _ = b.Write(append([]byte("ok\xff"), bytes.Repeat([]byte("a"), 2*scriptStdoutCap)...))
+	got := b.text()
+	if want := scriptStdoutCap + len(scriptTruncated); len(got) != want {
+		t.Errorf("text of %d bytes, want %d (the cap and the marker)", len(got), want)
+	}
+	if !strings.HasPrefix(got, "ok\xffaaa") {
+		t.Errorf("text starts %q, want the script's bytes as written", got[:8])
+	}
+}
+
+// A script that exits 0 while a child it started still holds its stdout, with its bound passing
+// before the worker stops waiting on the pipe, is reported by its exit, not as a timeout: the
+// script finished inside its bound.
+func TestAScriptThatExitsZeroWithAChildHoldingItsOutputIsNotATimeout(t *testing.T) {
+	root, _ := scriptRoot(t)
+	p := filepath.Join(root, "linger.sh")
+	writeScript(t, p, "#!/bin/sh\nsleep 30 &\necho done\nexit 0\n", 0o755)
+	// The bound is shorter than the grace the worker gives a held pipe, so it passes while the
+	// child holds stdout, and long enough for the script to start and exit on a loaded machine.
+	timeout := scriptKillGrace * 4 / 5
+	r := execScript(context.Background(), &scriptRun{name: "linger", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: timeout}, scriptSignals{})
+	if r.timedOut || r.exitCode != 0 || r.startErr != nil || !strings.HasPrefix(r.stdout, "done") {
+		t.Errorf("timedOut %v exit %d startErr %v stdout %q; want a success by its exit", r.timedOut, r.exitCode, r.startErr, r.stdout)
+	}
+}
+
+// The directories on the path the confirm names are checked as well as the resolved file's: a
+// symlinked directory, or a group-writable one, on the named path is refused even when the file
+// it leads to passes every check.
+func TestAScriptsNamedPathsDirectoriesAreCheckedToo(t *testing.T) {
+	root, check := scriptRoot(t)
+	good := filepath.Join(root, "helpers", "watch.sh")
+	writeScript(t, good, "#!/bin/sh\necho ok\n", 0o755)
+	if err := os.Symlink(filepath.Join(root, "helpers"), filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	openDir := filepath.Join(root, "open")
+	if err := os.Mkdir(openDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(openDir, 0o775); err != nil { // past the umask
+		t.Fatal(err)
+	}
+	if err := os.Symlink(good, filepath.Join(openDir, "watch.sh")); err != nil {
+		t.Fatal(err)
+	}
+	// A named path whose own directories pass, through a symlinked file, still resolves.
+	tidy := filepath.Join(root, "tidy")
+	if err := os.Mkdir(tidy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(good, filepath.Join(tidy, "watch.sh")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := check.resolve(lib.ScriptRoot + "tidy/watch.sh"); err != nil || got != good {
+		t.Fatalf("a symlinked file in a sound directory: %q, %v; want the target", got, err)
+	}
+	for name, p := range map[string]string{
+		"a symlinked directory on the named path":      lib.ScriptRoot + "linked/watch.sh",
+		"a group-writable directory on the named path": lib.ScriptRoot + "open/watch.sh",
+	} {
+		if got, err := check.resolve(p); err == nil {
+			t.Errorf("%s: resolved to %q; want a refusal", name, got)
+		}
+	}
+}
+
+// A submission whose own trigger names a script is a script task's even when the confirm carries
+// no script and the task credential names none (or there is no credential at all): it is
+// rejected script-refused and never falls through to a model turn.
+func TestASubmissionNamingAScriptNeverRunsAsAModelTurn(t *testing.T) {
+	kp, pub := signingKey(t)
+	_, check := scriptRoot(t)
+	ran := filepath.Join(t.TempDir(), "ran")
+	harness := stub(t, "touch "+ran+"\nexit 7\n")
+	const scriptAuthority = `{"grants":{"capability":{"key":"cap-a","revision":1}},"trigger":{"name":"schedule/stall-watch","origin":"builtin","script":"stall-watch"}}`
+	for name, tc := range map[string]struct {
+		token     func(task string) string
+		authority string
+		want      string
+	}{
+		"no task credential":                    {func(string) string { return "" }, scriptAuthority, "submission's trigger"},
+		"a credential whose trigger names none": {func(task string) string { return mintProxy(t, kp, task, pwPod, "", taskcred.AudienceCredentialProxy) }, scriptAuthority, "submission's trigger"},
+		"an authority block that can't be read": {func(string) string { return "" }, `[1]`, "authority block can't be read"},
+	} {
+		token := tc.token
+		t.Run(name, func(t *testing.T) {
+			_ = os.Remove(ran)
+			url := startServer(t)
+			d := newFakeDispatcher(t, url)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			startScriptWorker(t, ctx, profileWorkerConfig(t, url, harness), ProfileWorkerConfig{OneShot: true, TaskSigningKeys: pub, scriptCheck: check})
+			task := "task-script-3"
+			origin := profileSubmission(t, task, "run the watch", map[string]string{"cluster": "prod-east"})
+			origin.Authority = []byte(tc.authority)
+			d.offer(task, origin, 5)
+			if a := d.nextAccept(5 * time.Second); !a.Accepted {
+				t.Fatalf("answer %+v, want an accept", a)
+			}
+			d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task, ProxyToken: token(task)})
+			if _, final := drainLeases(d, task, 20*time.Second); !final {
+				t.Fatal("no final renewal")
+			}
+			if got := foldTask(t, testClient(t, url), pwProfile, task); got.State != lib.StateRejected {
+				t.Errorf("state %q, want rejected", got.State)
+			}
+			if msg := terminalText(t, url, pwProfile, task); !strings.Contains(msg, "script-refused") || !strings.Contains(msg, tc.want) {
+				t.Errorf("terminal %q, want script-refused naming %q", msg, tc.want)
+			}
+			if _, err := os.Stat(ran); err == nil {
+				t.Error("the harness ran a model turn for a script task")
+			}
+		})
+	}
+}
+
+// End to end: a script that exits non-zero ends the task failed script-failed with its exit code,
+// one that runs past its bound ends it failed script-timeout, and the worker's log line for a run
+// carries the stderr's size, never its text.
+func TestAScriptsFailureAndTimeoutAreItsTerminalsAndOnlyItsStderrSizeIsLogged(t *testing.T) {
+	const sentinel = "STDERR-SENTINEL-41c9"
+	kp, pub := signingKey(t)
+	root, check := scriptRoot(t)
+	writeScript(t, filepath.Join(root, "fail.sh"), "#!/bin/sh\necho "+sentinel+" >&2\nexit 3\n", 0o755)
+	writeScript(t, filepath.Join(root, "slow.sh"), "#!/bin/sh\nsleep 30\n", 0o755)
+	harness := stub(t, "exit 7\n")
+	for _, tc := range []struct {
+		name, file string
+		want       []string
+	}{
+		{"fails", "fail.sh", []string{"reason: script-failed", "exited 3"}},
+		{"times out", "slow.sh", []string{"reason: script-timeout", "1s bound"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			url := startServer(t)
+			d := newFakeDispatcher(t, url)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg := profileWorkerConfig(t, url, harness)
+			cfg.Logger = slog.New(slog.NewTextHandler(logs, nil))
+			startScriptWorker(t, ctx, cfg, ProfileWorkerConfig{OneShot: true, TaskSigningKeys: pub, scriptCheck: check})
+			task := "task-script-4"
+			d.offer(task, profileSubmission(t, task, "run the watch", nil), 5)
+			if a := d.nextAccept(5 * time.Second); !a.Accepted {
+				t.Fatalf("answer %+v, want an accept", a)
+			}
+			d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task,
+				Script:     &lib.DispatchScript{Name: "stall-watch", Path: lib.ScriptRoot + tc.file, TimeoutSeconds: 1},
+				ProxyToken: mintProxy(t, kp, task, pwPod, "stall-watch", taskcred.AudienceCredentialProxy)})
+			if _, final := drainLeases(d, task, 20*time.Second); !final {
+				t.Fatal("no final renewal")
+			}
+			if got := foldTask(t, testClient(t, url), pwProfile, task); got.State != lib.StateFailed {
+				t.Errorf("state %q, want failed", got.State)
+			}
+			msg := terminalText(t, url, pwProfile, task)
+			for _, w := range tc.want {
+				if !strings.Contains(msg, w) {
+					t.Errorf("terminal %q, want %q in it", msg, w)
+				}
+			}
+			out := logs.String()
+			if !strings.Contains(out, "script ran") || !strings.Contains(out, "stderrBytes=") {
+				t.Errorf("no script-ran log line with the stderr's size in:\n%s", out)
+			}
+			if tc.file == "fail.sh" && !strings.Contains(out, fmt.Sprintf("stderrBytes=%d", len(sentinel)+1)) {
+				t.Errorf("the log line doesn't carry the stderr's %d bytes:\n%s", len(sentinel)+1, out)
+			}
+			if strings.Contains(out, sentinel) {
+				t.Errorf("the script's stderr text reached the log:\n%s", out)
+			}
+		})
+	}
+}
+
+// prepareScript bounds a script by its own timeout within what is left of the task's deadline,
+// and refuses one with no time left.
+func TestAScriptsBoundIsItsTimeoutWithinTheTasksDeadline(t *testing.T) {
+	kp, pub := signingKey(t)
+	root, check := scriptRoot(t)
+	writeScript(t, filepath.Join(root, "watch.sh"), "#!/bin/sh\necho ok\n", 0o755)
+	w := &profileWorker{cfg: Config{PodName: pwPod}, pw: ProfileWorkerConfig{OneShot: true, TaskSigningKeys: pub, scriptCheck: check}}
+	heldFor := func(timeoutSeconds int) *held {
+		return &held{offer: lib.DispatchMessage{TaskID: "t1"}, origin: profileSubmission(t, "t1", "x", nil),
+			proxyToken: mintProxy(t, kp, "t1", pwPod, "stall-watch", taskcred.AudienceCredentialProxy),
+			script:     &lib.DispatchScript{Name: "stall-watch", Path: lib.ScriptRoot + "watch.sh", TimeoutSeconds: timeoutSeconds}}
+	}
+	for name, tc := range map[string]struct {
+		timeoutSeconds int
+		taskDeadline   time.Duration
+		want           time.Duration
+	}{
+		"the script's timeout, inside the deadline": {2, 10 * time.Second, 2 * time.Second},
+		"the deadline, inside the script's timeout": {60, 10 * time.Second, 10 * time.Second},
+	} {
+		sr, why := w.prepareScript(heldFor(tc.timeoutSeconds), tc.taskDeadline)
+		if why != "" || sr == nil || sr.timeout != tc.want {
+			t.Errorf("%s: bound %v, refusal %q; want a bound of %s", name, boundOf(sr), why, tc.want)
+		}
+	}
+	for name, deadline := range map[string]time.Duration{"no time left": 0, "past the deadline": -time.Second} {
+		if sr, why := w.prepareScript(heldFor(60), deadline); sr != nil || !strings.Contains(why, "no time is left") {
+			t.Errorf("%s: bound %v, refusal %q; want it refused for the deadline", name, boundOf(sr), why)
+		}
+	}
+}
+
+// boundOf is a prepared run's bound, or nil for none: what a failure prints, not the run's
+// environment.
+func boundOf(sr *scriptRun) any {
+	if sr == nil {
+		return nil
+	}
+	return sr.timeout
 }

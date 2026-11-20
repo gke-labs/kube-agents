@@ -347,7 +347,7 @@ A press of a Stop button, Slack's or Google Chat's, from such a sender gets no n
 
 #### On Slack
 
-The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own.
+The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own. The exception is a task the agent delegates to an AgentProfile, since nothing else in the thread shows a profile's progress. It gets a status line of its own, `⏳ submitted… (delegated to <profile>)`. The line moves to `⚙️ working` with the profile's progress, and closes to `✅ (delegated to <profile>)` when the profile is done.
 
 #### On Google Chat and the A2A console
 
@@ -605,6 +605,8 @@ An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) c
 The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched. External inbound Bot Framework webhook ingress is not yet shipped in the operator: `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods.
 
 Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`). See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
+
+What this means for an evaluator: enabling `spec.integration.teams` gives you the outbound half only. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams does not reach the agent: Microsoft delivers it to the bot's messaging endpoint, and the install provides none. The broker's event queue that the gateway reads admits only the gateway pod, so nothing outside the install can feed a message in either.
 
 ## Proactive alerts (both channels)
 

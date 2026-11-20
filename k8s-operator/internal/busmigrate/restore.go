@@ -47,6 +47,17 @@ const restoreFinishTimeout = 10 * time.Minute
 // that gives up early holds the name against its own retries.
 const restoreStartTimeout = 30 * time.Second
 
+// restoreSettlePoll is how often WaitRestored reads the stream again.
+var restoreSettlePoll = 250 * time.Millisecond
+
+// listAssigned is AssignedDurables' read of the stream's consumer list, a
+// variable so a test can make the server's assignments lag the restore.
+var listAssigned = consumerNames
+
+// jsConsumerNotFound is the JetStream API's error code for a consumer the
+// answering server does not hold.
+const jsConsumerNotFound = 10014
+
 // Metadata is what a snapshot records beside its data: the stream's config
 // and state as the server reported them when the snapshot began.
 type Metadata struct {
@@ -398,9 +409,6 @@ func sendChunk(ctx context.Context, nc *nats.Conn, subject string, chunk []byte)
 	return nil
 }
 
-// restoreSettlePoll is how often WaitRestored reads the stream again.
-var restoreSettlePoll = 250 * time.Millisecond
-
 // DurableSpec is a restored durable consumer the settle wait reads, with
 // the replica count the raise gives it (ExpectedConsumerReplicas).
 type DurableSpec struct {
@@ -582,10 +590,6 @@ func AssignedDurables(ctx context.Context, nc *nats.Conn, stream string, restore
 	}
 }
 
-// listAssigned is AssignedDurables' read of the stream's consumer list, a
-// variable so a test can make the server's assignments lag the restore.
-var listAssigned = consumerNames
-
 // consumerNames lists a stream's consumers, page by page.
 func consumerNames(ctx context.Context, nc *nats.Conn, stream string) ([]string, error) {
 	var names []string
@@ -615,10 +619,6 @@ func consumerInfo(ctx context.Context, nc *nats.Conn, stream, name string) (*nat
 	}
 	return &info, nil
 }
-
-// jsConsumerNotFound is the JetStream API's error code for a consumer the
-// answering server does not hold.
-const jsConsumerNotFound = 10014
 
 func isConsumerNotFound(err error) bool {
 	var e *jsAPIError

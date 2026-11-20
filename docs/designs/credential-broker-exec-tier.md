@@ -636,8 +636,17 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   is kept, at worst halved, rather than undone by a retry at once. A bare non-JSON `503` is not retried: Envoy also
   answers one when the upstream reset after the request was forwarded. Nor is a dropped
   connection (`BrokerDisconnected`), because the command may have run, nor a `2xx` answer that the
-  shim cannot use (not JSON, not an object, or a field that is missing or of the wrong type), for the same reason; that
-  one is not sent to the stateful broker either. `CREDENTIAL_PROXY_BUSY` is
+  shim cannot use (not JSON, not an object, a field that is missing or of the wrong type, or an
+  `exitCode` outside -127 to 255), for the same reason; that
+  one is not sent to the stateful broker either. The broker sends the command's return code as
+  `exitCode`, so a command that a signal ended arrives as the signal's negative number: the shim
+  writes its output and exits with 128 plus the number, as a shell does. A value above 255 or
+  below -127 is no command's result, and the exit would wrap it. The shim has no guard for a
+  `stdout` or
+  `kubeconfig` string with a lone surrogate, which would end its write in a `UnicodeEncodeError`:
+  the broker decodes a command's output as UTF-8 with replacement and encodes its answer the same
+  way, so the answer holds none.
+  `CREDENTIAL_PROXY_BUSY` is
   raised only at admission, before the command starts, so a retry never runs a command twice.
 - The retry skips a refusal at the session cap, which uses the same code so that the model
   reports it and does not retry [code, `credential_proxy.py`, `SessionSlots`]. The busy reply

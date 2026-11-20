@@ -218,7 +218,9 @@ CI enforcement: `make docs-check` runs the same checks as
   once a release is tagged, every row of the upgrade page's breaking-changes
   table labelled with it must come from a commit the tag contains (or sit in the
   tag's own copy of the table). Write `pending` for a new row; it fails once a
-  release contains it, and the message names the release to write. The release job opens a pull request that relabels such rows once a release is tagged (`scripts/release/open_upgrade_relabel_pr.sh`). For a
+  release contains it, and the message names the release to write. The release job opens a pull request that relabels such rows once a release is tagged (`scripts/release/open_upgrade_relabel_pr.sh`);
+  while that release is under 48 hours old, a push to `main` or a local run
+  with no base prints the row as a warning, and fails it after. For a
   reworded shipped row or a row added after its release was tagged,
   `scripts/upgrade_table_traces.txt` names the commit that shipped the change,
   and the tag must contain that commit instead. A pull request or merge group
@@ -227,8 +229,9 @@ CI enforcement: `make docs-check` runs the same checks as
   removal needs a relabel first; while an open release candidate (a
   `staging_*` tag no release contains yet) holds the row, the text stays until
   the release is tagged. A wrong label fails a push to
-  `main` and a pull request that adds or relabels the row or edits its entry;
-  on any other pull request it is a warning. It reads the history and the
+  `main` (after the grace above, for a `pending` row) and a pull request that
+  adds or relabels the row or edits its entry; on any other pull request it is
+  a warning. It reads the history and the
   release tags, so it fails on a shallow or tagless clone; run
   `git fetch --tags --unshallow` first.
 - `docs-check-cron-inventory` — `scripts/check_cron_inventory.py`; every job on
@@ -386,7 +389,7 @@ identifier appears, add its source here.
 | Issue triage queue: the `needs-triage` label, the `priority:` label prefix it mirrors, and when each event adds or removes it | `.github/workflows/needs-triage.yml` |
 | Flaky-check tracking: the `ci:flaky` label, the watched checks and the exclusions, the sweep window and interval, the one-issue-per-container key, the never-close rule | `scripts/notify_flaky_check.py` (`WATCHED_WORKFLOWS`, `SWEEP_WINDOW_DAYS`) and `.github/workflows/flaky-check-notify.yml`; the exclusion list the contract test enforces is `FLAKY_CHECK_EXCLUDED_WORKFLOWS` in `scripts/test_integration_contracts.py` |
 | Test quarantine: the skip string, the `KA_RUN_QUARANTINED` override, the `ci:quarantined` label, the issue lines it requires, the stale-age limit, the protected paths and their approvers, the once-per-kind issue comment | `scripts/check_quarantine.py` (`MARKER_RE`, `RUN_ENV`, `LABEL`, `STALE_DAYS`, `PROTECTED_PREFIXES`, `APPROVALS_FILE`, `COMMENT_MARKER`), `hack/quarantine-approved.txt` and its `hack/OWNERS` filter and `.github/workflows/quarantine-check.yml` |
-| Reviewer auto-assign: the skip reasons, the self-approval test that widens the verdict rule and narrows the draw, the robot-account exclusion, the `/request-review` reactions, the third-round hand-off and its marker | `scripts/request_reviewers.py`, `.github/workflows/auto_request_review.yml` and `reviewers.groups` and `options.robot_accounts` in `.github/auto_request_review.yml` |
+| Reviewer auto-assign: the skip reasons, the self-approval test that widens the verdict rule and narrows the draw, the robot-account exclusion, the `/request-review` reactions, the third-round hand-off and its marker, the away list and its format | `scripts/request_reviewers.py`, `.github/workflows/auto_request_review.yml` and `reviewers.groups` and `options.robot_accounts` in `.github/auto_request_review.yml` |
 | `/retest` re-run of GitHub Actions checks: who may ask, the per-name state it reads, the whole-vs-failed-jobs rule, the attempt ceiling, the reactions | `scripts/rerun_failed_checks.py` (`RERUN_ATTEMPT_CEILING`, `REACTION_ACKNOWLEDGED`, `REACTION_DECLINED`) and the `if:` in `.github/workflows/retest-actions.yml` |
 | Broken-main tracking: the `ci:main-broken` label, the watched workflows, the one-issue-per-episode marker, the sweep interval, the dismissal, older-episode-only and whole-read rules | `scripts/notify_broken_main.py` and `.github/workflows/main-broken-notify.yml`; the required-check roster the contract test enforces is `BROKEN_MAIN_WATCHED_WORKFLOWS` in `scripts/test_integration_contracts.py`; the trigger's `main`-only filter is held by `tests/test_pull_request_concurrency.py` |
 | Release-stage tracking: the `ci:release-stage-broken` and `ci:release-stalled` labels, the watched release pipelines, the one-issue-per-workflow markers and run stamps, the stalled-chain night count (distinct UTC dates) and skip-run ceiling (`STALL_NIGHTS`, `STALL_SKIP_RUNS_MAX`), the red-cases cell and its owner mention, the sweep interval, the candidate and first-failure log patterns, the Chat message shapes | `scripts/release/notify_release_stage_broken.py` (`WATCHED_WORKFLOWS`) and `.github/workflows/release-stage-broken-notify.yml`; the roster the contract test enforces is `RELEASE_STAGE_WATCHED_WORKFLOWS` in `scripts/test_integration_contracts.py`; the Chat variables are the CI-health poster's row below |

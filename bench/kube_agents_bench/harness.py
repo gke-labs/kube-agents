@@ -82,7 +82,11 @@ Environment:
     AGENT_TRANSPORT: ``api`` (default; everything above), ``slack`` (advisory, for
         the Slack lane: a test user's post in a CI channel, read back from the
         thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
-        ``AGENT_SLACK_TIMEOUT``, 600 s unset) or ``inject``, which
+        ``AGENT_SLACK_TIMEOUT``, 600 s unset; a prompt opening with
+        ``[bench:reply-under-home-post: <marker>]`` replies under a post the agent
+        made on its own instead, its wait for the post,
+        ``BENCH_SLACK_HOME_POST_WAIT``, coming before that budget, and only this
+        transport takes it) or ``inject``, which
         hands the prompt to the agent through the A2A gateway's inject backend
         instead -- ``POST /inject`` with the prompt, then the conversation's
         transcript folded until the task's terminal, the way the gateway
@@ -156,6 +160,7 @@ import http.client
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -180,7 +185,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -2819,6 +2824,34 @@ def expand_fleet_cluster_placeholders(prompt: str) -> tuple[str, str | None]:
     return _FLEET_CLUSTER_PLACEHOLDER.sub(value, prompt), None
 
 
+# The job's GitOps repository, for a prompt that has to name it: the
+# version-control skill writes only to the repository its task names, and the
+# repository differs per pool project. Read from BENCH_GITOPS_REPO, which
+# hack/ci-eval-pr.sh exports and the forge checks read (github_writes), so the
+# prompt names the repository the checks grade. Not {{GITOPS_REPO}}: that one
+# is bench/hack/run-gitops-pilot.sh's, rendered into its own task copies.
+GITOPS_REPO_PLACEHOLDER = "{{BENCH_GITOPS_REPO}}"
+
+
+def expand_gitops_repo_placeholder(prompt: str) -> tuple[str, str | None]:
+    """``prompt`` with the job's GitOps repository written in, and the setup
+    problem, if any.
+
+    A prompt that doesn't name the placeholder is returned as it is. One that
+    does needs ``BENCH_GITOPS_REPO``; without it the run is a setup failure the
+    caller records as infrastructure, never the model's.
+    """
+    if GITOPS_REPO_PLACEHOLDER not in prompt:
+        return prompt, None
+    repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
+    if not repo or any(ch.isspace() for ch in repo):
+        return prompt, (
+            f"the case prompt names the job's GitOps repository ({GITOPS_REPO_PLACEHOLDER}), but "
+            f"{github_writes.GITOPS_REPO_ENV_VAR} is {'unset' if not repo else repr(repo)}"
+        )
+    return prompt.replace(GITOPS_REPO_PLACEHOLDER, repo), None
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run where no answer can be graded, recorded as infrastructure.
 
@@ -3005,14 +3038,47 @@ def _execute_slack(prompt: str) -> AgentResult:
         timeout = _numeric_env("AGENT_SLACK_TIMEOUT", _SLACK_DEFAULT_TIMEOUT, float)
     except ValueError as exc:
         return AgentResult.errored(str(exc))
-    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
     try:
-        exchange = turn.run(prompt, timeout)
+        home_post = slack.parse_home_post(prompt)
+        lookback = _numeric_env(slack.HOME_POST_LOOKBACK_ENV, str(slack.HOME_POST_LOOKBACK_SECONDS), float)
+        wait = _numeric_env(slack.HOME_POST_WAIT_ENV, str(slack.HOME_POST_WAIT_SECONDS), float)
+        case_start = _numeric_env(slack.CASE_START_ENV, "0", float)
+        for name, value in ((slack.HOME_POST_LOOKBACK_ENV, lookback), (slack.HOME_POST_WAIT_ENV, wait),
+                            (slack.CASE_START_ENV, case_start)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite number of seconds, at least 0")
+    except ValueError as exc:
+        return AgentResult.errored(str(exc))
+    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
+    home_ts = ""
+    search_errors: list[str] = []
+    try:
+        if home_post is None:
+            exchange = turn.run(prompt, timeout)
+        else:
+            marker, reply = home_post
+            since = case_start - slack.CASE_START_MARGIN_SECONDS if case_start else turn.wall() - lookback
+            post = turn.find_home_post(marker, since, wait, search_errors)
+            if post is None:
+                # The agent never posted what the case set it up to post: the
+                # case's failure to grade, not infrastructure.
+                return AgentResult(
+                    output="", trajectory=[], tokens={},
+                    errors=[f"slack: no top-level post of the bot's holding {marker!r} in the channel within {wait:g}s"],
+                    metadata={"transport": TRANSPORT_SLACK, "outcome": "no_home_post", "slack_home_post_marker": marker,
+                              "slack_transient_errors": len(search_errors)},
+                )
+            home_ts = str(post["ts"])
+            exchange = turn.reply_under(home_ts, reply, timeout)
     except (slack.SlackAPIError, OSError) as exc:
         return _infra_failure(f"slack: {exc}")
     timing = exchange.timing()
     then_text = os.environ.get(slack.THEN_ENV, "").strip()
-    if then_text and exchange.outcome == "settled":
+    if then_text and home_ts:
+        # A reply under the agent's post is the case's one turn; a second
+        # one would need the post's thread, not the reply's.
+        timing["slack_then_outcome"] = "skipped: a reply under a home post takes no second turn"
+    elif then_text and exchange.outcome == "settled":
         timing.update(_slack_then(turn, exchange, then_text, timeout))
     elif then_text:
         timing["slack_then_outcome"] = f"skipped: the first turn's outcome was {exchange.outcome}"
@@ -3034,9 +3100,10 @@ def _execute_slack(prompt: str) -> AgentResult:
             "outcome": exchange.outcome,
             "window_posts": len(exchange.posts),
             "slack_ask_ts": exchange.ask_ts,
+            "slack_home_post_ts": home_ts or None,
             "slack_reaction": exchange.reaction or None,
             "slack_buttons": exchange.buttons,
-            "slack_transient_errors": len(exchange.errors),
+            "slack_transient_errors": len(exchange.errors) + len(search_errors),
             **timing,
         },
     )
@@ -3192,6 +3259,8 @@ class KubeAgentsHarness(AgentHarness):
         prompt, setup_problem = expand_agent_cluster_placeholders(prompt, os.environ.get("AGENT_CLUSTER_CONTEXT"))
         if setup_problem is None:
             prompt, setup_problem = expand_fleet_cluster_placeholders(prompt)
+        if setup_problem is None:
+            prompt, setup_problem = expand_gitops_repo_placeholder(prompt)
         if setup_problem is not None:
             transcript.set("", [], prompt=prompt, started_at=started_at)
             return _infra_failure(setup_problem)
@@ -3242,6 +3311,11 @@ class KubeAgentsHarness(AgentHarness):
         if transport not in _TRANSPORTS:
             return AgentResult.errored(
                 f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
+            )
+        if transport != TRANSPORT_SLACK and prompt.lstrip().startswith(slack.HOME_POST_DIRECTIVE):
+            # Only Slack shows a post the agent made on its own to reply under.
+            return AgentResult.errored(
+                f"{slack.HOME_POST_DIRECTIVE} <marker>] needs AGENT_TRANSPORT={TRANSPORT_SLACK}, got {transport!r}"
             )
         if transport == TRANSPORT_INJECT:
             result = self._execute_inject(prompt)
@@ -4310,8 +4384,14 @@ class KubeAgentsHarness(AgentHarness):
             return "no cancel was published (see the log), so it may still be running"
 
         # The profile fields go only on a turn addressed to a profile, so every
-        # other turn is built exactly as it was before #5945.
-        addressed = {"profile": target.name, "parameters": target.parameters} if target is not None else {}
+        # other turn is built exactly as it was before #5945. The intent goes
+        # only when the directive names it (intent=confirm), so a profile turn
+        # without it is built as it was before too.
+        addressed: dict[str, Any] = (
+            {"profile": target.name, "parameters": target.parameters} if target is not None else {}
+        )
+        if target is not None and target.intent:
+            addressed["intent"] = target.intent
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
