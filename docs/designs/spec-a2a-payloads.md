@@ -1079,7 +1079,7 @@ Worked examples:
 | Subject                                       | Class   | Writer                          | Content                                                                                         |
 | --------------------------------------------- | ------- | ------------------------------- | ----------------------------------------------------------------------------------------------- |
 | `a2a.topics.agent.platform.upgrade-readiness` | state   | platform agent                  | DataPart: current per-cluster readiness verdicts                                                |
-| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent                  | DataPart: the latest `leeway.report/v1alpha1` document (per-cluster topology and rank findings) |
+| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent                  | DataPart: the latest `leeway.report/v1alpha1` document; capped when over the message limit      |
 | `a2a.topics.agent.platform.version-skew`      | state   | platform agent                  | DataPart: skew summary across the fleet                                                         |
 | `a2a.topics.shared.blueprint`                 | state   | OKF Curator (`a2a/cmd/curator`) | DataPart: active OKF digest (`kube-agents.memory.blueprint/v1`)                                 |
 | `a2a.topics.shared.annotations`               | journal | any agent                       | TextPart/DataPart: dated observations and candidate proposals (`kube-agents.memory.outcome/v1`) |
@@ -1096,6 +1096,15 @@ update happened in the course of a task, the envelope carries that task's `taskI
 `correlationId` - which is the audit thread from a user's question to the standing state it
 changed. Updates published on an agent's own schedule carry a `correlationId` minted for
 that run.
+
+`topology-skew` is one artifact, so its report must fit one bus message (NATS's 1 MiB
+`max_payload`, less 64 KiB held back for the envelope and encoding slack). A larger report
+is published capped: the fleet's most severe findings in order, up to the first that does
+not fit, each kept in its cluster; the full report's
+`summary`; and a `truncated` block counting what was left out and giving the full report's
+path on the Platform Agent's disk. When even the clusters without findings do not fit,
+`clusters` is empty and `truncated.clusters_omitted` counts them. The TextPart summary
+gains a suffix naming the cap.
 
 ### Retention classes
 

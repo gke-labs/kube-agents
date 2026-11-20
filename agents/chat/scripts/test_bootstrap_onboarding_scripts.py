@@ -4214,7 +4214,8 @@ class FirstRunAuditsTest(unittest.TestCase):
             json.dumps({"jobs": [{"id": job_id, "name": name} for job_id, name in names.items()]}), encoding="utf-8"
         )
 
-    def _resend(self, home: str, answers=None, now: float | None = None) -> list[tuple[urllib.request.Request, dict]]:
+    def _resend(self, home: str, answers=None, now: float | None = None,
+                homes: dict | None = None) -> list[tuple[urllib.request.Request, dict]]:
         """One tick of the re-send stage with the projected home channel ``home``; the relay's requests, decoded.
 
         ``answers`` is what each request gets, in order: a dict the relay answers with, or an exception to raise;
@@ -4235,12 +4236,21 @@ class FirstRunAuditsTest(unittest.TestCase):
 
         env = {bootstrap_delivery.SESSION_KV_AUTH_ENV: "kv-key", bootstrap_delivery.FINDINGS_ENDPOINT_ENV: "http://relay.test"}
         with (
-            mock.patch.object(chat_notify, "home_file_value", return_value=home),
+            mock.patch.object(chat_notify, "home_file_value",
+                              side_effect=lambda key=chat_notify.HOME_FILE_KEY: (homes or {chat_notify.HOME_FILE_KEY: home}).get(key, "")),
             mock.patch.object(urllib.request, "urlopen", urlopen),
             mock.patch.dict(os.environ, env),
         ):
             bootstrap_delivery.resend_lost_summaries(self.d, time.time() if now is None else now)
         return requests
+
+    def test_a_learned_google_chat_space_opens_the_stage_as_a_slack_channel_does(self):
+        # The gate reads every projected home: a Chat space with Slack's file
+        # empty re-sends, and with both files empty nothing is asked.
+        self._lost_first_run()
+        self.assertEqual(self._resend("", homes={chat_notify.HOME_FILE_KEY: "", chat_notify.GCHAT_HOME_FILE_KEY: ""}), [])
+        requests = self._resend("", homes={chat_notify.HOME_FILE_KEY: "", chat_notify.GCHAT_HOME_FILE_KEY: "spaces/AAA"})
+        self.assertEqual(len(requests), 1)
 
     def _stage_log(self) -> str:
         try:

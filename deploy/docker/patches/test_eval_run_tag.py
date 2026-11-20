@@ -77,10 +77,11 @@ class TagTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(eval_run_tag.enabled())
 
-    def test_the_pattern_matches_the_proxys_and_the_session_kv_servers(self):
+    def test_the_pattern_matches_the_proxys_the_publishers_and_the_session_kv_servers(self):
         repo = HERE.parents[2]
         for path, name in (
             (repo / "hack" / "replay-proxy" / "replay_proxy.py", "EVAL_RUN_RE"),
+            (repo / "hack" / "replay-proxy" / "run_attribution.py", "EVAL_RUN_RE"),
             (repo / "agents" / "platform" / "scripts" / "session_kv_server.py", "SESSION_EVAL_RUN_RE"),
         ):
             source = path.read_text()

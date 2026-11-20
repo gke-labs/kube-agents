@@ -486,6 +486,13 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/allowlist.go",
         ("EnvTargetAllowedUsersGchat", "EnvTargetAllowedUsersSlack", "func (g *Gateway) targetAllows"),
     ),
+    # Who runs at which tier (#3659), as the gateway reads it. The name
+    # crosses the module boundary from the operator's render of
+    # spec.tiers.membership; C1 pins the pair.
+    "a2a_gateway_tier_membership": Source(
+        "a2a/gateway/tier_membership.go",
+        ("EnvTierMembership", "func parseTierMembership", "func (g *Gateway) tierOf"),
+    ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
     # the chat plugin's module, and tests/test_litellm_redaction.py keeps the

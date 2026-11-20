@@ -100,6 +100,7 @@ var reasonSentences = map[string]string{
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
 	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
+	"tier-ended":                         "an administrator stopped this agent running this kind of request, which ended this one; ask again if you still need it",
 	// A confirmed change runs only in a one-pod Job of its own (#4458); the
 	// detail names the profile and tier, which are for an operator.
 	"change-needs-job": "this change has to run in a job of its own, which this agent can't start for this kind of request, so nothing was changed",
@@ -891,11 +892,23 @@ func terminalNotice(state lib.TaskState, reason string) string {
 	case lib.StateFailed:
 		return noticeWithReason(noticeFailed, noticeFailedBare, text, shaped)
 	case lib.StateCanceled:
+		// A cancel is bare: the requester asked for it. One an
+		// administrator caused says so (canceledReasonShown).
+		if canceledReasonShown[reasonToken(reason)] {
+			return noticeWithReason(noticeCanceled, noticeCanceled, text, shaped)
+		}
 		return noticeCanceled
 	case lib.StateRejected:
 		return noticeWithReason(noticeRejected, noticeRejected, text, shaped)
 	}
 	return string(state)
+}
+
+// canceledReasonShown lists the tokens a canceled terminal names in its
+// notice: cancels the requester didn't ask for. Every other cancel reads as
+// the bare noticeCanceled.
+var canceledReasonShown = map[string]bool{
+	"tier-ended": true, // dispatch.ReasonTierEnded (#5850)
 }
 
 // noticeWithReason joins a notice's prefix to the reason's text: bare when
@@ -1198,7 +1211,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, doneLine != ""), active.LineNote), rs, "")
+			// On a backend that shows task status itself, the only line is a
+			// delegated profile child's (childKeepsLine): done, it closes to
+			// the bare mark, as a line that took its answer does, rather than
+			// leaving a "completed" header above the answer for good.
+			onLine := doneLine != "" || g.showsTaskStatus(rec.Key)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		if !active.Detached && rec.fanOutPending(taskID) {

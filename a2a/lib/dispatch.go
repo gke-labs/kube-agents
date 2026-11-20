@@ -162,8 +162,10 @@ type DispatchMessage struct {
 	// keeps its pod-level grants. TaskCredential (audience nats) is what the
 	// worker presents on its task connection to the bus. ProxyToken
 	// (audience credential-proxy) confines the task to the cluster the
-	// dispatcher checked at admission, and is absent when the task names no
-	// cluster. Both name the task, its profile and tier, the pod and its UID,
+	// dispatcher checked at admission. A task that names no cluster gets
+	// none, except an unattended task a trigger started, which gets a report
+	// credential with no target that the broker holds to the audit-report
+	// routes (#5619). Both name the task, its profile and tier, the pod and its UID,
 	// and expire at the task's deadline plus a clock-skew allowance, never
 	// past the configured maximum lifetime.
 	TaskCredential string `json:"taskCredential,omitempty"`

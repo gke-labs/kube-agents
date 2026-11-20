@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -234,6 +235,9 @@ type Gateway struct {
 	// first use (triggerLimiter).
 	triggerLimiterOnce sync.Once
 	triggerLimits      *triggerRateLimiter
+	// triggerMint, when set, mints trigger run grants in place of the cap
+	// bucket's minter (tests: a mint that fails).
+	triggerMint func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error)
 	// reports keeps the notify route's posts into conversations for the
 	// replies under them (reports.go).
 	reports pushedReports
@@ -381,6 +385,9 @@ type Gateway struct {
 	// targetAllowed is Config.TargetAllowedUsers compiled for lookup: the
 	// platform agent's own lists, checked when a session asks to delegate.
 	targetAllowed targetAllowed
+	// tierMembers is the tier each listed person's AgentProfile tasks run
+	// at, by requester (tier_membership.go, #3659 Tier 2c).
+	tierMembers map[TaskRequester]capability.Tier
 	// slackAllowed and slackAllowAll gate the slack backend's identity
 	// resolution ahead of the principal map (Config.SlackAllowedUsers,
 	// case preserved: Slack member ids compare exactly).
@@ -563,6 +570,10 @@ func New(o Options) (*Gateway, error) {
 		return nil, fmt.Errorf("people keyer: %w", err)
 	}
 	targetAllowed := buildTargetAllowed(o.Config, ps)
+	tierMembers := buildTierMembers(o.Config.TierMembership, ps)
+	if len(tierMembers) > 0 {
+		log.Info("tier membership loaded", "entries", len(tierMembers))
+	}
 	for target, byBackend := range targetAllowed {
 		for b, set := range byBackend {
 			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
@@ -641,6 +652,7 @@ func New(o Options) (*Gateway, error) {
 		gchatAllowed:     gchatAllowed,
 		gchatAllowAll:    o.Config.GchatAllowAllUsers,
 		targetAllowed:    targetAllowed,
+		tierMembers:      tierMembers,
 		slackAllowed:     slackAllowed,
 		slackAllowAll:    o.Config.SlackAllowAllUsers,
 		a2aGoogleAllowed: a2aGoogleAllowed,
@@ -1632,7 +1644,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		var route *profileRoute
 		if msg.Profile != "" {
 			requester := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
-			tier, err := requesterTier(requester)
+			// Every author whose text reaches the task, this one included:
+			// a thread runs at its authors' common tier (tierFor).
+			authors, unknown, _ := delegateAuthors(rec, requester)
+			tier, err := g.tierFor(authors, unknown)
 			if err == nil {
 				route, err = g.profileRouteFor(msg.Profile, msg.Parameters, tier, lib.SubmitKindTop)
 			}
@@ -3249,6 +3264,25 @@ type taskStart struct {
 	ChangeRequested bool
 }
 
+// childKeepsLine reports whether a task keeps its rolling line on a backend
+// that shows task status itself (StatusShower): a single child delegated to
+// an AgentProfile by a session turn (#6532). The backend's own status says
+// the chain is running, but none of it carries a profile worker's progress:
+// the plan rows come from the platform agent's notices, and the worker's
+// working and progress events render only on a line. Without one the room
+// sees "delegated to <profile>" and then nothing until the answer. A child
+// to platform keeps the platform's own status; a batch child (KeepActive)
+// is left as it is, since the relay doesn't edit its line yet; and a child
+// of a profile task is left lineless, so the room never holds two live
+// lines, its parent's and its own.
+func childKeepsLine(rec *SessionRecord, ts taskStart) bool {
+	if ts.Role != taskRoleChild || ts.Route == nil || ts.KeepActive {
+		return false
+	}
+	parent, ok := rec.TaskRefFor(ts.ParentTaskID)
+	return ok && parent.Tier == ""
+}
+
 // startTask opens a turn for a human message, and returns its task id once
 // the submission is on the bus, "" otherwise (startTaskWith).
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority, route *profileRoute) string {
@@ -3414,8 +3448,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	// None on a backend that shows the task's status itself (StatusShower).
-	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
+	// None on a backend that shows the task's status itself (StatusShower),
+	// except for a task delegated to a profile (childKeepsLine).
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key) && !childKeepsLine(rec, ts)
 	// A trigger's conversation has no chat backend: no placeholder there
 	// (unpostableTrigger), for a child or a wake started on its record.
 	if !lineless && !g.unpostableTrigger(rec.Key) {
@@ -3657,6 +3692,18 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 			g.log.Warn("steer refused", "rule", rule, "taskId", active.TaskID, "conversation", rec.Key,
 				"addressee", rec.Addressee, "steerBackend", author.Backend, "steerAuthor", author.Subject)
 			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
+			return
+		}
+	}
+	// A profile task's grant was minted once, at its authors' tier: a steer
+	// from someone at another tier is refused, before the author is
+	// recorded, rather than left to reach a task that runs at a tier its
+	// author doesn't have (#3659, Tier 2c).
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" {
+		if at := g.tierOf(author); string(at) != ref.Tier {
+			g.log.Warn("steer refused", "rule", ruleSteerTier, "taskId", active.TaskID, "conversation", rec.Key,
+				"taskTier", ref.Tier, "steerTier", at, "steerBackend", author.Backend, "steerAuthor", author.Subject)
+			g.post(rec.Key, fmt.Sprintf(noticeSteerTierDiffers, ref.Tier, at))
 			return
 		}
 	}
