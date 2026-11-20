@@ -799,7 +799,7 @@ ADVICE_CEILING = (
 )
 ADVICE_FORGE = (
     "Retest once the GitHub App's hourly rate limit has reset; grading could not read GitHub, so those runs say nothing"
-    " about your change. The evals repositories share one App installation's budget (#6105)."
+    " about your change. The evals repositories of a shard share one App installation's budget (#6105)."
 )
 ADVICE_DEADLINE_KILL = (
     "Don't retest; runs are being killed at the {minutes}-minute deadline before anything is graded,"

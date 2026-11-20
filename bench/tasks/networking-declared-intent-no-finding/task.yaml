@@ -1,0 +1,111 @@
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# cloud posture: the networking SOP's declared-intent step (§2a) reads the
+# linked repositories before it reports a posture, and two peered networks
+# kept at different MTUs on purpose, declared in the GitOps repo's knowledge/
+# directory, are not a finding — the pair is listed under the ledger's
+# Declared intent section with the file's path. The case runs the scheduled
+# audit itself and grades its ledger, because that is where the step lives:
+# the audit's `finish` on an agent without the step files the posture as a
+# finding.
+#
+# Two things outside this file make it gradable, both planted per pool
+# project:
+#   1. The fixture. mtu-peer-declared (role declared-mtu-peering,
+#      bench/tf/fleet/fixtures.json): a custom-mode VPC at MTU 8896 with no
+#      subnet, peered both ways with `default` (MTU 1460), so the collector's
+#      2.4 reads the ACTIVE peering as a mismatch and files
+#      NetworkPeering/default--mtu-peer-declared. The name carries no
+#      cluster_prefix, so the note spells the same object on every project.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: mtu-packet-fragmentation, namespace: "",
+#      object: NetworkPeering/default--mtu-peer-declared} beside the other
+#      streams' items; the harness reads the frontmatter, not the prose.
+#      scripts/provision_ci_pool_project.sh seeds it.
+#
+# Domain: fleet-audits (gcp-networking-fabric-audit).
+# Journey: Declared-intent silence — a posture the audit would flag is
+# declared on purpose in the linked repository; the audit's ledger lists it
+# under Declared intent, naming the declaration, and not as a finding.
+#
+# Planted defect required: mtu-peer-declared peered with default (the
+# fleet's shipped state) plus the repository declaration above.
+# Isolation class: read-only.
+# Eligible tier: presubmit once admitted; nightly from registration.
+id: networking-declared-intent-no-finding
+name: Networking audit lists a declared peered-MTU mismatch under Declared intent, not as a finding
+owner: bradhoekstra
+prompt: >-
+  Run the GCP networking fabric audit, following the gcp-networking-fabric-audit SOP.
+expected_output: >-
+  The audit runs to its ledger. The peering between default and
+  mtu-peer-declared, kept at different MTUs by design, is listed in the
+  ledger's Declared intent section with the repository and the knowledge/
+  path of the note that declares it, and no mtu-packet-fragmentation finding
+  names it. The firewall-world-open-ingress finding on the same project is
+  still a finding.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# The seeded-fleet fixture this scenario rests on, named by ROLE rather than
+# by project (docs/designs/bench-fleet-catalog.md). Project-scoped: no
+# kubeconfig, so no check reads it by `fixture_role:`; the runner probes the
+# two networks with gcloud and hack/fleet-fixture-state.py reads both halves
+# of the peering off `networks list`.
+fixtures:
+  - declared-mtu-peering
+
+verification_spec:
+  - name: the-posture-is-not-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The finding id the audit composes for this posture ends in the object
+      # segment, which names the pair; the id folds `NetworkPeering/default--
+      # mtu-peer-declared` to `networkpeering-default-mtu-peer-declared`
+      # (every run outside [a-z0-9] becomes one hyphen). The target segment
+      # before it names the project and varies per pool project, so the id is
+      # matched on the object alone. Nothing else in this stream names the
+      # pair. The id is 76 characters plus the project id, and `_shorten_id`
+      # clips its longest segment, this object, past 100: the phrase holds
+      # whole for a project id of at most 24 characters (every pool project's
+      # is at most 20); a dev install with a longer id has to grade through
+      # `scope: finding` with `finding_check` instead.
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      scope: finding_ids
+      forbidden_phrases: ["networkpeering-default-mtu-peer-declared"]
+  - name: the-undeclared-fault-is-still-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The declaration names one peering. A run that lists no
+      # firewall-world-open-ingress finding declared more than the note did,
+      # or never ran the check; on the seeded fleet the fault left is the
+      # world-open-2379 rule (role world-open-ingress), which no declaration
+      # may move. The trailing dot keeps the match on a finding id.
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      scope: finding_ids
+      required_phrases: ["firewall-world-open-ingress."]
+  - name: the-ledger-names-the-declaration
+    role: objective
+    mode: assert
+    check:
+      # The Declared intent table carries the object as
+      # `NetworkPeering/default--mtu-peer-declared` and the `repo:path`
+      # pointer of the note. The object spelling appears only in a finding's
+      # detail or a Declared intent row, and the first check rules the finding
+      # out.
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      required_phrases:
+        [
+          "## Declared intent",
+          "NetworkPeering/default--mtu-peer-declared",
+          "notification-relay-no-pdb.md",
+        ]

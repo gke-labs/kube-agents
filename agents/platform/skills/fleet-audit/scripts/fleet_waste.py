@@ -1248,9 +1248,12 @@ def _monitoring_command(project: str, requests: list[dict]) -> str:
 
     The read is an HTTPS GET with no argv of its own, and `finish` accepts a
     `checks_run` command only if it names an inspection binary, so the label
-    is the `curl` that issues the same requests outside the sandbox, one per
-    metric, each with every parameter the collector sent but the page size.
-    A list value repeats its key, as `requests` encodes it.
+    is the `curl` that issues the same requests outside the sandbox on the
+    commercial domain, one per metric, each with every parameter the collector
+    sent but the page size. A list value repeats its key, as `requests`
+    encodes it. The URL is the commercial one the collector holds: when the
+    environment names a custom universe domain, the relay client sends the
+    read to that domain's host, and the label does not.
     """
     url = MONITORING_TIMESERIES_URL.format(project=project)
     curls = []

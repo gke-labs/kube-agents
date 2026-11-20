@@ -30,7 +30,7 @@ agents/platform/governance/cluster_inventory_audit_sop.md unpaged-list 1 names t
 agents/platform/governance/compliance_audit_sop.md unpaged-list 3 the compliance audit's Config Connector and Config Sync (RootSync, RepoSync) reads per cluster, CRDs outside the paged collections
 agents/platform/governance/fleet_wide_cost_analysis_sop.md multi-kind-dump 2 the cost SOP's fifteen-kind dump per cluster and the Deployment-and-StatefulSet read the age check joins against
 agents/platform/governance/fleet_wide_cost_analysis_sop.md unpaged-list 7 the Pod, PVC and Job reads the cost SOP's checks join against the dump
-agents/platform/governance/obtainability_audit_sop.md multi-kind-dump 1 the obtainability audit's thirteen-kind dump per cluster
+agents/platform/governance/obtainability_audit_sop.md multi-kind-dump 1 the obtainability audit's fourteen-kind dump per cluster
 agents/platform/governance/obtainability_audit_sop.md unpaged-list 1 the obtainability audit's ComputeClass read
 agents/platform/governance/stockout_prevention_sop.md multi-kind-dump 2 the stockout SOP's dump of ComputeClasses, workloads and StorageClasses, and the ComputeClass check's own read
 agents/platform/governance/stockout_prevention_sop.md unpaged-list 1 the ComputeClass read the checks_run example shows as its command

@@ -36,9 +36,10 @@ on that interpreter. It is not a required check, so it holds no merge, but a red
 workflow run and files a main-broken issue like any other job in it.
 
 **The installer test files also run on bash 3.2.** `installer-tests-bash-floor.yml` runs
-`make test-python`, narrowed to the installer test files and the tests of
-`scripts/dev/repeat_under_load.sh`, on the macOS runner with `/bin/bash` 3.2 first on `PATH`, when a
-pull request or a push to `main` changes a file those tests read. It is not a required check.
+`make test-python`, narrowed to the installer test files, the tests of
+`scripts/dev/repeat_under_load.sh` and the helm retry tests of `hack/ci-deploy.sh`, on the macOS
+runner with `/bin/bash` 3.2 first on `PATH`, when a pull request or a push to `main` changes a file
+those tests read. It is not a required check.
 
 **`bench/tasks/` and `bench/cuj/` both drive an agent, and they are the two most confusable rows.**
 The difference is who supplies the failure and who owns the environment.
@@ -169,7 +170,8 @@ a build —
 and `make bench-case-check` checks it in about a second before you push. The target itself
 runs in no workflow: `scripts/test_task_registration.py` calls the same validator and
 asserts it returned no findings, and that lint is what gates, through `PYTHON_TEST_DIRS`
-and `python-tests.yml`. Read the contract before writing a case;
+and `python-tests.yml`; the one rule that needs the harness's parser gates through
+`bench/tests/test_case_entries_load.py`. Read the contract before writing a case;
 [`bench/CUSTOM-TASKS.md`](../bench/CUSTOM-TASKS.md) is the walkthrough that sits under it.
 
 ## The trap that spans every tier
