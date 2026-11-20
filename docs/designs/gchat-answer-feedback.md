@@ -1,15 +1,15 @@
 # Google Chat: rate the final answer, as on Slack
 
 Design for [#2732](https://github.com/gke-labs/kube-agents/issues/2732), the next step of the
-Google Chat next-mode parity work after the keyed home threads of #4390 and the DM thread per ask
+Google Chat gateway parity work after the keyed home threads of #4390 and the DM thread per ask
 of #4687 ([`gchat-dm-thread-per-ask.md`](gchat-dm-thread-per-ask.md)). It changes the A2A
-gateway under `spec.mode: next`: the Google Chat adapter draws the answer-feedback mark that the
+gateway: the Google Chat adapter draws the answer-feedback mark that the
 gateway already sets, takes the tap, and asks for the note a 👎 may carry, and the `PlatformAgent`
 gains the switch that turns it off on a Google Chat install.
 
 ## Intent
 
-Under `next` on Slack, the final answer of every ask ends with 👍 and 👎
+On Slack through the A2A gateway, the final answer of every ask ends with 👍 and 👎
 ([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "Answer feedback"). A tap is counted,
 keeps the question and the answer in the `feedback` bucket for thirty days so an operator can
 turn the exchange into an eval case, and a 👎 opens a box for a one-line note. On Google Chat
@@ -197,7 +197,7 @@ only. The CRD field pages and the upgrade page's row for the next release name t
 
 ## Acceptance, as a live run on gkedemos
 
-gkedemos runs `next` with Google Chat on the gateway and a `feedback` bucket with a TTL. With the
+gkedemos runs with Google Chat on the gateway and a `feedback` bucket with a TTL. With the
 branch's gateway image swapped in (the operator's `A2A_GATEWAY_IMAGE` override):
 
 1. Ask a question in the app's DM. The answer, in its thread, ends with 👍 and 👎 after any

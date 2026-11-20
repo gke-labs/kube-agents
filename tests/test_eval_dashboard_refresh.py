@@ -262,11 +262,11 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("1 releases", proc.stdout + proc.stderr)
         data = json.loads((self.target / "data.json").read_text())
-        self.assertEqual([r["rc_tag"] for r in data["releases"]], ["staging_2609092307_5b5ad10"])
+        self.assertEqual([r["rc_tag"] for r in data["releases"]], ["staging_2609092307_0707070"])
         # The Brief's release table renders from brief.json, which the
         # pipeline bakes into index.html and publishes beside it.
-        self.assertIn("staging_2609092307_5b5ad10", (self.target / "brief.json").read_text())
-        self.assertIn("staging_2609092307_5b5ad10", (self.target / "index.html").read_text())
+        self.assertIn("staging_2609092307_0707070", (self.target / "brief.json").read_text())
+        self.assertIn("staging_2609092307_0707070", (self.target / "index.html").read_text())
         self.assertFalse((self.target / "legacy.html").exists(), "the legacy page is retired")
 
     def test_second_run_merges_with_the_published_prior(self):

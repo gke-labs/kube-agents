@@ -1415,6 +1415,14 @@ platformAgent:
       #   requests:
       #     cpu: 150m
       #     memory: 384Mi
+      # defaultRoute is where the A2A gateway sends a plain conversation's first
+      # message: platform to the Platform Agent, session to a session pod of the
+      # conversation's own. Unset means platform; a later release flips the
+      # default to session. The Platform Agent stays reachable by handle either
+      # way. A change rolls the gateway and the Platform Agent pod. Against a
+      # PlatformAgent CRD that predates the field the chart fails; apply crds/
+      # first (upgrade.sh does).
+      # defaultRoute: platform
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
@@ -1557,6 +1565,14 @@ platformAgent:
     # while this key is above 0. The site's chatops page, "Limiting the open
     # triage pull requests", has the rules.
     incidentMaxOpenPullRequests: 0
+    # Eval installs only: true renders KUBEAGENTS_EVAL_RUN_TAGS=1 into
+    # spec.deployment.env. The agent then tags each model request with the eval
+    # run, case and repetition it serves, in HTTP headers the replay proxy logs
+    # and strips; nothing the model reads changes. Leave it false anywhere a
+    # replay proxy is not in front of LiteLLM. A literal entry with the same
+    # name in env above wins; a valueFrom entry with this key true fails the
+    # render, since the operator drops valueFrom entries.
+    evalRunTags: false
     # The event watcher's tuning settings. Each key that you set becomes one
     # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
     # the agent-api-auth container, which runs the watcher. A key that you do
@@ -2130,7 +2146,7 @@ plugins:
 # Service with the agent's API_SERVER_KEY, which stays in the pod. It is
 # reachable only through `kubectl port-forward`: the Service is always
 # ClusterIP and a NetworkPolicy refuses ingress from every other pod. See
-# docs/site/src/content/docs/deploy/web-console.md.
+# docs/site/src/content/docs/deploy/web-console.mdx.
 webConsole:
   enabled: false
   # GET /api/environment and PlatformAgent state: versions, install and

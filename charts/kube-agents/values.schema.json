@@ -1463,6 +1463,10 @@
                   "type": "integer",
                   "enum": [1, 3]
                 },
+                "defaultRoute": {
+                  "type": "string",
+                  "enum": ["session", "platform"]
+                },
                 "admission": {
                   "type": "object",
                   "additionalProperties": false,
@@ -1716,6 +1720,9 @@
               "type": ["integer", "null"],
               "minimum": 0,
               "maximum": 86400
+            },
+            "evalRunTags": {
+              "type": "boolean"
             },
             "credentialProxy": {
               "type": "object",

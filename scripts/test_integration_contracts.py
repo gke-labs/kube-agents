@@ -223,6 +223,18 @@ class SpecToolRegistryTest(unittest.TestCase):
         ("gke", "list_k8s_events"),
         ("gke", "get_k8s_logs"),
         ("gke", "get_k8s_rollout_status"),
+        # list-gitops-repos: read-only GKE MCP discovery tools forbidden on a
+        # managed-repo inventory ask (documented in gke-basics/references/mcp-usage.md).
+        ("gke", "check_k8s_auth"),
+        ("gke", "get_cluster"),
+        ("gke", "get_k8s_cluster_info"),
+        ("gke", "get_k8s_version"),
+        ("gke", "get_node_pool"),
+        ("gke", "get_operation"),
+        ("gke", "list_clusters"),
+        ("gke", "list_k8s_api_resources"),
+        ("gke", "list_node_pools"),
+        ("gke", "list_operations"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",

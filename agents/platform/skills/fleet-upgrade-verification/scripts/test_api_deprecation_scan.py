@@ -16,6 +16,32 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 import api_deprecation_scan as scan  # noqa: E402
 
+# The deepest document the search of `nested_past_the_parser` tries: 2 MiB of brackets.
+DEEPEST_DOCUMENT_TRIED = 1 << 20
+# Why a test skips when the search of `nested_past_the_parser` finds no document.
+NO_DOCUMENT_REFUSED = "the JSON parser of this Python parses %d levels, the deepest that this test tries"
+
+
+def nested_past_the_parser(levels, most):
+    """A JSON array nested `levels` deep or deeper that `json.loads` refuses for its
+    depth on this run, or None when one of `most` levels still parses.
+
+    The parser's depth limit is the interpreter's: about 10,000 levels on Python
+    3.12 and 3.13, and on 3.14 as many as the stack holds (more than 100,000
+    with a 16 MB stack). So no fixed depth is past it on every run.
+    """
+    depth = levels
+    while True:
+        text = "[" * depth + "]" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        if depth >= most:
+            return None
+        depth = min(2 * depth, most)
+
+
 PDB_V1BETA1 = b"apiVersion: policy/v1beta1\nkind: PodDisruptionBudget\nmetadata:\n  name: web-pdb\n"
 CRONJOB_V1BETA1 = b"apiVersion: batch/v1beta1\nkind: CronJob\nmetadata:\n  name: nightly\n"
 CRONJOB_V1 = b"apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: hourly\n"
@@ -234,8 +260,13 @@ class ParseManifestsTest(unittest.TestCase):
         docs, reason = scan.parse_manifests("d.yaml", b"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  annotations:\n    reviewed: 2001-02-30\n")
         self.assertEqual(docs, [])
         self.assertTrue(reason.startswith("YAML did not parse: ValueError"), reason)
-        nested = b"[" * 20000 + b"]" * 20000
-        docs, reason = scan.parse_manifests("deep.json", nested)
+        nested = nested_past_the_parser(20000, DEEPEST_DOCUMENT_TRIED)
+        if nested is None:
+            self.skipTest(NO_DOCUMENT_REFUSED % DEEPEST_DOCUMENT_TRIED)
+        # The loader refuses it: the walk, which gives the same reason, does not run.
+        with patch.object(scan, "_documents_of") as walk:
+            docs, reason = scan.parse_manifests("deep.json", nested.encode())
+        walk.assert_not_called()
         self.assertEqual(docs, [])
         self.assertTrue(reason.startswith("JSON did not parse"), reason)
 
