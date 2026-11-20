@@ -9,12 +9,14 @@
 # uses that one. Graded exactly like the named case: the pull request the
 # reply names, its diff the budget file alone, and the cluster unchanged.
 #
-# RED ON THE PERSONA BEFORE #6389's SKILL LINE. The skill used to say "if the
-# task names none, say so in your answer and stop", so the worker stops
-# without a pull request and the first objective fails: that is the case's
-# red, not infrastructure. On an install managing more than one repository
-# the skill still stops (it may not guess), so the case needs a lane whose
-# install manages exactly one.
+# REGRESSION COVERAGE, NOT A RED. The behaviour shipped with #6411's vcs.py
+# (identity with no repository answers the managed list on a profile worker),
+# and on 2026-11-20 the case passed on main's persona too, although that
+# skill still said "if the task names none, say so in your answer and stop":
+# the model followed the tool. #6389's skill line makes the text say what the
+# tool does; this case keeps the behaviour from regressing. On an install
+# managing more than one repository the skill stops (it may not guess), so
+# the case needs a lane whose install manages exactly one.
 #
 # TRANSPORT and isolation: as cluster-profile-confirmed-pdb-pull-request (inject
 # only, `intent=confirm`, one write to the eval GitOps repository in the

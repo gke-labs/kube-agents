@@ -1134,8 +1134,8 @@
 # (#6389): the same confirmed PodDisruptionBudget pull request as the case
 # above with the repository left unnamed, so the persona asks `identity` with
 # no repository and uses the install's one managed repository. Graded the
-# same way. Red on main's persona, whose skill stopped on an unnamed
-# repository. Pool installs manage exactly one repository (hack/ci-deploy.sh:
+# same way. Regression coverage: it passed on main's persona too (the
+# behaviour shipped with #6411). Pool installs manage exactly one repository (hack/ci-deploy.sh:
 # one forge and one GitOps repository per leased project).
 ./tasks/cluster-profile-finds-the-managed-repository/task.yaml
 

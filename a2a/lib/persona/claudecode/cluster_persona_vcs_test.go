@@ -350,11 +350,12 @@ func TestPlainWordsRefusalMatchesTheBrokersRule(t *testing.T) {
 	}
 }
 
-// The skill tells the model to work on the repository the task names, never
-// a guessed one, and to stop at a refusal rather than probe for another verb
-// or repository. Nothing in a profile worker lists the managed repositories,
-// so without these a model asked for a change spends its turns guessing
-// names the broker refuses. It also keeps a task's writes on the branch and
+// The skill tells the model to work on the repository the task names, or,
+// when it names none, to ask `identity` with no repository for the managed
+// list and use the one the task means (#6389), never a guessed one; and to
+// stop at a refusal rather than probe for another verb or repository.
+// Without these a model asked for a change spends its turns guessing names
+// the broker refuses. It also keeps a task's writes on the branch and
 // pull request that task opened: the permit is not tied to one proposal, so
 // the broker would admit an update to another of the install's own.
 func TestTheVersionControlSkillUsesTheNamedRepositoryAndStopsAtARefusal(t *testing.T) {
