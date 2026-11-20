@@ -7577,6 +7577,19 @@ class SlackRelay:
         return {"receipt": receipt, **event}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled event: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the event too, and spends the
+        receipt. Nothing retries a failed nack: the gateway nacks once and
+        moves on, and ``pull`` hands out queue entries only, so an event held
+        back here would sit in the receipt table until the pod restarts,
+        never delivered, and the table would grow by one each time. Dropping
+        it loses the same message and leaves nothing behind. The case needs
+        the slot the pull freed to be refilled before the nack: one arrival
+        if the queue was already full, SLACK_EVENT_QUEUE_MAXSIZE if it was
+        empty. A gateway that keeps pulling makes either rare; the warning
+        is the record when it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7585,8 +7598,9 @@ class SlackRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Slack event queue is full; cannot requeue event")
-                    return False
+                    LOGGER.warning(
+                        "Slack event queue is full; the nacked event is dropped, not requeued"
+                    )
             del self._receipts[receipt]
             return True
 
@@ -7954,6 +7968,21 @@ class TeamsRelay:
         return {"event": event, "receipt": receipt}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled activity: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the activity and its attempt
+        count, and spends the receipt, as a nack past
+        TEAMS_MAX_DELIVERY_ATTEMPTS does. Nothing retries a failed nack: the
+        gateway nacks once and moves on, and ``pull`` hands out queue entries
+        only, so an activity held back here would sit in the receipt table
+        until the pod restarts, never delivered, and the table and the
+        attempt map would grow by one each time. Dropping it loses the same
+        message and leaves nothing behind. The case needs the slot the pull
+        freed to be refilled before the nack: one arrival if the queue was
+        already full, TEAMS_EVENT_QUEUE_MAXSIZE if it was empty. A gateway
+        that keeps pulling makes either rare; the warning is the record when
+        it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7972,9 +8001,12 @@ class TeamsRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Teams event queue is full; cannot requeue activity")
-                    return False
-                self._attempts[event_key] = attempts + 1
+                    self._attempts.pop(event_key, None)
+                    LOGGER.warning(
+                        "Teams event queue is full; the nacked activity is dropped, not requeued"
+                    )
+                else:
+                    self._attempts[event_key] = attempts + 1
             else:
                 self._attempts.pop(event_key, None)
             del self._receipts[receipt]

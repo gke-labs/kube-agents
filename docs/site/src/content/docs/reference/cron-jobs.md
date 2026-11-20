@@ -76,6 +76,18 @@ Two environment variables are its per-install configuration, set through the cha
 
 The form URL is not configurable. `enabled: false` on the roster entry is the fleet-wide switch, as for every other job.
 
+`leeway-watch` posts topology and ComputeClass rank findings from its daily sweep. Five environment variables set which findings it posts and how often it posts an open one again. Set them through the chart value `platformAgent.deployment.env`, the same way as the feedback prompt's two above.
+
+| Variable                             | Default | Meaning                                                                                                                                   |
+| ------------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `LEEWAY_WATCH_MIN_SEVERITY`          | `info`  | the lowest severity posted: `info`, `warning` or `critical`                                                                               |
+| `LEEWAY_WATCH_MIN_DRIFT`             | `0`     | the lowest drift score (0–1) a topology finding needs                                                                                     |
+| `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`  | `0`     | the lowest share of a workload's pods in its fullest zone (0–1) a topology finding needs                                                  |
+| `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR` | `1`     | how many replicas (0–10000) past the most even spread possible a skew with no identified cause needs; `0` posts even the most even spread |
+| `LEEWAY_WATCH_REFRESH_DAYS`          | `7`     | days before a finding still open is posted again (1–365)                                                                                  |
+
+A zone that takes no pods is posted whatever the drift, share and floor thresholds say, though `LEEWAY_WATCH_MIN_SEVERITY` still applies to it. A workload confined to one zone by its node selector skips `LEEWAY_WATCH_MIN_DRIFT` only. A value that does not parse or is out of range is ignored and the default applies. A finding a threshold holds back is not reported as cleared.
+
 ## The shipping jobs
 
 Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) and [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json). Retired ids are omitted. An id on its way out ships switched off for a release before it is deleted. A disabled entry on the Platform Agent's roster is left out of this table rather than listed as a job an operator could reach. See [The retired jobs](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs).
