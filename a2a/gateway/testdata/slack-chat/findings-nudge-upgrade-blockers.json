@@ -15,7 +15,7 @@
                 "type": "text"
               },
               {
-                "text": " · 4 open across 2 clusters",
+                "text": " · 4 open issues covering 4 objects on 2 clusters",
                 "type": "text"
               }
             ],
@@ -233,11 +233,11 @@
                 "action_id": "kage.choice.1",
                 "text": {
                   "emoji": true,
-                  "text": "See all 4 items",
+                  "text": "See next 2",
                   "type": "plain_text"
                 },
                 "type": "button",
-                "value": "See all 4 items"
+                "value": "See next 2 open issues, from the list saved with this message"
               },
               {
                 "action_id": "kage.link.0",

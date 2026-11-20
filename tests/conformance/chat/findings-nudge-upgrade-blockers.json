@@ -130,7 +130,7 @@
       "chat": {
         "schema": "kube-agents.chat/v1",
         "headline": "2 critical issues will delay or block cluster upgrades",
-        "note": "· 4 open across 2 clusters",
+        "note": "· 4 open issues covering 4 objects on 2 clusters",
         "tone": "critical",
         "rows": [
           {
@@ -180,7 +180,8 @@
             "primary": true
           },
           {
-            "text": "See all 4 items"
+            "text": "See next 2",
+            "reply": "See next 2 open issues, from the list saved with this message"
           }
         ],
         "links": [

@@ -69,6 +69,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -227,8 +228,15 @@ HEADLINE_BLOCKING = (
     "{count} open issues are pausing new findings",
 )
 
-NOTE_OPEN_ACROSS = "· {open_count} open across {clusters}"
-NOTE_OPEN_ONLY = "· {open_count} open"
+# The count beside the headline is of issues (a check on a cluster); it says how
+# many objects those cover, so "40" is not read against a queue of 449 rows.
+NOTE_OPEN_ACROSS = "· {issues} covering {objects} on {clusters}"
+NOTE_OPEN_ONLY = "· {issues} covering {objects}"
+# Without the queue's rows there is no object count to give.
+NOTE_OPEN_ACROSS_PLAIN = "· {open_count} open across {clusters}"
+NOTE_OPEN_ONLY_PLAIN = "· {open_count} open"
+OPEN_ISSUE_NOUN = ("open issue", "open issues")
+OBJECT_NOUN = ("object", "objects")
 NOTE_SINGLE_CLUSTER = "· {cluster}"
 NOTE_MULTI_CLUSTER = "· across {clusters}"
 
@@ -242,7 +250,17 @@ FIX_SINGLE_LABEL = "Fix issue"
 FIX_FIRST_LABEL = "Fix first issue"
 REVIEW_SINGLE_LABEL = "Review item"
 REVIEW_FIRST_LABEL = "Review first item"
-SEE_ALL_LABEL = "See all {count} items"
+# The button asks for the next issues by rank, and the answer is saved with the
+# message: the lines below go into the thread's stored note when the message is
+# built, so answering a press needs no fetch of the queue's rows (a queue of 40
+# issues is 449 rows, and listing those took an agent turn of several minutes).
+SEE_NEXT_LABEL = "See next {count}"
+SEE_NEXT_REPLY = "See next {count} open issues, from the list saved with this message"
+NEXT_ITEMS_MAX = 10
+NEXT_ITEMS_HEADER = '[Next {count} open issues, for the "See next {count}" button]'
+NEXT_ITEM_LINE = "- {severity} · {summary}"
+NEXT_ITEMS_REST = "{rest} more open after these; the message's queue breakdown counts them by cluster."
+NEXT_ITEMS_LAST = "These are all the open issues the message did not show."
 BACKLOG_LINK_LABEL = "Open backlog"
 BACKLOG_TEXT_LINE = "Open backlog: {url}"
 CHOICE_REPLY_FORMAT = "{label}: {summary}"
@@ -657,15 +675,23 @@ def _headline(added_critical: list, reminded: list, added_other: list, blocking:
     return HEADLINE_BLOCKING[count != 1].format(count=count)
 
 
-def _note(open_actionable: int, surfaced_count: int, clusters: list[str]) -> str:
+def _note(open_actionable: int, surfaced_count: int, clusters: list[str], objects: int = 0) -> str:
     unique = list(dict.fromkeys(c for c in clusters if c))
     if open_actionable > surfaced_count:
+        if objects:
+            issues = _plural(open_actionable, *OPEN_ISSUE_NOUN)
+            covered = _plural(objects, *OBJECT_NOUN)
+            if unique:
+                return NOTE_OPEN_ACROSS.format(
+                    issues=issues, objects=covered, clusters=_plural(len(unique), *CLUSTER_NOUN)
+                )
+            return NOTE_OPEN_ONLY.format(issues=issues, objects=covered)
         if unique:
-            return NOTE_OPEN_ACROSS.format(
+            return NOTE_OPEN_ACROSS_PLAIN.format(
                 open_count=open_actionable,
                 clusters=_plural(len(unique), *CLUSTER_NOUN),
             )
-        return NOTE_OPEN_ONLY.format(open_count=open_actionable)
+        return NOTE_OPEN_ONLY_PLAIN.format(open_count=open_actionable)
     if len(unique) == 1:
         return NOTE_SINGLE_CLUSTER.format(cluster=unique[0])
     if len(unique) > 1:
@@ -768,6 +794,27 @@ def _queue_fold(
     return fold, remaining_critical
 
 
+def _next_items(rows: list[dict], surfaced_keys: set[tuple], ambiguous: frozenset[str]) -> tuple[list[str], int]:
+    """The next issues by rank that the message does not show, one plain line each, and how many more follow.
+
+    A line has the form of a row's own: severity, workload, objects covered,
+    cluster, short title. No table, so it reads the same in Slack and in Google Chat.
+    """
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        if fq.rolled_up(row):
+            continue
+        key = fq.item_key(row)
+        if key not in surfaced_keys:
+            grouped.setdefault(key, []).append(row)
+    lines = []
+    for index, (key, members) in enumerate(list(grouped.items())[:NEXT_ITEMS_MAX], start=1):
+        item = SimpleNamespace(key=key, members=members, covers=len(members))
+        entry = format_item(index, ROLE_NEW, item, ambiguous=ambiguous)
+        lines.append(NEXT_ITEM_LINE.format(severity=entry.severity, summary=entry.reply_summary))
+    return lines, max(0, len(grouped) - len(lines))
+
+
 def has_items(plan: fq.PacingPlan, daily: bool) -> bool:
     """Return True when ``plan`` has at least one finding to surface on this run."""
     return bool(plan.add or (daily and (plan.remind or plan.blocking)))
@@ -813,7 +860,8 @@ def build_nudge(
         if not fq.rolled_up(row) and cluster_label(row, ambiguous)
     ]
     headline = _headline(added_critical, reminded, added_other, blocking)
-    note = _note(open_actionable, len(tagged), all_clusters)
+    objects = sum(1 for row in rows if not fq.rolled_up(row)) if rows is not None else 0
+    note = _note(open_actionable, len(tagged), all_clusters, objects)
 
     fold: dict | None = None
     remaining_critical = 0
@@ -849,14 +897,20 @@ def build_nudge(
         primary_label = FIX_SINGLE_LABEL if len(formatted) == 1 else FIX_FIRST_LABEL
 
     choices = [primary_label]
-    if remaining > 0:
-        choices.append(SEE_ALL_LABEL.format(count=open_actionable))
     replies = {
         primary_label: CHOICE_REPLY_FORMAT.format(
             label=primary_label,
             summary=formatted[0].reply_summary,
         )
     }
+    next_lines: list[str] = []
+    next_rest = 0
+    if remaining > 0 and rows is not None:
+        next_lines, next_rest = _next_items(rows, surfaced_keys, ambiguous)
+    if next_lines:
+        see_next = SEE_NEXT_LABEL.format(count=len(next_lines))
+        choices.append(see_next)
+        replies[see_next] = SEE_NEXT_REPLY.format(count=len(next_lines))
 
     clean_backlog = backlog_url.strip() if backlog_url and backlog_url.strip().startswith(HTTP_SCHEMES) else ""
     links = [[BACKLOG_LINK_LABEL, clean_backlog]] if clean_backlog else []
@@ -875,6 +929,11 @@ def build_nudge(
         f"{fallback_text}\n\n{METADATA_HEADER}\n"
         + "\n".join(entry.metadata_line for entry in formatted)
     )
+    if next_lines:
+        closing = NEXT_ITEMS_REST.format(rest=next_rest) if next_rest else NEXT_ITEMS_LAST
+        thread_context += (
+            f"\n\n{NEXT_ITEMS_HEADER.format(count=len(next_lines))}\n" + "\n".join(next_lines) + f"\n{closing}"
+        )
     tone = (
         chat_message.TONE_CRITICAL
         if any(entry.severity == CRITICAL_SEVERITY for entry in formatted)

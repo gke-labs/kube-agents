@@ -2,7 +2,7 @@
   {
     "expected": 0,
     "carrier": "notify",
-    "text": "*2 critical issues will delay or block cluster upgrades* · 4 open across 2 clusters\n\n- `critical` *kube-system/istiod* on `prod-central` — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected) · Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replica) so the budget can be honoured.\n- `critical` *prod-central* — A Node object outlives its virtual machine: this cluster blocks the upgrade · The recommendation names a command, which is not shown here.\n\n2 more issues are open (1 critical, 1 lower priority).\n\n*Queue breakdown (2 more open)*\n```\nCluster      | Critical | Major | Minor | Next open issue\n-------------+----------+-------+-------+--------------------------------------------------------------------------------\nprod-central | 1        | 0     | 0     | billing/invoice-worker: mounts a static GCP key\nprod-europe  | 0        | 1     | 0     | validatingwebhookconfiguration/authz/gate.authz.example: A fail-closed webhook…\n```",
+    "text": "*2 critical issues will delay or block cluster upgrades* · 4 open issues covering 4 objects on 2 clusters\n\n- `critical` *kube-system/istiod* on `prod-central` — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected) · Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replica) so the budget can be honoured.\n- `critical` *prod-central* — A Node object outlives its virtual machine: this cluster blocks the upgrade · The recommendation names a command, which is not shown here.\n\n2 more issues are open (1 critical, 1 lower priority).\n\n*Queue breakdown (2 more open)*\n```\nCluster      | Critical | Major | Minor | Next open issue\n-------------+----------+-------+-------+--------------------------------------------------------------------------------\nprod-central | 1        | 0     | 0     | billing/invoice-worker: mounts a static GCP key\nprod-europe  | 0        | 1     | 0     | validatingwebhookconfiguration/authz/gate.authz.example: A fail-closed webhook…\n```",
     "widgets": [
       {
         "buttonList": {
@@ -33,7 +33,7 @@
                   "parameters": [
                     {
                       "key": "reply",
-                      "value": "See all 4 items"
+                      "value": "See next 2 open issues, from the list saved with this message"
                     },
                     {
                       "key": "choice",
@@ -42,7 +42,7 @@
                   ]
                 }
               },
-              "text": "See all 4 items"
+              "text": "See next 2"
             },
             {
               "onClick": {
