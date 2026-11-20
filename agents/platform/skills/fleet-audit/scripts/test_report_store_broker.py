@@ -704,12 +704,15 @@ class TestSeed(BrokerTestCase):
         self.assertNotIn(("PUT", f"{PREFIX}/{AUDIT}/{KEY}/latest"), self.broker.calls("PUT"))
         self.assertIn("latest not copied", self.logged[-1])
 
-    def test_a_stream_the_broker_holds_is_not_seeded(self):
+    def test_a_stream_a_run_wrote_first_still_takes_the_older_history(self):
+        """A run that wrote through the broker before this shell seeded (a
+        profile worker) keeps its latest; the local history goes in under it."""
         directory = self.plant_local()
-        self.put_remote(9)
-        self.store(str(self.local)).read_latest(AUDIT, REPO)
-        self.assertEqual([], self.broker.calls("PUT"))
-        self.assertFalse((directory / report_status.SEED_MARKER_NAME).exists())
+        newer = self.put_remote(9)
+        self.assertEqual(newer, self.store(str(self.local)).read_latest(AUDIT, REPO))
+        self.assertEqual([self.run_put(n) for n in range(3)], self.broker.calls("PUT"))
+        self.assertEqual(newer, self.broker.stream(AUDIT, KEY)["latest"])
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
 
     def test_a_refused_stream_is_skipped_and_logged(self):
         directory = self.plant_local()
@@ -879,6 +882,121 @@ class TestSeed(BrokerTestCase):
 
     def remote_runs(self) -> dict:
         return self.broker.stream(AUDIT, KEY)["runs"]
+
+    def run_put(self, n: int) -> tuple[str, str]:
+        return ("PUT", f"{PREFIX}/{AUDIT}/{KEY}/runs/{self.stamp(n)}")
+
+    @staticmethod
+    def stamp(n: int) -> str:
+        return stamp_name(NOW + timedelta(minutes=n))[: -len(".json")]
+
+    def plant_run(self, directory: Path, n: int) -> None:
+        (directory / "runs" / stamp_name(NOW + timedelta(minutes=n))).write_bytes(self.envelope(n))
+
+    def test_a_stranded_seed_copies_the_rest_under_a_newer_run(self):
+        """A seed that stopped part way on a non-transient error, then a run
+        wrote through the broker: the next seed copies what is left, oldest
+        first, leaves that run's latest alone, and marks the stream."""
+        directory = self.plant_local(count=5)
+        for n in (0, 1):
+            self.put_remote(n, latest=False)
+        newer = self.put_remote(9)
+        self.assertEqual(newer, self.store(str(self.local)).read_latest(AUDIT, REPO))
+        self.assertEqual([self.run_put(n) for n in (2, 3, 4)], self.broker.calls("PUT"))
+        self.assertEqual(newer, self.broker.stream(AUDIT, KEY)["latest"])
+        self.assertEqual(sorted(self.stamp(n) for n in (0, 1, 2, 3, 4, 9)), sorted(self.remote_runs()))
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+        self.assertIn("seeded compliance-audit in acme/fleet into the broker", self.logged[-1])
+        self.assertIn("latest not copied", self.logged[-1])
+
+    def test_a_refusal_mid_seed_is_finished_by_the_next_process(self):
+        """A 500 on the second copy: no marker, and the read that started the
+        seed still answers. The process then lands a run of its own (finish),
+        and a fresh client's seed still copies the rest and marks."""
+        directory = self.plant_local()
+        real = self.broker.answer
+        puts = []
+
+        def fail_the_second(method, path, body):
+            if method == "PUT" and "/runs/" in path:
+                puts.append(path)
+                if len(puts) == 2:
+                    return 500, {"error": "internal"}
+            return real(method, path, body)
+
+        self.broker.answer = fail_the_second
+        store = self.store(str(self.local))
+        self.assertIsNone(store.read_latest(AUDIT, REPO))
+        self.assertFalse((directory / report_status.SEED_MARKER_NAME).exists())
+        self.assertIn("stopped after 1 run(s), to be resumed by the next run", self.logged[-1])
+        self.assertEqual([self.stamp(0)], sorted(self.remote_runs()))
+        store.write_run(AUDIT, REPO, stamp_name(NOW + timedelta(minutes=9)), self.envelope(9))
+        store.write_latest(AUDIT, REPO, self.envelope(9))
+        self.broker.answer = real
+        self.broker.requests.clear()
+        self.assertEqual(self.envelope(9), self.store(str(self.local)).read_latest(AUDIT, REPO))
+        self.assertEqual([self.run_put(n) for n in (1, 2)], self.broker.calls("PUT"))
+        self.assertEqual(sorted(self.stamp(n) for n in (0, 1, 2, 9)), sorted(self.remote_runs()))
+        self.assertEqual(self.envelope(9), self.broker.stream(AUDIT, KEY)["latest"])
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+
+    def test_a_newer_run_landing_between_copies_does_not_stop_the_seed(self):
+        """The broker already holds a newer run (a profile worker's), and
+        another lands between two of the seed's copies: the seed still copies
+        every local entry, never writes latest, and marks the stream."""
+        directory = self.plant_local()
+        self.put_remote(8)
+        real = self.broker.answer
+        newest = self.envelope(9)
+
+        def a_run_lands_after_the_first_copy(method, path, body):
+            answer = real(method, path, body)
+            if (method, path) == self.run_put(0):
+                stream = self.broker.stream(AUDIT, KEY)
+                stream["runs"][self.stamp(9)] = newest
+                stream["latest"] = newest
+            return answer
+
+        self.broker.answer = a_run_lands_after_the_first_copy
+        self.assertEqual(newest, self.store(str(self.local)).read_latest(AUDIT, REPO))
+        self.assertEqual([self.run_put(n) for n in range(3)], self.broker.calls("PUT"))
+        self.assertEqual(newest, self.broker.stream(AUDIT, KEY)["latest"])
+        self.assertEqual(sorted(self.stamp(n) for n in (0, 1, 2, 8, 9)), sorted(self.remote_runs()))
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+
+    def test_entries_the_full_ring_would_prune_are_skipped_as_done(self):
+        """With the broker's ring at the listener's size, a local entry older
+        than its oldest would be pruned the moment it landed: skipped, counted
+        as done, and the stream is marked. A newer one still goes in."""
+        directory = self.plant_local(count=3, latest="none")
+        self.plant_run(directory, 40)
+        (directory / "latest.json").write_bytes(self.envelope(40))
+        for n in range(20, 20 + audit_report.REPORT_HISTORY):
+            self.put_remote(n)
+        self.store(str(self.local)).read_latest(AUDIT, REPO)
+        self.assertEqual([self.run_put(40)], self.broker.calls("PUT"))
+        self.assertEqual(audit_report.REPORT_HISTORY, len(self.remote_runs()))
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+        self.assertIn("1 run(s), 3 older than the broker's ring skipped", self.logged[-1])
+
+    def test_a_repeat_seed_over_a_complete_copy_marks_without_a_put(self):
+        """A copy that finished, whose marker is gone, after later runs pushed
+        its oldest entries out of the broker's ring: nothing to copy, marked."""
+        size = audit_report.REPORT_HISTORY
+        directory = self.plant_local(count=size)
+        for n in range(2, size):
+            self.put_remote(n)
+        for n in (size, size + 1):
+            self.put_remote(n)
+        self.store(str(self.local)).read_latest(AUDIT, REPO)
+        self.assertEqual([], self.broker.calls("PUT"))
+        self.assertEqual(self.envelope(size + 1), self.broker.stream(AUDIT, KEY)["latest"])
+        self.assertTrue((directory / report_status.SEED_MARKER_NAME).exists())
+
+    def test_the_ring_size_is_the_listeners(self):
+        self.assertEqual(audit_report.REPORT_HISTORY, report_status.BROKER_RING_SIZE)
+        listener = Path(__file__).resolve().parents[3] / "scripts" / "audit_report_store.py"
+        self.assertIn(f"\nREPORT_HISTORY = {report_status.BROKER_RING_SIZE}\n", listener.read_text())
 
     def test_no_local_store_no_seed(self):
         store = self.store(str(self.tmp / "absent"))

@@ -257,22 +257,25 @@ The sandbox's own file store holds every run from before the switch, and the bro
 empty. So the first time a script touches a stream through the broker (a read, or a write) while the
 pod's local root holds it with no `.seeded-to-broker` marker, the script copies it in. It holds an
 flock on the local stream directory throughout, and looks for the marker again once it has it, so two
-seeds on the pod, or a seed and a `finish` there (whose writes seed first), take turns. When the
-broker's ring is empty, or holds only stamps the local ring holds (a seed that stopped part way), the
-local entries it lacks and that are newer than its newest go oldest first. Then `latest.json` goes,
-only when it is a byte copy of the newest local entry and, checked again just before the write, the
-broker's newest ring entry is that same run and it has no other `latest`: a run that landed through
-the broker meanwhile (a profile worker takes no local lock) keeps its own, so a seed never rolls
+seeds on the pod, or a seed and a `finish` there (whose writes seed first), take turns. Each attempt
+copies every local ring entry the broker's ring lacks, oldest first, whatever other runs the broker
+holds: a profile worker's, or this shell's own `finish`, that wrote the stream before the seed began
+or while it copied. The one exception is an entry the listener would prune at once: with the broker's
+ring already at its 14 entries, a local entry older than its oldest is skipped and counted as done.
+Then `latest.json` goes, only when it is a byte copy of the newest local entry and, checked just
+before the write, the broker's newest ring entry is that same run and it has no `latest`: a run that
+landed through the broker (a profile worker takes no local lock) keeps its own, so a seed never rolls
 `latest` back. Then the script leaves the marker so the copy never repeats, and logs one line for the
-stream. When the broker's ring holds a run the local one does not, a run has written the stream since:
-nothing is copied, and the marker is left only when every local entry is already in the broker. A
-stream the broker refuses to take (a 403: a repository the install does not register) is skipped and
-logged with no marker, so a later registration can still seed it. A store that cannot be used now
-fails the read or write that started the seed, as an outage, and the next touch in the same process
-seeds again: a run's write never lands on a stream half copied, where the broker's ring would then hold
-a stamp the local one lacks and the rest of the local history would never be copied. Any other
-failure leaves no marker, so the next run resumes where it stopped. The copy is idempotent and never deletes or changes
-a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
+stream. The marker is left exactly when every local entry is on the broker or skipped as above,
+including when nothing needed copying. A stream the broker refuses to take (a 403: a repository the
+install does not register) is skipped and logged with no marker, so a later registration can still
+seed it; an entry it refuses alone (a 400, 409 or 413) is skipped and the rest still copy. A store
+that cannot be used now fails the read or write that started the seed, as an outage, and the next
+touch in the same process seeds again, so a run never reads a stream half copied as a first run. Any
+other failure (another refusal, a local file that cannot be read) is logged, leaves no marker, and
+lets the read or write go on; the next process's seed copies what is still missing and marks the
+stream, whatever the broker was written in between. A `PUT` of a stamp the listener already holds
+rewrites it, so the copy is idempotent. It never deletes or changes a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
 worker has no local store, so nothing is seeded there. The known limit: the copied envelopes are as
 trustworthy as today's file store, which the agent can write; the seed is not attested.
 
