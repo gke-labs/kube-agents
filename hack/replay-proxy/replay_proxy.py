@@ -42,6 +42,7 @@ otherwise count one LiteLLM pod twice.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import math
@@ -55,7 +56,6 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -85,14 +85,21 @@ ANALYSIS_QUEUE_SIZE = 1024
 # Slot answers whose (context, answer) the replay lookup keeps, so a turn
 # normalizes only its new answer's prefix.
 VARIANT_MEMO_CAPACITY = 100_000
-# Keys whose turn among their saved answers replay keeps (ShadowProxy.next_turn),
-# least recently looked up dropped first. A seeded cache holds fewer keys than this.
+# Keys whose untagged-lookup count replay keeps (ShadowProxy.next_turn), least
+# recently looked up dropped first. A seeded cache holds fewer keys than this.
 TURN_MEMO_CAPACITY = 1_000_000
-# Distinct weightings whose turn order (weighted_cycle) is kept built. A cycle
-# is as long as its weights' sum (each weight at most
-# replay_cache.MAX_ANSWER_WEIGHT, and reduced by their common divisor), and
-# most keys with several answers weigh a few turns in all.
-CYCLE_MEMO_CAPACITY = 1024
+# The finish reasons of a complete answer. Any other (`length`, cut off at the
+# token limit; `content_filter`; none at all) is a reply the model did not
+# finish, and record mode never stores it.
+STORABLE_FINISH_REASONS = frozenset({"stop", "tool_calls"})
+# Where a replay lookup's seed came from (seeded_order), logged as served_seed:
+# the request's eval run tag and the key, or, untagged, the key and this pod's
+# count of untagged lookups of it.
+SEED_EVAL_RUN = "eval_run"
+SEED_TURN = "turn"
+SEED_SEPARATOR = "\n"
+SEED_ENCODING = "utf-8"
+SEED_BYTE_ORDER = "big"
 # A rough prompt-token estimate for a line whose response carried no usage.
 BYTES_PER_TOKEN = 4
 DEFAULT_BIND_HOST = "0.0.0.0"
@@ -498,11 +505,13 @@ def unstorable_reasons(
     mapping: normalizer.Mapping, scrubber: request_store.Scrubber,
     upstream_incomplete: bool = False, client_disconnected: bool = False, observe_failed: bool = False,
     observe_too_large: bool = False, stored: Optional[Dict[str, Any]] = None,
+    finish_reason: Optional[str] = None,
 ) -> List[str]:
     """Why replay would not have saved this answer (eval-design.md); empty when it would.
 
     `stored` is the answer as it would be saved (replay_cache.stored_answer),
-    when the caller has it already.
+    when the caller has it already. `finish_reason` is the response's; only
+    STORABLE_FINISH_REASONS mark a finished answer.
     """
     for flag, reason in (
         (upstream_incomplete, F.UNSTORABLE_UPSTREAM_INCOMPLETE),
@@ -515,6 +524,8 @@ def unstorable_reasons(
     if status != HTTP_OK or not (message.get("content") or message.get("tool_calls")):
         return [F.UNSTORABLE_NO_ANSWER]
     reasons = []
+    if finish_reason not in STORABLE_FINISH_REASONS:
+        reasons.append(F.UNSTORABLE_UNFINISHED)
     group = headers.get(MODEL_GROUP_HEADER)
     if group is None:
         reasons.append(F.UNSTORABLE_NO_MODEL_GROUP)
@@ -587,56 +598,41 @@ Keyed = Tuple[normalizer.NormalizedRequest, str]
 # A servable replay hit: the restored answer, its saved entry, the fingerprint
 # it is saved under, how it matched (VIA_EXACT or VIA_ANSWER_SLOTS), which of
 # the key's answers it is (its identity; replay_cache.LEGACY_ANSWER for the
-# older layout's), how many answers the key has, the served answer's weight
-# and the key's total weight (weighted_cycle).
-Hit = Tuple[Dict[str, Any], Dict[str, Any], str, str, str, int, int, int]
+# older layout's), how many answers the key has, the served answer's weight,
+# the key's total weight, and where the draw's seed came from (SEED_*).
+Hit = Tuple[Dict[str, Any], Dict[str, Any], str, str, str, int, int, int, str]
 
 
-@lru_cache(maxsize=CYCLE_MEMO_CAPACITY)
-def weighted_cycle(weights: Tuple[int, ...]) -> Tuple[int, ...]:
-    """One full turn order over answers weighing `weights`: sum(weights) turns, answer i taking weights[i] of them.
+def seeded_draw(weights: Tuple[int, ...], seed: str, attempt: int) -> int:
+    """A weighted random index into `weights`, fixed by (`seed`, `attempt`).
 
-    Smooth weighted round-robin: each turn every answer gains its weight, the
-    one with the most (the first on a tie) is taken and loses the total. The
-    order depends on the weights alone, so it is the same on every pod and
-    every run, and spreads each answer's turns evenly: 9:1 gives the rarer
-    answer one turn in ten, 2:1 gives A, B, A, and equal weights give plain
-    rotation, 0, 1, 2, ...
+    Index i comes up with probability weights[i] / sum(weights). The draw is
+    sha256 of the seed and the attempt number, never Python's hash(), so it
+    is the same on every pod and every process.
     """
-    total = sum(weights)
-    current = [0] * len(weights)
-    order = []
-    for _ in range(total):
-        for i, w in enumerate(weights):
-            current[i] += w
-        chosen = max(range(len(weights)), key=lambda i: (current[i], -i))
-        current[chosen] -= total
-        order.append(chosen)
-    return tuple(order)
+    material = f"{seed}{SEED_SEPARATOR}{attempt}".encode(SEED_ENCODING)
+    point = int.from_bytes(hashlib.sha256(material).digest(), SEED_BYTE_ORDER) % sum(weights)
+    for index, weight in enumerate(weights):
+        if point < weight:
+            return index
+        point -= weight
+    raise AssertionError("unreachable: point is below the weights' sum")
 
 
-def weighted_order(weights: Tuple[int, ...], turn: int) -> List[int]:
-    """The answers a lookup at `turn` tries, in order, each once.
+def seeded_order(weights: Tuple[int, ...], seed: str) -> List[int]:
+    """The answers a lookup tries, in order, each once: a seeded weighted random pick, then fall-through.
 
-    The first is the weighted rotation's answer at this turn. If it is
-    refused, the next is the rotation over the answers left, by their own
-    weights, at the turn that counts how many earlier turns the first
-    rotation gave the refused answer: the n-th turn of a refused answer goes
-    to the n-th turn of the rest's rotation, and so on down. An answer that
-    is always refused thus has its turns shared among the others exactly in
-    proportion to their weights (1, 1, 8 with the 8 refused splits 1:1),
-    every answer is tried before the request goes live, and the order
-    depends on the weights and the turn alone.
+    The first is a draw over every answer by weight. If it is refused, the
+    next is a draw over the answers left, by their own weights, with a seed
+    derived from the first (the attempt number), and so on down, so an answer
+    that is always refused has its share split among the rest in proportion to
+    their weights, and every answer is tried before the request goes live.
+    The same seed gives the same order; a different seed an independent one.
     """
     left = list(range(len(weights)))
     order: List[int] = []
     while left:
-        rest = tuple(weights[i] for i in left)
-        divisor = math.gcd(*rest)
-        cycle = weighted_cycle(tuple(w // divisor for w in rest))
-        position = cycle[turn % len(cycle)]
-        # Earlier turns this rotation gave the answer it gives now: the rest's turn.
-        turn = (turn // len(cycle)) * cycle.count(position) + cycle[:turn % len(cycle)].count(position)
+        position = seeded_draw(tuple(weights[i] for i in left), seed, len(order))
         order.append(left.pop(position))
     return order
 
@@ -699,7 +695,7 @@ class ShadowProxy:
         # digests of its raw prefix and answer; oldest dropped past the capacity.
         self._variants: "OrderedDict[str, Tuple[Tuple[str, str], str]]" = OrderedDict()
         self._variant_lock = threading.Lock()
-        # Each key's next turn among its saved answers (next_turn).
+        # Each key's count of untagged lookups (next_turn).
         self._turns: "OrderedDict[str, int]" = OrderedDict()
         self._turn_lock = threading.Lock()
         self.out = out if out is not None else sys.stdout
@@ -715,20 +711,23 @@ class ShadowProxy:
 
     def lookup(
         self, body: Dict[str, Any], received: float, keyed: Optional[Keyed] = None,
+        eval_run: Optional[str] = None,
     ) -> Tuple[Optional[Hit], Optional[Dict[str, Any]]]:
         """Replay mode: (hit, None) on a servable hit; see Hit for its parts.
 
         On a miss, (None, None), or (None, refusal) when a key matched saved
         answers that guards refused: the key and the guard, for the miss block.
-        A key with several saved answers hands them out in turn (next_turn),
-        each in proportion to how often passing runs produced it (its weight,
-        replay_cache.AnswerCache.weights; 1 when the cache gives none) by
-        weighted_order: a refused answer passes to the next one in that order
-        (the rotation over the answers left, by their own weights),
-        so a request is served whichever of them its guards allow and goes
-        live only when they refuse every one. `keyed` is the
-        request's normalization and fingerprint (keyed()), when the caller has
-        them already.
+        A key with several saved answers serves one by a weighted random pick,
+        each answer in proportion to how often graded runs produced it (its
+        weight, replay_cache.AnswerCache.weights; 1 when the cache gives none),
+        seeded by the request's eval run tag (`eval_run`: run id, case and
+        repetition) and the key (seed()), so one repetition's lookups of a key
+        always pick alike and another run or repetition draws independently,
+        as live repetitions do. A refused answer falls through to a draw over
+        the answers left (seeded_order), so a request is served whichever of
+        them its guards allow and goes live only when they refuse every one.
+        `keyed` is the request's normalization and fingerprint (keyed()), when
+        the caller has them already.
         """
         messages = body.get(request_store.MESSAGES_KEY)
         messages = messages if isinstance(messages, list) else []
@@ -754,26 +753,34 @@ class ShadowProxy:
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
         found = self.cache.weights(fingerprint) if len(saved) > 1 else {}
         weights = tuple(found.get(name, 1) for name, _ in saved)
+        source, seed = self.seed(fingerprint, eval_run)
         first_guard = None
-        for index in weighted_order(weights, self.next_turn(fingerprint)):
+        for index in seeded_order(weights, seed):
             name, entry = saved[index]
             answer, guard = self._servable(name, entry, fingerprint, via, normalized)
             if answer is not None:
-                return (answer, entry, fingerprint, via, name, len(saved), weights[index], sum(weights)), None
+                return (answer, entry, fingerprint, via, name, len(saved), weights[index], sum(weights), source), None
             first_guard = first_guard or guard
         refused = refusal(via, first_guard or F.GUARD_UNREADABLE_ENTRY)
         if len(saved) > 1:
             refused[F.REFUSED_ALTERNATES] = len(saved)
         return None, refused
 
-    def next_turn(self, fingerprint: str) -> int:
-        """The turn this lookup of a key takes: 0 for its first, then 1, 2, ..., one counter per key.
+    def seed(self, fingerprint: str, eval_run: Optional[str]) -> Tuple[str, str]:
+        """(SEED_* source, seed) for a lookup of `fingerprint`'s answers.
 
-        A lookup takes the saved answer at its turn in the key's weighted
-        order (weighted_order), so the repetitions of a case are served
-        different recordings in turn rather than all one. The counter is this process's: each proxy pod
-        turns its own.
+        Tagged: the eval run tag and the key, so the same run, case, repetition
+        and key always draw the same answer, and a /retest (a new run id) draws
+        again. Untagged (a night with tags off, Hermes' auxiliary calls): the
+        key and this pod's count of untagged lookups of it (next_turn), so a pod
+        given the same requests in the same order draws the same answers.
         """
+        if eval_run:
+            return SEED_EVAL_RUN, SEED_SEPARATOR.join((SEED_EVAL_RUN, eval_run, fingerprint))
+        return SEED_TURN, SEED_SEPARATOR.join((SEED_TURN, fingerprint, str(self.next_turn(fingerprint))))
+
+    def next_turn(self, fingerprint: str) -> int:
+        """This pod's count of earlier untagged lookups of a key: 0 for its first, then 1, 2, ..."""
         with self._turn_lock:
             turn = self._turns.get(fingerprint, 0)
             self._turns[fingerprint] = turn + 1
@@ -1051,8 +1058,8 @@ class ShadowProxy:
         # so two answers that differ in anything served never share a file.
         # answer_variant's identity is coarser (it renames ages, pids and keyed
         # numbers the request never held), so it must not name one. A second
-        # run's different answer is saved beside the first and the publisher
-        # keeps whichever came from passing runs.
+        # run's different answer is saved beside the first, and the publisher
+        # keeps each one a graded run gave.
         saved = self.cache.save_alternate(entry[F.FINGERPRINT], entry[F.STORED_ANSWER_HASH], {
             replay_cache.ENTRY_FINGERPRINT: entry[F.FINGERPRINT],
             replay_cache.ENTRY_ANSWER: stored,
@@ -1237,6 +1244,7 @@ class ShadowProxy:
             entry[F.ALTERNATES] = upstream.get("alternates")
             entry[F.SERVED_WEIGHT] = upstream.get("served_weight")
             entry[F.ALTERNATES_WEIGHT] = upstream.get("alternates_weight")
+            entry[F.SERVED_SEED] = upstream.get("served_seed")
         entry.update(usage_tokens(upstream["usage"]))
         if served is not None:
             # The recording's reasoning and cache writes, billed when it was recorded, not now.
@@ -1264,6 +1272,7 @@ class ShadowProxy:
                 observe_failed=upstream["observe_failed"],
                 observe_too_large=upstream["observe_too_large"],
                 stored=stored,
+                finish_reason=upstream.get("finish_reason"),
             )
         # The per-message and answer hashes are of the normalized, unscrubbed
         # content, as the fingerprint is: the scrubber blanks the rest of a
@@ -1385,16 +1394,18 @@ class Handler(BaseHTTPRequestHandler):
         refused = None
         keyed = None
         if body is not None and self.proxy.config.mode == F.MODE_REPLAY:
+            # Read here: _forward drops the tag headers before going upstream.
+            tags = self._eval_tags()
             try:
                 keyed = self.proxy.keyed(body, received)
-                hit, refused = self.proxy.lookup(body, received, keyed)
+                hit, refused = self.proxy.lookup(body, received, keyed, tags[F.EVAL_RUN])
             except Exception:  # a cache that cannot be read is a miss, never a failed request
                 self.proxy.metrics.add("analysis_errors")
                 hit = None
             if hit is not None:
                 self.proxy.metrics.add("completions")
                 self.proxy.metrics.add("served")
-                answer, saved, fingerprint, via, alternate, alternates, weight, total = hit
+                answer, saved, fingerprint, via, alternate, alternates, weight, total, seed_source = hit
                 upstream = self._serve(body, answer, saved, fingerprint)
                 upstream["served_via"] = via
                 upstream["served_key"] = fingerprint
@@ -1402,6 +1413,7 @@ class Handler(BaseHTTPRequestHandler):
                 upstream["alternates"] = alternates
                 upstream["served_weight"] = weight
                 upstream["alternates_weight"] = total
+                upstream["served_seed"] = seed_source
                 upstream.update(self._eval_tags())
                 self.proxy.submit(body, received, upstream, len(raw), served=saved, keyed=keyed)
                 return

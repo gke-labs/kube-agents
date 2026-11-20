@@ -1,4 +1,4 @@
-"""Which eval run each request a proxy logged belongs to, and whether that run passed.
+"""Which graded eval run each request a proxy logged belongs to, and how that run was graded.
 
 One build runs many cases and repetitions at once on one install
 (examples/inference-replay/eval-design.md, "Telling the runs in a build
@@ -49,16 +49,19 @@ Decisions, per logged request:
 
 A saved alternate (one distinct answer to one request) is decided by every
 storable line whose logged `stored_answer_hash`, the hash of the answer as
-stored, is the alternate's name, recorded or not: it passes when any of them is
-attributed to runs that all passed, since a passing run produced that very
-answer, even when a failing run gave it first and saved it
-(Attribution.decide_alternate), and never while any of them is a disagreement.
-An answer only failing runs gave never passes. A different answer to the same
-request is an alternate of its own, decided by its own lines. An answer in the
-older layout (one per request) is decided by its recording line, or, when that
-line is left unattributed or untagged on the last call, by the other lines
-that sent the same request and got the same answer, provided no failing run is
-tied to any of them (Attribution.decide_answer).
+stored, is the alternate's name, recorded or not: it is published when any of
+them is attributed to a graded run, passing or failing (pass when every such
+run passed, fail otherwise), and never while any of them is a disagreement
+(Attribution.decide_alternate). A different answer to the same request is an
+alternate of its own, decided by its own lines. An answer in the older layout
+(one per request) is decided by its recording line, or, when that line is left
+unattributed or untagged on the last call, by the other lines that sent the
+same request and got the same answer (Attribution.decide_answer).
+
+Only bench-gate's case-<name>.json says which attempt of a repetition was
+graded (it names the run directory holding that attempt's eval_run.json, which
+the harness copies there only once the attempt ends), so a line waits as
+`pending` until its case is graded, though the verdict no longer matters.
 """
 
 from __future__ import annotations
@@ -98,6 +101,8 @@ UNATTRIBUTED = "unattributed"
 UNTAGGED = "untagged"
 DISAGREE = "disagree"
 DECISIONS = (PASS, FAIL, PENDING, UNATTRIBUTED, UNTAGGED, DISAGREE)
+# A line or alternate a graded attempt produced: published whatever the verdict.
+GRADED = (PASS, FAIL)
 
 # The eval run tag (`<run>/<case>/<rep>`) as the proxy logs it in `eval_run`:
 # replay_proxy.EVAL_RUN_RE, which deploy/docker/patches/test_eval_run_tag.py
@@ -583,54 +588,47 @@ class Attribution:
         The cache keeps each distinct answer to a fingerprint once, so when
         traffic no graded run owns (an alert's triage, another Cluster Agent's
         turn) got an answer first, a run that later got the same answer to the
-        same request is never its recording line. A line of the same build and fingerprint whose own
-        answer is the saved one (`answer_variant`) proves its runs got
-        that answer to that request. Only a recording line left unattributed or
-        untagged on the last call takes that evidence, and only when no failing
-        run is tied to the saved line or to any line that got the same answer
-        (`_tied_runs`), whatever those lines' own decisions say.
+        same request is never its recording line. A line of the same build and
+        fingerprint whose own answer is the saved one (`answer_variant`) proves
+        its runs got that answer to that request. Only a recording line left
+        unattributed or untagged on the last call takes that evidence, from the
+        lines decided by graded runs, passing or failing, and none when any of
+        them is a disagreement.
         """
         decision = self.decide(saved)
         if decision.decision not in (UNATTRIBUTED, UNTAGGED) or saved.answer_variant is None or not self.final:
             return decision
-        if self._any_failed(self._tied_runs(saved)):
-            return decision
-        passed: Set[str] = set()
+        graded: Set[str] = set()
         for other in self.by_fingerprint.get((saved.build, saved.fingerprint), []):
             if other.request_id == saved.request_id or other.answer_variant != saved.answer_variant:
                 continue
-            if self._any_failed(self._tied_runs(other)):
-                return decision
             found = self.decide(other)
             if found.decision == DISAGREE:
                 return decision
-            if found.decision == PASS:
-                passed.update(found.runs)
-        if passed:
-            return Decision(PASS, tuple(sorted(passed)))
-        return decision
+            if found.decision in GRADED:
+                graded.update(found.runs)
+        return self._of_runs(graded) if graded else decision
 
     def decide_alternate(self, producers: List[Line]) -> Decision:
         """The decision for one alternate, from every line that produced it (same request, same stored hash).
 
         Record mode saves an answer once, so of several runs that gave the same
         answer only the first line says `recorded`; the later ones still
-        produced it. The alternate passes when any storable producer is
-        decided PASS on its own (decide): a passing run gave exactly this
-        answer to exactly this request, whichever run saved the file. A
-        failing run that gave it too does not hold it back, since what is
-        served is that passing run's answer. A producer whose tag and card
-        disagree refuses it outright: the attribution of that answer cannot be
-        trusted. An answer only failing runs gave never passes. With no PASS, a
-        producer still pending keeps it pending; otherwise the first
-        producer's decision stands.
+        produced it. The alternate is decided by the graded runs among its
+        storable producers (each decided on its own, decide): PASS when they
+        all passed, FAIL when any failed, and either is published, since a
+        graded attempt gave exactly this answer to exactly this request. A
+        producer whose tag and card disagree refuses it outright: the
+        attribution of that answer cannot be trusted. With no graded producer,
+        one still pending keeps it pending; otherwise the first producer's
+        decision stands.
         """
         decisions = [found for _, found in self._producer_decisions(producers)]
         if any(found.decision == DISAGREE for found in decisions):
             return Decision(DISAGREE)
-        passed = sorted({run for found in decisions if found.decision == PASS for run in found.runs})
-        if passed:
-            return Decision(PASS, tuple(passed))
+        graded = {run for found in decisions if found.decision in GRADED for run in found.runs}
+        if graded:
+            return self._of_runs(graded)
         if any(found.decision == PENDING for found in decisions):
             return Decision(PENDING)
         return decisions[0] if decisions else Decision(UNATTRIBUTED if self.final else PENDING)
@@ -639,38 +637,24 @@ class Attribution:
         """Each storable producer's own decision (decide_alternate)."""
         return [(line, self.decide(line)) for line in producers if line.storable]
 
-    def passing_count(self, producers: List[Line]) -> int:
-        """How many times passing runs produced an alternate: its producers decided PASS, one per request.
+    def graded_count(self, producers: List[Line]) -> int:
+        """How many times graded runs produced an alternate: its producers decided PASS or FAIL, one per request.
 
         The same per-line decision decide_alternate publishes on, counted
         rather than or-ed, by card or by tag alike: each is one request a
-        passing run sent and the model answered with exactly this stored
-        answer, so the counts of a key's alternates are how often passing runs
+        graded run sent and the model answered with exactly this stored
+        answer, so the counts of a key's alternates are how often graded runs
         got each. A request is counted once however many times its line was
         read; an alternate with a disagreeing producer counts none.
         """
         found = self._producer_decisions(producers)
         if any(decision.decision == DISAGREE for _, decision in found):
             return 0
-        return len({line.request_id for line, decision in found if decision.decision == PASS})
+        return len({line.request_id for line, decision in found if decision.decision in GRADED})
 
     def disagreements(self) -> int:
         """How many of the build's logged requests have a tag and a card naming different runs."""
         return len({line.request_id for line in self.logs.lines if self.disagrees(line)})
-
-    def _tied_runs(self, line: Line) -> Set[str]:
-        """Every graded run a line is tied to: its own cards' runs, even beside a card no run worked,
-        and the run its tag names. A decision keeps only some of them (PASS drops a failing run that
-        also produced it), so the publish guard reads these."""
-        own = self._own(line)
-        runs = set(own[0]) if own is not None else set()
-        status, key = self.tag_status(line)
-        if status == TAG_RUN:
-            runs.add(key)
-        return runs
-
-    def _any_failed(self, runs: Set[str]) -> bool:
-        return any(not self.runs[run].passed for run in runs)
 
     def run_of(self, line: Line) -> Optional[str]:
         """The one run a request names by its own IDs, for the lane's per-run counts; None otherwise."""

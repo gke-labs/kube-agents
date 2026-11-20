@@ -1,4 +1,4 @@
-"""Upload a trusted nightly's recorded answers, from runs that passed, to the shared replay cache.
+"""Upload a trusted nightly's recorded answers, from graded runs, to the shared replay cache.
 
 A nightly whose proxy runs in record mode saves answers in the proxy pods
 (replay_cache.py). collect_shadow.py copies them out of the cluster while the
@@ -6,9 +6,10 @@ eval runs, with the lines and the stored request text, into a directory on the
 job's own machine (`--keep-dir`), and calls this every few minutes and once at
 the end. Each call works out which run each recorded answer came from
 (run_attribution.py) against the cases graded so far (bench-gate's
-case-<name>.json under the artifacts directory), and uploads the answers
-passing runs got and no failing run did (examples/inference-replay/eval-design.md,
-"Only save answers from runs that passed").
+case-<name>.json under the artifacts directory), and uploads every answer a
+graded attempt got, whether its run passed or failed
+(examples/inference-replay/eval-design.md, "Save every real answer from graded
+runs").
 
 What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
 - `alts/<fingerprint>-<answer>.json`: one answer to a request, flat
@@ -17,13 +18,12 @@ What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
   log line's `stored_answer_hash`), so every distinct stored answer the
   night's runs gave to a key has a name of its own. One goes up when any
   storable line whose `stored_answer_hash` is that name,
-  recorded or not, is attributed to runs that passed
+  recorded or not, is attributed to a graded attempt, passing or failing
   (run_attribution.Attribution.decide_alternate): runs that give the same
-  answer save it once, and the run that saved it may have failed. A line is
-  attributed by its card, or with no card of its own by its eval run tag
-  (`eval_run`) alone, and never when the two name different runs; an
-  untagged line with no card is no evidence. An answer only failing runs gave
-  stays here. The key already holds the normalizer
+  answer save it once. A line is attributed by its card, or with no card of
+  its own by its eval run tag (`eval_run`) alone, and never when the two name
+  different runs; an untagged line with no card, a retried attempt's line and
+  traffic no graded run owns are no evidence. The key already holds the normalizer
   version, the LiteLLM config checksum and image, so answers no other run
   could hit cost space only; the version prefix lets a reader fetch only its
   own.
@@ -45,9 +45,9 @@ how many requests' tags and cards named different runs, and the objects this cal
 already from an earlier night), each with its size in this night's copy and,
 for a slot, the fingerprint of the answer it points at; under `produced`,
 per fingerprint, the answers (alternates) this call confirmed and so this
-night's passing runs gave; and under `produced_counts`, for every alternate
+night's graded runs gave; and under `produced_counts`, for every alternate
 the build has confirmed so far, how many of its producing requests were
-attributed to passing runs (run_attribution.Attribution.passing_count). The
+attributed to graded runs (run_attribution.Attribution.graded_count). The
 replay lane reads these to fetch exactly the answers recent nightlies
 produced and to weigh them (fetch_cache.py), and to compare verdicts
 (lane_report.py).
@@ -55,10 +55,11 @@ produced and to weigh them (fetch_cache.py), and to compare verdicts
 Every object is written once (`gcloud storage cp --no-clobber`, and the
 recorder's grant cannot overwrite). An alternate's name is the hash of its
 stored answer, so one an earlier night wrote under the same name
-holds the same answer to the same request; tonight's passing runs producing it is what the
+holds the same answer to the same request; tonight's graded runs producing it is what the
 record says. An older-layout answer's name is only its key, so there the
-first night to record a key keeps it. An answer whose runs are not all graded
-yet waits for a later call; the last call refuses what is still undecided.
+first night to record a key keeps it. An answer no graded run has produced yet
+waits for a later call (bench-gate names the graded attempt only once it
+grades the case); the last call refuses what is still undecided.
 """
 
 from __future__ import annotations
@@ -117,13 +118,14 @@ RECORD_LOST_LINES = "lost_lines"
 RECORD_TAG_CARD_DISAGREEMENTS = "tag_card_disagreements"
 RECORD_OBJECTS = "objects"
 # Per normalizer version, per fingerprint, the identities of the answers this
-# night's passing runs gave (the alternates this record confirms): what the
+# night's graded runs gave (the alternates this record confirms): what the
 # lane may load (fetch_cache.py), so a served answer is never older than the
 # night that produced it.
 RECORD_PRODUCED = "produced"
 # Per normalizer version, per fingerprint, per answer: how many times this
-# build's passing runs produced each alternate it has confirmed so far, in this
-# call or an earlier one (run_attribution.Attribution.passing_count), counted
+# build's graded runs, passing or failing, produced each alternate it has
+# confirmed so far, in this call or an earlier one
+# (run_attribution.Attribution.graded_count), counted
 # again on every call, so a build's newest record holds its fullest count. The
 # lane serves a key's answers in proportion to these (fetch_cache.py); a record
 # written before it has none, and each answer it produced counts once.
@@ -288,8 +290,8 @@ class Selection:
     runs: List[RA.Run] = field(default_factory=list)
     lost_lines: int = 0
     disagreements: int = 0
-    # version -> fingerprint -> answer -> passing producer count (RECORD_PRODUCED_COUNTS),
-    # for every alternate already in the bucket or decided PASS by this call.
+    # version -> fingerprint -> answer -> graded producer count (RECORD_PRODUCED_COUNTS),
+    # for every alternate already in the bucket or published by this call.
     counts: Dict[str, Dict[str, Dict[str, int]]] = field(default_factory=dict)
 
     def add(self, version: str, sub: str, name: str, path: str) -> None:
@@ -361,7 +363,7 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 parts = alternate_parts(name)
                 if (version, name) in state.done:
                     if parts is not None and producers.get(parts):
-                        selection.set_count(version, parts, attribution.passing_count(producers[parts]))
+                        selection.set_count(version, parts, attribution.graded_count(producers[parts]))
                     continue
                 fingerprint = parts[0] if parts is not None else name[len(ANSWERS) + 1: -len(JSON_SUFFIX)]
                 line = recorded.get(fingerprint) if parts is None else None
@@ -380,10 +382,10 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 else:
                     decision = attribution.decide_answer(line).decision
                 selection.count(decision)
-                if decision == RA.PASS:
+                if decision in RA.GRADED:
                     selection.add(version, sub, name, path)
                     if parts is not None:
-                        selection.set_count(version, parts, attribution.passing_count(producers[parts]))
+                        selection.set_count(version, parts, attribution.graded_count(producers[parts]))
         for sub in (VARIANTS, MESSAGES):
             for name, path in pod_files(pod_dir, sub):
                 if (version, name) not in state.done:

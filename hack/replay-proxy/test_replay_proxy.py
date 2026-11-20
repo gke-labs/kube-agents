@@ -253,10 +253,11 @@ class ProxyTestCase(unittest.TestCase):
         self.server.server_close()
         self.upstream.server_close()
 
-    def request(self, method, path, body=None, port=None):
+    def request(self, method, path, body=None, port=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=LOG_WAIT_SECONDS)
         data = json.dumps(body).encode() if isinstance(body, dict) else body
-        conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
+        sent = {"Content-Type": "application/json"} if data else {}
+        conn.request(method, path, body=data, headers={**sent, **(headers or {})})
         resp = conn.getresponse()
         try:
             payload = resp.read()
@@ -939,7 +940,26 @@ class LogLineTest(ProxyTestCase):
         headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
         answer = {"role": "assistant", "content": f"Reading ~/.hermes/sessions/{session}/state.json"}
         self.assertTrue(mapping.answer_repeats_date(answer["content"]), "the raw text does name the day")
-        self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber), [])
+        self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber,
+                                                         finish_reason="stop"), [])
+
+    def test_only_a_finished_reply_is_storable(self):
+        body = {"model": "model-default", "messages": [{"role": "user", "content": "list the pods"}]}
+        mapping = replay_proxy.normalizer.normalize_request(body, time.time()).mapping
+        scrubber = replay_proxy.request_store.Scrubber(REDACTOR, RULES)
+        headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        answer = {"role": "assistant", "content": "Listing the pods now."}
+        for finish, expected in (("stop", []), ("tool_calls", []), ("length", ["unfinished_reply"]),
+                                 ("content_filter", ["unfinished_reply"]), (None, ["unfinished_reply"])):
+            with self.subTest(finish_reason=finish):
+                self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber,
+                                                                 finish_reason=finish), expected)
+
+    def test_a_reply_cut_off_at_the_token_limit_is_logged_unstorable(self):
+        FakeLiteLLM.custom_body = json.dumps({"choices": [{"index": 0, "finish_reason": "length", "message": {
+            "role": "assistant", "content": "The pods are web-1 and"}}]}).encode()
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertIn("unfinished_reply", self.lines(1)[0]["unstorable"])
 
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"
