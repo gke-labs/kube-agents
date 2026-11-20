@@ -42,9 +42,10 @@ rejects `task_id:` in a case here.
 
 The value must equal the directory name. The directory name is what
 `hack/ci-eval-pr.sh` derives `TASK_NAME` from, what the results file is copied to, and
-what every lint and every table in `bench/tasks/DRAFTS.md` keys on. An id that disagrees
-with its directory means two names for one case and a search that finds half the
-references.
+what every lint and every table in `bench/tasks/DRAFTS.md` keys on. The `Eval-Case:` line
+of an overlay patch names it too, and `make skills-check` fails a line that names no
+directory here. An id that disagrees with its directory means two names for one case and a
+search that finds half the references.
 
 ## The fields, and what each one is for
 
