@@ -15,6 +15,7 @@ from typing import Any
 from pathlib import Path
 from mcp.server import MCPServer
 import sandbox_exec
+import first_run_report
 from agent_common_server import _run_env
 from untrusted_text import strip_unsafe
 from chat_platforms import HOME_CHANNEL_ENV_SUFFIX, enabled_chat_platforms
@@ -74,6 +75,23 @@ NON_CHAT_SESSION_ORIGINS = frozenset({"api_server", "k8s-watcher"})
 # reads the same finding twice. The measured relay is ~9s; the old 10s bound
 # left that one second of headroom.
 CRON_REPORT_TIMEOUT_SECONDS = 360.0
+
+# `get_first_run_report`'s caps, and the sandbox read's bound. Both reads are
+# cut at the ceiling delivery moves the ranked report whole under
+# (bootstrap_delivery.REPORT_MAX_BYTES; test_platform_mcp_server pins them
+# equal), so a report that was delivered comes back whole; cut rather than
+# refused, since a part of the report answers the question delivery's refusal
+# does not. The full read took the conversation post's 96 KiB once, and a real
+# sweep's INVENTORY.raw.md (105,584 bytes on one install) came back cut, which
+# sent the worker to the terminal for the rest; at 256 KiB the cap is about
+# 60k-75k tokens of Markdown tables, the price of keeping the worker on the tool.
+# `truncated` says when a file was still cut. The timeout is delivery's
+# (bootstrap_delivery.SANDBOX_TIMEOUT_SECONDS): one ssh round trip for a file.
+FIRST_RUN_REPORT_RANKED_MAX_BYTES = 256 * 1024
+FIRST_RUN_REPORT_FULL_MAX_BYTES = 256 * 1024
+FIRST_RUN_REPORT_SANDBOX_TIMEOUT_SECONDS = 30
+# What the ERROR line names when the read failed.
+FIRST_RUN_REPORT_SUBJECT = "the first-run report"
 
 # Initialize the MCP server
 mcp = MCPServer("GKE Platform Control Plane")
@@ -379,8 +397,16 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
 # tree on the agent pod's PVC), so the agent cannot resolve a kanban assignee from
 # its terminal. This server runs in the agent pod, where the tree is.
 
+def _data_root() -> Path:
+    """The agent pod's data root: the chat profile's home, where the Cluster Agent profiles and
+    onboarding's markers are. PLATFORM_AGENT_HOME (in this child's env block; the operator sets
+    it from spec.harness.hermes.agentHome), else DEFAULT_AGENT_HOME; never HERMES_HOME, which in
+    this child is the platform profile's own home under it."""
+    return Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME)
+
+
 def _profiles_dir() -> Path:
-    return profiles_base(Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME))
+    return profiles_base(_data_root())
 
 
 def _cluster_agent_roster() -> list[dict]:
@@ -1386,6 +1412,56 @@ def findings_publication(
     return _findings_call(
         "PUT", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}", body
     )
+
+
+@mcp.tool()
+def get_first_run_report(which: str = first_run_report.WHICH_RANKED) -> str:
+    """
+    The first-run (onboarding) inventory report the agent already wrote, and what became of it.
+
+    Reads the report where onboarding left it (the shell sandbox's data volume,
+    or the agent pod's data root with the sandbox off) and the delivery markers
+    in that data root. No new scan. `state` is `delivered` (posted into the chat
+    the first person wrote in; `path_taken` is `origin` for the chat the
+    onboarding job was linked to, `conversation` for the thread recorded under
+    the gateway), `filed` (a ledger issue; `filed` carries its repo, number, url
+    and time), `retired` (a week passed with nobody arriving; the findings are
+    still in the queue when `findings_registered` is true), `pending` (written,
+    not yet delivered) or `absent` (no report yet: the sweep has not written one).
+    `report` is `kind`, the text, `source` (the file it came from), `bytes` and
+    `truncated`; null when the asked-for file is not there.
+
+    Args:
+        which: `ranked` (default) for the report the user received, criticals
+            and roll-up as written; `full` for the sweep's complete findings,
+            every cluster and workload. Each at most 256 KiB, `truncated` set
+            when cut. This tool is the only route to the report: never read
+            `/opt/data/INVENTORY*` (the report, or the sweep's working files)
+            with a terminal or file tool.
+    """
+    if which not in first_run_report.REPORT_KINDS:
+        return f"ERROR: which must be one of {', '.join(first_run_report.REPORT_KINDS)}, not {which!r}"
+    cap = FIRST_RUN_REPORT_RANKED_MAX_BYTES if which == first_run_report.WHICH_RANKED else FIRST_RUN_REPORT_FULL_MAX_BYTES
+
+    def sandbox_read(path: str, max_bytes: int) -> bytes | None:
+        return sandbox_exec.read_bytes(path, max_bytes=max_bytes, timeout=FIRST_RUN_REPORT_SANDBOX_TIMEOUT_SECONDS)
+
+    try:
+        result = first_run_report.read_first_run_report(
+            _data_root(),
+            which=which,
+            max_bytes=cap,
+            sandbox_read=sandbox_read if sandbox_exec.sandbox_enabled() else None,
+        )
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
+        return f"ERROR: could not reach {FIRST_RUN_REPORT_SUBJECT}: {exc}"
+    except (sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed, OSError) as exc:
+        return f"ERROR: could not read {FIRST_RUN_REPORT_SUBJECT}: {exc}"
+    if result["report"] is not None:
+        # The report is prose a worker wrote from cluster data, so it carries what
+        # a workload's name or a probe's message carried, as a pod's logs do.
+        result["report"]["text"] = _neutralize_tokens(_strip_unsafe_chars(result["report"]["text"]))
+    return json.dumps(result, indent=2)
 
 
 def start_session_kv_server() -> None:

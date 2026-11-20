@@ -2625,10 +2625,13 @@ are questions about this pod that a file in the other one cannot answer.
 
 Reading that as the general answer would be a mistake. It crosses what one
 notifier was already going to deliver, at one moment in a card's life, into a
-directory nothing else reads. The one other agent-side reader that crosses is
-`bootstrap_delivery.py`, which reads the file it posts, `INVENTORY.md`, and the three
+directory nothing else reads. Two other agent-side readers cross.
+`bootstrap_delivery.py` reads the file it posts, `INVENTORY.md`, and the three
 JSON files written beside it by name once its markers say a delivery is due, and lands
-nothing on disk. Every other
+nothing on disk. `get_first_run_report` in `platform_mcp_server.py` reads one of three
+fixed names (`INVENTORY.delivered.md`, `INVENTORY.md`, `INVENTORY.raw.md`) through
+`sandbox_exec.read_bytes` under a byte cap when a user asks what onboarding found, and
+lands nothing on disk either: the bytes go back as the tool's result. Every other
 agent-side reader still looks on the gateway's volume and still finds nothing, and
 generalising either — a tool the model can call to bring a file across on demand,
 with a landing directory that persists past a single delivery — is a decision about
@@ -2786,7 +2789,7 @@ unidentified caller gets an undifferentiated `401` rather than a reason. `CREDEN
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
 the same listener, on every install the A2A gateway's, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
+operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
@@ -2838,8 +2841,8 @@ deletes are refused, and no other role's `publish` is resolved. It
 is bound both ways: `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names the gateway's ServiceAccount, no
 other caller may present the audience, and that account may present only this audience or the
 `a2a-chat` one, whose token the same pod holds ([fleet-audit-report-store.md](fleet-audit-report-store.md)
-§3). Under
-`mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
+§3). With
+an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
 allowlist. `/v1/vcs/` admits it too, and every verb there needs a valid task credential:
@@ -2857,7 +2860,8 @@ only when they are all the install's, and `proposal-create` only from the instal
 label edit is refused under `caller.vcs-labels`. A profile `issue-list` may not widen its
 search past the managed repository: a `query` that is not plain words (a `:`, quote,
 backslash or parenthesis, or `OR`, `AND` or `NOT` as a word), or a quote or backslash in a
-label name, is refused under `caller.vcs-query`. The shell is held to none of this. No
+label name, is refused under `caller.vcs-query`. A profile `identity` with no repository answers the
+managed repositories' names, read-only, and nothing else. The shell is held to none of this. No
 other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in
@@ -2868,7 +2872,7 @@ credential's cluster and project. Profile calls together hold at most
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
-The scope publisher Job under `mode: next` has a role of its own, `scope`:
+The scope publisher Job has a role of its own, `scope`:
 its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
 `CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
 `ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token
