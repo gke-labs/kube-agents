@@ -20,21 +20,23 @@
 # operator, which renders the built-in schedules, from making or unmaking a built-in.
 #
 # WHAT IT CHECKS, for a CREATE or UPDATE of an AgentSchedule by anyone but the operator's
-# ServiceAccount:
+# ServiceAccount (or the garbage collector, below):
 #
 #   1. The origin label doesn't become, or stop being, `builtin`: a create may not carry it, and an
 #      update may not add it, change it to it, or change or remove it where it was.
 #   2. The controller reference doesn't change, whatever kind it names: a create may not carry
 #      one, and an update may not add, change or remove one. Every kind, not only PlatformAgent,
 #      because the reconciler's controller check matches on the owner's uid alone.
+#   3. A built-in schedule's spec doesn't change: what it runs, on which profile, when and where its
+#      report goes are the operator's.
 #
 # Anything else passes, so a person may still annotate a built-in schedule (`run-now`, `stop`) or
 # edit a user schedule. A built-in schedule written before this policy existed isn't refused for
-# that alone: its label and reference pass unchanged. The reconciler is what keeps one the operator
+# that alone: its label, reference and spec pass unchanged. The reconciler is what keeps one the operator
 # didn't write from running as built-in.
 #
-# The operator's identity below is the kustomize path's. The chart's copy names
-# `<release>-operator-sa` in the release namespace instead (hack/sync-chart-manifests.sh, the same
+# The operator's identities are listed below (both install paths; the chart's copy names
+# `<release>-operator-sa` in the release namespace, hack/sync-chart-manifests.sh, the same
 # substitution agent-rbac-policy.yaml takes). DELETE is not matched: deleting a schedule makes
 # nothing built-in, and the garbage collector deletes a PlatformAgent's schedules.
 #
@@ -57,9 +59,19 @@ spec:
         operations: ["CREATE", "UPDATE"]
         resources: ["agentschedules"]
   matchConditions:
-    - name: is-not-the-operator
+    # Two operator usernames, as agent-rbac-policy.yaml lists: the kustomize path (INSTALL.md
+    # Method 2, config/default's `namePrefix: kubeagents-` on SA `controller`) runs it as
+    # `kubeagents-controller`; the chart runs it as `<release>-operator-sa` in the release
+    # namespace, and hack/sync-chart-manifests.sh rewrites the second entry to that. The garbage
+    # collector is exempt too: orphaning a PlatformAgent's schedules (`kubectl delete --cascade=orphan`)
+    # has it remove their controller reference, and refusing that would leave the PlatformAgent
+    # stuck terminating. It only ever removes references.
+    - name: is-not-the-operator-or-the-garbage-collector
       expression: >-
-        request.userInfo.username != 'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'
+        !(request.userInfo.username in [
+          'system:serviceaccount:kubeagents-system:kubeagents-controller',
+          'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa',
+          'system:serviceaccount:kube-system:generic-garbage-collector'])
   variables:
     - name: originKey
       expression: "'kubeagents.x-k8s.io/origin'"
@@ -93,6 +105,12 @@ spec:
       reason: Forbidden
     - expression: "variables.newControllers == variables.oldControllers"
       message: "only the operator may add, change or remove an AgentSchedule's controller reference"
+      reason: Forbidden
+    # A built-in schedule's spec is the operator's too: what it runs, on which profile, when and
+    # where its report goes all run at the unattended tier and write the audit's report stream.
+    # Annotations (run-now, stop) and the rest of the metadata still pass.
+    - expression: "variables.oldOrigin != 'builtin' || object.spec == oldObject.spec"
+      message: "only the operator may change a built-in AgentSchedule's spec"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

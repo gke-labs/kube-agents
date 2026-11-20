@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -57,7 +58,7 @@ func TestTheBuiltinPolicyLeavesBuiltinToTheOperator(t *testing.T) {
 	ctx := context.Background()
 	ns := agentScheduleBuiltinPolicyNamespace
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
-	for _, sa := range []string{agentScheduleBuiltinPolicyOperator, "schedule-writer"} {
+	for _, sa := range []string{agentScheduleBuiltinPolicyOperator, "kubeagents-controller", "schedule-writer"} {
 		mustCreate(ctx, t, admin, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: sa, Namespace: ns}})
 	}
 	// Both identities may write schedules, so only the policy tells them apart.
@@ -73,12 +74,16 @@ func TestTheBuiltinPolicyLeavesBuiltinToTheOperator(t *testing.T) {
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "schedules"},
 		Subjects: []rbacv1.Subject{
 			{Kind: "ServiceAccount", Name: agentScheduleBuiltinPolicyOperator, Namespace: ns},
+			{Kind: "ServiceAccount", Name: "kubeagents-controller", Namespace: ns},
 			{Kind: "ServiceAccount", Name: "schedule-writer", Namespace: ns},
+			{Kind: "ServiceAccount", Name: "generic-garbage-collector", Namespace: "kube-system"},
 		},
 	})
 	applyAdmissionPolicyFile(ctx, t, admin, agentScheduleBuiltinPolicyFile)
 	operator := impersonatedClientWith(t, cfg, scheme, ns, agentScheduleBuiltinPolicyOperator)
+	kustomizeOperator := impersonatedClientWith(t, cfg, scheme, ns, "kubeagents-controller")
 	writer := impersonatedClientWith(t, cfg, scheme, ns, "schedule-writer")
+	collector := impersonatedClientWith(t, cfg, scheme, "kube-system", "generic-garbage-collector")
 
 	controller := metav1.OwnerReference{
 		APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
@@ -177,6 +182,17 @@ func TestTheBuiltinPolicyLeavesBuiltinToTheOperator(t *testing.T) {
 	refused(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) {
 		s.OwnerReferences[0].Name = "another-agent"
 	}), "a writer changing the PlatformAgent controller")
+	refused(update(writer, "builtin", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "Run something else." }),
+		"a writer changing a built-in schedule's spec")
+	refused(writer.Patch(ctx, schedule("w-user", false, false), client.RawPatch(types.MergePatchType,
+		[]byte(`{"metadata":{"labels":{"kubeagents.x-k8s.io/origin":"builtin"}}}`))), "a writer's merge patch adding the builtin label")
+	allowed(update(operator, "builtin", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "Run the audit again." }),
+		"the operator changing its built-in schedule's spec")
+	allowed(kustomizeOperator.Create(ctx, schedule("builtin-kustomize", true, true)), "the kustomize path's operator creating a built-in schedule")
+	// Orphaning a PlatformAgent's schedules: the garbage collector removes
+	// their controller reference.
+	allowed(update(collector, "builtin-kustomize", func(s *agentv1alpha1.AgentSchedule) { s.OwnerReferences = nil }),
+		"the garbage collector orphaning a built-in schedule")
 	allowed(update(operator, "builtin", func(s *agentv1alpha1.AgentSchedule) {
 		s.Labels[agentv1alpha1.AgentScheduleOriginLabel] = agentv1alpha1.AgentScheduleOriginUser
 		s.OwnerReferences = nil

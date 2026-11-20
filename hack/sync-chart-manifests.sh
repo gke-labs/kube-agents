@@ -18,8 +18,8 @@
 #   - templates/web-console-cr-admission-policy.yaml is config/admission/web-console-cr-policy.yaml,
 #     verbatim, wrapped in the kube-agents.webConsoleCRPolicyEnabled helper.
 #   - templates/agentschedule-builtin-admission-policy.yaml is config/admission/agentschedule-builtin-policy.yaml
-#     under the admission values gate, with the operator's identity substituted as for the
-#     agent RBAC policy.
+#     under the admission values gate, with the chart's operator identity substituted for the
+#     second of its operator usernames, as for the agent RBAC policy.
 #   - templates/a2a-dispatcher-job-admission-policy.yaml is config/admission/a2a-dispatcher-job-policy.yaml,
 #     likewise, under kube-agents.a2aDispatcherJobPolicyEnabled and A2A_DISPATCHER_JOB_POLICY.
 #   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and

@@ -239,6 +239,11 @@ func AgentScheduleTriggerName(sched *agentv1alpha1.AgentSchedule) string {
 // PlatformAgent renders. The operator renders none yet: the change that
 // renders them fills this from the list it renders from, so a schedule is
 // read as built-in only when the operator would have written it.
+//
+// That renderer must own the whole object it renders: a schedule someone
+// created under a built-in's name before the admission policy existed has to
+// be overwritten in full (labels, references and spec) or deleted and
+// created again, never adopted by name with its content kept.
 func agentScheduleBuiltinNames(*agentv1alpha1.PlatformAgent) []string { return nil }
 
 // builtinNames is the reconciler's built-in set: BuiltinNames when a test
