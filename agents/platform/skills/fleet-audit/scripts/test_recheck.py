@@ -349,6 +349,25 @@ class RegistrationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             recheck.narrowed_cluster_check("no-pdb", "pdbs")
 
+    def test_the_no_pdb_recheck_comes_from_its_recipe_with_the_same_kinds_and_steps(self):
+        spec = recheck.RECHECKS["no-pdb"]
+        self.assertEqual(
+            spec.kinds, "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers"
+        )
+        # Find the target, run no-pdb, then each sibling behind its selecting step.
+        self.assertEqual(len(spec.steps), 6)
+        self.assertEqual(
+            [spec.steps[i] for i in (0, 2, 4)],
+            [recheck.in_scope_workload, recheck.select_target_workload, recheck.select_budgets],
+        )
+        self.assertEqual(sorted(recheck.RECHECKS), ["no-pdb"])
+
+    def test_a_recipe_builds_its_steps_and_an_unknown_sibling_fails(self):
+        recipe = recheck.registry.Recipe("no-pdb", "n", "t", "dev", recheck_kinds="deployments")
+        self.assertEqual(len(recheck.recheck_for(recipe).steps), 2)
+        with self.assertRaises(KeyError):
+            recheck.recheck_for(recipe._replace(recheck_siblings="no-such-sibling"))
+
     def test_a_workload_step_runs_the_collectors_function_for_that_id(self):
         # The step is the collector's CheckSpec, not a copy of it.
         spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb")

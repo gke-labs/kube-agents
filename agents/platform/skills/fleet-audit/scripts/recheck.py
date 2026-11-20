@@ -51,12 +51,14 @@ code, which cannot travel on a `python3 -I -` stdin the way `stall_report.py`
 does (it reads its own `__file__` and imports its siblings). From a shell the
 CLI reads with the local `kubectl`.
 
-Only `no-pdb` is registered. A re-check is the kinds it reads in the target
-namespace and a tuple of small steps, each of which ends the re-check with a
-verdict or hands on: find the target as the audit's scope leaves it, run one
-collector check by id on it, narrow a cluster check to the objects that select
-it. Another check id joins `RECHECKS` as a new tuple of those steps, plus any
-new step it needs.
+A re-check is the kinds it reads in the target namespace and a tuple of small
+steps, each of which ends the re-check with a verdict or hands on: find the
+target as the audit's scope leaves it, run one collector check by id on it,
+narrow a cluster check to the objects that select it. `RECHECKS` is built from
+the fix recipes (`fix_recipes/<kind>/recipe.yaml`, `recheck_kinds` and
+`recheck_siblings`); only `no-pdb` declares one. A recipe adds a re-check in its
+recipe file, plus a `SIBLING_NARROWING` entry for a sibling check not yet there.
+Only collector workload checks are re-checked; readiness rules are not yet.
 
 Exit codes: 0 clean, 1 reproduces, 2 unchecked (a failed read, a crash inside
 the re-check, or a usage error). The JSON on stdout carries the same answer.
@@ -78,6 +80,9 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 import audit_report
 import collect
+
+# collect.py has put the platform scripts on the path, where the registry lives.
+from fix_recipes import registry  # noqa: E402
 
 OUTCOME_CLEAN = "clean"
 OUTCOME_REPRODUCES = "reproduces"
@@ -268,23 +273,28 @@ def narrowed_cluster_check(slug: str, context_key: str) -> Step:
     return step
 
 
-RECHECKS: dict[str, Recheck] = {
-    "no-pdb": Recheck(
-        # `horizontalpodautoscalers`: `blocking-pdb` compares against an
-        # autoscaler's floor rather than `spec.replicas`.
-        "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers",
-        (
-            in_scope_workload,
-            workload_check("no-pdb"),
-            # A second budget over the same pods makes the eviction API refuse
-            # them all, so a fix that adds one beside another is not clean.
-            select_target_workload,
-            narrowed_cluster_check("pdb-overlapping", "workloads"),
-            select_budgets,
-            narrowed_cluster_check("blocking-pdb", "pdbs"),
-        ),
-    ),
+#: How a sibling check a fix could trip is narrowed to the target: the step
+#: that selects what it may see, and the context key that selection replaces.
+#: A recipe naming a sibling not here fails at import.
+SIBLING_NARROWING: dict[str, tuple[Step, str]] = {
+    # A second budget over the same pods makes the eviction API refuse them
+    # all, so a fix that adds one beside another is not clean.
+    "pdb-overlapping": (select_target_workload, "workloads"),
+    "blocking-pdb": (select_budgets, "pdbs"),
 }
+
+
+def recheck_for(recipe: registry.Recipe) -> Recheck:
+    """A workload-scoped recipe's re-check: find the target, run its own check, then each sibling narrowed."""
+    steps: list[Step] = [in_scope_workload, workload_check(recipe.kind)]
+    for sibling in recipe.siblings():
+        select, context_key = SIBLING_NARROWING[sibling]
+        steps += [select, narrowed_cluster_check(sibling, context_key)]
+    return Recheck(recipe.recheck_kinds, tuple(steps))
+
+
+#: One re-check per recipe that declares one (`fix_recipes/<kind>/recipe.yaml`).
+RECHECKS: dict[str, Recheck] = {r.kind: recheck_for(r) for r in registry.recipes() if r.recheck_kinds}
 
 
 def judge(spec: Recheck, target: Target, dump: dict) -> tuple[Verdict, dict]:
