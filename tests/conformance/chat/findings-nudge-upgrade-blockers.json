@@ -1,7 +1,7 @@
 {
   "name": "findings-nudge-upgrade-blockers",
   "source": "agents/platform/scripts/test_findings_nudge.py::DetectorWordingTests.test_the_two_findings_of_issue_6256_read_as_sentences",
-  "notes": "findings_nudge_card.chat_from_card: the daily nudge on the upgrade readiness review's own titles and actions (a budget, a cluster-wide finding), with the cluster breakdown table and the queue buttons.",
+  "notes": "findings_nudge_card.chat_from_card: the daily nudge on the upgrade readiness review's own titles and actions (a budget, and a cluster-wide finding whose remedy names a command, so the neutral line stands in), with the cluster breakdown table and the queue buttons.",
   "input": {
     "findings_nudge": {
       "now": "2026-10-06T12:00:00Z",
@@ -141,7 +141,7 @@
           {
             "text": "**prod-central** — A Node object outlives its virtual machine: this cluster blocks the upgrade",
             "severity": "critical",
-            "detail": "Delete the orphan Node object; nothing runs on it."
+            "detail": "The recommendation names a command, which is not shown here."
           }
         ],
         "after": ["2 more issues are open (1 critical, 1 lower priority)."],

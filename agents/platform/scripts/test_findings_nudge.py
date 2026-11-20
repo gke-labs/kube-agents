@@ -269,10 +269,8 @@ class CardAndChatUxTests(unittest.TestCase):
         self.assertIn("**kube-system/istiod** on `prod-central`", chat["rows"][0]["text"])
         self.assertIn("(minAvailable: 1, 1 pod expected)", chat["rows"][0]["text"])
         self.assertIn("(1 replica)", chat["rows"][0]["text"])
-        self.assertEqual(
-            chat["rows"][1]["detail"],
-            "Delete the orphan Node object.",
-        )
+        # The action holds a command, in parentheses: nothing is cut out of it, the neutral line stands in.
+        self.assertEqual(chat["rows"][1]["detail"], nudge.COMMAND_ACTION)
 
         # Forbidden plumbing never appears in fallback text, chat JSON, or Block Kit JSON.
         visible_serialized = fallback + "\n" + json.dumps(chat) + "\n" + json.dumps(blocks)
@@ -323,9 +321,10 @@ class CardAndChatUxTests(unittest.TestCase):
         self.assertIn("covers=2", hidden)
 
     def test_clean_action_strips_bare_and_inline_cli_commands(self):
+        # No cut: "Run <command> to <goal>" took the first " to " anywhere in the text for its goal.
         self.assertEqual(
             nudge.clean_action("Run `kubectl rollout restart deployment/api` to reload certificates."),
-            "Reload certificates.",
+            nudge.COMMAND_ACTION,
         )
         self.assertEqual(
             nudge.clean_action("kubectl delete node gke-orphan-1"),
@@ -407,7 +406,7 @@ class DetectorWordingTests(unittest.TestCase):
                 ),
                 (
                     "**wolfram-auto-01** — A Node object outlives its virtual machine: this cluster blocks the upgrade",
-                    "Delete the orphan Node object; nothing runs on it.",
+                    nudge.COMMAND_ACTION,
                 ),
             ],
         )
@@ -432,64 +431,76 @@ class DetectorWordingTests(unittest.TestCase):
             "x (minAvailable: 50%, rounds up to 2 of 2 expected pods)",
         )
 
-    def test_no_sentence_is_edited_around_a_command(self):
-        # A recommendation is shown whole or not at all: an edit around a command can turn a
-        # warning into its opposite, or hide a destructive step beside the "Fix issue" button.
+    def test_a_recommendation_with_a_command_gives_the_neutral_line_whole(self):
+        # Nothing is cut out and nothing is edited around a command: an edit can turn a warning
+        # into its opposite, hide a destructive step, or print a later clause as the whole action.
         for raw in (
+            # A negation or a condition in front of a command.
             "Do not run `kubectl delete pod web-0`, scale the Deployment instead.",
             "Do not run `kubectl delete pdb jayanti-pdb`.",
             "Stop: do not `kubectl delete node gke-x`; drain it first.",
             "Do not run kubectl delete ns shop --force on production.",
+            # A destructive step beside the "Fix issue" button.
             "Clean up: gcloud container clusters delete prod-usc1 --quiet.",
             "Run `kubectl delete node gke-old-1` and then recreate the pool.",
-            "Prefer `helm upgrade --atomic` over `helm upgrade`.",
-            "Raise the budget, then run `kubectl get pdb -A`.",
+            "Run `terraform destroy` to start over.",
+            "Clean up (run `kubectl delete namespace prod`).",
+            # "Run X to Y", whose goal was whatever followed the first " to ".
+            "Run `kubectl rollout restart deployment/api` to reload certificates.",
+            "Run kubectl cordon node-1. Then move the workloads to another pool.",
+            "Run kubectl rollout restart deploy/api and scale it to 3 replicas.",
+            "Run git commit -m 'switch to v2' to record the change.",
+            # A command in parentheses, also where the parentheses hold a condition.
+            "Delete the orphan Node object (kubectl delete node <name>); nothing runs on it.",
+            "Raise the budget (kubectl patch pdb api only after the rollout finishes).",
+            # An example.
+            "Add a LimitRange, e.g. `kubectl apply -f limitrange.yaml`, then re-check.",
+            "Do not, for example, `kubectl delete pod web-0`.",
+            # A command after a lead-in, with a flag.
             "Upgrade the control plane of prod-usc1 with gcloud container clusters upgrade prod-usc1 "
             "--master --cluster-version=1.33.5-gke.1080000.",
-            "Restrict access with gcloud container clusters update c "
-            "--master-authorized-networks=10.0.0.0/8, 192.168.0.0/16 --enable-master-authorized-networks.",
+            "Prefer `helm upgrade --atomic` over `helm upgrade`.",
             "Gcloud container clusters update c --enable-shielded-nodes",
             # Nothing but a command.
             "Run `kubectl get pods`",
-            "Run kubectl delete namespace prod --wait=false",
+            "gcloud container clusters update prod --enable-shielded-nodes",
             "kubectl delete pod --all -n shop",
-            "kubectl delete -f manifests/old.yaml",
             "kubectl delete secret sa-key -n billing after moving to Workload Identity",
-            # One word left of "Run <command> to <goal>", or a command in the goal.
-            "Run kubectl get pods -n x to check.",
-            "Run helm upgrade api ./chart to pick up the image and then run kubectl rollout status deploy/api --timeout=60s.",
         ):
-            self.assertEqual(nudge.clean_action(raw), nudge.FALLBACK_ACTION, raw)
+            self.assertEqual(nudge.clean_action(raw), nudge.COMMAND_ACTION, raw)
 
-    def test_a_removed_command_does_not_hide_a_destructive_step(self):
-        # "Start over." does not say that the fix destroys something.
-        for raw in (
-            "Run `terraform destroy` to start over.",
-            "Run kubectl delete namespace prod --wait=false to clean up.",
-            "Run `kubectl drain node-1 --force --delete-emptydir-data` to free the node.",
-            "Clean up (run `kubectl delete namespace prod`).",
-            "Tidy the old release, e.g. `helm uninstall api -n shop`, before the upgrade.",
-        ):
-            self.assertEqual(nudge.clean_action(raw), nudge.FALLBACK_ACTION, raw)
-        # The words that are left name the step themselves: nothing is hidden.
-        self.assertEqual(
-            nudge.clean_action("Delete the orphan Node object (kubectl delete node <name>); nothing runs on it."),
-            "Delete the orphan Node object; nothing runs on it.",
-        )
+    def test_the_neutral_line_states_no_action_and_holds_for_a_warning(self):
+        self.assertEqual(nudge.COMMAND_ACTION, "The recommendation names a command, which is not shown here.")
 
-    def test_a_cut_that_leaves_a_stub_gives_the_fallback(self):
-        for raw in (
-            "Do not, for example, `kubectl delete pod web-0`.",
-            "Do not run e.g. `kubectl get pdb x`.",
-            "Run, e.g., `kubectl get pods`.",
-            "Try e.g. `kubectl rollout restart deploy/web`.",
-            "Check it (kubectl get pdb -A).",
+    def test_the_plain_delete_is_the_one_rewording(self):
+        self.assertEqual(nudge.clean_action("kubectl delete node gke-prod-pool-8f2a."), "Remove the node gke-prod-pool-8f2a.")
+
+    def test_text_with_no_command_to_find_is_shown_as_written(self):
+        for prose in (
+            "Stop building images with docker socket mounts in the pod spec.",
+            "Deploy via helm charts rather than raw manifests, and pin the chart version.",
+            "Use a pre-helm hook to migrate the CRDs.",
+            "Avoid non-git sources for manifests.",
+            "Rotate the leaked credential; git history still contains it, so rewrite it too.",
+            "Docker Hub images should move to Artifact Registry.",
+            "Terraform owns this pool: change max_surge in the module.",
+            "Fix via git revert of the last change to the overlay.",
+            "Raise .spec.maxUnavailable to 1 - see the runbook (page 3).",
+            "--trust-remote-code must be removed from the container's args.",
+            # A command with no flag, written into a sentence, is not told from prose.
+            "Roll back with helm rollback api 3.",
         ):
-            self.assertEqual(nudge.clean_action(raw), nudge.FALLBACK_ACTION, raw)
-        self.assertEqual(
-            nudge.clean_action("Scale the pool to 3 nodes; e.g. `gcloud container clusters resize c --num-nodes 3`."),
-            "Scale the pool to 3 nodes.",
-        )
+            self.assertEqual(nudge.clean_action(prose), prose)
+
+    def test_the_readiness_reviews_remedies_are_shown_as_written_or_replaced_whole(self):
+        replaced = {
+            entry for entry, remedy in review.ENTRY_MITIGATIONS.items() if nudge.clean_action(remedy) == nudge.COMMAND_ACTION
+        }
+        # The two remedies that name a command: connection draining, and the orphan Node object.
+        self.assertEqual(replaced, {21, 22})
+        for entry, remedy in review.ENTRY_MITIGATIONS.items():
+            if entry not in replaced:
+                self.assertEqual(nudge.clean_action(remedy), " ".join(remedy.split()), entry)
 
     def test_a_mention_or_a_link_in_a_findings_text_is_not_live(self):
         row = finding(
@@ -504,57 +515,9 @@ class DetectorWordingTests(unittest.TestCase):
             self.assertNotIn(live, shown)
         self.assertIn("!channel api has no limits, see the runbook", bundle.text)
         self.assertIn("Ask @U123ABC or !here to set limits on api.", bundle.text)
-
-    def test_the_fallback_states_no_action_of_its_own(self):
-        self.assertEqual(nudge.FALLBACK_ACTION, "The recommended fix is a command, which is not shown here.")
-
-    def test_the_forms_that_keep_the_meaning_come_out(self):
-        cases = {
-            # A command in parentheses, with the sentence around it as written, a negation included.
-            "Do not delete the pod by hand (kubectl delete pod web-0); scale the Deployment instead.": (
-                "Do not delete the pod by hand; scale the Deployment instead."
-            ),
-            "Raise .spec.maxUnavailable to 1 (kubectl edit pdb api -n shop).": "Raise .spec.maxUnavailable to 1.",
-            "Check the pool version (gcloud container node-pools describe p --format='value(version)') and upgrade it.": (
-                "Check the pool version and upgrade it."
-            ),
-            # An example in backticks.
-            "Add a LimitRange, e.g. `kubectl apply -f limitrange.yaml`, then re-check.": "Add a LimitRange, then re-check.",
-            # "Run <command> to <goal>" keeps the goal.
-            "Run `kubectl rollout restart deployment/api` to reload certificates.": "Reload certificates.",
-            # The plain delete, in words.
-            "kubectl delete node gke-prod-pool-8f2a.": "Remove the node gke-prod-pool-8f2a.",
-        }
-        for raw, plain in cases.items():
-            self.assertEqual(nudge.clean_action(raw), plain, raw)
-
-    def test_text_with_no_command_to_find_is_left_as_written(self):
-        for prose in (
-            "Stop building images with docker socket mounts in the pod spec.",
-            "Deploy via helm charts rather than raw manifests, and pin the chart version.",
-            "Use a pre-helm hook to migrate the CRDs.",
-            "Avoid non-git sources for manifests.",
-            "Rotate the leaked credential; git history still contains it, so rewrite it too.",
-            "Docker Hub images should move to Artifact Registry.",
-            "Terraform owns this pool: change max_surge in the module.",
-            "Roll back via Helm to the previous release, then pin the chart version.",
-            "Fix via git revert of the last change to the overlay.",
-            "Check the release notes: Helm chart 4.2 changes the default.",
-            "Run helm charts through a linter before merging.",
-            # A command with no flag, written into a sentence, is not told from prose.
-            "Roll back with helm rollback api 3.",
-        ):
-            self.assertEqual(nudge.clean_action(prose), prose)
-
-    def test_the_readiness_reviews_own_remedies_are_shown_or_replaced_never_edited(self):
-        for entry, remedy in review.ENTRY_MITIGATIONS.items():
-            shown = nudge.clean_action(remedy)
-            written = " ".join(remedy.split())
-            self.assertIn(
-                shown,
-                (written, nudge.FALLBACK_ACTION, nudge.PAREN_CLI_RE.sub("", written)),
-                f"entry {entry}: {shown}",
-            )
+        # A row's own names go the same way, though a Kubernetes name cannot hold one.
+        named = finding(cluster="<!channel>", namespace="", object="<@U123ABC>", title="x", recommendation={})
+        self.assertIn("- critical · @U123ABC on !channel — x", nudge.compose(plan_for([named]), 1, False))
 
     def test_one_of_a_version_is_not_a_count(self):
         self.assertEqual(

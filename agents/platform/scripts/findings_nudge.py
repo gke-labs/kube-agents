@@ -158,51 +158,32 @@ NESTED_PARENS_FLAT = r"(\1, \2)"
 # "1 replicas" is a count; the "1" that ends a version or a name ("1.31.1 nodes", "pool-1 nodes") is not.
 ONE_PLURAL_RE = re.compile(r"(?<![\d.-])\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
 
-# A recommendation is text this script did not write, so it is shown whole or
-# not at all: nothing edits a sentence around a command. Three forms come out
-# without changing what the sentence says (a command in parentheses, an "e.g."
-# example in backticks, and "Run <command> to <goal>", which keeps the goal),
-# and the plain "kubectl delete <kind> <name>" is said in words. Any other
-# command this finds (in backticks, carrying a flag, or opening the action)
-# puts `FALLBACK_ACTION` in place of the whole recommendation. A command with
-# no flag written into a sentence is not told from prose and stays as written.
+# A recommendation is text this script did not write, so it is shown as written
+# or not at all: nothing is cut out of it and nothing is edited around a
+# command. Where a command is found (a tool in backticks, in parentheses,
+# opening the action, after "Run", or followed in its sentence by a flag),
+# `COMMAND_ACTION` stands in for the whole recommendation. A false hit ("drop
+# the -latest tag") costs the sentence, never its meaning. A command with no
+# flag written into a sentence is not told from prose and stays as written.
+# The one rewording is the whole action `kubectl delete <kind> <name>`.
 CLI_TOOLS_PATTERN = r"(?:kubectl|gcloud|helm|git|gh|terraform|tofu|docker)"
-PAREN_CLI_RE = re.compile(
-    rf"\s*\((?i:e\.g\.?,?\s*|for example,?\s*|run\s+)?`?{CLI_TOOLS_PATTERN}\b(?:[^()]|\([^()]*\))*\)",
-)
-EXAMPLE_CLI_RE = re.compile(rf"(?i:[,;]?\s*(?:e\.g\.?|for example|such as),?)\s*`{CLI_TOOLS_PATTERN}\b[^`]*`")
-RUN_CLI_TO_RE = re.compile(rf"^\s*(?i:run)\s+`?{CLI_TOOLS_PATTERN}\s+[^`]+?`?\s+to\s+(.+)$")
 # The plain form only: a flag is not a kind, and a condition after it is not dropped.
 KUBECTL_DELETE_RE = re.compile(
     r"^\s*`?kubectl\s+delete\s+([a-z][a-z0-9.]*)\s+([a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)`?\s*\.?\s*$"
 )
-# A command still in the text: a tool in backticks; a tool followed, in its
-# sentence, by a flag (a "." or ";" inside a version or a file name does not
-# end the sentence); or a tool that opens the action.
-COMMAND_LEFT_RE = re.compile(
+COMMAND_FOUND_RE = re.compile(
     rf"`{CLI_TOOLS_PATTERN}\b[^`]*`"
-    rf"|(?i:\b{CLI_TOOLS_PATTERN}\b)(?:(?![.;](?:\s|$)).)*?\s--?[A-Za-z]"
-    rf"|^\s*{CLI_TOOLS_PATTERN}\s+\S",
+    rf"|\(\s*(?i:e\.g\.?,?\s*|for example,?\s*|run\s+)?`?{CLI_TOOLS_PATTERN}\b"
+    rf"|^\s*(?i:run\s+)?`?{CLI_TOOLS_PATTERN}\s+\S"
+    # A "." or ";" inside a version or a file name does not end the sentence.
+    rf"|(?i:\b{CLI_TOOLS_PATTERN}\b)(?:(?![.;](?:\s|$)).)*?\s--?[A-Za-z]",
 )
-# A space a removed form left before a mark; ".spec.replicas" and ":v2" are not that.
-SPACE_BEFORE_MARK_RE = re.compile(r"\s+(?=[,.;:!?](?:\s|$))")
-# One word left of "Run <command> to <goal>" says nothing ("Check.").
-ACTION_MIN_WORDS = 2
-# What is left of a sentence a command was cut out of has to stand: three words
-# or more, and no end on a word or a mark the command hung from ("Do not.",
-# "Do not run.", "Scale the pool;").
-CUT_MIN_WORDS = 3
-CUT_DANGLING_WORDS = ("not", "run")
-CUT_DANGLING_MARK = ";"
-# A step a removed command would take that the words left must still name: with
-# "Run `terraform destroy` to start over." the reader of "Start over." is not
-# told what the fix destroys. A force flag counts.
-DESTRUCTIVE_WORDS = ("delete", "destroy", "drain", "uninstall", "rollback", "reset", "purge", "force")
-# In place of a recommendation that cannot be shown without its command. It
-# states no action of its own: the source's action is the command.
-FALLBACK_ACTION = "The recommended fix is a command, which is not shown here."
+# In place of a recommendation with a command in it. It states no action of its
+# own, and it is true also when the source says not to run the command.
+COMMAND_ACTION = "The recommendation names a command, which is not shown here."
+# The name the first tests gave it.
+FALLBACK_ACTION = COMMAND_ACTION
 REMOVE_ACTION = "Remove the {kind} {name}."
-ACTION_EDGE_CHARS = " ,;:-—"
 SUBJECT_EDGE_CHARS = " :—-"
 # A detector's title is "<what is wrong>: <subject> ..."; what may follow the subject's name.
 TITLE_SUBJECT_SEPARATOR = ": "
@@ -466,69 +447,20 @@ def _ensure_period(sentence: str) -> str:
 
 
 def clean_action(raw_action: str) -> str:
-    """Show a recommendation's action whole, with no pasted CLI command, or not at all.
+    """Show a recommendation's action as written, or `COMMAND_ACTION` when it holds a command.
 
-    Returns the action as written when it holds no command this can find; the
-    action minus a parenthesised command or a backticked example; the goal of
-    "Run <command> to <goal>"; "Remove the <kind> <name>." for the plain
-    `kubectl delete`; and `FALLBACK_ACTION` for every other action with a
-    command in it, so no sentence is edited around one.
+    Nothing is cut out of the text. The whole action `kubectl delete <kind>
+    <name>` is said in words, "Remove the <kind> <name>.".
     """
-    original = _plain(raw_action)
-    if not original:
+    text = _plain(raw_action)
+    if not text:
         return ""
-    delete_match = KUBECTL_DELETE_RE.match(original)
+    delete_match = KUBECTL_DELETE_RE.match(text)
     if delete_match:
         return REMOVE_ACTION.format(kind=delete_match.group(1), name=delete_match.group(2))
-    text = original
-    removed: list[str] = []
-
-    def take(match: re.Match) -> str:
-        removed.append(match.group(0))
-        return ""
-
-    run_match = RUN_CLI_TO_RE.match(text)
-    if run_match:
-        removed.append(text[: run_match.start(1)])
-        goal = run_match.group(1).strip()
-        if _word_count(goal) < ACTION_MIN_WORDS:
-            return FALLBACK_ACTION
-        text = goal[:1].upper() + goal[1:]
-    cut = len(removed)
-    text = EXAMPLE_CLI_RE.sub(take, PAREN_CLI_RE.sub(take, text))
-    if COMMAND_LEFT_RE.search(text):
-        return FALLBACK_ACTION
-    if removed:
-        text = SPACE_BEFORE_MARK_RE.sub("", _one_line(text))
-        if _hides_a_destructive_step(removed, text) or (len(removed) > cut and _is_stub(text)):
-            return FALLBACK_ACTION
-    text = _fix_singular_plurals(_one_line(text)).strip(ACTION_EDGE_CHARS)
-    return _ensure_period(text) if text else FALLBACK_ACTION
-
-
-def _word_count(text: str) -> int:
-    return len(text.rstrip("".join(SENTENCE_ENDINGS)).split())
-
-
-def _is_stub(text: str) -> bool:
-    """Whether what a cut left cannot stand as a sentence."""
-    body = text.rstrip("".join(SENTENCE_ENDINGS) + " ")
-    words = body.split()
-    return (
-        len(words) < CUT_MIN_WORDS
-        or body.endswith(CUT_DANGLING_MARK)
-        or words[-1].lower() in CUT_DANGLING_WORDS
-    )
-
-
-def _hides_a_destructive_step(removed: list[str], kept: str) -> bool:
-    """Whether a removed command takes a destructive step the kept words do not name."""
-    kept_lower = kept.lower()
-    return any(
-        word in span.lower() and word not in kept_lower
-        for span in removed
-        for word in DESTRUCTIVE_WORDS
-    )
+    if COMMAND_FOUND_RE.search(text):
+        return COMMAND_ACTION
+    return _ensure_period(_fix_singular_plurals(text))
 
 
 def ambiguous_clusters(rows: list[dict]) -> frozenset[str]:
@@ -547,8 +479,8 @@ def cluster_label(finding: dict, ambiguous: frozenset[str] = frozenset()) -> str
     cluster = str(finding.get("cluster") or "").strip()
     project = str(finding.get("project") or "").strip()
     if cluster and cluster in ambiguous and project:
-        return f"{cluster} ({project})"
-    return cluster
+        return _plain(f"{cluster} ({project})")
+    return _plain(cluster)
 
 
 def _target_name(finding: dict) -> str:
@@ -558,7 +490,7 @@ def _target_name(finding: dict) -> str:
     # A cluster-wide finding has no workload to name: the row leads with its cluster.
     if not obj or obj == raw_cluster or obj in CLUSTER_SCOPE_OBJECTS:
         return ""
-    return f"{namespace}/{obj}" if namespace else obj
+    return _plain(f"{namespace}/{obj}" if namespace else obj)
 
 
 def _leading_groups(text: str) -> tuple[str, str]:
