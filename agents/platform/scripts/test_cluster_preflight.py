@@ -446,6 +446,19 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertNotIn("re-scaffold if needed", result["remediation"])
         self.assertIn("scope.held-cluster", result["evidence"])
 
+    def test_check_5_keeps_a_long_reason_on_a_cluster_with_long_names(self):
+        # The longest names GKE allows and a reason at the CRD's 256-character cap put
+        # the reason's end past check 5's 500-character evidence cut.
+        reason = "R" * 255 + "!"
+        long_err = self.HOLD_ERR.replace(
+            "cluster prod-1 (payments-prod, us-central1)",
+            "cluster " + "c" * 40 + " (" + "p" * 30 + ", northamerica-northeast1)",
+        ).replace("INC-42 rollback in progress", reason)
+        self.assertGreater(long_err.index(". An operator paused"), 500)
+        result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=long_err)
+        self.assertEqual("5", result["check"])
+        self.assertIn("Reason given: " + reason + ".", result["reason"])
+
     def test_check_5_names_a_hold_on_every_cluster(self):
         all_err = self.HOLD_ERR.replace(
             "cluster prod-1 (payments-prod, us-central1) is on hold (spec.hold): INC-42 rollback in progress",

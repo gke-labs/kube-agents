@@ -132,9 +132,6 @@ class HoldState:
         self.triples = triples
         self.reason = reason
 
-    def any(self) -> bool:
-        return self.held_all or bool(self.triples)
-
     def reason_suffix(self) -> str:
         return f": {self.reason}" if self.reason else ""
 
