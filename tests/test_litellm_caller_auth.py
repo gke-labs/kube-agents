@@ -57,8 +57,10 @@ _HELM_BASE_ARGS = [
     "templates/litellm.yaml",
 ]
 
-# What callers send today, each found in the caller's own code.
-_CALLER_PLACEHOLDERS = {"none", "a2a-playground"}
+# What callers send today, each found in the caller's own code. Hermes's
+# "no-key-required" is in the agent image, not this tree: its provider resolver
+# sends it in place of the config's "none" (seen on a live install).
+_CALLER_PLACEHOLDERS = {"none", "a2a-playground", "no-key-required"}
 # The routes callers use: the agents' and Hindsight's OpenAI clients, the
 # curator and decision memory (/chat/completions under /v1), the worker's
 # Claude Code (/v1/messages, its count_tokens), the web console (/model/info,

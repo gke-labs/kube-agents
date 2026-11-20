@@ -70,11 +70,15 @@ MASTER_KEY_ENV = "LITELLM_MASTER_KEY"
 # The class a caller with no key, or a placeholder, is admitted as. Also its
 # api_key: a fixed word, so the label and the rate-limit bucket are one.
 KEYLESS_CLASS = "keyless"
-# What callers send today because their client wants a non-empty key: the
-# agents' and Hindsight's "none" (deploy/shared/defaults/config.yaml,
-# platformagent_manifests.go, a2a/memory/llm.go) and the worker adapter's
-# "a2a-playground" (a2a/cmd/worker-adapter/main.go).
-PLACEHOLDER_KEYS = frozenset({"none", "a2a-playground"})
+# What callers send today because their client wants a non-empty key:
+# Hindsight's, the curator's and decision memory's "none" (hindsight.yaml,
+# a2a/memory/llm.go, decision_memory.py); the worker adapter's "a2a-playground"
+# (a2a/cmd/worker-adapter/main.go); and Hermes's "no-key-required". The agents'
+# config says api_key "none" (deploy/shared/defaults/config.yaml,
+# platformagent_manifests.go), but Hermes's provider resolver replaces it with
+# its own placeholder (hermes_cli/runtime_provider.py in the agent image), so
+# "no-key-required" is what an agent turn actually sends.
+PLACEHOLDER_KEYS = frozenset({"none", "a2a-playground", "no-key-required"})
 # The routes a non-admin caller may use, matched exactly. LiteLLM's own
 # allowed_routes check also admits every path under an entry, which would
 # take in /health/test_connection and /health/drain beside /health.
