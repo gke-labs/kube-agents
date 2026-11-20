@@ -102,8 +102,9 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 
 	for _, n := range streams {
 		var err error
+		var restored int
 		for i := 0; i < 30; i++ {
-			if err = RestoreVerified(ctx, nc, metas[n].Config, metas[n].State, metas[n].TakenAt, opener(data[n]), digests[n], policyOf(withReplicas(rendered[n], 1))); err == nil {
+			if restored, err = RestoreVerifiedCounting(ctx, nc, metas[n].Config, metas[n].State, metas[n].TakenAt, opener(data[n]), digests[n], policyOf(withReplicas(rendered[n], 1))); err == nil {
 				break
 			}
 			t.Logf("restore %s attempt %d: %v", n, i, err)
@@ -119,6 +120,17 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 		}
 		if err != nil {
 			t.Fatalf("restore %s: %v", n, err)
+		}
+		// As the restore pod does (cli.go's restoreAll): the server assigns
+		// the consumers a restore brought back only after it answers the
+		// restore, and a raise sent before then can bring a consumer up on
+		// the new replicas without its restored state (ack floor 0, every
+		// message pending; #6643). So wait for the assignments, then raise.
+		actx, cancel := context.WithTimeout(ctx, restoreAssignTimeout)
+		_, err = AssignedDurables(actx, nc, n, restored, metas[n].Config, 3)
+		cancel()
+		if err != nil {
+			t.Fatalf("%s: waiting for its restored consumers' assignments: %v", n, err)
 		}
 		if err := RaiseReplicas(ctx, nc, n, 3); err != nil {
 			t.Fatalf("%s to R3: %v", n, err)

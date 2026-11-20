@@ -169,7 +169,7 @@ The chat flags are held to the file rather than overriding it for one run, becau
 one-run override would be undone by the next full upgrade without a word. They are
 `--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
 `--slack-home-channel-name`, `--slack-home-channel-policy`, `--google-chat-allowed-users`,
-`--google-chat-home-channel`,
+`--google-chat-home-channel`, `--google-chat-home-channel-policy`,
 `--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
 Against an existing `install.env`, a flag that disagrees with the key the file assigns is
 refused before anything is applied, naming the file and the key: edit the key (or, for
@@ -194,7 +194,7 @@ record (never a token), for an operator who goes on to run `lifecycle.sh apply` 
 first, so a later `upgrade.sh` renders what they applied. A toggle recorded `true` brings the settings of
 its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
 `SLACK_HOME_CHANNEL`, `SLACK_HOME_CHANNEL_NAME` and `SLACK_HOME_CHANNEL_POLICY` for Slack; `ALLOWED_USERS`,
-`CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The
+`CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL`, `GOOGLE_CHAT_HOME_CHANNEL_POLICY` and `GOOGLE_CHAT_MODE` for Google Chat. The
 toggle is written after them, so a record cut short leaves the settings with the integration
 off, never the integration on without its allowlist. Otherwise
 an allowlist given at the prompt or as an export would be left out, and the next upgrade would
@@ -226,6 +226,8 @@ run alone. A
 full or operator `upgrade.sh` applies the CRDs before the chart; a `lifecycle.sh apply` run by hand
 after `--generate-only` does not, so on an install whose CRD predates the field apply
 `charts/kube-agents/crds/` first, or the chart refuses the value with a message that says so.
+`GOOGLE_CHAT_HOME_CHANNEL_POLICY` (`--google-chat-home-channel-policy`) is the same key for
+`spec.integration.googleChat.homeChannelPolicy`, on the same terms throughout.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,
 regenerated on every run from the loaded environment. Nobody edits it.

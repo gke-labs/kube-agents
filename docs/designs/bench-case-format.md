@@ -54,8 +54,8 @@ references.
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
 than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner, and the
-harness fills in the cluster placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
-`{{FLEET_CLUSTER_*:<role>}}`).
+harness fills in the placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
+`{{FLEET_CLUSTER_*:<role>}}`, `{{BENCH_GITOPS_REPO}}`).
 A first line of `[bench:slack-question-wake]` makes the run a replay of the wake a card blocked
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
@@ -95,6 +95,12 @@ schedule a stopped ask or a replay read only a prompt's first line, so a combine
 the wrong phase; combining one is a later change.
 It runs only over the inject transport (the door's `profile` and `parameters`), which every CI
 lane uses; the api transport errors on it.
+One field is not a parameter: `intent=confirm` submits the ask as a structured confirm, the door's
+`"intent":"confirm"`, so the gateway sets the task's `changeRequested`, which a profile's write path
+(the `cluster` persona's version-control skill) needs. `confirm` is its only value, and the lint
+refuses any other; a directive without it sends a typed message. The door takes the confirm only
+where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
+which is infrastructure, since the agent never saw the ask.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -372,10 +378,12 @@ which a kanban worker gets in its newest tool result at 90% of a finite cap and 
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
 the cap closes with `Iteration budget exhausted (N/M)`; `budget` is the `M` every such record must
 name; a worker that finishes inside 90% of its cap records neither, so the check is for a card
-written to outrun the cap; a run whose cards have no run rows, in which no attempt
-ran out and none completed either (the harness archives a card still running at its delegation
-ceiling, which closes the attempt `reclaimed`), or whose capture recorded gaps and no attempt ran
-out, is `status: "error"`),
+written to outrun the cap; a run with no worker capture to read, a run in which no record names a
+cap and no attempt has the outcome `completed` (no run rows, or the harness archives a card still
+running at its delegation ceiling, which closes the attempt `reclaimed`), or a run in which no
+record names a cap and either the capture recorded gaps or the workers' captured results, one or
+more, are all withheld or absent, is `status: "error"`; any other run in which no record names a
+cap is a fail),
 `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question

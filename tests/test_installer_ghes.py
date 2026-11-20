@@ -31,12 +31,14 @@ from tests.test_install_script import (
     _INSTALL_SH,
     _INSTALLER_COMMON,
     _REPO_ROOT,
+    _HOST_TOOL_MARKER,
+    _HOST_TOOL_PROBE,
     _run_installer_bash,
 )
 # The modules, not the classes: a TestCase imported by name is collected here too.
 from tests import test_installer_common as _installer_common
 from tests import test_installer_gitlab as _gitlab
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _PEM = "-----BEGIN CERTIFICATE-----\nMIIBghes\n-----END CERTIFICATE-----\n"
 _HOST = "github.acme.corp"
@@ -269,13 +271,19 @@ class GhesFlagsTest(_Tmp):
 
     def test_through_main_a_bad_host_stops_before_step_one(self):
         body = (
+            f"{_HOST_TOOL_PROBE}"
             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
             "main -y --image-tag=0.1.0 --gitops-host=acme.ghe.com --gitops-org=platform && rc=0 || rc=$?\n"
             'echo "rc=$rc"\n'
         )
+        # main runs with no dry run. If the host check did not stop it, step one
+        # would start the host's git, gcloud and terraform, and a package
+        # manager for a tool that is missing. The PATH has none of them.
         proc = _run_installer_bash(body, get_isolated_test_env(overrides={
-            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}))
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+            "PATH": str(create_minimal_tools_bin(self._tmp, exclude=("git",)))}))
         out = proc.stdout + proc.stderr
+        self.assertNotIn(_HOST_TOOL_MARKER, proc.stdout)
         self.assertNotIn("rc=0", proc.stdout, out)
         self.assertIn("a host that GitHub operates", out)
         self.assertNotIn("1. Checking Prerequisites", out)

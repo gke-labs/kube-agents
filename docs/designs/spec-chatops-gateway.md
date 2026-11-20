@@ -256,7 +256,7 @@ not the whole output story: the gateway authors a small set of posts of its own.
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
 edits, posted and edited with `OutMessage.Stop` while the task runs so that a backend that
 draws a Stop control draws it there, which Google Chat does, below; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
-Agent Sessions, where a submission that never reached the bus is posted instead), the status card, the steer acknowledgement, the release line for a task that
+Agent Sessions, where a submission that never reached the bus is posted instead, except for a single child a session turn delegates to an AgentProfile, which keeps its line there too and closes it to the bare mark (#6532): that status never carries a profile worker's progress), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
 below), the notice the reap scan posts once when that grace passes with no turn to
 carry the release line, and failure notices (a submission or steer that never reached the bus). All
@@ -524,7 +524,7 @@ refused here, with the same target-only notice and an audit line, and nothing re
 parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and
 incarnation that asked. The conversation's rolling line for it, on a backend that keeps one (not
 Slack, a `StatusShower`), is the same "working on" line any task gets, suffixed
-`(delegated to platform)`; the parent's own line is left in place on the
+`(delegated to platform)`. A single child a session turn delegates to an AgentProfile gets its `(delegated to <profile>)` line on Slack as well (#6532), since Slack's own status carries nothing of a profile worker's progress; the parent's own line is left in place on the
 parent's history entry and closes on the parent's own terminal, not the child's. From the mint on,
 the child is the conversation's active task: a follow-up steers it, `stop` cancels it, a status ask
 reports it. A heal releases the child from the conversation's active-task slot, and retires its
@@ -752,10 +752,13 @@ leaves the record as it was:
 3. **Mint.** The grant names the resolved profile, the requester's tier and the target as its
    scope (`project/P/location/L/cluster/C`, or the install's namespace with no target), with
    the dispatcher as its delegate, because the dispatcher is the one verifier caller for a
-   profile task. Until the PlatformAgent's membership mapping exists, every person at any door
-   is `read`, and a requester with no identity is refused. The one path that mints `unattended` is
-   the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which ships dark until
-   the callout grants a trigger source its submit subject. A delegated profile child runs at its
+   profile task. The tier is the authors' (the requester, the thread's writers and the task's
+   steer authors), each mapped by the PlatformAgent's `spec.tiers.membership` or else `read`;
+   authors at different tiers are refused, and so is a tier that isn't loaded and interactive,
+   or one wider than the gateway's own authority tier besides `profile.run` (#3659). The
+   console is `read`, and a requester with no identity is refused. The one path that mints
+   `unattended` is the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which
+   ships dark until the callout grants a trigger source its submit subject. A delegated profile child runs at its
    parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
    task can't delegate to `platform`, whose child would be minted at the install's tier and
    scope.
@@ -1796,7 +1799,7 @@ the Hermes platform that used to post it is off. So the agent asks the gateway, 
 the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
 core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?, "reply_to"?, "report"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
-(`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
+(`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`, else the learned space), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
 prints) and `thread_id`, the thread it landed in, or an `error` naming why nothing was
 posted. A home request on a gateway that has no home channel is refused that way and kept
@@ -1806,13 +1809,13 @@ at the next refusal, with a meta entry counting the refusals since the last dige
 last five subjects. When a home channel arrives, the gateway posts one digest into it (the
 count, the span, the last subjects, how many of those texts it still holds) and takes what it
 named off the count; the texts stay until pruned. The arrival is seen where the home channel is
-read: at a start that has one (the CR's, or on Slack the projected file's), or at the first
-home request that finds the projected file naming one (Slack, with the learn armed). The
+read: at a start that has one (the CR's, or the projected file's), or at the first
+home request that finds the projected file naming one (with the learn armed). The
 requester's answer is the same refusal, worded to say the post is kept and carrying `kept`;
 the relay records its own undelivered line as before, and the alert path records the alert as
 kept. The operator names every armed route in `A2A_NOTIFY_CONVERSATIONS` and every armed route
-with a home channel set on the CR in `A2A_NOTIFY_PLATFORM`; the agent adds Slack when the gateway
-learned a channel, and sends home posts to every armed route when no platform has a home, each
+with a home channel set on the CR in `A2A_NOTIFY_PLATFORM`; the agent adds a platform whose
+projected file names a learned channel, and sends home posts to every armed route when no platform has a home, each
 keeping them for its digest (below; `routed_platforms()`).
 Each backend keeps its own refused posts under its own key. The `HomeChannelUnset` condition
 names every armed platform without a home channel, and says where its posts go meanwhile. The gateway writes nothing to the
@@ -1830,7 +1833,7 @@ with `kept` beside the error, and `a2a notify` exits with a fourth status for it
 senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
 it as handled, so the keep holds one copy, and the alert path records the alert as kept
 rather than lost. The agent-side callers
-(`agents/platform/scripts/chat_notify.py`) switch on `routed_platforms()` (`A2A_NOTIFY_PLATFORM`, plus Slack when the projected file names a channel, else every armed route) and send to every
+(`agents/platform/scripts/chat_notify.py`) switch on `routed_platforms()` (`A2A_NOTIFY_PLATFORM`, plus Slack or Chat when its projected file names a channel, else every armed route) and send to every
 other platform through `hermes send` as before (a day on with no conversation to take onboarding's
 first report, that report is a ledger issue on GitHub, and a home line on each routed platform links it the same way).
 `A2A_NOTIFY_PLATFORM` holds a comma-separated list of platform names, and a single name is a list of one;
@@ -1838,13 +1841,14 @@ these are the agent's platform names (`google_chat`, `slack`), not the gateway's
 name or unset (`a2aGchatNotifyArmed`), and for `slack` by the Slack rule below. The operator
 renders in `A2A_NOTIFY_PLATFORM` every armed platform whose home channel the CR sets, a space name
 or a channel id, Chat first (`a2aNotifyHomePlatforms`), and renders no variable when none is. It
-reads CR fields only, so a learn replaces no pod. `routed_platforms()` adds Slack to that list when
-the gateway holds Slack and the projected file names a channel, the CR's or a learned one. With
-no list, it takes Slack alone when the file names a channel, and otherwise every armed route, and
-each gateway backend keeps the refused posts for its digest. The rule reads only the two variables
-and the file, so a cron child or the terminal tool, which Hermes strips of `*_HOME_CHANNEL`,
-computes the same answer as the session server. The alert picks one platform from that answer,
-Chat first. The kanban patch's copy applies the same rule. The kanban notifier's report back to a gateway
+reads CR fields only, so a learn replaces no pod. `routed_platforms()` adds Slack or Chat to that
+list when the gateway holds the platform and its projected file (`slack_home`, `gchat_home`) names a
+learned channel. A learned home never outranks a configured one: the platforms the operator listed
+come first, then the learned ones, Chat before Slack in each group. With no platform left with a home, it takes every
+armed route, and each gateway backend keeps the refused posts for its digest. The rule reads only
+the two variables and the two files, so a cron child or the terminal tool, which Hermes strips of `*_HOME_CHANNEL`,
+computes the same answer as the session server. The alert picks the first platform of that answer,
+so it stays on a configured home when the other platform's is only learned. The kanban patch's copy applies the same rule. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, a comma-separated list of the
 platforms the gateway serves (read by `chat_notify.gateway_platforms()` on the agent side and by the kanban patches' own copies), which names every armed route, home channel or not (`a2aNotifyPlatforms`); on Chat
@@ -1908,17 +1912,18 @@ Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` then names `slac
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
 route off, as on Chat. With both backends armed `A2A_NOTIFY_CONVERSATIONS` reads
 `google_chat,slack`, and `A2A_NOTIFY_PLATFORM` names the ones with a home channel on the CR; the
-agent adds a learned Slack channel, and sends home posts to both when neither has one.
+agent adds a learned Slack channel or Chat space, and sends home posts to both when neither has one.
 
 **The home-channel record.** The operator owns a ConfigMap
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
 record's name as `A2A_HOME_CHANNEL_RECORD`, the gateway's own image as `A2A_SELF_IMAGE` and the switch
-that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway. The
+that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway
+(Google Chat has the same contract with its own policy and keys: "The Google Chat half" below). The
 operator reads the record once per reconcile and projects the home channel it stands behind, "the CR,
-else the admitted record", into a second ConfigMap it owns, `<agent>-chat-home`, one key `slack_home`
-always present, mounted as a read-only directory (Optional, no subPath, out of every pod-template hash)
+else the admitted record", into a second ConfigMap it owns, `<agent>-chat-home`, one key per backend
+(`slack_home`, `gchat_home`) always present, mounted as a read-only directory (Optional, no subPath, out of every pod-template hash)
 in the agent pod at `/etc/kube-agents/chat-home` and in the gateway pod at `/etc/a2a/chat-home`; the
 kubelet refreshes the file in place within about a minute, so a learned channel reaches both pods with
 no pod replaced and no copy to drift, and the `HomeChannelUnset` condition comes from the same read.
@@ -1926,9 +1931,10 @@ The agent's env carries the CR field only, as any CR edit does. The operator adm
 only under policy `auto`, when the value is a channel id of at most 32 runes and no `slack.refused`
 stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks a
 file-sourced home before each post (below), never the CR field. The projection joins the stack's teardown list, and a hand edit of it is
-rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
+rewritten on the next pass. The gateway's half (`a2a/gateway/home_channel.go`, the learner both
+backends share, and `a2a/gateway/slack_home_channel.go`, Slack's candidate, check and line) sits behind that
 switch, `A2A_HOME_CHANNEL_LEARN=true`. The gateway keeps no copy of the home
-channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
+channel. It reads one file per backend, `/etc/a2a/chat-home/slack_home` for Slack: the projection of the home channel the
 operator admits (the CR field, else the record), which the operator change that admits the record
 mounts as a directory in the gateway pod; the notify route reads that file once per request, in
 `validate`, and the request posts
@@ -1968,6 +1974,31 @@ move over the projected file for at most two minutes, one line in the new channe
 and one in the old says it moved. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
 nothing without the operator's projection. `patch` on the object is the RBAC bound; data-only merge
 patches with the read `resourceVersion` as the precondition are the gateway's contract.
+
+**The Google Chat half.** Chat learns its home space the same way, in the same record and the same
+projection, under its own names, so a gateway that holds both backends keeps two homes:
+`spec.integration.googleChat.homeChannelPolicy` (`auto`, also absent, or `manual`), rendered as
+`A2A_GCHAT_HOME_POLICY`; the record keys `gchat`, `gchat.setBy`, `gchat.setAt` and `gchat.refused`
+(`writer` is shared and names the image that wrote last); and the projected file `gchat_home`. The
+operator renders the record name, the image and the switch whenever Chat is on the gateway, mounts the
+projection in both pods then, and admits a recorded space only under policy `auto`, when the value is
+a space name (`spaces/<id>`) of at most 64 runes and no `gchat.refused` stands beside it. The
+switch is the one Slack reads: a gateway whose operator renders it without a `gchat_home` file finds
+the file absent, and an absent file learns nothing. The shared learner is the Slack flow above with
+the backend's keys; what is Chat's own (`a2a/gateway/gchat_home_channel.go`) is this. The candidate is
+a verified, typed message that is not a command, outside a direct message, that Chat does not mark
+`threadReply`: Chat delivers a space message to the app only when it mentions the app, so every such
+message is addressed, and in a space without threading every message is top-level. A direct message
+is never a candidate and a group chat (`GROUP_CHAT`) is refused without a call. The home is the
+space, never a thread of it. The check is `spaces.get` through the relay, under the app's own
+credentials: a 403 or 404 is `not-member`, a direct message or group chat is `direct-message`, a
+space that admits people outside the organization (`externalUserAllowed`) is `shared`, as a Slack
+Connect channel is, and a value that is not a space name is `malformed`; Chat has no `archived`. The
+same check runs once per home post the file named, and writes `gchat.refused` beside the record. The
+one line is posted in the learning thread and says in plain words that an administrator can move it,
+with no field path or kind name; Chat has no Home tab, so there is no picker, and a move is a CR edit or an edit of the
+record. `HomeChannelUnset` carries Chat's sentence with Slack's manual and refused suffixes and its own learn and malformed ones, which speak of a space. A sender's
+record entry is the `users/<id>` resource name, not the email.
 
 A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
 and posted on the `ts`, or a bare `ts`, which names no channel, so the gateway checks it only for
@@ -2013,9 +2044,13 @@ as the console does, with no variable arming it. Each request is one frame on
 the whole `text`, not chunked; a `chat` message's text is its fallback, and the console renders
 text. An `update` key edits the frame it posted, as it edits a chat message elsewhere. A
 request may carry `reply_to`, the gateway task whose turn filed the card (`a2a notify
---reply-to`), which the frame passes on as `replyTo` so a console client can join the report to
-its turn, and echo it as the `replyTo` of a reply under the report ("Transport" below). A
-`reply_to` that is not a task id's shape is dropped and the report still posted.
+--reply-to`), which the frame passes on as `replyTo` so a console client can join the post to
+its turn, and the report mark (`report`, below), which the frame carries as `report: true` on
+the card's report alone, so the console page offers a reply under that post and echoes its
+`replyTo` as the `replyTo` of the reply ("Transport" below; the MCP server does not read the mark
+yet and labels every gathered frame a card's report); a progress note or plan line names its task on
+the frame without the mark, since no report is kept under it to reply to. A `reply_to` that is
+not a task id's shape is dropped and the report still posted.
 The task reaches the card this way. The hermes-bridge records it on a console conversation's
 route (`task_id`). `kanban_event_routing` snapshots it into the card's subscription when the
 card is filed, as `console:<token>#<taskId>` (`#` cannot occur in a console token, which is one
@@ -2564,7 +2599,7 @@ restarts, while a chat backend that stops is run again after a backoff and the r
 keep going. The inject and A2A doors sit beside the backends, for the reason the inject
 section gives. The operator renders every backend the CR enables into the one gateway,
 Chat and Slack together when both are. Decided 2026-11-12. Home posts go to every armed route
-with a home channel set on the CR, plus Slack when the gateway learned a channel; with none,
+with a home channel set on the CR, plus any whose channel the gateway learned; with none,
 every armed route keeps them for its digest. Revised 2026-11-13, because an alert picks one
 platform and stops when the gateway keeps it. The operator renders the CR half and the agent adds
 the learned channel from the projected file, so a learn replaces no pod.
@@ -2671,7 +2706,7 @@ the label check included; anything else shows as written. Every field goes out a
 (`blocksMention`, the notify route's check), which the renderer no longer writes. The blocks go on
 the wire as the renderer wrote them, not through slack-go's types.
 With Agent Sessions wired (every Slack adapter the gateway builds) there is no live message in a
-Slack thread, since the adapter is a `StatusShower` for any conversation with a thread; where a backend keeps one, the live message shows
+Slack thread, since the adapter is a `StatusShower` for any conversation with a thread, except a single child a session turn delegates to an AgentProfile, which keeps its line (#6532); where a backend keeps one, the live message shows
 the newest progress chat message under every display mode, and keeps it when the task ends, its text turning to the terminal line; a progress artifact without one turns
 the message back to text. A layout the backend refuses is not offered again until the progress
 chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,
@@ -2975,12 +3010,13 @@ so no `handoff` or `"cardsPending": true` is emitted once the cards settle in tu
 `"cardsPending": true`, no unsettled handoff remains and the client need not wait. Its text is the
 deliverable for a completed task and the gateway's notice
 otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
-carrying the notice; a console client reads the child's answer from TASKS. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
-turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
-notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
+carrying the notice; a console client reads the child's answer from TASKS. A kanban card's post into the conversation is a frame too, with `"kind": "notify"`, the
+turn it reports on as `replyTo`, and `"report": true` on the card's report alone ("Proactive posts:
+the chat.notify route", the console's route). A notice carries none of those fields, so a client
+waiting on a turn can tell the three apart. The
 page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
 frame costs it nothing. It shows the notify frames, which it has no other source for; one whose
-frame names its turn gets a reply button under the text, in a pane that can send, and the next
+frame carries the report mark and names its turn gets a reply button under the text, in a pane that can send, and the next
 typed turn after a click carries that `replyTo` on `.in`, so the agent's follow-up opens with the
 report. A card's
 report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`

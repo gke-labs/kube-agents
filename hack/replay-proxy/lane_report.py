@@ -22,9 +22,10 @@ which the Prow job exports). It writes, into `--out`:
   served from (`nightly`), which is where answers came from, not a verdict:
   uploads are write-once, so that is the night that first wrote the answer,
   often an older one on another commit; and, per conversation that was served anything,
-  whether its run's verdict matched the recording's. Only answers from runs
-  that passed are published (publish_cache.py), so a recording's verdict is a
-  pass, and a mismatch is a replayed run that failed. A conversation whose run
+  whether its run's verdict matched the recording's. Only answers a passing
+  run gave are published (publish_cache.py), though the run that first saved
+  an answer's object may have failed; a mismatch is a replayed run that
+  failed. A conversation whose run
   can't be told (run_attribution.py), whose run bench-gate graded as neither a
   pass nor a fail (infra, blocked, not_applicable), or whose recording night
   is in no record the fetch read is `unknown`, each counted by reason in
@@ -257,8 +258,9 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
             continue
         # The night that first wrote the answer, which can be weeks old: the
         # fetch reads runs back to the bucket's lifecycle (fetch_cache.py).
-        # Its verdict is the run that wrote the answer, so this is that night
-        # and not the newest one: only a run that passed publishes.
+        # The comparison is with that night's run, not the newest night's: a
+        # passing run produced the answer, though the run that first wrote its
+        # object may have failed (publish_cache.py, alternates).
         if not recorded or recorded not in nightly_runs:
             unknown(RECORDING_BUILD_UNRECORDED)
             continue

@@ -85,8 +85,8 @@ class Decision(NamedTuple):
 
 DECISIONS = (
     # The Pub/Sub platform plugin.
-    Decision("agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py", "PubsubRelay.__init__", BUILD_OPENER, TAKES, REFUSE, BROKER, BROKER_BEARER),
-    Decision("agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py", "PubSubAdapter._run_turn_via_api._post", URLOPEN, TAKES, REFUSE, GATEWAY_API, LOOPBACK_BEARER),
+    Decision("agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py", "<module>._GATEWAY_API_OPENER", BUILD_OPENER, REFUSES, REFUSE, GATEWAY_API, LOOPBACK_BEARER),
+    Decision("agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py", "PubsubRelay.__init__", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     # The chat profile.
     Decision("agents/chat/defaults/plugins/chat_metrics/metrics.py", "ProposalsOpenedGauge._read", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision("agents/chat/scripts/bootstrap_delivery.py", "_post_surfaced", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
