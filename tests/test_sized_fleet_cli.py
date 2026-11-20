@@ -1,7 +1,10 @@
-"""hack/sized_fleet.py's own logic: the region, the host check, the teardown record and the churn warm-up. The cloud calls are stubbed; nothing here creates or deletes a resource."""
+"""hack/sized_fleet.py's own logic: the region, the host check, the teardown record, the churn warm-up, the image lookup, the sweep and the soak window's eval cases. The cloud calls are stubbed; nothing here creates or deletes a resource."""
 
 import argparse
 import importlib.util
+
+
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,3 +100,141 @@ class CredentialsTest(unittest.TestCase):
             self.assertEqual(cli.os.environ[cli.kube.KUBECONFIG_ENV], str(Path(tmp) / "k"))
         self.assertEqual(calls[-1], "scale-host")
         self.assertEqual(len(calls), len(cli.sf.fleet("S").clusters) + 1)
+
+
+class PublishedTest(unittest.TestCase):
+    def test_the_newest_commit_with_images_is_chosen(self):
+        log = mock.Mock(stdout="aaa\nbbb\nccc\n")
+        with mock.patch.object(cli.subprocess, "run", return_value=log), \
+                mock.patch.object(cli, "image_published", side_effect=lambda sha: sha != "aaa"):
+            self.assertEqual(cli.newest_published(), "bbb")
+
+    def test_no_published_commit_stops_the_run(self):
+        with mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(stdout="aaa\n")), \
+                mock.patch.object(cli, "image_published", return_value=False):
+            with self.assertRaises(SystemExit):
+                cli.newest_published()
+
+
+class SweepTest(unittest.TestCase):
+    def test_only_sizes_with_a_cluster_older_than_the_limit_are_deleted(self):
+        clusters = [
+            {"createTime": "2026-11-10T00:00:00Z", "resourceLabels": {cli.SIZE_LABEL: "m"}},
+            {"createTime": "2026-11-11T09:00:00Z", "resourceLabels": {cli.SIZE_LABEL: "s"}},
+        ]
+        deleted = []
+        now = cli.datetime.fromisoformat("2026-11-11T10:00:00+00:00").timestamp()
+        with mock.patch.object(cli.kube, "gcloud", return_value=json.dumps(clusters)), \
+                mock.patch.object(cli.time, "time", return_value=now), \
+                mock.patch.object(cli, "cmd_down", side_effect=lambda a: deleted.append(a.size)):
+            cli.cmd_sweep(args())
+        self.assertEqual(deleted, ["M"])
+
+    def test_a_failed_size_does_not_stop_the_others_and_the_sweep_says_so(self):
+        old = "2026-11-10T00:00:00Z"
+        clusters = [{"createTime": old, "resourceLabels": {cli.SIZE_LABEL: size}} for size in ("l", "m", "x")]
+        tried = []
+
+        def down(a):
+            tried.append(a.size)
+            if a.size == "L":
+                raise cli.TofuFailed("destroy", 1, "state lock")
+
+        now = cli.datetime.fromisoformat("2026-11-11T10:00:00+00:00").timestamp()
+        with mock.patch.object(cli.kube, "gcloud", return_value=json.dumps(clusters)), \
+                mock.patch.object(cli.time, "time", return_value=now), \
+                mock.patch.object(cli, "cmd_down", side_effect=down):
+            rc = cli.cmd_sweep(args())
+        self.assertEqual(tried, ["L", "M"])
+        self.assertEqual(rc, cli.EXIT_UNSOUND)
+
+
+class EvalTest(unittest.TestCase):
+    def test_the_cases_file_lists_paths_and_skips_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cases.txt"
+            path.write_text("# header\n\n./tasks/a/task.yaml\n  ./tasks/b/task.yaml  \n")
+            self.assertEqual(cli.eval_cases(path), ["./tasks/a/task.yaml", "./tasks/b/task.yaml"])
+
+    def test_the_shipped_cases_file_names_cases_that_exist(self):
+        cases = cli.eval_cases(cli.EVAL_CASES_FILE)
+        self.assertTrue(cases)
+        for case in cases:
+            self.assertTrue((cli.BENCH_DIR / case).is_file(), case)
+
+    def test_a_case_passes_only_when_every_objective_passed(self):
+        passed = {"role": "objective", "success": True}
+        failed = {"role": "objective", "success": False}
+        safeguard = {"role": "safeguard", "success": False}
+        self.assertTrue(cli.case_passed({"verification_report": [passed, safeguard]}))
+        self.assertFalse(cli.case_passed({"verification_report": [passed, failed]}))
+        self.assertFalse(cli.case_passed({"verification_report": []}))
+
+
+class ImagesTest(unittest.TestCase):
+    def test_every_first_party_image_an_install_pulls_is_checked(self):
+        repos = cli.image_repositories()
+        # The chart's five tags, and the bus images the operator renders at its own tag.
+        for name in ("platform-agent", "k8s-operator", "a2a-gateway", "a2a-worker", "hermes-bridge", "web-console"):
+            self.assertIn(f"gke-labs/kube-agents/{name}", repos)
+        self.assertFalse(any("litellm" in r for r in repos))
+
+    def test_a_commit_counts_as_published_only_when_every_image_is(self):
+        with mock.patch.object(cli, "manifest_exists", side_effect=lambda repo, sha: "operator" in repo):
+            self.assertFalse(cli.image_published("abc"))
+        with mock.patch.object(cli, "manifest_exists", return_value=True):
+            self.assertTrue(cli.image_published("abc"))
+
+
+class EvalCaseIsolationTest(unittest.TestCase):
+    def test_a_case_that_fails_to_run_does_not_cost_the_others_their_records(self):
+        calls = []
+
+        def run_case(case, name, env, evals):
+            calls.append(name)
+            if name == "a":
+                raise cli.subprocess.TimeoutExpired("devops-bench", 1)
+            return {"passed": True}
+
+        relay = mock.Mock(port=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = Path(tmp) / "cases.txt"
+            cases.write_text("./tasks/a/task.yaml\n./tasks/b/task.yaml\n")
+            with mock.patch.object(cli.operations, "Relay", return_value=relay), \
+                    mock.patch.object(cli.operations, "agent_env", return_value={}), \
+                    mock.patch.object(cli, "run_case", side_effect=run_case):
+                summary = cli.run_evals(args(eval_cases=str(cases), namespace="ns", host_cluster="h"), "ctx",
+                                        Path(tmp))
+            self.assertTrue((Path(tmp) / "evals" / "summary.json").is_file())
+        self.assertEqual(calls, ["a", "b"])
+        self.assertFalse(summary["a"]["passed"])
+        self.assertTrue(summary["b"]["passed"])
+        relay.stop.assert_called_once()
+
+
+class TestBedValuesTest(unittest.TestCase):
+    def test_a_release_with_chat_or_gitops_is_refused(self):
+        values = {"platformAgent": {"integration": {"slack": {"enabled": True}, "github": {"gitRepo": "o/r"},
+                                                    "repositories": [{"url": "x"}]}}}
+        problems, _ = cli.test_bed_values(values)
+        self.assertEqual(len(problems), 3)
+
+    def test_auto_promote_is_turned_off_and_other_env_kept(self):
+        values = {"platformAgent": {"deployment": {"env": [{"name": "A", "value": "1"},
+                                                          {"name": cli.AUTO_PROMOTE_ENV, "value": "true"}]}}}
+        problems, env = cli.test_bed_values(values)
+        self.assertEqual(problems, [])
+        self.assertEqual(env, [{"name": "A", "value": "1"}, {"name": cli.AUTO_PROMOTE_ENV, "value": "false"}])
+
+
+class RunCaseInterruptTest(unittest.TestCase):
+    def test_an_interrupt_stops_the_case_process_group_and_is_raised(self):
+        proc = mock.Mock(pid=4242)
+        proc.communicate.side_effect = [SystemExit(143), ("partial", None)]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(cli.os, "killpg") as killpg:
+            with self.assertRaises(SystemExit):
+                cli.run_case("./tasks/a/task.yaml", "a", {}, Path(tmp))
+            self.assertEqual((Path(tmp) / "a.log").read_text(), "partial")
+        killpg.assert_called_once_with(4242, cli.signal.SIGTERM)

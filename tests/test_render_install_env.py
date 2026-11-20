@@ -396,6 +396,15 @@ class RenderingTest(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertEqual(parse(text)["HELM_UPGRADE_INSTALL"], "true")
 
+    def test_card_stop_enabled_is_rendered_when_set_and_omitted_when_not(self):
+        """Opt-in per environment: unset leaves the key out, and the stop stays off."""
+        rc, log, text = render(dict(_COORDS))
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("CARD_STOP_ENABLED", parse(text))
+        rc, log, text = render({**_COORDS, "CARD_STOP_ENABLED": "true"})
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(parse(text)["CARD_STOP_ENABLED"], "true")
+
     def test_helm_upgrade_install_is_not_required_under_strict(self):
         """Absent keeps today's behaviour and destroys nothing, so a strict
         render must not ask for it."""
