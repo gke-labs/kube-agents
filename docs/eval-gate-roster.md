@@ -614,7 +614,7 @@ with "Not a roster admission."
     asserts nothing there that the case depends on. A repository assertion is a `state` entry
     on the subject that `hack/fleet-fixture-state.py` names in its `REPOSITORY_SUBJECT`
     constant, `repository/<path>`: today the declared-intent note
-    (`knowledge/notification-relay-no-pdb.md`) on the five `declared-*` roles, held by git blob
+    (`knowledge/notification-relay-no-pdb.md`) on the `declared-*` roles, held by git blob
     sha to the content provisioning seeds. It must sit on one of the case's roles, or anywhere
     in the catalog for a case that lists no role (`repository_asserted_roles` in the test).
 

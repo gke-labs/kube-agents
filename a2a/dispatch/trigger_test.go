@@ -27,6 +27,20 @@ func triggeredEnv(t *testing.T, profile, taskID, capKey, trigger string, params 
 	return env
 }
 
+// scriptAdmission is triggerAdmission in Job mode: a Job runner, the
+// unattended tier, and a Job template, where a script can run.
+func scriptAdmission(t *testing.T) (*Dispatcher, *fakeVerifier, lib.DispatchConfig, lib.DispatchProfile, holdKey) {
+	t.Helper()
+	v := &fakeVerifier{}
+	d := &Dispatcher{cfg: testConfig(), verifier: v, verified: map[holdKey]permit{}, jobs: newFakeJobs(0), pool: NewStaticPool()}
+	prof := testProfile("tse", 1, "unattended")
+	// By reference, as the operator renders it; the inline form is
+	// TestAdmissionHandsAnInlineTemplatesScriptOn's.
+	prof.JobTemplateRef = &lib.DispatchJobTemplateRef{Name: "dispatch-job-tse", Hash: "h1"}
+	snap := lib.DispatchConfig{Namespace: "kubeagents-system", Profiles: []lib.DispatchProfile{prof}}
+	return d, v, snap, prof, holdKey{"tse", "unattended", lib.SubmitKindTop, "task-1"}
+}
+
 func triggerAdmission(t *testing.T) (*Dispatcher, *fakeVerifier, lib.DispatchConfig, lib.DispatchProfile, holdKey) {
 	t.Helper()
 	v := &fakeVerifier{}
@@ -142,35 +156,150 @@ func TestTheProxyTokenCarriesTheAdmittedTrigger(t *testing.T) {
 	}
 }
 
-// A checked trigger on a task that names no cluster has no credential-proxy
-// token to ride on: the task still runs, and the drop is logged rather than
-// silent.
-func TestATriggerWithNoClusterToRideOnIsLoggedAsDropped(t *testing.T) {
+// triggeredRun runs one task for profile tse at tier, on a keyed dispatcher
+// with a worker that accepts, from a submission claiming trigger ("" for
+// none) with params, and returns its one confirm, the signing key's public
+// half and the dispatcher's log.
+func triggeredRun(t *testing.T, tier, trigger string, params map[string]string) (lib.DispatchMessage, string, string) {
+	t.Helper()
 	b := newBus(t, "tse-1")
-	b.ensure("tse", 2, 0, "read")
-	w := b.worker("tse", "read", "tse-1", answerAccept, time.Second)
-	ti := oneProfile("tse", 2, "tse-1")
-	ti.pool.SetUID("tse", "read", "tse-1", "uid-tse-1")
-	kp, _ := signingKey(t)
+	tiers := []string{"read", "unattended"}
+	if tier != "read" && tier != "unattended" {
+		tiers = append(tiers, tier)
+	}
+	b.ensure("tse", 2, 0, tiers...)
+	w := b.worker("tse", tier, "tse-1", answerAccept, time.Second)
+	ti := oneProfile("tse", 2)
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0] = testProfile("tse", 2, tiers...) })
+	ti.pool.Set("tse", tier, "tse-1")
+	ti.pool.SetUID("tse", tier, "tse-1", "uid-tse-1")
+	kp, pub := signingKey(t)
 	logs := &syncBuffer{}
 	b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(d *Dispatcher) {
 		d.log = slog.New(slog.NewTextHandler(logs, nil))
 	})
-
-	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject("tse", "read", lib.SubmitKindTop, "task-1"),
-		triggeredEnv(t, "tse", "task-1", "cap-ok", scheduleTriggerJSON, nil)); err != nil {
+	env := submissionEnv(t, "tse", "task-1", "cap-ok", params)
+	if trigger != "" {
+		env = triggeredEnv(t, "tse", "task-1", "cap-ok", trigger, params)
+	}
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject("tse", tier, lib.SubmitKindTop, "task-1"), env); err != nil {
 		t.Fatal(err)
 	}
 	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
 		t.Fatalf("terminal %+v", ts)
 	}
 	confirms := confirmsOf(w)
-	if len(confirms) != 1 || confirms[0].ProxyToken != "" {
-		t.Fatalf("%d confirms; want one with no proxy token", len(confirms))
+	if len(confirms) != 1 || confirms[0].TaskCredential == "" {
+		t.Fatalf("%d confirms; want one carrying a task credential", len(confirms))
 	}
-	out := logs.String()
-	if !strings.Contains(out, "trigger dropped") || !strings.Contains(out, scheduleTrigger.Name) {
-		t.Errorf("no log line for the dropped trigger in:\n%s", out)
+	return confirms[0], pub, logs.String()
+}
+
+// The bus credential never carries a target or a trigger, whatever the
+// proxy token carries.
+func checkBusCredentialIsBare(t *testing.T, confirm lib.DispatchMessage, pub string) {
+	t.Helper()
+	natsC := verifyAs(t, confirm.TaskCredential, pub, taskcred.AudienceNATS)
+	if natsC.Target != nil || natsC.Trigger != nil {
+		t.Errorf("the bus credential carries target %+v, trigger %+v", natsC.Target, natsC.Trigger)
+	}
+}
+
+// An unattended task a trigger started, naming no cluster, gets a report
+// credential (#5619): a credential-proxy token with no target and the
+// admitted trigger. Only its jti is logged, never the token.
+func TestAnUnattendedTriggeredTaskWithNoClusterGetsAReportCredential(t *testing.T) {
+	confirm, pub, logs := triggeredRun(t, "unattended", scheduleTriggerJSON, nil)
+	if confirm.ProxyToken == "" {
+		t.Fatal("no proxy token on the confirm; want a report credential")
+	}
+	proxyC := verifyAs(t, confirm.ProxyToken, pub, taskcred.AudienceCredentialProxy)
+	want := taskcred.Trigger{Name: scheduleTrigger.Name, Origin: scheduleTrigger.Origin, Stream: scheduleTrigger.Stream}
+	if proxyC.Target != nil || proxyC.Trigger == nil || *proxyC.Trigger != want || proxyC.Tier != taskcred.ReportTier {
+		t.Errorf("proxy token: tier %q, target %+v, trigger %+v; want %q, none, %+v", proxyC.Tier, proxyC.Target, proxyC.Trigger, taskcred.ReportTier, want)
+	}
+	checkBusCredentialIsBare(t, confirm, pub)
+	if strings.Contains(logs, "trigger dropped") {
+		t.Errorf("a minted report credential was logged as dropped:\n%s", logs)
+	}
+	if strings.Contains(logs, confirm.ProxyToken) || !strings.Contains(logs, proxyC.ID) {
+		t.Errorf("the log should name the report credential's jti and never the token:\n%s", logs)
+	}
+}
+
+// An unattended task with no trigger, naming no cluster, gets no proxy
+// token: with no trigger there is no report credential.
+func TestAnUnattendedTaskWithNoTriggerOrClusterGetsNoProxyToken(t *testing.T) {
+	confirm, pub, _ := triggeredRun(t, "unattended", "", nil)
+	if confirm.ProxyToken != "" {
+		t.Errorf("an unattended task with no trigger and no cluster got a proxy token")
+	}
+	checkBusCredentialIsBare(t, confirm, pub)
+}
+
+// A read task naming no cluster gets no proxy token, with a trigger or
+// without. A grant binds a trigger only at the unattended tier, so the
+// triggered case shouldn't happen; it is logged as dropped, and nothing is
+// minted for it.
+func TestAReadTaskWithNoClusterGetsNoProxyToken(t *testing.T) {
+	confirm, pub, _ := triggeredRun(t, "read", "", nil)
+	if confirm.ProxyToken != "" {
+		t.Errorf("a read task with no cluster got a proxy token")
+	}
+	checkBusCredentialIsBare(t, confirm, pub)
+
+	confirm, pub, logs := triggeredRun(t, "read", scheduleTriggerJSON, nil)
+	if confirm.ProxyToken != "" {
+		t.Errorf("a read task with a trigger and no cluster got a proxy token")
+	}
+	checkBusCredentialIsBare(t, confirm, pub)
+	if !strings.Contains(logs, "trigger dropped") || !strings.Contains(logs, scheduleTrigger.Name) {
+		t.Errorf("no log line for the dropped trigger in:\n%s", logs)
+	}
+}
+
+// A task at a custom tier, even one in unattended mode, gets no report
+// credential: only the tier named unattended binds a trigger today (#6091),
+// so the mint keys on the name, and a trigger that reached a custom tier
+// anyway is dropped, not minted.
+func TestACustomTierWithATriggerAndNoClusterGetsNoProxyToken(t *testing.T) {
+	confirm, pub, logs := triggeredRun(t, "nightly", scheduleTriggerJSON, nil)
+	if confirm.ProxyToken != "" {
+		t.Errorf("a task at a custom tier got a proxy token with no cluster")
+	}
+	checkBusCredentialIsBare(t, confirm, pub)
+	if !strings.Contains(logs, "trigger dropped") {
+		t.Errorf("no log line for the dropped trigger in:\n%s", logs)
+	}
+}
+
+// An unattended task a trigger started that names a cluster is unchanged:
+// its proxy token carries the cluster as its target, and the trigger.
+func TestAnUnattendedTriggeredTaskWithAClusterKeepsItsTarget(t *testing.T) {
+	confirm, pub, _ := triggeredRun(t, "unattended", scheduleTriggerJSON, clusterParams)
+	if confirm.ProxyToken == "" {
+		t.Fatal("no proxy token on the confirm")
+	}
+	proxyC := verifyAs(t, confirm.ProxyToken, pub, taskcred.AudienceCredentialProxy)
+	wantTarget := taskcred.Target{Project: "proj-1", Location: "us-central1", Cluster: "prod-1"}
+	want := taskcred.Trigger{Name: scheduleTrigger.Name, Origin: scheduleTrigger.Origin, Stream: scheduleTrigger.Stream}
+	if proxyC.Target == nil || *proxyC.Target != wantTarget || proxyC.Trigger == nil || *proxyC.Trigger != want {
+		t.Errorf("proxy token: target %+v, trigger %+v; want %+v, %+v", proxyC.Target, proxyC.Trigger, wantTarget, want)
+	}
+	checkBusCredentialIsBare(t, confirm, pub)
+}
+
+// The tier a report credential names is the one grants bind triggers at:
+// taskcred's ReportTier (and the Python verifier's REPORT_TIER) is
+// capability.TierUnattended, and the dispatcher's default unattended tier.
+func TestTheReportTierIsTheUnattendedTier(t *testing.T) {
+	for name, tier := range map[string]string{
+		"capability.TierUnattended": string(capability.TierUnattended),
+		"DefaultUnattendedTier":     DefaultUnattendedTier,
+	} {
+		if tier != taskcred.ReportTier {
+			t.Errorf("%s is %q, taskcred.ReportTier %q: want one name", name, tier, taskcred.ReportTier)
+		}
 	}
 }
 
@@ -192,7 +321,7 @@ func TestANullAuthorityIsRefusedAsNoCapability(t *testing.T) {
 // A script-run trigger (#5622) reaches the verifier and the task credential
 // whole, script included: the copy into the credential drops no field.
 func TestAdmissionCarriesTheTriggersScriptIntoTheCredential(t *testing.T) {
-	d, v, snap, prof, hk := triggerAdmission(t)
+	d, v, snap, prof, hk := scriptAdmission(t)
 	prof.Scripts = []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
 	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
 	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
@@ -207,11 +336,15 @@ func TestAdmissionCarriesTheTriggersScriptIntoTheCredential(t *testing.T) {
 	if adm.trigger == nil || *adm.trigger != want {
 		t.Errorf("admission handed on trigger %+v; want %+v", adm.trigger, want)
 	}
+	if adm.script == nil || *adm.script != prof.Scripts[0] {
+		t.Errorf("admission handed on script %+v; want the profile's entry %+v", adm.script, prof.Scripts[0])
+	}
 }
 
 // A script the profile doesn't allowlist is refused at admission, before the
 // verifier is asked, whatever the grant says (#5622): the profile's list is
-// where a script-run task's path comes from. A trigger with no script is
+// where a script-run task's path comes from. The rig is in Job mode, so the
+// refusal is the list's, not the Job-mode one. A trigger with no script is
 // untouched by the list.
 func TestAdmissionRefusesAScriptTheProfileDoesNotAllowlist(t *testing.T) {
 	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
@@ -219,12 +352,16 @@ func TestAdmissionRefusesAScriptTheProfileDoesNotAllowlist(t *testing.T) {
 		"no scripts":     nil,
 		"another script": {{Name: "stall-watch", Path: lib.ScriptRoot + "stall_watch.py", TimeoutSeconds: 60}},
 	} {
-		d, v, snap, prof, hk := triggerAdmission(t)
+		d, v, snap, prof, hk := scriptAdmission(t)
 		prof.Scripts = scripts
+		snap.Profiles = []lib.DispatchProfile{prof}
 		del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
-		_, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
-		if err != nil || ref == nil || ref.reason != ReasonScriptNotAllowed {
-			t.Errorf("%s: refusal %+v, err %v; want %s", name, ref, err, ReasonScriptNotAllowed)
+		adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+		if err != nil || ref == nil || ref.reason != ReasonScriptNotAllowed || !strings.Contains(ref.detail, "allowlists no script") {
+			t.Errorf("%s: refusal %+v, err %v; want %s for the allowlist", name, ref, err, ReasonScriptNotAllowed)
+		}
+		if adm.script != nil {
+			t.Errorf("%s: admitted script %+v", name, adm.script)
 		}
 		if got := v.triggerList(); len(got) != 0 {
 			t.Errorf("%s: the verifier was asked (%d time(s)) about a script the profile doesn't list", name, len(got))
@@ -236,5 +373,56 @@ func TestAdmissionRefusesAScriptTheProfileDoesNotAllowlist(t *testing.T) {
 	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scheduleTriggerJSON, clusterParams)}
 	if _, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now()); err != nil || ref != nil {
 		t.Fatalf("a trigger without a script: refusal %+v, err %v", ref, err)
+	}
+}
+
+// A script runs only in Job mode, where each task gets a pod of its own:
+// at a tier that isn't unattended, with no Job runner, or with no Job
+// template, a listed script is refused before the verifier is asked, even
+// where a pool pod could take the task (as one serving unattended can).
+func TestAdmissionRefusesAScriptOutsideJobMode(t *testing.T) {
+	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
+	listed := []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
+	for name, edit := range map[string]func(d *Dispatcher, prof *lib.DispatchProfile, hk *holdKey){
+		"read tier": func(_ *Dispatcher, prof *lib.DispatchProfile, hk *holdKey) {
+			prof.Tiers = []string{"read", "unattended"}
+			hk.tier = "read"
+		},
+		"no Job runner": func(d *Dispatcher, _ *lib.DispatchProfile, _ *holdKey) { d.jobs = nil },
+		"no Job template": func(_ *Dispatcher, prof *lib.DispatchProfile, _ *holdKey) {
+			prof.JobTemplate, prof.JobTemplateRef = nil, nil
+		},
+	} {
+		d, v, snap, prof, hk := scriptAdmission(t)
+		prof.Scripts = listed
+		pool := NewStaticPool()
+		pool.Set("tse", "unattended", "pool-pod-1")
+		d.pool = pool
+		edit(d, &prof, &hk)
+		snap.Profiles = []lib.DispatchProfile{prof}
+		del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
+		adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+		if err != nil || ref == nil || ref.reason != ReasonScriptNotAllowed || !strings.Contains(ref.detail, "Job mode") {
+			t.Errorf("%s: refusal %+v, err %v; want %s for Job mode", name, ref, err, ReasonScriptNotAllowed)
+		}
+		if adm.script != nil || len(v.triggerList()) != 0 {
+			t.Errorf("%s: admitted script %+v, verifier asked %d time(s)", name, adm.script, len(v.triggerList()))
+		}
+	}
+}
+
+// A profile whose config carries its Job template inline still runs scripts:
+// HasJobTemplate takes either form.
+func TestAdmissionHandsAnInlineTemplatesScriptOn(t *testing.T) {
+	d, _, snap, prof, hk := scriptAdmission(t)
+	prof.JobTemplateRef = nil
+	prof.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"worker"}]}}`)
+	prof.Scripts = []lib.DispatchScript{{Name: "compliance-audit", Path: lib.ScriptRoot + "compliance_audit.py", TimeoutSeconds: 60}}
+	snap.Profiles = []lib.DispatchProfile{prof}
+	scripted := `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`
+	del := &envDelivery{env: triggeredEnv(t, "tse", "task-1", "cap-a", scripted, clusterParams)}
+	adm, ref, err := d.admit(context.Background(), del, snap, prof, hk, time.Now())
+	if err != nil || ref != nil || adm.script == nil || *adm.script != prof.Scripts[0] {
+		t.Fatalf("an inline template's script: admitted %+v, refusal %+v, err %v", adm.script, ref, err)
 	}
 }

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """hack/ci_pause_scheduled_audits.py, run as scheduled_audits runs it: `python3 - <home> [--resume] < script`.
+All runs but one get the script with a short gap between two read-backs (script_text).
 
 Pinned: which jobs it pauses and which it leaves (plumbing, the oobe stage's audits, a job
 already off), that it believes the store over Hermes' exit code, its exit codes, that --resume
@@ -42,6 +43,27 @@ SCRIPT = REPO / "hack" / "ci_pause_scheduled_audits.py"
 RUNNER = REPO / "hack" / "ci-eval-pr.sh"
 STAGE = REPO / "agents" / "chat" / "scripts" / "oobe.py"
 ROSTER_SOURCE = REPO / "agents" / "platform" / "cron" / "jobs.json"
+# The line of the script that sets the gap between two read-backs of the store, and
+# the line most runs here get in its place. Each run that pauses a job sleeps one
+# gap or more. A run reads the script from stdin, so it can get the text with this
+# one line changed and nothing else.
+ROUND_SLEEP_LINE_RE = re.compile(r"^PAUSE_ROUND_SLEEP_SECONDS = .+$", re.M)
+SHORT_ROUND_SLEEP_LINE = "PAUSE_ROUND_SLEEP_SECONDS = 0.01"
+
+
+def script_text(real_round_sleep=False):
+    """The script as a run gets it on stdin: its own text, or that text with the
+    gap between two read-backs made short."""
+    text = SCRIPT.read_text()
+    if real_round_sleep:
+        return text
+    text, lines = ROUND_SLEEP_LINE_RE.subn(SHORT_ROUND_SLEEP_LINE, text)
+    assert lines == 1, (
+        f"{SCRIPT} has {lines} lines that set PAUSE_ROUND_SLEEP_SECONDS; script_text() makes the gap short "
+        "in exactly one. If the script names the gap in another way, change ROUND_SLEEP_LINE_RE to match."
+    )
+    return text
+
 
 # A stand-in for `hermes -p platform cron pause <id>` that writes what Hermes' pause_job writes.
 # FAKE_HERMES_MODE=noop exits 0 and writes nothing; =fail exits 1.
@@ -120,7 +142,7 @@ class PauseTest(unittest.TestCase):
         self.roster.write_text(json.dumps({"jobs": jobs}))
         self.shipped.write_text(json.dumps({"jobs": jobs if shipped is None else shipped}))
 
-    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False):
+    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False, real_round_sleep=False):
         env = {
             **os.environ,
             "HERMES_BIN": str(self.hermes),
@@ -131,7 +153,7 @@ class PauseTest(unittest.TestCase):
         }
         result = subprocess.run(
             [sys.executable, "-", str(self.home), *(["--resume"] if resume else []), *(["--chain"] if chain else [])],
-            input=SCRIPT.read_text(),
+            input=script_text(real_round_sleep),
             capture_output=True, text=True, env=env, timeout=60,
         )
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
@@ -304,7 +326,8 @@ class PauseTest(unittest.TestCase):
 
         writer = threading.Thread(target=late_writer)
         writer.start()
-        result, _ = self.run_script()
+        # The script's own text: its gap must outlast the second the writer waits.
+        result, _ = self.run_script(real_round_sleep=True)
         writer.join()
         # Read after the writer is done: the store the run left is what the cases get.
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}

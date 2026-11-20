@@ -1,5 +1,5 @@
 {
-  "version": "6d768ad428ddb16c",
+  "version": "9e24071f9264d69c",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -148,6 +148,7 @@
           "chat.notify.reply.agent.>",
           "$KV.cap.root.*",
           "chat.board",
+          "a2a.trigger.reply.>",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.CONSUMER.CREATE.TASKS.>",
           "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -190,6 +191,8 @@
           "chat.notify.slack",
           "chat.notify.console",
           "chat.board.reply.gateway.>",
+          "a2a.trigger.*.submit",
+          "a2a.trigger.*.status",
           "_INBOX.gateway.>"
         ],
         "denyPublish": [

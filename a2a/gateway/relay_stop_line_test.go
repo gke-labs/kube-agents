@@ -152,9 +152,23 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 		}
 		return false
 	})
+	first := waitForRecord(t, r, conv, "the detached, closed task", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.Detached && rec.ActiveTask.LineClosed
+	})
+	firstRef, ok := first.TaskRefFor(origin.TaskID)
+	if !ok {
+		t.Fatalf("missing task ref for %s in %+v", origin.TaskID, first)
+	}
 	edits := len(r.adapter.editTexts())
 	press(line + "#t2")
+	waitForRecord(t, r, conv, "the second press recorded", func(rec *SessionRecord) bool {
+		return rec.LastUserMessage.After(first.LastUserMessage)
+	})
 	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "still going"}}, false, false)
+	waitForRecord(t, r, conv, "the progress event relayed", func(rec *SessionRecord) bool {
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && len(ref.RelayedSeqs) > len(firstRef.RelayedSeqs)
+	})
 	if err := exec.PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
 		t.Fatal(err)
 	}

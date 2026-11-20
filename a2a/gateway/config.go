@@ -96,17 +96,21 @@ const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
 // has it.
 const EnvSlackTestUsers = "A2A_SLACK_TEST_USERS"
 
-// The learned-home contract (slack_home_channel.go): the operator renders the
-// policy from slack.homeChannelPolicy, the record ConfigMap's name, the
+// The learned-home contract (home_channel.go): the operator renders each
+// backend's policy from its homeChannelPolicy, the record ConfigMap's name, the
 // gateway's own image for the record's writer and reader keys, and the one
 // switch that arms the learn, which only an operator that also admits the
 // record renders.
 const (
 	envSlackHomePolicy    = "A2A_SLACK_HOME_POLICY"
+	envGchatHomePolicy    = "A2A_GCHAT_HOME_POLICY"
 	envHomeChannelRecord  = "A2A_HOME_CHANNEL_RECORD"
 	envSelfImage          = "A2A_SELF_IMAGE"
 	envHomeChannelLearn   = "A2A_HOME_CHANNEL_LEARN"
 	slackHomePolicyManual = "manual"
+	// gchatHomePolicyManual is googleChat.homeChannelPolicy's "manual", the
+	// same word as Slack's.
+	gchatHomePolicyManual = slackHomePolicyManual
 	envTrue               = "true"
 )
 
@@ -137,7 +141,10 @@ const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
 const (
 	envImagePullRefs = "A2A_IMAGE_PULL_REFS"
-	imagePullRefSep  = ","
+	// envTriggerEventKinds lists the event triggers the trigger ingress
+	// admits (Config.TriggerEventKinds).
+	envTriggerEventKinds = "A2A_TRIGGER_EVENT_KINDS"
+	imagePullRefSep      = ","
 )
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
@@ -285,6 +292,9 @@ type Config struct {
 	// SlackHomePolicy is slack.homeChannelPolicy as the operator renders it:
 	// "manual" keeps the home channel the CR's alone; anything else is auto.
 	SlackHomePolicy string
+	// GchatHomePolicy is googleChat.homeChannelPolicy as the operator renders
+	// it: "auto" (also absent) or "manual".
+	GchatHomePolicy string
 	// HomeChannelRecord names the ConfigMap a learned home channel is
 	// recorded in, and SelfImage the gateway's own image reference, which it
 	// stamps into that record. HomeChannelLearn is the switch that arms the
@@ -338,6 +348,13 @@ type Config struct {
 	// empty means nobody. The A2A door's backend ("a2a") is the exception:
 	// no pair for it means nobody (doorUnlisted). See allowlist.go.
 	TargetAllowedUsers map[string]map[string][]string
+	// TierMembership maps a person, by backend and plaintext user id, to the
+	// tier their AgentProfile tasks run at (#3659, Tier 2c): the operator
+	// renders the PlatformAgent's spec.tiers.membership into
+	// A2A_TIER_MEMBERSHIP, and the gateway HMACs each id as it does the
+	// allowlists. Anyone unlisted runs at read; the console's shared principal
+	// always does (#5557).
+	TierMembership []TierMember
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
 	// it arms the door. DEV AND EVAL ONLY. The door is not a backend (see
@@ -357,6 +374,16 @@ type Config struct {
 	// platform persona widens from the holders of the agent's own API key to
 	// anyone holding pods/portforward in the namespace.
 	InjectToken string
+
+	// InjectConfirm (A2A_INJECT_CONFIRM, "true" and nothing else) lets the
+	// inject door take intent "confirm", which submits the turn with a
+	// change requested (TaskParameters.ChangeRequested). Off, the door
+	// refuses that intent with a 400. The door's caller is the eval
+	// harness, a program, so a confirm over it is automation by design and
+	// belongs only on an install armed for evals: the operator renders this
+	// beside A2A_INJECT_LISTEN under the same flag (A2A_INJECT_BACKEND on
+	// the operator), and a door armed by hand without it cannot confirm.
+	InjectConfirm bool
 
 	// InjectPrincipalMapPath is the door's OWN principal map
 	// (A2A_INJECT_PRINCIPAL_MAP), separate from PrincipalMapPath and never a
@@ -656,6 +683,17 @@ type Config struct {
 	// ingress accepts (trigger_ingress.go): a token bucket that holds this
 	// many and refills at this rate. Zero takes DefaultTriggerRatePerHour.
 	TriggerRatePerHour int
+	// TriggerEventKinds are the event triggers (#6572) whose submissions the
+	// trigger ingress admits, each <source>/<kind>: a source the callout
+	// binds to its own identity, and one kind of event it reports
+	// (A2A_TRIGGER_EVENT_KINDS, comma-separated). Empty, the default, admits
+	// none: only the schedule source submits. Listing kinds, not sources,
+	// bounds the rate buckets a source can open to the kinds named here.
+	TriggerEventKinds []string
+	// TriggerEventRatePerHour is the cap on each admitted event kind's
+	// submissions, a bucket per <source>/<kind>. Zero takes
+	// DefaultTriggerEventRatePerHour.
+	TriggerEventRatePerHour int
 
 	// CapabilityOptional relaxes exactly one thing: what happens when this
 	// gateway cannot mint. Zero value — the safe one — refuses the turn.
@@ -821,6 +859,29 @@ func (c *Config) HomeLearnArmed() bool {
 		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
 }
 
+// GchatHomeLearnArmed is HomeLearnArmed for the Google Chat home space: the
+// Chat backend is armed (beside any other), the CR names no home channel,
+// the policy is auto, a record is named, and the operator has armed the
+// learn. The switch is the one Slack's learn reads: an operator that renders
+// it without projecting Chat's file leaves the file absent, and an absent
+// file learns nothing (homeLearner.learn).
+func (c *Config) GchatHomeLearnArmed() bool {
+	return c.GchatRelayURL != "" && c.GchatHomeChannel == "" &&
+		c.GchatHomePolicy != gchatHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
+}
+
+// HomeLearnArmedFor is the learn's gate for one backend by name
+// (BackendSlack, BackendGchat); no other backend learns a home.
+func (c *Config) HomeLearnArmedFor(backend string) bool {
+	switch backend {
+	case BackendSlack:
+		return c.HomeLearnArmed()
+	case BackendGchat:
+		return c.GchatHomeLearnArmed()
+	}
+	return false
+}
+
 // Elected reports whether this gateway runs under the election (election.go).
 func (c *Config) Elected() bool { return c.GatewayLease != "" }
 
@@ -876,6 +937,11 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	for _, kind := range strings.Split(os.Getenv(envTriggerEventKinds), ",") {
+		if kind = strings.TrimSpace(kind); kind != "" {
+			cfg.TriggerEventKinds = append(cfg.TriggerEventKinds, kind)
+		}
+	}
 	seenPullRefs := make(map[string]struct{})
 	for _, refName := range strings.Split(os.Getenv(envImagePullRefs), imagePullRefSep) {
 		refName = strings.TrimSpace(refName)
@@ -891,6 +957,7 @@ func FromEnv() (*Config, error) {
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
+	cfg.GchatHomePolicy = strings.TrimSpace(os.Getenv(envGchatHomePolicy))
 	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
 	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
 	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
@@ -917,6 +984,11 @@ func FromEnv() (*Config, error) {
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
 	}
+	members, err := parseTierMembership(os.Getenv(EnvTierMembership))
+	if err != nil {
+		return nil, err
+	}
+	cfg.TierMembership = members
 	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
 		if u = strings.TrimSpace(u); u != "" {
 			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)
@@ -928,6 +1000,10 @@ func FromEnv() (*Config, error) {
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
+	cfg.InjectConfirm = os.Getenv("A2A_INJECT_CONFIRM") == "true"
+	if cfg.InjectConfirm && cfg.InjectListen == "" {
+		return nil, fmt.Errorf("A2A_INJECT_CONFIRM is set but the inject door is not armed (A2A_INJECT_LISTEN)")
+	}
 	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
 	cfg.ConsoleDoor = os.Getenv("A2A_CONSOLE_DOOR") == "true"
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
@@ -1023,6 +1099,15 @@ func FromEnv() (*Config, error) {
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
 	// it is checked where the spawner is built (gateway.New).
+	for _, kind := range cfg.TriggerEventKinds {
+		// Neither "schedule" nor "run-now" as a source: each opens a
+		// schedule's idempotency key, and an event source's keys must not
+		// spell one.
+		src, k, ok := strings.Cut(kind, "/")
+		if !ok || !lib.ValidSubjectToken(src) || !lib.ValidSubjectToken(k) || src == lib.TriggerSourceSchedule || src == lib.TriggerRunNowKeyPrefix {
+			return nil, fmt.Errorf(envTriggerEventKinds+" entry %q is not <source>/<kind> of dot-free DNS-1123 labels for an event source", kind)
+		}
+	}
 	if !lib.ValidSubjectToken(cfg.DefaultAddressee) {
 		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE %q is not a dot-free DNS-1123 label", cfg.DefaultAddressee)
 	}

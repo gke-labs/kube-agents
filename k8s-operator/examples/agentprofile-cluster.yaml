@@ -23,9 +23,11 @@ metadata:
   name: cluster
 spec:
   description: >-
-    Read-only SRE for one GKE cluster, named per task: live runtime state and
-    workload debugging. Returns a grounded root cause analysis and a proposed
-    manifest patch; never mutates cluster state and never opens pull requests.
+    SRE for one GKE cluster, named per task, read-only on that cluster: live
+    runtime state and workload debugging. Returns a grounded root cause analysis
+    and a proposed manifest patch; never mutates cluster state. Opens a pull
+    request on the install's managed repository only when the task asks for
+    that change.
   persona:
     image: <registry>/kube-agents/persona-cluster:<tag>
   harness:

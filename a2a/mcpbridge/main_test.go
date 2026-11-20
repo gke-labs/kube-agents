@@ -25,6 +25,7 @@ const (
 func TestMain(m *testing.M) {
 	for _, name := range []string{
 		envConfigPath,
+		EnvStreamSteps,
 		EnvMCPToken,
 		EnvMCPTokenDeployment,
 		envGHToken,

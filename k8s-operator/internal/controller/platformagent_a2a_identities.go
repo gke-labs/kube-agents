@@ -403,6 +403,23 @@ const a2aDispatchStopSubjects = "a2a.stop.*.*"
 // a2aGatewayUser is the gateway's NATS user.
 const a2aGatewayUser = "gateway"
 
+// The attested trigger ingress subjects (lib.TriggerSubmitSubject and its
+// kin, #5617), spelled here because this module can't import lib; the
+// rendered fixtures and the operator's submitter test hold them equal.
+const (
+	a2aTriggerSubmitWildcard  = "a2a.trigger.*.submit"
+	a2aTriggerStatusWildcard  = "a2a.trigger.*.status"
+	a2aTriggerReplySubjects   = "a2a.trigger.reply.>"
+	a2aTriggerScheduleSubmit  = "a2a.trigger." + triggerScheduleSource + ".submit"
+	a2aTriggerScheduleStatus  = "a2a.trigger." + triggerScheduleSource + ".status"
+	a2aTriggerScheduleReplies = "a2a.trigger.reply." + triggerScheduleSource + ".>"
+)
+
+// a2aAgentSchedulesEnabled reports whether the operator runs the
+// AgentSchedule reconciler (AgentSchedulesEnabled, the check cmd/main.go
+// registers it on), and so holds the schedule source's trigger grants.
+func a2aAgentSchedulesEnabled() bool { return AgentSchedulesEnabled() }
+
 // a2aProfileSupervisorPrefix and a2aProfileSupervisorSuffix spell a profile's
 // supervisor subjects, a2a.tasks.<profile>.*.supervisor: where the dispatcher
 // writes a profile task's terminal failures (lib.TaskSupervisorSubject). The
@@ -480,6 +497,15 @@ func operatorIdentity() (a2aIdentity, bool) {
 			"$JS.API.DIRECT.GET." + a2aDirectoryStream + "." + a2aDirectorySubjectPrefix + "*",
 		},
 		subscribe: []string{"_INBOX." + a2aOperatorBusUser + ".>"},
+	}
+	// With schedules on (A2A_AGENT_SCHEDULES, the switch that registers the
+	// AgentSchedule reconciler), the operator is the schedule source on
+	// attested trigger ingress (#5617): it submits a due run and asks
+	// after the runs it started, and reads the gateway's answers in its
+	// source's reply namespace. Nothing else holds the schedule source.
+	if a2aAgentSchedulesEnabled() {
+		id.publish = append(id.publish, a2aTriggerScheduleSubmit, a2aTriggerScheduleStatus)
+		id.subscribe = append(id.subscribe, a2aTriggerScheduleReplies)
 	}
 	// With a dispatcher, the operator also makes and removes the profiles'
 	// shared durables on PROFILE_SUBMITS (agentprofile_durables.go), and it
@@ -625,6 +651,13 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// session-kv. This grant being the gateway's alone is what keeps any
 		// other principal from asking the bridge to act.
 		a2aBoardSubject,
+		// The answers to trigger submissions and status queries, in the
+		// trigger reply namespace rather than a source's _INBOX, for the
+		// reason a2aNotifyReplySubjects gives: a grant reaching the
+		// source's inbox would let the gateway forge its JetStream replies.
+		// The gateway answers only on the asking source's own prefix
+		// (lib.ValidTriggerReplySubject).
+		a2aTriggerReplySubjects,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	// The profile cards' start-up read (a2a/gateway/profiledir.go): the
@@ -703,6 +736,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			a2aNotifySubjectConsole,
 			// The bridge's answer to a board request.
 			a2aBoardReplySubjects,
+			// Attested trigger ingress (#5617): every source's submissions
+			// and status queries. The callout binds a source's subject to
+			// its ServiceAccount, so the subject token names the caller.
+			a2aTriggerSubmitWildcard,
+			a2aTriggerStatusWildcard,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -1096,11 +1134,11 @@ func bridgeIdentity() a2aIdentity {
 
 	// The capability path, and the reason this static principal has one.
 	//
-	// The operator renders A2A_SPAWN_SESSIONS=true and renders no
-	// A2A_DEFAULT_ADDRESSEE, so the gateway keeps its own default and every
-	// turn in a stock `mode: next` install is addressed to
-	// a2aBridgeAddressee and executed by the sidecar this principal
-	// belongs to. A session pod is reached only by an explicit `delegate:`.
+	// The operator renders A2A_SPAWN_SESSIONS=true and renders
+	// A2A_DEFAULT_ADDRESSEE as `platform` unless spec.harness.tuning.defaultRoute
+	// says `session` (resolveA2ADefaultRoute), so every turn in a stock install
+	// is addressed to a2aBridgeAddressee and executed by the sidecar this
+	// principal belongs to. A session pod is reached only by an explicit `delegate:`.
 	// Without these two subjects the capability the gateway mints for those
 	// tasks is read by nobody: minted, referenced, and never checked.
 	//

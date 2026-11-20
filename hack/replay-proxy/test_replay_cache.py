@@ -32,10 +32,37 @@ ANSWER = {
 
 class LayoutTest(unittest.TestCase):
     def test_a_name_with_a_trailing_newline_is_outside_the_layout(self):
-        for rel in (f"answers/{'a' * 64}.json", f"variants/{'a' * 16}/{'b' * 16}.json"):
+        for rel in (f"answers/{'a' * 64}.json", f"variants/{'a' * 16}/{'b' * 16}.json",
+                    f"alts/{'a' * 64}/{'b' * 64}.json"):
             with self.subTest(rel=rel):
                 self.assertTrue(replay_cache.CACHE_REL_RE.match(rel))
                 self.assertIsNone(replay_cache.CACHE_REL_RE.match(rel + "\n"))
+
+
+class WeightsTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.cache = replay_cache.AnswerCache(self.root)
+
+    def test_a_weights_file_is_in_the_directory_layout_but_not_among_the_buckets_objects(self):
+        import publish_cache
+        rel = f"weights/{'a' * 64}.json"
+        self.assertTrue(replay_cache.CACHE_REL_RE.match(rel), "the lane seeds it")
+        self.assertIsNone(replay_cache.CACHE_REL_RE.match(rel + "\n"))
+        self.assertIsNone(publish_cache.OBJECT_NAME_RE.match(rel), "no record may name one")
+
+    def test_weights_keep_positive_integers_and_cap_them(self):
+        a, b, c, d, e = ("%x" % n * 64 for n in range(10, 15))
+        self.assertTrue(self.cache.save_weights("f" * 64, {a: 3, b: 0, c: True, d: "2", e: 10 ** 9}))
+        self.assertEqual(self.cache.weights("f" * 64), {a: 3, e: replay_cache.MAX_ANSWER_WEIGHT})
+
+    def test_no_file_or_a_file_that_is_not_a_map_gives_no_weights(self):
+        self.assertEqual(self.cache.weights("f" * 64), {})
+        path = Path(self.root, "weights", "e" * 64 + ".json")
+        path.parent.mkdir()
+        path.write_text("[1, 2]")
+        self.assertEqual(self.cache.weights("e" * 64), {})
 
 
 class NormalizeRestoreTest(unittest.TestCase):
@@ -57,6 +84,19 @@ class NormalizeRestoreTest(unittest.TestCase):
         saved = replay_cache.normalize_answer(ANSWER, mapping_for("task t_11111111"))
         _, missing = replay_cache.restore_answer(saved, mapping_for("nothing to bind"))
         self.assertEqual(missing, ["⟦TASK_1⟧", "⟦TASK_1⟧"])
+
+
+class StoredHashTest(unittest.TestCase):
+    """An alternate's name covers everything served, the finish reason included."""
+
+    ANSWER = {"role": "assistant", "content": "Looking at the card."}
+
+    def test_answers_differing_only_in_finish_reason_get_different_names(self):
+        self.assertNotEqual(replay_cache.stored_hash(self.ANSWER, "stop"), replay_cache.stored_hash(self.ANSWER, "length"))
+
+    def test_no_finish_reason_is_named_as_the_default_it_is_served_with(self):
+        self.assertEqual(replay_cache.stored_hash(self.ANSWER, None),
+                         replay_cache.stored_hash(self.ANSWER, replay_cache.DEFAULT_FINISH_REASON))
 
 
 class AnswerCacheTest(unittest.TestCase):
@@ -89,6 +129,44 @@ class AnswerCacheTest(unittest.TestCase):
             handle.write("{not json")
         self.assertIsNone(self.cache.load("bad"))
         self.assertEqual(list(self.cache.entries()), [])
+
+    def test_an_alternate_is_written_once_and_never_changes(self):
+        fp, answer = "a" * 64, "b" * 64
+        self.assertTrue(self.cache.save_alternate(fp, answer, {"answer": {"content": "first"}}))
+        self.assertFalse(self.cache.save_alternate(fp, answer, {"answer": {"content": "second"}}))
+        (name, entry), = self.cache.answers(fp)
+        self.assertEqual((name, entry["answer"]["content"]), (answer, "first"))
+        self.assertEqual(os.listdir(os.path.join(self.root, replay_cache.ALTS_DIR, fp)), [answer + ".json"])
+
+    def test_concurrent_writers_of_one_alternate_leave_exactly_one_winner(self):
+        results = []
+        threads = [threading.Thread(target=lambda i=i: results.append(
+            self.cache.save_alternate("a" * 64, "b" * 64, {"n": i}))) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count(True), 1)
+
+    def test_a_keys_answers_come_in_one_order_and_only_hex_names_count(self):
+        fp = "a" * 64
+        for answer in ("c" * 64, "b" * 64):
+            self.cache.save_alternate(fp, answer, {"answer": {"content": answer[0]}})
+        Path(self.root, replay_cache.ALTS_DIR, fp, "stray.json").write_text("{}")
+        self.assertEqual([name for name, _ in self.cache.answers(fp)], ["b" * 64, "c" * 64])
+        for bad in ("../" + fp, fp + "\n", "x"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.cache.answers(bad), [])
+                with self.assertRaises(ValueError):
+                    self.cache.save_alternate(bad, "b" * 64, {})
+
+    def test_an_alternate_counts_as_the_keys_answer_for_slots_and_the_index(self):
+        fp = "a" * 64
+        self.cache.save_alternate(fp, "b" * 64, {"answer": {"content": "x"}, "fingerprint": fp})
+        self.assertTrue(self.cache.has_answer(fp))
+        self.assertFalse(self.cache.save_slot("d" * 64, fp) and self.cache.save_slot("d" * 64, "e" * 64))
+        self.assertEqual(self.cache.load_slot("d" * 64), fp, "a pointer to a key with an alternate stays")
+        self.assertEqual([entry["fingerprint"] for entry in self.cache.entries()], [fp])
 
     def test_messages(self):
         self.assertTrue(self.cache.save_message("h1", "text \ud83d"))

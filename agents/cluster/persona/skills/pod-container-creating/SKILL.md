@@ -44,7 +44,7 @@ Name what blocks one pod's containers from starting, quote the event, and propos
 | `Failed`: `unauthorized`, `403`, `denied` on pull                | Registry access                           | Grant the node or Workload Identity read on the registry, or add `imagePullSecrets` |
 | `FailedAttachVolume`, `Multi-Attach error`                       | Disk still attached elsewhere             | Use `ReadWriteOnce` with one replica, or a regional/RWX class                       |
 
-For a wrong tag, find the last image tag that ran from the cluster (`kubectl rollout history deployment/<name> -n <namespace>` lists the revisions, and `kubectl rollout history deployment/<name> -n <namespace> --revision=<N>` shows each one's image; you have no GitOps repository, so don't look for one). Propose reverting to the last working tag, or correcting the tag version in the manifest patch.
+For a wrong tag, find the last image tag that ran from the cluster (`kubectl rollout history deployment/<name> -n <namespace>` lists the revisions, and `kubectl rollout history deployment/<name> -n <namespace> --revision=<N>` shows each one's image; you have no GitOps checkout, so don't look for one unless the task names the repository). Propose reverting to the last working tag, or correcting the tag version in the manifest patch.
 
 # Rules
 

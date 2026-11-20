@@ -156,6 +156,12 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# For the gateway's own API, which is on loopback. No proxy from the
+# environment: a proxy cannot reach this pod's loopback, so the turn would
+# fail, and the proxy would get the alert's prompt and the call's headers.
+_GATEWAY_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 class PubsubRelay:
     """The Pub/Sub REST API, spoken to the credential broker's relay.
 
@@ -164,13 +170,15 @@ class PubsubRelay:
     broker adds the Google credential; this side presents the gateway's
     projected token, read from CREDENTIAL_PROXY_TOKEN_FILE on every call, and
     never follows a redirect with it (credential_proxy_client's guard, kept
-    here because this file is loaded by path with no sibling module).
+    here because this file is loaded by path with no sibling module). It takes
+    no proxy from the environment, as that client does not: the relay is an
+    in-cluster Service, and a proxy in between would get the token.
     """
 
     def __init__(self, base_url: str, token_file: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.token_file = token_file
-        self._opener = urllib.request.build_opener(_NoRedirects)
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -1259,7 +1267,7 @@ class PubSubAdapter(BasePlatformAdapter):
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
             )
-            return urllib.request.urlopen(req, timeout=timeout)
+            return _GATEWAY_API_OPENER.open(req, timeout=timeout)
 
         try:
             await asyncio.to_thread(

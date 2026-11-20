@@ -7,6 +7,7 @@ reaches the right cluster - or is rejected outright.
 Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
+import base64
 import contextlib
 import http.client
 import http.server
@@ -1411,6 +1412,54 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual(1, sent["exit_code"])
         self.assertNotIn("request", sent)
         self.assertIn("does not hold a task credential", sent["stderr"])
+
+    @staticmethod
+    def jwt_shaped(nats):
+        """An unsigned header.payload.sig string: the shim reads claims, never verifies."""
+
+        def segment(value):
+            return base64.urlsafe_b64encode(json.dumps(value).encode("utf-8")).rstrip(b"=").decode("ascii")
+
+        return f"{segment({'typ': 'JWT'})}.{segment({'jti': 'J', 'nats': nats})}.c2ln"
+
+    def headers_for(self, path):
+        with patch.dict("os.environ", self.task_env(), clear=False):
+            return credential_proxy_client.task_credential_headers(path)
+
+    def test_a_report_credential_is_sent_only_on_the_audit_report_routes(self):
+        # No target: the broker admits it on /v1/audit-reports alone, so on
+        # any other call the task goes without and keeps local-only commands.
+        token = self.jwt_shaped({"type": "task", "tier": "report", "trigger": {"name": "t"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reportsx", "/v1/audit", "/"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
+        for path in ("/v1/audit-reports", "/v1/audit-reports/fleet-audit/k/latest", "/v1/audit-reports?x=1"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+        sent = self.run_shim(["kubectl", "version", "--client"], self.task_env())
+        self.assertEqual(0, sent["exit_code"])
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
+
+    def test_a_targeted_credential_is_sent_on_every_route(self):
+        token = self.jwt_shaped({"type": "task", "target": {"cluster": "c"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+
+    def test_a_credential_whose_claims_cannot_be_read_is_sent_as_before(self):
+        # The broker refuses a bad one loudly; leaving it off would hide that.
+        for token in ("a.b.c", "a.-_-.c", "a." + base64.urlsafe_b64encode(b"[1]").decode().rstrip("=") + ".c", "abc"):
+            with self.subTest(token=token):
+                self.token_path.write_text(token, encoding="utf-8")
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for("/v1/exec"))
+
+    def test_no_token_file_sends_nothing_on_any_route(self):
+        self.token_path.unlink()
+        for path in ("/v1/exec", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
 
     def test_kubeconfig_does_not_choose_the_cluster_in_a_task(self):
         sent = self.run_shim(["kubectl", "get", "pods"], self.task_env(KUBECONFIG=str(self.kubeconfig)))
@@ -2867,7 +2916,7 @@ class ScriptedBroker:
     """A local HTTP server that answers `/v1/exec` from a script, in order.
 
     Each entry is `(status, headers, body)`; a body that is a dict is sent as
-    JSON. The last entry repeats once the script runs out, so a test that
+    JSON, and a bytes body as it is. The last entry repeats once the script runs out, so a test that
     expects five refusals scripts one. Every request's body is kept, so a test
     can check the retried request is the same one. Real sockets rather than a
     patched opener: the retry has to work through `open_broker_request`'s own
@@ -2897,7 +2946,10 @@ class ScriptedBroker:
                     return
                 index = min(len(server.requests) - 1, len(server.script) - 1)
                 status, headers, body = server.script[index]
-                data = json.dumps(body).encode("utf-8") if isinstance(body, dict) else body.encode("utf-8")
+                if isinstance(body, dict):
+                    data = json.dumps(body).encode("utf-8")
+                else:
+                    data = body if isinstance(body, bytes) else body.encode("utf-8")
                 self.send_response(status)
                 for name, value in headers.items():
                     self.send_header(name, value)
@@ -3221,6 +3273,167 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertIn("the connection dropped after the request was sent", err.getvalue())
         self.assertNotIn("HTTP 200", err.getvalue())
 
+    def test_a_2xx_object_with_a_field_of_a_wrong_type_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
+        """The fields are checked before anything is written. The line names the field and the type, never a value."""
+        whole = {"stdout": "NAME STATUS\n", "stderr": "a warning\n", "exitCode": 0}
+        cases = (
+            ({**whole, "stdout": 5}, "the response's stdout is of type int, not a string"),
+            ({**whole, "stdout": None}, "the response's stdout is of type NoneType, not a string"),
+            ({**whole, "stderr": ["a warning"]}, "the response's stderr is of type list, not a string"),
+            ({**whole, "exitCode": "x"}, "the response's exitCode is of type str, not an integer"),
+            ({**whole, "exitCode": "0"}, "the response's exitCode is of type str, not an integer"),
+            ({**whole, "exitCode": None}, "the response's exitCode is of type NoneType, not an integer"),
+            ({**whole, "exitCode": True}, "the response's exitCode is of type bool, not an integer"),
+            ({**whole, "exitCode": 1.5}, "the response's exitCode is of type float, not an integer"),
+            ({**whole, "kubeconfig": 5}, "the response's kubeconfig is of type int, not a string"),
+            ({"stdout": "NAME STATUS\n", "stderr": ""}, "the response has no exitCode"),
+            ({}, "the response has no exitCode"),
+        )
+        for answer, shape in cases:
+            with self.subTest(answer=answer):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, answer), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+
+    def test_an_object_with_a_field_of_a_wrong_type_is_not_sent_to_the_fallback(self):
+        exec_tier = self.broker([(200, {}, {"stdout": 5, "exitCode": 0})])
+        stateful = self.broker([(200, {}, OK)])
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                sleep_fn=self.sleeps.append, rng=self.rng,
+            )
+        self.assertEqual(1, code)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual(1, len(exec_tier.requests))
+        self.assertEqual([], stateful.requests)
+        self.assertIn("the command may have run", err.getvalue())
+
+    def test_an_object_that_holds_only_its_exit_code_still_runs_as_before(self):
+        """An absent `stdout` or `stderr` is empty, as it was. An exit code from 0 to 255 is the
+        shim's as it stands."""
+        answers = (
+            ({"exitCode": 3}, 3),
+            ({"exitCode": 0, "stdout": "ok\n"}, 0),
+            ({"exitCode": 0, "kubeconfig": None}, 0),
+            ({"exitCode": 255}, 255),
+        )
+        for answer, expected in answers:
+            with self.subTest(answer=answer):
+                code, out, err = self.run_shim(self.broker([(200, {}, answer)]))
+                self.assertEqual(expected, code)
+                self.assertEqual(answer.get("stdout", ""), out)
+                self.assertEqual("", err)
+
+    def test_a_negative_exit_code_is_a_signal_death_with_its_output_and_128_plus_the_signal(self):
+        """The broker sends a command's return code, and a command that a signal ended has the
+        signal's negative number. A shell reports that death as 128 plus the number."""
+        cases = ((-9, 137), (-15, 143), (-1, 129), (-127, 255))
+        for exit_code, expected in cases:
+            with self.subTest(exit_code=exit_code):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, {"stdout": "NAME STATUS\n", "stderr": "Killed\n", "exitCode": exit_code})])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(expected, code)
+                self.assertEqual("NAME STATUS\n", out)
+                self.assertEqual("Killed\n", err)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+
+    def test_a_signal_death_with_a_cut_payload_is_still_the_status_of_a_cut_payload(self):
+        """A cut stdout is not the command's answer, whatever ended the command. A cut that fell
+        on stderr alone keeps the command's own status, here the signal's."""
+        cut_stdout = {"stdout": "{", "exitCode": -9, "truncated": True, "bytesWritten": 1, "limit": 4096}
+        code, _, _ = self.run_shim(self.broker([(200, {}, cut_stdout)]))
+        self.assertEqual(credential_proxy_client.EXIT_OUTPUT_TRUNCATED, code)
+        cut_stderr = {"stdout": "{}", "stderr": "I0101 ...", "exitCode": -9, "truncated": True, "stdoutTruncated": False}
+        code, out, _ = self.run_shim(self.broker([(200, {}, cut_stderr)]))
+        self.assertEqual(137, code)
+        self.assertEqual("{}", out)
+
+    def test_an_exit_code_that_no_command_can_have_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
+        """Above 255 no status exists, and `sys.exit` would wrap it: 256 would read as success.
+        Below -127 no signal exists. The line names the field and the range, never the value."""
+        shape = "the response's exitCode is outside -127 to 255"
+        for exit_code in (256, 300, 2147483648, 10**30, -128, -2147483648):
+            with self.subTest(exit_code=exit_code):
+                self.sleeps.clear()
+                answer = {"stdout": "NAME STATUS\n", "stderr": "a warning\n", "exitCode": exit_code}
+                broker = self.broker([(200, {}, answer), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+
+    def test_an_exit_code_that_no_command_can_have_is_not_sent_to_the_fallback(self):
+        exec_tier = self.broker([(200, {}, {"stdout": "NAME STATUS\n", "exitCode": 256})])
+        stateful = self.broker([(200, {}, OK)])
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                sleep_fn=self.sleeps.append, rng=self.rng,
+            )
+        self.assertEqual(1, code)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual(1, len(exec_tier.requests))
+        self.assertEqual([], stateful.requests)
+        self.assertIn("the command may have run", err.getvalue())
+
+    def test_a_2xx_body_that_is_not_utf_8_is_the_line_of_a_body_that_is_not_json(self):
+        for body in (b"\xff", b'{"stdout": "\xff", "exitCode": 0}'):
+            with self.subTest(body=body):
+                broker = self.broker([(200, {}, body), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual(
+                    "credential proxy error (HTTP 200): non-JSON response; the command may have run\n", err
+                )
+
+    # The depth at which `json.loads` gives up depends on the Python version and on the
+    # stack, so the tests find a document that the parser of this run refuses.
+    DEEP_DOCUMENT_FIRST_DEPTH = 1000
+    DEEP_DOCUMENT_LAST_DEPTH = 4_000_000
+
+    def a_document_that_the_parser_refuses(self):
+        depth = self.DEEP_DOCUMENT_FIRST_DEPTH
+        while depth <= self.DEEP_DOCUMENT_LAST_DEPTH:
+            document = "[" * depth + "]" * depth
+            try:
+                json.loads(document)
+            except RecursionError:
+                return document
+            depth *= 2
+        self.skipTest(f"json.loads parses {depth // 2} nested lists; no document is too deep here")
+
+    def test_a_2xx_body_nested_too_deep_for_the_parser_is_the_line_of_a_body_that_is_not_json(self):
+        broker = self.broker([(200, {}, self.a_document_that_the_parser_refuses()), (200, {}, OK)])
+        code, out, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertEqual("credential proxy error (HTTP 200): non-JSON response; the command may have run\n", err)
+
+    def test_a_refusal_nested_too_deep_for_the_parser_is_a_refusal_with_no_json_body(self):
+        broker = self.broker([(502, {}, self.a_document_that_the_parser_refuses()), (200, {}, OK)])
+        code, out, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertEqual("credential proxy error (HTTP 502): non-JSON response\n", err)
+
     def test_a_policy_block_still_exits_77_at_once(self):
         blocked = {"code": "SECURITY_POLICY_BLOCKED", "message": "Command blocked.", "rule": "no-delete"}
         broker = self.broker([(403, {}, blocked), (200, {}, OK)])
@@ -3488,6 +3701,44 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertGreaterEqual(self.sleeps[0], 2.0)
         self.assertLessEqual(self.sleeps[0], 4.0)
         self.assertEqual(2, len(err.getvalue().strip().splitlines()))
+
+    def test_a_refusal_whose_body_is_too_deep_for_the_parser_is_handed_back_as_one_with_no_json_body(self):
+        """`json()` raises RecursionError for a body nested very deep. The relay reads that as a
+        body that is not JSON: an upstream answer, handed back and not waited out."""
+
+        class TooDeep(self.Response):
+            def json(self):
+                raise RecursionError("maximum recursion depth exceeded")
+
+        for status in (503, 429):
+            with self.subTest(status=status):
+                self.sleeps.clear()
+                refused = TooDeep(status, None)
+                http_, session = self.session([refused, self.Response(200, {"timeSeries": []})])
+                self.assertIs(refused, session.get(self.URL, timeout=30))
+                self.assertEqual(1, len(http_.calls))
+                self.assertEqual([], self.sleeps)
+
+    def test_a_real_reply_with_a_document_that_the_parser_refuses_has_no_json_body(self):
+        """The same through a reply object of `requests` and a document that the parser of this run refuses."""
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is not installed here; the sandbox image has it")
+        depth = 1000
+        while depth <= 4_000_000:
+            document = "[" * depth + "]" * depth
+            try:
+                json.loads(document)
+            except RecursionError:
+                break
+            depth *= 2
+        else:
+            self.skipTest(f"json.loads parses {depth // 2} nested lists; no document is too deep here")
+        reply = requests.models.Response()
+        reply.status_code = 503
+        reply._content = document.encode("utf-8")
+        self.assertIsNone(credential_proxy_client.ApiSession._json_body(reply))
 
     def test_a_draining_refusal_drops_the_pooled_connections_before_the_retry(self):
         # A draining exec pod answers on the caller's keep-alive connection to

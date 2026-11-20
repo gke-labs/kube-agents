@@ -254,7 +254,7 @@ func TestADrainingUnattendedTierBesideANewOne(t *testing.T) {
 	if got := unattendedTierOf(n); got != "weekly" {
 		t.Errorf("the Job template's tier is %q, want weekly", got)
 	}
-	tmpl := buildProfileJobTemplate(agent, n, false)
+	tmpl := buildProfileJobTemplate(agent, n, false, "")
 	if want := agentProfileServiceAccountName(n, "weekly"); tmpl.Spec.ServiceAccountName != want {
 		t.Errorf("the Job template runs as %q, want %q", tmpl.Spec.ServiceAccountName, want)
 	}
