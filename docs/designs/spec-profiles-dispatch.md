@@ -422,8 +422,8 @@ leave open:
   - the path resolves to a regular file under the script root, owned by root, writable by no group
     or other, and neither setuid nor setgid, in directories that are the same on both the named path
     and the resolved one, and the worker isn't its owner. The file itself may be one symlink within
-    the root, straight to the file: a link to another link, or through a symlinked directory, is
-    refused. No directory on the named path may be a symlink.
+    the root whose target, as written, is where it resolves: a link to another link, or through a
+    symlinked directory that changes where it leads, is refused. No directory on the named path may be a symlink.
 
   The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
   broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,

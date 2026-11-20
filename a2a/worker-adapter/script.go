@@ -34,9 +34,10 @@ import (
 //   - the path resolves to a regular file under the script root, owned by
 //     root and writable by no one else, neither setuid nor setgid, in
 //     directories that are the same on both the named path and the resolved
-//     one; the file itself may be one symlink within the root, straight to
-//     the file (not to another link, nor through a symlinked directory), and
-//     no directory on the named path may be a symlink.
+//     one; the file itself may be one symlink within the root whose target,
+//     as written, is where it resolves (so not to another link, and not
+//     through a symlinked directory that changes where it leads), and no
+//     directory on the named path may be a symlink.
 //
 // The script gets a cleared environment: the worker's own PATH and HOME and
 // the broker hand-off (all rendered by the operator), plus the task's
@@ -160,8 +161,9 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 }
 
 // oneLinkAtMost refuses a named path that is a symlink whose target, as
-// written and taken from the link's own directory, isn't real: a link to a
-// link, or a link through a symlinked directory.
+// written and taken from the link's own directory, isn't where it resolves:
+// a link to a link, or a link through a symlinked directory that changes
+// where it leads.
 func oneLinkAtMost(path, real string) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
@@ -350,10 +352,13 @@ type scriptSignals struct {
 }
 
 // killSession SIGKILLs every process but the worker that procRoot lists in
-// session sid, pass after pass until a pass finds none. A session's id is
-// its leader's pid, and the kernel doesn't hand out a pid still in use as a
-// session's id, so while anything is left in the session this reaches only
-// that. Where procRoot can't be read it does nothing.
+// session sid, pass after pass until a pass finds one it can signal no
+// longer. A session's id is its leader's pid, and the kernel doesn't hand out
+// a pid still in use as a session's id, so the session itself can't be
+// mistaken; a member's own pid can be reused in the moment between reading
+// procRoot and the kill. As pid 1 that can only be one of the script's own
+// descendants, and the namespace kill follows anyway. Where procRoot can't
+// be read it does nothing.
 func killSession(procRoot string, sid int) {
 	self := os.Getpid()
 	for range sessionSweepPasses {
@@ -362,8 +367,11 @@ func killSession(procRoot string, sid int) {
 			if pid == self {
 				continue
 			}
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			found = true
+			// Only a member it could signal keeps the sweep going: one it
+			// may not signal (EPERM) would make it spin to the pass limit.
+			if syscall.Kill(pid, syscall.SIGKILL) == nil {
+				found = true
+			}
 		}
 		if !found {
 			return
