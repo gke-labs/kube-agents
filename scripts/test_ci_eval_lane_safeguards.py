@@ -117,6 +117,10 @@ def run_step(
             tasks_array,
             step,
             'echo "REPO=${BENCH_GITOPS_REPO-<unset>}"',
+            # Read in a child, as devops-bench reads it: the harness fills a
+            # prompt's {{BENCH_GITOPS_REPO}} from it, so set-but-unexported
+            # would record such a case as infrastructure on every run.
+            'bash -c \'echo "CHILD_REPO=${BENCH_GITOPS_REPO-<unset>}"\'',
             'echo "REQUESTING=${INJECT_LANE_REQUESTING-<unset>}"',
             'echo "DIR=${INJECT_LANE_TASKS_DIR-<unset>}"',
             'echo "PAUSE=${WRITER_LAUNCH_PAUSE-<unset>}"',
@@ -170,6 +174,7 @@ class InjectLaneTest(unittest.TestCase):
         result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
+        self.assertEqual(value(result, "CHILD_REPO"), "gke-agentic/kube-agents-evals-21-infra")
         # The writer units wait the safeguard's settle, not the stagger.
         self.assertEqual(value(result, "PAUSE"), "30")
         scratch = pathlib.Path(value(result, "DIR"))
