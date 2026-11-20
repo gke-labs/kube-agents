@@ -254,16 +254,25 @@ OPTION_NOUN = ("option", "options")
 HAVE = ("has", "have")
 THEM = ("it", "them")
 IT_NAMES = ("it names", "they name")
+LEAVE_AND_LIST = ("leaves automatic node pool creation off and lists", "leave automatic node pool creation off and list")
 OPTION_LIST_SEPARATOR = ", "
 OPTION_LIST_LAST = " and "
+SENTENCE_SEPARATOR = " "
 OPTIONS_LISTED = "This class lists {count} machine options in order."
-OPTIONS_BACKED = "Only {options} {have} a node pool."
+ONLY_OPTIONS_BACKED = "Only {options} {have} a node pool."
+OPTIONS_BACKED = "{options} {have} a node pool."
 OPTIONS_UNBACKED = "{options} {have} none, and automatic node pool creation is off, so GKE cannot create {them}."
 POOLS_CANNOT_GROW = "If {pools} cannot grow, pods that use this class wait."
 NO_OPTION_BACKED = "{options} {have} no node pool, and automatic node pool creation is off, so GKE cannot create {them}."
-LABELLED_POOLS_MATCH_NONE = "The node pools with this class's label match no option: {pools}."
+NAMED_POOLS_MISSING = ("{options} names no node pool that exists.", "{options} name no node pool that exists.")
+SPARE_POOLS = (
+    "Node pool {pools} has this class's label and matches {options}.",
+    "Node pools {pools} have this class's label and match {options}.",
+)
+NO_OPTION = "no option"
+NO_CHECKED_OPTION = "none of the options that were checked"
 PODS_WAIT = "Pods that use this class wait."
-NO_NODE_ADDED = "GKE adds no node for these options."
+NO_NODE_ADDED = ("GKE adds no node for this option.", "GKE adds no node for these options.")
 OPTIONS_UNCHECKED = "{options} could not be checked: {names} no node pool and no machine type."
 # The name GKE gives the cluster-level default ComputeClass.
 CLUSTER_DEFAULT_CLASS = "default"
@@ -1352,7 +1361,7 @@ def _option_what(rule: dict) -> str:
     for field in RULE_LABEL_FIELDS:
         if rule.get(field):
             value = rule[field]
-            return ", ".join(value) if isinstance(value, list) else str(value)
+            return OPTION_LIST_SEPARATOR.join(value) if isinstance(value, list) else str(value)
     return ""
 
 
@@ -1364,7 +1373,7 @@ def _options(positions: list[int], priorities: list[dict], pools_of: list[list[s
     named = []
     for position in positions:
         rule = priorities[position - 1]
-        what = ", ".join(pools_of[position - 1] or []) if pools_of and rule.get("nodepools") else _option_what(rule)
+        what = OPTION_LIST_SEPARATOR.join(pools_of[position - 1] or []) if pools_of and rule.get("nodepools") else _option_what(rule)
         named.append(f"{position} ({what})" if what else str(position))
     return f"{OPTION_NOUN[len(positions) > 1]} {_and_list(named)}"
 
@@ -1396,27 +1405,44 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     unjudged = [position for position, pools in enumerate(pools_of, 1) if pools is None]
     if not unbacked:
         return None
-    many = len(unbacked) > 1
+    # An option that names node pools is not one GKE would create a pool for,
+    # so a missing named pool gets its own sentence.
+    named_missing = [position for position in unbacked if priorities[position - 1].get("nodepools")]
+    no_pool = [position for position in unbacked if position not in named_missing]
+    many = len(no_pool) > 1
+    all_checked = not unjudged
+    backing = list(dict.fromkeys(pool_name for position in backed for pool_name in pools_of[position - 1]))
+    # A node pool with the class's label that is behind no option. Pods may
+    # still run on it, so with one the detail says only what GKE does not do.
+    spare = [
+        (pool.get("name") or "", (pool.get("config") or {}).get("machineType") or "")
+        for pool in _class_pools(name, node_pools)
+        if pool.get("name") not in backing
+    ]
     sentences = [OPTIONS_LISTED.format(count=len(priorities))]
     if backed:
-        backing = list(dict.fromkeys(pool_name for position in backed for pool_name in pools_of[position - 1]))
-        sentences.append(OPTIONS_BACKED.format(options=_options(backed, priorities, pools_of), have=HAVE[len(backed) > 1]))
-        sentences.append(OPTIONS_UNBACKED.format(options=_sentence_start(_options(unbacked, priorities)), have=HAVE[many], them=THEM[many]))
-        sentences.append(POOLS_CANNOT_GROW.format(pools=_and_list(backing)))
-    else:
-        sentences.append(NO_OPTION_BACKED.format(options=_sentence_start(_options(unbacked, priorities)), have=HAVE[many], them=THEM[many]))
-        labelled = [f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in _class_pools(name, node_pools)]
-        if labelled:
-            # Pods may still run on a labelled pool that matches no option, so
-            # this form says only what GKE does not do.
-            sentences.append(LABELLED_POOLS_MATCH_NONE.format(pools=_and_list(labelled)))
-            sentences.append(NO_NODE_ADDED)
-        else:
-            sentences.append(PODS_WAIT)
+        # "Only" speaks for every option, so it needs every option checked.
+        options_backed = _options(backed, priorities, pools_of)
+        template = ONLY_OPTIONS_BACKED if all_checked else OPTIONS_BACKED
+        sentences.append(template.format(options=options_backed if all_checked else _sentence_start(options_backed), have=HAVE[len(backed) > 1]))
+        if no_pool:
+            sentences.append(OPTIONS_UNBACKED.format(options=_sentence_start(_options(no_pool, priorities)), have=HAVE[many], them=THEM[many]))
+    elif no_pool:
+        sentences.append(NO_OPTION_BACKED.format(options=_sentence_start(_options(no_pool, priorities)), have=HAVE[many], them=THEM[many]))
+    if named_missing:
+        sentences.append(NAMED_POOLS_MISSING[len(named_missing) > 1].format(options=_sentence_start(_options(named_missing, priorities))))
+    if spare:
+        pools = _and_list([f"{pool_name} ({machine_type})" if machine_type else pool_name for pool_name, machine_type in spare])
+        sentences.append(SPARE_POOLS[len(spare) > 1].format(pools=pools, options=NO_OPTION if all_checked else NO_CHECKED_OPTION))
+        sentences.append(NO_NODE_ADDED[len(unbacked) > 1])
+    elif all_checked:
+        # What follows for pods is said only where every option was checked:
+        # an option the pool list cannot answer may still place them.
+        sentences.append(POOLS_CANNOT_GROW.format(pools=_and_list(backing)) if backed else PODS_WAIT)
     if unjudged:
         several = len(unjudged) > 1
         sentences.append(OPTIONS_UNCHECKED.format(options=_sentence_start(_options(unjudged, priorities)), names=IT_NAMES[several]))
-    return {"object": f"ComputeClass/{name}", "excerpt": " ".join(sentences), "needs_triage": MANUAL_POOL_TRIAGE}
+    return {"object": f"ComputeClass/{name}", "excerpt": SENTENCE_SEPARATOR.join(sentences), "needs_triage": MANUAL_POOL_TRIAGE}
 
 
 def _reads_pool_labels(workload: dict, compute_classes_by_name: dict[str, dict]) -> bool:
@@ -2471,7 +2497,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             {
                 "check": UNBACKED_MANUAL_FALLBACK,
                 "reason": (
-                    "GKE Autopilot: Google creates the nodes for every ComputeClass, "
+                    "GKE Autopilot: GKE creates the nodes for every ComputeClass, "
                     "so no machine option waits on a node pool."
                 ),
             }
@@ -2544,7 +2570,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             # No class in scope is an answer the dump alone gives; a class in
             # scope needs the pools this read would have listed.
             unevaluated[UNBACKED_MANUAL_FALLBACK] = (
-                f"{', '.join(manual_fallback_unread)} leave automatic node pool creation off and list backup machine options, "
+                f"{', '.join(manual_fallback_unread)} {LEAVE_AND_LIST[len(manual_fallback_unread) > 1]} machine options, "
                 f"and the node pools those options need were not read: {pools_failure}"
             )
             limitations.append(

@@ -4428,7 +4428,13 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
     def test_a_nodepools_rule_that_names_no_existing_pool_is_unbacked(self):
         rules = [{"nodepools": ["gone-pool"]}, {"nodepools": ["default-pool"]}]
         hit = self.check(rules, [FLEET_POOL])
-        self.assertIn("Only option 2 (default-pool) has a node pool. Option 1 (gone-pool) has none", hit["excerpt"])
+        self.assertEqual(
+            hit["excerpt"],
+            "This class lists 2 machine options in order. Only option 2 (default-pool) has a node pool. "
+            "Option 1 (gone-pool) names no node pool that exists. If default-pool cannot grow, pods that use this class wait.",
+        )
+        both_gone = self.check([{"nodepools": ["a"]}, {"nodepools": ["b"]}, {"nodepools": ["default-pool"]}], [FLEET_POOL])
+        self.assertIn("Options 1 (a) and 2 (b) name no node pool that exists.", both_gone["excerpt"])
 
     def test_a_class_with_no_node_pool_of_its_own_is_filed_for_every_rule(self):
         """The rule as the issue locks it: any rule with no manual node pool
@@ -4437,19 +4443,55 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
             hit = self.check(FLEET_CLASS_RULES, pools)
             self.assertEqual(
                 hit["excerpt"],
-                "This class lists 3 machine options in order. Options 1 (default-pool), 2 (n4) and 3 (c3) have no node pool, "
-                "and automatic node pool creation is off, so GKE cannot create them. Pods that use this class wait.",
+                "This class lists 3 machine options in order. Options 2 (n4) and 3 (c3) have no node pool, "
+                "and automatic node pool creation is off, so GKE cannot create them. "
+                "Option 1 (default-pool) names no node pool that exists. Pods that use this class wait.",
             )
 
     def test_a_labelled_pool_that_backs_no_rule_is_filed(self):
         """3.12 (c) passes on the label, so nothing else names this class."""
         hit = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")])
         self.assertIn("Options 1 (n4) and 2 (c3) have no node pool", hit["excerpt"])
-        self.assertTrue(hit["excerpt"].endswith("The node pools with this class's label match no option: e2-pool (e2-medium). GKE adds no node for these options."))
+        self.assertTrue(hit["excerpt"].endswith("Node pool e2-pool (e2-medium) has this class's label and matches no option. GKE adds no node for these options."))
+        two = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc"), manual_pool("bare-pool", "", "general-ccc")])
+        self.assertIn("Node pools e2-pool (e2-medium) and bare-pool have this class's label and match no option.", two["excerpt"])
         self.assertNotIn("wait", hit["excerpt"])
         workload = deployment("api", node_selector={fs.COMPUTE_CLASS_LABEL: "general-ccc"})
         cc = compute_class("general-ccc", [{"machineFamily": "n4"}, {"machineFamily": "c3"}], node_pool_auto_creation=False)
         self.assertIsNone(fs.check_dangling_compute_class(workload, {"general-ccc": cc}, {"general-ccc"}))
+
+    def test_a_labelled_pool_behind_no_option_is_named_beside_a_backed_option(self):
+        """Pods may still run on that pool, so the detail does not say that they wait."""
+        hit = self.check([{"nodepools": ["a"]}, {"machineFamily": "n4"}], [manual_pool("a", "e2-medium"), manual_pool("e2-pool", "e2-standard-4", "general-ccc")])
+        self.assertEqual(
+            hit["excerpt"],
+            "This class lists 2 machine options in order. Only option 1 (a) has a node pool. "
+            "Option 2 (n4) has none, and automatic node pool creation is off, so GKE cannot create it. "
+            "Node pool e2-pool (e2-standard-4) has this class's label and matches no option. GKE adds no node for this option.",
+        )
+
+    def test_the_detail_speaks_only_for_the_options_that_were_checked(self):
+        accelerator_only = {"gpu": {"type": "nvidia-l4", "count": 1}}
+        gpu_pool = manual_pool("gpu-pool", "g2-standard-4", "general-ccc")
+        beside_backed = self.check([{"nodepools": ["a"]}, {"machineFamily": "n4"}, accelerator_only], [manual_pool("a", "e2-medium"), gpu_pool])
+        self.assertEqual(
+            beside_backed["excerpt"],
+            "This class lists 3 machine options in order. Option 1 (a) has a node pool. "
+            "Option 2 (n4) has none, and automatic node pool creation is off, so GKE cannot create it. "
+            "Node pool gpu-pool (g2-standard-4) has this class's label and matches none of the options that were checked. "
+            "GKE adds no node for this option. Option 3 could not be checked: it names no node pool and no machine type.",
+        )
+        none_backed = self.check([{"machineFamily": "n4"}, accelerator_only], [gpu_pool])
+        self.assertIn("matches none of the options that were checked. GKE adds no node for this option. Option 2 could not be checked", none_backed["excerpt"])
+        self.assertNotIn("Only", none_backed["excerpt"])
+
+    def test_the_procedure_carries_the_collector_s_headline(self):
+        """The ledger title comes from the procedure and the chat summary from
+        the renderer; one sentence, held in step here."""
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.UNBACKED_MANUAL_FALLBACK}`)")[1]
+        remediation_line = next(line for line in section.splitlines() if line.startswith("- **Remediation:**"))
+        self.assertIn(audit_report.CHECK_PHRASES[fs.UNBACKED_MANUAL_FALLBACK].format(object="<name>"), remediation_line)
 
     def test_the_procedure_carries_the_collector_s_impact_sentence(self):
         sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
@@ -4505,14 +4547,21 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         hit = self.check([*FLEET_CLASS_RULES, accelerator_only], [FLEET_POOL])
         self.assertIn("This class lists 4 machine options in order.", hit["excerpt"])
         self.assertTrue(hit["excerpt"].endswith("Option 4 could not be checked: it names no node pool and no machine type."))
+        # An option that could not be checked may still place pods, so the detail does not say that they wait.
+        self.assertNotIn("wait", hit["excerpt"])
+        unbacked_and_unchecked = self.check([{"machineFamily": "n4"}, accelerator_only], [])
+        self.assertNotIn("wait", unbacked_and_unchecked["excerpt"])
 
     def test_the_detail_counts_several_backed_and_several_unchecked_options(self):
         accelerator_only = {"gpu": {"type": "nvidia-l4", "count": 1}}
         rules = [{"nodepools": ["a"]}, {"machineFamily": "n4"}, {"nodepools": ["b"]}, accelerator_only, {"podFamily": "general-purpose"}]
         hit = self.check(rules, [manual_pool("a", "e2-medium"), manual_pool("b", "e2-medium")])
-        self.assertIn("Only options 1 (a) and 3 (b) have a node pool. Option 2 (n4) has none", hit["excerpt"])
-        self.assertIn("If a and b cannot grow, pods that use this class wait.", hit["excerpt"])
+        self.assertIn("Options 1 (a) and 3 (b) have a node pool. Option 2 (n4) has none", hit["excerpt"])
+        self.assertNotIn("Only", hit["excerpt"])
         self.assertTrue(hit["excerpt"].endswith("Options 4 and 5 could not be checked: they name no node pool and no machine type."))
+        checked = self.check(rules[:3], [manual_pool("a", "e2-medium"), manual_pool("b", "e2-medium")])
+        self.assertIn("Only options 1 (a) and 3 (b) have a node pool. Option 2 (n4) has none", checked["excerpt"])
+        self.assertTrue(checked["excerpt"].endswith("If a and b cannot grow, pods that use this class wait."))
 
     def test_the_detail_keeps_the_case_of_a_name(self):
         rules = [{"nodepools": ["default-pool"]}, {"machineType": "N4-Standard-8"}]
