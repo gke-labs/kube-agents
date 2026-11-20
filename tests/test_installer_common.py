@@ -3481,6 +3481,34 @@ class InstallerCommonTest(unittest.TestCase):
             "helm_upgrade_install must default to false",
         )
 
+    def test_tfvars_generation_includes_card_stop_enabled(self):
+        """CARD_STOP_ENABLED reaches card_stop_enabled; unset or not truthy is false."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value, want in ((None, "false"), ("true", "true"), ("on", "true"),
+                                ("false", "false"), ("ture", "false")):
+                with self.subTest(value=value):
+                    env = {"API_SERVER_KEY": "k"}
+                    if value is not None:
+                        env["CARD_STOP_ENABLED"] = value
+                    proc = self._run(f'write_tfvars_from_state "{dest}"', env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn(f"card_stop_enabled = {want}\n", dest.read_text())
+
+    def test_card_stop_enabled_reaches_the_chart_value(self):
+        """main.tf hands the tfvars key to operator.cardStop.enabled, and only while it is on."""
+        composition = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        main_tf = (composition / "main.tf").read_text()
+        self.assertIsNotNone(
+            re.search(r"(?m)^      var\.card_stop_enabled \? \{\n        cardStop = \{\n          enabled = true\n"
+                      r"        \}\n      \} : \{\},$", main_tf),
+            "kube_agents_helm_values does not set operator.cardStop.enabled only when card_stop_enabled is on",
+        )
+        variables_tf = (composition / "variables.tf").read_text()
+        block = variables_tf.split('variable "card_stop_enabled" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIsNotNone(re.search(r"(?m)^\s*default\s*=\s*false\s*$", block),
+                             "card_stop_enabled must default to false")
+
     def test_tfvars_carries_namespace_identity_and_cmek_names(self):
         # Every one of these used to be a fixed name the generator never wrote,
         # so install.env's NAMESPACE reached nothing and a second install in a

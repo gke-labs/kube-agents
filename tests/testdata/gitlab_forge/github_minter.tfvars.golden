@@ -114,6 +114,8 @@ enable_gke_backup_plan = false
 
 helm_upgrade_install = false
 
+card_stop_enabled = false
+
 # The CRD defaults dashboardEnabled to true; the installer has always
 # defaulted it to false and asks. Memory settings mirror --memory.
 hermes_dashboard_enabled = false
