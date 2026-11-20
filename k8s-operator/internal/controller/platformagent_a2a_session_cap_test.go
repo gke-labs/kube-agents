@@ -236,7 +236,7 @@ func TestTheSessionCapFollowsTheLiveTasksWidth(t *testing.T) {
 				t.Errorf("the condition's message carries the figure %s; figures go in the event: %s", digit, c.Message)
 			}
 		}
-		if !strings.Contains(c.Message, "#6466") {
+		if !strings.Contains(c.Message, a2aBusReshapeAnnotation) {
 			t.Errorf("the condition does not name the reshape: %s", c.Message)
 		}
 		events := drainEvents(rec)

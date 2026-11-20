@@ -1144,8 +1144,9 @@ type TuningSpec struct {
 	// the fit is below maxSessions). A stream with no room for one session
 	// sends plain conversations to `platform` instead. The cap stays fitted
 	// until TASKS is widened: on a one-server bus, busReplicas 3 widens it
-	// and keeps its history, and a planned opt-in TASKS reshape will on any
-	// bus. On an existing install, until the operator has read the bus's
+	// and keeps its history, and on any bus a new value on the
+	// kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
+	// rendered width. On an existing install, until the operator has read the bus's
 	// width once, the provision Job waits. While the operator's
 	// A2A_SESSION_CLUSTER_VIEW is on, `session` routes to `platform`, so the
 	// session route never widens what a plain turn reaches. On `platform`
