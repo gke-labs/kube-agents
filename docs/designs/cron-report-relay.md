@@ -220,9 +220,10 @@ beside its record, and `_load_findings_nudge_card` reads it (`findings_nudge_car
 its text is the report being relayed and the report was not truncated. With the flag on and a
 channel known (or the leg routed through the gateway), `_post_findings_nudge_card` posts it as
 Block Kit through the relay or as a chat message through the gateway, and the report goes out as
-text where the card does not post. What is stored against the thread is then the card's
+text where the card does not post. What is stored against the thread is the card's
 `thread_context`, the report's text followed by the ids of the findings it names, which the
-message itself does not print; a report relayed without its card stores the text alone.
+message itself does not print, on every leg that lands, card or text; a truncated report, or one
+whose card file is missing, unreadable or for another report, stores the text alone.
 
 ## Why no agent turn runs over the report
 

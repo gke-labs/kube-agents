@@ -924,7 +924,7 @@ and after it `findings_nudge.py` runs hourly and names only what `findings_queue
   `FINDINGS_DAILY_CRITICALS` pending critical items not first shown that day are named again.
   They are not additions and count against nothing. A pending critical below that top is named
   only on the day it was added.
-- **The stop-add notice:** the same once-a-day part names every pending non-critical item under
+- **The stop-add notice:** the same once-a-day part names every pending non-critical item above
   a notice that new findings are paused until it is resolved, snoozed or dismissed, so stop-add is
   never silent for more than a day. Accepting it releases the hold too (§3.2), and so does fixing
   it, once a complete sweep no longer reports it. A pending critical holding non-criticals back
@@ -934,8 +934,9 @@ and after it `findings_nudge.py` runs hourly and names only what `findings_queue
   and no-longer-reported objects go into the context stored for the message's thread
   (`findings_nudge_card.thread_context`), which a reply in that thread is answered with. That row
   holds one report, so a second nudge on the same UTC day, which posts into the same thread,
-  replaces the first one's ids; a report that posts without its card (a truncated report, a card
-  file that could not be written) stores the text alone.
+  replaces the first one's ids. The ids are stored whenever the card file matches the report,
+  also on a leg that posts the report as text; a truncated report, or one whose card file is
+  missing, unreadable or for another report, stores the text alone.
 
 The day's limits count additions from `findings_additions` (§3.1, `GET /v1/findings/additions`),
 one row per item added, with the class the item had when it was added, so neither dismissing,
