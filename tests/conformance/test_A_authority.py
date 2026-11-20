@@ -885,9 +885,9 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         relayed: list = []
 
         class Store:
-            def relay(self, method, path, body):
+            def relay(self, method, path, body, writer=None):
                 relayed.append((method, path))
-                return 200, b"{}"
+                return 200, b"{}", None
 
         def handle(method: str, path: str, role: str = reader) -> list:
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
@@ -898,7 +898,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             replies: list = []
             handler._json = lambda status, body: replies.append(int(status))
             handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
-            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
             handler._handle_audit_reports()
             return replies
 
@@ -987,9 +987,9 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         relayed: list = []
 
         class Store:
-            def relay(self, method, path, body):
+            def relay(self, method, path, body, writer=None):
                 relayed.append((method, path))
-                return 200, b"{}"
+                return 200, b"{}", None
 
         def handle(method: str, path: str) -> list:
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
@@ -999,7 +999,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             handler.report_profiles = frozenset()
             replies: list = []
             handler._json = lambda status, body: replies.append(int(status))
-            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
             handler._handle_audit_reports()
             return replies
 
@@ -1021,6 +1021,81 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             with self.subTest(exec_pod=method):
                 self.assertFalse(cp.exec_pod_serves(method, path))
                 self.assertFalse(cp.exec_pod_serves(method, f"{stream}/runs/20261113T120000.123456Z"))
+
+    def test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller(self) -> None:
+        # Who wrote a stored run (#5619, fleet-audit-report-store.md §3): on the
+        # PUT of a ring entry the broker sends X-Report-Writer, `shell` for the
+        # shell and `builtin-schedule:<audit>:<task>` for a profile task, the
+        # task id its verified credential's own claim. A caller's header of the
+        # name, in any case and on any route, is stripped and never relayed; and
+        # of the store's answer only the writer comes back. The A2A gateway's
+        # report relay trusts a report on this stamp alone.
+        cp = h.credential_proxy
+        received: list = []
+        answer_writer = ["builtin-schedule:compliance-audit:task-1"]
+
+        class Store:
+            def relay(self, method, path, body, writer=None):
+                received.append((method, writer))
+                return 200, b"{}", answer_writer[0] if method == "GET" else None
+
+        publish = "acme%2Fgitops"
+        stream = f"/v1/audit-reports/compliance-audit/{publish}"
+        run = f"{stream}/runs/20261113T120000.123456Z"
+        grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+        shell = cp.Principal(workload="shell", uid="u", role=cp.CALLER_ROLE_SHELL)
+        profile = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                               task=types.SimpleNamespace(task="task-7f3a", profile="fleet-audit", trigger=grant))
+
+        def handle(method: str, path: str, principal, forged: dict) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.headers = email.message.Message()
+            for name, value in forged.items():
+                handler.headers[name] = value
+            handler.principal = principal
+            handler.report_store = Store()
+            handler.report_profiles = frozenset({"fleet-audit"})
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._read_audit_report_body = lambda: b"{}"
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append((int(status), writer))
+            handler._handle_audit_reports()
+            self.assertIsNone(handler.headers.get(cp.REPORT_WRITER_HEADER), "a caller's writer header survived")
+            return replies
+
+        forgeries = ({}, {"X-Report-Writer": "shell"}, {"x-report-writer": "builtin-schedule:compliance-audit:forged"},
+                     {"X-REPORT-WRITER": "builtin-schedule:compliance-audit:task-7f3a"})
+        with mock.patch.object(cp, "report_install_store_keys", return_value=(publish, frozenset({publish}))):
+            for principal, want in ((shell, "shell"), (profile, "builtin-schedule:compliance-audit:task-7f3a")):
+                for forged in forgeries:
+                    with self.subTest(writer=want, forged=forged):
+                        received.clear()
+                        self.assertEqual([(200, None)], handle("PUT", run, principal, forged))
+                        self.assertEqual([("PUT", want)], received)
+                        # No other route sends a writer, a read least of all.
+                        received.clear()
+                        for method, path in (("PUT", f"{stream}/latest"), ("DELETE", f"{stream}/latest"),
+                                             ("GET", f"{stream}/latest"), ("GET", run), ("GET", "/v1/audit-reports")):
+                            handle(method, path, principal, forged)
+                        self.assertEqual([None] * 5, [writer for _, writer in received])
+            # The store's writer reaches the caller, the a2a-reports reader included.
+            reader = cp.Principal(workload="gateway", uid="u", role=cp.CALLER_ROLE_A2A_REPORTS)
+            with mock.patch.object(cp, "report_publish_store_key", return_value=publish):
+                for principal, path in ((shell, run), (profile, f"{stream}/latest"),
+                                        (reader, "/v1/audit-reports/compliance-audit/publish/latest")):
+                    with self.subTest(reads=principal.role):
+                        self.assertEqual([(200, answer_writer[0])], handle("GET", path, principal, {}))
+            # A profile task with no task id a writer can be made of is refused, unrelayed.
+            received.clear()
+            nameless = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                                    task=types.SimpleNamespace(task=None, profile="fleet-audit", trigger=grant))
+            self.assertEqual([(403, cp.RULE_REPORT_WRITER)], handle("PUT", run, nameless, {"X-Report-Writer": "shell"}))
+            self.assertEqual([], received)
+        # And the relay itself sends the stamp it is given and nothing of the caller's.
+        self.assertEqual("shell", cp.report_writer_for(cp.CALLER_ROLE_SHELL, profile.task, "compliance-audit"))
+        self.assertIsNone(cp.report_writer_for(cp.CALLER_ROLE_A2A_REPORTS, profile.task, "compliance-audit"))
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches
