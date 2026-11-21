@@ -445,6 +445,63 @@ class TestCallback(unittest.TestCase):
             text = self._run(data, "agenerate_content_stream")[key]["parts"][0]["text"]
             self.assertRegex(text, r"^you run on \[cluster-name:[0-9a-f]{12}\]$", key)
 
+    # Payloads and controls: only a part's binary payload and the request's
+    # control keys are left alone.
+
+    def test_only_a_parts_binary_payload_is_skipped(self) -> None:
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}, "title": "node 10.0.0.9"},
+                        {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "on prod-eu-1"}, "context": "my-proj-4"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                        {"type": "image_url", "image_url": {"url": f"https://example.com/x?token={_OAUTH_TOKEN}"}},
+                    ],
+                }
+            ]
+        }
+        image, document, inline, linked = self._run(data, "anthropic_messages")["messages"][0]["content"]
+        self.assertEqual(image["source"]["data"], "AAAA")
+        self.assertNotIn("10.0.0.9", image["title"])
+        self.assertNotIn("prod-eu-1", json.dumps(document))
+        self.assertNotIn("my-proj-4", json.dumps(document))
+        self.assertEqual(inline["image_url"]["url"], "data:image/png;base64,AAAA")
+        self.assertNotIn(_OAUTH_TOKEN, json.dumps(linked))
+
+    def test_gemini_binary_inline_data_keeps_its_payload_and_text_inline_data_is_refused(self) -> None:
+        binary = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]}]}
+        self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], "AAAA")
+        for mime in ("text/plain", "application/json"):
+            text = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": "b24gcHJvZC1ldS0x"}}]}]}
+            with self.assertRaises(self.module.UnwalkableRequestError, msg=mime):
+                self._run(text, "agenerate_content")
+
+    def test_top_level_text_outside_the_known_shapes_is_redacted_and_controls_are_not(self) -> None:
+        tools = [{"name": "login", "description": "logs in to prod-eu-1", "input_schema": {"type": "object", "properties": {"password": {"type": "string"}}}}]
+        data = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "instructions": "you run on prod-eu-1",
+            "function_call": {"name": "f", "arguments": json.dumps({"host": "10.0.0.5"})},
+            "metadata": {"user_api_key_hash": "sk-hash-should-stay", "note": "prod-eu-1"},
+            "api_key": f"Bearer {_OAUTH_TOKEN}",
+            "litellm_call_id": "prod-eu-1",
+            "model": "prod-eu-1",
+        }
+        result = self._run(data)
+        self.assertNotIn("prod-eu-1", result["tools"][0]["description"])
+        # Text rules only: a schema's `password` property is still a schema.
+        self.assertEqual(result["tools"][0]["input_schema"]["properties"]["password"], {"type": "string"})
+        self.assertNotIn("prod-eu-1", result["instructions"])
+        self.assertNotIn("10.0.0.5", json.dumps(result["function_call"]))
+        # Controls and the gateway's own bookkeeping are left as they came.
+        self.assertEqual(result["metadata"], {"user_api_key_hash": "sk-hash-should-stay", "note": "prod-eu-1"})
+        self.assertEqual(result["api_key"], f"Bearer {_OAUTH_TOKEN}")
+        self.assertEqual(result["litellm_call_id"], "prod-eu-1")
+        self.assertEqual(result["model"], "prod-eu-1")
+
     # Fail closed.
 
     def test_a_request_in_a_shape_the_hook_cannot_walk_is_refused(self) -> None:
@@ -452,6 +509,9 @@ class TestCallback(unittest.TestCase):
             {"model": "m", "query": f"token {_OAUTH_TOKEN}"},
             {"model": "m", "documents": ["on prod-eu-1"]},
             {"model": "m"},
+            {"model": "m", "messages": {"role": "user", "content": "prod-eu-1"}},
+            {"model": "m", "contents": "on prod-eu-1"},
+            {"model": "m", "contents": [{"role": "user", "parts": "on prod-eu-1"}]},
         ):
             with self.assertRaises(self.module.UnwalkableRequestError) as raised:
                 self._run(dict(data), "arerank")
