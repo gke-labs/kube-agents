@@ -337,6 +337,15 @@ type Gateway struct {
 	// fails relayTerminal's replay of the task's stream, as a transport
 	// error would.
 	terminalReplayHook func(taskID string) error
+	// fanOutReplayHook is an optional test hook, called with the task id each
+	// time a fan-out path replays a task's stream in full (fanOutReplay),
+	// so a test can tell those reads from the direct gets that open no
+	// consumer (#6646). Read under mu.
+	fanOutReplayHook func(taskID string)
+	// fanOutSpotChecks is, per fan-out parent, which running child the heal
+	// replays in full next (nextFanOutSpotCheck). Read under mu; in memory,
+	// so a restart starts each fan-out's turn over.
+	fanOutSpotChecks map[string]int
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -531,6 +532,84 @@ func (g *Gateway) taskStreamEmpty(ctx context.Context, addressee, taskID string)
 		}
 	}
 	return true, nil
+}
+
+// taskProbe is what the newest message on each of a task's replay subjects
+// says, read with direct gets and no consumer (probeTask).
+type taskProbe struct {
+	// empty is nothing on any of the subjects in the retention window.
+	empty bool
+	// final is a terminal status on one of them, the newest message there.
+	final bool
+	// state is the terminal's state when final, else the newest status
+	// among the subjects' newest messages, else working: a task with events
+	// on its stream and no status among the newest is under way.
+	state lib.TaskState
+}
+
+// The probe reads only each subject's newest message. A terminal followed
+// by a later write on the same subject reads as running, and a child whose
+// newest message is an artifact reads as working even after an
+// input-required status: the heal's spot check (healFanOut) covers the
+// first, and the second only shows in the status answer.
+//
+// probeTask reads a task's state from the newest message on each of its
+// replay subjects (lib.TaskReplaySubjects) with direct gets, the read
+// taskStreamEmpty makes, so a fan-out's status and heal learn which children
+// are running, ended or not yet started without opening a replay consumer
+// per child (#6646). Only a terminal needs the full replay, for its folded
+// final message, and the caller makes that read for those children alone.
+// An error is the read failing, not the subjects being empty.
+func (g *Gateway) probeTask(ctx context.Context, addressee, taskID string) (taskProbe, error) {
+	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		return taskProbe{}, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
+	}
+	p := taskProbe{empty: true, state: lib.StateWorking}
+	var newest, finalSeq uint64
+	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
+		msg, err := stream.GetLastMsgForSubject(ctx, subject)
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			continue
+		}
+		if err != nil {
+			return taskProbe{}, fmt.Errorf("newest message on %s: %w", subject, err)
+		}
+		p.empty = false
+		status, ok := statusOf(msg.Data)
+		if !ok {
+			continue
+		}
+		if status.TaskID != taskID {
+			continue // not this task's status, whatever subject it was published on
+		}
+		if status.Final {
+			// Two terminals (an executor's and a supervisor's that raced
+			// it): the first in stream order is the task's, as the fold has
+			// it, and the later one its post-final drop.
+			if !p.final || msg.Sequence < finalSeq {
+				p.final, p.state, finalSeq = true, status.Status.State, msg.Sequence
+			}
+			continue
+		}
+		if !p.final && msg.Sequence > newest {
+			newest, p.state = msg.Sequence, status.Status.State
+		}
+	}
+	return p, nil
+}
+
+// statusOf is the status update data carries, when it is one.
+func statusOf(data []byte) (lib.StatusUpdate, bool) {
+	env, err := lib.ParseEnvelope(data)
+	if err != nil || env.Kind != lib.KindStatusUpdate {
+		return lib.StatusUpdate{}, false
+	}
+	var s lib.StatusUpdate
+	if err := json.Unmarshal(env.Payload, &s); err != nil {
+		return lib.StatusUpdate{}, false
+	}
+	return s, true
 }
 
 // noticeCeilingGraces bounds the no-first-event notice from above, in

@@ -360,19 +360,37 @@ const noticeBatchChildNeverStarted = "⚠️ delegated task `%s` has produced no
 func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *ActiveTask, parent TaskRef) {
 	changed := false
 	if active.StatusMsgID != "" {
-		if task, _, _, err := g.client.TasksGetTerminal(ctx, rec.AddresseeFor(parent.ID), parent.ID); err == nil && task.Final {
-			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(task.State, ""), active.LineNote), "")
+		if probe, err := g.probeTask(ctx, rec.AddresseeFor(parent.ID), parent.ID); err == nil && probe.final {
+			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(probe.state, ""), active.LineNote), "")
 			active.StatusMsgID = ""
 			changed = true
 		}
 	}
+	var running []TaskRef
 	for _, kid := range rec.batchChildren(parent.ID) {
 		// A child's heal may have ended the batch, and the wake taken the
 		// conversation: the rest are already recorded.
 		if fresh, _ := rec.TaskRefFor(kid.ID); fresh.BatchEnd != nil {
 			continue
 		}
-		changed = g.healBatchChild(ctx, rec, kid) || changed
+		healed, live := g.healBatchChild(ctx, rec, kid, false)
+		changed = healed || changed
+		if live {
+			running = append(running, kid)
+		}
+	}
+	// The probe reads only the newest message on each subject, so a terminal
+	// followed by a later write on the same subject (a dying executor's
+	// flush, the post-final drop) reads as running. One child the probe
+	// calls running is replayed in full each pass, in turn, so such a child
+	// is still healed, and a pass still opens at most one consumer for it
+	// however wide the fan-out (#6646).
+	if len(running) > 0 {
+		kid := running[g.nextFanOutSpotCheck(parent.ID, len(running))]
+		if fresh, _ := rec.TaskRefFor(kid.ID); fresh.BatchEnd == nil {
+			healed, _ := g.healBatchChild(ctx, rec, kid, true)
+			changed = healed || changed
+		}
 	}
 	if changed {
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
@@ -388,10 +406,23 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 // first event past FirstEventGrace is ended as never started, with its stop
 // record for a profile task. A profile child's grace allows for the
 // dispatcher's queue first (batchChildGrace). It reports whether it healed.
-func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid TaskRef) bool {
-	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, kid.Addressee, kid.ID)
+func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid TaskRef, spotCheck bool) (healed, running bool) {
+	// The newest messages say whether the child ended or has started at all,
+	// with no consumer. Only a terminal is replayed in full, for the folded
+	// final message its status card and the wake carry (#6646).
+	probe, err := g.probeTask(ctx, kid.Addressee, kid.ID)
+	if err != nil {
+		g.log.Warn("heal: a fan-out child's state could not be read", "conversation", rec.Key, "taskId", kid.ID, "err", err)
+	}
+	var task *lib.Task
+	var terminalSubject string
+	if err == nil && (probe.final || (spotCheck && !probe.empty)) {
+		if task, terminalSubject, err = g.fanOutReplay(ctx, kid.Addressee, kid.ID); err != nil {
+			g.log.Warn("heal: a fan-out child's stream could not be replayed", "conversation", rec.Key, "taskId", kid.ID, "err", err)
+		}
+	}
 	switch {
-	case err == nil && task.Final:
+	case err == nil && task != nil && task.Final:
 		// Either supervisor form (#5301), read as the relay reads it, so a
 		// healed child's terminal and a relayed one are booked alike.
 		source := terminalSourceOf(terminalSubject)
@@ -425,8 +456,8 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 			text = result
 		}
 		g.batchChildEnded(ctx, rec, kid, BatchEnd{State: task.State, Text: text, Source: source, Unposted: true, Cards: toCards}, reason)
-		return true
-	case noFirstEventPastGrace(&ActiveTask{SubmittedAt: kid.StartedAt}, isTaskNotFound(err), g.batchChildGrace(kid), time.Now()):
+		return true, false
+	case noFirstEventPastGrace(&ActiveTask{SubmittedAt: kid.StartedAt}, err == nil && probe.empty, g.batchChildGrace(kid), time.Now()):
 		grace := g.batchChildGrace(kid)
 		g.log.Info("healing a fan-out child with no first event inside the grace", "conversation", rec.Key, "taskId", kid.ID,
 			"addressee", kid.Addressee, "grace", grace)
@@ -441,9 +472,24 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 			setParentLine(rec, kid.ID, "")
 		}
 		g.batchChildEnded(ctx, rec, kid, BatchEnd{State: lib.StateFailed, Text: childNeverStarted, Source: TerminalNeverStarted, Unposted: true}, childNeverStarted)
-		return true
+		return true, false
 	}
-	return false
+	// Running as far as the probe can tell: something on its stream, and no
+	// terminal among the newest messages (or a spot check that found none).
+	return false, err == nil && !probe.empty && !probe.final
+}
+
+// nextFanOutSpotCheck is which of n running children the heal replays in
+// full this pass for parent: each in turn, across passes.
+func (g *Gateway) nextFanOutSpotCheck(parent string, n int) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fanOutSpotChecks == nil {
+		g.fanOutSpotChecks = map[string]int{}
+	}
+	i := g.fanOutSpotChecks[parent] % n
+	g.fanOutSpotChecks[parent] = i + 1
+	return i
 }
 
 // The status answer and the steer refusal while a fan-out runs.
@@ -485,14 +531,15 @@ func (g *Gateway) answerFanOutStatus(ctx context.Context, rec *SessionRecord, pa
 			continue
 		}
 		state := fanOutStateUnknown
-		task, err := g.client.TasksGet(ctx, k.Addressee, k.ID)
+		// Direct gets of the newest messages, no replay consumer per child (#6646).
+		probe, err := g.probeTask(ctx, k.Addressee, k.ID)
 		switch {
-		case err == nil:
-			state = string(task.State)
-		case isTaskNotFound(err):
+		case err != nil:
+			g.log.Error("status read failed for a fan-out child", "taskId", k.ID, "err", err)
+		case probe.empty:
 			state = fanOutStateWaiting
 		default:
-			g.log.Error("status replay failed for a fan-out child", "taskId", k.ID, "err", err)
+			state = string(probe.state)
 		}
 		lines = append(lines, fmt.Sprintf(noticeFanOutStatusLine, batchChildName(k), state))
 	}
@@ -509,4 +556,18 @@ func (g *Gateway) refuseFanOutSteer(rec *SessionRecord, parent TaskRef) {
 		return
 	}
 	g.post(rec.Key, fmt.Sprintf(noticeFanOutSteer, left))
+}
+
+// fanOutReplay replays a task's stream in full on an ordered consumer, the
+// one read a fan-out path makes that spends a TASKS consumer slot: its
+// folded state and the subject its terminal came on.
+func (g *Gateway) fanOutReplay(ctx context.Context, addressee, taskID string) (*lib.Task, string, error) {
+	g.mu.Lock()
+	hook := g.fanOutReplayHook
+	g.mu.Unlock()
+	if hook != nil {
+		hook(taskID)
+	}
+	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, taskID)
+	return task, terminalSubject, err
 }
