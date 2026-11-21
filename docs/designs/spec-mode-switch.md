@@ -228,7 +228,7 @@ record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
 child task and the gateway checks the target agent's `AllowedUsers` against the requester first -
 built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view bypasses
 that check entirely, so on an install whose CR narrows the platform agent's allowlist the two gates
-no longer admit the same people. The view retires on the default flip (#2371); until then, on an
+no longer admit the same people. Its retirement is tracked in #6483, and while the flag is set `defaultRoute: session` keeps plain turns on `platform` routing; until it retires, on an
 install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
 a person the gateway refuses a delegation to `platform` can still read its clusters through a
 session's view. The flag stays off by default for that reason. An install with a single user, or

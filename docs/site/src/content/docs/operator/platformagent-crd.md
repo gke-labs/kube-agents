@@ -583,15 +583,31 @@ door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), 
 `maxSessions` renders `10`, `defaultRoute` renders `platform`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
 
 `defaultRoute` is where the A2A gateway sends a plain conversation's first message: `platform` to the
-Platform Agent, `session` to a session pod of the conversation's own. The operator renders it as
-`A2A_DEFAULT_ADDRESSEE` on the gateway and on the Platform Agent container, which the hermes-bridge
+Platform Agent, `session` to a session pod of the conversation's own. Unset means `platform`, today's
+behaviour; making `session` the default is a later change, gated on evidence. The operator renders it
+as `A2A_DEFAULT_ADDRESSEE` on the gateway and on the Platform Agent container, which the hermes-bridge
 sidecar copies. Changing it rolls the gateway and the Platform Agent pod. On either route the Platform
-Agent stays reachable by handle and `delegate:` opens a session pod. A later release flips the unset
-default to `session`.
+Agent stays reachable by handle and `delegate:` opens a session pod.
 
-`session` also widens the `TASKS` consumer budget, because each session counts the replays of its
-task too. On an install whose stream is narrower, the provision Job refuses until `maxSessions` is
-lowered or `TASKS` is recreated. Its message names both.
+`defaultRoute: session` opts an install into the session route. It widens the `TASKS` consumer
+budget, because each session counts the replays of its task too (7 consumers rather than 3). A stream
+cannot be widened once it exists, so on the session route the operator reads `TASKS`' live
+`max_consumers` from the bus's monitoring endpoint and fits the session cap to it.
+`status.effectiveSessionCap` is `maxSessions`, or the sessions the stream has room for when that is
+fewer, and the `SessionCapFitted` condition and a Warning event say so.
+
+The gateway's cap, the session quota and the provision Job's check follow the fitted cap; a new
+`TASKS` is still created wide enough for `maxSessions`. A stream with no room for one session sends
+plain conversations to `platform`. The cap stays fitted until `TASKS` is widened. On a one-server bus,
+setting `busReplicas` to 3 widens it and keeps its history. On any bus, a new value on the
+`kubeagents.x-k8s.io/bus-reshape` annotation recreates it at the rendered width, keeping its messages
+([Recreating TASKS wider](#recreating-tasks-wider)). On an existing install, until the operator has read the width once, the
+provision Job waits; a new install starts at `maxSessions`. On `platform` none of this runs.
+
+While the operator's `A2A_SESSION_CLUSTER_VIEW` is set, the session pods' temporary cluster view is
+on, and every plain conversation stays with the Platform Agent, `defaultRoute: session` included.
+`SessionCapFitted` says so with reason `SessionClusterViewOn`, and the session route engages once the
+view is retired.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short
@@ -1864,6 +1880,12 @@ notices the pruning from the write's echo, and writes and logs the tier once per
 than on every pass. It renders `auto` at `small`, since the latch cannot be stored, and lands the
 field with the first probe after this release's CRD is applied.
 
+`effectiveSessionCap` is the session cap the operator renders on the session route, fitted to the
+live `TASKS` stream as [`spec.harness.tuning`](#specharnesstuning) describes. A pass that cannot
+read the bus keeps the stored value, and a stored value's reading is reused for five minutes. It is
+written only on `defaultRoute: session`; on `platform`, the default, a value an earlier opt-in left
+is cleared.
+
 These condition types appear in `conditions`; only `Ready` is always present. The table is
 generated from `k8s-operator/internal/controller/condition_docs.go`, and the controller's tests
 fail when it writes a condition type that has no row there:
@@ -1902,6 +1924,7 @@ fail when it writes a condition type that has no row there:
 | `ReplicasLimited` | Only while `spec.deployment.availability.replicas` is above 1, after a pass that rendered the gateway | `status: True`, `Reason: HighAvailabilityNotSupported`. The operator runs the gateway as a single replica, whatever the field asks for; the message names the requested count and why a second replica does not start. Not `Degraded`: the single replica runs. Written on whichever status the pass ends on, on the same terms as `VolumesDropped`: a refusal that returns before the render neither writes nor clears it. Set the field to 1, or remove it, to clear it. |
 | `CredentialProxyExecReady` | Only while `credentialProxy.exec.replicas` is above 0 and the agent's name is accepted for the tier | `status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`, `UniverseDomainMismatch`) leaves it as it stands, count included, until the park clears. |
 | `SizingCappedByQuota` | Only while `spec.deployment.sizingProfile` is `auto` and the cluster count earns a higher tier than the namespace's ResourceQuota has room for, or than a LimitRange bound admits, or after a quota refused the pod a step recreated | `status: True`, `Reason: ResourceQuotaShort` or `LimitRangeShort`. The message names the tier earned, the tier the step was measured from, the tier that stays, and the short quota and key or the LimitRange, bound, resource and container; the figures go in the Warning event. Not `Degraded`: the running tier keeps running. Written before the render, so an earlier refusal neither writes nor clears it. Cleared by the pass that finds room or whose count no longer earns the step; a pass with no reading leaves it, so a gateway outage neither clears nor re-records it. The event watcher switched off by spec clears it. Raise the quota or the bound, or name the tier in `sizingProfile`. |
+| `SessionCapFitted` | Only while the session cap is fitted below `maxSessions` on an install that sets `spec.harness.tuning.defaultRoute: session`, the install fell back to `platform`, its cap waits on its first reading of the bus, the operator's `A2A_SESSION_CLUSTER_VIEW` holds the session route off, or the served CRD drops the cap. Never on `platform`, which an unset field resolves to | `status: True`, `Reason: TasksStreamNarrow`: the live `TASKS` stream has room for fewer sessions than `maxSessions`, so `status.effectiveSessionCap` holds the fitted cap, which the gateway's cap, the session quota and the provision Job follow. `Reason: NoRoomForASession`: not one session fits, so plain conversations go to `platform`. The cap stays fitted until `TASKS` is widened: on a one-server bus, setting `busReplicas` to 3 widens it and keeps its history; on any bus, a new value on the `kubeagents.x-k8s.io/bus-reshape` annotation recreates it at the rendered width, keeping its messages. `status: Unknown`, `Reason: WaitingOnBusWidth`: on a provisioned bus the width can't be read yet, so plain conversations go to session pods at `maxSessions` and the provision Job waits until it is read. `status: True`, `Reason: SessionClusterViewOn`: the session pods' temporary cluster view is on, so plain conversations stay with `platform` until the view is retired. `status: True`, `Reason: StatusFieldPruned`: the served PlatformAgent CRD is older than the operator and drops `status.effectiveSessionCap`, so plain conversations stay with `platform` until the chart's `crds/` is applied; the operator checks again every five minutes. The message carries no figures; the Warning event names the live width, what `maxSessions` needs and the fitted cap. Removed once none of these holds, and on `platform`. |
 | `DataVolumeNotExpanded` | Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default, raised by `expectedClusterProfiles` for the agent's claim) and its StorageClass cannot expand it | `status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it. The agent's claim, when it is below that size and will not grow (its class cannot expand it, or this PlatformAgent does not control it), also gets one `DataVolumeUndersized` Warning Event per state. |
 | `ExternalModelEgress` | Only while the resolved Google Cloud universe domain is not `googleapis.com` and `status.inference.provider` is an external SaaS provider (any provider other than `openai_compatible`, `vertex_ai`, `hosted_vllm`, `vllm`, `ollama`, or `custom`) | `status: True`, `Reason: ExternalSaaSProviderInCustomUniverse`. Prompts, cluster telemetry excerpts, and tool results leave the sovereign or partner universe boundary to reach the external model provider. Not `Degraded`: `Ready` is unaffected, since an operator may authorize external model egress deliberately. Switch LiteLLM to an in-universe endpoint (`openai_compatible` or `vertex_ai` with `platformAgent.harness.universeDomain` set on the chart) to clear it. |
 
