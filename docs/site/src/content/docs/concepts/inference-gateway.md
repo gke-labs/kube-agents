@@ -297,7 +297,7 @@ The same switch reaches the agent pod. The chart projects this rule file there a
 
 Each process reads the file once at start. A changed rule file reaches the gateway on its next roll. In the agent pod a long-lived process keeps the rules it started with while each new worker process reads the current file, so roll the pod to move them all. The image parses the file with the grammar it shipped with, so keep the chart and the agent image at one version when this switch is on. It does not touch chat egress.
 
-A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook, including a refused request shape, fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
+A rule that fails to load stops the gateway pod at startup rather than forwarding requests it has not redacted, and the render fails on a name, action or source it does not accept; an exception inside the hook, including a refused request shape, fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
 
 ### Pass-through trajectory logging
 
