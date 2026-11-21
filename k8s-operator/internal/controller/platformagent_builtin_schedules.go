@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,7 +87,8 @@ const (
 	// render was deleted, to be created again as the built-in.
 	builtinSchedulesReasonReplaced = "ReplacedUnownedSchedule"
 	// builtinSchedulesReasonForbidden: the operator's role refuses a write the renderer needs,
-	// as an operator image ahead of its ClusterRole would see. The rest of the reconcile goes on.
+	// as an operator image ahead of its RBAC (the namespaced Role holds the writes) would see. The
+	// rest of the reconcile goes on.
 	builtinSchedulesReasonForbidden = "WritesForbidden"
 )
 
@@ -160,7 +162,7 @@ const builtinAppliedSuspendAnnotation = "kubeagents.x-k8s.io/builtin-applied-sus
 func desiredBuiltinSpec(agent *agentv1alpha1.PlatformAgent, row builtinSchedule, existing *agentv1alpha1.AgentSchedule) (agentv1alpha1.AgentScheduleSpec, *bool) {
 	spec := *row.Spec.DeepCopy()
 	if row.Canary {
-		spec.Delivery.Mode = "local"
+		spec.Delivery.Mode = agentv1alpha1.AgentScheduleDeliveryLocal
 		if spec.Parameters == nil {
 			spec.Parameters = map[string]string{}
 		}
@@ -172,7 +174,7 @@ func desiredBuiltinSpec(agent *agentv1alpha1.PlatformAgent, row builtinSchedule,
 		spec.Suspend = true
 	case overridden:
 		spec.Suspend = o.Suspend
-	case existing != nil && existing.Annotations[builtinAppliedSuspendAnnotation] != strconvBool(existing.Spec.Suspend):
+	case existing != nil && existing.Annotations[builtinAppliedSuspendAnnotation] != strconv.FormatBool(existing.Spec.Suspend):
 		// Someone set it directly since the operator last did: it stands.
 		spec.Suspend = existing.Spec.Suspend
 		return spec, nil
@@ -181,13 +183,6 @@ func desiredBuiltinSpec(agent *agentv1alpha1.PlatformAgent, row builtinSchedule,
 	}
 	applied := spec.Suspend
 	return spec, &applied
-}
-
-func strconvBool(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }
 
 // builtinOverrideProblems is what the condition reports about the overrides: entries naming no
@@ -330,7 +325,7 @@ func (r *PlatformAgentReconciler) createBuiltinSchedule(ctx context.Context, age
 	spec, applied := desiredBuiltinSpec(agent, row, nil)
 	sched.Spec = spec
 	if applied != nil {
-		sched.Annotations = map[string]string{builtinAppliedSuspendAnnotation: strconvBool(*applied)}
+		sched.Annotations = map[string]string{builtinAppliedSuspendAnnotation: strconv.FormatBool(*applied)}
 	}
 	if err := controllerutil.SetControllerReference(agent, sched, r.Scheme); err != nil {
 		return fmt.Errorf("controller reference on built-in schedule %s: %w", row.Name, err)
@@ -347,7 +342,7 @@ func (r *PlatformAgentReconciler) createBuiltinSchedule(ctx context.Context, age
 // left as they are.
 func (r *PlatformAgentReconciler) updateBuiltinSchedule(ctx context.Context, agent *agentv1alpha1.PlatformAgent, row builtinSchedule, sched *agentv1alpha1.AgentSchedule) error {
 	spec, applied := desiredBuiltinSpec(agent, row, sched)
-	annotationCurrent := applied == nil || sched.Annotations[builtinAppliedSuspendAnnotation] == strconvBool(*applied)
+	annotationCurrent := applied == nil || sched.Annotations[builtinAppliedSuspendAnnotation] == strconv.FormatBool(*applied)
 	if equality.Semantic.DeepEqual(sched.Spec, spec) && annotationCurrent {
 		return nil
 	}
@@ -356,7 +351,7 @@ func (r *PlatformAgentReconciler) updateBuiltinSchedule(ctx context.Context, age
 		if sched.Annotations == nil {
 			sched.Annotations = map[string]string{}
 		}
-		sched.Annotations[builtinAppliedSuspendAnnotation] = strconvBool(*applied)
+		sched.Annotations[builtinAppliedSuspendAnnotation] = strconv.FormatBool(*applied)
 	}
 	if err := r.Update(ctx, sched); err != nil {
 		return fmt.Errorf("update built-in schedule %s: %w", row.Name, err)
@@ -379,7 +374,7 @@ func builtinSchedulesCondition(agent *agentv1alpha1.PlatformAgent, rows []builti
 		parts = append(parts, part)
 	}
 	if len(forbidden) > 0 {
-		note(builtinSchedulesReasonForbidden, "a built-in schedule write was refused: "+strings.Join(forbidden, "; ")+". If the role refused it, apply the chart's ClusterRole")
+		note(builtinSchedulesReasonForbidden, "a built-in schedule write was refused: "+strings.Join(forbidden, "; ")+". If RBAC refused it, apply the chart's RBAC: the writes are on the operator's namespaced Role in the install namespace")
 	}
 	if len(replaced) > 0 {
 		note(builtinSchedulesReasonReplaced, "replacing the unowned schedule on reserved name(s) "+strings.Join(replaced, ", "))

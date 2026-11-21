@@ -691,7 +691,7 @@ func TierAccessDenied(c *RBACChecker) []string {
 // than crashloop.
 //
 // Only the reads and the status write count: the built-in renderer's writes
-// (agentScheduleWriteVerbs) don't, so an older ClusterRole that lacks them
+// (agentScheduleWriteVerbs, on the namespaced Role) don't, so an older Role that lacks them
 // keeps the schedule controller running, and the renderer reports the
 // refusal itself (reconcileBuiltinSchedules).
 func AgentScheduleAccessDenied(c *RBACChecker) []string {

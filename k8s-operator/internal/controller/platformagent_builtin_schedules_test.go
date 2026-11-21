@@ -294,7 +294,7 @@ func TestTheBuiltinNameSetIsTheTables(t *testing.T) {
 }
 
 // A role that refuses the renderer's writes, as an operator image ahead of
-// its ClusterRole would have, is reported on the condition and doesn't fail
+// its RBAC would have, is reported on the condition and doesn't fail
 // the PlatformAgent's reconcile.
 func TestARefusedBuiltinWriteIsReportedNotFatal(t *testing.T) {
 	agent := builtinTestAgent()
@@ -453,7 +453,7 @@ func TestOverridesAreNotReportedWhileSchedulesAreOff(t *testing.T) {
 
 // The schedule controller's denials count reads and the status write only:
 // a role with no create, update or delete on agentschedules (an image ahead
-// of its ClusterRole) keeps the controller running, and one without list
+// of its RBAC) keeps the controller running, and one without list
 // doesn't.
 func TestAgentScheduleAccessDeniedIgnoresTheRenderersWrites(t *testing.T) {
 	writes := NewRBACChecker((&fakeAuthorizer{deny: func(a *authorizationv1.ResourceAttributes) bool {

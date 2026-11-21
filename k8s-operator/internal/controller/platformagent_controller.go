@@ -1646,6 +1646,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.profileHoldRequeue > 0 {
 			requeue = min(requeue, a2aState.profileHoldRequeue)
 		}
+		// And the built-in schedule renderer's next look (a replaced
+		// schedule's deletion, a write that raced), which nothing watched
+		// marks.
+		if a2aState.builtinSchedulesRequeue > 0 {
+			requeue = min(requeue, a2aState.builtinSchedulesRequeue)
+		}
 		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
@@ -1670,6 +1676,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// And a profile held for the bus's config (a2aDispatchableProfiles).
 		if a2aState.profileHoldRequeue > 0 {
 			requeue = min(requeue, a2aState.profileHoldRequeue)
+		}
+		// And the built-in schedule renderer's next look (a replaced
+		// schedule's deletion, a write that raced), which nothing watched
+		// marks.
+		if a2aState.builtinSchedulesRequeue > 0 {
+			requeue = min(requeue, a2aState.builtinSchedulesRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
