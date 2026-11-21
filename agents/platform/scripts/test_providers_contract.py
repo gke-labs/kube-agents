@@ -841,24 +841,35 @@ class ContractTest(unittest.TestCase):
         answer, _ = self.invoke(forge, verb, fixture)
         return answer
 
-    def test_a_github_title_body_or_number_of_another_type_reads_as_an_absent_one(self):
-        """A forge answer is another party's text. A `title` or a `body` that is not a text is
-        `""`, and a `number` that is not an integer is `None`: what an absent field gives. A
-        nested value then stops at the translation and does not go on to a caller that prints it."""
+    def test_a_github_title_or_number_of_another_type_reads_as_an_absent_one_and_such_a_body_as_none(self):
+        """A forge answer is another party's text. A `title` that is not a text is `""`, and a
+        `number` that is not an integer is `None`: what an absent field gives. A `body` that is
+        not a text is `None`, which is not the empty text: an empty body is one that a caller
+        can write over, and `None` is a body that did not arrive. A nested value stops at the
+        translation and does not go on to a caller that prints it."""
         deep = [[[["nested"]]]]
-        for value in (deep, {"a": {"b": "c"}}, 7, 1.5, True, None):
+        for value in (deep, {"a": {"b": "c"}}, 7, 1.5, True, False, [], {}, 0):
             with self.subTest(text=value):
                 changed = {"title": value, "body": value}
                 proposal = self._github_answer_with("proposal-view", changed)["proposal"]
-                self.assertEqual(("", ""), (proposal["title"], proposal["body"]))
+                self.assertEqual(("", None), (proposal["title"], proposal["body"]))
                 issue = self._github_answer_with("issue-view", changed)["issue"]
-                self.assertEqual(("", ""), (issue["title"], issue["body"]))
-                self.assertEqual("", self._github_answer_with("issue-comment", {"body": value})["comment"]["body"])
+                self.assertEqual(("", None), (issue["title"], issue["body"]))
+                self.assertIsNone(self._github_answer_with("issue-comment", {"body": value})["comment"]["body"])
         for value in ("7", deep, {"n": 7}, 7.0, True, False, None):
             with self.subTest(number=value):
                 changed = {"number": value}
                 self.assertIsNone(self._github_answer_with("proposal-view", changed)["proposal"]["number"])
                 self.assertIsNone(self._github_answer_with("issue-view", changed)["issue"]["number"])
+
+    def test_a_github_body_that_is_null_is_an_empty_body(self):
+        """GitHub sends `null` for a body with no text. That is a real empty body, as before."""
+        changed = {"title": None, "body": None}
+        proposal = self._github_answer_with("proposal-view", changed)["proposal"]
+        self.assertEqual(("", ""), (proposal["title"], proposal["body"]))
+        issue = self._github_answer_with("issue-view", changed)["issue"]
+        self.assertEqual(("", ""), (issue["title"], issue["body"]))
+        self.assertEqual("", self._github_answer_with("issue-comment", {"body": None})["comment"]["body"])
 
     def test_a_github_search_hit_with_a_number_of_another_type_has_no_number(self):
         forge, directory = self._github()

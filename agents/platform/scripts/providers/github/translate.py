@@ -28,10 +28,23 @@ REVIEW_STATES = {
 def _text(value: Any) -> str:
     """`value` when the forge sent a text, else `""`, which is what an absent field gives.
 
-    A `title` or a `body` goes to callers that print it and match patterns on
-    it. A value of another type (a list, an object, however deep) stops here.
+    A `title` goes to callers that print it and match patterns on it. A value
+    of another type (a list, an object, however deep) stops here.
     """
     return value if isinstance(value, str) else ""
+
+
+def _body(value: Any) -> str | None:
+    """A `body`: the text, `""` for `null`, and `None` for a value of another type.
+
+    GitHub sends `null` for an empty body, and that is a real empty body. A
+    value of another type is no body at all, and the two are different answers
+    to a caller: the fleet audit writes over an empty ledger body, and it
+    leaves a body that did not arrive alone.
+    """
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else None
 
 
 def _number(value: Any) -> int | None:
@@ -133,7 +146,7 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
         "mergeCommit": (node.get("merge_commit_sha") or None)
         if state == "merged"
         else None,
-        "body": _text(node.get("body")),
+        "body": _body(node.get("body")),
     }
 
 
@@ -152,7 +165,7 @@ def issue(node: dict[str, Any]) -> dict[str, Any]:
         "url": node.get("html_url") or "",
         "created": node.get("created_at") or "",
         "updated": node.get("updated_at") or "",
-        "body": _text(node.get("body")),
+        "body": _body(node.get("body")),
     }
 
 
@@ -183,7 +196,7 @@ def comment(node: dict[str, Any], kind: str = "issue") -> dict[str, Any]:
         # one thing that suffix was ever read for.
         "bot": is_automation(node.get("user")),
         "created": node.get("submitted_at") or node.get("created_at") or "",
-        "body": _text(node.get("body")),
+        "body": _body(node.get("body")),
         "url": node.get("html_url") or "",
         "path": node.get("path") or "",
         "line": node.get("line"),
