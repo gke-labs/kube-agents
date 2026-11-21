@@ -556,11 +556,15 @@ class HelmFleetAuditProfileTest(unittest.TestCase):
         self.assertNotIn("clusterRef", spec)
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
-    def test_it_takes_no_parameters_like_its_persona(self):
+    def test_its_parameters_are_the_personas(self):
+        # The worker refuses a task when the CR's parameters and the persona's
+        # differ, so the chart's list is the persona's own: dry_run alone.
         persona = yaml.safe_load(_FLEET_AUDIT_PERSONA.read_text(encoding="utf-8"))
-        self.assertFalse(persona.get("parameters"), "the fleet-audit persona declares parameters")
+        want = [(p["name"], bool(p.get("required", False))) for p in persona["parameters"]]
+        self.assertEqual(want, [("dry_run", False)])
         spec = self._profile(self._render("--set", "profiles.fleetAudit.enabled=true").stdout)["spec"]
-        self.assertFalse(spec.get("parameters"))
+        got = [(p["name"], bool(p.get("required", False))) for p in spec["parameters"]]
+        self.assertEqual(got, want)
 
 
 class HelmFleetAuditProfileReuseValuesTest(unittest.TestCase):

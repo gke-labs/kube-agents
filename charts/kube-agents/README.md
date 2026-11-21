@@ -1721,8 +1721,9 @@ the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
 
 `profiles.fleetAudit.enabled` (default `false`) renders `AgentProfile/fleet-audit`,
 the parent of the install's fleet-wide scheduled audits and of onboarding's first
-inventory. It takes no parameters: it reads no cluster itself, and each cluster's
-checks run as a delegated `cluster` task. Its persona is the `persona-fleet-audit`
+inventory. It takes no target: it reads no cluster itself, and each cluster's
+checks run as a delegated `cluster` task. Its one parameter, `dry_run`, marks a
+shadow run. Its persona is the `persona-fleet-audit`
 image, built from `agents/fleet-audit/persona`, and its report scripts are in the
 `a2a-worker` image under `/opt/fleet-audit/scripts`. `profiles.fleetAudit.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. Its tiers are `read` and `unattended`, since a scheduled audit

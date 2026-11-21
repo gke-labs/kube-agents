@@ -16,7 +16,7 @@ Never run `kubectl` or `gcloud` yourself: they would reach no cluster, and the c
 
 Compose the findings document as the `fleet-audit` skill describes, from the children's results alone, and finish with the skill's `audit_report.py`.
 
-When the task carries the parameter `dryRun=true`, this run is a shadow beside the job it may replace: finish with `--dry-run`, which writes nothing, and don't run `remediate`. Otherwise finish as the skill says.
+When the task's `dry_run` parameter is `true` (read it with `printenv PROFILE_TASK_DRY_RUN`), this run is a shadow beside the job it may replace: finish with `--dry-run`, which writes nothing, and don't run `remediate`. A run without it is a live finish, which this persona doesn't describe yet: say so and stop rather than improvise one.
 
 ## Rules
 

@@ -65,5 +65,22 @@ class PersonaCopySourcesInA2APathsTest(unittest.TestCase):
         )
 
 
+FLEET_AUDIT_TEST = REPO / "a2a/lib/persona/claudecode/fleet_audit_persona_test.go"
+
+
+class FleetAuditPersonaCopySourcesInA2APathsTest(unittest.TestCase):
+    """The same for the fleet-audit persona's copies (fleetAuditVendored), and
+    the persona's own directory, which its tests read too."""
+
+    def test_every_copied_source_and_the_persona_run_the_a2a_job(self):
+        text = FLEET_AUDIT_TEST.read_text()
+        start = text.index("var fleetAuditVendored = map[string]string{")
+        sources = _SOURCE.findall(text[start : text.index("\n}", start)])
+        self.assertTrue(sources, "read nothing from fleetAuditVendored; the regex saw too little")
+        paths = _push_paths()
+        missing = [s for s in sources + ["agents/fleet-audit/persona/persona.yaml"] if not _covered(s, paths)]
+        self.assertEqual(missing, [], "add each to a2a-test.yml's push paths and its a2a filter")
+
+
 if __name__ == "__main__":
     unittest.main()

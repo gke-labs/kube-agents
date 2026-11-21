@@ -16,11 +16,11 @@ Write `findings.json` exactly as [`references/findings-document.md`](references/
 The scripts are in the worker image, under `/opt/fleet-audit/scripts`:
 
 ```
-python3 /opt/fleet-audit/scripts/audit_report.py finish --audit <audit id> --findings-file findings.json --no-collector-manifest "<why>" --dry-run
+python3 /opt/fleet-audit/scripts/audit_report.py finish --audit <audit id> --findings-file findings.json --dry-run
 ```
 
 - `--audit` is the stream the task's request names.
 - An audit that takes a collector manifest needs `--manifest-file`, or `--no-collector-manifest` with a reason. The script says which.
-- `--dry-run` writes nothing and opens nothing, and every shadow run (the task parameter `dryRun=true`) uses it. A live run's finish is the scheduled job's own, and isn't described here yet.
+- `--dry-run` writes nothing and opens nothing, and every shadow run (the task's `dry_run` parameter is `true`, in `PROFILE_TASK_DRY_RUN`) uses it. A live run's finish is the scheduled job's own, and isn't described here yet.
 
 Never run `remediate` in a shadow run, and never open an issue or a pull request by any other means.

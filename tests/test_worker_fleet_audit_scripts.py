@@ -7,6 +7,7 @@ to exactly that set of sources, and checks the set imports from one directory
 alone, as the image's build-time check does, without building the image.
 """
 
+import json
 import os
 import re
 import shutil
@@ -63,6 +64,31 @@ class WorkerFleetAuditScriptsTest(unittest.TestCase):
                 cwd=tmp, env=env, check=True, capture_output=True, text=True,
             )
             self.assertIn("--dry-run", out.stdout)
+
+    def test_a_dry_run_finish_completes_from_one_directory(self):
+        # A real finish on the --dry-run path, which reaches the lazy imports
+        # an import or --help never does: a document from the platform tests'
+        # own builder, so it's one finish accepts.
+        sys.path.insert(0, str(REPO_ROOT / "agents/platform/skills/fleet-audit/scripts"))
+        try:
+            import test_audit_report  # noqa: PLC0415
+        finally:
+            sys.path.pop(0)
+        document = test_audit_report.make_doc()
+        with tempfile.TemporaryDirectory() as tmp:
+            for src in SOURCES:
+                shutil.copy(REPO_ROOT / src, Path(tmp) / Path(src).name)
+            findings = Path(tmp) / "findings.json"
+            findings.write_text(json.dumps(document))
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": tmp, "PYTHONDONTWRITEBYTECODE": "1",
+                   "FLEET_AUDIT_SCRATCH_DIR": str(Path(tmp) / "scratch"), "FLEET_AUDIT_REPORTS_DIR": str(Path(tmp) / "reports")}
+            run = subprocess.run(
+                [sys.executable, "audit_report.py", "finish", "--audit", test_audit_report.AUDIT,
+                 "--findings-file", str(findings), "--no-collector-manifest", "test", "--dry-run"],
+                cwd=tmp, env=env, capture_output=True, text=True,
+            )
+            self.assertNotIn("ModuleNotFoundError", run.stderr)
+            self.assertEqual(run.returncode, 0, run.stderr[-2000:])
 
 
 if __name__ == "__main__":

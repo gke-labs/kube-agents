@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
@@ -39,8 +40,9 @@ var fleetAuditReferenceEdits = map[string][]tseSkillEdit{
 }
 
 // The persona loads and renders for Claude Code without a warning, with its
-// one skill, no task parameters (it runs fleet-wide, so a task names no
-// target), and no MCP server.
+// one skill, no MCP server, and one optional parameter, dry_run, a name the
+// gateway accepts (lib.TaskParameterNameRE): it runs fleet-wide, so a task
+// names no target.
 func TestTheFleetAuditPersonaRendersWhole(t *testing.T) {
 	p := load(t, fleetAuditPersonaDir)
 	out := render(t, p, persona.Target{Relay: relay})
@@ -54,8 +56,13 @@ func TestTheFleetAuditPersonaRendersWhole(t *testing.T) {
 	if want := []string{"fleet-audit"}; !slices.Equal(skills, want) {
 		t.Errorf("skills = %v, want %v", skills, want)
 	}
-	if len(p.Manifest.Parameters) != 0 {
-		t.Errorf("parameters = %v, want none: the persona runs fleet-wide", p.Manifest.Parameters)
+	if len(p.Manifest.Parameters) != 1 || p.Manifest.Parameters[0].Name != "dry_run" || p.Manifest.Parameters[0].Required {
+		t.Errorf("parameters = %+v, want dry_run alone, not required", p.Manifest.Parameters)
+	}
+	for _, prm := range p.Manifest.Parameters {
+		if !lib.TaskParameterNameRE.MatchString(prm.Name) {
+			t.Errorf("parameter %q isn't a name the gateway accepts", prm.Name)
+		}
 	}
 	if len(p.MCP.Servers) != 0 {
 		t.Errorf("MCP servers = %v, want none", p.MCP.Servers)

@@ -114,8 +114,8 @@ The fleet-audit profile (#5623, #5620): the parent of the install's fleet-wide
 scheduled audits and of onboarding's first inventory. Its persona is
 agents/fleet-audit/persona, published as the persona-fleet-audit image; its
 report scripts are in the worker image (/opt/fleet-audit/scripts). It takes no
-task parameters: it runs fleet-wide, and each cluster's checks run as a
-delegated cluster task. Off by default: no schedule runs on it until the
+target: it runs fleet-wide, and each cluster's checks run as a delegated
+cluster task. Its one parameter, dry_run, marks a shadow run. Off by default: no schedule runs on it until the
 onboarding PR renders one. Delegation from a profile task will need the
 profile's opt-in (spec.delegates, #6789), set by whichever of #6789 and the
 onboarding PR lands second.
@@ -181,6 +181,11 @@ spec:
   identity: {}
   allowedTiers:
     {{- toYaml $fa.allowedTiers | nindent 4 }}
+  {{- /* The persona's own parameters (agents/fleet-audit/persona/persona.yaml),
+  as for the cluster profile above: dry_run marks a shadow run. */}}
+  parameters:
+    - name: dry_run
+      required: false
   lifecycle:
     activeDeadlineSeconds: {{ $fa.lifecycle.activeDeadlineSeconds }}
     ttlSecondsAfterFinished: {{ $fa.lifecycle.ttlSecondsAfterFinished }}

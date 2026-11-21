@@ -138,8 +138,10 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 # (agents/fleet-audit/persona, #5623): copied from their sources at build time,
 # flat in one directory, since a script's own directory is where Python finds
 # the others when the persona's skill runs `python3 /opt/fleet-audit/scripts/
-# audit_report.py`. They're the closure audit_report.py imports on its finish
-# paths; the RUN below fails the build if one no longer imports from here alone.
+# audit_report.py`. They're the closure audit_report.py imports on its
+# `finish --dry-run` path (a live finish needs more, which the PR that runs one
+# adds); the RUN below fails the build if one no longer imports from here alone,
+# and tests/test_worker_fleet_audit_scripts.py runs that finish on a document.
 # Every worker carries them; they act only with the task's own confined
 # credential, so a cluster or tse worker gains nothing it couldn't already do.
 # tests/test_worker_fleet_audit_scripts.py holds this list to its sources.

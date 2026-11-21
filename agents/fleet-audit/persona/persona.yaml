@@ -11,5 +11,11 @@ model: model-default
 tools:
   - read_file
   - shell
+parameters:
+  - name: dry_run
+    description: >-
+      "true" for a shadow run beside the job it may replace: finish writes
+      nothing outside the run's own report, and runs no remediation.
+    required: false
 requires:
   commands: [python3]
