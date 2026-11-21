@@ -438,7 +438,7 @@ class SlackRelayPatchTest(unittest.TestCase):
             captured["payload"] = json.loads(req.data.decode("utf-8"))
             return FakeHTTPResponse({"response": {"ok": True, "team_id": "T123"}})
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             result = asyncio.run(client.api_call("auth.test"))
 
         self.assertEqual(dict(result.data), {"ok": True, "team_id": "T123"})
@@ -456,7 +456,7 @@ class SlackRelayPatchTest(unittest.TestCase):
                 }
             })
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen_with_headers):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen_with_headers):
             result = asyncio.run(client.api_call("auth.test"))
 
         self.assertEqual(dict(result.data), {"ok": True, "team_id": "T123"})
@@ -482,7 +482,7 @@ class SlackRelayPatchTest(unittest.TestCase):
             captured["payload"] = json.loads(req.data.decode("utf-8"))
             return FakeHTTPResponse({"response": {"ok": True}})
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             asyncio.run(client.api_call("auth.test"))
 
         self.assertEqual("T2", captured["payload"]["teamId"])
@@ -511,7 +511,7 @@ class SlackRelayPatchTest(unittest.TestCase):
         async def fast_sleep(_seconds):
             return None
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), mock.patch(
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen), mock.patch(
             "asyncio.sleep", side_effect=fast_sleep
         ):
             connected = asyncio.run(adapter.connect())
@@ -543,7 +543,7 @@ class SlackRelayPatchTest(unittest.TestCase):
                 }
             )
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             with self.assertRaises(SlackApiError) as caught:
                 asyncio.run(client.api_call("chat.postMessage"))
 
@@ -579,7 +579,7 @@ class SlackRelayPatchTest(unittest.TestCase):
         def fake_urlopen(req, timeout=None):
             raise relay_error({"error": "Slack relay unavailable"})
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 asyncio.run(client.api_call("chat.postMessage"))
 
@@ -599,7 +599,7 @@ class SlackRelayPatchTest(unittest.TestCase):
         def fake_urlopen(req, timeout=None):
             raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             connected = asyncio.run(adapter.connect())
 
         self.assertFalse(connected)
@@ -618,7 +618,7 @@ class SlackRelayPatchTest(unittest.TestCase):
             captured["payload"] = json.loads(req.data.decode("utf-8"))
             return FakeHTTPResponse({"data": base64.b64encode(b"bytes").decode()})
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             content = asyncio.run(
                 adapter._download_slack_file_bytes(
                     "https://files.slack.com/f", team_id="T1", html_label="media"
@@ -744,7 +744,7 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
                 raise result
             return FakeHTTPResponse({"response": result})
 
-        return captured, mock.patch("urllib.request.urlopen", side_effect=fake_urlopen)
+        return captured, mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen)
 
     def _send(self, entry, message="brief", **kwargs):
         return asyncio.run(

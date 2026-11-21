@@ -42,6 +42,11 @@
 # desired count above what the full pool can run -- one replica Ready, the
 # rest Pending. The backlog is live, the pool cannot absorb it, and the
 # audit must name the pool and quantify the gap.
+#
+# Second planted defect required: a zero-node pool named
+# "missing-reservation-pool" on the seeded fleet that consumes only the
+# reservation "seeded-absent-reservation", which exists in no zone. The audit
+# must file a reservation finding against that pool.
 # Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
 # the earlier claim that it was is the correction this line carries: step 0 of
 # every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
@@ -65,8 +70,10 @@ expected_output: >-
   The ledger issue names pinned-inference-pool as the pool at risk, states why
   (single zone, node autoscaling capped, pending replicas the pool cannot
   place), and quantifies the shortfall in nodes or pods rather than issuing
-  a generic capacity warning. The closing response is the SOP's one line,
-  carrying the ledger URL in full.
+  a generic capacity warning. The ledger also carries a reservation finding
+  against missing-reservation-pool, whose named reservation exists in no
+  zone. The closing response is the SOP's one line, carrying the ledger URL
+  in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -81,6 +88,7 @@ domain: capacity
 # docs/designs/bench-fleet-catalog.md.
 fixtures:
   - hpa-saturated
+  - missing-reservation-pool
 
 # Graded against the LEDGER, not the chat reply: the stockout-prevention SOP
 # mandates a one-line closing response that deliberately restates nothing, so
@@ -112,11 +120,27 @@ verification_spec:
       # full pool can run, so the scheduler refuses replicas the audit must
       # see. The collector counts them into the pool's evidence as "<n>
       # Unschedulable pods of <workload> select this pool and cannot be
-      # placed" (fleet_stockout.py, backlog_clause). The verifier scopes to
-      # the whole body or to finding ids, so the workload name is what binds
-      # the phrase to the planted pool's finding: only inference-server's
-      # selector names that pool.
+      # placed" (fleet_stockout.py, backlog_clause). This check reads the
+      # whole body, so the workload name is what binds the phrase to the
+      # planted pool's finding: only inference-server's selector names that
+      # pool.
       required_phrases: ["Unschedulable pods of inference-server"]
+  # The second planted defect: a zero-node pool named
+  # "missing-reservation-pool" that consumes only the reservation
+  # "seeded-absent-reservation", which exists in no zone. GKE accepts the pool
+  # and nothing fails until it has to add a node, so only the comparison of the
+  # pool with the project's reservations (SOP 3.10(d)) finds it.
+  # scope: finding -- binds the check to the object. A `finding_ids` phrase for
+  # the pool would also pass on another check's finding against the same pool.
+  - name: a-reservation-finding-was-filed-against-the-pool-with-no-reservation
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding
+      finding_check: reservation-mismatch-risk
+      required_phrases: ["missing-reservation-pool"]
   # Cluster-state safeguard: the pool's node-pool config is GKE-level, but
   # the HPA half of the planted defect is a cluster object -- and raising its
   # cap is exactly the tempting "fix". Addressed by fixture ROLE, so it reads
