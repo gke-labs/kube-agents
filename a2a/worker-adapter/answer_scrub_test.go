@@ -255,3 +255,26 @@ func TestToolResultDecoding(t *testing.T) {
 		t.Errorf("block content = %s, want the text blocks only", got)
 	}
 }
+
+// The stderr tail is scrubbed whole before it's cut to stderrTailBytes, so
+// a credential that the cut would split is redacted, not left as a fragment.
+func TestStderrTailIsScrubbedBeforeItIsCut(t *testing.T) {
+	const value = "synthetic-secret-value-0001"
+	line := "password=" + value + "\n"
+	// Put the credential so the cut point falls inside its value.
+	cut := stderrTailBytes - 10
+	padding := strings.Repeat("x", 100) + "\n"
+	tail := strings.Repeat("-", cut-len(value)/2) // after the credential
+	stderr := &tailBuffer{max: stderrScanBytes}
+	_, _ = stderr.Write([]byte(padding + line + tail))
+	p := &harnessProc{stderr: stderr}
+	got := p.stderrEvidence(answerscrub.ScrubInline)
+	for i := 6; i <= len(value); i++ {
+		if strings.Contains(got, value[len(value)-i:]) {
+			t.Fatalf("the stderr tail kept a fragment of the credential: %q", got)
+		}
+	}
+	if len(got) > len(stderrTailHeading)+stderrTailBytes {
+		t.Fatalf("the tail is %d bytes, over stderrTailBytes", len(got)-len(stderrTailHeading))
+	}
+}

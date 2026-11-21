@@ -1193,7 +1193,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		state := lib.StateFailed
 		reason := "reason: stream-ended-without-result" +
 			reapEvidence(waitErr, reapTook, proc.cmd.WaitDelay) +
-			a.scrub(scanEvidence(proc.scanErr())+proc.stderrEvidence())
+			a.scrub(scanEvidence(proc.scanErr())) + proc.stderrEvidence(a.scrub)
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
 }
