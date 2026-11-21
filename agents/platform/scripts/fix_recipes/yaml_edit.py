@@ -729,6 +729,10 @@ def document_spans(text: str) -> list[tuple[int, int]]:
     return _documents(text.split("\n"))
 
 
+# A digit-led plain string read as text: it holds a letter or `%` and only
+# letters, digits, `.`, `-` and `%` (`25%`, `100m`, `3ds-pdb`). No sign, no
+# `_`: go-yaml strips `_` and reads `08` or `+_1` as a number.
+_DIGIT_LED_TEXT = re.compile(r"[0-9][0-9A-Za-z.%-]*[A-Za-z%][0-9A-Za-z.%-]*")
 _DOUBLE_READABLE = re.compile(r'(?:[^\\"]|\\[\\"])*')
 _INT_PLAIN = re.compile(r"-?(?:0|[1-9][0-9]*)")
 
@@ -763,9 +767,10 @@ def read_scalar(text: str, doc_index: int, path: list[PathSegment]) -> Value:
         return raw == "true"
     if _INT_PLAIN.fullmatch(raw) and INT_MIN <= int(raw) <= INT_MAX:
         return int(raw)
-    # Any other plain scalar the parser accepted is a string to YAML 1.1
-    # (`25%`, `100m`, `3ds-pdb`) unless it is one of the forms it reads as
-    # something else, which are refused rather than guessed at.
-    if not _NONSTRING_PLAIN.match(raw):
+    # Other plain strings: letter-led ones `_render` could write, and the
+    # digit-led text a manifest carries (`25%`, `100m`, `3ds-pdb`). Anything
+    # else (signs, `_`, leading zeros: go-yaml and PyYAML disagree on some)
+    # is refused rather than guessed at.
+    if (_SAFE_PLAIN.match(raw) or _DIGIT_LED_TEXT.fullmatch(raw)) and not _NONSTRING_PLAIN.match(raw):
         return raw
     raise RefusedEdit("unreadable-value", f"{where}: plain value {raw!r} is not one this module reads")
