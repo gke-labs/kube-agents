@@ -185,7 +185,7 @@ class CompareTest(unittest.TestCase):
             return code, out.getvalue()
 
     def test_answer_length_is_compared_from_the_grading_logs(self) -> None:
-        """A case whose mean answer on B runs over A's by more than the margin
+        """A case whose median answer on B runs over A's by more than the margin
         is flagged wordier; within the margin it isn't."""
         code, out = self.run_ab_with_words(
             {"long": [100, 100, 100], "close": [200, 200, 200]},
@@ -232,7 +232,15 @@ class CompareTest(unittest.TestCase):
             errout = io.StringIO()
             with redirect_stdout(io.StringIO()), redirect_stderr(errout):
                 self.assertEqual(ab.main(["--length-gate", str(a), str(b)]), 2)
-            self.assertIn("--length-gate needs", errout.getvalue())
+            self.assertIn("--length-gate needs answer shapes", errout.getvalue())
+
+    def test_the_length_gate_needs_a_case_with_shapes_on_both_runs(self) -> None:
+        """Shapes for different cases on the two runs compare nothing, which
+        the gate refuses rather than passes."""
+        code, _ = self.run_ab_with_words(
+            {"x": [100], "y": []}, {"x": [], "y": [100]}, "--length-gate"
+        )
+        self.assertEqual(code, 2)
 
     def test_a_small_absolute_difference_is_not_wordier(self) -> None:
         self.assertFalse(ab.wordier(0, 5))

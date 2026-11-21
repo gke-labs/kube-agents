@@ -71,7 +71,7 @@ TASK_LINE = re.compile(r"^Task (\S+) Result:")
 REP_LINE = re.compile(r"^\s+rep (\d+): (\S+) --")
 ANSWER_WORDS = re.compile(r"^\s+rep (\d+) shape: .*\banswer_words=(\d+)")
 INFRA_OUTCOME = "infra"
-# A case is wordier on B when its mean answer runs longer than A's by more
+# A case is wordier on B when its median answer runs longer than A's by more
 # than this share: 3 repetitions carry noise, so small differences aren't
 # flagged, nor a difference under MIN_EXTRA_WORDS.
 LENGTH_MARGIN = 0.25
@@ -309,9 +309,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if any(kind == REGRESSION for _, kind, _, _ in rows):
         return 1
     if args.length_gate:
-        if not a_words or not b_words:
+        if not any(c in a_words and c in b_words for c, *_ in rows):
             print(
-                f"ERROR: --length-gate needs both runs' {GRADING_LOG} with answer shapes; one has none",
+                f"ERROR: --length-gate needs answer shapes for at least one case on both runs ({GRADING_LOG}); none overlap",
                 file=sys.stderr,
             )
             return 2
