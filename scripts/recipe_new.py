@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     for path in written:
         print(f"wrote {path.relative_to(REPO)}")
-    print(f"Fill in every {MARKER} line, give the recipe an eval case that carries "
+    print(f"Fill in every {MARKER} line, give the recipe an eval case whose post_merge_outcome check carries "
           f"`recipe: {args.kind}`, then run `make recipe-check`.")
     return 0
 

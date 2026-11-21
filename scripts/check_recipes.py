@@ -4,9 +4,9 @@
 For every agents/platform/scripts/fix_recipes/<kind>/:
 
 - the registry loads it (fields, values, directory named after its kind);
-- its `eval_case` names a bench/tasks/<case>/task.yaml that carries
-  `recipe: <kind>` (validate_bench_cases.py checks the reverse: a case naming a
-  recipe is that recipe's case);
+- its `eval_case` names a bench/tasks/<case>/task.yaml whose
+  `post_merge_outcome` check carries `recipe: <kind>` (the one place a case
+  names its recipe; bench/tests/test_recipe_eval_cases.py holds the reverse);
 - no file in it still carries the scaffold's RECIPE-TEMPLATE marker, and a
   `fix.py` or `checks.py` defines what the scaffold says it must.
 
@@ -32,7 +32,7 @@ RECIPES = SCRIPTS / "fix_recipes"
 TASKS = REPO / "bench" / "tasks"
 MARKER = "RECIPE-TEMPLATE"
 #: What a recipe module must define, when it has one.
-REQUIRED_NAMES = {"fix.py": ("generate", "read_inputs"), "checks.py": ("read_kinds", "checks")}
+REQUIRED_NAMES = {"fix.py": ("generate", "read_inputs"), "checks.py": ("read_kinds", "checks", "unanswered")}
 RECIPE_PREFIX = "agents/platform/scripts/fix_recipes/"
 SHARED_PLUMBING = tuple(
     f"agents/platform/scripts/{name}"
@@ -58,9 +58,8 @@ SHARED_PLUMBING = tuple(
 )
 
 sys.path.insert(0, str(SCRIPTS))
-sys.path.insert(0, str(REPO / "scripts"))
-import case_owner
-from fix_recipes import registry
+import yaml  # noqa: E402
+from fix_recipes import registry  # noqa: E402
 
 
 def recipe_problems(recipes_dir: Path = RECIPES, tasks_dir: Path = TASKS) -> list[str]:
@@ -78,8 +77,11 @@ def recipe_problems(recipes_dir: Path = RECIPES, tasks_dir: Path = TASKS) -> lis
             task = tasks_dir / recipe.eval_case / "task.yaml"
             if not task.is_file():
                 problems.append(f"{where}: eval case {recipe.eval_case!r} has no bench/tasks/{recipe.eval_case}/task.yaml")
-            elif case_owner.task_field(task.read_text(encoding="utf-8"), "recipe") != recipe.kind:
-                problems.append(f"{where}: bench/tasks/{recipe.eval_case}/task.yaml does not carry `recipe: {recipe.kind}`")
+            elif recipe.kind not in case_recipes(task):
+                problems.append(
+                    f"{where}: bench/tasks/{recipe.eval_case}/task.yaml has no post_merge_outcome check "
+                    f"with `recipe: {recipe.kind}`"
+                )
         for path in sorted((recipes_dir / recipe.kind).iterdir()):
             if not path.is_file():
                 continue
@@ -92,6 +94,25 @@ def recipe_problems(recipes_dir: Path = RECIPES, tasks_dir: Path = TASKS) -> lis
                 if missing:
                     problems.append(f"{where}/{path.name}: does not define {', '.join(missing)}")
     return problems
+
+
+def case_recipes(task: Path) -> set[str]:
+    """The `recipe` of every post_merge_outcome check in a case, however deep it is nested."""
+    found: set[str] = set()
+
+    def walk(node: object) -> None:
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+        elif isinstance(node, dict):
+            if node.get("type") == "post_merge_outcome" and isinstance(node.get("recipe"), str):
+                found.add(node["recipe"])
+            for key in ("check", "checks"):
+                walk(node.get(key))
+
+    spec = yaml.safe_load(task.read_text(encoding="utf-8")) or {}
+    walk(spec.get("verification_spec") if isinstance(spec, dict) else None)
+    return found
 
 
 def _top_level_names(text: str) -> set[str]:

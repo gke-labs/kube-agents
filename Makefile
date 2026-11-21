@@ -905,6 +905,7 @@ recipe-new: ## Scaffold a fix recipe: make recipe-new KIND=<audit check id>.
 	@python3 scripts/recipe_new.py "$(KIND)"
 
 recipe-check: ## Validate every fix recipe: it loads, its eval case names it back, no scaffold line is left.
+	@python3 -c "import yaml" 2>/dev/null || { echo "recipe-check needs PyYAML: python3 -m pip install pyyaml"; exit 1; }
 	@python3 scripts/check_recipes.py $(if $(RECIPE_CHECK_BASE),--base "$(RECIPE_CHECK_BASE)")
 
 # The integration tier: real components wired together with the agent replaced

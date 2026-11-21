@@ -36,9 +36,13 @@ class Tree:
         return self.recipes / kind
 
     def case(self, name: str, recipe: str | None) -> None:
+        """A case whose post_merge_outcome check, nested as no-pdb's is, names `recipe`."""
         (self.tasks / name).mkdir()
-        line = f"recipe: {recipe}\n" if recipe else ""
-        (self.tasks / name / "task.yaml").write_text(f"id: {name}\ndomain: reliability\n{line}")
+        line = f"\n          recipe: {recipe}" if recipe else ""
+        (self.tasks / name / "task.yaml").write_text(
+            f"id: {name}\nverification_spec:\n  - name: verified\n    check:\n      checks:\n"
+            f"        - type: post_merge_outcome\n          outcome: verified_fixed{line}\n"
+        )
 
     def problems(self) -> list[str]:
         return check_recipes.recipe_problems(self.recipes, self.tasks)
@@ -65,13 +69,14 @@ class RecipeCheckTest(unittest.TestCase):
         problems = "\n".join(self.tree.problems())
         self.assertIn("no-pdb: no `eval_case`", problems)
         self.assertIn("blocking-pdb: eval case 'missing-case' has no", problems)
-        self.assertIn("case-b/task.yaml does not carry `recipe: hpa-floors-at-one`", problems)
+        self.assertIn("case-b/task.yaml has no post_merge_outcome check with `recipe: hpa-floors-at-one`", problems)
 
     def test_scaffold_lines_and_missing_names_fail(self):
         self.tree.case("case-a", "no-pdb")
         self.tree.recipe("no-pdb", extra={
             "fix.py": "def generate(candidate, finding_id):\n    pass\n",
-            "checks.py": "read_kinds = 'pods'\n# RECIPE-TEMPLATE\ndef checks(change, live):\n    return []\n",
+            "checks.py": "read_kinds = 'pods'\n# RECIPE-TEMPLATE\ndef checks(change, live):\n    return []\n"
+                         "def unanswered(detail):\n    return []\n",
         })
         problems = "\n".join(self.tree.problems())
         self.assertIn("fix.py: does not define read_inputs", problems)
@@ -87,9 +92,10 @@ class RecipeCheckTest(unittest.TestCase):
         self.assertEqual(check_recipes.recipe_problems(), [])
 
     def test_the_required_names_are_what_the_broker_and_the_registry_load(self):
-        # registry.checks_module refuses a checks.py without these, and the
-        # broker calls fix.read_inputs then fix.generate.
-        self.assertEqual(check_recipes.REQUIRED_NAMES["checks.py"], ("read_kinds", "checks"))
+        # registry.checks_module refuses a checks.py without the first two,
+        # and the broker calls fix.read_inputs then fix.generate.
+        # fix_preflight also calls checks.unanswered.
+        self.assertEqual(check_recipes.REQUIRED_NAMES["checks.py"], ("read_kinds", "checks", "unanswered"))
         self.assertEqual(set(check_recipes.REQUIRED_NAMES["fix.py"]), {"generate", "read_inputs"})
 
 
@@ -136,30 +142,39 @@ class ScaffoldTest(unittest.TestCase):
                 recipe_new.scaffold("blocking-pdb", tree.recipes)
 
 
-class BenchRecipeKeyTest(unittest.TestCase):
-    """validate_bench_cases.py's side: a case's `recipe:` names a recipe whose eval_case is that case."""
+class ScaffoldThroughTheLoadersTest(unittest.TestCase):
+    """A freshly scaffolded recipe loads through the code that runs it, so the templates cannot drift from it."""
 
-    def problems_for(self, name: str, recipe_line: str) -> list[str]:
-        import validate_bench_cases as vbc
+    def test_the_registry_the_broker_and_the_preflight_load_the_scaffold(self):
+        from unittest import mock
 
-        source = (vbc.TASKS_DIR / "post-merge-verified-fixed" / "task.yaml").read_text(encoding="utf-8")
-        text = source.replace("recipe: no-pdb\n", recipe_line)
+        sys.path.insert(0, str(check_recipes.REPO / "agents/platform/skills/fleet-audit/scripts"))
+        import fix_preflight
+        from fix_recipes import registry
+
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / name / "task.yaml"
-            path.parent.mkdir()
-            path.write_text(text.replace("id: post-merge-verified-fixed", f"id: {name}"), encoding="utf-8")
-            return [p for p in vbc.validate_case(name, path, registered=None) if "recipe" in p]
-
-    def test_the_shipped_case_and_recipe_agree(self):
-        self.assertEqual(self.problems_for("post-merge-verified-fixed", "recipe: no-pdb\n"), [])
-
-    def test_an_unknown_recipe_or_one_that_does_not_name_the_case_is_refused(self):
-        self.assertIn("is not a fix recipe", " ".join(self.problems_for("post-merge-verified-fixed", "recipe: no-such\n")))
-        self.assertIn("whose eval_case is", " ".join(self.problems_for("another-case", "recipe: no-pdb\n")))
-
-    def test_a_recipe_line_yaml_and_the_line_scan_read_differently_is_refused(self):
-        problems = self.problems_for("post-merge-verified-fixed", 'recipe: &r no-pdb\n')
-        self.assertIn("reads as", " ".join(problems))
+            root = Path(tmp)
+            recipe_new.scaffold("zz-scaffold-probe", root)
+            loaded = registry.load(root)
+            registry.checks_module.cache_clear()
+            try:
+                with mock.patch.object(registry, "HERE", root), mock.patch.object(registry, "recipes", lambda: loaded):
+                    # The broker's generator: what automerge_eligibility calls.
+                    fix = registry.generator("zz-scaffold-probe", root)
+                    self.assertTrue(callable(fix.generate) and callable(fix.read_inputs))
+                    with self.assertRaises(NotImplementedError):
+                        fix.generate({}, "finding")
+                    # The safety checks: the registry's own loader refuses a module missing a name.
+                    checks = registry.checks_module("zz-scaffold-probe")
+                    self.assertTrue(callable(checks.checks))
+                    # The pre-flight runs the template's `unanswered` and reads its result shape.
+                    answer = fix_preflight.check_fix({"check": "zz-scaffold-probe", "id": "f"}, None, in_manifest=True)
+                    self.assertFalse(answer["eligible"])
+                    for result in answer["checks"]:
+                        self.assertEqual(set(result), {"name", "passed", "detail", "status"})
+                        self.assertEqual(result["status"], "unknown")
+            finally:
+                registry.checks_module.cache_clear()
 
 
 if __name__ == "__main__":
