@@ -1501,6 +1501,10 @@ spec:
               value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
+              value: kubeagents-credential-proxy-a2a-reports
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1945,6 +1949,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -2024,6 +2030,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2220,6 +2229,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
             - name: NATS_URL
@@ -2300,6 +2311,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2599,6 +2613,11 @@ spec:
                   audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
         - name: a2a-bus-token
           projected:
             sources:
@@ -3044,7 +3063,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "85ca76c94916249c",
+      "version": "e659f58d74177b7a",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3170,6 +3189,7 @@ data:
               "chat.notify.reply.agent.>",
               "$KV.cap.root.*",
               "chat.board",
+              "a2a.trigger.reply.>",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.CONSUMER.CREATE.TASKS.>",
               "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3208,6 +3228,8 @@ data:
               "chat.notify.slack",
               "chat.notify.console",
               "chat.board.reply.gateway.>",
+              "a2a.trigger.*.submit",
+              "a2a.trigger.*.status",
               "_INBOX.gateway.>"
             ],
             "denyPublish": [
@@ -3261,7 +3283,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 85ca76c94916249c
+    kubeagents.x-k8s.io/a2a-authmap-version: e659f58d74177b7a
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3463,7 +3485,7 @@ spec:
             - name: A2A_RESERVED_PRINCIPALS
               value: callout,gateway,bridge,seed,web,console,console-mcp,sys
             - name: A2A_RESERVED_ADDRESSEES
-              value: platform
+              value: platform,session
             - name: A2A_TASK_SIGNING_PUBLIC_KEYS
               value: <GENERATED_FOR_TESTS>
             - name: A2A_ISSUER_SEED
@@ -3878,6 +3900,7 @@ stringData:
                   "chat.notify.reply.agent.>",
                   "$KV.cap.root.*",
                   "chat.board",
+                  "a2a.trigger.reply.>",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
                   "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
@@ -3932,6 +3955,8 @@ stringData:
                   "chat.notify.slack",
                   "chat.notify.console",
                   "chat.board.reply.gateway.>",
+                  "a2a.trigger.*.submit",
+                  "a2a.trigger.*.status",
                   "_INBOX.gateway.>"
                 ]
                 deny = [
@@ -5691,6 +5716,7 @@ metadata:
 ---
 apiVersion: v1
 data:
+  gchat_home: ""
   slack_home: ""
 kind: ConfigMap
 metadata:
@@ -5740,7 +5766,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-647cdd83
+  name: platformagent-a2a-provision-a8600b61
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6231,8 +6257,13 @@ spec:
               the bridge sidecar with fewer workers where\n  # it declared more than the
               default, or recreates the stream, and\n  # provisioning does none of those.
               Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              which is\n  # usually not 2, so an unexpected failure stays on the retry
+              budget. The\n  # bus reshape treats a Job failed on this exit as provisioned
+              for a\n  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth),
+              and\n  # checks the bus holds every stream besides, since a shell error
+              can exit\n  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate
+              keeps this the\n  # script's only explicit exit 2.\n  exit 2\nfi\n\necho
+              \"a2a provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp
@@ -6410,6 +6441,8 @@ spec:
               value: "9096"
             - name: A2A_SPAWN_SESSIONS
               value: "true"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
             - name: A2A_WORKER_IMAGE
               value: ghcr.io/gke-labs/kube-agents/a2a-worker:latest
             - name: A2A_STRICT_EVENTS_WRITER
@@ -6449,6 +6482,14 @@ spec:
               value: default
             - name: A2A_GCHAT_TOKEN_PATH
               value: /var/run/secrets/a2a-chat-relay/token
+            - name: A2A_GCHAT_HOME_POLICY
+              value: auto
+            - name: A2A_HOME_CHANNEL_RECORD
+              value: platformagent-home-channel
+            - name: A2A_SELF_IMAGE
+              value: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
+            - name: A2A_HOME_CHANNEL_LEARN
+              value: "true"
             - name: A2A_RESOLVED_SCOPE_CONFIGMAP
               value: platformagent-resolved-scope
             - name: A2A_GATEWAY_LEASE
@@ -6458,6 +6499,10 @@ spec:
                 fieldRef:
                   apiVersion: v1
                   fieldPath: metadata.name
+            - name: A2A_REPORT_STORE_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: A2A_REPORT_STORE_TOKEN_FILE
+              value: /var/run/secrets/a2a-reports/token
             - name: A2A_TIERS_FILE
               value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
@@ -6495,6 +6540,12 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
+              readOnly: true
+            - mountPath: /etc/a2a/chat-home
+              name: chat-home
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-reports
+              name: a2a-reports-token
               readOnly: true
             - mountPath: /etc/a2a-tiers
               name: a2a-tiers
@@ -6541,6 +6592,19 @@ spec:
             sources:
               - serviceAccountToken:
                   audience: kubeagents-credential-proxy-a2a-chat
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
+        - name: a2a-reports-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-a2a-reports
                   expirationSeconds: 3600
                   path: token
         - configMap:

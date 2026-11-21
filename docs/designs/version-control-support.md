@@ -681,8 +681,15 @@ only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
 `vcs:proposal-create` permit. Each write is held to the install's own work: a
 `platform-agent/` branch named bare, no branch carrying somebody else's open
 proposal, a proposal opened by the install's login from its own branch in this
-repository, and no label edit. [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
-owns that caller.
+repository, and no label edit. Its `issue-list` search fields may start no search
+qualifier of their own (plain words in `query`, no quote or backslash in a label name), and
+its `identity` with no repository answers the managed list's names (`{managedRepositories:
+[host/path, …]}`, the entries the managed check compares against, without their provider
+prefix), so a task that names no repository can find the one it may use.
+Within that, each write reaches only what the same task
+made (#6400): a branch it published while the name was free on the remote, and a
+proposal it opened. A later task can't continue an earlier task's branch or proposal
+(#6423). [`spec-subagent-profiles.md`](spec-subagent-profiles.md) owns that caller.
 
 ### No shallow clones
 
@@ -991,7 +998,7 @@ a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
 than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
 requires. `issue-list`'s `query?` is free text each forge composes into
-its own search grammar, and its `excludeLabels?` is what a sweep that must skip
+its own search grammar (plain words only for the profile role, above), and its `excludeLabels?` is what a sweep that must skip
 its own claim marker asks with. `proposal-list` filters on the branches instead
 — `source?` and `target?` — because "is there already a proposal for this
 branch" is the question every write flow opens with. A comment carries `id` and
@@ -1030,7 +1037,10 @@ under the same name does not build on it and its publish is refused as
 `BRANCH_DIVERGED`. Every flow that derives a branch name from what it is fixing
 (one name per workload, so a repeat alert finds the earlier pull request) meets
 this on its second run. `branch-view` answers whether the remote holds the
-branch and at what revision; `branch-delete` removes a spent one. Both are broker
+branch and at what revision; `branch-delete` removes a spent one. A profile task has
+neither the delete nor a way to publish to a branch another task left on the remote (#6400), so a
+profile flow that derives its branch name meets the refusal, `PROPOSAL_NOT_THIS_TASKS`,
+not the reuse (#6423). Both are broker
 verbs — the question is `ls-remote` and the delete is a push, identical on every
 forge — but the delete's gate needs `proposal-list`, so a forge without it does
 not list `branch-delete` in `capabilities` and is refused `FORGE_UNSUPPORTED`. The skill spells them `remote-branch view|delete`,
@@ -3432,8 +3442,8 @@ The profile worker is the third, and it runs model output. What bounds it is the
 task credential the dispatcher signed for its pod: no credential, no verb. The
 reads need nothing more. A write needs the `vcs:proposal-create` permit, which
 the dispatcher mints only for a request that asked for a change through a
-structured confirm, and even then it reaches only the install's own branches and
-proposals, never their labels, on a repository the install manages.
+structured confirm, and even then it reaches only the branches and proposals its
+own task made (#6400), never their labels, on a repository the install manages.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it

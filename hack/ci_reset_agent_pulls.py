@@ -102,8 +102,8 @@ describe = sweep.boskos_pool.describe
 # request's fault and is not retried.
 RETRY_DELAYS_SECONDS = (2, 8)
 RETRYABLE_STATUS_FLOOR = 500
-# The evals repositories share one App installation, so one hourly REST budget
-# (#6105): when it runs out, every call answers a marked 403 until the reset
+# The evals repositories of one shard share an App installation, so one hourly
+# REST budget (#6105; hack/eval/ledger-reader-apps.txt): when it runs out, every call answers a marked 403 until the reset
 # GitHub names in X-RateLimit-Reset, minutes away. A limited call waits the
 # Retry-After it asks, else for that reset when the budget is spent, else a
 # minute, never more than
@@ -219,7 +219,7 @@ def call(method: str, path: str, token: str, body: dict | None = None):
                 if delay <= 0:
                     raise RateLimitExhausted(
                         f"GitHub's rate limit on {method} {path} outlasted {RATE_LIMIT_BUDGET_SECONDS}s of "
-                        f"waiting ({describe(exc)}); the evals repositories share one App installation's "
+                        f"waiting ({describe(exc)}); the evals repositories of a shard share one App installation's "
                         "hourly budget (#6105)"
                     ) from exc
                 _rate_limit_waited += delay

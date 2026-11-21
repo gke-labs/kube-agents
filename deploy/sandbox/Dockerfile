@@ -761,6 +761,10 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
      /opt/defaults/scripts/
+# automation_rules.py reads the kinds of fix from the fix-recipe registry, a
+# package with one directory per kind, so it is its own COPY: a directory in the
+# list above would land flattened into /opt/defaults/scripts.
+COPY agents/platform/scripts/fix_recipes/ /opt/defaults/scripts/fix_recipes/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/eod_report_generator.py

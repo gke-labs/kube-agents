@@ -143,25 +143,6 @@ def _board(root: Path, *, children_table: bool = True) -> None:
             conn.execute("INSERT INTO task_links VALUES (?, ?)", (FRONT, CHILD))
 
 
-@pytest.fixture(autouse=True)
-def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Keep ``_settle`` off whatever cluster kubectl is pointed at.
-
-    Same guard as the harness suite's: settling reads the pod and then
-    deletes the card's state through ``kubectl exec``, and left live the two
-    ``_settle`` tests below would aim those at the developer's current
-    context. Returns the scripts that would have run.
-    """
-    scripts: list[str] = []
-
-    def _record(script: str, timeout: float) -> str:
-        scripts.append(script)
-        return ""
-
-    monkeypatch.setattr(harness, "_agent_shell", _record)
-    return scripts
-
-
 @pytest.fixture
 def data_root(tmp_path: Path) -> Path:
     """An agent data volume: the board plus one session store per profile."""

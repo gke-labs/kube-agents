@@ -156,7 +156,8 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # every gcloud read as this account, so the presence probe and the state pass
 # list instances, firewall rules, networks and snapshots as it (#2483, #2682),
 # and the state pass reads the startup-fail VM's serial port output and lists
-# the snapshots' source disks as it.
+# the snapshots' source disks as it. It also lists the project's reservations
+# as it, for the missing-reservation-pool role (compute.reservations.list).
 # roles/compute.viewer is get and list on Compute Engine resources, with no
 # create, update or delete. It does show instance metadata and serial port
 # output (compute.instances.getSerialPortOutput), so no secret goes in this
@@ -585,6 +586,57 @@ resource "google_container_node_pool" "declared_zonal_pool" {
   }
 }
 
+# Posture (capacity, reservations): a pool that consumes one named
+# reservation, and that reservation exists in no zone of the project. GKE
+# accepts such a pool at zero nodes and reports it RUNNING; the first node it
+# tries to add is refused, because the reservation is not found. So the pool
+# can never grow, and nothing says so until a workload needs it. The stack
+# plants no reservation: the missing one is the defect, and a reservation
+# with the name below would heal it. Zero nodes cost nothing. No autoscaling,
+# so the stockout SOP's 3.9 (an autoscaling pool in one zone) does not name
+# it; the taint keeps every pod off it. n2-standard-2 is the shape the pool
+# was accepted with; a 20 GB disk as the fleet's other pools, so the drift
+# audit's pool cohort gets no new outlier. Catalogue role:
+# missing-reservation-pool.
+resource "google_container_node_pool" "missing_reservation_pool" {
+  name       = "missing-reservation-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  node_config {
+    machine_type    = "n2-standard-2"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048, as on the pools above.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "missing-reservation"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "missing-reservation"
+      effect = "NO_SCHEDULE"
+    }
+
+    reservation_affinity {
+      consume_reservation_type = "SPECIFIC_RESERVATION"
+      key                      = "compute.googleapis.com/reservation-name"
+      values                   = ["seeded-absent-reservation"]
+    }
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's
@@ -931,9 +983,9 @@ resource "google_compute_disk" "orphan_pd" {
 # `sourceDisk` names no live disk, that no snapshot schedule took, and that is
 # more than 90 full days old. Its own exclusion names a legal hold or a
 # compliance retention the collector cannot read, which is why the check is
-# proposed as the stream's one declarable posture: once it is, the pool
-# project's GitOps knowledge/ note declares `declared-orphan-snap-<prefix>`
-# on purpose and the audit lists it under Declared intent, while
+# the stream's one declarable posture: the pool project's GitOps knowledge/
+# note declares `declared-orphan-snap-<prefix>` on purpose and the audit
+# lists it under Declared intent, while
 # `orphan-snap-<prefix>`, undeclared, stays a finding beside it (the control
 # that shows a declaration moved one snapshot and not the check). Catalogue
 # roles: declared-orphan-snapshot and orphan-snapshot.
@@ -1106,8 +1158,10 @@ resource "google_compute_firewall" "world_open_deny_remote" {
 # `NetworkPeering/default--mtu-peer-declared`. Both one-way halves are
 # needed: a peering with one half is INACTIVE, which the check skips. No
 # `labels`: a VPC network and a peering take none, so neither carries
-# fleet_labels. Until the stream's declared-intent slice lands, the finding
-# publishes and no case grades it. Catalogue role: declared-mtu-peering.
+# fleet_labels. The pool project's GitOps repository declares the pair on
+# purpose in knowledge/notification-relay-no-pdb.md, so the networking audit
+# lists it under Declared intent, not as a finding. Catalogue role:
+# declared-mtu-peering.
 resource "google_compute_network" "mtu_peer_declared" {
   name                    = "mtu-peer-declared"
   auto_create_subnetworks = false
@@ -1179,9 +1233,10 @@ resource "google_compute_instance" "startup_fail" {
 #
 # Zonal control plane with `node_locations` across two zones, not a regional
 # cluster: the fleet is standing, and a regional control plane would triple
-# the node floor for a property nothing here needs. Two e2-small nodes, one
-# per zone, is the minimum shape on which "the pods are all in one zone" is a
-# true statement about a real cluster.
+# the node floor for a property nothing here needs. Two nodes, one per zone
+# (an e2-small and an e2-standard-2; see the pool comment below), is the
+# minimum shape on which "the pods are all in one zone" is a true statement
+# about a real cluster.
 # ---------------------------------------------------------------------------
 
 resource "google_container_cluster" "seeded_d" {
@@ -1237,6 +1292,26 @@ resource "google_container_cluster" "seeded_d" {
     channel = "REGULAR"
   }
 
+  # The Filestore CSI driver is off. GKE turns it on by default on new
+  # clusters from 1.36.3 (the ten pool projects created 2026-11-16 have it;
+  # the 2026-10-05 clusters on 1.35 do not), and its node agent and
+  # lock-release controller request about 200Mi on the first zone's e2-small,
+  # where the system set already leaves under 100Mi for the four 16Mi
+  # zone-pinned fixtures (the sponge's one placed replica is 8Mi more; its
+  # other five sit Pending by design). With the driver on, whether the
+  # fixtures schedule depends on which node the second konnectivity-agent
+  # lands on, and on six of the ten new projects they sat Pending. Nothing in
+  # the fleet mounts Filestore. An in-place add-on update, not a replace, so
+  # no reconcile-allow entry; a cluster whose API answer omits the key (the
+  # 1.35 ones) plans one such update that writes the same answer back, then
+  # converges. The add-on is not a drift facet. The pool comment below sizes
+  # this node on CPU; this block is what keeps memory off that table.
+  addons_config {
+    gcp_filestore_csi_driver_config {
+      enabled = false
+    }
+  }
+
   maintenance_policy {
     daily_maintenance_window {
       start_time = "03:00"
@@ -1265,7 +1340,9 @@ resource "google_container_cluster" "seeded_d" {
 # system Deployments land on is a scheduler choice that flips at cluster
 # creation and after a drain. Sizes settle it where placement cannot: the
 # first zone's node is an e2-small (940m allocatable) that the zone-pinned
-# fixtures and the sponge keep full, the second zone's an e2-standard-2
+# fixtures and the sponge keep full (on CPU; the cluster's addons_config
+# above keeps the Filestore driver's 200Mi off its memory), the second
+# zone's an e2-standard-2
 # (1930m) that keeps at least 800m free under any system set and can never
 # fit four 500m workers. Not an e2-medium: every shared-core E2 size reports
 # the same 940m allocatable to Kubernetes, which the first apply showed, so

@@ -100,6 +100,7 @@ var reasonSentences = map[string]string{
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
 	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
+	"tier-ended":                         "an administrator stopped this agent running this kind of request, which ended this one; ask again if you still need it",
 	// A confirmed change runs only in a one-pod Job of its own (#4458); the
 	// detail names the profile and tier, which are for an operator.
 	"change-needs-job": "this change has to run in a job of its own, which this agent can't start for this kind of request, so nothing was changed",
@@ -110,6 +111,11 @@ var reasonSentences = map[string]string{
 	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
 	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A script-run task's worker (#5622): refused before the script ran,
+	// the script failed, or it ran past its bound.
+	"script-refused": "the worker refused to run this scheduled script, and its log says why",
+	"script-failed":  "the scheduled script ended with an error",
+	"script-timeout": "the scheduled script ran past its time limit and was stopped",
 	// A script-run task naming a script its profile doesn't list (#5622).
 	"script-not-allowed": "this agent isn't set up to run the script this schedule asked for, so it didn't run; whoever manages this agent can allow the script, or change the schedule",
 	// The agent ran and produced no answer.
@@ -453,6 +459,8 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
 	defer l.Unlock()
+	// A wake that took a cap slot ends it here, as a turn does (#6033).
+	defer g.releaseCapHold(sessionKey)
 
 	// A stopping gateway renders nothing new: its run context is done, so
 	// every read would fail, and the batch's deliveries are left for the
@@ -761,11 +769,23 @@ func terminalNotice(state lib.TaskState, reason string) string {
 	case lib.StateFailed:
 		return noticeWithReason(noticeFailed, noticeFailedBare, text, shaped)
 	case lib.StateCanceled:
+		// A cancel is bare: the requester asked for it. One an
+		// administrator caused says so (canceledReasonShown).
+		if canceledReasonShown[reasonToken(reason)] {
+			return noticeWithReason(noticeCanceled, noticeCanceled, text, shaped)
+		}
 		return noticeCanceled
 	case lib.StateRejected:
 		return noticeWithReason(noticeRejected, noticeRejected, text, shaped)
 	}
 	return string(state)
+}
+
+// canceledReasonShown lists the tokens a canceled terminal names in its
+// notice: cancels the requester didn't ask for. Every other cancel reads as
+// the bare noticeCanceled.
+var canceledReasonShown = map[string]bool{
+	"tier-ended": true, // dispatch.ReasonTierEnded (#5850)
 }
 
 // noticeWithReason joins a notice's prefix to the reason's text: bare when
@@ -1016,7 +1036,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
+			// On a backend that shows task status itself, the only line is a
+			// delegated profile child's (childKeepsLine): done, it closes to
+			// the bare mark, as a line that took its answer does, rather than
+			// leaving a "completed" header above the answer for good.
+			onLine := doneLine != "" || g.showsTaskStatus(rec.Key)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		if !active.Detached && rec.fanOutPending(taskID) {

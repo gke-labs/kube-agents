@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """hack/ci_pause_scheduled_audits.py, run as scheduled_audits runs it: `python3 - <home> [--resume] < script`.
+All runs but one get the script with a short gap between two read-backs (script_text).
 
 Pinned: which jobs it pauses and which it leaves (plumbing, the oobe stage's audits, a job
 already off), that it believes the store over Hermes' exit code, its exit codes, that --resume
@@ -42,6 +43,27 @@ SCRIPT = REPO / "hack" / "ci_pause_scheduled_audits.py"
 RUNNER = REPO / "hack" / "ci-eval-pr.sh"
 STAGE = REPO / "agents" / "chat" / "scripts" / "oobe.py"
 ROSTER_SOURCE = REPO / "agents" / "platform" / "cron" / "jobs.json"
+# The line of the script that sets the gap between two read-backs of the store, and
+# the line most runs here get in its place. Each run that pauses a job sleeps one
+# gap or more. A run reads the script from stdin, so it can get the text with this
+# one line changed and nothing else.
+ROUND_SLEEP_LINE_RE = re.compile(r"^PAUSE_ROUND_SLEEP_SECONDS = .+$", re.M)
+SHORT_ROUND_SLEEP_LINE = "PAUSE_ROUND_SLEEP_SECONDS = 0.01"
+
+
+def script_text(real_round_sleep=False):
+    """The script as a run gets it on stdin: its own text, or that text with the
+    gap between two read-backs made short."""
+    text = SCRIPT.read_text()
+    if real_round_sleep:
+        return text
+    text, lines = ROUND_SLEEP_LINE_RE.subn(SHORT_ROUND_SLEEP_LINE, text)
+    assert lines == 1, (
+        f"{SCRIPT} has {lines} lines that set PAUSE_ROUND_SLEEP_SECONDS; script_text() makes the gap short "
+        "in exactly one. If the script names the gap in another way, change ROUND_SLEEP_LINE_RE to match."
+    )
+    return text
+
 
 # A stand-in for `hermes -p platform cron pause <id>` that writes what Hermes' pause_job writes.
 # FAKE_HERMES_MODE=noop exits 0 and writes nothing; =fail exits 1.
@@ -120,7 +142,7 @@ class PauseTest(unittest.TestCase):
         self.roster.write_text(json.dumps({"jobs": jobs}))
         self.shipped.write_text(json.dumps({"jobs": jobs if shipped is None else shipped}))
 
-    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False):
+    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False, real_round_sleep=False):
         env = {
             **os.environ,
             "HERMES_BIN": str(self.hermes),
@@ -131,7 +153,7 @@ class PauseTest(unittest.TestCase):
         }
         result = subprocess.run(
             [sys.executable, "-", str(self.home), *(["--resume"] if resume else []), *(["--chain"] if chain else [])],
-            input=SCRIPT.read_text(),
+            input=script_text(real_round_sleep),
             capture_output=True, text=True, env=env, timeout=60,
         )
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
@@ -304,7 +326,8 @@ class PauseTest(unittest.TestCase):
 
         writer = threading.Thread(target=late_writer)
         writer.start()
-        result, _ = self.run_script()
+        # The script's own text: its gap must outlast the second the writer waits.
+        result, _ = self.run_script(real_round_sleep=True)
         writer.join()
         # Read after the writer is done: the store the run left is what the cases get.
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
@@ -785,14 +808,33 @@ class ChainWatchTest(unittest.TestCase):
 
     def test_a_second_stop_still_waits_for_a_pass_the_first_outwaited(self):
         # The fan-out's stop times out; the EXIT trap's stop, with no pid file left, waits on.
-        calls = self.run_watch(1, 'echo started >> "$LOG"; sleep 5; echo landed >> "$LOG"', [
-            "sleep 2",
-            "stop_chain_audits_watch 2>/dev/null",
+        # The pass ends on a gate file, not on a clock. The first stop cannot see the pass
+        # land, because the gate is shut. The gate opens 1s into the second stop, whose
+        # bound is 5s. A fixed 5s pass against sleep 2 and two 2s bounds had both sides
+        # land on the same sixth second (#6435).
+        gate = '"${STATE_DIR}/gate"'
+        # 100 polls of 0.2s: a pass whose gate never comes ends by itself after 20s, so a
+        # run that is cut leaves no watch that polls for ever.
+        pass_stub = (
+            f'echo started >> "$LOG"; n=0; until [ -e {gate} ] || [ "$n" -ge 100 ]; do sleep 0.2; n=$((n + 1)); done;'
+            ' echo landed >> "$LOG"'
+        )
+        calls = self.run_watch(1, pass_stub, [
+            # A step that fails opens the gate on the way out, so the pass ends at once
+            # and the failure is the step's, not a timeout.
+            "trap ': > \"{tmp}/gate\"' EXIT",
+            # The pass is under way before the first stop.
+            'n=0; until grep -qx started "$LOG" 2>/dev/null || [ "$n" -ge 100 ]; do sleep 0.2; n=$((n + 1)); done',
+            'grep -qx started "$LOG"',
+            'stop_chain_audits_watch 2> "{tmp}/first-stop.err"',
+            # The first stop gave up at its bound, and the pass had not landed.
+            'grep -q "still running after 5s" "{tmp}/first-stop.err"',
             'tail -1 "$LOG" | grep -qx started',
             '[ ! -e "{tmp}/watch.pid" ]',
+            '( sleep 1; : > "{tmp}/gate" ) &',
             "stop_chain_audits_watch",
             'tail -1 "$LOG" | grep -qx landed || { echo "the second stop did not wait" >&2; exit 9; }',
-        ], stop_wait=2)
+        ], stop_wait=5)
         self.assertEqual(calls, ["started", "landed"])
 
     def test_a_stop_waits_for_a_pass_under_way(self):

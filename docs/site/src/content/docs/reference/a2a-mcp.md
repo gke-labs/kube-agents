@@ -21,7 +21,7 @@ Its pod adds one to the namespace's session pod quota, and the chart's quota che
 
 ## Connecting a client
 
-To connect Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents from Antigravity](/kube-agents/install/antigravity-mcp/). A client that talks to the server directly connects as below.
+To connect Claude Code, Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents over MCP](/kube-agents/install/mcp/). A client that talks to the server directly connects as below.
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
@@ -41,11 +41,15 @@ The match fails closed. The bridge renames a deployment to `<kube-context>/<name
 
 The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
 
-When a turn call carries `_meta.conversation_id` or `stream_steps: true`, `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact. The workstation bridge sets `stream_steps: true` only when its host passes `_meta.conversation_id` (or a vendor-prefixed `*/conversation_id`); a host that sends only `_meta.progressToken` keeps the single-answer form. With streaming on, each step's `title` and `markdown` reach the host. While the task is still running, `result` starts with ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running``, prompting the host to call `task_control` (`get`) for the next step.
+When a turn call carries `_meta.conversation_id` or `stream_steps: true`, `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact. The workstation bridge sets `stream_steps: true` only when its host passes `_meta.conversation_id` (or a vendor-prefixed `*/conversation_id`); a host that sends only `_meta.progressToken` keeps the single-answer form.
+
+The bridge's `KUBE_AGENTS_MCP_STREAM_STEPS` setting (or `--stream-steps`) overrides this. `off` sends `stream_steps: false` and returns plain results even when the host passes a conversation id. `on` sends `stream_steps: true` for every host. A `stream_steps` the call names itself always wins, though under `off` its step windows come back as plain text, without the envelope. With streaming on, each step's `title` and `markdown` reach the host. While the task is still running, `result` starts with ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running``, prompting the host to call `task_control` (`get`) for the next step.
 
 A streamed `get` can re-read a finished turn that delegated, outside the stream that sent it. With no live watch of its chain, it settles at once. It returns the root's own answer and a note that the delegated tasks were not followed.
 
 The bridge offers `poll_events` too and forwards it to this server, so card reports that arrive after a `send_message` answer can be read with the `conversation_token` and `since` the answer gives.
+
+A `send_message` that answers a card's report passes `reply_to`, the task the report's heading gave as `on task`; the agent then reads that report before answering. That read happens on the [platform route](/kube-agents/concepts/chatops/#session), the install's default; a conversation on its own session pod does not read it yet. Without it, a reply under a report starts from the words alone.
 
 To rotate the token, write a new value into the Secret. The server reads the mounted file on every request, so the new token is accepted and the old one refused as soon as the kubelet updates the mount, usually within a minute. A blank value, or one holding a byte no request header could carry, is replaced: the operator mints a new token over it.
 

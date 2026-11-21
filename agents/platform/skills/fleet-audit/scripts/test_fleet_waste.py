@@ -4267,6 +4267,693 @@ class CutPodNameTest(unittest.TestCase):
         self.assertEqual(self.over(ctx, {**own, ours_gone: (22.0, 80000.0)}), [])
 
 
+class GeneratedNameFamilyTest(unittest.TestCase):
+    """Deployments a spawner names `<stem>-<uuid>` are one controller to the sizing checks.
+
+    Each such Deployment used to be its own finding, under a name that no file
+    declares and that is gone when the spawner replaces the member. The family
+    is one finding on `Deployment/<stem>`, which lasts.
+    """
+
+    NS = "lab"
+    STEM = "calibration"
+    U1 = "0b9f6c1e-3a52-4d7e-9c41-5e2a7d8f1b30"
+    U2 = "7c2d4e9a-1f03-4b6a-8e5d-9a0c3b2f4d61"
+    U3 = "e41a8b27-6d9c-4f10-b3a2-0c5d7e9f1a82"
+    HASH = "bcdfghjklm"
+    IDLE = (0.001, 4.0)
+
+    def pod_name(self, deployment, suffix="2456x"):
+        """The name that Kubernetes gives a Deployment's pod: the ReplicaSet's
+        name and a hyphen, cut to 58 characters, then five random characters.
+        A member `calibration-<uuid>` is 48 characters, so its pods have no
+        hyphen before the suffix (seen on the seeded fleet on 2026-11-18)."""
+        return f"{deployment}-{self.HASH}-"[:58] + suffix
+
+    def pod(self, deployment, *, suffix="2456x", ns=NS, cpu_req="10m", mem_req="512Mi", mem_lim="1Gi", sized=True):
+        resources = {"requests": {"cpu": cpu_req, "memory": mem_req}, "limits": {"memory": mem_lim}} if sized else {}
+        return obj(
+            "Pod", self.pod_name(deployment, suffix), ns=ns,
+            **{
+                "spec.containers": [{"name": "main", "resources": resources}],
+                "status.startTime": "2026-07-31T15:00:00Z",
+                "status.phase": "Running",
+                "metadata.labels": {"pod-template-hash": self.HASH},
+                "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": f"{deployment}-{self.HASH}"}],
+            },
+        )
+
+    def member(self, uuid, stem=STEM):
+        return f"{stem}-{uuid}"
+
+    def idle(self, pods, extra=None):
+        return {**{(p["metadata"]["namespace"], p["metadata"]["name"]): self.IDLE for p in pods}, **(extra or {})}
+
+    def over(self, pods, peaks=None, **context):
+        return fw.check_overrequest({"pods": pods, **context}, self.idle(pods) if peaks is None else peaks, now=NOW, autopilot=False)
+
+    def objects(self, hits):
+        return sorted(hit["object"] for hit in hits)
+
+    # -- how a family is recognised --------------------------------------- #
+
+    def test_a_family_is_one_finding_on_its_stem(self):
+        """Three members, two replicas each, 128Mi against a 256Mi limit. Each
+        member alone clears §3.1's bars, and each used to be its own finding."""
+        pods = [
+            self.pod(self.member(uuid), suffix=suffix, mem_req="128Mi", mem_lim="256Mi")
+            for uuid in (self.U1, self.U2, self.U3)
+            for suffix in ("2456x", "7z8w9")
+        ]
+        [hit] = self.over(pods)
+        self.assertEqual(hit["object"], "Deployment/calibration")
+        self.assertEqual(hit["namespace"], self.NS)
+        self.assertIn("stands for 3 generated-name Deployments `calibration-<uuid>`", hit["excerpt"])
+        self.assertIn("Totals span 6 replicas", hit["excerpt"])
+        self.assertIn("change the template that creates", hit["excerpt"])
+        for uuid in (self.U1, self.U2, self.U3):
+            self.assertNotIn(uuid, hit["excerpt"])
+
+    def test_one_member_is_a_family(self):
+        """A spawner that keeps one instance has a new name each run, so the
+        finding's identity would move each week."""
+        [hit] = self.over([self.pod(self.member(self.U1))])
+        self.assertEqual(hit["object"], "Deployment/calibration")
+        self.assertIn("stands for 1 generated-name Deployment `calibration-<uuid>`", hit["excerpt"])
+
+    def test_a_family_takes_no_cut_form_by_its_stem(self):
+        """A single Deployment with a long name reads its pods' cut names. A
+        family's `object` is its stem, and the cut form by that name is the
+        pod of a Deployment named as the stem, here one that is gone. The
+        family does not read it."""
+        stem = "notebook-" + "a" * 38
+        self.assertEqual(len(stem), 47)
+        live = self.pod(self.member(self.U1, stem))
+        stranger = (self.NS, f"{stem}-4b5c6d7f89-"[:58] + "7z8w9")
+        [hit] = self.over([live], self.idle([live], {stranger: (0.9, 400.0)}))
+        self.assertEqual(hit["object"], f"Deployment/{stem}")
+        self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+        self.assertNotIn("replaced", hit["excerpt"])
+
+    def test_a_name_that_is_not_a_uuid_stays_as_it_is(self):
+        names = [
+            "calibration-x7k2p",
+            "calibration-worker",
+            "calibration-0b9f6c1e3a524d7e9c415e2a7d8f1b30",
+            "calibration-0b9f6c1e-3a52-4d7e-9c41-5e2a7d8f1b3",
+            "calibration-0b9f6c1e3-a52-4d7e-9c41-5e2a7d8f1b30",
+            "calibration-0b9f6c1e-3a52-4d7e-9c41-5e2a7d8f1b3g",
+            "calibration-0b9f6c1e-3a52-4d7e-9c41-5e2a7d8f1b30-blue",
+        ]
+        hits = self.over([self.pod(name) for name in names])
+        self.assertEqual(self.objects(hits), sorted(f"Deployment/{name}" for name in names))
+        for hit in hits:
+            self.assertNotIn("generated-name", hit["excerpt"])
+
+    def test_only_a_deployment_is_a_member(self):
+        """A StatefulSet keeps its pods' names, and a bare ReplicaSet or Pod
+        has no template above it. Each stays under its own name."""
+        name = self.member(self.U1)
+        sts = self.pod(name)
+        sts["metadata"]["name"] = f"{name}-0"
+        sts["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "name": name}]
+        bare_rs = self.pod(self.member(self.U2))
+        bare_rs["metadata"]["labels"] = {}
+        bare_rs["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": self.member(self.U2)}]
+        hits = self.over([sts, bare_rs])
+        self.assertEqual(self.objects(hits), [f"ReplicaSet/{self.member(self.U2)}", f"StatefulSet/{name}"])
+        # Beside a Deployment of the same name they still stay, and they are
+        # not counted as its family's members.
+        hits = self.over([sts, bare_rs, self.pod(name)])
+        self.assertEqual(self.objects(hits), ["Deployment/calibration", f"ReplicaSet/{self.member(self.U2)}", f"StatefulSet/{name}"])
+        [family] = [hit for hit in hits if hit["object"] == "Deployment/calibration"]
+        self.assertIn("stands for 1 generated-name Deployment ", family["excerpt"])
+        # A StatefulSet with the stem's name is no Deployment and stops no roll-up.
+        stem = self.pod("calibration")
+        stem["metadata"]["labels"] = {}
+        stem["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "name": "calibration"}]
+        self.assertEqual(self.objects(self.over([stem, self.pod(name)])), ["Deployment/calibration", "StatefulSet/calibration"])
+
+    def test_an_owner_and_labels_do_not_join_different_names(self):
+        """One chart release and one operator resource hold many different
+        Deployments. Neither is evidence of one template."""
+        shared = {
+            "metadata.labels": {"app.kubernetes.io/part-of": "render", "app.kubernetes.io/managed-by": "Helm"},
+            "metadata.annotations": {"meta.helm.sh/release-name": "render"},
+            "metadata.ownerReferences": [{"kind": "RenderStack", "name": "render", "controller": True}],
+        }
+        deployments = [obj("Deployment", name, ns=self.NS, **shared) for name in ("render-api", "render-worker")]
+        hits = self.over([self.pod("render-api"), self.pod("render-worker")], deployments=deployments)
+        self.assertEqual(self.objects(hits), ["Deployment/render-api", "Deployment/render-worker"])
+
+    def test_two_families_in_one_namespace_stay_apart(self):
+        pods = [self.pod(self.member(self.U1)), self.pod(self.member(self.U2)), self.pod(self.member(self.U3, stem="render"))]
+        hits = self.over(pods)
+        self.assertEqual(self.objects(hits), ["Deployment/calibration", "Deployment/render"])
+        by_object = {hit["object"]: hit["excerpt"] for hit in hits}
+        self.assertIn("stands for 2 generated-name Deployments", by_object["Deployment/calibration"])
+        self.assertIn("stands for 1 generated-name Deployment `render-<uuid>`", by_object["Deployment/render"])
+
+    def test_one_stem_in_two_namespaces_stays_apart(self):
+        pods = [self.pod(self.member(self.U1)), self.pod(self.member(self.U3)), self.pod(self.member(self.U2), ns="other")]
+        hits = self.over(pods)
+        self.assertEqual(sorted((hit["namespace"], hit["object"]) for hit in hits), [("lab", "Deployment/calibration"), ("other", "Deployment/calibration")])
+        counts = {hit["namespace"]: hit["excerpt"] for hit in hits}
+        self.assertIn("stands for 2 generated-name Deployments", counts["lab"])
+        self.assertIn("stands for 1 generated-name Deployment ", counts["other"])
+
+    def test_a_live_deployment_with_the_stems_name_stops_the_roll_up(self):
+        """Two findings may not share one identity, and the real object keeps its name."""
+        member = self.member(self.U1)
+        hits = self.over([self.pod(member), self.pod("calibration")])
+        self.assertEqual(self.objects(hits), ["Deployment/calibration", f"Deployment/{member}"])
+        # The same when the Deployment is in the dump and owns no eligible pod.
+        hits = self.over([self.pod(member)], deployments=[obj("Deployment", "calibration", ns=self.NS)])
+        self.assertEqual(self.objects(hits), [f"Deployment/{member}"])
+        # Control: a Deployment of that name in another namespace changes nothing.
+        hits = self.over([self.pod(member)], deployments=[obj("Deployment", "calibration", ns="other")])
+        self.assertEqual(self.objects(hits), ["Deployment/calibration"])
+
+    def test_both_owner_steps_group_alike(self):
+        members = [self.member(self.U1), self.member(self.U2)]
+        key = (self.NS, "Deployment", "calibration")
+        sized = fw._eligible_pods_by_owner({"pods": [self.pod(name) for name in members]}, now=NOW)
+        self.assertEqual(list(sized), [key])
+        self.assertEqual(sized[key]["family"]["members"], members)
+        unsized = fw._unsized_pods_by_owner({"pods": [self.pod(name, sized=False) for name in members]}, now=NOW)
+        self.assertEqual(list(unsized), [key])
+        self.assertEqual(unsized[key]["family"]["members"], members)
+
+    # -- how a family is judged ------------------------------------------- #
+
+    def test_a_member_that_is_gone_still_counts(self):
+        """The spawner replaced a member this morning. Its pods are in the
+        Monitoring answer under a name that no live Deployment has."""
+        pod = self.pod(self.member(self.U1))
+        gone = (self.NS, self.pod_name(self.member(self.U3), "7z8w9"))
+        self.assertEqual(len(gone[1]), 63)
+        self.assertEqual(self.over([pod], self.idle([pod], {gone: (0.001, 400.0)})), [])
+        [hit] = self.over([pod], self.idle([pod], {gone: (0.001, 50.0)}))
+        self.assertIn("Resize to memory 100Mi", hit["excerpt"])
+        self.assertIn("1 pod it has replaced", hit["excerpt"])
+        # Control: without the gone member the target is the 64Mi floor.
+        [hit] = self.over([pod])
+        self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+
+    def test_a_gone_members_pod_is_found_under_each_form_of_its_name(self):
+        """Not cut (a short stem), cut in the hash (the planted `calibration`),
+        cut right after the UUID, and cut in the UUID (a stem of 22 characters or more)."""
+        stems = {"web": 57, "calibration": 63, "calibration-rigs-1234": 63, "calibration-of-the-lab-rig": 63}
+        for stem, length in stems.items():
+            with self.subTest(stem=stem):
+                pod = self.pod(self.member(self.U1, stem=stem))
+                gone = self.pod_name(self.member(self.U3, stem=stem), "7z8w9")
+                self.assertEqual(len(gone), length)
+                self.assertEqual(len(pod["metadata"]["name"]), length)
+                [hit] = self.over([pod], self.idle([pod], {(self.NS, gone): (0.001, 50.0)}))
+                self.assertEqual(hit["object"], f"Deployment/{stem}")
+                self.assertIn("Resize to memory 100Mi", hit["excerpt"])
+                self.assertIn("1 pod it has replaced", hit["excerpt"])
+
+    def test_a_gone_pod_of_another_name_is_not_the_familys(self):
+        pod = self.pod(self.member(self.U1))
+        hot = (0.001, 400.0)
+        others = {
+            (self.NS, self.pod_name("calibration", "7z8w9")): hot,
+            (self.NS, self.pod_name(self.member(self.U3, stem="render"), "7z8w9")): hot,
+            (self.NS, self.pod_name("calibration-x7k2p", "7z8w9")): hot,
+            ("other", self.pod_name(self.member(self.U3), "7z8w9")): hot,
+            # Deployments that are no member, with names that the cut reaches.
+            (self.NS, self.pod_name(f"{self.member(self.U3)}-blue", "7z8w9")): hot,
+            (self.NS, self.pod_name("calibration-0b9f6c1e-3a52-4d7e-9c41-worker-of-the-lab", "7z8w9")): hot,
+            (self.NS, self.pod_name("calibrations-of-the-first-lab-rig-in-the-east-wing", "7z8w9")): hot,
+            # Not a Deployment's pod: a StatefulSet's ordinal, a hook Job's
+            # name (vowels), one generated segment, and a longer tail.
+            (self.NS, f"{self.member(self.U3)}-0"): hot,
+            (self.NS, f"{self.member(self.U3)}-migrate-x7k2p"): hot,
+            (self.NS, f"{self.member(self.U3)}-7z8w9"): hot,
+            (self.NS, f"{self.member(self.U3)}-{self.HASH}-7z8w9-x"): hot,
+        }
+        [hit] = self.over([pod], self.idle([pod], others))
+        self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+        self.assertNotIn("replaced", hit["excerpt"])
+
+    def test_a_dot_in_the_stem_is_not_a_wildcard(self):
+        pod = self.pod(self.member(self.U1, stem="cal.bration"))
+        other = (self.NS, self.pod_name(self.member(self.U3, stem="calxbration"), "7z8w9"))
+        [hit] = self.over([pod], self.idle([pod], {other: (0.001, 400.0)}))
+        self.assertEqual(hit["object"], "Deployment/cal.bration")
+        self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+
+    def test_each_uuid_at_the_end_of_a_name_is_cut(self):
+        """`run-<uuid>-<uuid>`: a stem that ends in a UUID would move as a member's name does."""
+        first, second = f"run-{self.U1}-{self.U2}", f"run-{self.U1}-{self.U3}"
+        pods = [self.pod(first), self.pod(second)]
+        gone = (self.NS, self.pod_name(f"run-{self.U2}-{self.U3}", "7z8w9"))
+        [hit] = self.over(pods, self.idle(pods, {gone: (0.001, 50.0)}))
+        self.assertEqual(hit["object"], "Deployment/run")
+        self.assertIn("stands for 2 generated-name Deployments `run-<uuid>`", hit["excerpt"])
+        self.assertIn("Resize to memory 100Mi", hit["excerpt"])
+
+    def test_a_member_that_differs_stays_in_the_family(self):
+        """After the owner changes the template, old and new members live side
+        by side. The one finding stays; the hottest pod of any member sets the target."""
+        small, large = self.pod(self.member(self.U1)), self.pod(self.member(self.U2), mem_req="2Gi", mem_lim="4Gi")
+        keys = [(self.NS, p["metadata"]["name"]) for p in (small, large)]
+        [hit] = self.over([small, large], {keys[0]: (0.001, 20.0), keys[1]: (0.001, 10.0)})
+        self.assertEqual(hit["object"], "Deployment/calibration")
+        self.assertIn("different requests (memory 512Mi to 2048Mi per pod)", hit["excerpt"])
+        self.assertIn("Resize to memory 64Mi per replica", hit["excerpt"])
+        # A member that uses its request protects the others: 300Mi in the
+        # small one is 23% of the family's request for each pod.
+        self.assertEqual(self.over([small, large], {keys[0]: (0.001, 300.0), keys[1]: (0.001, 10.0)}), [])
+        # Control: members with one request get no such sentence.
+        [hit] = self.over([self.pod(self.member(self.U1)), self.pod(self.member(self.U2))])
+        self.assertNotIn("different requests", hit["excerpt"])
+
+    def test_a_live_pod_that_the_checks_skip_still_sets_the_peak(self):
+        """A member that started 20 minutes ago, or that declares no request,
+        is no replica of the sized entry. Its usage is the template's all the
+        same, and the pod is read as soon as it is gone."""
+        idle = self.pod(self.member(self.U1), mem_req="2Gi", mem_lim="4Gi")
+        young = self.pod(self.member(self.U2), mem_req="2Gi", mem_lim="4Gi")
+        young["status"]["startTime"] = "2026-07-31T23:40:00Z"
+        bare = self.pod(self.member(self.U2), sized=False)
+        for other in (young, bare):
+            with self.subTest(sized="resources" in other["spec"]["containers"][0] and bool(other["spec"]["containers"][0]["resources"])):
+                keys = [(self.NS, p["metadata"]["name"]) for p in (idle, other)]
+                self.assertEqual(self.over([idle, other], {keys[0]: (0.001, 10.0), keys[1]: (0.001, 900.0)}), [])
+                # Control: the same usage on a pod of another name does not count.
+                stranger = self.pod("render")
+                stranger["status"]["startTime"] = "2026-07-31T23:40:00Z"
+                keys = [(self.NS, p["metadata"]["name"]) for p in (idle, stranger)]
+                [hit] = self.over([idle, stranger], {keys[0]: (0.001, 10.0), keys[1]: (0.001, 900.0)})
+                self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+        # Control: a young pod of a member with the same name in another namespace.
+        elsewhere = self.pod(self.member(self.U1), ns="other", suffix="7z8w9", mem_req="2Gi", mem_lim="4Gi")
+        elsewhere["status"]["startTime"] = "2026-07-31T23:40:00Z"
+        peaks = {(self.NS, idle["metadata"]["name"]): (0.001, 10.0), ("other", elsewhere["metadata"]["name"]): (0.001, 900.0)}
+        [hit] = self.over([idle, elsewhere], peaks)
+        self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+        # §3.12 sizes its members off the hottest pod of any member too.
+        sized = self.pod(self.member(self.U1))
+        keys = [(self.NS, p["metadata"]["name"]) for p in (bare, sized)]
+        [hit] = fw.check_unsized({"pods": [bare, sized]}, {keys[0]: (0.05, 200.0), keys[1]: (0.05, 900.0)}, now=NOW, autopilot=False)
+        self.assertIn("100m / 1800Mi per replica", hit["excerpt"])
+        self.assertNotIn("replaced", hit["excerpt"])
+        # The window and the count beside that peak are the entry's, so the text says where the peak is from.
+        self.assertIn("The peak also reads 1 live pod of its members that this finding does not count as a replica.", hit["excerpt"])
+        [hit] = fw.check_unsized({"pods": [bare]}, {keys[0]: (0.05, 200.0)}, now=NOW, autopilot=False)
+        self.assertNotIn("also reads", hit["excerpt"])
+
+    def test_a_pod_in_deletion_counts_and_another_kind_with_the_name_does_not(self):
+        idle = self.pod(self.member(self.U1), mem_req="2Gi", mem_lim="4Gi")
+        leaving = self.pod(self.member(self.U2), mem_req="2Gi", mem_lim="4Gi")
+        leaving["metadata"]["deletionTimestamp"] = "2026-07-31T23:59:00Z"
+        keys = [(self.NS, p["metadata"]["name"]) for p in (idle, leaving)]
+        self.assertEqual(self.over([idle, leaving], {keys[0]: (0.001, 10.0), keys[1]: (0.001, 900.0)}), [])
+        # A StatefulSet with a member's name is no member's pod.
+        sts = self.pod(self.member(self.U1), suffix="7z8w9")
+        sts["metadata"]["name"] = f"{self.member(self.U1)}-0"
+        sts["metadata"]["labels"] = {}
+        sts["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "name": self.member(self.U1)}]
+        sts["status"]["startTime"] = "2026-07-31T23:40:00Z"
+        peaks = {keys[0]: (0.001, 10.0), (self.NS, sts["metadata"]["name"]): (0.001, 900.0)}
+        [hit] = self.over([idle, sts], peaks)
+        self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+        self.assertNotIn("also reads", hit["excerpt"])
+
+    def test_a_pod_that_the_checks_skip_is_never_the_one_witness(self):
+        """The family's own pods did not report. A young pod's ten minutes, or a
+        pod of another member, must not stand in for the week that nobody read."""
+        settled = self.pod(self.member(self.U1), cpu_req="2", mem_req="8Gi", mem_lim="16Gi")
+        young = self.pod(self.member(self.U2), cpu_req="2", mem_req="8Gi", mem_lim="16Gi")
+        young["status"]["startTime"] = "2026-07-31T23:50:00Z"
+        keys = [(self.NS, p["metadata"]["name"]) for p in (settled, young)]
+        self.assertEqual(self.over([settled, young], {keys[1]: (0.002, 30.0)}), [])
+        # One dimension of the settled pod was not read.
+        self.assertEqual(self.over([settled, young], {keys[0]: (1.6, None), keys[1]: (0.002, 30.0)}), [])
+        # §3.12: the pod with no request has no series; a sized member's pod has one.
+        bare = self.pod(self.member(self.U1), sized=False)
+        sized = self.pod(self.member(self.U2))
+        keys = [(self.NS, p["metadata"]["name"]) for p in (bare, sized)]
+        self.assertEqual(fw.check_unsized({"pods": [bare, sized]}, {keys[1]: (0.4, 900.0)}, now=NOW, autopilot=False), [])
+
+    def test_underrequest_leaves_a_young_pod_out(self):
+        """§3.11 raises a request. A pod's first minutes are no sustained level."""
+        settled = self.pod(self.member(self.U1))
+        young = self.pod(self.member(self.U2))
+        young["status"]["startTime"] = "2026-07-31T23:40:00Z"
+        keys = [(self.NS, p["metadata"]["name"]) for p in (settled, young)]
+        means = {keys[0]: 100.0, keys[1]: 3000.0}
+        peaks = {key: (0.05, value) for key, value in means.items()}
+        self.assertEqual(fw.check_underrequest({"pods": [settled, young]}, peaks, means, now=NOW), [])
+
+    def test_underrequest_files_no_family_whose_members_differ(self):
+        """The hottest pod's mean, held against the sum, made a 4Gi member that
+        uses 3Gi an overage for the family, graded `critical` on the small
+        member's limit. No member here is above its own request."""
+        large = self.pod(self.member(self.U1), mem_req="4Gi", mem_lim="4Gi")
+        small = self.pod(self.member(self.U2), mem_req="256Mi", mem_lim="256Mi")
+        keys = [(self.NS, p["metadata"]["name"]) for p in (large, small)]
+        means = {keys[0]: 3072.0, keys[1]: 200.0}
+        peaks = {key: (0.05, value) for key, value in means.items()}
+        self.assertEqual(fw.check_underrequest({"pods": [large, small]}, peaks, means, now=NOW), [])
+        # The same when only the limits differ.
+        wide = self.pod(self.member(self.U2), mem_lim="8Gi")
+        pods = [self.pod(self.member(self.U1)), wide]
+        means = {(self.NS, p["metadata"]["name"]): 973.0 for p in pods}
+        peaks = {key: (0.05, value) for key, value in means.items()}
+        self.assertEqual(fw.check_underrequest({"pods": pods}, peaks, means, now=NOW), [])
+        # Control: one Deployment with the same two pods is still judged, as on `main`.
+        rollout = [self.pod("api", mem_req="4Gi", mem_lim="4Gi"), self.pod("api", suffix="7z8w9", mem_req="256Mi", mem_lim="256Mi")]
+        means = {(self.NS, rollout[0]["metadata"]["name"]): 3072.0, (self.NS, rollout[1]["metadata"]["name"]): 200.0}
+        peaks = {key: (0.05, value) for key, value in means.items()}
+        self.assertEqual(len(fw.check_underrequest({"pods": rollout}, peaks, means, now=NOW)), 1)
+
+    def test_a_stem_with_a_name_that_lasts_makes_no_family(self):
+        """A Deployment for each tenant carries the tenant's id and is declared
+        in Git. Its finding keeps its name, and with it the file to fix. The
+        other Deployments of the stem stay single too: the family's pod pattern
+        would take the pods that the declared one has replaced."""
+        declared, held_by_argo, held_by_helm, spawned = (self.member(u, stem="tenant") for u in (self.U1, self.U2, self.U3, "11111111-2222-4333-8444-555555555555"))
+        argo = obj("Deployment", held_by_argo, ns=self.NS, **{"metadata.annotations": {"argocd.argoproj.io/tracking-id": "tenants:apps/Deployment:lab/x"}})
+        helm = obj("Deployment", held_by_helm, ns=self.NS, **{"metadata.annotations": {"meta.helm.sh/release-name": "tenants"}})
+        # A `managed-by` label alone names no release: a spawner sets one too.
+        labelled = obj("Deployment", spawned, ns=self.NS, **{"metadata.labels": {"app.kubernetes.io/managed-by": "spawner"}})
+        cases = {
+            "declared": ([declared, spawned], {"declared_deployments": {(self.NS, declared)}}),
+            "argo": ([held_by_argo, spawned], {"deployments": [argo, labelled]}),
+            "helm": ([held_by_helm, spawned], {"deployments": [helm, labelled]}),
+        }
+        for label, (names, context) in cases.items():
+            with self.subTest(label):
+                hits = self.over([self.pod(name) for name in names], **context)
+                self.assertEqual(self.objects(hits), sorted(f"Deployment/{name}" for name in names))
+                for hit in hits:
+                    self.assertNotIn("generated-name", hit["excerpt"])
+        # Controls. Another stem in the namespace is still a family; a label
+        # alone and a declaration in another namespace keep nothing out.
+        other = self.member(self.U1)
+        hits = self.over([self.pod(declared), self.pod(other)], declared_deployments={(self.NS, declared)})
+        self.assertEqual(self.objects(hits), ["Deployment/calibration", f"Deployment/{declared}"])
+        self.assertEqual(self.objects(self.over([self.pod(spawned)], deployments=[labelled])), ["Deployment/tenant"])
+        self.assertEqual(self.objects(self.over([self.pod(declared)], declared_deployments={("other", declared)})), ["Deployment/tenant"])
+
+    def test_a_declared_deployments_replaced_pod_is_not_a_familys(self):
+        """The declared tenant rolled this week, and its old pod used 3Gi of the
+        4Gi it requests. The spawned one beside it is small and idle. No member
+        is above its request, and no finding may say so."""
+        declared, spawned = self.member(self.U1, stem="tenant"), self.member(self.U2, stem="tenant")
+        pods = [self.pod(declared, mem_req="4Gi", mem_lim="4Gi"), self.pod(spawned, mem_req="256Mi", mem_lim="256Mi")]
+        keys = [(self.NS, p["metadata"]["name"]) for p in pods]
+        old_pod = (self.NS, f"{declared}-5d8c7b6f9d-7z8w9")
+        means = {keys[0]: 3072.0, keys[1]: 100.0, old_pod: 3072.0}
+        peaks = {key: (0.05, value) for key, value in means.items()}
+        context = {"pods": pods, "declared_deployments": {(self.NS, declared)}}
+        self.assertEqual(fw.check_underrequest(context, peaks, means, now=NOW), [])
+        hits = fw.check_overrequest(context, {keys[0]: (0.001, 3072.0), keys[1]: (0.001, 4.0), old_pod: (0.001, 3072.0)}, now=NOW, autopilot=False)
+        self.assertEqual(self.objects(hits), [f"Deployment/{spawned}"])
+
+    def test_the_collector_keeps_a_declared_deployment_under_its_name(self):
+        """The declaration index reaches the grouping through `collect_cluster`."""
+        declared, spawned = self.member(self.U1, stem="tenant"), self.member(self.U2, stem="tenant")
+        family = self.member(self.U3)
+        pods = [self.pod(name, ns="default") for name in (declared, spawned, family)]
+
+        def fleet(tmp, *, workspace):
+            def run(argv, **kwargs):
+                if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                    return run_of(0, json.dumps([{"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}]))
+                if argv[:2] == ["kubectl", "get"]:
+                    return run_of(0, json.dumps(dump_of(*pods)))
+                if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                    return run_of(0, "[]")
+                return run_of(0, "")
+
+            session = usage_session(*[("default", p["metadata"]["name"], 0.001, 4.0) for p in pods])
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=session, now=NOW, workspace=workspace)
+            [cluster] = [entry for entry in manifest["clusters"] if entry.get("candidates") is not None and "prod-usc1" in entry["name"]]
+            return {c["object"]: c for c in cluster["candidates"] if c["check"] == "overrequest"}, cluster.get("limitations") or ""
+
+        caveat = fw.FAMILY_NO_INDEX_SENTENCE.strip()
+
+        with TemporaryDirectory() as tmp:
+            clone = Path(tmp) / "infra"
+            (clone / "clusters/prod-usc1/workloads").mkdir(parents=True)
+            (clone / "clusters/prod-usc1/workloads/tenant.yaml").write_text(
+                f"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {declared}\n  namespace: default\n"
+            )
+            # Neither of these declares the family's member: another cluster's
+            # tree, and another kind with its name.
+            (clone / "clusters/stage-usc1/workloads").mkdir(parents=True)
+            (clone / "clusters/stage-usc1/workloads/calibration.yaml").write_text(
+                f"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {family}\n  namespace: default\n"
+            )
+            (clone / "clusters/prod-usc1/workloads/config.yaml").write_text(
+                f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {family}\n  namespace: default\n"
+            )
+            found, limitations = fleet(tmp, workspace=clone)
+            self.assertEqual(sorted(found), ["Deployment/calibration", f"Deployment/{declared}", f"Deployment/{spawned}"])
+            self.assertEqual(found[f"Deployment/{declared}"]["declaration"]["path"], "clusters/prod-usc1/workloads/tenant.yaml")
+            self.assertNotIn("declaration", found["Deployment/calibration"])
+            self.assertNotIn(caveat, found["Deployment/calibration"]["excerpt"])
+            with_index = limitations
+            # With no index the declared Deployment is in a family, and each family's excerpt says so.
+            # It is no limitation: a limitation is a coverage gap and makes the run partial.
+            found, limitations = fleet(tmp, workspace=None)
+            self.assertEqual(sorted(found), ["Deployment/calibration", "Deployment/tenant"])
+            for candidate in found.values():
+                self.assertIn(caveat, candidate["excerpt"])
+            self.assertEqual(limitations, with_index)
+
+    def test_a_check_called_with_no_word_on_the_index_says_nothing_of_it(self):
+        """Only `collect_cluster` knows if the run read a declaration."""
+        [hit] = self.over([self.pod(self.member(self.U1))])
+        self.assertNotIn(fw.FAMILY_NO_INDEX_SENTENCE.strip(), hit["excerpt"])
+        [hit] = self.over([self.pod(self.member(self.U1))], declarations_read=False)
+        self.assertIn(fw.FAMILY_NO_INDEX_SENTENCE.strip(), hit["excerpt"])
+        [hit] = self.over([self.pod(self.member(self.U1))], declarations_read=True)
+        self.assertNotIn(fw.FAMILY_NO_INDEX_SENTENCE.strip(), hit["excerpt"])
+        # No family, no sentence.
+        [hit] = self.over([self.pod("api")], declarations_read=False)
+        self.assertNotIn(fw.FAMILY_NO_INDEX_SENTENCE.strip(), hit["excerpt"])
+
+    def test_the_uncounted_pods_are_held_against_each_replica(self):
+        """Two replicas in the entry and one young pod of another member at 300Mi:
+        the family's peak is 300Mi for each replica, 600Mi in all."""
+        entry = [self.pod(self.member(self.U1), mem_req="4Gi", mem_lim="8Gi"), self.pod(self.member(self.U1), suffix="7z8w9", mem_req="4Gi", mem_lim="8Gi")]
+        young = self.pod(self.member(self.U2), mem_req="4Gi", mem_lim="8Gi")
+        young["status"]["startTime"] = "2026-07-31T23:40:00Z"
+        cpu_only = self.pod(self.member(self.U3), mem_req="4Gi", mem_lim="8Gi")
+        cpu_only["status"]["startTime"] = "2026-07-31T23:40:00Z"
+        pods = entry + [young, cpu_only]
+        peaks = {(self.NS, p["metadata"]["name"]): (0.001, 10.0) for p in entry}
+        peaks[(self.NS, young["metadata"]["name"])] = (0.001, 300.0)
+        # A pod with a series on one dimension only is read on that dimension, and it is counted.
+        peaks[(self.NS, cpu_only["metadata"]["name"])] = (0.001, None)
+        [hit] = self.over(pods, peaks)
+        self.assertIn("peak observed 0.00 vCPU / 0.6 GiB", hit["excerpt"])
+        self.assertIn("Resize to memory 600Mi per replica", hit["excerpt"])
+        self.assertIn("Totals span 2 replicas", hit["excerpt"])
+        self.assertIn("The peak also reads 2 live pods of its members", hit["excerpt"])
+
+    def test_a_gone_pod_is_never_a_familys_one_witness(self):
+        """The family's own pod did not report. A gone pod that only the name
+        gave, which can be another workload's, must not call the week idle."""
+        stem = "notebook-session-kernel"
+        member = self.pod(self.member(self.U1, stem=stem), cpu_req="2", mem_req="4Gi", mem_lim="8Gi")
+        key = (self.NS, member["metadata"]["name"])
+        other = (self.NS, self.pod_name(f"{self.member(self.U3, stem=stem)}-worker", "7z8w9"))
+        self.assertEqual(self.over([member], {other: (0.001, 4.0)}), [])
+        # One dimension of the own pod was not read; the gone pod has both.
+        self.assertEqual(self.over([member], {key: (0.001, None), other: (0.001, 4.0)}), [])
+        bare = self.pod(self.member(self.U1, stem=stem), sized=False)
+        self.assertEqual(fw.check_unsized({"pods": [bare]}, {other: (0.001, 4.0)}, now=NOW, autopilot=False), [])
+        # Control: beside a measured own pod the gone pod is read.
+        [hit] = self.over([member], {key: (0.001, 4.0), other: (0.001, 50.0)})
+        self.assertIn("1 pod it has replaced", hit["excerpt"])
+
+    def test_underrequest_states_the_window_of_the_pod_with_the_mean(self):
+        """One member's pod is 61 minutes old and above its request; another
+        member's pod is 12 days old and far below it. The level lasted 61
+        minutes, and the text may not say a week."""
+        young = self.pod(self.member(self.U1), mem_req="256Mi", mem_lim="1Gi")
+        young["status"]["startTime"] = "2026-07-31T22:59:00Z"
+        old = self.pod(self.member(self.U2), mem_req="256Mi", mem_lim="1Gi")
+        old["status"]["startTime"] = "2026-07-20T00:00:00Z"
+        keys = [(self.NS, p["metadata"]["name"]) for p in (young, old)]
+        gone = (self.NS, self.pod_name(self.member(self.U3), "7z8w9"))
+        means = {keys[0]: 990.0, keys[1]: 100.0, gone: 100.0}
+        peaks = {k: (0.05, v) for k, v in means.items()}
+        [hit] = fw.check_underrequest({"pods": [young, old]}, peaks, means, now=NOW)
+        self.assertIn("over the trailing 1h", hit["excerpt"])
+        self.assertIn("the pod with this mean started 1h ago", hit["excerpt"])
+        self.assertNotIn(f"over the trailing {fw.USAGE_WINDOW_HOURS}h (Cloud Monitoring)", hit["excerpt"])
+        # The gone pod is not read by this check, so the text names no replaced pod.
+        self.assertNotIn("it has replaced", hit["excerpt"])
+        # Control: when the old pod is the hot one, the window is the read's,
+        # and the gone pod in the answer is still not named.
+        means = {keys[0]: 100.0, keys[1]: 990.0, gone: 100.0}
+        peaks = {k: (0.05, v) for k, v in means.items()}
+        [hit] = fw.check_underrequest({"pods": [young, old]}, peaks, means, now=NOW)
+        self.assertIn(f"over the trailing {fw.USAGE_WINDOW_HOURS}h (Cloud Monitoring)", hit["excerpt"])
+        self.assertNotIn("it has replaced", hit["excerpt"])
+
+    def test_the_template_instruction_comes_before_the_optional_sentences(self):
+        """A very long excerpt is cut at its end; the instruction must not be what goes."""
+        pods = [self.pod(self.member(self.U1)), self.pod(self.member(self.U2), mem_req="2Gi", mem_lim="4Gi")]
+        [hit] = self.over(pods, declarations_read=False)
+        instruction = hit["excerpt"].index("change the template that creates the members")
+        for later in ("The members declare different requests", fw.FAMILY_NO_INDEX_SENTENCE.strip()):
+            self.assertLess(instruction, hit["excerpt"].index(later))
+
+    def test_what_a_cut_name_cannot_say(self):
+        """With a stem of 23 characters the cut removes the hash, and the gone
+        pod of Deployment `<stem>-<uuid>-worker` has a member's form. §3.1 reads
+        it, which can only raise the peak. §3.11 raises a request, so for a
+        family it reads no gone pod: not this one, and not a member's."""
+        stem = "notebook-session-kernel"
+        member = self.pod(self.member(self.U1, stem=stem), mem_req="256Mi", mem_lim="1Gi")
+        key = (self.NS, member["metadata"]["name"])
+        other = (self.NS, self.pod_name(f"{self.member(self.U3, stem=stem)}-worker", "7z8w9"))
+        own = (self.NS, self.pod_name(self.member(self.U2, stem=stem), "7z8w9"))
+        self.assertEqual(len(other[1]), 63)
+        for gone in (other, own):
+            with self.subTest(gone=gone[1]):
+                means = {key: 100.0, gone: 950.0}
+                peaks = {k: (0.05, v) for k, v in means.items()}
+                self.assertEqual(fw.check_underrequest({"pods": [member]}, peaks, means, now=NOW), [])
+                # §3.1 reads it: 950Mi against 256Mi is no over-request.
+                self.assertEqual(self.over([member], {key: (0.001, 4.0), gone: (0.001, 950.0)}), [])
+        # Control: one Deployment's replaced pod still counts in §3.11, as on `main`.
+        plain = self.pod("api", mem_req="256Mi", mem_lim="1Gi")
+        gone = (self.NS, f"api-{self.HASH}-7z8w9")
+        means = {(self.NS, plain["metadata"]["name"]): 100.0, gone: 950.0}
+        peaks = {k: (0.05, v) for k, v in means.items()}
+        self.assertEqual(len(fw.check_underrequest({"pods": [plain]}, peaks, means, now=NOW)), 1)
+
+    def test_a_guaranteed_family_keeps_its_marker(self):
+        """Requests equal to limits: §3.1 files it for a person, as it files one Deployment."""
+        pods = [self.pod(self.member(u), cpu_req="500m", mem_req="2Gi", mem_lim="2Gi") for u in (self.U1, self.U2)]
+        for pod in pods:
+            pod["spec"]["containers"][0]["resources"]["limits"]["cpu"] = "500m"
+        [hit] = self.over(pods)
+        self.assertEqual(hit["object"], "Deployment/calibration")
+        self.assertTrue(hit["_guaranteed"])
+        self.assertTrue(hit["_family"])
+
+    def test_an_hpa_on_a_member_skips_the_family(self):
+        pods = [self.pod(self.member(self.U1)), self.pod(self.member(self.U2))]
+        hpa = obj("HorizontalPodAutoscaler", "one", ns=self.NS, **{"spec.scaleTargetRef": {"kind": "Deployment", "name": self.member(self.U2)}})
+        self.assertEqual(self.over(pods, hpas=[hpa]), [])
+        self.assertEqual(len(self.over(pods)), 1)
+
+    def test_the_excerpt_names_what_each_member_carries(self):
+        """The owner and the labels do not make the family; they say where its template is."""
+        members = [self.member(self.U1), self.member(self.U2)]
+        pods = [self.pod(name) for name in members]
+
+        def deployment(name, labels=None, owner="lab-pool"):
+            labels = {"app.kubernetes.io/part-of": "calibration", "app.kubernetes.io/managed-by": "spawner"} if labels is None else labels
+            return obj("Deployment", name, ns=self.NS, **{
+                "metadata.labels": labels,
+                "metadata.ownerReferences": [{"kind": "CalibrationPool", "name": owner, "controller": True}],
+            })
+
+        [hit] = self.over(pods, deployments=[deployment(name) for name in members])
+        self.assertEqual(hit["object"], "Deployment/calibration")
+        self.assertIn("owned by `CalibrationPool/lab-pool`", hit["excerpt"])
+        self.assertIn("`app.kubernetes.io/managed-by: spawner`", hit["excerpt"])
+        self.assertIn("`app.kubernetes.io/part-of: calibration`", hit["excerpt"])
+        # A value that one member does not carry is not named, and neither is
+        # an owner whose own name is generated for each member.
+        mixed = [deployment(members[0], owner=f"run-{self.U1}"), deployment(members[1], labels={"app.kubernetes.io/managed-by": "spawner"}, owner=f"run-{self.U2}")]
+        [hit] = self.over(pods, deployments=mixed)
+        self.assertNotIn("owned by", hit["excerpt"])
+        self.assertNotIn("part-of", hit["excerpt"])
+        self.assertIn("`app.kubernetes.io/managed-by: spawner`", hit["excerpt"])
+        # One owner with a generated name of its own, and two owners with fixed names: neither is named.
+        for owners in ((f"run-{self.U3}", f"run-{self.U3}"), ("pool-a", "pool-b")):
+            [hit] = self.over(pods, deployments=[deployment(name, owner=owner) for name, owner in zip(members, owners)])
+            self.assertNotIn("owned by", hit["excerpt"])
+
+    def test_a_family_finding_takes_no_declaration_by_its_name(self):
+        """A file that declares `Deployment/calibration` declares another
+        object: the family's name is in no cluster and in no repository."""
+        declarations = {("c1", "Deployment", self.NS, "calibration"): {"clusters/c1/lab/calibration.yaml"}}
+        reconcilers = {(self.NS, "Deployment/calibration"): "the Helm release `calibration`"}
+        releases = {(self.NS, "Deployment/calibration"): {"path": "clusters/c1/lab/release.yaml"}}
+        joins = {"cluster": "c1", "declarations": declarations, "reconcilers": reconcilers, "releases": releases}
+        [family] = self.over([self.pod(self.member(self.U1))])
+        candidate = fw._emit("overrequest", family, **joins)
+        self.assertEqual(candidate["object"], "Deployment/calibration")
+        for key in ("declaration", "reconciler", "release_declaration"):
+            self.assertNotIn(key, candidate)
+        # Control: a real Deployment of that name takes the joins.
+        [real] = self.over([self.pod("calibration")])
+        candidate = fw._emit("overrequest", real, **joins)
+        self.assertEqual(candidate["declaration"]["path"], "clusters/c1/lab/calibration.yaml")
+        self.assertIn("reconciler", candidate)
+        # The same for the two other checks that file a family.
+        unsized = self.pod(self.member(self.U1), sized=False)
+        [hit] = fw.check_unsized({"pods": [unsized]}, {(self.NS, unsized["metadata"]["name"]): (0.05, 200.0)}, now=NOW, autopilot=False)
+        self.assertNotIn("declaration", fw._emit("unsized-workload", hit, **joins))
+        under = self.pod(self.member(self.U1))
+        key = (self.NS, under["metadata"]["name"])
+        [hit] = fw.check_underrequest({"pods": [under]}, {key: (0.05, 973.0)}, {key: 973.0}, now=NOW)
+        self.assertNotIn("declaration", fw._emit("underrequest", hit, **joins))
+
+    def test_each_finding_counts_the_members_it_measured(self):
+        """One member declares requests, one declares none, and one started ten
+        minutes ago. §3.1 and §3.12 each file the stem for their own member."""
+        sized = self.pod(self.member(self.U1))
+        unsized = self.pod(self.member(self.U2), sized=False)
+        young = self.pod(self.member(self.U3))
+        young["status"]["startTime"] = "2026-07-31T23:50:00Z"
+        pods = [sized, unsized, young]
+        peaks = {(self.NS, p["metadata"]["name"]): (0.001, 4.0) for p in pods}
+        [over] = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)
+        [bare] = fw.check_unsized({"pods": pods}, peaks, now=NOW, autopilot=False)
+        for hit in (over, bare):
+            self.assertEqual(hit["object"], "Deployment/calibration")
+            self.assertIn("stands for 1 generated-name Deployment ", hit["excerpt"])
+
+    # -- the other checks that read the owner step ------------------------ #
+
+    def test_unsized_members_are_one_finding(self):
+        pods = [self.pod(self.member(self.U1), sized=False), self.pod(self.member(self.U2), sized=False)]
+        peaks = {(self.NS, p["metadata"]["name"]): (0.05, 200.0) for p in pods}
+        [hit] = fw.check_unsized({"pods": pods}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(hit["object"], "Deployment/calibration")
+        self.assertIn("stands for 2 generated-name Deployments `calibration-<uuid>`", hit["excerpt"])
+        self.assertNotIn("different requests", hit["excerpt"])
+
+    def test_underrequested_members_are_one_finding(self):
+        pods = [self.pod(self.member(self.U1)), self.pod(self.member(self.U2))]
+        means = {(self.NS, p["metadata"]["name"]): 973.0 for p in pods}
+        peaks = {key: (0.05, value) for key, value in means.items()}
+        [hit] = fw.check_underrequest({"pods": pods}, peaks, means, now=NOW)
+        self.assertEqual(hit["object"], "Deployment/calibration")
+        self.assertIn("stands for 2 generated-name Deployments `calibration-<uuid>`", hit["excerpt"])
+
+    def test_the_idle_workload_check_files_nothing_on_a_family(self):
+        """Its bar is the controller's age, and a family has none in the dump.
+        A stand-down has no member-free form either: there is no `replicas` to
+        set on a template that a spawner holds."""
+        members = [self.member(self.U1), self.member(self.U2)]
+        pods = [self.pod(name, cpu_req="50m", mem_req="64Mi", mem_lim="128Mi") for name in members]
+        context = {
+            "pods": pods,
+            "services": [],
+            "deployments": [obj("Deployment", name, ns=self.NS, **{"metadata.creationTimestamp": "2026-07-01T00:00:00Z"}) for name in members],
+        }
+        peaks = {(self.NS, p["metadata"]["name"]): (0.0021, 6.0) for p in pods}
+        self.assertEqual(fw.check_idle_workload(context, peaks, now=NOW), [])
+        self.assertEqual(fw.check_overrequest(context, peaks, now=NOW, autopilot=False), [])
+
+
 class UnsizedWorkloadTest(unittest.TestCase):
     """§3.12 -- the population §3.1 and §3.11 both skip.
 

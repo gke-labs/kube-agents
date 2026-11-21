@@ -9,6 +9,7 @@ behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
 import base64
 import datetime
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -3428,6 +3429,34 @@ class InstallerCommonTest(unittest.TestCase):
             "helm_upgrade_install must default to false",
         )
 
+    def test_tfvars_generation_includes_card_stop_enabled(self):
+        """CARD_STOP_ENABLED reaches card_stop_enabled; unset or not truthy is false."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value, want in ((None, "false"), ("true", "true"), ("on", "true"),
+                                ("false", "false"), ("ture", "false")):
+                with self.subTest(value=value):
+                    env = {"API_SERVER_KEY": "k"}
+                    if value is not None:
+                        env["CARD_STOP_ENABLED"] = value
+                    proc = self._run(f'write_tfvars_from_state "{dest}"', env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn(f"card_stop_enabled = {want}\n", dest.read_text())
+
+    def test_card_stop_enabled_reaches_the_chart_value(self):
+        """main.tf hands the tfvars key to operator.cardStop.enabled, and only while it is on."""
+        composition = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        main_tf = (composition / "main.tf").read_text()
+        self.assertIsNotNone(
+            re.search(r"(?m)^      var\.card_stop_enabled \? \{\n        cardStop = \{\n          enabled = true\n"
+                      r"        \}\n      \} : \{\},$", main_tf),
+            "kube_agents_helm_values does not set operator.cardStop.enabled only when card_stop_enabled is on",
+        )
+        variables_tf = (composition / "variables.tf").read_text()
+        block = variables_tf.split('variable "card_stop_enabled" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIsNotNone(re.search(r"(?m)^\s*default\s*=\s*false\s*$", block),
+                             "card_stop_enabled must default to false")
+
     def test_tfvars_carries_namespace_identity_and_cmek_names(self):
         # Every one of these used to be a fixed name the generator never wrote,
         # so install.env's NAMESPACE reached nothing and a second install in a
@@ -6107,7 +6136,8 @@ class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
                       "\treturn found && id != \"\" && !strings.Contains(id, \"/\")\n}\n", gateway)
         operator = (_REPO_ROOT / "k8s-operator/internal/controller/platformagent_a2a_manifests.go").read_text()
         self.assertRegex(operator, r'\n\ta2aGchatSpacePrefix\s*=\s*"spaces/"\n')
-        self.assertIn("\thome := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)\n"
+        self.assertIn("\treturn gchatSpaceName(agent.Spec.Integration.GoogleChat.HomeChannel)\n", operator)
+        self.assertIn("\thome := strings.TrimSpace(s)\n"
                       "\tid, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)\n"
                       "\tif !ok || id == \"\" || strings.Contains(id, \"/\") {\n", operator)
         shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
@@ -6160,6 +6190,8 @@ class GatewayHomeChannelUnsetWarningTest(unittest.TestCase):
         proc = self._run(slack="false", chat="true")
         self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
+        # As for Slack: the learn is offered beside the key.
+        self.assertIn("under homeChannelPolicy auto (the default), mention the agent once, top-level, in the named space you want", proc.stdout)
 
     def test_both_platforms_share_the_gateway(self):
         # Each backend needs its own home; with both unset both keys are named, Chat first.
@@ -6351,6 +6383,54 @@ class SlackHomeChannelPolicyTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
         self.assertIsNone(content, "the file must be left untouched")
+
+class GoogleChatHomeChannelPolicyTest(unittest.TestCase):
+    """GOOGLE_CHAT_HOME_CHANNEL_POLICY renders
+    spec.integration.googleChat.homeChannelPolicy on SLACK_HOME_CHANNEL_POLICY's
+    terms: the same exact enum, refused by the generator before a file is
+    written."""
+
+    _run = InstallerCommonTest._run
+    _tfvars = SlackHomeChannelPolicyTest._tfvars
+
+    def _check(self, value, flags=""):
+        return self._run(f'require_google_chat_home_channel_policy {shlex.quote(value)} {flags}; echo "rc=$?"')
+
+    def test_the_three_accepted_values_pass_silently(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertNotIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY", proc.stdout + proc.stderr)
+
+    def test_any_other_spelling_is_refused_as_the_crd_would(self):
+        for value in ("Auto", " auto", "manual ", "MANUAL", "sometimes"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(f"GOOGLE_CHAT_HOME_CHANNEL_POLICY is '{value}', which is not auto or manual (empty means auto)", out)
+                self.assertIn("spec.integration.googleChat.homeChannelPolicy", out)
+                self.assertIn("Set it in install.env and run again", out)
+                self.assertNotIn("--google-chat-home-channel-policy", out)
+
+    def test_the_remedy_names_the_flag_when_install_sh_can_set_it(self):
+        proc = self._check("sometimes", "flags")
+        self.assertIn("Set it in install.env or --google-chat-home-channel-policy and run again", proc.stdout + proc.stderr)
+
+    def test_the_generator_renders_the_policy_beside_the_chat_home_channel(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc, content = self._tfvars({"GOOGLE_CHAT_HOME_CHANNEL_POLICY": value})
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f'google_chat_home_channel  = ""\ngoogle_chat_home_channel_policy = "{value}"\n', content)
+
+    def test_the_generator_refuses_a_policy_outside_the_enum_with_no_file_written(self):
+        proc, content = self._tfvars({"GOOGLE_CHAT_HOME_CHANNEL_POLICY": "sometimes"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
+        self.assertIsNone(content, "the file must be left untouched")
+
 
 # ── print_footprint_summary: the step 11 footprint and modeled-cost block ───
 
@@ -6726,6 +6806,89 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout)
         self.assertIn("values don't meet the specifications", proc.stderr)
         self.assertNotIn("Release footprint", proc.stdout)
+
+    def _failed_step(self, break_step, function="render_footprint_summary"):
+        """Run the render on a copy of the chart with one step of the probe build made to fail.
+
+        `break_step` is shell that runs after the copy exists at $CHECKOUT and before the
+        call. $TMPDIR is a directory of the run's own, listed after the call, so a probe
+        directory that stays behind shows on the `left:` line.
+        """
+        chart = _REPO_ROOT / "charts" / "kube-agents"
+        script = (
+            # C messages: the tests read cp's own error text.
+            'export LC_ALL=C\n'
+            'work="$(mktemp -d)"; CHECKOUT="$work/checkout"; export TMPDIR="$work/tmp"\n'
+            'mkdir -p "$CHECKOUT/charts/kube-agents/templates" "$TMPDIR"\n'
+            f'cp "{chart}/Chart.yaml" "{chart}/values.yaml" "{chart}/values.schema.json" "$CHECKOUT/charts/kube-agents/"\n'
+            f'cp -R "{chart}/files" "$CHECKOUT/charts/kube-agents/files"\n'
+            f'cp "{chart}/templates/_helpers.tpl" "$CHECKOUT/charts/kube-agents/templates/"\n'
+            f"{break_step}\n"
+            f'{function} "$CHECKOUT" "$TFVARS"; echo "rc=$?"\n'
+            'echo "left: $(ls -A "$TMPDIR" | tr "\\n" " ")"\n'
+            'chmod -R u+rwx "$work"; rm -rf "$work"\n'
+        )
+        return self._run(script, helm_script=_ECHO_HELM)
+
+    # The four steps of the probe build that had no handler: each must end the render
+    # with a non-zero status, with the step's own error and no helm call after it, and
+    # leave no probe directory behind.
+    _UNREADABLE_SCHEMA = 'chmod 000 "$CHECKOUT/charts/kube-agents/values.schema.json"'
+    _UNREADABLE_HELPERS = 'chmod 000 "$CHECKOUT/charts/kube-agents/templates/_helpers.tpl"'
+    _FAILING_MKDIR = 'mkdir() { case "$*" in */templates) echo "mkdir: cannot create the templates directory" >&2; return 1 ;; *) command mkdir "$@" ;; esac; }'
+    _FAILING_PROBE_WRITE = (
+        'printf() { case "$1" in "apiVersion: v1"*) echo "printf: write error" >&2; return 1 ;; *) builtin printf "$@" ;; esac; }'
+    )
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_schema(self):
+        proc = self._failed_step(self._UNREADABLE_SCHEMA)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("values.schema.json", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        # The render did not go on without the schema: helm was not called.
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_helpers_template(self):
+        proc = self._failed_step(self._UNREADABLE_HELPERS)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("_helpers.tpl", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_templates_directory_cannot_be_made(self):
+        proc = self._failed_step(self._FAILING_MKDIR)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        # The step's own error and nothing after it: without the handler the next copy
+        # fails into the directory that is not there, and its handler ends the render.
+        self.assertEqual(proc.stderr, "mkdir: cannot create the templates directory\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_probe_template_cannot_be_written(self):
+        proc = self._failed_step(self._FAILING_PROBE_WRITE)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertEqual(proc.stderr, "printf: write error\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_print_names_the_failed_step_and_nothing_after_it(self):
+        # The warning carries the step's error alone: no summary rendered without the
+        # schema, and no helm error for a template the copy never delivered.
+        for break_step, name in ((self._UNREADABLE_SCHEMA, "values.schema.json"), (self._UNREADABLE_HELPERS, "_helpers.tpl")):
+            with self.subTest(name=name):
+                proc = self._failed_step(break_step, function="print_footprint_summary")
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                warning = next((line for line in proc.stdout.splitlines() if line.startswith("WARN: ")), "")
+                self.assertIn("Could not render the release footprint summary: ", warning)
+                self.assertIn(name, warning)
+                self.assertTrue(warning.rstrip().endswith("Permission denied"), warning)
+                self.assertNotIn("args: ", proc.stdout)
+                self.assertIn("left: \n", proc.stdout)
 
     def test_print_warns_and_goes_on_without_helm(self):
         proc = self._run(

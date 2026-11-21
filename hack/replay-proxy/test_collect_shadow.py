@@ -618,6 +618,15 @@ class RecordModeTest(CollectorTestCase):
     def kept(self, rel):
         return os.path.join(self.keep, "pods", POD_NAME, "cache", rel)
 
+    def test_alternates_are_kept_on_this_machine_and_emptied_in_the_pod(self):
+        first = self.cache(f"alts/{fp(1)}/{fp(7)}.json", b'{"answer": 7}')
+        self.cache(f"alts/{fp(1)}/{fp(8)}.json", b'{"answer": 8}')
+        self.collector.collect_pass()
+        for answer, data in ((fp(7), b'{"answer": 7}'), (fp(8), b'{"answer": 8}')):
+            with open(self.kept(f"alts/{fp(1)}/{answer}.json"), "rb") as handle:
+                self.assertEqual(handle.read(), data)
+        self.assertEqual(os.path.getsize(first), 0, "emptied, so its name still says that answer was written")
+
     def test_answers_are_kept_on_this_machine_and_emptied_in_the_pod(self):
         answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
         variant = self.cache(f"variants/{fp(2)}/{'a' * 16}.json", b"")
@@ -775,6 +784,14 @@ class ReplayModeTest(CollectorTestCase):
             self.assertEqual(handle.read(), "2")
         self.collector.collect_pass()
         self.assertEqual(self.seeds(), 1, "a seeded pod is not seeded again")
+
+    def test_a_weights_file_is_seeded_with_the_answers(self):
+        path = os.path.join(self.seed_dir, "weights", f"{fp(1)}.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as handle:
+            handle.write('{"%s": 9}' % fp(2))
+        self.collector.collect_pass()
+        self.assertTrue(os.path.isfile(os.path.join(self.pod, CACHE, "weights", f"{fp(1)}.json")))
 
     def test_a_pod_that_replaced_one_is_seeded_too(self):
         self.collector.collect_pass()
