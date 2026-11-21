@@ -255,7 +255,7 @@ A few fields are left as they came. They are kept only where the provider APIs p
 
 - in the assistant's own turn, a thinking block's text and signature, which the provider checks against each other. The model wrote that text from input the hook had already redacted;
 - redacted thinking and a thought signature, in the same turn;
-- binary payloads (images, PDFs, audio, video) that decode as base64 and start the way their media type does.
+- binary payloads of a listed type (common images, PDF, audio and video) that decode as base64 and start the way their media type does. A payload of any other type is refused.
 
 A request the hook cannot walk is refused. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at a payload position that is not binary base64. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 

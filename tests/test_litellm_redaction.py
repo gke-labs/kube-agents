@@ -83,6 +83,7 @@ _RULE_MATCHING_BASE64 = "iVBORw0KGgoAIza" + "B" * 37  # a PNG header, then the G
 # A small real PNG start, for parts whose payload only has to be a PNG.
 _PNG_BASE64 = "iVBORw0KGgo="
 _PDF_BASE64 = "JVBERi0xLjQK"  # %PDF-1.4
+_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IA=="  # RIFF....WAVE
 
 
 def _stub_litellm() -> None:
@@ -583,6 +584,10 @@ class TestCallback(unittest.TestCase):
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + text_as_png}},
             {"type": "image_url", "image_url": {"url": "data:image/png;name=on-prod-eu-1;base64," + _PNG_BASE64}},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}},  # bad padding
+            {"type": "image", "source": {"type": "base64", "media_type": "video/mp4", "data": text_as_png}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/heic", "data": text_as_png}},
+            {"type": "input_audio", "input_audio": {"format": "ogg", "data": text_as_png}},
+            {"type": "image", "source": {"type": "base64", "media_type": "audio/x-made-up", "data": _WAV_BASE64}},
         ):
             with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
@@ -638,6 +643,16 @@ class TestCallback(unittest.TestCase):
         self.assertNotIn("10.0.0.7", third)
         json.loads(first)
         json.loads(second)
+
+    def test_caller_data_shaped_like_an_internal_marker_is_just_data(self) -> None:
+        lookalike = {"__kube_agents_json_string__": 0, "__kube_agents_json_document__": "x"}
+        data = {"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "a", "name": "t", "input": lookalike},
+            {"type": "tool_use", "id": "b", "name": "t", "input": json.dumps({"host": "10.0.0.5"})},
+        ]}]}
+        first, second = self._run(data, "anthropic_messages")["messages"][0]["content"]
+        self.assertEqual(first["input"], lookalike)
+        self.assertNotIn("10.0.0.5", second["input"])
 
     # Fail closed.
 
@@ -698,7 +713,7 @@ class TestCallback(unittest.TestCase):
                     "role": "user",
                     "content": [
                         {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": payload}}]},
-                        {"type": "input_audio", "input_audio": {"format": "wav", "data": payload}},
+                        {"type": "input_audio", "input_audio": {"format": "wav", "data": _WAV_BASE64}},
                         {"type": "file", "file": {"filename": "r.pdf", "file_data": "data:application/pdf;base64," + _PDF_BASE64}},
                     ],
                 }
@@ -706,7 +721,7 @@ class TestCallback(unittest.TestCase):
         }
         result, audio, filed = self._run(data)["messages"][0]["content"]
         self.assertEqual(result["content"][0]["source"]["data"], payload)
-        self.assertEqual(audio["input_audio"]["data"], payload)
+        self.assertEqual(audio["input_audio"]["data"], _WAV_BASE64)
         self.assertEqual(filed["file"]["file_data"], "data:application/pdf;base64," + _PDF_BASE64)
         for part in (
             {"type": "image_url", "image_url": {"url": "data:text/plain;base64,b24gcHJvZC1ldS0x"}},

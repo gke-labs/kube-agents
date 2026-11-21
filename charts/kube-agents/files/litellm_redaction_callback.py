@@ -24,8 +24,9 @@ function's arguments): in an assistant's or the model's own turn, a thinking
 block's text and signature (the provider checks the text against the
 signature, and the model wrote it from input this hook had already redacted),
 redacted thinking's data and a thought signature; and, anywhere a part may
-carry one, a binary payload of a known binary media type that decodes as
-base64 and starts the way that media does. Generation
+carry one, a binary payload of a listed binary media type (images, PDF,
+audio, video) that decodes as base64 and starts the way that media does; a
+payload of any other type is refused. Generation
 settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
 `messages` or `contents` that is not a list of objects, or anything at a
@@ -126,22 +127,39 @@ GEMINI_OPAQUE_PART_KEYS = ("thoughtSignature", "thought_signature")
 GEMINI_INLINE_KEYS = ("inlineData", "inline_data")
 GEMINI_MIME_KEYS = ("mimeType", "mime_type")
 GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
-BINARY_MEDIA_PATTERN = re.compile(
-    r"^(?:image/(?:png|jpeg|gif|webp|heic|heif)|application/pdf|audio/[a-z0-9.+-]+|video/[a-z0-9.+-]+)$",
-    re.IGNORECASE,
-)
+# The binary media types a payload may claim, each with how its bytes start:
+# a payload is kept only if its bytes start that way, so text labelled as one
+# of these is refused rather than kept unread. A type not listed here is
+# refused at a payload position.
+_FTYP = (lambda d: d[4:8] == b"ftyp")
+_RIFF = (lambda form: (lambda d: d[:4] == b"RIFF" and d[8:12] == form))
+_EBML = (lambda d: d[:4] == b"\x1aE\xdf\xa3")
+_MPEG_AUDIO = (lambda d: d[:3] == b"ID3" or (len(d) > 1 and d[0] == 0xFF and d[1] & 0xE0 == 0xE0))
+MEDIA_SIGNATURES = {
+    "image/png": lambda d: d[:8] == b"\x89PNG\r\n\x1a\n",
+    "image/jpeg": lambda d: d[:3] == b"\xff\xd8\xff",
+    "image/gif": lambda d: d[:6] in (b"GIF87a", b"GIF89a"),
+    "image/webp": _RIFF(b"WEBP"),
+    "image/heic": _FTYP,
+    "image/heif": _FTYP,
+    "application/pdf": lambda d: d[:5] == b"%PDF-",
+    "audio/wav": _RIFF(b"WAVE"),
+    "audio/x-wav": _RIFF(b"WAVE"),
+    "audio/mpeg": _MPEG_AUDIO,
+    "audio/mp3": _MPEG_AUDIO,
+    "audio/aac": _MPEG_AUDIO,
+    "audio/ogg": lambda d: d[:4] == b"OggS",
+    "audio/flac": lambda d: d[:4] == b"fLaC",
+    "audio/mp4": _FTYP,
+    "audio/webm": _EBML,
+    "video/mp4": _FTYP,
+    "video/quicktime": _FTYP,
+    "video/webm": _EBML,
+    "video/x-matroska": _EBML,
+}
 # A data URL with no parameter but `;base64`: a parameter is text the check
 # would otherwise pass along unread.
 STRICT_DATA_URL = re.compile(r"^data:([^;,]+);base64,(.*)$", re.IGNORECASE | re.DOTALL)
-# The first bytes each binary media type starts with, where it has a fixed
-# signature: a payload that does not start with them is not that media, and is
-# refused rather than kept unread.
-MEDIA_MAGIC = {
-    "image/png": (b"\x89PNG\r\n\x1a\n",),
-    "image/jpeg": (b"\xff\xd8\xff",),
-    "image/gif": (b"GIF87a", b"GIF89a"),
-    "application/pdf": (b"%PDF-",),
-}
 ASSISTANT_ROLES = frozenset({"assistant", "model"})
 # Field names the carve reads, as the provider APIs spell them.
 SOURCE_KEY = "source"
@@ -163,10 +181,8 @@ PARTS_KEY = "parts"
 # A string holding a JSON object or array (a tool call's arguments, a tool's
 # JSON output) is decoded and walked as a document, so key names count and a
 # value after an escaped newline is matched, then re-encoded only if a rule
-# changed it. The wrapper marks where it came from while the walk runs.
+# changed it.
 JSON_OPENERS = ("{", "[")
-JSON_WRAPPER_KEY = "__kube_agents_json_string__"
-JSON_DOCUMENT_KEY = "__kube_agents_json_document__"
 DATA_KEY = "data"
 
 
@@ -241,18 +257,17 @@ class KubeAgentsRedactionCallback(CustomLogger):
     def _keep_payload(self, media: Any, data: Any, path: tuple, kept: List[tuple]) -> None:
         """Keep a base64 payload of a known binary media type that decodes as
         that media; refuse anything else."""
-        if not (isinstance(media, str) and BINARY_MEDIA_PATTERN.match(media.strip())):
+        media = media.strip().lower() if isinstance(media, str) else media
+        starts = MEDIA_SIGNATURES.get(media) if isinstance(media, str) else None
+        if starts is None:
             raise self._refuse(f"a payload of media type {media!r}")
-        media = media.strip().lower()
         if not isinstance(data, str):
             raise self._refuse(f"a {media} payload that is not a string")
         try:
             decoded = base64.b64decode("".join(data.split()), validate=True)
         except (binascii.Error, ValueError):
             raise self._refuse(f"a {media} payload that is not base64") from None
-        magic = MEDIA_MAGIC.get(media)
-        webp = media == "image/webp" and not (decoded[:4] == b"RIFF" and decoded[8:12] == b"WEBP")
-        if webp or (magic is not None and not decoded.startswith(magic)):
+        if not starts(decoded):
             raise self._refuse(f"a payload that does not start as {media}")
         kept.append((path, data))
 
@@ -352,11 +367,11 @@ class KubeAgentsRedactionCallback(CustomLogger):
             return
 
     @classmethod
-    def _expand_json(cls, node: Any, sources: List[str]) -> Any:
+    def _expand_json(cls, node: Any, path: tuple, found: List[tuple]) -> Any:
         """node with each string that holds a JSON object or array replaced by
-        its decoded document, wrapped with the index of the original string in
-        sources, so _collapse_json can re-encode it. Only the document is
-        walked."""
+        its decoded document, recording (path, original string) in found so
+        _collapse_json can re-encode it. Nothing is added to the tree, so no
+        caller data can be mistaken for a marker."""
         if isinstance(node, str):
             text = node.strip()
             if text[:1] in JSON_OPENERS:
@@ -365,13 +380,36 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 except ValueError:
                     return node
                 if isinstance(decoded, (dict, list)):
-                    sources.append(node)
-                    return {JSON_WRAPPER_KEY: len(sources) - 1, JSON_DOCUMENT_KEY: cls._expand_json(decoded, sources)}
+                    found.append((path, node))
+                    return cls._expand_json(decoded, path, found)
             return node
         if isinstance(node, list):
-            return [cls._expand_json(item, sources) for item in node]
+            return [cls._expand_json(item, path + (i,), found) for i, item in enumerate(node)]
         if isinstance(node, dict):
-            return {key: cls._expand_json(value, sources) for key, value in node.items()}
+            return {key: cls._expand_json(value, path + (key,), found) for key, value in node.items()}
+        return node
+
+    @staticmethod
+    def _get(root: Any, path: tuple) -> Any:
+        node = root
+        for step in path:
+            node = node[step]
+        return node
+
+    def _redact_keys(self, node: Any, counts: Dict[str, int]) -> Any:
+        """node with the text rules run over every key name: the walk reads
+        values, so a value written as a key is redacted here."""
+        if isinstance(node, list):
+            return [self._redact_keys(item, counts) for item in node]
+        if isinstance(node, dict):
+            rebuilt = {}
+            for key, value in node.items():
+                if isinstance(key, str):
+                    key, made = AuditRedactor.redact_text_counted(key, self._rules)
+                    for name, count in made.items():
+                        counts[name] = counts.get(name, 0) + count
+                rebuilt[key] = self._redact_keys(value, counts)
+            return rebuilt
         return node
 
     @staticmethod
@@ -389,41 +427,37 @@ class KubeAgentsRedactionCallback(CustomLogger):
         json.loads(source.strip(), object_pairs_hook=pairs)
         return found
 
-    def _collapse_json(self, node: Any, sources: List[str], counts: Dict[str, int]) -> Any:
-        """Undo _expand_json on a walked tree. A decoded document goes back to
-        its original string only if the walk changed nothing, the string has
-        no repeated key, and the text rules over the raw string change nothing
-        either; otherwise it is re-encoded and the text rules run over the
-        result too, which also reaches key names and numbers."""
-        if isinstance(node, dict) and set(node) == {JSON_WRAPPER_KEY, JSON_DOCUMENT_KEY} and isinstance(node[JSON_WRAPPER_KEY], int):
-            source = sources[node[JSON_WRAPPER_KEY]]
-            document = self._collapse_json(node[JSON_DOCUMENT_KEY], sources, counts)
-            # The text rules run over the canonical encoding as well as the
-            # raw string: escapes in the raw string (a key written as
-            # \u-sequences) can hide a value the canonical one shows.
-            canonical = json.dumps(document, ensure_ascii=False)
-            encoded, made = AuditRedactor.redact_text_counted(canonical, self._rules)
-            raw, _ = AuditRedactor.redact_text_counted(source, self._rules)
-            unchanged = encoded == canonical and raw == source and document == json.loads(source.strip())
-            if unchanged and not self._has_duplicate_keys(source):
-                return source
-            for name, count in made.items():
-                counts[name] = counts.get(name, 0) + count
-            return encoded
-        if isinstance(node, list):
-            return [self._collapse_json(item, sources, counts) for item in node]
-        if isinstance(node, dict):
-            # The walk reads values, not key names: each decoded key gets the
-            # text rules here, so a value written as a key is redacted too.
-            rebuilt = {}
-            for key, value in node.items():
-                if isinstance(key, str):
-                    key, made = AuditRedactor.redact_text_counted(key, self._rules)
-                    for name, count in made.items():
-                        counts[name] = counts.get(name, 0) + count
-                rebuilt[key] = self._collapse_json(value, sources, counts)
-            return rebuilt
-        return node
+    def _encode_json(self, document: Any, source: str, counts: Dict[str, int]) -> str:
+        """A walked, key-redacted document back to a string: the original one
+        only if the walk changed nothing, the string has no repeated key, and
+        the text rules over the raw string and over the canonical encoding
+        change nothing either; otherwise the canonical encoding, redacted."""
+        # The canonical encoding as well as the raw string: escapes in the
+        # raw string (a key written as \u-sequences) can hide a value the
+        # canonical one shows.
+        canonical = json.dumps(document, ensure_ascii=False)
+        encoded, made = AuditRedactor.redact_text_counted(canonical, self._rules)
+        raw, _ = AuditRedactor.redact_text_counted(source, self._rules)
+        unchanged = encoded == canonical and raw == source and document == json.loads(source.strip())
+        if unchanged and not self._has_duplicate_keys(source):
+            return source
+        for name, count in made.items():
+            counts[name] = counts.get(name, 0) + count
+        return encoded
+
+    def _collapse_json(self, walked: Any, found: List[tuple], counts: Dict[str, int]) -> Any:
+        """Undo _expand_json on a walked tree, deepest document first, so an
+        outer document is re-encoded with its inner ones already strings.
+        Paths name the tree as expanded, and key names are redacted only
+        after every path is used."""
+        for path, source in sorted(found, key=lambda item: len(item[0]), reverse=True):
+            document = self._redact_keys(self._get(walked, path), counts)
+            encoded = self._encode_json(document, source, counts)
+            if path:
+                self._put(walked, path, encoded)
+            else:
+                walked = encoded
+        return self._redact_keys(walked, counts)
 
     def _redact_field(self, value: Any, kept: List[tuple], counts: Dict[str, int]) -> Any:
         """One top-level field: every string redacted, key names counted, the
@@ -435,12 +469,12 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 self._put(placeholder, path, None)
         else:
             placeholder = value
-        sources: List[str] = []
-        expanded = self._expand_json(placeholder, sources)
+        found: List[tuple] = []
+        expanded = self._expand_json(placeholder, (), found)
         walked, made = AuditRedactor.redact_counted(expanded, self._rules)
         for name, count in made.items():
             counts[name] = counts.get(name, 0) + count
-        redacted = self._collapse_json(walked, sources, counts)
+        redacted = self._collapse_json(walked, found, counts)
         for path, original in kept:
             self._put(redacted, path, original)
         return redacted
