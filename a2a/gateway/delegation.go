@@ -48,6 +48,10 @@ const (
 	// ruleDelegationParentChainMismatch refuses when an ancestor the record
 	// still holds contradicts the parent's carried chain.
 	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
+	// ruleDelegationUnattendedChild refuses a scheduled run's child whose
+	// profile's card doesn't list the unattended tier: its owner hasn't
+	// agreed to runs nobody is watching, even read-only ones (#6744).
+	ruleDelegationUnattendedChild = "delegation.unattended-child"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root
@@ -329,6 +333,15 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			if route, err = g.profileRouteFor(addressee, e.Parameters, tier, lib.SubmitKindChild); err != nil {
 				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
 				return nil, false
+			}
+			if profileParent && capability.Tier(parent.Tier) == capability.TierUnattended {
+				// The child runs at read, but for a schedule, with nobody
+				// watching: only a profile whose card lists unattended takes
+				// it, as only such a profile takes the trigger itself.
+				if card, ok := g.profiles.lookup(route.Profile); !ok || !cardAllowsTier(card, capability.TierUnattended) {
+					refuse(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+fmt.Sprintf(noticeUnattendedChild, route.Profile), "child", route.Profile)
+					return nil, false
+				}
 			}
 			if profileParent {
 				if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {

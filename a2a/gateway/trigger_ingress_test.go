@@ -1075,3 +1075,110 @@ func TestARefusedFanOutReadsFailedNotCompleted(t *testing.T) {
 		t.Fatalf("a refused fan-out's status = %+v, want failed", got)
 	}
 }
+
+// TestAScheduledRunHandsNoTaskToAProfileThatTakesNoScheduledWork: the
+// child runs at read, but for a schedule, so its profile's card must list
+// unattended, as the trigger's own profile's must (#6744).
+func TestAScheduledRunHandsNoTaskToAProfileThatTakesNoScheduledWork(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifact(t, "readonly", "look")); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		return rec != nil && strings.Contains(rec.delegationEndFor(origin.TaskID), fmt.Sprintf(noticeUnattendedChild, "readonly"))
+	})
+	for _, m := range tr.submissions() {
+		if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+			t.Fatalf("a child was minted on %s", m.Subject)
+		}
+	}
+}
+
+// TestAScheduledRunThatMintedAChildReadsItsOwnEnd: a refused request
+// followed by one that mints a child is not a bare hand-off, so the run's
+// own completed stands.
+func TestAScheduledRunThatMintedAChildReadsItsOwnEnd(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p9", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		if rec == nil {
+			return false
+		}
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && ref.DelegationEnd != ""
+	})
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	var childMsg *nats.Msg
+	waitFor(t, "the child's submission", func() bool {
+		for _, m := range tr.submissions() {
+			if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+				childMsg = m
+				return true
+			}
+		}
+		return false
+	})
+	var childEnv lib.Envelope
+	if err := json.Unmarshal(childMsg.Data, &childEnv); err != nil {
+		t.Fatal(err)
+	}
+	child := tr.execFor(t, &childEnv, "cluster")
+	if err := child.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "fine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, lib.Artifact{ArtifactID: "r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "one cluster checked, all fine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	var got lib.TriggerStatusReply
+	waitFor(t, "the run's terminal in its status", func() bool {
+		got = tr.status(t, s, reply.TaskID)
+		return got.Terminal
+	})
+	if got.State != lib.StateCompleted {
+		t.Fatalf("a run that minted a child reads %+v, want completed", got)
+	}
+}

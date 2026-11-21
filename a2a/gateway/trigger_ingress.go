@@ -530,9 +530,10 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 }
 
 // delegationEndFor is the reason a task's delegation minted no child
-// (TaskRef.DelegationEnd), or "".
+// (TaskRef.DelegationEnd), or "" - also when it did mint one on another
+// request, whose result its `completed` may carry (as handOffEnd reads it).
 func (rec *SessionRecord) delegationEndFor(taskID string) string {
-	if ref, ok := rec.TaskRefFor(taskID); ok {
+	if ref, ok := rec.TaskRefFor(taskID); ok && len(ref.Children) == 0 {
 		return ref.DelegationEnd
 	}
 	return ""

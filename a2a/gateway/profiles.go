@@ -67,6 +67,9 @@ const (
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// noticeUnattendedChild refuses a scheduled run's child whose profile
+	// doesn't allow unattended runs (#6744).
+	noticeUnattendedChild = "%s doesn't take scheduled work, so a scheduled run can't hand it a task"
 	// The profile parent's chain and scope refusals (#5686). The chain and
 	// scope named are the parent's own.
 	noticeProfileCycle         = "%s is already working on this request above this task (%s), so it can't take it again"
