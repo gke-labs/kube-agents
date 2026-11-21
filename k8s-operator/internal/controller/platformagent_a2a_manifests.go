@@ -7303,6 +7303,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	env = append(env, a2aSessionIdleEnv(agent)...)
 	// The report reader's token and the broker's address, on every install
 	// (a2a_report_reader.go).
 	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
@@ -9440,4 +9441,23 @@ func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 // without a restart; the gateway reads it per routed task.
 func a2aGatewayScopeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
+}
+
+// a2aSessionIdleEnv renders spec.harness.tuning's session idle times onto the
+// gateway (#2371), each only when set, so an install that sets neither keeps
+// the gateway's defaults (30m, and 5m for a single-turn DM) and its rendered
+// Deployment unchanged. An older gateway ignores A2A_DM_IDLE_TTL.
+func a2aSessionIdleEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Harness == nil || agent.Spec.Harness.Tuning == nil {
+		return nil
+	}
+	t := agent.Spec.Harness.Tuning
+	var env []corev1.EnvVar
+	if t.SessionIdleMinutes != nil {
+		env = append(env, corev1.EnvVar{Name: "A2A_IDLE_TTL", Value: fmt.Sprintf("%dm", *t.SessionIdleMinutes)})
+	}
+	if t.DMSessionIdleMinutes != nil {
+		env = append(env, corev1.EnvVar{Name: "A2A_DM_IDLE_TTL", Value: fmt.Sprintf("%dm", *t.DMSessionIdleMinutes)})
+	}
+	return env
 }

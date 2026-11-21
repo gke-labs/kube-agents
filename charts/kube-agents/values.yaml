@@ -1401,6 +1401,18 @@ platformAgent:
       # maxSessions caps the A2A session pods the install runs at once; the
       # operator's default applies when it is unset.
       # maxSessions: 10
+      # sessionIdleMinutes is how long a session pod is kept after the last
+      # message in its conversation (default 30); a running task always keeps
+      # it, and the next message after a reap gets a new pod with the
+      # conversation's history. It also bounds how long a Slack thread stays
+      # live without a fresh mention after its last task.
+      # sessionIdleMinutes: 30
+      # dmSessionIdleMinutes replaces it for a DM conversation with one
+      # message so far (default 5), so a one-question DM frees its slot of
+      # maxSessions sooner; a second message puts the conversation back on
+      # sessionIdleMinutes. A value above sessionIdleMinutes has no effect
+      # beyond it.
+      # dmSessionIdleMinutes: 5
       # sessionResources are the session pods' CPU and memory requests and
       # limits; only cpu and memory are read. Each key you set to a positive
       # value replaces its default (requests 150m / 320Mi, limits 2 / 2Gi) and
