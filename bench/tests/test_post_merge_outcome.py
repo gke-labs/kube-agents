@@ -48,7 +48,7 @@ def pod(tmp_path, monkeypatch):
     db = tmp_path / "kv.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, merged_at TEXT, applied_at TEXT, "
+            "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, kind TEXT, merged_at TEXT, applied_at TEXT, "
             "health_result TEXT, outcome TEXT, outcome_at TEXT, outcome_detail TEXT, reported_at TEXT)"
         )
     jobs = tmp_path / "jobs.json"
@@ -62,9 +62,10 @@ def pod(tmp_path, monkeypatch):
 
 def _set_record(db: Path, **row) -> None:
     with sqlite3.connect(db) as conn:
-        conn.execute("INSERT OR REPLACE INTO post_merge_records (url, outcome, outcome_detail, reported_at) "
-                     "VALUES (?, ?, ?, ?)",
-                     (PR, row.get("outcome"), row.get("outcome_detail"), row.get("reported_at", "silent: 2026-11-18")))
+        conn.execute("INSERT OR REPLACE INTO post_merge_records (url, kind, outcome, outcome_detail, reported_at) "
+                     "VALUES (?, ?, ?, ?, ?)",
+                     (PR, row.get("kind", "no-pdb"), row.get("outcome"), row.get("outcome_detail"),
+                      row.get("reported_at", "silent: 2026-11-18")))
 
 
 class Forge:
@@ -136,7 +137,7 @@ def _no_kubectl(real):
 
 def _verifier(**overrides) -> post_merge.PostMergeOutcomeVerifier:
     fields = {"type": "post_merge_outcome", "owner": "gke-agentic", "outcome": "verified_fixed",
-              "apply_fixture_role": "no-pdb-workload", **overrides}
+              "apply_fixture_role": "no-pdb-workload", "recipe": "no-pdb", **overrides}
     return post_merge.PostMergeOutcomeVerifier(**fields)
 
 
@@ -286,7 +287,56 @@ def test_read_record_needs_the_sentinel():
 
 
 def test_a_spec_with_the_check_parses():
-    parse_node({"type": "post_merge_outcome", "outcome": "verified_fixed", "apply_fixture_role": "no-pdb-workload"})
+    parse_node({"type": "post_merge_outcome", "outcome": "verified_fixed", "apply_fixture_role": "no-pdb-workload",
+                "recipe": "no-pdb"})
+
+
+def test_a_bad_recipe_name_fails_at_load():
+    for bad in ("No_PDB", "", "-x"):
+        with pytest.raises(ValueError):
+            _verifier(recipe=bad)
+
+
+def test_a_record_of_another_recipe_fails(world):
+    _set_record(world.pod.db, kind="blocking-pdb", outcome="verified_fixed")
+    status, reason, _ = _verifier()._check(5)
+    assert status == "fail" and "recorded as a 'blocking-pdb' fix, not the 'no-pdb' recipe" in reason
+
+
+def test_an_edited_manifest_is_applied_at_its_head_and_put_back_at_its_base(world, monkeypatch):
+    import base64
+
+    monkeypatch.setattr(post_merge, "DRIVE_DEADLINE_SEC", 0.0)
+    edited = "clusters/seeded-a/seeded-reliability/limits.yaml"
+    world.forge.extra_files = [{"filename": edited, "status": "modified"},
+                               {"filename": "clusters/seeded-a/kustomization.yaml", "status": "modified"}]
+    real_get = world.forge.get
+
+    def get(url, token, timeout):
+        if f"/contents/{edited}?ref=head1" in url:
+            return 200, {"sha": "h", "content": base64.b64encode(b"kind: LimitRange # head\n").decode()}
+        if f"/contents/{edited}?ref=base1" in url:
+            return 200, {"sha": "b", "content": base64.b64encode(b"kind: LimitRange # base\n").decode()}
+        if url.endswith("/pulls/7"):
+            return 200, {"merged": True, "base": {"sha": "base1"}, "head": {"sha": "head1"}}
+        return real_get(url, token, timeout)
+
+    monkeypatch.setattr(post_merge, "_forge_get_json", get)
+    _set_record(world.pod.db, outcome="verified_fixed")
+    _verifier().verify(0)
+    assert "kind: LimitRange # head\n" in world.applied
+    assert world.applied[-1] == "kind: LimitRange # base\n", "cleanup applies the base back"
+    assert not any("kustomization" in text for text in world.applied)
+
+
+def test_an_edited_manifest_unreadable_at_its_base_errors_before_the_merge(world, monkeypatch):
+    world.forge.extra_files = [{"filename": "clusters/seeded-a/seeded-reliability/limits.yaml", "status": "modified"}]
+    real_get = world.forge.get
+    monkeypatch.setattr(post_merge, "_forge_get_json",
+                        lambda url, token, timeout: (404, {}) if "limits.yaml?ref=" in url else real_get(url, token, timeout))
+    status, reason, _ = _verifier()._check(5)
+    assert status == "error" and "could not be read at its head and base" in reason
+    assert not any(url.endswith("/merge") for _, url in world.forge.writes)
 
 
 def test_the_entry_point_is_published():
