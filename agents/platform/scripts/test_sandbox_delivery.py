@@ -304,6 +304,11 @@ def local_imports(path: Path, universe: set[str]) -> set[str]:
     body, and `from github_token_refresh import refresh_git_credentials` and
     `import gitops_workspace` are different nodes.
     """
+    if path.is_dir():
+        # A package: what its modules import, so a sibling import inside it is
+        # held to the allowlist like a top-level script's. Recursive, so a
+        # recipe's own module (`fix_recipes/<kind>/checks.py`) counts too.
+        return set().union(*(local_imports(p, universe) for p in sorted(path.rglob("*.py"))))
     if path.suffix != ".py":
         return set()
     found = set()
@@ -312,7 +317,9 @@ def local_imports(path: Path, universe: set[str]) -> set[str]:
             found.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             found.add(node.module.split(".")[0])
-    return {f"{m}.py" for m in found if f"{m}.py" in universe}
+    # A package (`fix_recipes`) counts by its directory's name, which is what a
+    # directory COPY puts under /opt/defaults/scripts.
+    return {f"{m}.py" if f"{m}.py" in universe else m for m in found if f"{m}.py" in universe or m in universe}
 
 
 class SandboxDelivery(unittest.TestCase):
@@ -320,6 +327,7 @@ class SandboxDelivery(unittest.TestCase):
         self.baked = baked_scripts()
         self.stubbed = stubbed_scripts()
         self.shared = {p.name for p in SCRIPTS.iterdir() if p.suffix in (".py", ".sh")}
+        self.shared |= {p.name for p in SCRIPTS.iterdir() if (p / "__init__.py").is_file()}
 
     def test_every_script_an_agent_is_told_to_run_reaches_the_sandbox(self):
         """Or is stubbed, which is the deliberate answer for the agent-pod-only ones.
@@ -558,7 +566,7 @@ class SandboxDelivery(unittest.TestCase):
             if p.is_file() and not p.name.startswith("test_")
         ]
         for path in candidates:
-            if not path.exists():
+            if not path.is_file():
                 continue
             first = path.read_bytes().split(b"\n", 1)[0]
             if first.startswith(b"#!") and b"/opt/hermes/" in first:

@@ -362,6 +362,12 @@ const (
 	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
 	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
 
+	// a2aTierMembershipEnvVar carries spec.tiers.membership to the gateway
+	// as backend:user=tier, comma-separated, plaintext like the allowlists:
+	// the gateway HMACs the ids. Spelled the same in a2a/gateway/
+	// tier_membership.go (EnvTierMembership).
+	a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP"
+
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
 	// address it listens on. The host is the pod's loopback, not every
@@ -1563,6 +1569,28 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	return env
 }
 
+// a2aTierMembershipEnv renders spec.tiers.membership for the gateway
+// (#3659), and nothing when it's empty, so an install without it renders as
+// before. The schema keeps commas, equals signs and spaces out of a user, so
+// the list joins as it is. A person listed twice (two cases of one Google
+// Chat email, which the schema's keys tell apart and the webhook refuses, but
+// a cluster without the webhook admits) keeps the first entry: the gateway
+// refuses a repeat at boot, and one bad entry mustn't stop it.
+func a2aTierMembershipEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Tiers == nil || len(agent.Spec.Tiers.Membership) == 0 {
+		return nil
+	}
+	entries := make([]string, 0, len(agent.Spec.Tiers.Membership))
+	seen := map[string]bool{}
+	for _, m := range agent.Spec.Tiers.Membership {
+		if key := tierMemberKey(m); !seen[key] {
+			seen[key] = true
+			entries = append(entries, m.Backend+":"+m.User+"="+m.Tier)
+		}
+	}
+	return []corev1.EnvVar{{Name: a2aTierMembershipEnvVar, Value: strings.Join(entries, ",")}}
+}
+
 // a2aAgentDoorEnabled reports whether the operator was deployed with the A2A
 // door flag, read the same way and failing shut the same way.
 func a2aAgentDoorEnabled() bool {
@@ -1589,7 +1617,14 @@ func a2aGchatHomeSpace(agent *agentv1alpha1.PlatformAgent) string {
 	if !googleChatEnabled(agent) {
 		return ""
 	}
-	home := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)
+	return gchatSpaceName(agent.Spec.Integration.GoogleChat.HomeChannel)
+}
+
+// gchatSpaceName is s trimmed when it is a Chat space name ("spaces/<id>",
+// nothing nested), and "" otherwise. The same rule reads the CR field and a
+// space the gateway learned (platformagent_home_channel_record.go).
+func gchatSpaceName(s string) string {
+	home := strings.TrimSpace(s)
 	id, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)
 	if !ok || id == "" || strings.Contains(id, "/") {
 		return ""
@@ -1624,8 +1659,8 @@ func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 
 // a2aNotifyHomePlatforms is every armed platform whose home channel the CR
 // sets, Chat first (A2A_NOTIFY_PLATFORM), and empty when none is. It reads
-// CR fields only, so a learned channel rolls no pod: the agent adds Slack
-// from the projected file, and sends home posts to every armed route when no
+// CR fields only, so a learned channel rolls no pod: the agent adds Slack or
+// Chat from its projected file, and sends home posts to every armed route when no
 // platform has a home (agents/platform/scripts/chat_notify.py,
 // routed_platforms).
 func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent) []string {
@@ -1643,6 +1678,12 @@ func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 // channel to post to.
 func a2aGchatHasHome(agent *agentv1alpha1.PlatformAgent) bool {
 	return a2aGchatNotifyArmed(agent) && a2aGchatHomeSpace(agent) != ""
+}
+
+// a2aGchatHasEffectiveHome is a2aSlackHasHome for Chat: armed with a home
+// space from the CR or the admitted record. Only the status reads it.
+func a2aGchatHasEffectiveHome(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) bool {
+	return a2aGchatNotifyArmed(agent) && a2aGchatHomeEffective(agent, rec) != ""
 }
 
 // a2aSlackHasHome is whether Slack's chat.notify route is armed with a home
@@ -4295,7 +4336,12 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   # it declared more than the default, or recreates the stream, and
   # provisioning does none of those. Note that
   # set -euo pipefail exits with the failing command's own status, which is
-  # not 2, so an unexpected failure stays on the retry budget.
+  # usually not 2, so an unexpected failure stays on the retry budget. The
+  # bus reshape treats a Job failed on this exit as provisioned for a
+  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth), and
+  # checks the bus holds every stream besides, since a shell error can exit
+  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate keeps this the
+  # script's only explicit exit 2.
   exit 2
 fi
 
@@ -5381,12 +5427,37 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3, or what the last pass recorded
 		return nil
 	}
+	if running != 0 && want == running {
+		// A person's request to recreate TASKS at the width the CR renders
+		// (the bus-reshape annotation): it starts only on a settled bus
+		// whose TASKS is narrower than that (busReshapeRefusal).
+		if err := r.maybeStartBusReshape(ctx, agent, running); err != nil {
+			return err
+		}
+	}
 	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
 		// A migration under way decides the count, whatever the field and
 		// the StatefulSet read mid-way.
 		n, err := r.advanceBusMigration(ctx, agent, time.Now())
 		if err != nil {
 			return err
+		}
+		if busMigrationLeg(run.Leg) == busMigrationReshape {
+			// A reshape runs at the count the bus runs and never changes it.
+			n = running
+			if n == 0 {
+				n = busReshapeServers(agent)
+			}
+			if busMigrationTerminal(busMigrationPhase(run.Phase)) {
+				// The provision Job that refused the narrow TASKS has the
+				// same digested name for the same render, so nothing would
+				// run it again and Ready would stay down on its failure.
+				// Deleted, the next pass runs a fresh one against the
+				// widened (or, if the run was undone, unchanged) TASKS.
+				if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
+					return err
+				}
+			}
 		}
 		agent.Status.BusReplicas = int32(n) // #nosec G115 -- 1 or 3
 		return nil
@@ -5463,8 +5534,15 @@ func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, no
 // and noteBusMigrationEcho records the prune, so the next pass refuses to
 // start one, with its Warning Event.
 func (r *PlatformAgentReconciler) startBusMigrationPersisted(ctx context.Context, agent *agentv1alpha1.PlatformAgent, running, want int) error {
+	return r.persistBusMigrationStart(ctx, agent, func() { startBusMigration(agent, running, want, metav1.Now()) })
+}
+
+// persistBusMigrationStart runs start, which may record a new run in
+// agent's status, and writes that record before the pass goes on, as
+// startBusMigrationPersisted says.
+func (r *PlatformAgentReconciler) persistBusMigrationStart(ctx context.Context, agent *agentv1alpha1.PlatformAgent, start func()) error {
 	before := agent.Status.BusMigration
-	startBusMigration(agent, running, want, metav1.Now())
+	start()
 	if agent.Status.BusMigration == before {
 		return nil // nothing started
 	}
@@ -5510,7 +5588,9 @@ func busMigrationWouldStart(agent *agentv1alpha1.PlatformAgent, want int) bool {
 	// operator does not run has no target it can read, so any count it is
 	// asked for starts one: reading it as a shrink would ignore a request
 	// for one server, without a word.
-	if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+	if leg := busMigrationLeg(run.Leg); !busMigrationLegKnown(leg) || leg == busMigrationReshape {
+		// A reshape doesn't change the count, so it has no target that
+		// another count could be compared with.
 		return true
 	}
 	return want != busMigrationTarget(run) || agent.Annotations[a2aBusMigrationStartAnnotation] == run.RunID
@@ -6347,7 +6427,7 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				Verbs:         []string{"get"},
 			},
 			// The home-channel record, one named ConfigMap: the gateway's
-			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
+			// learn (a2a/gateway/home_channel.go) reads and patches it,
 			// and the operator reads it into the projected file both pods
 			// mount and the HomeChannelUnset condition
 			// (platformagent_home_channel_record.go).
@@ -6960,13 +7040,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
-	// The home-channel projection, read by the notify route and the learner
-	// (a2a/gateway/slack_home_channel.go), whenever Slack is armed, Chat
-	// beside it or not: Chat's home is the CR's and reads no file, so a
-	// Chat-only gateway's template stays as it was.
+	// The home-channel projection, read by the notify routes and the learners
+	// (a2a/gateway/home_channel.go), whenever Slack or Chat is armed: each
+	// reads its own file in the one directory.
 	var homeVolumes []corev1.Volume
 	var homeMounts []corev1.VolumeMount
-	if a2aSlackArmed(agent) {
+	if a2aHomeChannelProjected(agent) {
 		homeVolumes = []corev1.Volume{homeChannelProjectionVolume(agent)}
 		homeMounts = []corev1.VolumeMount{homeChannelProjectionMount(a2aGatewayChatHomeDir)}
 	}
@@ -6999,6 +7078,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// only: proactive posts have nowhere to go.
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
+		}
+		// The learned-home contract for Chat, as for Slack above: Chat's own
+		// policy, and the record, image and switch when the Slack block has
+		// not rendered them already.
+		chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomePolicyEnvVar, Value: gchatHomeChannelPolicy(agent)})
+		if !a2aSlackArmed(agent) {
+			chatEnv = append(chatEnv,
+				corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},
+				corev1.EnvVar{Name: a2aGatewaySelfImageEnvVar, Value: a2aGatewayImage()},
+				corev1.EnvVar{Name: a2aHomeChannelLearnEnvVar, Value: a2aHomeChannelLearnEnvValue},
+			)
 		}
 		// Answer feedback is on unless the install turns it off; only the
 		// off is rendered, as on Slack, so the pod is unchanged by default.
@@ -7170,6 +7260,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
 	env = append(env, a2aTargetAllowlistEnv(agent)...)
+	env = append(env, a2aTierMembershipEnv(agent)...)
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
 	}

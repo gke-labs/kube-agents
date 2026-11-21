@@ -6828,7 +6828,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 6)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 7)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -8226,6 +8226,112 @@ class TestComputeDeclaredShapes(HarnessTestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025")])
         self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+
+
+class TestNetworkingDeclaredShapes(HarnessTestCase):
+    """The networking stream's one posture: two peered networks kept at different MTUs. One arm, one object kind."""
+
+    NETWORKING = "gcp-networking-fabric-audit"
+    PROJECT = "project/acme-prod"
+    # The collector's excerpt for 2.4 (networking_audit.py check_mtu_mismatch),
+    # the pair sorted so `default` leads.
+    MTU_EXCERPT = "default mtu=1460 peered with jumbo-storage mtu=8896"
+
+    def _mtu_finding(self, fid="mtu", obj="NetworkPeering/default--jumbo-storage", namespace=""):
+        return make_finding(fid=fid, check="mtu-packet-fragmentation", severity="major", cluster=self.PROJECT, namespace=namespace, obj=obj, excerpt=self.MTU_EXCERPT, command="gcloud compute networks list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "align the MTUs"})
+
+    def _world_open_finding(self):
+        return make_finding(fid="open", check="firewall-world-open-ingress", severity="critical", cluster=self.PROJECT, namespace="", obj="FirewallRule/allow-etcd-anywhere", excerpt="tcp:2379 from 0.0.0.0/0 reaches 1 RUNNING instance with an external address", command="gcloud compute firewall-rules list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "narrow the source range"})
+
+    def _doc(self, findings):
+        clusters = [{"name": self.PROJECT, "location": "-", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.NETWORKING, self.PROJECT))}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.NETWORKING, clusters=clusters), self.NETWORKING)
+
+    def _declaration(self, obj, check="mtu-packet-fragmentation", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/jumbo-peering.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_mtu_mismatch(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.NETWORKING), frozenset({"mtu-packet-fragmentation"}))
+        for fault in ("subnet-ip-exhaustion", "cloud-nat-exhaustion", "psc-routing-deadlock", "cloud-armor-false-positive", "firewall-world-open-ingress"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.NETWORKING))
+
+    def test_a_declaration_moves_the_peering_and_leaves_the_world_open_rule(self):
+        # One note names the peering and the firewall rule. The peering moves;
+        # the rule is a fault and is never looked up, whatever the note says.
+        doc = self._doc([self._mtu_finding(), self._world_open_finding()])
+        declarations = [self._declaration("NetworkPeering/default--jumbo-storage"), self._declaration("FirewallRule/allow-etcd-anywhere", check="firewall-world-open-ingress")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["FirewallRule/allow-etcd-anywhere"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual(doc["declared"][0]["declaration"]["path"], "knowledge/jumbo-peering.md")
+        self.assertNotIn("DECLARATION NOT APPLIED", err.getvalue())
+
+    def test_a_scoped_declaration_covers_its_project_alone(self):
+        # `cluster` on the item is the finding's `project/<id>`; a note scoped
+        # to another project leaves this one's peering a finding.
+        doc = self._doc([self._mtu_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage", cluster="project/other-prod")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPeering/default--jumbo-storage"])
+        doc = self._doc([self._mtu_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage", cluster=self.PROJECT)])
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
+
+    def test_the_manifest_route_declares_a_covered_candidate(self):
+        candidate = {"check": "mtu-packet-fragmentation", "cluster": self.PROJECT, "namespace": "", "object": "NetworkPeering/default--jumbo-storage", "severity": "major", "excerpt": self.MTU_EXCERPT}
+        manifest = {"clusters": [{"name": self.PROJECT, "candidates": [candidate]}]}
+        doc = self._doc([])
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, [self._declaration("NetworkPeering/default--jumbo-storage")], manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(candidate))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NetworkPeering/default--jumbo-storage"])
+
+    def test_an_incomplete_search_withholds_the_peering_and_publishes_the_faults(self):
+        doc = self._doc([self._mtu_finding(), self._world_open_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual([f["object"] for f in withheld], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["FirewallRule/allow-etcd-anywhere"])
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_peering(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="mtu-packet-fragmentation", cluster=self.PROJECT, namespace="", obj="NetworkPeering/default--jumbo-storage", title="jumbo-storage stays at 8896 beside default by design", repo="acme/fleet", path="knowledge/jumbo-peering.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+        for fault in ("subnet-ip-exhaustion", "cloud-nat-exhaustion", "psc-routing-deadlock", "cloud-armor-false-positive", "firewall-world-open-ingress"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "mtu-packet-fragmentation"
+        for obj in ("Network/jumbo-storage", "Project/acme-prod", "Subnet/jumbo-a"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("networkpeering", str(cm.exception))
+
+    def test_a_namespace_a_worker_wrote_onto_the_peering_is_folded_before_the_join(self):
+        # The collector files the peering with no namespace on a project
+        # target and the note writes `namespace: ""`; a worker's namespace
+        # would give the pair a second identity, so the validator empties it
+        # (UNNAMESPACED_CHECKS) and the declaration still joins.
+        doc = self._doc([self._mtu_finding(namespace="default")])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.networkpeering-default-jumbo-storage", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage")])
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):
@@ -26707,6 +26813,7 @@ class TestTriageMarkedFindings(BaseTestCase):
             "namespace-token",
             "service-selector",
             "hard-spread",
+            "reserved-pool",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)

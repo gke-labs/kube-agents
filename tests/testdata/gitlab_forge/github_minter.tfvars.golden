@@ -92,6 +92,7 @@ chat_topic_name           = "platform-agent-chat-events"
 chat_subscription_name    = "platform-agent-chat-events-sub"
 google_chat_allowed_users = []
 google_chat_home_channel  = ""
+google_chat_home_channel_policy = ""
 google_chat_mode          = "default"
 
 enable_slack            = false

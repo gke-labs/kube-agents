@@ -7,6 +7,7 @@ reaches the right cluster - or is rejected outright.
 Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
+import base64
 import contextlib
 import http.client
 import http.server
@@ -1232,6 +1233,130 @@ class VcsCallErrorTest(unittest.TestCase):
                 self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
                 self.assertTrue(stream.closed, "vcs_call left the refusal open")
 
+    @staticmethod
+    def _nested_lists(levels):
+        """The JSON text of `levels` lists, one inside the other."""
+        return b"[" * levels + b"]" * levels
+
+    def test_a_2xx_answer_nested_deeper_than_the_bound_is_the_too_deep_error(self):
+        bound = credential_proxy_client.MAX_VCS_BODY_DEPTH
+        # The answer object is one level; its `entries` hold the rest.
+        with self._no_token_file, self._answer(b'{"entries": %s}' % self._nested_lists(bound - 1)):
+            answer = credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+        self.assertFalse(credential_proxy_client.nests_deeper_than(answer, bound))
+        self.assertTrue(credential_proxy_client.nests_deeper_than(answer, bound - 1))
+        for levels in (bound, 4 * bound):
+            body = b'{"entries": %s}' % self._nested_lists(levels)
+            with self.subTest(levels=levels), self._no_token_file, self._answer(body):
+                with self.assertRaises(credential_proxy_client.VcsAnswerTooDeep) as caught:
+                    credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                # A ValueError, as for a body that is not JSON, and nothing of the body.
+                self.assertIsInstance(caught.exception, ValueError)
+                self.assertNotIn("[", str(caught.exception))
+
+    def _refused_with(self, status, body):
+        stream = io.BytesIO(body)
+        error = self._held_refusal(status, stream)
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+        self.assertTrue(stream.closed, "vcs_call left the refusal open")
+        return caught.exception
+
+    LEFT_OUT = "left out: nested too deep to read"
+
+    def test_a_refusal_nested_deeper_than_the_bound_keeps_its_keys_and_a_text_takes_each_part_that_is_too_deep(self):
+        """The refusal object is one level; a value has the rest. The caller still reads the code."""
+        bound = credential_proxy_client.MAX_VCS_BODY_DEPTH
+        at_the_bound, too_deep = self._nested_lists(bound - 1), self._nested_lists(bound)
+
+        kept = self._refused_with(409, b'{"error": "the base branch moved", "code": "BASE_MOVED", "detail": %s}' % at_the_bound)
+        self.assertTrue(kept.payload["detail"] == json.loads(at_the_bound))
+
+        # The deepest value that passes stays beside one that is too deep.
+        mixed = self._refused_with(409, b'{"error": "moved", "detail": %s, "more": %s}' % (at_the_bound, too_deep))
+        self.assertTrue(mixed.payload["detail"] == json.loads(at_the_bound))
+        self.assertEqual((mixed.payload["error"], mixed.payload["more"]), ("moved", self.LEFT_OUT))
+        self.assertFalse(credential_proxy_client.nests_deeper_than(mixed.payload, bound))
+
+        for status, code, part in ((409, "BASE_MOVED", "detail"), (404, "FORGE_NOT_FOUND", "detail"), (429, "FORGE_RATE_LIMITED", "entries")):
+            with self.subTest(code=code):
+                body = b'{"error": "the forge refused", "code": "%s", "%s": %s}' % (code.encode(), part.encode(), too_deep)
+                refused = self._refused_with(status, body)
+                self.assertEqual(refused.payload, {"error": "the forge refused", "code": code, part: self.LEFT_OUT})
+                self.assertEqual(refused.json_body, refused.payload)
+                self.assertEqual(str(refused), "the forge refused")
+
+        # A list that is within the bound stays beside a part that is too deep.
+        refused = self._refused_with(
+            413,
+            b'{"error": "too large", "code": "SNAPSHOT_TOO_LARGE", "entries": [{"path": "a", "bytes": 9}], "ceiling": 5, "detail": %s}'
+            % too_deep,
+        )
+        self.assertEqual(
+            refused.payload,
+            {
+                "error": "too large", "code": "SNAPSHOT_TOO_LARGE", "entries": [{"path": "a", "bytes": 9}], "ceiling": 5,
+                "detail": self.LEFT_OUT,
+            },
+        )
+
+        # An `error` that is too deep becomes the status; a refusal with no `error` gets none.
+        refused = self._refused_with(422, b'{"error": %s, "code": "FORGE_REJECTED", "detail": "a title is needed"}' % too_deep)
+        self.assertEqual(refused.payload, {"error": "HTTP 422", "code": "FORGE_REJECTED", "detail": "a title is needed"})
+        refused = self._refused_with(403, b'{"message": "blocked", "rule": %s}' % too_deep)
+        self.assertEqual(refused.payload, {"message": "blocked", "rule": self.LEFT_OUT})
+
+        # No version control on the broker is still read from the code.
+        stream = io.BytesIO(b'{"error": "not available", "code": "VCS_UNAVAILABLE", "detail": %s}' % too_deep)
+        error = self._held_refusal(404, stream)
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+            with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
+                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+
+    def test_a_busy_refusal_with_a_part_that_is_too_deep_is_sent_again_and_its_text_is_kept(self):
+        """A refusal that says it came before admission ran nothing; a `detail` that is too deep does not change that."""
+        bound = credential_proxy_client.MAX_VCS_BODY_DEPTH
+        for levels in (bound - 1, bound, 4 * bound):
+            # The refusal object is one level; its `detail` holds the rest.
+            busy = self._busy("profile")[:-1] + b', "detail": ' + self._nested_lists(levels) + b"}"
+            calls, opener = self._replies((503, busy, {}), {"proposal": {"number": 3}})
+            with self.subTest(levels=levels), opener, patch("sys.stderr", new_callable=io.StringIO) as err:
+                result, _ = self._call()
+                self.assertEqual({"proposal": {"number": 3}}, result)
+                self.assertEqual(2, len(calls))
+                # The broker's own text is in the line, and nothing of the deep part.
+                self.assertIn("(HTTP 503): busy;", err.getvalue())
+                self.assertNotIn("[[", err.getvalue())
+
+        # The refusal that is raised when the retries are spent has the text in place of the part.
+        busy = self._busy("profile")[:-1] + b', "detail": ' + self._nested_lists(bound) + b"}"
+        calls, opener = self._replies(*([(503, busy, {})] * 10))
+        with opener, patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                self._call()
+        self.assertGreater(len(calls), 1)
+        self.assertEqual((caught.exception.payload["bound"], caught.exception.payload["detail"]), ("profile", self.LEFT_OUT))
+
+    def test_a_busy_refusal_whose_retry_mark_is_too_deep_is_sent_one_time(self):
+        """A mark that is too deep is a mark that the client does not know, and not one that is absent:
+        a busy refusal with no `bound` is sent again, and one with a `bound` that it cannot read is not."""
+        too_deep = self._nested_lists(credential_proxy_client.MAX_VCS_BODY_DEPTH)
+        code = credential_proxy_client.BUSY_CODE.encode()
+        bodies = {
+            "bound": b'{"error": "busy", "code": "%s", "before_admission": true, "bound": %s}' % (code, too_deep),
+            "before_admission": b'{"error": "busy", "code": "%s", "bound": "profile", "before_admission": %s}' % (code, too_deep),
+            "code": b'{"error": "busy", "bound": "profile", "before_admission": true, "code": %s}' % too_deep,
+        }
+        for mark, body in bodies.items():
+            calls, opener = self._replies((503, body, {}), {"proposal": {"number": 3}})
+            with self.subTest(mark=mark), opener, patch("sys.stderr", new_callable=io.StringIO) as err:
+                with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                    self._call()
+                self.assertEqual(1, len(calls))
+                self.assertEqual(caught.exception.payload[mark], self.LEFT_OUT)
+                self.assertEqual("", err.getvalue())
+
     def test_a_2xx_answer_that_is_an_object_comes_back_as_it_is(self):
         for answer in ({}, {"baseBranch": "main", "entries": [1, 2]}):
             with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
@@ -1411,6 +1536,54 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual(1, sent["exit_code"])
         self.assertNotIn("request", sent)
         self.assertIn("does not hold a task credential", sent["stderr"])
+
+    @staticmethod
+    def jwt_shaped(nats):
+        """An unsigned header.payload.sig string: the shim reads claims, never verifies."""
+
+        def segment(value):
+            return base64.urlsafe_b64encode(json.dumps(value).encode("utf-8")).rstrip(b"=").decode("ascii")
+
+        return f"{segment({'typ': 'JWT'})}.{segment({'jti': 'J', 'nats': nats})}.c2ln"
+
+    def headers_for(self, path):
+        with patch.dict("os.environ", self.task_env(), clear=False):
+            return credential_proxy_client.task_credential_headers(path)
+
+    def test_a_report_credential_is_sent_only_on_the_audit_report_routes(self):
+        # No target: the broker admits it on /v1/audit-reports alone, so on
+        # any other call the task goes without and keeps local-only commands.
+        token = self.jwt_shaped({"type": "task", "tier": "report", "trigger": {"name": "t"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reportsx", "/v1/audit", "/"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
+        for path in ("/v1/audit-reports", "/v1/audit-reports/fleet-audit/k/latest", "/v1/audit-reports?x=1"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+        sent = self.run_shim(["kubectl", "version", "--client"], self.task_env())
+        self.assertEqual(0, sent["exit_code"])
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
+
+    def test_a_targeted_credential_is_sent_on_every_route(self):
+        token = self.jwt_shaped({"type": "task", "target": {"cluster": "c"}})
+        self.token_path.write_text(token, encoding="utf-8")
+        for path in ("/v1/exec", "/v1/mcp/developer_knowledge", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for(path))
+
+    def test_a_credential_whose_claims_cannot_be_read_is_sent_as_before(self):
+        # The broker refuses a bad one loudly; leaving it off would hide that.
+        for token in ("a.b.c", "a.-_-.c", "a." + base64.urlsafe_b64encode(b"[1]").decode().rstrip("=") + ".c", "abc"):
+            with self.subTest(token=token):
+                self.token_path.write_text(token, encoding="utf-8")
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token}, self.headers_for("/v1/exec"))
+
+    def test_no_token_file_sends_nothing_on_any_route(self):
+        self.token_path.unlink()
+        for path in ("/v1/exec", "/v1/audit-reports"):
+            with self.subTest(path=path):
+                self.assertEqual({}, self.headers_for(path))
 
     def test_kubeconfig_does_not_choose_the_cluster_in_a_task(self):
         sent = self.run_shim(["kubectl", "get", "pods"], self.task_env(KUBECONFIG=str(self.kubeconfig)))
@@ -3267,14 +3440,13 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertIn("the command may have run", err.getvalue())
 
     def test_an_object_that_holds_only_its_exit_code_still_runs_as_before(self):
-        """An absent `stdout` or `stderr` is empty, as it was. An integer exit code is the shim's
-        as it stands, also one that no process can exit with: its value is not checked."""
+        """An absent `stdout` or `stderr` is empty, as it was. An exit code from 0 to 255 is the
+        shim's as it stands."""
         answers = (
             ({"exitCode": 3}, 3),
             ({"exitCode": 0, "stdout": "ok\n"}, 0),
             ({"exitCode": 0, "kubeconfig": None}, 0),
-            ({"exitCode": 300}, 300),
-            ({"exitCode": -1}, -1),
+            ({"exitCode": 255}, 255),
         )
         for answer, expected in answers:
             with self.subTest(answer=answer):
@@ -3282,6 +3454,63 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
                 self.assertEqual(expected, code)
                 self.assertEqual(answer.get("stdout", ""), out)
                 self.assertEqual("", err)
+
+    def test_a_negative_exit_code_is_a_signal_death_with_its_output_and_128_plus_the_signal(self):
+        """The broker sends a command's return code, and a command that a signal ended has the
+        signal's negative number. A shell reports that death as 128 plus the number."""
+        cases = ((-9, 137), (-15, 143), (-1, 129), (-127, 255))
+        for exit_code, expected in cases:
+            with self.subTest(exit_code=exit_code):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, {"stdout": "NAME STATUS\n", "stderr": "Killed\n", "exitCode": exit_code})])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(expected, code)
+                self.assertEqual("NAME STATUS\n", out)
+                self.assertEqual("Killed\n", err)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+
+    def test_a_signal_death_with_a_cut_payload_is_still_the_status_of_a_cut_payload(self):
+        """A cut stdout is not the command's answer, whatever ended the command. A cut that fell
+        on stderr alone keeps the command's own status, here the signal's."""
+        cut_stdout = {"stdout": "{", "exitCode": -9, "truncated": True, "bytesWritten": 1, "limit": 4096}
+        code, _, _ = self.run_shim(self.broker([(200, {}, cut_stdout)]))
+        self.assertEqual(credential_proxy_client.EXIT_OUTPUT_TRUNCATED, code)
+        cut_stderr = {"stdout": "{}", "stderr": "I0101 ...", "exitCode": -9, "truncated": True, "stdoutTruncated": False}
+        code, out, _ = self.run_shim(self.broker([(200, {}, cut_stderr)]))
+        self.assertEqual(137, code)
+        self.assertEqual("{}", out)
+
+    def test_an_exit_code_that_no_command_can_have_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
+        """Above 255 no status exists, and `sys.exit` would wrap it: 256 would read as success.
+        Below -127 no signal exists. The line names the field and the range, never the value."""
+        shape = "the response's exitCode is outside -127 to 255"
+        for exit_code in (256, 300, 2147483648, 10**30, -128, -2147483648):
+            with self.subTest(exit_code=exit_code):
+                self.sleeps.clear()
+                answer = {"stdout": "NAME STATUS\n", "stderr": "a warning\n", "exitCode": exit_code}
+                broker = self.broker([(200, {}, answer), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+
+    def test_an_exit_code_that_no_command_can_have_is_not_sent_to_the_fallback(self):
+        exec_tier = self.broker([(200, {}, {"stdout": "NAME STATUS\n", "exitCode": 256})])
+        stateful = self.broker([(200, {}, OK)])
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                sleep_fn=self.sleeps.append, rng=self.rng,
+            )
+        self.assertEqual(1, code)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual(1, len(exec_tier.requests))
+        self.assertEqual([], stateful.requests)
+        self.assertIn("the command may have run", err.getvalue())
 
     def test_a_2xx_body_that_is_not_utf_8_is_the_line_of_a_body_that_is_not_json(self):
         for body in (b"\xff", b'{"stdout": "\xff", "exitCode": 0}'):

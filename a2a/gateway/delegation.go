@@ -314,7 +314,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		if addressee != targetPlatform {
 			tier := capability.Tier(parent.Tier)
 			if !profileParent {
-				if tier, err = requesterTier(*parent.Requester); err != nil {
+				authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
+				if tier, err = g.tierFor(authors, unknown); err != nil {
 					refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
 					return nil, false
 				}

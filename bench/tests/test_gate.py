@@ -537,7 +537,7 @@ def test_report_excerpt_collapses_strips_and_truncates(raw, expected):
 def test_a_report_with_a_lone_surrogate_still_grades_and_writes_the_hand_off(
     kanban_task, make_run, tmp_path, capsys
 ):
-    """results.json can carry `\ud83d` as a JSON escape; json.loads keeps it
+    """results.json can carry `\\ud83d` as a JSON escape; json.loads keeps it
     as a lone surrogate, and printing that raises under a UTF-8 stdout. The
     gate must still print its lines and write the case JSON."""
     def broken(rec):

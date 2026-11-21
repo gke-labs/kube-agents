@@ -84,6 +84,8 @@ class SharedHomeFileContractTest(unittest.TestCase):
             sys.path.pop(0)
         self.assertEqual(kanban_chat_notify.HOME_FILE_DIR, chat_notify.HOME_FILE_DIR)
         self.assertEqual(kanban_chat_notify.HOME_FILE_KEY, chat_notify.HOME_FILE_KEY)
+        self.assertEqual(kanban_chat_notify.GCHAT_HOME_FILE_KEY, chat_notify.GCHAT_HOME_FILE_KEY)
+        self.assertEqual(kanban_chat_notify.GCHAT_HOME_FILE_PLATFORM, chat_notify.GCHAT_PLATFORM)
 
 
 class RoutedPlatformFromTheFileTest(unittest.TestCase):
@@ -219,6 +221,7 @@ class RoutedPlatformsCopiesAgreeTest(unittest.TestCase):
     PLATFORM_VALUES = (None, "google_chat", "slack", "google_chat,slack")
     CONVERSATIONS_VALUES = (None, "google_chat", "slack", "google_chat,slack")
     FILE_VALUES = (None, "", "C0BUCG2F43E")
+    GCHAT_FILE_VALUES = (None, "", "spaces/AAA")
 
     def setUp(self):
         scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents", "platform", "scripts")
@@ -235,8 +238,8 @@ class RoutedPlatformsCopiesAgreeTest(unittest.TestCase):
             directory.start()
             self.addCleanup(directory.stop)
 
-    def _set_file(self, value):
-        path = os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY)
+    def _set_file(self, value, key=kanban_chat_notify.HOME_FILE_KEY):
+        path = os.path.join(self.dir, key)
         if value is None:
             if os.path.exists(path):
                 os.remove(path)
@@ -248,19 +251,42 @@ class RoutedPlatformsCopiesAgreeTest(unittest.TestCase):
         for platform in self.PLATFORM_VALUES:
             for conversations in self.CONVERSATIONS_VALUES:
                 for file_value in self.FILE_VALUES:
-                    env = {
-                        kanban_chat_notify.NOTIFY_PLATFORM_ENV: platform,
-                        kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: conversations,
-                    }
-                    with self.subTest(platform=platform, conversations=conversations, file=file_value):
-                        self._set_file(file_value)
-                        with mock.patch.dict(os.environ, {}):
-                            for name, value in env.items():
-                                os.environ.pop(name, None)
-                                if value is not None:
-                                    os.environ[name] = value
-                            self.assertEqual(kanban_chat_notify.routed_platforms(),
-                                             self.chat_notify.routed_platforms())
+                    for gchat_value in self.GCHAT_FILE_VALUES:
+                        env = {
+                            kanban_chat_notify.NOTIFY_PLATFORM_ENV: platform,
+                            kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: conversations,
+                        }
+                        with self.subTest(platform=platform, conversations=conversations, file=file_value, gchat=gchat_value):
+                            self._set_file(file_value)
+                            self._set_file(gchat_value, kanban_chat_notify.GCHAT_HOME_FILE_KEY)
+                            with mock.patch.dict(os.environ, {}):
+                                for name, value in env.items():
+                                    os.environ.pop(name, None)
+                                    if value is not None:
+                                        os.environ[name] = value
+                                self.assertEqual(kanban_chat_notify.routed_platforms(),
+                                                 self.chat_notify.routed_platforms())
+
+    def test_a_learned_home_never_outranks_a_configured_one(self):
+        # (A2A_NOTIFY_PLATFORM, slack_home, gchat_home, expected): configured
+        # platforms first, then learned ones, Chat before Slack in each group.
+        rows = (
+            ("slack", "C1\n", "spaces/AAA\n", ["slack", "google_chat"]),
+            ("slack", "", "spaces/AAA\n", ["slack", "google_chat"]),
+            ("google_chat", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+            ("google_chat", "C1\n", "", ["google_chat", "slack"]),
+            ("", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+            ("", "", "spaces/AAA\n", ["google_chat"]),
+            ("google_chat,slack", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+        )
+        for listed, slack_file, gchat_file, expected in rows:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._set_file(slack_file, kanban_chat_notify.HOME_FILE_KEY)
+                self._set_file(gchat_file, kanban_chat_notify.GCHAT_HOME_FILE_KEY)
+                with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: listed,
+                                                  kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack"}):
+                    self.assertEqual(kanban_chat_notify.routed_platforms(), expected)
+                    self.assertEqual(self.chat_notify.routed_platforms(), expected)
 
 
 class _Runner:

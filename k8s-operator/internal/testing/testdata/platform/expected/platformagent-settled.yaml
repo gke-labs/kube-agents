@@ -2031,6 +2031,9 @@ spec:
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
               readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
+              readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
               readOnly: true
@@ -2308,6 +2311,9 @@ spec:
               readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
+              readOnly: true
+            - mountPath: /etc/kube-agents/chat-home
+              name: chat-home
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: agent-credential-proxy-token
@@ -2607,6 +2613,11 @@ spec:
                   audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
         - name: a2a-bus-token
           projected:
             sources:
@@ -5705,6 +5716,7 @@ metadata:
 ---
 apiVersion: v1
 data:
+  gchat_home: ""
   slack_home: ""
 kind: ConfigMap
 metadata:
@@ -5754,7 +5766,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-647cdd83
+  name: platformagent-a2a-provision-a8600b61
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6245,8 +6257,13 @@ spec:
               the bridge sidecar with fewer workers where\n  # it declared more than the
               default, or recreates the stream, and\n  # provisioning does none of those.
               Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              which is\n  # usually not 2, so an unexpected failure stays on the retry
+              budget. The\n  # bus reshape treats a Job failed on this exit as provisioned
+              for a\n  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth),
+              and\n  # checks the bus holds every stream besides, since a shell error
+              can exit\n  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate
+              keeps this the\n  # script's only explicit exit 2.\n  exit 2\nfi\n\necho
+              \"a2a provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp
@@ -6465,6 +6482,14 @@ spec:
               value: default
             - name: A2A_GCHAT_TOKEN_PATH
               value: /var/run/secrets/a2a-chat-relay/token
+            - name: A2A_GCHAT_HOME_POLICY
+              value: auto
+            - name: A2A_HOME_CHANNEL_RECORD
+              value: platformagent-home-channel
+            - name: A2A_SELF_IMAGE
+              value: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
+            - name: A2A_HOME_CHANNEL_LEARN
+              value: "true"
             - name: A2A_RESOLVED_SCOPE_CONFIGMAP
               value: platformagent-resolved-scope
             - name: A2A_GATEWAY_LEASE
@@ -6516,6 +6541,9 @@ spec:
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
               readOnly: true
+            - mountPath: /etc/a2a/chat-home
+              name: chat-home
+              readOnly: true
             - mountPath: /var/run/secrets/a2a-reports
               name: a2a-reports-token
               readOnly: true
@@ -6566,6 +6594,11 @@ spec:
                   audience: kubeagents-credential-proxy-a2a-chat
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
         - name: a2a-reports-token
           projected:
             defaultMode: 256
