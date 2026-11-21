@@ -28,6 +28,13 @@ const (
 	strayReport  = "STRAY: a report on someone else's task."
 	reportDelay  = 200 * time.Millisecond
 	turnWaitSecs = 10
+	// cursorWait bounds waitCursor for a handful of frames.
+	cursorWait = 5 * time.Second
+	// burstDrainWait bounds the wait for a listener to drain a burst. It is
+	// not an expectation of how long a drain takes: under the race detector
+	// on a loaded runner one takes seconds, so this only stops a listener
+	// that stalled or lost frames from hanging the test.
+	burstDrainWait = 2 * time.Minute
 )
 
 func setReportQuiet(t *testing.T, d time.Duration) {
@@ -242,13 +249,22 @@ func poll(t *testing.T, s *Server, args map[string]any) string {
 // waitCursor waits until the cursor reaches n.
 func waitCursor(t *testing.T, e *Events, n uint64) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	if !cursorReaches(e, n, cursorWait) {
+		t.Fatalf("cursor %d, want %d", e.Cursor(), n)
+	}
+}
+
+// cursorReaches reports whether the cursor reached n within the wait. It
+// fails nothing itself, so it can run off the test goroutine.
+func cursorReaches(e *Events, n uint64, within time.Duration) bool {
+	deadline := time.Now().Add(within)
 	for e.Cursor() < n {
 		if time.Now().After(deadline) {
-			t.Fatalf("cursor %d, want %d", e.Cursor(), n)
+			return false
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	return true
 }
 
 func TestPollEventsCursors(t *testing.T) {
@@ -502,7 +518,9 @@ func TestTheListenerDrainsABurst(t *testing.T) {
 		_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), data)
 	}
 	_ = nc.Flush()
-	waitCursor(t, b.Events(), burst)
+	if !cursorReaches(b.Events(), burst, burstDrainWait) {
+		t.Fatalf("the listener heard %d of %d frames in %s", b.Events().Cursor(), burst, burstDrainWait)
+	}
 	if err := b.client.Conn().LastError(); err != nil {
 		t.Errorf("the connection reports %v after a burst", err)
 	}
@@ -511,18 +529,26 @@ func TestTheListenerDrainsABurst(t *testing.T) {
 		t.Errorf("%d kept, %d dropped", len(p.Frames), p.Dropped)
 	}
 
-	// The quiet period outlasts the burst, which under the race detector
-	// can take longer than the default's 300ms, so the report after it is
-	// still gathered.
-	setReportQuiet(t, 3*time.Second)
+	// No clock decides when the burst is over: how long a drain takes
+	// depends on the runner. The turn gathers, with no quiet end, until the
+	// listener has heard the report published after the burst; the root's
+	// result then ends gathering at once.
+	setReportQuiet(t, time.Hour)
+	heard := make(chan *Events, 1)
 	s, _, _, tb := turnServer(t, gatewayScenario{finish: true, after: func(gnc *nats.Conn, token string, turn int32) {
 		for i := 0; i < burst; i++ {
 			data, _ := json.Marshal(notifyFrame(fmt.Sprintf("b-%d", i), "task-unrelated", "x"))
 			_ = gnc.Publish(fmt.Sprintf(consoleOutSubject, token), data)
 		}
 		publishNotify(gnc, token, notifyFrame("n-real", "task-root1", cardReport))
+		// The burst and the report are this listener's only frames.
+		if e := <-heard; !cursorReaches(e, burst+1, burstDrainWait) {
+			t.Errorf("during a turn the listener heard %d of %d frames in %s", e.Cursor(), burst+1, burstDrainWait)
+		}
+		publishNotify(gnc, token, resultFrame(fmt.Sprintf("task-root%d", turn), false))
 	}})
-	text := send(t, s, map[string]any{"text": "busy", "wait_seconds": turnWaitSecs})
+	heard <- tb.Events()
+	text := send(t, s, map[string]any{"text": "busy", "wait_seconds": maxWaitSeconds})
 	mustContain(t, text, cardReport)
 	if err := tb.client.Conn().LastError(); err != nil {
 		t.Errorf("the connection reports %v after a burst during a turn", err)
