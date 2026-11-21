@@ -67,7 +67,7 @@ def git_diff(old: str, new: str, path: str = PATH, mode: str = "100644", new_pat
 
 
 def verify(head: str, base: str = BASE, path: str = PATH, diff: str | None = None, recipe=RECIPE, fix=FIX):
-    return ae.verify_edited_manifest(recipe, fix, git_diff(base, head, path) if diff is None else diff, path, base)
+    return ae.verify_edited_manifest(recipe, fix, git_diff(base, head, path) if diff is None else diff, path, base, head)
 
 
 class Accepted(unittest.TestCase):
@@ -90,11 +90,11 @@ class Accepted(unittest.TestCase):
 class RefusedDiffShapes(unittest.TestCase):
     head = BASE.replace("minAvailable: 1  #", "minAvailable: 2  #")
 
-    def assertRefused(self, diff, base=BASE, path=PATH, recipe=RECIPE, fix=FIX):
+    def assertRefused(self, diff, base=BASE, path=PATH, recipe=RECIPE, fix=FIX, head=None):
         if (base, path) == (BASE, PATH):
             self.assertNotEqual(diff, git_diff(BASE, self.head), "the case is the accepted diff, unchanged")
         with self.assertRaises(ae.EditRefused):
-            ae.verify_edited_manifest(recipe, fix, diff, path, base)
+            ae.verify_edited_manifest(recipe, fix, diff, path, base, self.head if head is None else head)
 
     def test_rename(self):
         diff = git_diff(BASE, self.head, new_path="clusters/fleet-1/shop/other.yaml")
@@ -127,7 +127,8 @@ class RefusedDiffShapes(unittest.TestCase):
     def test_quoted_or_odd_paths(self):
         for path in ('"clusters/fleet-1/a b.yaml"', "clusters/fleet-1/../x.yaml", "clusters/fleet-1/.hidden/x.yaml",
                      "apps/shop/budgets.yaml", "clusters/budgets.yaml", "clusters/fleet-1/shop/budgets.json",
-                     "clusters//shop/budgets.yaml"):
+                     "clusters//shop/budgets.yaml", "clusters/a\\..\\b/x.yaml", "clusters/fleet\u22151/x.yaml",
+                     "clusters/fleet-1/caf\u00e9.yaml"):
             with self.subTest(path=path):
                 self.assertRefused(git_diff(BASE, self.head, path=path), path=path)
 
@@ -312,11 +313,29 @@ class Hardening(unittest.TestCase):
             "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable\n"
         )
         self.assertTrue(ae.git_blob_id(merge_base).startswith("6296333"))
-        edit = ae.verify_edited_manifest(recipe, FIX, diff, "clusters/fleet-1/b.yaml", merge_base)
+        head = merge_base.replace("minAvailable: 1", "minAvailable: 2")
+        edit = ae.verify_edited_manifest(recipe, FIX, diff, "clusters/fleet-1/b.yaml", merge_base, head)
         self.assertEqual(edit.name, "checkout")
         with self.assertRaises(ae.EditRefused) as cm:
-            ae.verify_edited_manifest(recipe, FIX, diff, "clusters/fleet-1/b.yaml", base_tip)
+            ae.verify_edited_manifest(recipe, FIX, diff, "clusters/fleet-1/b.yaml", base_tip, head)
         self.assertIn("the base branch moved", str(cm.exception))
+        # A crafted base whose blob id shares the diff's 7-hex prefix (simulated
+        # here by printing the tip's own prefix) still applies to the wrong
+        # object, and is refused because the result is not the real head.
+        crafted = diff.replace("index 6296333..", f"index {ae.git_blob_id(base_tip)[:7]}..")
+        with self.assertRaises(ae.EditRefused) as cm:
+            ae.verify_edited_manifest(recipe, FIX, crafted, "clusters/fleet-1/b.yaml", base_tip, head)
+        self.assertIn("is not the proposal's head", str(cm.exception))
+
+    def test_a_head_that_is_not_the_diff_applied_is_refused(self):
+        head = BASE.replace("minAvailable: 1  #", "minAvailable: 2  #")
+        with self.assertRaises(ae.EditRefused):
+            ae.verify_edited_manifest(RECIPE, FIX, git_diff(BASE, head), PATH, BASE, head.replace("replicas: 3", "replicas: 4"))
+
+    def test_text_that_cannot_be_encoded_is_a_refusal(self):
+        head = BASE.replace("minAvailable: 1  #", "minAvailable: 2  #  \udc80")
+        with self.assertRaises(ae.EditRefused):
+            ae.verify_edited_manifest(RECIPE, FIX, git_diff(BASE, head), PATH, BASE, head)
 
     def test_a_raising_allowed_edit_is_one_recipe_refusal(self):
         # The broker catches EditRefused per recipe, so a recipe bug cannot end the judgement early.
@@ -351,6 +370,13 @@ class Registry(unittest.TestCase):
             "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.labels.app\n",
             "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.selector.matchLabels.app\n",
             "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: status.replicas\n",
+            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.spec.nodeSelector.pool\n",
+            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.spec.nodeName\n",
+            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.spec.serviceAccountName\n",
+            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.resourceVersion\n",
+            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.generation\n",
+            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.managedFields.0.manager\n",
+            "verify: edit-manifest\nedit_kind: Service\nedit_paths: spec.topologySelector\n",
         ):
             with self.subTest(extra=extra), self.assertRaises(registry.RecipeError):
                 registry.parse(self.HEAD + extra)

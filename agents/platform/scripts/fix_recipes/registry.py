@@ -54,7 +54,8 @@ How the broker proves a pull request is the fix: `verify` is `add-manifest`
 `edit-manifest`. An `edit-manifest` recipe names `edit_kind`, the Kubernetes
 kind of the one document it edits, and `edit_paths`, the dotted scalar paths
 it may change (a segment of digits is a list index), never an identity,
-label, selector, ownership or status field (`EDIT_FORBIDDEN_SEGMENTS`).
+label, selector (including any `...Selector`), placement, service account,
+ownership, server-bookkeeping or status field (`EDIT_FORBIDDEN_SEGMENTS`).
 `automerge_edit` holds a pull request to exactly those edits, refuses any
 that changes a field's YAML type (a bool is not an int), and then asks
 `fix.py`'s `allowed_edit(path, old, new)`, which must return True for each.
@@ -96,11 +97,15 @@ HEALTH_PROBES = ("restart_flat", "none")
 #: `edit-manifest` (one scalar edit to an existing manifest, `automerge_edit`).
 VERIFY_VERBS = ("add-manifest", "edit-manifest")
 #: Segments refused anywhere in an `edit_paths` entry: identity at any depth
-#: (a List's items, a pod template), what an object selects or is selected
-#: by, ownership, and status, which the cluster writes.
+#: (a List's items, a pod template), labels and every selector (any segment
+#: ending in `Selector` too, such as `nodeSelector`), where a pod runs and as
+#: whom (`nodeName`, `serviceAccountName`), ownership, the server's own
+#: bookkeeping, and status, which the cluster writes.
 EDIT_FORBIDDEN_SEGMENTS = frozenset({
     "apiVersion", "kind", "name", "namespace", "generateName", "uid", "ownerReferences", "finalizers",
     "labels", "annotations", "selector", "matchLabels", "matchExpressions", "status",
+    "nodeName", "serviceAccountName", "serviceAccount", "resourceVersion", "generation", "managedFields",
+    "creationTimestamp", "deletionTimestamp", "selfLink",
 })
 #: One `edit_paths` entry: dotted mapping keys, a segment of digits being a list index.
 EDIT_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*))*")
@@ -248,7 +253,9 @@ def _check_verification(fields: dict[str, str], where: str) -> None:
         raise RecipeError(f"{where}: `edit_paths` must be dotted field paths separated by spaces, such as `spec.minAvailable`")
     if len(set(paths)) != len(paths):
         raise RecipeError(f"{where}: `edit_paths` repeats a path")
-    named = sorted({seg for p in paths for seg in p.split(".") if seg in EDIT_FORBIDDEN_SEGMENTS})
+    named = sorted({
+        seg for p in paths for seg in p.split(".") if seg in EDIT_FORBIDDEN_SEGMENTS or seg.endswith("Selector")
+    })
     if named:
         raise RecipeError(f"{where}: `edit_paths` may not name {', '.join(named)} at any depth")
     if any(a != b and b.startswith(a + ".") for a in paths for b in paths):
