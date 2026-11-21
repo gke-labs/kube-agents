@@ -1138,6 +1138,15 @@
 # (the persona's version-control skill) land; its record shows when they do.
 ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 
+# A cluster profile task that names no repository finds the one it may use
+# (#6389): the same confirmed PodDisruptionBudget pull request as the case
+# above with the repository left unnamed, so the persona asks `identity` with
+# no repository and uses the install's one managed repository. Graded the
+# same way. Regression coverage: it passed on main's persona too (the
+# behaviour shipped with #6411). Pool installs manage exactly one repository (hack/ci-deploy.sh:
+# one forge and one GitOps repository per leased project).
+./tasks/cluster-profile-finds-the-managed-repository/task.yaml
+
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
 # verdict lines: the cause is the missing class and not a stockout, and the
