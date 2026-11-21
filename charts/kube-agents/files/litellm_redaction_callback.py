@@ -79,24 +79,17 @@ SCALAR_INPUT_KEYS = ("input", "prompt")
 TOOL_CALLS_KEY = "tool_calls"
 FUNCTION_KEY = "function"
 ARGUMENTS_KEY = "arguments"
-# Anthropic messages: the top-level system text, and the content blocks that
-# carry text under a key other than `text`.
+# Anthropic messages: the top-level system text, and the thinking block,
+# whose signature the provider checks and the walk must not touch.
 SYSTEM_KEY = "system"
-TOOL_USE_TYPE = "tool_use"
-TOOL_USE_INPUT_KEY = "input"
-TOOL_RESULT_TYPE = "tool_result"
-TOOL_RESULT_CONTENT_KEY = "content"
 THINKING_TYPE = "thinking"
 THINKING_KEY = "thinking"
 # Gemini: the conversation, its parts, and the system instruction under
-# either spelling the API takes.
+# either spelling the API takes. Within a part, binary data and the
+# thought signature are left alone; everything else is walked.
 CONTENTS_KEY = "contents"
 PARTS_KEY = "parts"
 GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
-FUNCTION_CALL_KEY = "functionCall"
-FUNCTION_CALL_ARGS_KEY = "args"
-FUNCTION_RESPONSE_KEY = "functionResponse"
-FUNCTION_RESPONSE_KEY_RESPONSE = "response"
 # Parts left as they are: binary payloads, which no text rule applies to and
 # which a substitution would corrupt, and opaque blocks the provider checks.
 UNWALKED_PART_TYPES = frozenset(
@@ -190,35 +183,26 @@ class KubeAgentsRedactionCallback(CustomLogger):
     def _redact_part(self, part: Dict[str, Any], counts: Dict[str, int]) -> Dict[str, Any]:
         """One content part or block, in place.
 
-        A text part by its text; a tool call's input and a tool result's
-        content by walking them; thinking by its text. Binary and opaque parts
-        are left alone. Any other part is walked whole, key names included:
-        a part type this file has never seen still has its text redacted.
+        Binary and opaque parts are left alone. A thinking block has its text
+        redacted and its signature left as the provider issued it. Every other
+        part -- text, a tool's input, what a tool returned, a part type this
+        file has never seen -- is walked whole, with the key-aware walk the
+        audit hooks use, so a value is redacted wherever in the part it sits
+        and JSON held in a string stays valid JSON.
         """
         kind = part.get(PART_TYPE_KEY)
         if kind in UNWALKED_PART_TYPES:
-            return part
-        if kind == TOOL_USE_TYPE:
-            if TOOL_USE_INPUT_KEY in part:
-                part[TOOL_USE_INPUT_KEY] = self._redact_arguments(part[TOOL_USE_INPUT_KEY], counts)
-            return part
-        if kind == TOOL_RESULT_TYPE:
-            if TOOL_RESULT_CONTENT_KEY in part:
-                part[TOOL_RESULT_CONTENT_KEY] = self._redact_value(part[TOOL_RESULT_CONTENT_KEY], counts)
             return part
         if kind == THINKING_TYPE:
             if isinstance(part.get(THINKING_KEY), str):
                 part[THINKING_KEY] = self._redact_text(part[THINKING_KEY], counts)
             return part
-        if isinstance(part.get(TEXT_KEY), str) and set(part) <= {PART_TYPE_KEY, TEXT_KEY, "cache_control", "citations"}:
-            part[TEXT_KEY] = self._redact_text(part[TEXT_KEY], counts)
-            return part
         return self._redact_structure(part, counts)
 
     def _redact_gemini_parts(self, parts: Any, counts: Dict[str, int]) -> Any:
-        """Gemini parts, in place: text, a function call's args, a function
-        response's response; binary parts left alone; any other part walked
-        whole."""
+        """Gemini parts, in place: binary and opaque fields left alone, every
+        other field (text, a function call, a function response, anything
+        newer) walked whole."""
         if not isinstance(parts, list):
             return self._redact_structure(parts, counts)
         for i, part in enumerate(parts):
@@ -226,21 +210,8 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 parts[i] = self._redact_value(part, counts)
                 continue
             for key in list(part):
-                value = part[key]
-                if key in UNWALKED_GEMINI_PART_KEYS:
-                    continue
-                if key == TEXT_KEY and isinstance(value, str):
-                    part[key] = self._redact_text(value, counts)
-                elif key == FUNCTION_CALL_KEY and isinstance(value, dict):
-                    if FUNCTION_CALL_ARGS_KEY in value:
-                        value[FUNCTION_CALL_ARGS_KEY] = self._redact_arguments(value[FUNCTION_CALL_ARGS_KEY], counts)
-                elif key == FUNCTION_RESPONSE_KEY and isinstance(value, dict):
-                    if FUNCTION_RESPONSE_KEY_RESPONSE in value:
-                        value[FUNCTION_RESPONSE_KEY_RESPONSE] = self._redact_structure(
-                            value[FUNCTION_RESPONSE_KEY_RESPONSE], counts
-                        )
-                elif isinstance(value, (str, list, dict)):
-                    part[key] = self._redact_structure(value, counts)
+                if key not in UNWALKED_GEMINI_PART_KEYS:
+                    part[key] = self._redact_structure(part[key], counts)
         return parts
 
     def _redact_gemini_content(self, content: Any, counts: Dict[str, int]) -> Any:
