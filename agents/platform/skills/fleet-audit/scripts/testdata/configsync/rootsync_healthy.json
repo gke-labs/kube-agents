@@ -1,80 +1,80 @@
 {
- "apiVersion": "configsync.gke.io/v1beta1",
- "kind": "RootSync",
- "metadata": {
-  "generation": 3,
-  "labels": {
-   "applyset.kubernetes.io/id": "applyset-e22zDPwKdkFqCzUzScEvOv2nZZ55DLNRI-wrMTICH94-v1"
+  "apiVersion": "configsync.gke.io/v1beta1",
+  "kind": "RootSync",
+  "metadata": {
+    "generation": 3,
+    "labels": {
+      "applyset.kubernetes.io/id": "applyset-e22zDPwKdkFqCzUzScEvOv2nZZ55DLNRI-wrMTICH94-v1"
+    },
+    "name": "root-sync",
+    "namespace": "config-management-system"
   },
-  "name": "root-sync",
-  "namespace": "config-management-system"
- },
- "spec": {
-  "git": {
-   "auth": "none",
-   "branch": "main",
-   "dir": "config-sync-quickstart/multirepo/root",
-   "period": "0s",
-   "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples"
+  "spec": {
+    "git": {
+      "auth": "none",
+      "branch": "main",
+      "dir": "config-sync-quickstart/multirepo/root",
+      "period": "0s",
+      "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples"
+    },
+    "sourceFormat": "unstructured",
+    "sourceType": "git"
   },
-  "sourceFormat": "unstructured",
-  "sourceType": "git"
- },
- "status": {
-  "conditions": [
-   {
-    "lastTransitionTime": "2026-11-20T23:32:45Z",
-    "lastUpdateTime": "2026-11-20T23:32:45Z",
-    "status": "False",
-    "type": "Reconciling"
-   },
-   {
-    "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
-    "errorSummary": {},
-    "lastTransitionTime": "2026-11-20T23:33:10Z",
-    "lastUpdateTime": "2026-11-20T23:33:10Z",
-    "message": "Sync Completed",
-    "reason": "Sync",
-    "status": "False",
-    "type": "Syncing"
-   }
-  ],
-  "lastSyncedCommit": "75d46d285d33abda619209afbe8ea0ebfb377000",
-  "observedGeneration": 3,
-  "reconciler": "root-reconciler",
-  "rendering": {
-   "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
-   "errorSummary": {},
-   "gitStatus": {
-    "branch": "main",
-    "dir": "config-sync-quickstart/multirepo/root",
-    "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
-    "revision": "HEAD"
-   },
-   "lastUpdate": "2026-11-20T23:32:50Z",
-   "message": "Rendering skipped"
-  },
-  "source": {
-   "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
-   "errorSummary": {},
-   "gitStatus": {
-    "branch": "main",
-    "dir": "config-sync-quickstart/multirepo/root",
-    "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
-    "revision": "HEAD"
-   },
-   "lastUpdate": "2026-11-20T23:32:51Z"
-  },
-  "sync": {
-   "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
-   "errorSummary": {},
-   "gitStatus": {
-    "branch": "main",
-    "dir": "config-sync-quickstart/multirepo/root",
-    "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
-    "revision": "HEAD"
-   },
-   "lastUpdate": "2026-11-20T23:33:10Z"
+  "status": {
+    "conditions": [
+      {
+        "lastTransitionTime": "2026-11-20T23:32:45Z",
+        "lastUpdateTime": "2026-11-20T23:32:45Z",
+        "status": "False",
+        "type": "Reconciling"
+      },
+      {
+        "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+        "errorSummary": {},
+        "lastTransitionTime": "2026-11-20T23:33:10Z",
+        "lastUpdateTime": "2026-11-20T23:33:10Z",
+        "message": "Sync Completed",
+        "reason": "Sync",
+        "status": "False",
+        "type": "Syncing"
+      }
+    ],
+    "lastSyncedCommit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+    "observedGeneration": 3,
+    "reconciler": "root-reconciler",
+    "rendering": {
+      "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+      "errorSummary": {},
+      "gitStatus": {
+        "branch": "main",
+        "dir": "config-sync-quickstart/multirepo/root",
+        "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
+        "revision": "HEAD"
+      },
+      "lastUpdate": "2026-11-20T23:32:50Z",
+      "message": "Rendering skipped"
+    },
+    "source": {
+      "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+      "errorSummary": {},
+      "gitStatus": {
+        "branch": "main",
+        "dir": "config-sync-quickstart/multirepo/root",
+        "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
+        "revision": "HEAD"
+      },
+      "lastUpdate": "2026-11-20T23:32:51Z"
+    },
+    "sync": {
+      "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+      "errorSummary": {},
+      "gitStatus": {
+        "branch": "main",
+        "dir": "config-sync-quickstart/multirepo/root",
+        "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
+        "revision": "HEAD"
+      },
+      "lastUpdate": "2026-11-20T23:33:10Z"
+    }
   }
- }
 }

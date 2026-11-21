@@ -1,158 +1,158 @@
 {
- "apiVersion": "v1",
- "items": [
-  {
-   "apiVersion": "v1",
-   "kind": "Pod",
-   "metadata": {
-    "generation": 1,
-    "labels": {
-     "app": "reconciler",
-     "configsync.gke.io/deployment-name": "ns-reconciler-gamestore",
-     "configsync.gke.io/managed-by": "reconciler-manager",
-     "configsync.gke.io/reconciler": "ns-reconciler-gamestore",
-     "configsync.gke.io/sync-generation": "2",
-     "configsync.gke.io/sync-kind": "RepoSync",
-     "configsync.gke.io/sync-name": "repo-sync",
-     "configsync.gke.io/sync-namespace": "gamestore",
-     "pod-template-hash": "d488c59db",
-     "topology.kubernetes.io/region": "us-central1",
-     "topology.kubernetes.io/zone": "us-central1-a"
-    },
-    "name": "ns-reconciler-gamestore-d488c59db-h8k46",
-    "namespace": "config-management-system",
-    "ownerReferences": [
-     {
-      "apiVersion": "apps/v1",
-      "controller": true,
-      "kind": "ReplicaSet",
-      "name": "ns-reconciler-gamestore-d488c59db"
-     }
-    ]
-   },
-   "status": {
-    "containerStatuses": [
-     {
-      "lastState": {},
-      "name": "git-sync",
-      "ready": true,
-      "restartCount": 0,
-      "started": true,
-      "state": {
-       "running": {
-        "startedAt": "2026-11-20T23:33:00Z"
-       }
-      }
-     },
-     {
-      "lastState": {},
-      "name": "otel-agent",
-      "ready": true,
-      "restartCount": 0,
-      "started": true,
-      "state": {
-       "running": {
-        "startedAt": "2026-11-20T23:33:00Z"
-       }
-      }
-     },
-     {
-      "lastState": {},
-      "name": "reconciler",
-      "ready": true,
-      "restartCount": 0,
-      "started": true,
-      "state": {
-       "running": {
-        "startedAt": "2026-11-20T23:33:00Z"
-       }
-      }
-     }
-    ],
-    "phase": "Running"
-   }
-  },
-  {
-   "apiVersion": "v1",
-   "kind": "Pod",
-   "metadata": {
-    "generation": 1,
-    "labels": {
-     "app": "reconciler",
-     "configsync.gke.io/deployment-name": "root-reconciler",
-     "configsync.gke.io/managed-by": "reconciler-manager",
-     "configsync.gke.io/reconciler": "root-reconciler",
-     "configsync.gke.io/sync-generation": "5",
-     "configsync.gke.io/sync-kind": "RootSync",
-     "configsync.gke.io/sync-name": "root-sync",
-     "configsync.gke.io/sync-namespace": "config-management-system",
-     "pod-template-hash": "7f99b9c746",
-     "topology.kubernetes.io/region": "us-central1",
-     "topology.kubernetes.io/zone": "us-central1-a"
-    },
-    "name": "root-reconciler-7f99b9c746-h4dhh",
-    "namespace": "config-management-system",
-    "ownerReferences": [
-     {
-      "apiVersion": "apps/v1",
-      "controller": true,
-      "kind": "ReplicaSet",
-      "name": "root-reconciler-7f99b9c746"
-     }
-    ]
-   },
-   "status": {
-    "containerStatuses": [
-     {
-      "lastState": {},
-      "name": "git-sync",
-      "ready": true,
-      "restartCount": 0,
-      "started": true,
-      "state": {
-       "running": {
-        "startedAt": "2026-11-20T23:37:38Z"
-       }
-      }
-     },
-     {
-      "lastState": {},
-      "name": "otel-agent",
-      "ready": true,
-      "restartCount": 0,
-      "started": true,
-      "state": {
-       "running": {
-        "startedAt": "2026-11-20T23:37:38Z"
-       }
-      }
-     },
-     {
-      "lastState": {
-       "terminated": {
-        "exitCode": 137,
-        "finishedAt": "2026-11-20T23:56:27Z",
-        "reason": "OOMKilled",
-        "startedAt": "2026-11-20T23:56:11Z"
-       }
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "generation": 1,
+        "labels": {
+          "app": "reconciler",
+          "configsync.gke.io/deployment-name": "ns-reconciler-gamestore",
+          "configsync.gke.io/managed-by": "reconciler-manager",
+          "configsync.gke.io/reconciler": "ns-reconciler-gamestore",
+          "configsync.gke.io/sync-generation": "2",
+          "configsync.gke.io/sync-kind": "RepoSync",
+          "configsync.gke.io/sync-name": "repo-sync",
+          "configsync.gke.io/sync-namespace": "gamestore",
+          "pod-template-hash": "d488c59db",
+          "topology.kubernetes.io/region": "us-central1",
+          "topology.kubernetes.io/zone": "us-central1-a"
+        },
+        "name": "ns-reconciler-gamestore-d488c59db-h8k46",
+        "namespace": "config-management-system",
+        "ownerReferences": [
+          {
+            "apiVersion": "apps/v1",
+            "controller": true,
+            "kind": "ReplicaSet",
+            "name": "ns-reconciler-gamestore-d488c59db"
+          }
+        ]
       },
-      "name": "reconciler",
-      "ready": false,
-      "restartCount": 9,
-      "started": false,
-      "state": {
-       "terminated": {
-        "exitCode": 137,
-        "finishedAt": "2026-11-21T00:01:50Z",
-        "reason": "OOMKilled",
-        "startedAt": "2026-11-21T00:01:34Z"
-       }
+      "status": {
+        "containerStatuses": [
+          {
+            "lastState": {},
+            "name": "git-sync",
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "state": {
+              "running": {
+                "startedAt": "2026-11-20T23:33:00Z"
+              }
+            }
+          },
+          {
+            "lastState": {},
+            "name": "otel-agent",
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "state": {
+              "running": {
+                "startedAt": "2026-11-20T23:33:00Z"
+              }
+            }
+          },
+          {
+            "lastState": {},
+            "name": "reconciler",
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "state": {
+              "running": {
+                "startedAt": "2026-11-20T23:33:00Z"
+              }
+            }
+          }
+        ],
+        "phase": "Running"
       }
-     }
-    ],
-    "phase": "Running"
-   }
-  }
- ],
- "kind": "List"
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "generation": 1,
+        "labels": {
+          "app": "reconciler",
+          "configsync.gke.io/deployment-name": "root-reconciler",
+          "configsync.gke.io/managed-by": "reconciler-manager",
+          "configsync.gke.io/reconciler": "root-reconciler",
+          "configsync.gke.io/sync-generation": "5",
+          "configsync.gke.io/sync-kind": "RootSync",
+          "configsync.gke.io/sync-name": "root-sync",
+          "configsync.gke.io/sync-namespace": "config-management-system",
+          "pod-template-hash": "7f99b9c746",
+          "topology.kubernetes.io/region": "us-central1",
+          "topology.kubernetes.io/zone": "us-central1-a"
+        },
+        "name": "root-reconciler-7f99b9c746-h4dhh",
+        "namespace": "config-management-system",
+        "ownerReferences": [
+          {
+            "apiVersion": "apps/v1",
+            "controller": true,
+            "kind": "ReplicaSet",
+            "name": "root-reconciler-7f99b9c746"
+          }
+        ]
+      },
+      "status": {
+        "containerStatuses": [
+          {
+            "lastState": {},
+            "name": "git-sync",
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "state": {
+              "running": {
+                "startedAt": "2026-11-20T23:37:38Z"
+              }
+            }
+          },
+          {
+            "lastState": {},
+            "name": "otel-agent",
+            "ready": true,
+            "restartCount": 0,
+            "started": true,
+            "state": {
+              "running": {
+                "startedAt": "2026-11-20T23:37:38Z"
+              }
+            }
+          },
+          {
+            "lastState": {
+              "terminated": {
+                "exitCode": 137,
+                "finishedAt": "2026-11-20T23:56:27Z",
+                "reason": "OOMKilled",
+                "startedAt": "2026-11-20T23:56:11Z"
+              }
+            },
+            "name": "reconciler",
+            "ready": false,
+            "restartCount": 9,
+            "started": false,
+            "state": {
+              "terminated": {
+                "exitCode": 137,
+                "finishedAt": "2026-11-21T00:01:50Z",
+                "reason": "OOMKilled",
+                "startedAt": "2026-11-21T00:01:34Z"
+              }
+            }
+          }
+        ],
+        "phase": "Running"
+      }
+    }
+  ],
+  "kind": "List"
 }

@@ -145,7 +145,8 @@ locals {
   # reconciler is down. Beside it, the stand-in reconciler: the labels of a
   # real reconciler pod, and a container of the reconciler's name that
   # allocates past its limit at every start. Its requests and limits are the
-  # ones Autopilot would write, so the object is the same on either host type.
+  # ones an Autopilot host wrote for it (read back from a live plant on GKE
+  # 1.35), so the object is the same on either host type.
   out_of_memory          = var.reconciler_state == "out-of-memory"
   between_kills_at       = "2026-11-20T23:50:41Z"
   manifest_out_of_memory = <<-MANIFEST

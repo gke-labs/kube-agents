@@ -8801,20 +8801,33 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
                 self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync"), pods=[pod]), [])
 
     def test_a_pod_names_one_sync_object_by_all_three_labels(self):
-        """Two sync objects can share a name: a RootSync and a RepoSync, or two
-        RepoSyncs in two namespaces. A killed reconciler names only its own."""
-        root = configsync_object("RootSync", "sync")
-        team_a = configsync_object("RepoSync", "sync", ns="team-a")
-        team_b = configsync_object("RepoSync", "sync", ns="team-b")
-        for kind, ns, expected in (
-            ("RootSync", "config-management-system", ("config-management-system", "RootSync/sync")),
-            ("RepoSync", "team-a", ("team-a", "RepoSync/sync")),
-            ("RepoSync", "team-b", ("team-b", "RepoSync/sync")),
+        """Sync objects can share a name (two kinds, or two namespaces) and a
+        namespace (two names, or two kinds). A killed reconciler names only
+        the object that all three of its labels name."""
+        objects = [
+            configsync_object("RootSync", "sync"),
+            configsync_object("RootSync", "other"),
+            configsync_object("RepoSync", "sync"),
+            configsync_object("RepoSync", "sync", ns="team-a"),
+            configsync_object("RepoSync", "sync", ns="team-b"),
+        ]
+        for kind, name, ns in (
+            ("RootSync", "sync", "config-management-system"),
+            ("RootSync", "other", "config-management-system"),
+            ("RepoSync", "sync", "config-management-system"),
+            ("RepoSync", "sync", "team-a"),
+            ("RepoSync", "sync", "team-b"),
         ):
-            with self.subTest(kind=kind, ns=ns):
-                pod = configsync_reconciler_pod(kind, "sync", ns=ns, restarts=4, killed="OOMKilled", killed_at=self.LAST_KILL)
-                hits = self.run_on(root, team_a, team_b, pods=[pod])
-                self.assertEqual([(h["namespace"], h["object"]) for h in hits], [expected])
+            with self.subTest(kind=kind, name=name, ns=ns):
+                pod = configsync_reconciler_pod(kind, name, ns=ns, restarts=4, killed="OOMKilled", killed_at=self.LAST_KILL)
+                hits = self.run_on(*objects, pods=[pod])
+                self.assertEqual([(h["namespace"], h["object"]) for h in hits], [(ns, f"{kind}/{name}")])
+
+    def test_the_window_for_a_recent_kill_is_three_times_the_back_off_cap(self):
+        """A crash loop's back-off tops out at five minutes, so the last kill
+        of a container that dies at its start is inside 15."""
+        self.assertEqual(collect.CONFIGSYNC_OOM_RECENT_SECONDS, 3 * 5 * 60)
+        self.assertEqual(collect.CONFIGSYNC_OOM_MIN_RESTARTS, 2)
 
     def test_the_loop_is_named_while_the_container_is_down_and_while_it_is_up(self):
         for running in (True, False):
@@ -8879,6 +8892,12 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
             "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(86400), reconciling_reason="Sync", reconciling_message="Syncing"
         )
         self.assertEqual(self.run_on(syncing), [])
+
+    def test_a_reconciling_condition_that_is_false_is_not_a_finding_however_old(self):
+        settled = configsync_object(
+            "RootSync", "root-sync", reconciling="False", reconciling_since=self.ago(86400), reconciling_message=self.DEPLOYMENT_DOWN
+        )
+        self.assertEqual(self.run_on(settled), [])
 
     def test_a_reconciling_condition_with_no_time_is_not_a_finding(self):
         self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", reconciling="True", reconciling_message=self.DEPLOYMENT_DOWN)), [])
@@ -13891,7 +13910,7 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         # An owned pod: no other check files the reconciler pod itself.
         self.assertEqual([c["check"] for c in result["candidates"] if "reconciler" in c["object"]], [])
 
-    def test_the_check_makes_no_pod_read_of_its_own_and_names_the_dump_only_where_a_sync_object_exists(self):
+    def test_the_check_makes_no_pod_read_of_its_own_and_records_a_command_only_where_a_sync_object_exists(self):
         for label, kw in (("no Config Sync", {}), ("served and empty", {"configsync_items": []}), ("one object", {"configsync_items": [configsync_object("RootSync", "root-sync")]})):
             with self.subTest(label):
                 tester = TestComplianceCollectCluster()

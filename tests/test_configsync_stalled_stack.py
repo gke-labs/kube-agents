@@ -163,7 +163,8 @@ class PlantedStatusTest(unittest.TestCase):
         stack = _MAIN.read_text()
         # The reconciler of `root-sync` has no suffix; any other sync's has its name.
         self.assertRegex(stack, "default_sync_name" + _ASSIGN + '"root-sync"')
-        self.assertNotIn("OOMKilled", stack)
+        # The stalled status names no cause: a kill for memory is the stack's other state.
+        self.assertNotIn("OOMKilled", yaml.safe_dump(_planted_manifest()))
 
     def test_the_object_and_its_status_go_in_one_create(self):
         # The suite's rule keeps a namespace-scoped plant to its manifest, so

@@ -10181,11 +10181,9 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         if parsed is not None:
             context["configsync_objects"].extend((parsed or {}).get("items") or [])
     # The reconciler pods are already in hand, from the workload dump at the
-    # top of this function. The record names that read only where a sync
-    # object exists: with none, no pod was read for this check.
-    configsync_reason, configsync_record = _configsync_disposition(
-        configsync_runs, workload_read if context["configsync_objects"] else None
-    )
+    # top of this function, so the record names that read after the sync
+    # reads. There is a record only where a sync object exists.
+    configsync_reason, configsync_record = _configsync_disposition(configsync_runs, workload_read)
     if configsync_reason.startswith(UNDETERMINED_PREFIX):
         context.setdefault("unevaluated", {})["configsync-reconciler-stalled"] = configsync_reason
     elif configsync_reason:
