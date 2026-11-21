@@ -413,7 +413,16 @@ class KubeAgentsRedactionCallback(CustomLogger):
         if isinstance(node, list):
             return [self._collapse_json(item, sources, counts) for item in node]
         if isinstance(node, dict):
-            return {key: self._collapse_json(value, sources, counts) for key, value in node.items()}
+            # The walk reads values, not key names: each decoded key gets the
+            # text rules here, so a value written as a key is redacted too.
+            rebuilt = {}
+            for key, value in node.items():
+                if isinstance(key, str):
+                    key, made = AuditRedactor.redact_text_counted(key, self._rules)
+                    for name, count in made.items():
+                        counts[name] = counts.get(name, 0) + count
+                rebuilt[key] = self._collapse_json(value, sources, counts)
+            return rebuilt
         return node
 
     def _redact_field(self, value: Any, kept: List[tuple], counts: Dict[str, int]) -> Any:

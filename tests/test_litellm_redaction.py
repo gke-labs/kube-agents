@@ -617,16 +617,22 @@ class TestCallback(unittest.TestCase):
         # rules (after an escaped newline, the IP has no word boundary).
         repeated_escaped = '{"cmd": "get pods\\n10.0.0.7", "cmd": "safe"}'
         keyed = json.dumps({"10.0.0.5": "pod", "ok": 1})
+        # A key in an object sent as an object, not a string.
+        object_key = {"command": "x", "on 10.0.0.4": True}
         # The same key written with escapes, which the raw text rules cannot read.
-        escaped_key = '{"\\u0031\\u0030.0.0.8": "pod"}'
+        escaped_key = '{"\\u0031\\u0030.0.0.8": "pod", "a\\n10.0.0.9": 1}'
         data = {"messages": [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": "o", "type": "function", "function": {"name": "t", "arguments": object_key}},
             {"id": "a", "type": "function", "function": {"name": "t", "arguments": repeated}},
             {"id": "b", "type": "function", "function": {"name": "t", "arguments": keyed}},
             {"id": "c", "type": "function", "function": {"name": "t", "arguments": repeated_escaped}},
             {"id": "d", "type": "function", "function": {"name": "t", "arguments": escaped_key}},
         ]}]}
-        first, second, third, fourth = (call["function"]["arguments"] for call in self._run(data)["messages"][0]["tool_calls"])
-        self.assertNotIn("10.0.0.8", json.dumps(json.loads(fourth), ensure_ascii=False))
+        as_object, first, second, third, fourth = (call["function"]["arguments"] for call in self._run(data)["messages"][0]["tool_calls"])
+        self.assertNotIn("10.0.0.4", json.dumps(as_object))
+        decoded_fourth = json.dumps(json.loads(fourth), ensure_ascii=False)
+        self.assertNotIn("10.0.0.8", decoded_fourth)
+        self.assertNotIn("10.0.0.9", decoded_fourth)
         self.assertNotIn("prod-eu-1", first)
         self.assertNotIn("10.0.0.5", second)
         self.assertNotIn("10.0.0.7", third)
