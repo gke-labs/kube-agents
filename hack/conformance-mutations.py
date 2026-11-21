@@ -357,6 +357,46 @@ MUTATIONS: list[Mutation] = [
         "must then be trusted to ignore",
     ),
     Mutation(
+        "A3-report-run-start-a2a-reads",
+        "agents/platform/scripts/credential_proxy.py",
+        ("REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN})\n",
+         "REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN, REPORT_ROUTE_RUN_START})\n"),
+        "test_A3_a_run_start_record_rides_the_run_write_rule_alone",
+        "let the report reader read a run-start record too, so a chat reply can say "
+        "a run did not finish -- it then reads a record no report rule vouches for, "
+        "on the one route its role was confined from",
+    ),
+    Mutation(
+        "A3-report-run-start-is-a-run",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if segments[6].startswith(REPORT_RUN_START_PREFIX):\n            return REPORT_ROUTE_RUN_START\n",
+         ""),
+        "test_A3_a_run_start_record_rides_the_run_write_rule_alone",
+        "treat a run-start record as one more run, since it rides the run route -- "
+        "it is then stamped as a report, and the A2A reader reads it as one",
+    ),
+    Mutation(
+        "A3-report-run-start-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (\"DELETE\", re.compile(f\"{_REPORT_STREAM}/latest\")),\n",
+         "    (\"DELETE\", re.compile(f\"{_REPORT_STREAM}/latest\")),\n"
+         "    (\"DELETE\", re.compile(f\"{_REPORT_STREAM}/runs/{_REPORT_RUN_START}\")),\n"),
+        "test_A3_a_run_start_record_rides_the_run_write_rule_alone",
+        "let a finish drop its run's record instead of marking it, to keep the "
+        "directory small -- a caller then erases a newer run's record and the run "
+        "that died reads as never started",
+    ),
+    Mutation(
+        "A3-report-run-start-any-task",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                rule = report_run_start_permitted(role, task, segments[-1])\n",
+         "                pass\n"),
+        "test_A3_a_profile_task_writes_only_its_own_run_start_record",
+        "let a profile task write any run's record, since the run write's stream "
+        "and key rules already hold it to its own stream -- a task then marks the "
+        "newest real run done, or crowds it out, and a run that died reads as finished",
+    ),
+    Mutation(
         "A3-report-no-role-is-shell",
         "agents/platform/scripts/credential_proxy.py",
         ("    if role == CALLER_ROLE_SHELL:\n        pass\n",

@@ -468,5 +468,163 @@ class TestNestedStores(ReportStatusTestCase):
                     report_status.store_path(str(self.root), AUDIT, bad)
 
 
+
+class TestRunStartRecords(ReportStatusTestCase):
+    """The run-start record (#6812): readers show a newest run that never finished."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_latest()
+        self.store = Path(report_status.store_path(str(self.root), AUDIT, REPO))
+        # The file store's clock moves a millisecond a write, so each record is
+        # received after the one before it, whatever its `started_at` says.
+        ticks = [NOW.timestamp()]
+
+        def clock():
+            ticks[0] += 0.001
+            return ticks[0]
+
+        # create: a seam a store from before `received_at` lacks.
+        clock_patch = patch.object(report_status, "_clock", clock, create=True)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+
+    def started(self, run_id, minutes, done=False, scheduled=True):
+        record = report_status.run_start_record(
+            run_id,
+            (NOW + timedelta(minutes=minutes)).isoformat(),
+            scheduled,
+            done_at=(NOW + timedelta(minutes=minutes + 5)).isoformat() if done else None,
+            outcome="UPDATED" if done else None,
+        )
+        report_status.write_run_start(str(self.root), AUDIT, REPO, record)
+        return record
+
+    def unfinished(self):
+        return report_status.project(str(self.root), now=NOW, scratch=str(self.scratch))["streams"][AUDIT]["repos"][
+            REPO
+        ]["unfinished_run"]
+
+    def test_no_record_says_nothing(self):
+        self.assertIsNone(self.unfinished())
+
+    def test_a_running_run_is_shown_beside_the_report(self):
+        self.started("local-a1", 0)
+        projection = report_status.project(str(self.root), now=NOW, scratch=str(self.scratch))
+        entry = projection["streams"][AUDIT]["repos"][REPO]
+        self.assertEqual(
+            {
+                "note": "the last run did not finish",
+                "run_id": "local-a1",
+                "started_at": NOW.isoformat(),
+                "scheduled": True,
+            },
+            entry["unfinished_run"],
+        )
+        # The report itself is untouched.
+        self.assertEqual(NOW.isoformat(), entry["latest"]["finished_at"])
+        self.assertNotIn("unfinished_run", entry["latest"])
+
+    def test_a_run_that_never_finished_stays_shown_after_older_runs_finished(self):
+        self.started("task-1", 0, done=True)
+        self.started("task-2", 60)
+        self.assertEqual("task-2", self.unfinished()["run_id"])
+
+    def test_a_finished_run_says_nothing_extra(self):
+        self.started("task-1", 0)
+        self.started("task-1", 0, done=True)
+        self.assertIsNone(self.unfinished())
+
+    def test_a_late_done_mark_of_an_older_run_does_not_hide_a_newer_start(self):
+        self.started("task-old", 0)
+        self.started("task-new", 60)
+        # The older run's finish lands after the newer run started.
+        self.started("task-old", 0, done=True)
+        self.assertEqual("task-new", self.unfinished()["run_id"])
+
+    def test_a_done_mark_with_no_start_is_no_record(self):
+        with self.assertRaises(ValueError):
+            report_status.write_run_start(
+                str(self.root), AUDIT, REPO, {"run_id": "task-9", "done_at": NOW.isoformat(), "outcome": "UPDATED"}
+            )
+        self.started("task-2", 0)
+        # One planted by hand, ahead of any start, newer than the real run.
+        (self.store / report_status.RUN_STARTS_DIR / "task-9.json").write_text(
+            json.dumps({"run_id": "task-9", "done_at": (NOW + timedelta(hours=1)).isoformat()})
+        )
+        # And one naming another run than its file.
+        (self.store / report_status.RUN_STARTS_DIR / "task-8.json").write_text(
+            json.dumps({"run_id": "task-2", "started_at": (NOW + timedelta(hours=2)).isoformat(), "done_at": "x"})
+        )
+        self.assertEqual("task-2", self.unfinished()["run_id"])
+        self.assertIsNone(report_status.read_run_start(str(self.root), AUDIT, REPO, "task-9"))
+        self.assertIsNone(report_status.read_run_start(str(self.root), AUDIT, REPO, "task-8"))
+
+    def test_records_sit_beside_the_ring_and_never_in_it(self):
+        ring = report_status.list_runs(str(self.root), AUDIT, REPO)
+        self.started("task-1", 0)
+        self.assertEqual(ring, report_status.list_runs(str(self.root), AUDIT, REPO))
+        self.assertEqual([], [p.name for p in (self.store / report_status.RUNS_DIR).iterdir() if "task" in p.name])
+        self.assertTrue((self.store / report_status.RUN_STARTS_DIR / "task-1.json").is_file())
+
+    def test_a_record_never_creates_a_store(self):
+        record = report_status.run_start_record("task-1", NOW.isoformat(), False)
+        with self.assertRaises(FileNotFoundError):
+            report_status.write_run_start(str(self.root), AUDIT, "acme/other", record)
+        self.assertFalse(Path(report_status.store_path(str(self.root), AUDIT, "acme/other")).exists())
+
+    def test_the_newest_records_are_kept_by_their_receipt(self):
+        for n in range(report_status.RUN_START_HISTORY + 2):
+            self.started(f"task-{n}", n)
+        # A record written last stays, whatever start its writer claims; the
+        # first written goes.
+        self.started("task-ancient", -60)
+        kept = sorted(path.name for path in (self.store / report_status.RUN_STARTS_DIR).iterdir())
+        self.assertEqual(
+            sorted([f"task-{n}.json" for n in range(3, report_status.RUN_START_HISTORY + 2)] + ["task-ancient.json"]),
+            kept,
+        )
+
+    def test_a_later_started_at_received_earlier_is_not_the_newest(self):
+        self.started("task-planted", 50)
+        self.started("task-real", -60)
+        self.assertEqual("task-real", self.unfinished()["run_id"])
+        # And through the listing a broker sends: by its received_at.
+        listed = [
+            {"run_id": "task-planted", "started_at": (NOW + timedelta(minutes=50)).isoformat(),
+             "received_at": NOW.isoformat()},
+            {"run_id": "task-real", "started_at": (NOW - timedelta(hours=1)).isoformat(),
+             "received_at": (NOW + timedelta(seconds=1)).isoformat()},
+        ]
+        self.assertEqual("task-real", report_status.newest_run_start(listed)["run_id"])
+
+    def test_a_done_mark_keeps_its_received_at(self):
+        self.started("task-old", 0)
+        path = self.store / report_status.RUN_STARTS_DIR / "task-old.json"
+        first = json.loads(path.read_text())["received_at"]
+        self.started("task-new", -60)
+        self.started("task-old", 0, done=True)
+        self.assertEqual(first, json.loads(path.read_text())["received_at"])
+        self.assertEqual("task-new", self.unfinished()["run_id"])
+
+    def test_a_task_credential_names_the_run(self):
+        claims = base64_claims({"nats": {"task": "task-7f3a", "profile": "fleet-audit"}})
+        token = Path(self.scratch) / "task-token"
+        token.write_text(f"e30.{claims}.sig")
+        with patch.dict(os.environ, {report_status.TASK_TOKEN_FILE_ENV: str(token)}):
+            self.assertEqual("task-7f3a", report_status.task_id_from_credential())
+        token.write_text(f"e30.{base64_claims({'nats': {'task': 'Not A Label'}})}.sig")
+        with patch.dict(os.environ, {report_status.TASK_TOKEN_FILE_ENV: str(token)}):
+            self.assertIsNone(report_status.task_id_from_credential())
+        with patch.dict(os.environ, {report_status.TASK_TOKEN_FILE_ENV: ""}):
+            self.assertIsNone(report_status.task_id_from_credential())
+
+
+def base64_claims(claims):
+    import base64
+
+    return base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+
+
 if __name__ == "__main__":
     unittest.main()

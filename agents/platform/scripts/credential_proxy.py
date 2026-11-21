@@ -3234,9 +3234,17 @@ def required_roles(path: str) -> tuple[str, ...]:
 # decodes to an empty, `.` or `..` part or a control character, in any escaping.
 # A run is the ring's `%Y%m%dT%H%M%S.%fZ` stamp
 # (audit_report.REPORT_STAMP_FORMAT). The routes validate each segment again.
+# The one other run name is a run-start record's (#6812), `started-<run id>`
+# (REPORT_RUN_START_PREFIX), admitted on the GET and PUT of one run alone,
+# under a run write's rules and, for a profile task, only for its own task id
+# (report_run_start_permitted; fleet-audit-report-store.md §3).
 _REPORT_AUDIT_ID = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _REPORT_STORE_KEY = r"(?!\.{1,2}/)[A-Za-z0-9._~%-]+"
 _REPORT_RUN_STAMP = r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z"
+# Mirrored from audit_report_store.RUN_START_PREFIX and its run id, a DNS-1123
+# label; test_audit_report_routes.py holds them equal.
+REPORT_RUN_START_PREFIX = "started-"
+_REPORT_RUN_START = rf"{REPORT_RUN_START_PREFIX}[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?"
 _REPORT_STREAM = f"{AUDIT_REPORTS_PREFIX}/{_REPORT_AUDIT_ID}/{_REPORT_STORE_KEY}"
 # How deep a store key is unescaped before it is refused: it is escaped at most
 # twice (a non-GitHub path inside the key), so a fixed point past this is hostile.
@@ -3264,9 +3272,13 @@ REPORT_CREDENTIAL_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(f"{_REPORT_STREAM}/latest")),
     ("GET", re.compile(f"{_REPORT_STREAM}/runs")),
     ("GET", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    # One run-start record, which finish reads back to mark its own run done.
+    ("GET", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_START}")),
     # finish's writes: the ring entry, then latest as its copy, and dropping a
     # latest that no longer describes the ledger.
     ("PUT", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    # start's run-start record, and finish's done mark on it.
+    ("PUT", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_START}")),
     ("PUT", re.compile(f"{_REPORT_STREAM}/latest")),
     ("DELETE", re.compile(f"{_REPORT_STREAM}/latest")),
 )
@@ -3357,6 +3369,9 @@ RULE_REPORT_NO_TRIGGER = "audit-report.no-trigger"
 RULE_REPORT_TRIGGER_ORIGIN = "audit-report.trigger-origin"
 RULE_REPORT_TRIGGER_STREAM = "audit-report.trigger-stream"
 RULE_REPORT_REPOSITORY_KEY = "audit-report.repository-key"
+# A profile task's PUT of a run-start record named for any run but its own
+# task (#6812): it may write its own record alone (report_run_start_permitted).
+RULE_REPORT_RUN_START_TASK = "audit-report.run-start-task"
 # The A2A gateway's report reader (#5618): a write, a route other than one
 # report, and a key segment other than REPORT_A2A_PUBLISH_KEY are each their
 # own refusal.
@@ -3394,12 +3409,16 @@ REPORT_WRITER_RE = re.compile(
 RULE_REPORT_WRITER = "audit-report.writer"
 
 # What a store path asks for, by its shape under REPORT_CREDENTIAL_ROUTES:
-# the stream list, one stream's latest, its run index, or one run.
+# the stream list, one stream's latest, its run index, one run, or one
+# run-start record (#6812). A run-start record is never REPORT_ROUTE_RUN, so it
+# carries no writer stamp and the A2A report reader cannot read it.
 REPORT_ROUTE_LIST = "list"
 REPORT_ROUTE_LATEST = "latest"
 REPORT_ROUTE_RUNS = "runs"
 REPORT_ROUTE_RUN = "run"
-# The reads the A2A gateway's report reader makes: one finished report, never an index.
+REPORT_ROUTE_RUN_START = "run-start"
+# The reads the A2A gateway's report reader makes: one finished report, never an
+# index or a run-start record.
 REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN})
 # The segment counts of a split store path ("", "v1", "audit-reports", ...).
 _REPORT_LIST_SEGMENTS = 3
@@ -3455,6 +3474,8 @@ def report_route_kind(path: str) -> str | None:
     if len(segments) == _REPORT_STREAM_ROUTE_SEGMENTS and segments[5] == "runs":
         return REPORT_ROUTE_RUNS
     if len(segments) == _REPORT_RUN_SEGMENTS and segments[5] == "runs":
+        if segments[6].startswith(REPORT_RUN_START_PREFIX):
+            return REPORT_ROUTE_RUN_START
         return REPORT_ROUTE_RUN
     return None
 
@@ -3519,7 +3540,9 @@ def report_write_permitted(
 ) -> str | None:
     """The rule a write to the store breaks, or None when the caller may write.
 
-    A write is a ring entry, latest, or dropping latest. ``key`` is the
+    A write is a ring entry, a run-start record (decided here exactly as a
+    ring entry, nothing here reads the route; report_run_start_permitted then
+    binds a profile task to its own record), latest, or dropping latest. ``key`` is the
     request's raw store-key segment, compared whole with the install's own:
     ``gitops_key``, the key `finish` publishes to (report_publish_store_key),
     or, when that rule yields no repository (``gitops_key`` None),
@@ -3566,6 +3589,25 @@ def report_write_permitted(
     if role == CALLER_ROLE_SHELL and key != REPORT_NO_FORGE_STORE_KEY and key in registered_keys:
         return None
     return RULE_REPORT_REPOSITORY_KEY
+
+
+def report_run_start_permitted(role: Any, task: Any, run_name: Any) -> str | None:
+    """The rule a permitted write of a run-start record still breaks, or None.
+
+    Asked after report_write_permitted, for a PUT whose route is
+    REPORT_ROUTE_RUN_START. A profile caller writes only the record named for
+    its own run: ``run_name`` (the path's last segment) must be
+    `started-<task id>`, with the task id the verified task credential's `task`
+    claim, so a task cannot overwrite, mark done or crowd out another run's
+    record. The shell is not bound: it writes the ring itself. Every other
+    role was refused by report_write_permitted already, and is refused here too.
+    """
+    if role == CALLER_ROLE_SHELL:
+        return None
+    task_id = getattr(task, "task", None) if role == CALLER_ROLE_PROFILE else None
+    if not isinstance(task_id, str) or not task_id or run_name != f"{REPORT_RUN_START_PREFIX}{task_id}":
+        return RULE_REPORT_RUN_START_TASK
+    return None
 
 
 def report_writer_for(role: Any, task: Any, audit_id: Any) -> str | None:
@@ -15443,7 +15485,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 registered,
             )
             # The PUT of a ring entry carries the writer stamp, made from the
-            # verified caller and nothing the request says.
+            # verified caller and nothing the request says. A run-start record
+            # (REPORT_ROUTE_RUN_START) is relayed unstamped: it is no report,
+            # and a profile task writes only its own run's.
+            if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN_START:
+                rule = report_run_start_permitted(role, task, segments[-1])
             if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN:
                 writer = report_writer_for(role, task, segments[3])
                 if writer is None:

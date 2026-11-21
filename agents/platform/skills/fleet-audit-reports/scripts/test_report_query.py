@@ -1310,5 +1310,52 @@ class TestThroughTheBroker(TestTheWriterIsWhatIsRead):
         self.assertIn("not readable", payload["error"])
 
 
+
+class TestUnfinishedRun(StoreTestCase):
+    """The run-start record (#6812): a newest run that never finished is said beside the report."""
+
+    STAMP = "20260826T063100.000000Z"
+
+    def setUp(self):
+        super().setUp()
+        self.write_run(AUDIT, self.STAMP, [finding("a")])
+
+    def started(self, run_id, at, done=False):
+        status = report_query.report_status
+        record = status.run_start_record(
+            run_id, at, True, done_at="2026-08-26T07:00:00+00:00" if done else None, outcome="UPDATED" if done else None
+        )
+        status.write_run_start(self.root, AUDIT, REPO, record)
+
+    def test_no_record_and_a_finished_run_add_nothing(self):
+        self.assertIsNone(self.ok("streams")["streams"][0]["unfinished_run"])
+        self.assertIsNone(self.ok("show", AUDIT)["unfinished_run"])
+        self.started("task-1", "2026-08-26T06:00:00+00:00", done=True)
+        self.assertIsNone(self.ok("streams")["streams"][0]["unfinished_run"])
+        self.assertIsNone(self.ok("show", AUDIT)["unfinished_run"])
+
+    def test_a_run_that_did_not_finish_is_named_beside_the_report(self):
+        self.started("task-1", "2026-08-26T06:00:00+00:00", done=True)
+        self.started("task-2", "2026-08-27T06:00:00+00:00")
+        expected = {
+            "note": "the last run did not finish",
+            "run_id": "task-2",
+            "started_at": "2026-08-27T06:00:00+00:00",
+            "scheduled": True,
+        }
+        row = self.ok("streams")["streams"][0]
+        self.assertEqual(expected, row["unfinished_run"])
+        # The report is the run before it, unaltered.
+        self.assertEqual(finished_at_for(self.STAMP), row["finished_at"])
+        shown = self.ok("show", AUDIT)
+        self.assertEqual(expected, shown["unfinished_run"])
+        self.assertNotIn("unfinished_run", shown["envelope"])
+        self.assertEqual(finished_at_for(self.STAMP), shown["envelope"]["finished_at"])
+        # An older run asked for by name is that run, with nothing about the newest.
+        self.assertIsNone(self.ok("show", AUDIT, "--run", self.STAMP)["unfinished_run"])
+        # The ring holds the reports alone.
+        self.assertEqual(1, row["runs"])
+
+
 if __name__ == "__main__":
     unittest.main()

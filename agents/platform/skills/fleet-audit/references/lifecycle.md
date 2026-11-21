@@ -78,7 +78,9 @@ Before inspecting anything, claim the workspace:
 
 This resolves the target repository (see [Which repository](#which-repository) below), makes
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
-the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
+the stream's open ledger issue, and clears any findings document a crashed run left behind. It also
+writes the run's run-start record to the report store, which `finish` marks done, so a reader can say
+that the last run did not finish. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
 administrator to add it to `$GITOPS_STATE_CONFIGMAP`. A refusal of the repository from the
 credential proxy or the broker is the same answer, and you stop there: see the skill's rule on
