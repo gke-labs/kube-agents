@@ -1,7 +1,10 @@
 # Node OS, kubelet and auto-repair (gce-compute-fleet-audit): workloads leak
 # threads or processes until a node's process IDs run out, and the kubelet sets
-# PIDPressure and evicts. A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#5410, which proposes `node-pid-pressure`).
+# PIDPressure and evicts. Parked as FIXTURE_NOT_READY
+# (gke-labs/kube-agents#5410, which proposes `node-pid-pressure`): the shape
+# that the first plan reads is a setting at the platform's default, and a
+# fixture for the node's own PIDPressure is not shown as a standing plant, so
+# the case carries no suite line.
 # What live tests showed (2026-11-20, scratch clusters, GKE Standard 1.35.8,
 # one run each): a pool has no pod PID limit by default, but each container
 # showed `pids.max = 629145`, 15 percent of the node's 4194304. On an 8 GB node
@@ -19,21 +22,21 @@
 # memory limit, on the default pool, whose kubelet configuration sets no pod
 # PID limit. By that text it cannot hold many processes, and the tests above do
 # not support a finding on it as the fault. A pool with no pod PID limit is
-# also the platform's default, which fixture rule 9 does not take as a fixture;
-# the case stays on the lane only until the decision on a fixture for the
-# node's own PIDPressure. Until then the flip condition is the first plan's: a
-# check that names that workload. The readiness rule group-oom-kill and the
-# case upgrades-fleet-readiness-multi-process-container assert it is the
+# also the platform's default, which fixture rule 9 does not take as a fixture,
+# so the case is parked. The cost of a fixture for the node's own PIDPressure:
+# a node of its own and a privileged pod that lowers `kernel.pid_max`, which
+# held for five minutes only in the test. The readiness rule group-oom-kill and
+# the case upgrades-fleet-readiness-multi-process-container assert it is the
 # fleet's only forking container, so no second forking plant may land. The
 # objective below keeps the form of the first plan, a finding on that workload;
-# a check keyed on the PIDPressure condition or on pid_used reads nothing here.
-# Domain `fleet-audits` as the other GCE compute cases.
+# the pull request that brings a fixture rewrites it, and the un-park pull
+# request restores the `suite:` and `suite_part:` lines. `expected_fail` stays:
+# the marker waits for a check on the node's PIDPressure or on its share of
+# process IDs in use. Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
-name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload, the first plan's shape; a fixture for PIDPressure is not shown)"
+name: "Node PID exhaustion (parked: the fleet's multi-process workload is a platform-default shape; a fixture for PIDPressure is not shown as a standing plant)"
 domain: fleet-audits
-suite: validated-capabilities
-suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -43,12 +46,13 @@ prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.
 expected_output: >-
-  Reads the fleet's existing multi-process workload on a pool with no pod PID
-  limit. Customer failure, as live tests showed it: several leaking containers
-  used all process IDs of a large node, and the kubelet set PIDPressure and
-  evicted; one container did not. Validated needs a fixture for that state; the
-  present objective accepts a finding that names `multi-process-worker`. The
-  closing response is the SOP's one line with the ledger URL.
+  Parked. Reads the fleet's existing multi-process workload on a pool with no
+  pod PID limit. Customer failure, as live tests showed it: several leaking
+  containers used all process IDs of a large node, and the kubelet set
+  PIDPressure and evicted; one container did not. Validated needs a fixture for
+  that state; the present objective accepts a finding that names
+  `multi-process-worker`. The closing response is the SOP's one line with the
+  ledger URL.
 infrastructure:
   deployer: noop
 validated: false
