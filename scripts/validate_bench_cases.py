@@ -1681,17 +1681,21 @@ def validate_case(
     # here a case may name only a recipe that names it back.
     recipe = spec.get("recipe")
     if recipe is not None:
-        recipes = {r.kind: r for r in fix_recipes.recipes()}
-        if not isinstance(recipe, str) or recipe not in recipes:
-            problems.append(
-                f"'recipe:' {recipe!r} is not a fix recipe under "
-                f"agents/platform/scripts/fix_recipes/ (known: {', '.join(sorted(recipes))})"
-            )
-        elif recipes[recipe].eval_case != name:
-            problems.append(
-                f"'recipe: {recipe}' names a recipe whose eval_case is "
-                f"{recipes[recipe].eval_case!r}, not this case; set eval_case in its recipe.yaml"
-            )
+        try:
+            recipes = {r.kind: r for r in fix_recipes.recipes()}
+        except fix_recipes.RecipeError as exc:
+            problems.append(f"names recipe {recipe!r}, but the fix recipes do not load: {exc}")
+        else:
+            if not isinstance(recipe, str) or recipe not in recipes:
+                problems.append(
+                    f"'recipe:' {recipe!r} is not a fix recipe under "
+                    f"agents/platform/scripts/fix_recipes/ (known: {', '.join(sorted(recipes))})"
+                )
+            elif recipes[recipe].eval_case != name:
+                problems.append(
+                    f"'recipe: {recipe}' names a recipe whose eval_case is "
+                    f"{recipes[recipe].eval_case!r}, not this case; set eval_case in its recipe.yaml"
+                )
 
     # The audit streams a case drives without grading their ledger. The runner
     # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an

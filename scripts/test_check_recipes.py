@@ -70,11 +70,11 @@ class RecipeCheckTest(unittest.TestCase):
     def test_scaffold_lines_and_missing_names_fail(self):
         self.tree.case("case-a", "no-pdb")
         self.tree.recipe("no-pdb", extra={
-            "fix.py": "def other():\n    pass\n",
-            "checks.py": "READ_KINDS = 'pods'\n# RECIPE-TEMPLATE\ndef checks(change, live):\n    return []\n",
+            "fix.py": "def generate(candidate, finding_id):\n    pass\n",
+            "checks.py": "read_kinds = 'pods'\n# RECIPE-TEMPLATE\ndef checks(change, live):\n    return []\n",
         })
         problems = "\n".join(self.tree.problems())
-        self.assertIn("fix.py: does not define generate", problems)
+        self.assertIn("fix.py: does not define read_inputs", problems)
         self.assertIn("checks.py: still has scaffold lines", problems)
         self.assertNotIn("checks.py: does not define", problems)
 
@@ -85,6 +85,12 @@ class RecipeCheckTest(unittest.TestCase):
 
     def test_the_shipped_recipes_pass(self):
         self.assertEqual(check_recipes.recipe_problems(), [])
+
+    def test_the_required_names_are_what_the_broker_and_the_registry_load(self):
+        # registry.checks_module refuses a checks.py without these, and the
+        # broker calls fix.read_inputs then fix.generate.
+        self.assertEqual(check_recipes.REQUIRED_NAMES["checks.py"], ("read_kinds", "checks"))
+        self.assertEqual(set(check_recipes.REQUIRED_NAMES["fix.py"]), {"generate", "read_inputs"})
 
 
 class PlumbingTest(unittest.TestCase):
@@ -97,8 +103,12 @@ class PlumbingTest(unittest.TestCase):
     def test_plumbing_alone_or_a_recipe_alone_is_not_flagged(self):
         self.assertEqual(check_recipes.plumbing_flags(["agents/platform/scripts/dial_state.py"]), [])
         self.assertEqual(check_recipes.plumbing_flags([self.RECIPE_FILE]), [])
-        # The registry sits in fix_recipes/ but is plumbing, not a recipe.
-        self.assertEqual(check_recipes.plumbing_flags(["agents/platform/scripts/fix_recipes/registry.py"]), [])
+        # The modules beside the kinds are plumbing, not a recipe.
+        for module in ("registry.py", "probes.py", "yaml_edit.py", "__init__.py"):
+            path = f"agents/platform/scripts/fix_recipes/{module}"
+            with self.subTest(module=module):
+                self.assertEqual(check_recipes.plumbing_flags([path, "agents/platform/scripts/dial_state.py"]), [])
+                self.assertEqual(check_recipes.plumbing_flags([self.RECIPE_FILE, path]), [path])
 
 
 class ScaffoldTest(unittest.TestCase):
@@ -113,6 +123,8 @@ class ScaffoldTest(unittest.TestCase):
             problems = tree.problems()
             self.assertTrue(any("no `eval_case`" in p for p in problems))
             self.assertEqual(sum("scaffold lines" in p for p in problems), len(recipe_new.FILES))
+            # The scaffold defines everything the loaders need; only the marker holds it back.
+            self.assertFalse([p for p in problems if "does not define" in p])
 
     def test_it_refuses_a_bad_kind_and_an_existing_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

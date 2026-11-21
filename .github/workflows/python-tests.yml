@@ -545,17 +545,20 @@ jobs:
       # The fix recipes: each loads, names an eval case that names it back, and
       # carries no scaffold line. On a pull request it also flags a change that
       # edits a recipe and the shared plumbing beside it (a warning, for a
-      # platform owner's review). The base is fetched by sha, since the
-      # checkout is one commit deep; the sha comes in through env, never
-      # spliced into the script.
+      # platform owner's review). The checkout is the pull request's merge
+      # commit, one deep; its first parent is the base it merged onto, so a
+      # second commit of depth gives exactly the pull request's change. The
+      # ref comes in through env, never spliced into the script.
       - name: Check the fix recipes
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_REF: ${{ github.event_name == 'pull_request' && github.ref || '' }}
         run: |
-          if [ -n "$BASE_SHA" ]; then
-            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          base=""
+          if [ -n "$PR_REF" ]; then
+            git fetch --no-tags --depth=2 origin "$PR_REF"
+            base="HEAD^1"
           fi
-          make recipe-check RECIPE_CHECK_BASE="$BASE_SHA"
+          make recipe-check RECIPE_CHECK_BASE="$base"
 
       - name: Install bench and its test runner
         run: |

@@ -77,7 +77,9 @@ __all__ = [
 #   (read by ``lane.py`` and by ``load_case``), ``suite``
 #   (``validated-capabilities``: the case runs on the validated-capabilities lane only; the
 #   lane and scripts/validate_bench_cases.py read the bare line from the task
-#   file), ``suite_part`` (which section of that lane, default 1)
+#   file), ``suite_part`` (which section of that lane, default 1), ``recipe``
+#   (the fix recipe whose end-to-end case this is; read by
+#   scripts/check_recipes.py and scripts/validate_bench_cases.py)
 #   -- and ``task_version``, a
 #   case's own revision note that nothing reads. A new one is added here, in a
 #   pull request before any case a pull-request job grades uses it (the
@@ -91,7 +93,7 @@ REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
         "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
-        "suite_part",
+        "suite_part", "recipe",
         _REQUESTED_KEY,
     }
 )

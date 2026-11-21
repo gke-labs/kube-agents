@@ -32,7 +32,7 @@ RECIPES = SCRIPTS / "fix_recipes"
 TASKS = REPO / "bench" / "tasks"
 MARKER = "RECIPE-TEMPLATE"
 #: What a recipe module must define, when it has one.
-REQUIRED_NAMES = {"fix.py": ("generate",), "checks.py": ("READ_KINDS", "checks")}
+REQUIRED_NAMES = {"fix.py": ("generate", "read_inputs"), "checks.py": ("read_kinds", "checks")}
 RECIPE_PREFIX = "agents/platform/scripts/fix_recipes/"
 SHARED_PLUMBING = tuple(
     f"agents/platform/scripts/{name}"
@@ -50,7 +50,10 @@ SHARED_PLUMBING = tuple(
         "post_merge_stepdown.py",
         "post_merge_followups.py",
         "clean_merges.py",
+        "fix_recipes/__init__.py",
         "fix_recipes/registry.py",
+        "fix_recipes/probes.py",
+        "fix_recipes/yaml_edit.py",
     )
 )
 
@@ -104,7 +107,9 @@ def _top_level_names(text: str) -> set[str]:
 
 def plumbing_flags(changed: list[str]) -> list[str]:
     """The shared-plumbing files a change edits alongside a recipe; empty when it touches no recipe."""
-    recipe_paths = [p for p in changed if p.startswith(RECIPE_PREFIX) and p not in SHARED_PLUMBING]
+    # A recipe is a directory: fix_recipes/<kind>/<file>. The modules beside
+    # the kinds (registry, probes, the YAML editor) are plumbing.
+    recipe_paths = [p for p in changed if p.startswith(RECIPE_PREFIX) and "/" in p[len(RECIPE_PREFIX):]]
     if not recipe_paths:
         return []
     return sorted(p for p in changed if p in SHARED_PLUMBING)

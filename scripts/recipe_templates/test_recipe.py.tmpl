@@ -27,7 +27,7 @@ class RecipeTest(unittest.TestCase):
     def test_the_fix(self):
         # RECIPE-TEMPLATE: the same finding and base give the same bytes, and a
         # finding the fix cannot write exactly raises ValueError.
-        self.assertTrue(callable(fix.generate))
+        self.assertTrue(callable(fix.generate) and callable(fix.read_inputs))
 
     def test_the_checks(self):
         # RECIPE-TEMPLATE: each check passes on a namespace where the fix is safe

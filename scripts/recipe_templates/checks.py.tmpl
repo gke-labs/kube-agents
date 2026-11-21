@@ -1,14 +1,22 @@
 """The {kind} fix's safety checks: live facts that must hold before it may merge unattended.
 
-Stdlib only: the credential proxy imports recipe modules.
+The broker's label gate and the sandbox's pre-flight both load this file
+(`fix_recipes.registry.checks_module`) and run `checks` on their own read of
+the target namespace. Stdlib only: the credential proxy loads this file.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 #: The kubectl kinds one read of the target namespace must fetch, separated by commas.
-READ_KINDS = "RECIPE-TEMPLATE"
+read_kinds = "RECIPE-TEMPLATE"
 
 
-def checks(change: dict, live: dict) -> list[tuple[str, str, str]]:
-    """``(name, "pass" | "fail" | "unknown", evidence)`` for each check, on the namespace read in ``live``."""
+def checks(change: Any, live: dict) -> list[dict]:
+    """One result per check for the fix `change` (its fields as attributes) against the namespace read `live`.
+
+    Each result is a dict naming the check and its outcome, `pass`, `fail` or
+    `unknown`, in the shape `no-pdb/checks.py` returns.
+    """
     raise NotImplementedError("RECIPE-TEMPLATE: write the {kind} safety checks")
