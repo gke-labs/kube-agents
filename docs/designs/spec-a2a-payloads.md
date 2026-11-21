@@ -398,7 +398,9 @@ calls and become properties of the stream:
   `kind: message` with the same `taskId` to `…in`. Executor resumes and publishes
   `working`.
 - Steering (added 8/24; refusal posture recorded 8/31): a follow-up `message` on `…in`
-  while the task is `working` is legal. It is steering input - delivered to the
+  while the task is `working` is legal, except into a task that holds `changeRequested`: the
+  gateway sends no steer into one, and so no `input-required` answer or choice click either
+  (#5884). It is steering input - delivered to the
   executor, incorporated at its next turn boundary, no state transition implied. The
   hard interrupt is `cancel`, not a steer. An executor that cannot absorb input mid-turn
   may queue it instead (the standing front door, 10/8): it answers each follow-up with a
@@ -777,7 +779,10 @@ The same object may carry `"changeRequested": true`: the requester asked for a c
 request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
 and only for a turn that arrived as a structured confirm action, never from free text or a
 delegation's arguments. A child task or a wake carries its parent's value from the gateway's own
-record and cannot raise it. When it is true the gateway attaches the part even with no parameters.
+record and cannot raise it. No steer reaches a running task that holds it, from any door: a typed
+message there is refused with a notice to stop the task and confirm again, since the gateway can't
+tell which client on a door sent it and a change-permitted task's instructions must not change
+mid-run (a confirm is already refused while a task runs). When it is true the gateway attaches the part even with no parameters.
 Absent means false, so a submission that asks for no change is byte-identical to one written before
 the field existed. The dispatcher turns it into the `vcs:proposal-create` permit on the task's
 credential-proxy token.
