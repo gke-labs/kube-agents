@@ -7650,6 +7650,13 @@ type a2aProvisionState struct {
 	// the document goes stale, whichever is first; zero for no deadline.
 	scopeCondition *metav1.Condition
 	scopeRequeue   time.Duration
+	// builtinSchedulesCondition is the BuiltinSchedules condition
+	// reconcileBuiltinSchedules computed, nil when there's nothing to say;
+	// builtinSchedulesRequeue is how soon the renderer wants to look again
+	// (a replaced schedule's deletion in flight, a write that raced), zero
+	// for no need.
+	builtinSchedulesCondition *metav1.Condition
+	builtinSchedulesRequeue   time.Duration
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
@@ -8136,6 +8143,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	state.scopeCondition = scopeOutcome.condition
 	state.scopeRequeue = scopeOutcome.requeue
+
+	// The built-in AgentSchedules (platformagent_builtin_schedules.go).
+	builtinCondition, builtinRequeue, err := r.reconcileBuiltinSchedules(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	state.builtinSchedulesCondition = builtinCondition
+	state.builtinSchedulesRequeue = builtinRequeue
 
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
