@@ -2,6 +2,9 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -51,6 +54,19 @@ func profileBatchParent(t *testing.T, r *rig, conv string, clusters ...string) (
 	return parent, origin, kids
 }
 
+// startRestartableProfileRig is startProfileRig on a rig restartRig can
+// stop and replace.
+func startRestartableProfileRig(t *testing.T) *rig {
+	t.Helper()
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.ScopeFile = scope; c.Namespace = "kubeagents-system" })
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
+	return r
+}
+
 // childResultsOn reads every childResult on a parent's .in.
 func childResultsOn(t *testing.T, r *rig, addressee, taskID string) []lib.ChildResult {
 	t.Helper()
@@ -86,7 +102,11 @@ func TestAProfileParentsBatchSendsEachChildsEndAsItEnds(t *testing.T) {
 	r := startProfileRig(t)
 	ctx := context.Background()
 	conv := "console:tab-profile-batch"
-	_, origin, kids := profileBatchParent(t, r, conv, "a", "b", "c")
+	parent, origin, kids := profileBatchParent(t, r, conv, "a", "b", "c")
+	// A progress write mid-wait is no end either.
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>") {
 		if _, tier, kind, _, ok := lib.ParseSubmitSubject(e.subject); !ok || tier != "read" || kind != lib.SubmitKindChild {
@@ -114,6 +134,15 @@ func TestAProfileParentsBatchSendsEachChildsEndAsItEnds(t *testing.T) {
 	rec, _ := r.g.reg.Get(ctx, conv)
 	if rec.ActiveTask == nil || rec.ActiveTask.TaskID != origin.TaskID {
 		t.Fatalf("active = %+v, want the parent while its other children run", rec.ActiveTask)
+	}
+	// Handing off and waiting is no end: only the parent's terminal status
+	// cancels its batch, so the children still running get no cancel.
+	for _, k := range kids {
+		for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject("cluster", k.TaskID)) {
+			if e.env.Kind == lib.KindCancel {
+				t.Fatalf("child %s cancelled while its parent waits open", k.TaskID)
+			}
+		}
 	}
 
 	completeChild(t, r, kids[0], "a is fine")
@@ -427,4 +456,115 @@ func TestAWithdrawnProfileBatchLeavesAnEndedEntryAlone(t *testing.T) {
 			t.Fatalf("an end for entry %d", c.Entry)
 		}
 	}
+}
+
+// TestAHealedProfileParentEndCancelsItsBatch: when the relay missed a
+// profile parent's terminal and the heal finds it instead, the heal releases
+// the conversation and cancels the live children, as the relay would have.
+func TestAHealedProfileParentEndCancelsItsBatch(t *testing.T) {
+	t.Parallel()
+	r := startRestartableProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-healed-end"
+	parent, _, kids := profileBatchParent(t, r, conv, "a", "b")
+	r2, _ := restartRig(t, r, func() {
+		if err := parent.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+	r2.adapter.inbox <- InboundMessage{Conversation: conv, Backend: consoleBackend, Kind: "dm", AuthorID: consoleAuthor,
+		MessageID: "after-heal", Text: "anything new?"}
+	waitFor(t, "each live child cancelled by the heal", func() bool {
+		for _, k := range kids {
+			cancelled := false
+			for _, e := range streamEnvelopes(t, r2.url, lib.TaskInSubject("cluster", k.TaskID)) {
+				cancelled = cancelled || e.env.Kind == lib.KindCancel
+			}
+			if !cancelled {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// TestAProfileParentsBatchWithOneTargetsPinRefusingItsTierMintsNothing: the
+// pinned-tier check runs for every entry, as for a single child. One target
+// whose pinned profile doesn't take the child's tier refuses the whole
+// batch, since a batch is whole or not run.
+func TestAProfileParentsBatchWithOneTargetsPinRefusingItsTierMintsNothing(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("tse", &lib.AgentCard{Name: "tse", Parameters: clusterParams})
+	// Cluster c's pinned profile takes only unattended, not the read tier
+	// the parent's children are minted at.
+	r.g.profiles.put("c-pin", &lib.AgentCard{Name: "c-pin", Parameters: clusterParams, Tiers: []string{"unattended"},
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "c"}})
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-pinned-tier"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "tse", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "tse", Text: "c", Parameters: targetParams("p1", "us-east1", "c")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the batch recorded as refused for the pin", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && strings.Contains(ref.DelegationEnd, "c-pin")
+	})
+	time.Sleep(200 * time.Millisecond)
+	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"tse.>"); len(envs) != 0 {
+		t.Fatalf("a batch refused for one target's pin left %d child submission(s)", len(envs))
+	}
+}
+
+// TestASupervisorEndForAProfileParentCancelsItsBatch: a parent whose worker
+// died mid-wait never writes its own final status. The supervisor's
+// terminal on the parent's task (its deadline, or the worker's loss) is the
+// parent's end all the same, so the batch is cancelled then, not left to
+// run to each child's own deadline.
+func TestASupervisorEndForAProfileParentCancelsItsBatch(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	conv := "console:tab-profile-batch-supervisor-end"
+	_, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+	payload, err := json.Marshal(lib.StatusUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskSupervisorSubject("chat", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+	waitForRecord(t, r, conv, "the conversation released", func(rec *SessionRecord) bool {
+		return rec.ActiveTask == nil
+	})
+	waitFor(t, "each live child cancelled", func() bool {
+		for _, k := range kids {
+			cancelled := false
+			for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject("cluster", k.TaskID)) {
+				cancelled = cancelled || e.env.Kind == lib.KindCancel
+			}
+			if _, stop := dispatchStopFor(t, r.url, "cluster", k.TaskID); !cancelled || !stop {
+				return false
+			}
+		}
+		return true
+	})
 }

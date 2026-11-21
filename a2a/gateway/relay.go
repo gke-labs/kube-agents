@@ -1229,10 +1229,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			// task does, and its children are cancelled (cancelOrphanedBatch).
 			active.StatusMsgID = ""
 		} else {
-			if !active.Detached && rec.fanOutPending(taskID) {
-				g.cancelOrphanedBatch(ctx, rec, taskID)
-			}
-			rec.ActiveTask = nil
+			g.releaseEndedTask(ctx, rec, active)
 		}
 		// An executor's end of a live task is activity. The Slack adapter's
 		// session-thread rule (hasSession, through LastTaskActivity) counts

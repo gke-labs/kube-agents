@@ -129,6 +129,18 @@ func (g *Gateway) cancelTreeNode(ctx context.Context, rec *SessionRecord, ref Ta
 	}
 }
 
+// releaseEndedTask lets go of the conversation's active task, which has
+// ended, for the relay's terminal and the heal's alike, so the two can't
+// drift: a profile parent that ended while its batch ran has its live
+// children cancelled first (cancelOrphanedBatch). A session parent's batch
+// never reaches here while it runs, since its turn's end only hands off.
+func (g *Gateway) releaseEndedTask(ctx context.Context, rec *SessionRecord, active *ActiveTask) {
+	if !active.Detached && rec.profileTask(active.TaskID) && rec.fanOutPending(active.TaskID) {
+		g.cancelOrphanedBatch(ctx, rec, active.TaskID)
+	}
+	rec.ActiveTask = nil
+}
+
 // cancelOrphanedBatch cancels the live descendants of a profile parent that
 // ended while its batch ran: nothing reads their results now, so each is
 // cancelled, quietly, with its stop record, as a stop would, rather than

@@ -2059,7 +2059,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			}
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(state, ""), active.LineNote), "")
 		}
-		rec.ActiveTask = nil
+		g.releaseEndedTask(ctx, rec, active)
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is
 		// activity, and the session-thread window opens at the answer (the
