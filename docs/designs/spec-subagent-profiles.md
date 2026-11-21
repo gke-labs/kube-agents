@@ -600,7 +600,7 @@ when the broker's 403 carries `write_refusal: true`;
 adapter reads the file after each tool result, stops the harness as a cancel does, and
 publishes terminal `rejected` with `reason: write-refused`, naming the record's rule and
 verb and nothing of the output. Nothing the harness prints after the refusal is published.
-`rejected` is the state no supervisor retries, and the gateway shows its detail. The broker
+`rejected` is the state no supervisor retries, and a delegating parent reads its reason. The broker
 refuses the write either way: a record that is lost leaves the task running, and every
 further write is refused too.
 
