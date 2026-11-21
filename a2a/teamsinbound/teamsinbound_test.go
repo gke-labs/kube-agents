@@ -249,6 +249,8 @@ func TestARequestTheTokenDoesNotVouchForNeverReachesTheBroker(t *testing.T) {
 		{"another tenant", r.ms.mint(t, testKid, signingAlgorithm, good), activityJSON(map[string]any{"channelData": map[string]any{"tenant": map[string]any{"id": "11111111-2222-4333-8444-555555555555"}}, "conversation": map[string]any{"id": "x"}}), http.StatusForbidden, "not from the tenant"},
 		{"no tenant at all", r.ms.mint(t, testKid, signingAlgorithm, good), activityJSON(map[string]any{"channelData": nil, "conversation": map[string]any{"id": "x"}}), http.StatusForbidden, "not from the tenant"},
 		{"not JSON", r.ms.mint(t, testKid, signingAlgorithm, good), "not json", http.StatusBadRequest, "not a JSON object"},
+		{"JSON null", r.ms.mint(t, testKid, signingAlgorithm, good), " null ", http.StatusBadRequest, "not a JSON object"},
+		{"JSON array", r.ms.mint(t, testKid, signingAlgorithm, good), "[]", http.StatusBadRequest, "not a JSON object"},
 		{"oversize", r.ms.mint(t, testKid, signingAlgorithm, good), `{"text":"` + strings.Repeat("x", maxBodyBytes) + `"}`, http.StatusRequestEntityTooLarge, "larger"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

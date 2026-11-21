@@ -29,9 +29,9 @@ const (
 	readTimeout   = 20 * time.Second
 	writeTimeout  = 20 * time.Second
 	idleTimeout   = 60 * time.Second
-	// warmTimeout bounds the startup read of Microsoft's signing keys
-	// (Verifier.Warm runs its fetch on this context); a failure is logged
-	// and the first request fetches again.
+	// warmTimeout bounds each attempt to read Microsoft's signing keys at
+	// startup (WarmUntilReady runs Warm on a context with this timeout); a
+	// failed attempt is logged and tried again.
 	warmTimeout = 15 * time.Second
 	// warmRetryFirst and warmRetryMost bound the wait between attempts to
 	// read the keys when the first fails: 2 s, doubling to a minute.

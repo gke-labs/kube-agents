@@ -236,13 +236,13 @@ jobs:
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/gke-stockout-investigator:${{ github.sha }}
 
       # The A2A next stack: the gateway, the callout, the verifier, the
-      # AgentProfile dispatcher and the console built from the a2a/ module root, the worker from the repository
+      # AgentProfile dispatcher, the console and the Teams inbound receiver built from the a2a/ module root, the worker from the repository
       # root (it copies the broker shim from agents/platform/scripts; each
       # Dockerfile's header says which) and the Hermes bridge sidecar, which is
       # FROM the platform-agent image this same job pushed under this commit's
       # tag, never a registry default (a2a/Dockerfile.hermes-bridge refuses to
       # build without the arg). Hence its place after the platform step. The
-      # operator derives the six it renders from its own image, else from
+      # operator derives the seven it renders from its own image, else from
       # the agent image it resolves (registry and tag), so the tags here are
       # what a next install at this commit pulls.
       - name: Build and Push A2A Gateway (GHCR)
