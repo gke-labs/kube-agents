@@ -157,7 +157,10 @@ def main() -> None:
     #    findings queue's pacing limits take it to `findings_nudge.py` and to
     #    `bootstrap_handoff.py`, which hands them to the first inventory
     #    report's selection; a scrubbed one would silently fall back to its
-    #    default. Onboarding's conversation-path delivery runs `a2a notify` from the
+    #    default. leeway-watch's alert thresholds take it to `leeway_watch.py`;
+    #    a scrubbed one would silently fall back to its default and the sweep
+    #    would post what the CR asked it to hold back. Onboarding's
+    #    conversation-path delivery runs `a2a notify` from the
     #    `oobe` child, which needs the bus and the conversation route's
     #    platform; scrubbed, the report would wait for good. The stall watch's
     #    knobs, which the operator pins in the managed .env from
@@ -175,6 +178,11 @@ def main() -> None:
         "FINDINGS_DAILY_CRITICALS",
         "FINDINGS_NONCRITICAL_MAX",
         "FINDINGS_NONCRITICAL_AFTER_HOUR",
+        "LEEWAY_WATCH_MIN_SEVERITY",
+        "LEEWAY_WATCH_MIN_DRIFT",
+        "LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE",
+        "LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR",
+        "LEEWAY_WATCH_REFRESH_DAYS",
         "A2A_NOTIFY_CONVERSATIONS",
         "A2A_NOTIFY_PLATFORM",
         "NATS_URL",

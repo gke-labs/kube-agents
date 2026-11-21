@@ -12322,6 +12322,68 @@ spec:
                         and serves no sample.
                       type: boolean
                   type: object
+                tiers:
+                  description:
+                    Tiers says which tier each person's profile tasks run
+                    at.
+                  properties:
+                    membership:
+                      description: |-
+                        Membership lists the people whose profile tasks run at a tier other
+                        than read. Anyone not listed runs at read, and the console runs at
+                        read whatever this says, since everyone on it shares one principal. A
+                        thread whose authors are at different tiers can't start a profile task,
+                        and a steer from an author at another tier than the running task's is
+                        refused. A member whose tier no Tier defines is refused profile tasks
+                        until one does; they don't fall back to read. The tier must be
+                        interactive: the admission webhook refuses an unattended-mode Tier.
+                        At most 200 entries, so the list fits the one environment variable the
+                        gateway reads it from (TestTheLargestMembershipFitsOneEnvString).
+                      items:
+                        description:
+                          TierMember maps one person on one chat backend
+                          to a tier.
+                        properties:
+                          backend:
+                            description: |-
+                              Backend is the surface the person writes from: one whose requester is
+                              one verified person. The a2a door's eval class isn't one: its callers
+                              name themselves under a shared token; its Google and Entra sign-in
+                              classes are.
+                            enum:
+                              - gchat
+                              - slack
+                              - discord
+                              - a2a-google
+                              - a2a-entra
+                            type: string
+                          tier:
+                            description: Tier is the name of an interactive-mode Tier.
+                            maxLength: 63
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          user:
+                            description: |-
+                              User is the person's id on that backend: their email on Google Chat
+                              (compared without case) and on a2a-google (as their Google token
+                              carries it), their Entra object id on a2a-entra (as their Entra token
+                              carries it), their user id on Slack or Discord.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^[^,=\s]+$
+                            type: string
+                        required:
+                          - backend
+                          - tier
+                          - user
+                        type: object
+                      maxItems: 200
+                      type: array
+                      x-kubernetes-list-map-keys:
+                        - backend
+                        - user
+                      x-kubernetes-list-type: map
+                  type: object
               required:
                 - harness
               type: object
@@ -12614,6 +12676,13 @@ spec:
                       description: |-
                         Provider is the LiteLLM provider slug, the text before the first "/" of the
                         default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
+                      type: string
+                    reasoningEffort:
+                      description: |-
+                        ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+                        the default model's entry, as typed: low, medium or high from the chart, or
+                        whatever a hand-edited config says. Absent when the entry states none, so the
+                        model thinks at its own default, and absent while the served CRD predates it.
                       type: string
                   type: object
                 lastReconcileTime:

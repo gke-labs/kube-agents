@@ -171,5 +171,36 @@ class SummaryTest(unittest.TestCase):
             self.assertIn("30.0", out.getvalue())
 
 
+class SeveralAnswersTest(unittest.TestCase):
+    """How many served requests came from keys with several answers, and whether more than one was served."""
+
+    def test_counts_keys_with_several_answers_and_which_were_served(self):
+        served = []
+        for n, (key, alternates, alternate) in enumerate((("k1", 2, "x"), ("k1", 2, "y"), ("k2", 3, "x"),
+                                                          ("k2", 3, "x"), ("k3", 1, "x"))):
+            entry = line(f"r{n}", n, ["s", f"u{n}"], True)
+            entry.update(fingerprint=key, alternates=alternates, served_alternate=alternate)
+            served.append(entry)
+        old = line("old", 9, ["s", "u9"], True)  # written before the proxy logged answers per key
+        report = analyze_replay.summarize(analyze_replay.load([write(served + [old])]))
+        self.assertEqual(report["served_requests_from_keys_with_several_answers"], 4)
+        self.assertEqual(report["keys_with_several_answers_served"], 2)
+        self.assertEqual(report["keys_with_more_than_one_answer_served"], 1)
+        self.assertIn("1 of 2 such keys", analyze_replay.render(report))
+
+    def test_slot_hits_count_under_the_key_they_were_served_from(self):
+        # Two requests with keys of their own, both served through answer
+        # slots from key k1's two answers: one key, both answers served.
+        served = []
+        for n, alternate in enumerate(("x", "y")):
+            entry = line(f"r{n}", n, ["s", f"u{n}"], True)
+            entry.update(fingerprint=f"own-{n}", served_key="k1", served_via="answer_slots", alternates=2,
+                         served_alternate=alternate)
+            served.append(entry)
+        report = analyze_replay.summarize(analyze_replay.load([write(served)]))
+        self.assertEqual(report["keys_with_several_answers_served"], 1)
+        self.assertEqual(report["keys_with_more_than_one_answer_served"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

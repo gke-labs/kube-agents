@@ -1496,9 +1496,13 @@ spec:
             - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway,system:serviceaccount:kubeagents-system:platformagent-a2a-mcp
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
+            - name: CREDENTIAL_PROXY_MCP_AUDIENCE
+              value: kubeagents-credential-proxy-mcp
+            - name: CREDENTIAL_PROXY_MCP_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-mcp
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
             - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
@@ -1746,6 +1750,9 @@ spec:
         - podSelector:
             matchLabels:
               app: platformagent-a2a-gateway
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-mcp
       ports:
         - port: 8765
           protocol: TCP
@@ -4967,6 +4974,9 @@ spec:
             matchLabels:
               app.kubernetes.io/part-of: a2a-next
               kubeagents.x-k8s.io/a2a-component: seed
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-mcp
       ports:
         - port: 4222
           protocol: TCP
@@ -5161,6 +5171,31 @@ spec:
   policyTypes:
     - Ingress
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp-netpol
+  name: platformagent-a2a-mcp-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-mcp
+  policyTypes:
+    - Ingress
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5304,6 +5339,230 @@ status:
   loadBalancer: {}
 ---
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  token: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp-token
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-mcp
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: platformagent-a2a-mcp
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: mcp
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - command:
+            - /mcp
+          env:
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: MCP_BUS_USER
+              value: console-mcp
+            - name: MCP_BUS_PASSWORD_FILE
+              value: /var/run/secrets/a2a-mcp-bus/console-mcp-password
+            - name: MCP_TOKEN_FILE
+              value: /var/run/secrets/a2a-mcp/token
+            - name: MCP_LISTEN
+              value: :8089
+            - name: MCP_AGENT_NAME
+              value: platformagent
+            - name: MCP_NAMESPACE
+              value: kubeagents-system
+            - name: GOMEMLIMIT
+              value: "228170137"
+            - name: A2A_MCP_BROKER_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: A2A_MCP_BROKER_TOKEN_FILE
+              value: /var/run/secrets/a2a-mcp-broker/token
+          image: ghcr.io/gke-labs/kube-agents/a2a-console:latest
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /healthz
+              port: 8089
+            periodSeconds: 10
+          name: mcp
+          ports:
+            - containerPort: 8089
+              name: http
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8089
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 64Mi
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 64Mi
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          startupProbe:
+            failureThreshold: 60
+            httpGet:
+              path: /healthz
+              port: 8089
+            periodSeconds: 5
+          volumeMounts:
+            - mountPath: /var/run/secrets/a2a-mcp-bus
+              name: bus-key
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-mcp
+              name: mcp-token
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-mcp-broker
+              name: mcp-broker-token
+              readOnly: true
+          workingDir: /
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-mcp
+      volumes:
+        - name: bus-key
+          secret:
+            items:
+              - key: console-mcp-password
+                mode: 288
+                path: console-mcp-password
+            secretName: platformagent-a2a-nats-creds
+        - name: mcp-token
+          secret:
+            items:
+              - key: token
+                mode: 288
+                path: token
+            secretName: platformagent-a2a-mcp-token
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+        - name: mcp-broker-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-mcp
+                  expirationSeconds: 3600
+                  path: token
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: mcp
+  name: platformagent-a2a-mcp
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: http
+      port: 8089
+      targetPort: 8089
+  selector:
+    app: platformagent-a2a-mcp
+  type: ClusterIP
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   labels:
@@ -5342,7 +5601,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "39"
+    pods: "40"
 status: {}
 ---
 apiVersion: v1
@@ -5366,7 +5625,7 @@ metadata:
 ---
 apiVersion: v1
 data:
-  dispatch.json: '{"version":"7839c8c0ddb1a702","namespace":"kubeagents-system","profileNamespace":"kubeagents-system-profiles","ceiling":6,"interactiveReserve":2,"childReserve":2,"leaseSeconds":90,"renewSeconds":20,"restartGraceSeconds":60,"acceptTimeoutSeconds":10,"submitRetentionSeconds":259200,"profiles":[]}'
+  dispatch.json: '{"version":"c9abdae43c4d2510","namespace":"kubeagents-system","profileNamespace":"kubeagents-system-profiles","ceiling":6,"interactiveReserve":2,"childReserve":2,"leaseSeconds":90,"renewSeconds":20,"restartGraceSeconds":60,"acceptTimeoutSeconds":10,"submitRetentionSeconds":259200,"profileSupervisorForm":"profile","profiles":[]}'
 kind: ConfigMap
 metadata:
   labels:
@@ -5757,6 +6016,295 @@ metadata:
       uid: ""
 spec: {}
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway-netpol
+  name: platformagent-a2a-gateway-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9096
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 9096
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-gateway
+  policyTypes:
+    - Ingress
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  progressDeadlineSeconds: 1800
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-gateway
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/secret-env-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-a2a-gateway
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: gateway
+    spec:
+      automountServiceAccountToken: true
+      containers:
+        - env:
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: NATS_CA_CONFIGMAP
+              value: platformagent-a2a-nats-ca-bundle
+            - name: NATS_USER
+              value: gateway
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: gateway-password
+                  name: platformagent-a2a-nats-creds
+            - name: A2A_CONSOLE_DOOR
+              value: "true"
+            - name: A2A_MAX_SESSIONS
+              value: "10"
+            - name: A2A_SESSION_CPU_REQUEST
+              value: 150m
+            - name: A2A_SESSION_MEMORY_REQUEST
+              value: 320Mi
+            - name: A2A_SESSION_CPU_LIMIT
+              value: "2"
+            - name: A2A_SESSION_MEMORY_LIMIT
+              value: 2Gi
+            - name: A2A_GATEWAY_RELAY_PRECREATED
+              value: "true"
+            - name: A2A_BUSY_NOTICE_AT
+              value: "10"
+            - name: A2A_METRICS_PORT
+              value: "9096"
+            - name: A2A_SPAWN_SESSIONS
+              value: "true"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
+            - name: A2A_WORKER_IMAGE
+              value: ghcr.io/gke-labs/kube-agents/a2a-worker:latest
+            - name: A2A_STRICT_EVENTS_WRITER
+              value: "false"
+            - name: A2A_CAPABILITY_REQUIRED
+              value: "true"
+            - name: A2A_CARD_STOP
+              value: "false"
+            - name: A2A_CARD_STOP_TIMEOUT
+              value: 75s
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SESSION_KV_SALT
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_SALT
+                  name: platform-agent-secrets
+                  optional: true
+            - name: A2A_OWNER_DEPLOYMENT
+              value: platformagent-a2a-gateway
+            - name: A2A_SESSION_SERVICE_ACCOUNT
+              value: platformagent-a2a-session
+            - name: A2A_SCOPE_FILE
+              value: /etc/kube-agents/scope.json
+            - name: A2A_MANAGEMENT_PROJECT
+              value: example-project
+            - name: A2A_PRINCIPAL_MAP
+              value: /etc/a2a/principal-map
+            - name: A2A_GCHAT_RELAY_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: A2A_GCHAT_ALLOWED_USERS
+            - name: A2A_GCHAT_ALLOW_ALL_USERS
+              value: "true"
+            - name: A2A_CHAT_DISPLAY_MODE
+              value: default
+            - name: A2A_GCHAT_TOKEN_PATH
+              value: /var/run/secrets/a2a-chat-relay/token
+            - name: A2A_GCHAT_HOME_POLICY
+              value: auto
+            - name: A2A_HOME_CHANNEL_RECORD
+              value: platformagent-home-channel
+            - name: A2A_SELF_IMAGE
+              value: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
+            - name: A2A_HOME_CHANNEL_LEARN
+              value: "true"
+            - name: A2A_RESOLVED_SCOPE_CONFIGMAP
+              value: platformagent-resolved-scope
+            - name: A2A_GATEWAY_LEASE
+              value: platformagent-a2a-gateway
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: A2A_REPORT_STORE_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: A2A_REPORT_STORE_TOKEN_FILE
+              value: /var/run/secrets/a2a-reports/token
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
+          image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
+          name: gateway
+          ports:
+            - containerPort: 9096
+              name: a2a-metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: a2a-metrics
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/a2a/principal-map
+              name: principal-map
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+            - mountPath: /etc/kube-agents
+              name: a2a-gateway-scope
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-chat-relay
+              name: a2a-chat-relay-token
+              readOnly: true
+            - mountPath: /etc/a2a/chat-home
+              name: chat-home
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-reports
+              name: a2a-reports-token
+              readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
+              readOnly: true
+          workingDir: /
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-gateway
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+      volumes:
+        - configMap:
+            name: principal-map
+            optional: true
+          name: principal-map
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: a2a-gateway-scope
+        - name: a2a-chat-relay-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-a2a-chat
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            defaultMode: 292
+            name: platformagent-chat-home
+            optional: true
+          name: chat-home
+        - name: a2a-reports-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-a2a-reports
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
+status: {}
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -5766,7 +6314,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-647cdd83
+  name: platformagent-a2a-provision-c9e5a390
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5925,30 +6473,34 @@ spec:
               could not be brought to this render's settings; the ${reader} refuses to
               bind it and names the difference\" >&2\n}\nfixed_durable gateway-relay gateway
               --pull \\\n  --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor'
-              \\\n  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \\\n
-              \ --max-pending=8192 --defaults\nfixed_durable bridge-platform bridge --pull
-              \\\n  --filter='a2a.tasks.platform.*.in' \\\n  --ack=explicit --deliver=all
-              --replay=instant --max-deliver=-1 --defaults\n\n# DIRECTORY: last-value
-              — the tombstone replaces the card. 1GiB cap.\n$NATS stream info DIRECTORY
-              >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>'
-              --storage=file --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
-              --discard=old --replicas=\"${STREAM_REPLICAS}\" --max-consumers=64 --defaults\n\n#
-              TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.\n#
-              State-class topics (provisioned registry): upgrade-readiness, topology-skew,
-              blueprint, probe.\n#\n# The probe subject is the one here with NO writer,
-              deliberately, and it is the\n# single exception to the rule that a topic's
-              subject list and its writer's\n# grant travel together. It exists so that
-              an authorization probe has a real\n# provisioned subject to be refused ON:
-              a refusal against an unprovisioned\n# subject proves only that the subject
-              does not exist, while a refusal here\n# proves the grant. The web rail ships
-              that probe as a button, so it is pressed\n# in front of an audience rather
-              than living in a test file.\n#\n# It was aimed at the blueprint topic first.
-              That works right up until the\n# grant is wrong, at which point the probe
-              writes junk into a state-class\n# topic the fleet actually reads - and \"it
-              cannot happen while the grants\n# hold\" is the assumption the web user
-              already broke once. A writerless\n# subject makes the failure mode land
-              nowhere.\n$NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream
-              add TOPICS-STATE --allow-direct \\\n  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe'
+              --filter='a2a.tasks.p.*.*.supervisor' \\\n  --ack=explicit --deliver=all
+              --replay=instant --max-deliver=-1 \\\n  --max-pending=8192 --defaults\nif
+              ! $NATS consumer info TASKS gateway-relay --json 2>/dev/null | grep -qF
+              '\"a2a.tasks.p.*.*.supervisor\"'; then\n  echo \"TASKS gateway-relay does
+              not filter a2a.tasks.p.*.*.supervisor after this run; the dispatcher stays
+              on the five-token supervisor subject until it does\" >&2\n  exit 1\nfi\nfixed_durable
+              bridge-platform bridge --pull \\\n  --filter='a2a.tasks.platform.*.in' \\\n
+              \ --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults\n\n#
+              DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.\n$NATS
+              stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct
+              \\\n  --subjects='a2a.agents.>' --storage=file --retention=limits \\\n  --max-msgs-per-subject=1
+              --max-bytes=1073741824 --discard=old --replicas=\"${STREAM_REPLICAS}\" --max-consumers=64
+              --defaults\n\n# TOPICS-STATE: current answer plus short history, no age
+              limit. 1GiB cap.\n# State-class topics (provisioned registry): upgrade-readiness,
+              topology-skew, blueprint, probe.\n#\n# The probe subject is the one here
+              with NO writer, deliberately, and it is the\n# single exception to the rule
+              that a topic's subject list and its writer's\n# grant travel together. It
+              exists so that an authorization probe has a real\n# provisioned subject
+              to be refused ON: a refusal against an unprovisioned\n# subject proves only
+              that the subject does not exist, while a refusal here\n# proves the grant.
+              The web rail ships that probe as a button, so it is pressed\n# in front
+              of an audience rather than living in a test file.\n#\n# It was aimed at
+              the blueprint topic first. That works right up until the\n# grant is wrong,
+              at which point the probe writes junk into a state-class\n# topic the fleet
+              actually reads - and \"it cannot happen while the grants\n# hold\" is the
+              assumption the web user already broke once. A writerless\n# subject makes
+              the failure mode land nowhere.\n$NATS stream info TOPICS-STATE >/dev/null
+              2>&1 || $NATS stream add TOPICS-STATE --allow-direct \\\n  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe'
               \\\n  --storage=file --retention=limits \\\n  --max-msgs-per-subject=8 --max-bytes=1073741824
               --discard=old --replicas=\"${STREAM_REPLICAS}\" --max-consumers=64 --defaults\n\n#
               TOPICS-JOURNAL: append-only, ages out at 30d. 1GiB cap (a2aTopicsJournalMaxBytes).\n#
@@ -6257,8 +6809,13 @@ spec:
               the bridge sidecar with fewer workers where\n  # it declared more than the
               default, or recreates the stream, and\n  # provisioning does none of those.
               Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              which is\n  # usually not 2, so an unexpected failure stays on the retry
+              budget. The\n  # bus reshape treats a Job failed on this exit as provisioned
+              for a\n  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth),
+              and\n  # checks the bus holds every stream besides, since a shell error
+              can exit\n  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate
+              keeps this the\n  # script's only explicit exit 2.\n  exit 2\nfi\n\necho
+              \"a2a provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp
@@ -6317,293 +6874,4 @@ spec:
             sizeLimit: 64Mi
           name: tmp
   ttlSecondsAfterFinished: 86400
-status: {}
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: gateway-netpol
-  name: platformagent-a2a-gateway-netpol
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-spec:
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: gke-gmp-system
-      ports:
-        - port: 9096
-          protocol: TCP
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kubeagents-system
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: kube-agents-operator
-      ports:
-        - port: 9096
-          protocol: TCP
-  podSelector:
-    matchLabels:
-      app: platformagent-a2a-gateway
-  policyTypes:
-    - Ingress
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: gateway
-  name: platformagent-a2a-gateway
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-spec:
-  progressDeadlineSeconds: 1800
-  replicas: 1
-  selector:
-    matchLabels:
-      app: platformagent-a2a-gateway
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      annotations:
-        kubeagents.x-k8s.io/secret-env-hash: <SHA256_FOR_TESTS>
-      labels:
-        app: platformagent-a2a-gateway
-        app.kubernetes.io/instance: kubeagents-system-platformagent
-        app.kubernetes.io/managed-by: platformagent-controller
-        app.kubernetes.io/name: platform-agent
-        app.kubernetes.io/part-of: a2a-next
-        kubeagents.x-k8s.io/a2a-component: gateway
-    spec:
-      automountServiceAccountToken: true
-      containers:
-        - env:
-            - name: NATS_URL
-              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
-            - name: NATS_CA_FILE
-              value: /etc/a2a-nats-ca/ca.crt
-            - name: NATS_CA_CONFIGMAP
-              value: platformagent-a2a-nats-ca-bundle
-            - name: NATS_USER
-              value: gateway
-            - name: NATS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  key: gateway-password
-                  name: platformagent-a2a-nats-creds
-            - name: A2A_CONSOLE_DOOR
-              value: "true"
-            - name: A2A_MAX_SESSIONS
-              value: "10"
-            - name: A2A_SESSION_CPU_REQUEST
-              value: 150m
-            - name: A2A_SESSION_MEMORY_REQUEST
-              value: 320Mi
-            - name: A2A_SESSION_CPU_LIMIT
-              value: "2"
-            - name: A2A_SESSION_MEMORY_LIMIT
-              value: 2Gi
-            - name: A2A_GATEWAY_RELAY_PRECREATED
-              value: "true"
-            - name: A2A_BUSY_NOTICE_AT
-              value: "10"
-            - name: A2A_METRICS_PORT
-              value: "9096"
-            - name: A2A_SPAWN_SESSIONS
-              value: "true"
-            - name: A2A_DEFAULT_ADDRESSEE
-              value: platform
-            - name: A2A_WORKER_IMAGE
-              value: ghcr.io/gke-labs/kube-agents/a2a-worker:latest
-            - name: A2A_STRICT_EVENTS_WRITER
-              value: "false"
-            - name: A2A_CAPABILITY_REQUIRED
-              value: "true"
-            - name: A2A_CARD_STOP
-              value: "false"
-            - name: A2A_CARD_STOP_TIMEOUT
-              value: 75s
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            - name: SESSION_KV_SALT
-              valueFrom:
-                secretKeyRef:
-                  key: SESSION_KV_SALT
-                  name: platform-agent-secrets
-                  optional: true
-            - name: A2A_OWNER_DEPLOYMENT
-              value: platformagent-a2a-gateway
-            - name: A2A_SESSION_SERVICE_ACCOUNT
-              value: platformagent-a2a-session
-            - name: A2A_SCOPE_FILE
-              value: /etc/kube-agents/scope.json
-            - name: A2A_MANAGEMENT_PROJECT
-              value: example-project
-            - name: A2A_PRINCIPAL_MAP
-              value: /etc/a2a/principal-map
-            - name: A2A_GCHAT_RELAY_URL
-              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
-            - name: A2A_GCHAT_ALLOWED_USERS
-            - name: A2A_GCHAT_ALLOW_ALL_USERS
-              value: "true"
-            - name: A2A_CHAT_DISPLAY_MODE
-              value: default
-            - name: A2A_GCHAT_TOKEN_PATH
-              value: /var/run/secrets/a2a-chat-relay/token
-            - name: A2A_GCHAT_HOME_POLICY
-              value: auto
-            - name: A2A_HOME_CHANNEL_RECORD
-              value: platformagent-home-channel
-            - name: A2A_SELF_IMAGE
-              value: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
-            - name: A2A_HOME_CHANNEL_LEARN
-              value: "true"
-            - name: A2A_RESOLVED_SCOPE_CONFIGMAP
-              value: platformagent-resolved-scope
-            - name: A2A_GATEWAY_LEASE
-              value: platformagent-a2a-gateway
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  apiVersion: v1
-                  fieldPath: metadata.name
-            - name: A2A_REPORT_STORE_URL
-              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
-            - name: A2A_REPORT_STORE_TOKEN_FILE
-              value: /var/run/secrets/a2a-reports/token
-            - name: A2A_TIERS_FILE
-              value: /etc/a2a-tiers/tiers.json
-          image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
-          name: gateway
-          ports:
-            - containerPort: 9096
-              name: a2a-metrics
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: a2a-metrics
-            periodSeconds: 5
-          resources:
-            limits:
-              cpu: 500m
-              memory: 512Mi
-            requests:
-              cpu: 50m
-              memory: 64Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            readOnlyRootFilesystem: true
-          volumeMounts:
-            - mountPath: /etc/a2a/principal-map
-              name: principal-map
-              readOnly: true
-            - mountPath: /etc/a2a-nats-ca
-              name: a2a-nats-ca
-              readOnly: true
-            - mountPath: /etc/kube-agents
-              name: a2a-gateway-scope
-              readOnly: true
-            - mountPath: /var/run/secrets/a2a-chat-relay
-              name: a2a-chat-relay-token
-              readOnly: true
-            - mountPath: /etc/a2a/chat-home
-              name: chat-home
-              readOnly: true
-            - mountPath: /var/run/secrets/a2a-reports
-              name: a2a-reports-token
-              readOnly: true
-            - mountPath: /etc/a2a-tiers
-              name: a2a-tiers
-              readOnly: true
-          workingDir: /
-      dnsConfig:
-        options:
-          - name: ndots
-            value: "3"
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        seccompProfile:
-          type: RuntimeDefault
-      serviceAccountName: platformagent-a2a-gateway
-      topologySpreadConstraints:
-        - labelSelector:
-            matchLabels:
-              app: platformagent-a2a-gateway
-          matchLabelKeys:
-            - pod-template-hash
-          maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
-      volumes:
-        - configMap:
-            name: principal-map
-            optional: true
-          name: principal-map
-        - configMap:
-            name: platformagent-a2a-nats-ca-bundle
-          name: a2a-nats-ca
-        - configMap:
-            defaultMode: 292
-            items:
-              - key: scope.json
-                path: scope.json
-            name: platformagent-config
-            optional: true
-          name: a2a-gateway-scope
-        - name: a2a-chat-relay-token
-          projected:
-            defaultMode: 256
-            sources:
-              - serviceAccountToken:
-                  audience: kubeagents-credential-proxy-a2a-chat
-                  expirationSeconds: 3600
-                  path: token
-        - configMap:
-            defaultMode: 292
-            name: platformagent-chat-home
-            optional: true
-          name: chat-home
-        - name: a2a-reports-token
-          projected:
-            defaultMode: 256
-            sources:
-              - serviceAccountToken:
-                  audience: kubeagents-credential-proxy-a2a-reports
-                  expirationSeconds: 3600
-                  path: token
-        - configMap:
-            name: platformagent-a2a-tiers
-            optional: true
-          name: a2a-tiers
 status: {}

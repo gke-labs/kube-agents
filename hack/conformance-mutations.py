@@ -1847,6 +1847,16 @@ Mutation(
         "which are commercial hosts, are relayed",
     ),
     Mutation(
+        "C2-universe-domain-metadata-check",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if reported != configured:\n",
+         "    if False and reported != configured:\n"),
+        "test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts",
+        "trust the universe domain the environment names again, so a value "
+        "the host's metadata server contradicts starts the broker and its "
+        "credential goes to that domain's hosts",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
@@ -2617,10 +2627,93 @@ Mutation(
     Mutation(
         "A3-a2a-google-roster-chat-map",
         "a2a/gateway/gateway.go",
-        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
-         "\tif backend == consoleBackend {"),
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
+         "\tif backend == consoleBackend || backend == a2aEntraBackend {"),
         "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
         "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
+        "A3-a2a-entra-alg-unpinned",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif header.Alg != a2aEntraAlgorithm {", "\tif false {"),
+        "test_A3_an_entra_token_is_checked_against_the_tenants_keys_with_the_algorithm_pinned",
+        "let the token name its own algorithm, so a forger who writes alg none "
+        "or an HMAC alg keyed with the public key is checked the way they ask",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-tenant",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !issued || !strings.EqualFold(claims.Tid, v.tenantID) {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token from any tenant whose key happens to be in the set, so "
+        "an account outside the install's directory signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-application",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !audience {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token the tenant issued for some other application, so a "
+        "token a person granted another app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-entra-id-token-admitted",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\tif strings.TrimSpace(claims.Scp) == "" {', "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "admit a token that grants no delegated scope, so an ID token lifted "
+        "from a browser or a client log signs its subject in",
+    ),
+    Mutation(
+        "A3-a2a-entra-any-bearer-parsed",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !entraTokenShaped(token) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_jwt_never_reaches_the_tenants_keys",
+        "decode every non-static bearer as a JWT, so junk bearers and a "
+        "mistyped door token cost a parse and a key lookup each",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || objectID == "" {', '\tif objectID == "" {'),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "resolve an id that did not come through the door's Entra check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-entra-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aEntraAllowed[strings.ToLower(objectID)] {", "\tif false {"),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "admit every Entra-verified object id, so anyone in the tenant who can "
+        "mint a token for the install's application signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif err == nil && !d.entraAllowed[strings.ToLower(id.objectID)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_entra_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any account of the tenant "
+        "creates door conversations and submissions that evict a listed "
+        "person's",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-spellable",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\ta2aEntraCallerPrefix = ":entra:"', '\ta2aEntraCallerPrefix = "entra:"'),
+        "test_A3_no_eval_caller_can_spell_an_entra_caller",
+        "drop the leading colon, so an eval caller \"entra\" naming the context "
+        "\"<oid>:<ctx>\" spells a person's conversation key with the static token",
+    ),
+    Mutation(
+        "A3-a2a-entra-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
+         "\tif backend == consoleBackend || backend == a2aGoogleBackend {"),
+        "test_A3_the_entra_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Entra class's roster through principalMapFor, whose default "
         "is the chat map, so a door caller's id resolves as a chat identity",
     ),
     Mutation(
@@ -2852,6 +2945,23 @@ Mutation(
         "Authorization header, and every brokered command from every session "
         "pod is a 401 -- with the Go suite and the Python suite both green, "
         "because neither names the other's spelling",
+    ),
+    Mutation(
+        "C1-tier-membership-env-renamed-on-the-gateway-side",
+        "a2a/gateway/tier_membership.go",
+        ('const EnvTierMembership = "A2A_TIER_MEMBERSHIP"', 'const EnvTierMembership = "A2A_TIER_MEMBERS"'),
+        "test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary",
+        "rename the membership variable in the module that reads it. The "
+        "operator still renders the old name, so the gateway reads no "
+        "membership and every person runs at read",
+    ),
+    Mutation(
+        "C1-tier-membership-env-renamed-on-the-operator-side",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP"', 'a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP_LIST"'),
+        "test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary",
+        "rename the membership variable in the module that renders it; the "
+        "gateway keeps reading the old name and sees no membership",
     ),
     Mutation(
         "C1-target-allowlist-env-renamed-on-the-gateway-side",

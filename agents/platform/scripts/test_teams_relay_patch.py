@@ -373,7 +373,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             resp.read.return_value = b'{"response": {"id": "1"}}'
             return resp
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             await adapter._process_activity(
                 {
                     "type": "message",
@@ -703,7 +703,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "from": {"id": "29:user-456", "aadObjectId": "aad-user-456", "name": "Admin"},
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -751,7 +751,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "channelData": {"tenant": {"id": "tenant-1"}},
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -776,7 +776,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         ):
             received_events.clear()
             typed = dict(activity, conversation={"id": "conv-777", "conversationType": conversation_type})
-            with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
                 mock_resp = mock.MagicMock()
                 mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
                 mock_resp.__enter__.return_value = mock_resp
@@ -794,7 +794,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         registry = PlatformRegistry()
         adapter = registry.create_adapter("teams")
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps(
                 {"response": {"id": "msg-1"}}
@@ -858,7 +858,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "http://relay/v1/chat/teams/api", 400, "Bad Request", {}, None
         )
         for error in (rejected, urllib.error.URLError("connection refused")):
-            with mock.patch("urllib.request.urlopen", side_effect=error):
+            with mock.patch("urllib.request.OpenerDirector.open", side_effect=error):
                 res = await adapter.send(chat_id="conv-123", content="hello")
             self.assertIsInstance(res, SendResult)
             self.assertFalse(res.success)
@@ -905,7 +905,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         adapter._running = True
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen_ack):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen_ack):
             await adapter._relay_loop()
 
         self.assertEqual(len(handled), 1)
@@ -939,7 +939,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         adapter._running = True
         with (
-            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen_nack),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen_nack),
             mock.patch.object(
                 adapter, "_process_activity", side_effect=RuntimeError("boom")
             ),
@@ -976,7 +976,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "from": {"id": "user-1"},
             "conversation": {"id": "conv-1"},
         }
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             await adapter._process_activity(unauthorized_activity)
             self.assertEqual(handled, [])
             mock_urlopen.assert_not_called()
@@ -1019,7 +1019,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -1064,7 +1064,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "from": {"id": "u1"},
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             for bad_override in (
                 {"channelData": "bad"},
                 {"from": "bad"},
@@ -1122,7 +1122,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         with (
-            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen),
             mock.patch("asyncio.sleep", new=mock.AsyncMock()),
         ):
             self.assertTrue(await adapter.connect())
@@ -1143,7 +1143,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             io.BytesIO(b'{"settled": false}'),
         )
         with (
-            mock.patch("urllib.request.urlopen", side_effect=ready) as probe,
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=ready) as probe,
             mock.patch("asyncio.sleep", new=mock.AsyncMock()) as slept,
         ):
             self.assertTrue(await adapter.connect())
@@ -1162,12 +1162,12 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         body = json.dumps({"error": "Teams operation failed", "detail": "HTTP 403: BotNotInConversationRoster",
                            "teams": {"status": 403, "code": "BotNotInConversationRoster", "message": "not in roster"}}).encode()
         err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 502, "Bad Gateway", {}, io.BytesIO(body))
-        with mock.patch("urllib.request.urlopen", side_effect=err):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=err):
             res = await sender(None, "conv-1", "hello")
         self.assertIn("BotNotInConversationRoster", res["error"])
         self.assertNotIn("success", res)
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             self.assertEqual(await sender(None, "conv-1", "   "), {"success": True, "platform": "teams", "skipped": "empty_text"})
             self.assertEqual(
                 await sender(None, "conv-1", "", media_files=["/tmp/a.png"]),
@@ -1187,7 +1187,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             resp.__enter__.return_value = resp
             return resp
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             res = await sender(None, "conv-1", "report", media_files=["/tmp/a.png"])
         self.assertEqual(res, {"success": True, "message_id": "m-9", "media_omitted": 1})
         self.assertEqual(len(posted), 1)
@@ -1221,7 +1221,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             resp.__enter__.return_value = resp
             return resp
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             await adapter.send("conv-1", "# short\n- one line")
         self.assertIn("attachments", sent[0]["payload"])
 
@@ -1271,7 +1271,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         report = "\n".join(["finding %05d: cgroup pressure on node pool a" % i for i in range(700)])
         self.assertGreater(len(report), 2 * teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
         adapter.adaptive_cards = False
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             res = await adapter.send("conv-1", report, reply_to="1697000000000")
         self.assertTrue(res.success)
         self.assertEqual(res.message_id, "m-%d" % len(sent))
@@ -1306,7 +1306,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         adapter.adaptive_cards = False
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             res = await adapter.send("conv-1", "ok \ud83d done")
         self.assertTrue(res.success)
         self.assertEqual(sent[0]["text"], "ok ? done")
@@ -1336,7 +1336,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
-        with mock.patch("urllib.request.urlopen", side_effect=slow_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=slow_urlopen):
             with self.assertRaises(asyncio.TimeoutError):
                 await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.05)
             self.assertIn("conv-1", adapter._typing_in_flight)
@@ -1381,7 +1381,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
         loop.run_in_executor(None, busy.wait, 5)  # the only worker is taken
         with (
-            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen),
             mock.patch.object(teams_relay_patch, "TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS", 0.05),
         ):
             with self.assertRaises(asyncio.TimeoutError):
@@ -1443,7 +1443,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         chunk = "\U0001F600" * adapter.MAX_MESSAGE_LENGTH
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             await adapter.send("conv-1", chunk, reply_to="1697000000000")
         payload = sent[0]["payload"]
         wire = json.dumps(payload, ensure_ascii=False)
@@ -1478,7 +1478,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
         with (
-            mock.patch("urllib.request.urlopen", side_effect=slow_urlopen),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=slow_urlopen),
             mock.patch.object(teams_relay_patch, "TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS", 0.05),
         ):
             with self.assertRaises(asyncio.TimeoutError):
@@ -1518,7 +1518,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         report = "\n".join(["line %05d" % i for i in range(2000)])  # three chunks
-        with mock.patch("urllib.request.urlopen", side_effect=flaky_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=flaky_urlopen):
             res = await adapter.send("conv-1", report)
         self.assertFalse(res.success)
         self.assertIn("connection refused", res.error)

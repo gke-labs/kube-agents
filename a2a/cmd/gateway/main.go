@@ -99,6 +99,24 @@ func buildAdapters(cfg *gateway.Config, backends map[string]gateway.Adapter, nat
 	return buildAdaptersWith(backends, console, log)
 }
 
+// a2aDoorOptions carries the A2A door's configuration from the environment
+// to the door: the card's public URL and addressee, the task deadline, and
+// each sign-in class's arming and allowlist. One function, so a class the
+// config reads cannot be left out of the door that would check it.
+func a2aDoorOptions(cfg *gateway.Config, log *slog.Logger) gateway.A2ADoorOptions {
+	return gateway.A2ADoorOptions{
+		PublicURL:          cfg.A2ADoorPublicURL,
+		DefaultAddressee:   cfg.DefaultAddressee,
+		TaskDeadline:       cfg.TaskDeadline,
+		GoogleClientID:     cfg.A2ADoorGoogleClientID,
+		GoogleAllowedUsers: cfg.A2ADoorAllowedUsers,
+		EntraTenantID:      cfg.A2ADoorEntraTenantID,
+		EntraClientID:      cfg.A2ADoorEntraClientID,
+		EntraAllowedUsers:  cfg.A2ADoorEntraAllowedUsers,
+		Logger:             log,
+	}
+}
+
 // buildAdaptersWith is buildAdapters around a console adapter already
 // dialed, which realMain keeps for the console's chat.notify route. A lone
 // real backend is the mux's primary; with two or more no one backend is.
@@ -254,14 +272,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// beside any backend or alone, routed by its own key prefix, its
 	// callers resolved through its own map. See a2a/gateway/a2adoor.go.
 	if cfg.A2ADoorArmed() {
-		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
-			PublicURL:          cfg.A2ADoorPublicURL,
-			DefaultAddressee:   cfg.DefaultAddressee,
-			TaskDeadline:       cfg.TaskDeadline,
-			GoogleClientID:     cfg.A2ADoorGoogleClientID,
-			GoogleAllowedUsers: cfg.A2ADoorAllowedUsers,
-			Logger:             log,
-		})
+		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, a2aDoorOptions(cfg, log))
 		if err != nil {
 			log.Error("A2A door", "err", err)
 			return err

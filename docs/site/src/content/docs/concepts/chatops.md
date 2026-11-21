@@ -347,7 +347,7 @@ A press of a Stop button, Slack's or Google Chat's, from such a sender gets no n
 
 #### On Slack
 
-The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own.
+The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own. The exception is a task the agent delegates to an AgentProfile, since nothing else in the thread shows a profile's progress. It gets a status line of its own, `⏳ submitted… (delegated to <profile>)`. The line moves to `⚙️ working` with the profile's progress, and closes to `✅ (delegated to <profile>)` when the profile is done.
 
 #### On Google Chat and the A2A console
 
@@ -355,7 +355,7 @@ Each turn that becomes a task posts a status line, `⏳ submitted…`, which the
 
 On the A2A console the answer posts as a message of its own, and the status line then reads `✅ **completed**`. On Google Chat the answer posts as a message of its own, with its 👍 and 👎 buttons, and the status line ends as a bare ✅. When the agent hands the work to a card, its one-line acknowledgement replaces the status line instead, and the card's plan and report follow. Nothing reads `completed`. Chat marks the edited line as edited.
 
-A task that fails posts `❌ failed — <why>`, in plain words, or `❌ failed: <text>` when the reason arrived as plain text; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task — <why>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer. On Google Chat, the gateway rewrites the markdown Chat's text format has no syntax for. A heading becomes a bold line, a rule is dropped, and a bulleted list's marker becomes the one Chat draws a bullet from. A pipe table becomes a monospace block with its columns lined up.
+A task that fails posts `❌ failed — <why>`, in plain words, or `❌ failed: <text>` when the reason arrived as plain text; one that is cancelled posts `🛑 canceled`, unless you stopped it (see `stop` below); one the executor refuses posts `🚫 the executor rejected the task — <why>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer. On Google Chat, the gateway rewrites the markdown Chat's text format has no syntax for. A heading becomes a bold line, a rule is dropped, and a bulleted list's marker becomes the one Chat draws a bullet from. A pipe table becomes a monospace block with its columns lined up.
 
 On Google Chat, the agent's answer is one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask, and each alert or report the agent posts on its own, ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)).
 
@@ -386,6 +386,8 @@ If the task has produced nothing yet, a follow-up gets `✏️ steering sent —
 Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback summary`](#feedback-summary), two kinds of message are commands rather than follow-ups. Each must be the whole message; case and punctuation are ignored, and on Slack a mention of the bot is stripped first, so `@bot stop` counts.
 
 - **`stop`, `cancel` or `abort`.** With a task running, the gateway answers `🛑 cancel sent — the task ends when the executor confirms`, and the status line ends at `🛑 **canceled**` when it does. The reply the agent is still writing stops too, and files no card after the stop; one that the agent had not yet started when the stop arrived, or an agent image older than this behaviour, can still file one. Your next message starts a new task.
+
+  Nothing the stopped task writes after the stop reaches the conversation: no note, question or answer. Its line closes at 🛑 instead of a separate `🛑 canceled` message. A task with no line of its own, such as a delegated task on Slack, which shows task status itself, posts one `🛑 canceled` so the conversation sees it end. If the session had handed the work to other agents, one `stop` stops every one of those tasks too, with the one reply; the conversation can hand off new work once they have all ended.
 
   On Google Chat the status line answers instead, as it does for the Stop button below: the gateway posts nothing, the line reads `🛑 cancel sent — the task ends when the executor confirms` with its button gone, and `🛑 **canceled**` when the executor confirms. A second `stop` changes the line to `🛑 cancel already sent — the task ends when the executor confirms`. A task with no status line keeps the posted replies below, as does a `stop` that the cards' stop answers (`A2A_CARD_STOP=true`, outside a conversation whose tasks go to a session worker).
 
@@ -504,6 +506,7 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 
 - the image tag, the mode, the Kubernetes version, and the install's age and readiness;
 - the model as `provider/name` from the resource's `status.inference` (`unavailable` while the operator has not written it);
+- the reasoning effort configured on that model, from the same status (`unset` when the config states none, `unavailable` with the model);
 - the `status.usage` counters and readings;
 - one `proposals by origin:` line, the origins whose count is above zero, as the agent reports them (`none` when all are zero, `no reading` when the status has none);
 - the credential broker's top five `tool/subcommand` pairs since its pod started, from `status.usage.topTools` (`unavailable` while the status holds no list);
@@ -607,6 +610,8 @@ An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) c
 The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched. External inbound Bot Framework webhook ingress is not yet shipped in the operator: `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods.
 
 Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`). See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
+
+What this means for an evaluator: enabling `spec.integration.teams` gives you the outbound half only. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams does not reach the agent: Microsoft delivers it to the bot's messaging endpoint, and the install provides none. The broker's event queue that the gateway reads admits only the gateway pod, so nothing outside the install can feed a message in either.
 
 ## Proactive alerts (both channels)
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1051,13 +1052,15 @@ func startGchatRigWith(t *testing.T, spawn spawner, allowed []string, allowAll b
 	for _, o := range opts {
 		o(cfg)
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "gchat", Spawner: spawn})
+	logs := &lockedBuffer{}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "gchat", Spawner: spawn, Logger: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	go func() { _ = g.Run(ctx) }()
 
-	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs}
 }
 
 // TestGchatTurnCarriesVerifiedEmailPrincipal is the identity property the

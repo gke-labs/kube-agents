@@ -8,7 +8,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
 twenty-six-check roster (§3.1–§3.26 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s nineteen-check roster (§2.1–§2.19 of
+`compliance-audit`'s twenty-check roster (§2.1–§2.20 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -68,6 +68,8 @@ own shell to run.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import datetime
 import errno
@@ -336,6 +338,66 @@ IMPACT_HPA_AGGRESSIVE_SCALEDOWN = (
     "of running pods in a single period with little or no stabilization window "
     "while the containers receive SIGTERM immediately with no preStop wait, "
     "dropping connections in flight and flapping capacity on brief load dips."
+)
+
+# §2.18 and §2.20 admission-webhook constants, plus §2.20's PEM / X.509 DER
+# `Validity` (`notAfter`) constants (RFC 5280 §4.1, §4.1.2.5) and 30-day window.
+WEBHOOK_BACKEND_UNREACHABLE_SLUG = "webhook-backend-unreachable"
+WEBHOOK_CA_BUNDLE_EXPIRED_SLUG = "webhook-ca-bundle-expired"
+WEBHOOK_CA_EXPIRY_WARNING_DAYS = 30
+WEBHOOK_SEVERITY_CA_IGNORE_EXPIRING = "minor"
+PEM_CERT_BEGIN_MARKER = "-----BEGIN CERTIFICATE-----"
+PEM_CERT_END_MARKER = "-----END CERTIFICATE-----"
+DER_TAG_INTEGER = 0x02
+DER_TAG_UTC_TIME = 0x17
+DER_TAG_GENERALIZED_TIME = 0x18
+DER_TAG_SEQUENCE = 0x30
+DER_TAG_EXPLICIT_VERSION = 0xA0
+DER_HIGH_TAG_NUMBER_MASK = 0x1F
+DER_LONG_LENGTH_FLAG = 0x80
+DER_LONG_LENGTH_MASK = 0x7F
+DER_MAX_LENGTH_OCTETS = 4
+BIG_ENDIAN = "big"
+ASCII_ENCODING = "ascii"
+LATIN1_ENCODING = "latin-1"
+# RFC 5280 §4.1.2.5.1: two-digit UTCTime years >= 50 map to 1900..1999,
+# years < 50 map to 2000..2049.
+ASN1_UTC_PIVOT_YEAR = 50
+ASN1_UTC_CENTURY_1900 = 1900
+ASN1_UTC_CENTURY_2000 = 2000
+ASN1_UTC_Z = "Z"
+ASN1_MINUS_SIGN = "-"
+ASN1_OFFSET_HOURS_END = 3
+MINUTES_PER_HOUR = 60
+HOURS_PER_DAY = 24
+SECONDS_PER_DAY = 86400
+MICROSECOND_DIGITS = 6
+ASN1_UTC_TIME_RE = re.compile(
+    r"^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?(Z|[+-]\d{4})\Z"
+)
+ASN1_GENERALIZED_TIME_RE = re.compile(
+    r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(?:(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{4})\Z"
+)
+WEBHOOK_CA_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_IMPACT_WEBHOOK_CA_FAIL_EXPIRED = (
+    "This admission webhook fails closed and every certificate in its CA bundle has expired, "
+    "so the API server cannot verify the webhook's TLS certificate and refuses every request "
+    "its rules match until the bundle is rotated."
+)
+_IMPACT_WEBHOOK_CA_FAIL_EXPIRING = (
+    "This admission webhook fails closed and every certificate in its CA bundle expires "
+    "within 30 days; once notAfter passes, the API server will fail TLS verification to the "
+    "webhook and refuse every request its rules match until the bundle is rotated."
+)
+_IMPACT_WEBHOOK_CA_IGNORE_EXPIRED = (
+    "Every certificate in this admission webhook's CA bundle has expired and its "
+    "failurePolicy is Ignore, so the API server fails TLS verification on every call and "
+    "skips the webhook in silence without enforcing or mutating matching requests."
+)
+_IMPACT_WEBHOOK_CA_IGNORE_EXPIRING = (
+    "Every certificate in this admission webhook's CA bundle expires within 30 days and its "
+    "failurePolicy is Ignore; once notAfter passes, the API server will fail TLS verification "
+    "on every call and skip the webhook in silence."
 )
 
 
@@ -1410,6 +1472,8 @@ def selector_matches(selector: dict, labels: dict) -> bool:
         if labels.get(key) != value:
             return False
     for expr in selector.get("matchExpressions") or []:
+        if not isinstance(expr, dict):
+            continue
         key, op, values = expr.get("key"), expr.get("operator"), expr.get("values") or []
         if op == "In" and labels.get(key) not in values:
             return False
@@ -5080,7 +5144,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all nineteen checks of §2.
+# compliance-audit: all twenty checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -8643,8 +8707,9 @@ def check_serviceentry_host_collision(context: dict) -> list[dict]:
 # one, because a fail-closed webhook with a dead backend refuses every request
 # its rules match today, and a config-management system is the first caller to
 # find out. Both reads are best-effort, like `ccnp` above: a cluster whose
-# identity cannot list webhook configurations or EndpointSlices keeps its
-# other eighteen checks, and this one reads `Undetermined` there.
+# identity cannot list webhook configurations keeps its other eighteen checks
+# (or nineteen when EndpointSlices alone fails), and any uncovered check reads
+# `Undetermined` there.
 WEBHOOK_DUMP_KINDS = "validatingwebhookconfigurations,mutatingwebhookconfigurations"
 ENDPOINTSLICE_DUMP_KINDS = "endpointslices"
 UPGRADE_READINESS_SCRIPTS = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts"
@@ -8713,16 +8778,18 @@ def check_webhook_backend_unreachable(context: dict) -> list[dict]:
     One hit per configuration, since the finding id is (check, cluster, namespace,
     object): the excerpt names each failing webhook of it, its backend problem, its
     rules, and whether its selector admits the severity namespaces. Skipped: a webhook
-    with `failurePolicy: Ignore` (admission skips it in silence; #4960 is that shape), one
-    whose backend is a URL (its reachability is not readable from the cluster), one with
-    no rules (the server never calls it), and a configuration carrying GKE's add-on
-    label or component annotation (the universal suppressions, which the webhook
-    configurations of GKE's own operators carry).
+    with `failurePolicy: Ignore` (admission skips it in silence), one whose backend is
+    a URL (its reachability is not readable from the cluster), one with no rules (the
+    server never calls it), and a configuration carrying GKE's add-on label or
+    component annotation (the universal suppressions, which the webhook configurations
+    of GKE's own operators carry).
     """
+    if WEBHOOK_BACKEND_UNREACHABLE_SLUG in (context.get("unevaluated") or {}):
+        return []
     configurations = context.get("webhook_configurations") or []
     if not configurations:
-        # Nothing to judge, and the one state the collector leaves when a read
-        # or the import failed (the check is then unevaluated): import nothing.
+        # Nothing to judge, and the one state the collector leaves when the
+        # webhook read failed (the check is then unevaluated): import nothing.
         return []
     readiness = _upgrade_readiness()
     services = context.get("services") or []
@@ -8768,6 +8835,266 @@ def check_webhook_backend_unreachable(context: dict) -> list[dict]:
                 "object": f"{config.get('kind', '')}/{meta.get('name', '')}",
                 "excerpt": _WEBHOOK_HIT_JOIN.join(lines),
                 "severity": WEBHOOK_SEVERITY_REACHES if reaches else WEBHOOK_SEVERITY_OFF_PATH,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return hits
+
+
+def _der_read_tlv(data: bytes, offset: int) -> tuple[int, bytes, int]:
+    """Read one ASN.1 DER `(tag, content, next_offset)` tuple at `offset`."""
+    if offset < 0 or offset >= len(data):
+        raise ValueError("DER offset past end of buffer")
+    tag = data[offset]
+    if (tag & DER_HIGH_TAG_NUMBER_MASK) == DER_HIGH_TAG_NUMBER_MASK:
+        raise ValueError("unsupported high-tag-number DER tag")
+    offset += 1
+    if offset >= len(data):
+        raise ValueError("truncated DER length")
+    first_len = data[offset]
+    offset += 1
+    if first_len < DER_LONG_LENGTH_FLAG:
+        length = first_len
+    else:
+        num_octets = first_len & DER_LONG_LENGTH_MASK
+        if (
+            num_octets == 0
+            or num_octets > DER_MAX_LENGTH_OCTETS
+            or offset + num_octets > len(data)
+            or data[offset] == 0
+        ):
+            raise ValueError("invalid DER multi-octet length")
+        length = int.from_bytes(data[offset : offset + num_octets], BIG_ENDIAN)
+        if length < DER_LONG_LENGTH_FLAG:
+            raise ValueError("non-minimal DER length encoding")
+        offset += num_octets
+    end = offset + length
+    if end > len(data):
+        raise ValueError("DER element extends past buffer")
+    return tag, data[offset:end], end
+
+
+def _parse_asn1_time(tag: int, raw: bytes) -> datetime.datetime:
+    """Parse RFC 5280 §4.1.2.5 `UTCTime` (`0x17`) or `GeneralizedTime` (`0x18`) to UTC."""
+    try:
+        text = raw.decode(ASCII_ENCODING)
+    except UnicodeDecodeError as exc:
+        raise ValueError("non-ASCII ASN.1 time") from exc
+    frac = None
+    if tag == DER_TAG_UTC_TIME:
+        match = ASN1_UTC_TIME_RE.match(text)
+        if not match:
+            raise ValueError("malformed ASN.1 UTCTime")
+        yy_str, month, day, hour, minute, second, tz_str = match.groups()
+        yy = int(yy_str)
+        year = (ASN1_UTC_CENTURY_1900 if yy >= ASN1_UTC_PIVOT_YEAR else ASN1_UTC_CENTURY_2000) + yy
+    elif tag == DER_TAG_GENERALIZED_TIME:
+        match = ASN1_GENERALIZED_TIME_RE.match(text)
+        if not match:
+            raise ValueError("malformed ASN.1 GeneralizedTime")
+        yyyy_str, month, day, hour, minute, second, frac, tz_str = match.groups()
+        year = int(yyyy_str)
+    else:
+        raise ValueError(f"unexpected ASN.1 Time tag 0x{tag:02x}")
+    if tz_str == ASN1_UTC_Z:
+        tz = datetime.timezone.utc
+    else:
+        sign = -1 if tz_str[0] == ASN1_MINUS_SIGN else 1
+        tz_hours = int(tz_str[1:ASN1_OFFSET_HOURS_END])
+        tz_minutes = int(tz_str[ASN1_OFFSET_HOURS_END:])
+        if tz_hours >= HOURS_PER_DAY or tz_minutes >= MINUTES_PER_HOUR:
+            raise ValueError("invalid ASN.1 timezone offset")
+        tz = datetime.timezone(datetime.timedelta(hours=sign * tz_hours, minutes=sign * tz_minutes))
+    microsecond = int((frac + "0" * MICROSECOND_DIGITS)[:MICROSECOND_DIGITS]) if frac else 0
+    dt = datetime.datetime(
+        year, int(month), int(day), int(hour), int(minute), int(second or 0), microsecond, tzinfo=tz
+    )
+    try:
+        return dt.astimezone(datetime.timezone.utc)
+    except OverflowError as exc:
+        raise ValueError("ASN.1 time out of UTC range") from exc
+
+
+def _x509_not_after_utc(der: bytes) -> datetime.datetime:
+    """Extract `TBSCertificate.validity.notAfter` from a DER-encoded X.509 certificate."""
+    tag, cert_body, end = _der_read_tlv(der, 0)
+    if tag != DER_TAG_SEQUENCE or end != len(der):
+        raise ValueError("not a DER Certificate SEQUENCE")
+    tag, tbs_body, _ = _der_read_tlv(cert_body, 0)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing TBSCertificate SEQUENCE")
+    pos = 0
+    tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag == DER_TAG_EXPLICIT_VERSION:
+        tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_INTEGER:
+        raise ValueError("missing CertificateSerialNumber INTEGER")
+    tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing signature AlgorithmIdentifier SEQUENCE")
+    tag, _, pos = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing issuer Name SEQUENCE")
+    tag, validity_body, _ = _der_read_tlv(tbs_body, pos)
+    if tag != DER_TAG_SEQUENCE:
+        raise ValueError("missing Validity SEQUENCE")
+    nb_tag, nb_raw, vpos = _der_read_tlv(validity_body, 0)
+    _parse_asn1_time(nb_tag, nb_raw)
+    na_tag, na_raw, vend = _der_read_tlv(validity_body, vpos)
+    if vend != len(validity_body):
+        raise ValueError("unexpected trailing bytes in Validity")
+    return _parse_asn1_time(na_tag, na_raw)
+
+
+def _ca_bundle_not_afters(ca_bundle_b64: object) -> list[datetime.datetime]:
+    """All valid PEM X.509 `notAfter` timestamps decoded from a base64 `clientConfig.caBundle`."""
+    if not isinstance(ca_bundle_b64, str):
+        return []
+    compact = "".join(ca_bundle_b64.split())
+    if not compact:
+        return []
+    try:
+        pem_bytes = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError):
+        return []
+    pem_text = pem_bytes.decode(LATIN1_ENCODING)
+    expiries: list[datetime.datetime] = []
+    for chunk in pem_text.split(PEM_CERT_BEGIN_MARKER)[1:]:
+        if PEM_CERT_END_MARKER not in chunk:
+            continue
+        body, _, _ = chunk.partition(PEM_CERT_END_MARKER)
+        block_b64 = "".join(body.split())
+        if not block_b64:
+            continue
+        try:
+            der = base64.b64decode(block_b64, validate=True)
+            expiries.append(_x509_not_after_utc(der))
+        except (binascii.Error, ValueError):
+            continue
+    return expiries
+
+
+def check_webhook_ca_bundle_expired(
+    context: dict,
+    *,
+    now: datetime.datetime | None = None,
+) -> list[dict]:
+    """Cluster-scoped (§2.20): an admission webhook whose CA bundle certificate has expired
+    or expires within 30 days.
+
+    `kube-apiserver` loads every PEM certificate in `clientConfig.caBundle` into one X.509
+    root pool (`x509.CertPool.AppendCertsFromPEM`), so a rotation bundle carrying an
+    expired CA beside a newly injected valid CA still verifies serving certificates signed
+    by the active CA. A webhook is flagged when its `caBundle` parses to at least one
+    certificate and `max(notAfter)` across the bundle is in the past or within 30 days.
+    """
+    if WEBHOOK_CA_BUNDLE_EXPIRED_SLUG in (context.get("unevaluated") or {}):
+        return []
+    configurations = context.get("webhook_configurations") or []
+    if not configurations:
+        return []
+    eval_now = (
+        now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    ).astimezone(datetime.timezone.utc)
+    horizon = eval_now + datetime.timedelta(days=WEBHOOK_CA_EXPIRY_WARNING_DAYS)
+    severity_labels = _webhook_severity_namespaces(context)
+    hits: list[dict] = []
+    for config in configurations:
+        if not isinstance(config, dict):
+            continue
+        meta = config.get("metadata") or {}
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):
+            continue
+        if (meta.get("annotations") or {}).get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        lines: list[str] = []
+        has_fail_reaching_sys = False
+        has_fail_expired = False
+        has_fail_expiring = False
+        has_ignore_expired = False
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            rules = [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+            if not rules:
+                continue
+            client_cfg = hook.get("clientConfig")
+            if not isinstance(client_cfg, dict):
+                continue
+            expiries = _ca_bundle_not_afters(client_cfg.get("caBundle"))
+            if not expiries:
+                continue
+            latest_not_after = max(expiries)
+            if latest_not_after > horizon:
+                continue
+            is_expired = latest_not_after < eval_now
+            stamp = latest_not_after.strftime(WEBHOOK_CA_TIMESTAMP_FORMAT)
+            if is_expired:
+                days_ago = int((eval_now - latest_not_after).total_seconds() // SECONDS_PER_DAY)
+                ca_problem = (
+                    f"all {len(expiries)} caBundle certificates expired (latest notAfter {stamp}, {days_ago}d ago)"
+                    if len(expiries) > 1
+                    else f"caBundle notAfter {stamp} passed ({days_ago}d ago)"
+                )
+            else:
+                days_left = int((latest_not_after - eval_now).total_seconds() // SECONDS_PER_DAY)
+                ca_problem = (
+                    f"caBundle ({len(expiries)} certificates) latest notAfter {stamp} is within "
+                    f"{WEBHOOK_CA_EXPIRY_WARNING_DAYS}d ({days_left}d remaining)"
+                    if len(expiries) > 1
+                    else f"caBundle notAfter {stamp} is within {WEBHOOK_CA_EXPIRY_WARNING_DAYS}d ({days_left}d remaining)"
+                )
+            policy = hook.get("failurePolicy") or WEBHOOK_FAILURE_POLICY_FAIL
+            if policy == WEBHOOK_FAILURE_POLICY_FAIL:
+                raw_selector = hook.get("namespaceSelector")
+                selector = raw_selector if isinstance(raw_selector, dict) else {}
+                admitted = [
+                    ns for ns, labels in severity_labels.items() if selector_matches(selector, labels)
+                ]
+                if admitted:
+                    has_fail_reaching_sys = True
+                if is_expired:
+                    has_fail_expired = True
+                else:
+                    has_fail_expiring = True
+                reach = (
+                    f"its namespaceSelector admits {', '.join(admitted)}"
+                    if admitted
+                    else f"its namespaceSelector admits neither {' nor '.join(WEBHOOK_SEVERITY_NAMESPACES)}"
+                )
+                lines.append(
+                    f"{hook.get('name', '')}: failurePolicy Fail and {ca_problem}; rules: {_webhook_rules_text(rules)}; {reach}"
+                )
+            else:
+                if is_expired:
+                    has_ignore_expired = True
+                lines.append(
+                    f"{hook.get('name', '')}: failurePolicy {policy} and {ca_problem}; rules: {_webhook_rules_text(rules)}"
+                )
+        if not lines:
+            continue
+        if has_fail_reaching_sys:
+            severity = WEBHOOK_SEVERITY_REACHES
+        elif has_fail_expired or has_fail_expiring or has_ignore_expired:
+            severity = WEBHOOK_SEVERITY_OFF_PATH
+        else:
+            severity = WEBHOOK_SEVERITY_CA_IGNORE_EXPIRING
+        if has_fail_expired:
+            impact = _IMPACT_WEBHOOK_CA_FAIL_EXPIRED
+        elif has_fail_expiring:
+            impact = _IMPACT_WEBHOOK_CA_FAIL_EXPIRING
+        elif has_ignore_expired:
+            impact = _IMPACT_WEBHOOK_CA_IGNORE_EXPIRED
+        else:
+            impact = _IMPACT_WEBHOOK_CA_IGNORE_EXPIRING
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"{config.get('kind', '')}/{meta.get('name', '')}",
+                "excerpt": _WEBHOOK_HIT_JOIN.join(lines),
+                "severity": severity,
+                "impact": impact,
                 "reconciler": reconciler_of(meta),
                 "release": release_of(meta),
             }
@@ -8965,6 +9292,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         SERVICEENTRY_SEVERITY_CONFLICTING,  # overridden per hit: minor when the declarations are identical
         None,
         _IMPACT_SERVICEENTRY_HOST_COLLISION,
+    ),
+    CheckSpec(
+        WEBHOOK_CA_BUNDLE_EXPIRED_SLUG,
+        "cluster",
+        check_webhook_ca_bundle_expired,
+        "critical",  # overridden per hit by failurePolicy, selector reach, and expired vs 30-day window
+        None,
+        _IMPACT_WEBHOOK_CA_FAIL_EXPIRED,
     ),
 )
 
@@ -9244,6 +9579,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "lb-world-open": ("services",),
     "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
     SERVICEENTRY_HOST_COLLISION_SLUG: ("serviceentries",),
+    WEBHOOK_CA_BUNDLE_EXPIRED_SLUG: ("webhooks",),
 }
 
 # The category Config Connector registers across every CRD it installs.
@@ -9544,17 +9880,28 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     context["services"] = parsed.get("items", []) or []
     commands["lb-world-open"] = _record(paged_text(SERVICE_DUMP_KINDS), result)
 
-    # §2.18's two reads, best-effort like `ccnp` below: both APIs exist on
-    # every cluster, but an identity that cannot list them must not cost the
-    # cluster its other eighteen checks. A failed read leaves the check
-    # `Undetermined` on this cluster; the same disposition when the sibling
-    # skill's predicate cannot be imported, which is a packaging fault, not a
-    # clean cluster. The Services the check joins against are the read above.
+    # §2.18 and §2.20's best-effort reads, like `ccnp` below: both APIs exist
+    # on every cluster, but an identity that cannot list webhook configurations
+    # or EndpointSlices must not cost the cluster its other checks. §2.20 reads
+    # the webhook configurations alone (with stdlib X.509 parsing), so an
+    # EndpointSlice failure or a missing sibling readiness module leaves §2.18
+    # `Undetermined` while §2.20 still runs.
     context["webhook_configurations"], context["endpointslices"] = [], []
     webhook_reads: list[tuple[str, dict | None, Run]] = []
     for kinds in (WEBHOOK_DUMP_KINDS, ENDPOINTSLICE_DUMP_KINDS):
         parsed, result = paged(kinds)
         webhook_reads.append((kinds, parsed, result))
+    webhook_cfg_parsed, webhook_cfg_result = webhook_reads[0][1], webhook_reads[0][2]
+    if webhook_cfg_parsed is None:
+        stderr = webhook_cfg_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        context.setdefault("unevaluated", {})[WEBHOOK_CA_BUNDLE_EXPIRED_SLUG] = (
+            f"{UNDETERMINED_PREFIX} `kubectl get {WEBHOOK_DUMP_KINDS}` exited {webhook_cfg_result.rc} ({stderr}), so "
+            "whether an admission webhook's CA bundle certificate has expired or expires within 30 days was not "
+            "established. This check cleared nothing on this cluster."
+        )
+    else:
+        context["webhook_configurations"] = webhook_cfg_parsed.get("items", []) or []
+        commands[WEBHOOK_CA_BUNDLE_EXPIRED_SLUG] = _record(paged_text(WEBHOOK_DUMP_KINDS), webhook_cfg_result)
     webhook_reason = ""
     for kinds, parsed, result in webhook_reads:
         if parsed is None:
@@ -9575,11 +9922,10 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
                 "nothing on this cluster."
             )
     if webhook_reason:
-        context.setdefault("unevaluated", {})["webhook-backend-unreachable"] = webhook_reason
+        context.setdefault("unevaluated", {})[WEBHOOK_BACKEND_UNREACHABLE_SLUG] = webhook_reason
     else:
-        context["webhook_configurations"] = webhook_reads[0][1].get("items", []) or []
         context["endpointslices"] = webhook_reads[1][1].get("items", []) or []
-        commands["webhook-backend-unreachable"] = _record(
+        commands[WEBHOOK_BACKEND_UNREACHABLE_SLUG] = _record(
             "; ".join(paged_text(kinds) for kinds, _, _ in webhook_reads),
             Run(
                 [],
@@ -10754,7 +11100,8 @@ def collect_cluster(
         # hit has no object whose spec a controller could be holding". That is
         # false for most cluster checks -- `inference-endpoint-public`
         # names a Service, `blocking-pdb` a PodDisruptionBudget,
-        # `hpa-cannot-scale` an HPA, the two RBAC checks a binding or a role,
+        # `hpa-cannot-scale` an HPA, the RBAC checks a binding or a role,
+        # the two admission-webhook checks a webhook configuration,
         # and `default-sa-automount` a workload it reached without iterating
         # `collected.workloads`. Cluster-scoped means the check runs once per
         # cluster, not that its findings name the cluster. The one that cost:

@@ -982,11 +982,14 @@ install runs at once and renders only when set.
 
 ### MCP server (`operator.mcpServer.enabled`)
 
-`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
-then renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
-manages. It defaults to `false`. An
-`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
-still works and wins over the value. The
+The operator renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
+manages by default (`operator.mcpServer.enabled: true`). Setting `operator.mcpServer.enabled: false`
+sets `A2A_MCP_DOOR=false` on the controller manager and removes the server, its Service, its
+ServiceAccount, its NetworkPolicy and its token Secret. An `A2A_MCP_DOOR` entry in
+`operator.extraEnv` still works and wins over the value. A hand-run `helm upgrade` from a
+release where `operator.mcpServer.enabled` defaulted to `false` uses
+`--reset-then-reuse-values` (or `--set operator.mcpServer.enabled=true`), since
+`--reuse-values` preserves the earlier chart's default. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
 
@@ -1395,9 +1398,9 @@ existing install.
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings, and a fourth where the web
-console and its environment page are on. Two are generated from
+`admissionPolicy.enabled` (default `true`) installs cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, some only where the
+feature they hold is on. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1405,18 +1408,26 @@ check the rules of a role a binding _references_ — CEL cannot read another
 object — and the content policy only selects manifests carrying the
 `kube-agents/tier` label; see that file's header.
 
-The third, `kube-agents-a2a-gateway-pod`, is generated from
+Another, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
-ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", exactly the session labels, no runtime
+ServiceAccount, no automount, the session token audiences, no Secret volume, no
+Secret read but the session's own inference key, no host access, Pod Security
+"restricted", exactly the session labels, no runtime
 class, node selector, affinity or positive priority, and only the scheduler and
 tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
 
-The fourth, `kube-agents-web-console-cr`, is generated from
+Another, `kube-agents-agentschedule-builtin`, is generated from
+`k8s-operator/config/admission/agentschedule-builtin-policy.yaml`. It keeps
+everyone but the operator's ServiceAccount from making or unmaking a built-in
+`AgentSchedule`. Nobody else may set, change or remove its
+`kubeagents.x-k8s.io/origin: builtin` label or its controller reference, on create or update, or change a built-in schedule's spec (except `spec.suspend`). The garbage collector may still orphan a schedule. Annotating a built-in schedule (`run-now`) or suspending it (`spec.suspend`) still
+works for anyone the RBAC lets write it.
+
+Another, `kube-agents-web-console-cr`, is generated from
 `k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the
 web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
@@ -1499,11 +1510,12 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an operator flag,
-listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning).
-The profile dispatcher runs by default, so it is in `footprint.yaml`, and switched off
-(`operator.profileDispatcher.enabled: false`) it is still counted. It has a ceiling: about 200
+It also counts the standing pods the operator renders only behind an opt-in operator flag,
+listed with their sizes in `files/flagged-pods.yaml` (such as the OKF memory curator when
+`A2A_CURATOR` is `true`).
+The MCP server and the profile dispatcher both run by default, so they are in `footprint.yaml`,
+and switched off (`operator.mcpServer.enabled: false` or `operator.profileDispatcher.enabled: false`)
+each is still counted. The profile dispatcher has a ceiling: about 200
 AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 1.30+, where each
 carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
 profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones

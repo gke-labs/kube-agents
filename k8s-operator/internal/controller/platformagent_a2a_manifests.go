@@ -362,6 +362,12 @@ const (
 	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
 	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
 
+	// a2aTierMembershipEnvVar carries spec.tiers.membership to the gateway
+	// as backend:user=tier, comma-separated, plaintext like the allowlists:
+	// the gateway HMACs the ids. Spelled the same in a2a/gateway/
+	// tier_membership.go (EnvTierMembership).
+	a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP"
+
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
 	// address it listens on. The host is the pod's loopback, not every
@@ -1561,6 +1567,28 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
 	}
 	return env
+}
+
+// a2aTierMembershipEnv renders spec.tiers.membership for the gateway
+// (#3659), and nothing when it's empty, so an install without it renders as
+// before. The schema keeps commas, equals signs and spaces out of a user, so
+// the list joins as it is. A person listed twice (two cases of one Google
+// Chat email, which the schema's keys tell apart and the webhook refuses, but
+// a cluster without the webhook admits) keeps the first entry: the gateway
+// refuses a repeat at boot, and one bad entry mustn't stop it.
+func a2aTierMembershipEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Tiers == nil || len(agent.Spec.Tiers.Membership) == 0 {
+		return nil
+	}
+	entries := make([]string, 0, len(agent.Spec.Tiers.Membership))
+	seen := map[string]bool{}
+	for _, m := range agent.Spec.Tiers.Membership {
+		if key := tierMemberKey(m); !seen[key] {
+			seen[key] = true
+			entries = append(entries, m.Backend+":"+m.User+"="+m.Tier)
+		}
+	}
+	return []corev1.EnvVar{{Name: a2aTierMembershipEnvVar, Value: strings.Join(entries, ",")}}
 }
 
 // a2aAgentDoorEnabled reports whether the operator was deployed with the A2A
@@ -3705,6 +3733,28 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
+	return a2aProvisionScriptForm(agent, false)
+}
+
+// a2aProvisionScriptForm is a2aProvisionScript with the relay durable's third
+// filter, a profile task's six-token supervisor subject, when profileForm is
+// set (#5301, a2aProfileSupervisorFormFor).
+func a2aProvisionScriptForm(agent *agentv1alpha1.PlatformAgent, profileForm bool) string {
+	relayFilters := `--filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `'`
+	relayCheck := ""
+	if profileForm {
+		relayFilters += ` --filter='` + a2aGatewayProfileSupervisorFilter + `'`
+		// fixed_durable leaves a durable that won't take new settings as it
+		// is, with a WARN and exit 0. For the third filter that isn't enough:
+		// the operator switches the dispatcher to the six-token subject when
+		// this Job succeeds, so the run fails, and the Job retries, unless the
+		// relay durable reads the filter back (#5301).
+		relayCheck = `
+if ! $NATS consumer info TASKS ` + a2aGatewayRelayDurable + ` --json 2>/dev/null | grep -qF '"` + a2aGatewayProfileSupervisorFilter + `"'; then
+  echo "TASKS ` + a2aGatewayRelayDurable + ` does not filter ` + a2aGatewayProfileSupervisorFilter + ` after this run; the dispatcher stays on the five-token supervisor subject until it does" >&2
+  exit 1
+fi`
+	}
 	server := a2aNATSAddress(agent)
 	// The reserve the refusal quotes is this CR's, not the default table's:
 	// a CR that declares a bridge at 6 is told the 44 it was sized for, and
@@ -3984,9 +4034,9 @@ fixed_durable() { # name reader [consumer add flags...]
   echo "WARN: TASKS ${name} exists but could not be brought to this render's settings; the ${reader} refuses to bind it and names the difference" >&2
 }
 fixed_durable ` + a2aGatewayRelayDurable + ` gateway --pull \
-  --filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `' \
+  ` + relayFilters + ` \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \
-  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults
+  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults` + relayCheck + `
 fixed_durable ` + a2aBridgeDurable() + ` bridge --pull \
   --filter='` + a2aBridgeIntakeFilter() + `' \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
@@ -4308,7 +4358,12 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   # it declared more than the default, or recreates the stream, and
   # provisioning does none of those. Note that
   # set -euo pipefail exits with the failing command's own status, which is
-  # not 2, so an unexpected failure stays on the retry budget.
+  # usually not 2, so an unexpected failure stays on the retry budget. The
+  # bus reshape treats a Job failed on this exit as provisioned for a
+  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth), and
+  # checks the bus holds every stream besides, since a shell error can exit
+  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate keeps this the
+  # script's only explicit exit 2.
   exit 2
 fi
 
@@ -4387,7 +4442,15 @@ fi
 // existing install is a manual `nats stream edit` — stage 1 accepts that and
 // says it here rather than implying the digest-rename re-provisions.
 func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
-	script := a2aProvisionScript(agent)
+	return a2aProvisionJobForm(agent, false)
+}
+
+// a2aProvisionJobForm is buildA2AProvisionJob with the relay durable's
+// third filter when profileForm is set (#5301). The script is part of the
+// Job's digested name, so the filter's arrival is a new Job and a fresh run,
+// and the durable add updates the existing durable to three filters.
+func a2aProvisionJobForm(agent *agentv1alpha1.PlatformAgent, profileForm bool) *batchv1.Job {
+	script := a2aProvisionScriptForm(agent, profileForm)
 
 	job := &batchv1.Job{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "batch/v1", Kind: "Job"},
@@ -5160,17 +5223,21 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	} {
 		n += int64(ptr.Deref(sts.Spec.Replicas, 1))
 	}
-	// The workloads rendered on a condition, which the next-mode golden (the
-	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
-	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
-	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
-	// workloads behind an operator flag (the MCP door) come from
+	// The workloads rendered on a condition, which the settled golden (the
+	// example CR, no operator flags) cannot show when off or behind a flag;
+	// TestA2AStandingPodsCountTheConditionalWorkloads names each. The credential
+	// proxy's exec tier is a CR field (spec.deployment.credentialProxy.exec.replicas,
+	// unset as 0); the workloads behind an opt-in operator flag come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
-	// The profile dispatcher, on unless A2A_PROFILE_DISPATCHER is "false"
-	// (operator.profileDispatcher.enabled in the chart).
+	// The profile dispatcher and the MCP server, each on unless its flag is
+	// "false" (operator.profileDispatcher.enabled and operator.mcpServer.enabled
+	// in the chart).
 	if a2aDispatcherEnabled() {
 		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
+	}
+	if a2aMCPDoorEnabled() {
+		n += int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
 	}
 	n += a2aFlaggedStandingPods(agent)
 	// The gateway's standbys and its rollout's surge pod, under the election
@@ -6354,7 +6421,9 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 // ValidatingAdmissionPolicy kube-agents-a2a-gateway-pod
 // (config/admission/a2a-gateway-pod-policy.yaml) holds this subject's pod
 // creates to the session pod spawn.go builds: the session ServiceAccount, no
-// automount, the session token audiences, no Secret, the session labels. The
+// automount, the session token audiences, no Secret volume and no Secret read
+// but the session's own inference key (ANTHROPIC_API_KEY from key api-key of
+// <name>-inference-key-a2a-session), the session labels. The
 // chart installs it only under admissionPolicy.enabled on Kubernetes >= 1.30
 // and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
 // this grant is as wide as written.
@@ -7227,6 +7296,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
 	env = append(env, a2aTargetAllowlistEnv(agent)...)
+	env = append(env, a2aTierMembershipEnv(agent)...)
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
 	}
@@ -7340,6 +7410,15 @@ type a2aProvisionState struct {
 	done    bool
 	failed  bool
 	message string
+
+	// profileSupervisorFormLatch is whether the ProfileSupervisorForm latch
+	// is wanted (#5301): the dispatcher writes the six-token form. Written
+	// by the status writers, as BusProvisioned is, so a settled pass saves it.
+	profileSupervisorFormLatch bool
+	// profileSupervisorFormHeldBy names a reader holding the install on the
+	// five-token form because it runs an image other than this operator's
+	// render; the condition says so (ReaderNotOnReleaseImage).
+	profileSupervisorFormHeldBy string
 
 	// busMeta is the JetStream meta group check's finding on a pass that
 	// made it (checkA2ABusMeta), for the A2ABusMetaGroup condition.
@@ -7962,7 +8041,16 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		state.dispatcherCeiling = &ceiling
 	}
-	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining)
+	// How far the move to the six-token profile supervisor subject has got
+	// (#5301, platformagent_a2a_supervisor_form.go): the relay's third
+	// filter in the provision Job, and the dispatcher's switch after it.
+	profileSupervisorFilter, profileSupervisorForm, profileSupervisorHeldBy, err := r.a2aProfileSupervisorFormAndHold(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	state.profileSupervisorFormLatch = profileSupervisorForm != ""
+	state.profileSupervisorFormHeldBy = profileSupervisorHeldBy
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining, profileSupervisorForm)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
 		return state, err
@@ -7974,7 +8062,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// spec-digested name; a changed render — script or pod spec — is a new
 	// name and a fresh run. The superseded generation is swept below rather
 	// than left to its TTL, for the reason the sweep's own comment gives.
-	job := buildA2AProvisionJob(agent)
+	job := a2aProvisionJobForm(agent, profileSupervisorFilter)
 	state.jobName = job.Name
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err

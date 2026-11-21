@@ -4895,6 +4895,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// So does the sandbox pin: an old sandbox is a likely cause of the park.
 	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
+		profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		noChatPlatformConditionCurrent(agent, noChatMsg) &&
@@ -4913,6 +4914,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
+			profileSupervisorFormConditionCurrent(live, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
 			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
@@ -4931,6 +4933,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, gatewayMsg, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
+	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setNoChatPlatformCondition(agent, noChatMsg, now)
@@ -5409,6 +5412,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The provisioned-once record, same shape (wantBusProvisioned).
 	busProvisionedWanted := wantBusProvisioned(agent, a2a)
 	busProvisionedUnchanged := busProvisionedConditionCurrent(agent, busProvisionedWanted)
+	// The supervisor-form latch (#5301), same shape: computed here so a
+	// settled pass that reaches the switch still writes it.
+	profileSupervisorFormUnchanged := profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy)
 	// The verifier term has to be computed here, with the others, rather than
 	// read at the write below: the early return a few lines down is what
 	// decides whether there is a write at all. Left out of the check, the
@@ -5448,18 +5454,21 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// telemetry and policy results, which take a discovery to produce.
 	newActiveInterfaces := resolveActiveInterfaces(agent)
 
-	// The install's default model, read from its LiteLLM config. A negative clears
-	// both fields; a failed read keeps the pair the status carries, so a transient
-	// error never blanks it. Gated like activeInterfaces while the served CRD
-	// prunes the block.
+	// The install's default model, read from its LiteLLM config, with the reasoning
+	// effort its entry states (empty on a found read when it states none). A negative
+	// clears every field; a failed read keeps what the status carries, so a transient
+	// error never blanks it. While the served CRD prunes the block the write is held
+	// like activeInterfaces; while it prunes the effort alone, only a write that would
+	// change nothing the CRD keeps is held (inferencePairUnchanged).
 	newInference := agent.Status.Inference
 	switch model, read := r.readInferenceModel(ctx, agent); read {
 	case inferenceReadFound:
-		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model}
+		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model, ReasoningEffort: model.ReasoningEffort}
 	case inferenceReadNegative:
 		newInference = &agentv1alpha1.InferenceStatus{}
 	}
-	inferenceUnchanged := r.inferencePruned(agent) || inferenceStatusEqual(agent.Status.Inference, newInference)
+	inferenceUnchanged := inferenceStatusEqual(agent.Status.Inference, newInference) ||
+		(r.inferencePruned(agent) && inferencePairUnchanged(agent.Status.Inference, newInference))
 
 	resolvedUniverseDomain, universeDomainSource := r.resolvedUniverseDomainPair(ctx, agent)
 	universeDomainUnchanged := r.universeDomainPruned(agent) ||
@@ -5507,7 +5516,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		execReadyUnchanged &&
 		a2aGatewayUnchanged &&
-		busProvisionedUnchanged &&
+		busProvisionedUnchanged && profileSupervisorFormUnchanged &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && a2aBusMetaUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
 		gatewayElectedUnchanged &&
@@ -5596,6 +5605,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
+	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
@@ -5610,7 +5620,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Copied before the write: decoding the response may reuse the pointer's target.
 	var wroteInference *inferenceModel
 	if newInference != nil {
-		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
+		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model, ReasoningEffort: newInference.ReasoningEffort}
 	}
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, a2aTasksWaitRequeue, err

@@ -79,7 +79,9 @@ gateway's `incident_context` hook. The bridge makes the hook's by-thread read in
 message with no row and the Google Chat first-reply recovery, do not run on the `api`
 executor): when the submission carries no `pushedReport` part (the A2A gateway relays a report
 it posted into a conversation; `a2a/docs/hermes-bridge.md`; a relayed scheduled report is a
-home-channel thread post the gateway does not keep, so the by-thread read still serves it),
+home-channel thread post the gateway does not keep, so the by-thread read still serves it, except
+for the one opening turn after a card's report posted into that thread, which carries the card's
+report instead),
 before the task's first turn it tries the row a console reply names with its
 `replyTo` part (`<key>#<task>`, `a2a/docs/hermes-bridge.md`), then looks the
 conversation's thread up in the same table, and the row the kanban notifier stores for

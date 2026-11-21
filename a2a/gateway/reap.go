@@ -187,7 +187,7 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	active := rec.ActiveTask
 	askExpired := active != nil && active.Ask != "" && !active.SubmittedAt.IsZero() &&
 		now.Sub(active.SubmittedAt) >= g.cfg.AskTTL
-	if !askExpired && !g.requesterExpired(rec, now) && !g.sessionAuthorsExpired(rec, now) {
+	if !askExpired && !g.requesterExpired(rec, now) && !g.sessionAuthorsExpired(rec, now) && !g.batchTextExpired(rec, now) {
 		return
 	}
 	l := g.lockSession(rec.Key)
@@ -228,6 +228,20 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 		requesterIDs = append(requesterIDs, ref.ID)
 		changed = true
 	}
+	// A fan-out child's result kept for a wake that hasn't run is a content
+	// copy too, from the child's terminal on the stream: bounded from the
+	// child's start, which is never later than that terminal, so the copy
+	// never outlives the stream's. The end itself stays, so the batch still
+	// counts the child ended.
+	var batchTextIDs []string
+	for i := range fresh.Tasks {
+		ref := &fresh.Tasks[i]
+		if g.batchTextPast(*ref, now) {
+			ref.clearBatchText()
+			batchTextIDs = append(batchTextIDs, ref.ID)
+			changed = true
+		}
+	}
 	// The incarnation's author set is the same kind of copy (hashed ids a
 	// delegation is checked against) and is bounded the same way, from its
 	// oldest entry. Cleared, it no longer lists everyone, so it is marked
@@ -247,7 +261,25 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 		return
 	}
 	g.log.Info("ask bound: cleared copies past their TTL", "session", fresh.Key,
-		"taskId", askTaskID, "requesterTaskIds", requesterIDs, "sessionAuthors", sessionAuthorsCleared)
+		"taskId", askTaskID, "requesterTaskIds", requesterIDs, "sessionAuthors", sessionAuthorsCleared, "batchTextTaskIds", batchTextIDs)
+}
+
+// batchTextPast reports a fan-out child's entry holding result text
+// (BatchEnd.Text) past AskTTL from its start.
+func (g *Gateway) batchTextPast(ref TaskRef, now time.Time) bool {
+	return ref.BatchEnd != nil && ref.BatchEnd.Text != "" && !ref.StartedAt.IsZero() &&
+		now.Sub(ref.StartedAt) >= g.cfg.AskTTL
+}
+
+// batchTextExpired reports whether any entry's batch result text is past
+// AskTTL, from the scan's own view of the record.
+func (g *Gateway) batchTextExpired(rec *SessionRecord, now time.Time) bool {
+	for _, ref := range rec.Tasks {
+		if g.batchTextPast(ref, now) {
+			return true
+		}
+	}
+	return false
 }
 
 // sessionAuthorsExpired reports whether the incarnation's author set is past

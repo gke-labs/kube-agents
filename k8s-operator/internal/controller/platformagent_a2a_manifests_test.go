@@ -1148,15 +1148,20 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "bus-migration"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
 	}
-	// After the same-namespace pods, one namespace-crossing peer: every pod
-	// in the profile namespace (#3655). That namespace's own fence keeps
-	// its pods to the bus, LiteLLM and DNS, and the bus grants do the rest.
-	if len(rule.From) != len(wantPeers)+1 {
-		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+1, len(rule.From), rule.From)
+	// After the unconditional same-namespace pods, one namespace-crossing peer
+	// (every pod in the profile namespace, #3655, whose own fence keeps its
+	// pods to the bus, LiteLLM and DNS while the bus grants do the rest) and
+	// the MCP server's pod, rendered by default unless A2A_MCP_DOOR=false.
+	if len(rule.From) != len(wantPeers)+2 {
+		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+2, len(rule.From), rule.From)
 	}
 	if profile := rule.From[len(wantPeers)]; profile.PodSelector != nil || profile.IPBlock != nil || profile.NamespaceSelector == nil ||
 		!reflect.DeepEqual(profile.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: "test-ns-profiles", "app.kubernetes.io/component": "profiles"}) {
-		t.Errorf("the last 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
+		t.Errorf("profile-namespace 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
+	}
+	if mcp := rule.From[len(wantPeers)+1]; mcp.IPBlock != nil || mcp.NamespaceSelector != nil || mcp.PodSelector == nil ||
+		!reflect.DeepEqual(mcp.PodSelector.MatchLabels, map[string]string{"app": "test-agent-a2a-mcp"}) {
+		t.Errorf("MCP 4222 peer = %+v, want app=test-agent-a2a-mcp in the same namespace", mcp)
 	}
 	for i, want := range wantPeers {
 		peer := rule.From[i]
@@ -1635,18 +1640,16 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	agent.Spec.Harness.Tuning.BusReplicas = nil
 
-	// The MCP server is one more standing pod, only while its flag is on (#3869).
-	without := pods.Value()
-	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
-		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
+	// The MCP server and the profile dispatcher are on by default (counted
+	// above), each one fewer when switched off.
+	withBoth := pods.Value()
+	t.Setenv(a2aMCPDoorEnvVar, "false")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != withBoth-1 {
+		t.Fatalf("tuned quota with the MCP server off = %d, want %d (one fewer than with it)", pods.Value(), withBoth-1)
 	}
-
-	// And the profile dispatcher, on by default (counted above), one fewer
-	// switched off.
 	t.Setenv(a2aProfileDispatcherEnvVar, "false")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without {
-		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), without)
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != withBoth-2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), withBoth-2)
 	}
 }
 
@@ -6893,10 +6896,16 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with exec.replicas 3 = %d, want %d", got, base+3)
 		}
 	})
-	t.Run("the MCP door", func(t *testing.T) {
-		t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Run("the MCP door switched off", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "false")
+		if got := a2aStandingPods(a2aTestAgent()); got != base-1 {
+			t.Fatalf("standing pods with the MCP door off = %d, want %d", got, base-1)
+		}
+	})
+	t.Run("the curator", func(t *testing.T) {
+		t.Setenv(a2aCuratorEnvVar, "true")
 		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
-			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
+			t.Fatalf("standing pods with the curator = %d, want %d", got, base+1)
 		}
 	})
 	t.Run("the dispatcher switched off", func(t *testing.T) {

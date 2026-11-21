@@ -39,9 +39,8 @@ const (
 
 // KubeJobs is the binary's JobRunner: one Job per unattended task in the
 // profile namespace, from the profile's Job template. The template is the
-// DispatchJobTemplate the config names (JobTemplateRef), read when the Job is
-// launched, or the copy inline in the config from an operator that predates
-// the reference. It is used exactly as the operator rendered it, since the
+// profile's own DispatchJobTemplate, at the rendering the config's
+// JobTemplateRef names, read when the Job is launched. It is used exactly as the operator rendered it, since the
 // Job admission policy admits only that; the Job gets a name, the config's
 // jobLabels, and the shape the policy requires (backoffLimit 0, one pod, a
 // deadline, a TTL). The pod the task is offered to is the Job's own, by
@@ -107,18 +106,11 @@ func jobTemplateName(prof *lib.DispatchProfile, tier string) string {
 }
 
 // jobTemplate is prof's pod template at tier: from the DispatchJobTemplate
-// its reference names, only while that object carries the reference's hash,
-// or from the inline copy an older operator sends.
+// its reference names, only while that object carries the reference's hash.
 func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.DispatchProfile, tier string) (json.RawMessage, error) {
 	ref := prof.JobTemplateRef
 	if ref == nil {
-		return prof.JobTemplate, nil
-	}
-	// A profile's template is its own param: a reference to another
-	// profile's is refused rather than followed.
-	// A hash-only reference (#5479) names the profile's own param.
-	if ref.Name != "" && ref.Name != lib.DispatchJobTemplateName(prof.Name) {
-		return nil, fmt.Errorf("profile %s's jobTemplateRef names %s, not its own param", prof.Name, ref.Name)
+		return nil, fmt.Errorf("profile %s has no Job template", prof.Name)
 	}
 	name := jobTemplateName(prof, tier)
 	raw, err := k.getTemplate(ctx, namespace, name)
@@ -142,9 +134,8 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 	if got := obj.Metadata.Annotations[lib.DispatchJobTemplateHashAnnotation]; got != ref.Hash {
 		return nil, fmt.Errorf("%w: profile %s's %s holds rendering %q, the config names %q", ErrJobTemplateNotCurrent, prof.Name, name, got, ref.Hash)
 	}
-	// Checked here, per profile, where the inline copy is checked in the
-	// config's Validate: a bad param holds its own profile's tasks, not
-	// every profile's config.
+	// Checked here, per profile, rather than in the config's Validate: a
+	// bad param holds its own profile's tasks, not every profile's config.
 	if !lib.PodTemplateWithContainers(obj.Spec.Template) {
 		return nil, fmt.Errorf("%w: profile %s's %s holds no pod template with containers", ErrJobTemplateNotCurrent, prof.Name, name)
 	}

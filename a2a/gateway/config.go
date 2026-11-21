@@ -66,12 +66,12 @@ const defaultDelegationDepthMax = 3
 
 // defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
 // field's comment carries the rationale.
-const defaultDelegationWidthMax = 1
+const defaultDelegationWidthMax = 10
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
-// accepts: one, until a stop cancels a batch's every child, walking the
-// whole task tree (#5682). Raising it is what turns fan-out on.
-const delegationWidthBuiltMax = 1
+// accepts: ten, the fleet question's width (#5682). The children queue to
+// their profile's concurrency, which is what binds at once, not this.
+const delegationWidthBuiltMax = 10
 
 // defaultScopeFile is where the operator projects the install's rendered
 // spec.scope into the gateway pod: the same scope.json, at the same path, the
@@ -139,9 +139,20 @@ const (
 // spec.telemetry.peopleSeen=false.
 const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+
+// The A2A door's Microsoft Entra sign-in class (a2adoor_entra.go), set by
+// hand on the gateway as the Google class's variables are.
+const (
+	envA2ADoorEntraTenantID     = "A2A_DOOR_ENTRA_TENANT_ID"
+	envA2ADoorEntraClientID     = "A2A_DOOR_ENTRA_CLIENT_ID"
+	envA2ADoorEntraAllowedUsers = "A2A_DOOR_ENTRA_ALLOWED_USERS"
+)
 const (
 	envImagePullRefs = "A2A_IMAGE_PULL_REFS"
-	imagePullRefSep  = ","
+	// envTriggerEventKinds lists the event triggers the trigger ingress
+	// admits (Config.TriggerEventKinds).
+	envTriggerEventKinds = "A2A_TRIGGER_EVENT_KINDS"
+	imagePullRefSep      = ","
 )
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
@@ -345,6 +356,13 @@ type Config struct {
 	// empty means nobody. The A2A door's backend ("a2a") is the exception:
 	// no pair for it means nobody (doorUnlisted). See allowlist.go.
 	TargetAllowedUsers map[string]map[string][]string
+	// TierMembership maps a person, by backend and plaintext user id, to the
+	// tier their AgentProfile tasks run at (#3659, Tier 2c): the operator
+	// renders the PlatformAgent's spec.tiers.membership into
+	// A2A_TIER_MEMBERSHIP, and the gateway HMACs each id as it does the
+	// allowlists. Anyone unlisted runs at read; the console's shared principal
+	// always does (#5557).
+	TierMembership []TierMember
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
 	// it arms the door. DEV AND EVAL ONLY. The door is not a backend (see
@@ -415,8 +433,8 @@ type Config struct {
 	// A2ADoorPrincipalMapPath is the door's OWN principal map
 	// (A2A_DOOR_PRINCIPAL_MAP): keys prefixed a2a:, values eval-only
 	// identities, never a fallback to the chat map or the inject map. The
-	// developer identity class (ID tokens) arrives as a second resolver
-	// beside this file, not as an entry in it.
+	// Google and Entra sign-in classes resolve through verifiers beside
+	// this file, never as entries in it.
 	A2ADoorPrincipalMapPath string
 
 	// A2ADoorPublicURL is the URL the agent card advertises for the door's
@@ -438,6 +456,22 @@ type Config struct {
 	// posture: a door any Google account can sign in to is not a default
 	// anyone should get by leaving a list blank.
 	A2ADoorAllowedUsers []string
+	// A2ADoorEntraTenantID and A2ADoorEntraClientID arm the door's
+	// Microsoft Entra class (A2A_DOOR_ENTRA_TENANT_ID,
+	// A2A_DOOR_ENTRA_CLIENT_ID): a bearer without Google's ya29. prefix is checked,
+	// against the tenant's published signing keys, as a token the tenant
+	// issued for this application registration. Both empty leaves the
+	// class off; one without the other is refused, as is either without
+	// A2A_DOOR_LISTEN. Set by hand on the gateway, as the Google class's
+	// are; nothing renders them yet.
+	A2ADoorEntraTenantID string
+	A2ADoorEntraClientID string
+	// A2ADoorEntraAllowedUsers is the Entra class's allowlist
+	// (A2A_DOOR_ENTRA_ALLOWED_USERS, comma-separated object ids), held to
+	// the posture of A2ADoorAllowedUsers: the door refuses an object id off
+	// it (403) before it holds any state for the caller, the gateway checks
+	// the same list again, empty admits nobody, and there is no allow-all.
+	A2ADoorEntraAllowedUsers []string
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
@@ -684,6 +718,17 @@ type Config struct {
 	// ingress accepts (trigger_ingress.go): a token bucket that holds this
 	// many and refills at this rate. Zero takes DefaultTriggerRatePerHour.
 	TriggerRatePerHour int
+	// TriggerEventKinds are the event triggers (#6572) whose submissions the
+	// trigger ingress admits, each <source>/<kind>: a source the callout
+	// binds to its own identity, and one kind of event it reports
+	// (A2A_TRIGGER_EVENT_KINDS, comma-separated). Empty, the default, admits
+	// none: only the schedule source submits. Listing kinds, not sources,
+	// bounds the rate buckets a source can open to the kinds named here.
+	TriggerEventKinds []string
+	// TriggerEventRatePerHour is the cap on each admitted event kind's
+	// submissions, a bucket per <source>/<kind>. Zero takes
+	// DefaultTriggerEventRatePerHour.
+	TriggerEventRatePerHour int
 
 	// CapabilityOptional relaxes exactly one thing: what happens when this
 	// gateway cannot mint. Zero value — the safe one — refuses the turn.
@@ -754,12 +799,13 @@ type Config struct {
 	// what runs at once: the dispatcher queues children to each profile's
 	// concurrency.
 	//
-	// Zero means 1, a single child. FromEnv accepts only 1 for now: a batch's
-	// results come back in one wake, but a stop doesn't yet cancel every
-	// child of the tree, so an operator can't turn fan-out on until that
-	// stop is built (delegationWidthBuiltMax, #5682). Tests and
-	// embedders that build Config directly may set more, to exercise the
-	// mint. FromEnv also refuses a value under 1, as it does the depth bound.
+	// Zero means 1, a single child. FromEnv defaults it to 10 and accepts 1
+	// to 10 (delegationWidthBuiltMax): a batch's results come back in one
+	// wake, and one stop cancels every child of the tree. At the `cluster`
+	// profile's default concurrency of 2, ten children run two at a time,
+	// about five rounds. Tests and embedders that build Config directly may
+	// set up to lib.DelegateBatchMax. FromEnv refuses a value under 1, as it
+	// does the depth bound, and one over 10.
 	DelegationWidthMax int
 
 	// ScopeFile is the rendered spec.scope a profile task's target is
@@ -927,6 +973,11 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	for _, kind := range strings.Split(os.Getenv(envTriggerEventKinds), ",") {
+		if kind = strings.TrimSpace(kind); kind != "" {
+			cfg.TriggerEventKinds = append(cfg.TriggerEventKinds, kind)
+		}
+	}
 	seenPullRefs := make(map[string]struct{})
 	for _, refName := range strings.Split(os.Getenv(envImagePullRefs), imagePullRefSep) {
 		refName = strings.TrimSpace(refName)
@@ -969,6 +1020,11 @@ func FromEnv() (*Config, error) {
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
 	}
+	members, err := parseTierMembership(os.Getenv(EnvTierMembership))
+	if err != nil {
+		return nil, err
+	}
+	cfg.TierMembership = members
 	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
 		if u = strings.TrimSpace(u); u != "" {
 			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)
@@ -995,6 +1051,9 @@ func FromEnv() (*Config, error) {
 			cfg.A2ADoorAllowedUsers = append(cfg.A2ADoorAllowedUsers, u)
 		}
 	}
+	cfg.A2ADoorEntraTenantID = strings.TrimSpace(os.Getenv(envA2ADoorEntraTenantID))
+	cfg.A2ADoorEntraClientID = strings.TrimSpace(os.Getenv(envA2ADoorEntraClientID))
+	cfg.A2ADoorEntraAllowedUsers = splitList(os.Getenv(envA2ADoorEntraAllowedUsers))
 	metricsPort, err := metricsPortFromEnv(cfg)
 	if err != nil {
 		return nil, err
@@ -1060,6 +1119,29 @@ func FromEnv() (*Config, error) {
 	if cfg.A2ADoorGoogleClientID != "" && cfg.A2ADoorListen == "" {
 		return nil, fmt.Errorf("A2A_DOOR_GOOGLE_CLIENT_ID is set but A2A_DOOR_LISTEN is not: the Google sign-in class is part of the A2A door and has nothing to arm without it")
 	}
+	if (cfg.A2ADoorEntraTenantID == "") != (cfg.A2ADoorEntraClientID == "") {
+		return nil, fmt.Errorf("%s and %s are set together or not at all: the Microsoft Entra sign-in class checks a token against one tenant's keys for one application", envA2ADoorEntraTenantID, envA2ADoorEntraClientID)
+	}
+	// The token's tid claim is always the directory's GUID, and the door
+	// compares it to this value, so the tenant's domain name (which the
+	// Entra authority also accepts in a URL) would fetch the keys and then
+	// refuse every token as another tenant's. The client id is a GUID too.
+	for name, value := range map[string]string{envA2ADoorEntraTenantID: cfg.A2ADoorEntraTenantID, envA2ADoorEntraClientID: cfg.A2ADoorEntraClientID} {
+		if value != "" && !a2aEntraObjectIDPattern.MatchString(value) {
+			return nil, fmt.Errorf("%s is %q, not a GUID: use the portal's \"Directory (tenant) ID\" and \"Application (client) ID\" values, not a domain name", name, value)
+		}
+	}
+	// The allowlist names object ids; a UPN or an email can never match the
+	// GUID a token carries, so a list of them would admit nobody with no
+	// sign of why.
+	for _, u := range cfg.A2ADoorEntraAllowedUsers {
+		if !a2aEntraObjectIDPattern.MatchString(u) {
+			return nil, fmt.Errorf("%s entry %q is not an object id (a GUID): the Entra class lists people by object id, not by UPN or email", envA2ADoorEntraAllowedUsers, u)
+		}
+	}
+	if cfg.A2ADoorEntraTenantID != "" && cfg.A2ADoorListen == "" {
+		return nil, fmt.Errorf("%s is set but A2A_DOOR_LISTEN is not: the Microsoft Entra sign-in class is part of the A2A door and has nothing to arm without it", envA2ADoorEntraTenantID)
+	}
 	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
 		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")
 	}
@@ -1079,6 +1161,15 @@ func FromEnv() (*Config, error) {
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
 	// it is checked where the spawner is built (gateway.New).
+	for _, kind := range cfg.TriggerEventKinds {
+		// Neither "schedule" nor "run-now" as a source: each opens a
+		// schedule's idempotency key, and an event source's keys must not
+		// spell one.
+		src, k, ok := strings.Cut(kind, "/")
+		if !ok || !lib.ValidSubjectToken(src) || !lib.ValidSubjectToken(k) || src == lib.TriggerSourceSchedule || src == lib.TriggerRunNowKeyPrefix {
+			return nil, fmt.Errorf(envTriggerEventKinds+" entry %q is not <source>/<kind> of dot-free DNS-1123 labels for an event source", kind)
+		}
+	}
 	if !lib.ValidSubjectToken(cfg.DefaultAddressee) {
 		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE %q is not a dot-free DNS-1123 label", cfg.DefaultAddressee)
 	}
@@ -1110,7 +1201,7 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: need an integer from 1 to %d", widthMax, lib.DelegateBatchMax)
 	}
 	if wm > delegationWidthBuiltMax {
-		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's tree-wide stop is not built yet (#5682)", widthMax, delegationWidthBuiltMax)
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))

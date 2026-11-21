@@ -1,7 +1,7 @@
-"""Tests for automerge_checks.py: the broker's safety checks on a generated budget.
+"""Tests for fix_recipes/no-pdb/checks.py: the no-pdb recipe's safety checks on a generated budget.
 
-`fleet-audit/scripts/test_broker_checks_parity.py` holds the verdicts to the
-sandbox's own `pdb_safety.judge`.
+`fleet-audit/scripts/test_broker_checks_parity.py` holds the sandbox's
+pre-flight (`fix_preflight`), which runs this same recipe, to the same verdicts.
 """
 
 import sys
@@ -10,7 +10,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import automerge_checks as ac
+from fix_recipes import registry
+
+ac = registry.checks_module("no-pdb")
 
 NS = "shop"
 LABELS = {"app": "checkout"}
@@ -162,6 +164,39 @@ class JudgeTest(unittest.TestCase):
         for kind in ("cronjobs", "jobs", "horizontalpodautoscalers", "poddisruptionbudgets", "daemonsets"):
             self.assertIn(kind, ac.READ_KINDS.split(","))
 
+
+class RecipeInterfaceTest(unittest.TestCase):
+    """`read_kinds` and `checks(change, live)`, the interface the broker reads through the registry."""
+
+    def test_checks_is_judge_on_the_change_and_each_result_has_a_status(self):
+        from types import SimpleNamespace
+
+        change = SimpleNamespace(object=OBJ, namespace=NS, name=NAME, selector=SELECTOR)
+        for items in ((deployment(),), (deployment(replicas=1), pdb()), ()):
+            with self.subTest(items=items):
+                live = {"items": list(items)}
+                results = ac.checks(change, live)
+                self.assertEqual(results, ac.judge(live, OBJ, NS, NAME, SELECTOR))
+                for result in results:
+                    self.assertEqual(result["status"] == ac.PASS, result["passed"])
+                    self.assertIn(result["status"], (ac.PASS, ac.FAIL, ac.UNKNOWN))
+
+    def test_a_workload_it_cannot_judge_is_unknown_not_passed(self):
+        results = ac.judge({"items": []}, OBJ, NS, NAME, SELECTOR)
+        self.assertEqual({r["status"] for r in results}, {ac.UNKNOWN})
+        self.assertFalse(any(r["passed"] for r in results))
+
+    def test_a_judged_failure_is_fail(self):
+        results = by_name(ac.judge({"items": [deployment(replicas=1)]}, OBJ, NS, NAME, SELECTOR))
+        self.assertEqual(results[ac.REPLICAS_READY]["status"], ac.FAIL)
+
+    def test_a_status_from_an_older_generation_is_unknown(self):
+        results = by_name(ac.judge({"items": [deployment(generation=4)]}, OBJ, NS, NAME, SELECTOR))
+        self.assertFalse(results[ac.REPLICAS_READY]["passed"])
+        self.assertEqual(results[ac.REPLICAS_READY]["status"], ac.UNKNOWN)
+
+    def test_read_kinds_is_the_one_namespace_read(self):
+        self.assertEqual(ac.read_kinds, ac.READ_KINDS)
 
 if __name__ == "__main__":
     unittest.main()
