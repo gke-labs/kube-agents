@@ -267,7 +267,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 
 	// One live child per conversation, whichever turn asked
-	// for it: a stop detaches a child without ending it.
+	// for it: a stop detaches a child without ending it, so a stopped child
+	// counts until its terminal, or the heal, ends it.
 	// A batch being finished has its own children live.
 	if live := g.liveChild(ctx, rec); live != "" && !resuming {
 		refuse(ruleDelegationBusy, fmt.Sprintf("⚠️ delegation refused: a delegated task is still running (task %s)", live), "child", live)
@@ -566,11 +567,12 @@ func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID 
 		g.publishDispatchStop(ctx, ref)
 		if !g.publishBatchCancel(ctx, rec, ref, authority, batchCancelWithdrawn) {
 			rec.MarkCanceled(id)
+			rec.setCancelUnsent(id, true)
 			kept[id] = true
 			continue
 		}
 		if ref.StatusMsgID != "" {
-			g.editLine(rec.Key, ref.StatusMsgID, noticeBatchChildWithdrawn, "")
+			g.editLine(rec.Key, ref.StatusMsgID, withLineNote(noticeBatchChildWithdrawn, ref.LineNote), "")
 		}
 		g.logTaskTerminal(rec, ref.Addressee, id, lib.StateCanceled, TerminalFromGateway,
 			"reason: "+reasonBatchWithdrawn+" - "+noticeBatchChildWithdrawn)
@@ -1062,6 +1064,8 @@ func breakBacktickRuns(body string, n int) string {
 // refused request can be asked again, a second live child cannot be undone.
 func (g *Gateway) liveChild(ctx context.Context, rec *SessionRecord) string {
 	for _, ref := range rec.Tasks {
+		// A stopped child counts until it has ended: a cancel, sent or
+		// not, doesn't stop a task that is still working.
 		if ref.Role != taskRoleChild {
 			continue
 		}

@@ -311,6 +311,25 @@ func (s *sideDoorAdapter) AnswersOnLine(conversation string) bool {
 	return ok && answerer.AnswersOnLine(conversation)
 }
 
+// AnswersWholeOnLine answers for the primary's own conversations; a door
+// keeps the post and the terminal edit.
+func (s *sideDoorAdapter) AnswersWholeOnLine(conversation string) bool {
+	if s.doorFor(conversation) != nil {
+		return false
+	}
+	answerer, ok := s.primary.(WholeLineAnswerer)
+	return ok && answerer.AnswersWholeOnLine(conversation)
+}
+
+// PieceSize is the primary's for its own conversations (PieceSizer); a
+// door's caller reads chat-sized pieces, discordChunk.
+func (s *sideDoorAdapter) PieceSize(conversation string) int {
+	if s.doorFor(conversation) != nil {
+		return discordChunk
+	}
+	return pieceSizeOf(s.primary, conversation)
+}
+
 func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if s.doorFor(conversation) != nil {
 		return
@@ -324,8 +343,8 @@ func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verifi
 // affordance: the caller that will one day use it is a classifier deciding to
 // move a reply out of a room, which only a room has. Behind the mux a user id
 // may name its backend as <backend>:<id>, and the mux routes it there with
-// the bare id. A chat backend name the mux knows (gchat, slack, discord,
-// console) that is not armed is refused by name. On
+// the bare id. A chat backend name the mux knows (gchat, slack, teams,
+// discord, console) that is not armed is refused by name. On
 // a one-backend mux any id without a known backend prefix goes whole to that
 // backend; with several backends armed, a bare or unknown-prefixed id is
 // refused. With no chat stack the first door answers, as the inject door

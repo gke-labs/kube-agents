@@ -31,11 +31,12 @@ const attributionSaltInfo = "a2a-attribution-salt"
 const attributionSaltLen = 32
 
 // The mux keys and conversation prefixes, exported for cmd/gateway, which
-// builds one adapter per backend: Backends returns the first three, and the
+// builds one adapter per backend: Backends returns the first four, and the
 // console is the essential backend beside them.
 const (
 	BackendGchat   = gchatBackend
 	BackendSlack   = slackBackend
+	BackendTeams   = teamsBackend
 	BackendDiscord = discordBackend
 	BackendConsole = consoleBackend
 )
@@ -53,6 +54,7 @@ type backendArm struct {
 var backendArms = []backendArm{
 	{name: gchatBackend, armed: func(c *Config) bool { return c.GchatRelayURL != "" }},
 	{name: slackBackend, armed: func(c *Config) bool { return c.SlackBotToken != "" }},
+	{name: teamsBackend, armed: func(c *Config) bool { return c.TeamsRelayURL != "" }},
 	{name: discordBackend, armed: func(c *Config) bool { return c.DiscordToken != "" }},
 }
 
@@ -66,12 +68,12 @@ const defaultDelegationDepthMax = 3
 
 // defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
 // field's comment carries the rationale.
-const defaultDelegationWidthMax = 1
+const defaultDelegationWidthMax = 10
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
-// accepts: one, until a stop cancels a batch's every child, walking the
-// whole task tree (#5682). Raising it is what turns fan-out on.
-const delegationWidthBuiltMax = 1
+// accepts: ten, the fleet question's width (#5682). The children queue to
+// their profile's concurrency, which is what binds at once, not this.
+const delegationWidthBuiltMax = 10
 
 // defaultScopeFile is where the operator projects the install's rendered
 // spec.scope into the gateway pod: the same scope.json, at the same path, the
@@ -85,6 +87,22 @@ const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token" // #nosec 
 // envGchatHomeChannel carries the Chat home space the chat.notify route posts
 // to (notify.go); the operator renders it from googleChat.homeChannel.
 const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
+
+// The Teams backend's environment: the broker relay URL that arms it, the
+// projected token it presents (the a2a-chat audience, the Google Chat
+// backend's token by default), the allowlist and allow-all gates, the home
+// channel the chat.notify route posts to, the tenant it serves, and whether
+// replies render as Adaptive Cards. The operator renders them from
+// spec.integration.teams when it runs with A2A_TEAMS_BACKEND=true.
+const (
+	envTeamsRelayURL      = "A2A_TEAMS_RELAY_URL"
+	envTeamsTokenPath     = "A2A_TEAMS_TOKEN_PATH" // #nosec G101 -- an environment variable name, not a credential
+	envTeamsAllowedUsers  = "A2A_TEAMS_ALLOWED_USERS"
+	envTeamsAllowAllUsers = "A2A_TEAMS_ALLOW_ALL_USERS"
+	envTeamsHomeChannel   = "A2A_TEAMS_HOME_CHANNEL"
+	envTeamsTenantID      = "A2A_TEAMS_TENANT_ID"
+	envTeamsAdaptiveCards = "A2A_TEAMS_ADAPTIVE_CARDS"
+)
 
 // envSlackHomeChannel carries the Slack home channel's id the chat.notify
 // route posts to; the operator renders it from slack.homeChannel.
@@ -293,6 +311,30 @@ type Config struct {
 	// a chat.notify proactive post lands (notify.go). Empty leaves the route
 	// serving conversation requests only.
 	GchatHomeChannel string
+	// TeamsRelayURL is the credential proxy's relay base URL for the Teams
+	// backend; setting it arms the Teams adapter, which pulls Bot Framework
+	// activities from the broker's Teams queue and replies through its
+	// passthrough. TeamsTokenPath is the projected ServiceAccount token it
+	// presents (the a2a-chat audience, GchatTokenPath's default).
+	TeamsRelayURL  string
+	TeamsTokenPath string
+	// TeamsAllowedUsers is the Teams backend's ingress allowlist: Microsoft
+	// Entra object ids (from.aadObjectId), the immutable identity, or Bot
+	// Framework user ids, compared case-insensitively; the legacy path's
+	// TEAMS_ALLOWED_USERS gate. TeamsAllowAllUsers disables it, stated
+	// explicitly.
+	TeamsAllowedUsers  []string
+	TeamsAllowAllUsers bool
+	// TeamsHomeChannel is the install's Teams home conversation id, where a
+	// chat.notify proactive post lands; empty leaves the route serving
+	// conversation requests only.
+	TeamsHomeChannel string
+	// TeamsTenantID, when set, is the one Entra tenant the adapter serves; an
+	// activity from another tenant is acked away.
+	TeamsTenantID string
+	// TeamsAdaptiveCards renders Teams replies as Adaptive Cards; off, they
+	// post as plain text. On unless the env says false.
+	TeamsAdaptiveCards bool
 	// SlackHomeChannel is the install's Slack home channel id ("C0123"),
 	// the one place a Slack chat.notify home post may land (notify.go). Empty
 	// leaves the route serving conversation requests only.
@@ -788,12 +830,13 @@ type Config struct {
 	// what runs at once: the dispatcher queues children to each profile's
 	// concurrency.
 	//
-	// Zero means 1, a single child. FromEnv accepts only 1 for now: a batch's
-	// results come back in one wake, but a stop doesn't yet cancel every
-	// child of the tree, so an operator can't turn fan-out on until that
-	// stop is built (delegationWidthBuiltMax, #5682). Tests and
-	// embedders that build Config directly may set more, to exercise the
-	// mint. FromEnv also refuses a value under 1, as it does the depth bound.
+	// Zero means 1, a single child. FromEnv defaults it to 10 and accepts 1
+	// to 10 (delegationWidthBuiltMax): a batch's results come back in one
+	// wake, and one stop cancels every child of the tree. At the `cluster`
+	// profile's default concurrency of 2, ten children run two at a time,
+	// about five rounds. Tests and embedders that build Config directly may
+	// set up to lib.DelegateBatchMax. FromEnv refuses a value under 1, as it
+	// does the depth bound, and one over 10.
 	DelegationWidthMax int
 
 	// ScopeFile is the rendered spec.scope a profile task's target is
@@ -833,7 +876,7 @@ type Config struct {
 }
 
 // Backends lists every REAL chat backend this config arms, in backendArms'
-// order (gchat, slack, discord: BackendGchat, BackendSlack, BackendDiscord),
+// order (gchat, slack, teams, discord: BackendGchat, BackendSlack, BackendTeams, BackendDiscord),
 // or nil when none is armed. The doors are not among the answers, for the
 // reason Backend gives.
 func (c *Config) Backends() []string {
@@ -847,7 +890,7 @@ func (c *Config) Backends() []string {
 }
 
 // Backend names the first REAL chat backend of Backends: "gchat", "slack",
-// "discord", or "" when a side door (inject, A2A, or both) or the console
+// "teams", "discord", or "" when a side door (inject, A2A, or both) or the console
 // door alone is the only way in. It is the authority default; the door
 // default (inject, a2a or console) is chosen in New, not here.
 //
@@ -979,6 +1022,17 @@ func FromEnv() (*Config, error) {
 		cfg.ImagePullRefs = append(cfg.ImagePullRefs, refName)
 	}
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
+	cfg.TeamsRelayURL = strings.TrimSpace(os.Getenv(envTeamsRelayURL))
+	cfg.TeamsTokenPath = envOr(envTeamsTokenPath, cfg.GchatTokenPath)
+	for _, u := range strings.Split(os.Getenv(envTeamsAllowedUsers), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.TeamsAllowedUsers = append(cfg.TeamsAllowedUsers, u)
+		}
+	}
+	cfg.TeamsAllowAllUsers = os.Getenv(envTeamsAllowAllUsers) == envTrue
+	cfg.TeamsHomeChannel = strings.TrimSpace(os.Getenv(envTeamsHomeChannel))
+	cfg.TeamsTenantID = strings.TrimSpace(os.Getenv(envTeamsTenantID))
+	cfg.TeamsAdaptiveCards = strings.TrimSpace(os.Getenv(envTeamsAdaptiveCards)) != strconv.FormatBool(false)
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
 	cfg.GchatHomePolicy = strings.TrimSpace(os.Getenv(envGchatHomePolicy))
@@ -1004,6 +1058,9 @@ func FromEnv() (*Config, error) {
 	}
 	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersSlack); ok {
 		platformLists[slackBackend] = append([]string{}, splitList(raw)...)
+	}
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersTeams); ok {
+		platformLists[teamsBackend] = append([]string{}, splitList(raw)...)
 	}
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
@@ -1093,7 +1150,7 @@ func FromEnv() (*Config, error) {
 		// same reason: a console client such as the MCP server needs a
 		// gateway on an install that configured no chat backend.
 		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" && !cfg.ConsoleDoor {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), A2A_TEAMS_RELAY_URL (its Teams relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
 		}
 	}
 	// Fail closed: a door with no token would be reachable by anything that
@@ -1189,7 +1246,7 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: need an integer from 1 to %d", widthMax, lib.DelegateBatchMax)
 	}
 	if wm > delegationWidthBuiltMax {
-		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's tree-wide stop is not built yet (#5682)", widthMax, delegationWidthBuiltMax)
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))

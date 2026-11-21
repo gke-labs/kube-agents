@@ -23,6 +23,8 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
+	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,16 +43,17 @@ import (
 )
 
 // The MCP server (a2a/cmd/mcp): a Model Context Protocol endpoint for an
-// external coding agent, as a console client of the bus. It is opt-in per
-// install with the operator flag below, like the inject backend and the
-// agent door, and while it is off nothing of it is rendered. It runs in its
+// external coding agent, as a console client of the bus. It runs by default
+// beside every PlatformAgent, and A2A_MCP_DOOR=false (the chart's
+// operator.mcpServer.enabled: false) switches it off and removes all of its
+// objects. It runs in its
 // own pod, not the gateway's, so the only bus credential within its reach is
 // its own console-mcp password, and the only way in is a kubectl port-forward and
-// the server's own bearer token. A CR field can replace the flag if the
-// server becomes a supported, documented feature.
+// the server's own bearer token.
 const (
-	// a2aMCPDoorEnvVar is the operator flag. Anything but "true" is off, the
-	// rule a2aInjectBackendEnabled gives: a typo leaves the door shut.
+	// a2aMCPDoorEnvVar switches the MCP server off when strconv.ParseBool reads
+	// false or rejects the value; empty or unset leaves it on. The chart sets
+	// it from operator.mcpServer.enabled.
 	a2aMCPDoorEnvVar = "A2A_MCP_DOOR"
 
 	a2aMCPComponent    = "mcp"
@@ -104,10 +107,8 @@ const (
 
 	// Sized like the console, whose pair is sized for GKE Autopilot without
 	// Pod bursting (the request is what the container runs under there).
-	// The chart's quota preflight counts this pod from its flagged-pods.yaml
-	// entry when A2A_MCP_DOOR is set (#3869, a2aFlaggedPods), and
-	// TestTheChartCountsEveryFlaggedPod holds that entry to these figures, so
-	// a change here moves the entry too. The CPU limit is there because a
+	// On by default, the settled golden renders it and footprint.yaml sums it
+	// from there (make chart-sync). The CPU limit is there because a
 	// namespace ResourceQuota on limits.cpu refuses a container with none.
 	a2aMCPCPURequest    = "100m"
 	a2aMCPMemoryRequest = "128Mi"
@@ -131,10 +132,28 @@ const (
 	a2aMCPTokenIndex = 3
 )
 
-// a2aMCPDoorEnabled reports whether the operator was deployed with the MCP
-// flag.
+// a2aRefusedMCPDoorValues holds each unparseable A2A_MCP_DOOR value already
+// logged, so a reconcile loop logs a typo once rather than per pass.
+var a2aRefusedMCPDoorValues sync.Map
+
+// a2aMCPDoorEnabled reports whether this operator renders the MCP server: on by
+// default when A2A_MCP_DOOR is unset or empty, parsed with strconv.ParseBool
+// when set, and off (fail-closed) when unparseable.
 func a2aMCPDoorEnabled() bool {
-	return os.Getenv(a2aMCPDoorEnvVar) == "true"
+	trimmed := strings.TrimSpace(os.Getenv(a2aMCPDoorEnvVar))
+	if trimmed == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(trimmed)
+	if err != nil {
+		if _, seen := a2aRefusedMCPDoorValues.LoadOrStore(trimmed, true); !seen {
+			logf.Log.WithName("platformagent-controller").Info(
+				"Unparseable "+a2aMCPDoorEnvVar+" value; keeping the MCP server off",
+				"value", trimmed)
+		}
+		return false
+	}
+	return enabled
 }
 
 func a2aMCPName(agent *agentv1alpha1.PlatformAgent) string {
@@ -254,14 +273,19 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						StartupProbe:   probe(a2aMCPStartupPeriod, a2aMCPStartupFailure),
 						ReadinessProbe: probe(a2aMCPReadinessPeriod, a2aMCPReadinessFailure),
 						LivenessProbe:  probe(a2aMCPLivenessPeriod, a2aMCPLivenessFailure),
+						// Ephemeral-storage request and equal limit for the container's
+						// own log (emptyDirLogsAllowance), as a2aDispatcherResources sets:
+						// the server writes nothing else to disk.
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse(a2aMCPCPURequest),
-								corev1.ResourceMemory: resource.MustParse(a2aMCPMemoryRequest),
+								corev1.ResourceCPU:              resource.MustParse(a2aMCPCPURequest),
+								corev1.ResourceMemory:           resource.MustParse(a2aMCPMemoryRequest),
+								corev1.ResourceEphemeralStorage: resource.MustParse(emptyDirLogsAllowance),
 							},
 							Limits: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse(a2aMCPCPULimit),
-								corev1.ResourceMemory: resource.MustParse(a2aMCPMemoryLimit),
+								corev1.ResourceCPU:              resource.MustParse(a2aMCPCPULimit),
+								corev1.ResourceMemory:           resource.MustParse(a2aMCPMemoryLimit),
+								corev1.ResourceEphemeralStorage: resource.MustParse(emptyDirLogsAllowance),
 							},
 						},
 						SecurityContext: &corev1.SecurityContext{

@@ -63,6 +63,7 @@ const (
 var routePlatforms = map[string]string{
 	"gchat:":           lib.NotifyPlatformGchat,
 	"slack:":           lib.NotifyPlatformSlack,
+	"teams:":           lib.NotifyPlatformTeams,
 	consoleRoutePrefix: lib.NotifyPlatformConsole,
 }
 
@@ -382,6 +383,7 @@ const (
 	// The gateway's door names (a2a/gateway: gchatBackend, slackBackend, ...).
 	backendGchat     = "gchat"
 	backendSlack     = "slack"
+	backendTeams     = "teams"
 	backendDiscord   = "discord"
 	backendConsole   = "console"
 	backendA2A       = "a2a"
@@ -406,12 +408,14 @@ type sessionOrigin struct {
 
 // backendOrigins maps the gateway door a task came through
 // (authority.requester.backend) to the session's origin. A chat door's
-// platform is the ledger's platform label: Google Chat and Slack are spelled
-// as the chat metrics labels spell them, and Discord, which has no chat
-// metrics label, keeps its backend name.
+// platform is the ledger's platform label: Google Chat, Slack and Teams are
+// spelled as the chat metrics labels spell them (HERMES_PLATFORM_LABELS has
+// teams as teams), and Discord, which has no chat metrics label, keeps its
+// backend name.
 var backendOrigins = map[string]sessionOrigin{
 	backendGchat:     {Origin: originChat, Platform: originPlatformGooglechat},
 	backendSlack:     {Origin: originChat, Platform: backendSlack},
+	backendTeams:     {Origin: originChat, Platform: backendTeams},
 	backendDiscord:   {Origin: originChat, Platform: backendDiscord},
 	backendConsole:   {Origin: originConsole},
 	backendA2A:       {Origin: originAPI},
