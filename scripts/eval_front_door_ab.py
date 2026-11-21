@@ -33,9 +33,10 @@ This reads both and puts every case in one class:
 
 It prints a Markdown table and exits 1 when any case regressed, 0 otherwise.
 When both runs carry their grading log (``eval-grading.log``), it also compares
-each case's mean answer words and flags a case whose answer runs over A's by
-more than ``LENGTH_MARGIN``; ``--length-gate`` makes such a case exit 1 too, since
-answer length is part of front-door parity.
+each case's median answer words, infrastructure repetitions left out, and
+flags a case whose answer runs over A's by more than ``LENGTH_MARGIN``; ``--length-gate`` makes such a case exit 1 too, since
+answer length is part of front-door parity, and exits 2 when a run has no
+shapes to compare.
 It exits 2 when the two runs can't be compared: a directory it can't read, a
 run with no case hand-offs (often a path one level too high), every case of B
 unscored or missing (the session route broke before any case could be graded,
@@ -67,11 +68,14 @@ FRONT_DOOR_FILE = "front-door.txt"
 # its case's `Task <case> Result:` line (bench-gate case).
 GRADING_LOG = "eval-grading.log"
 TASK_LINE = re.compile(r"^Task (\S+) Result:")
-ANSWER_WORDS = re.compile(r"\brep \d+ shape:.*\banswer_words=(\d+)")
+REP_LINE = re.compile(r"^\s+rep (\d+): (\S+) --")
+ANSWER_WORDS = re.compile(r"^\s+rep (\d+) shape: .*\banswer_words=(\d+)")
+INFRA_OUTCOME = "infra"
 # A case is wordier on B when its mean answer runs longer than A's by more
 # than this share: 3 repetitions carry noise, so small differences aren't
-# flagged.
+# flagged, nor a difference under MIN_EXTRA_WORDS.
 LENGTH_MARGIN = 0.25
+MIN_EXTRA_WORDS = 10
 
 
 class UnreadableRun(Exception):
@@ -174,8 +178,10 @@ def check_comparable(
 
 
 def read_answer_words(directory: Path) -> dict[str, float]:
-    """Each case's mean answer words in a run, from its grading log; empty
-    when the run has no log (an older run, or one that delivered nothing)."""
+    """Each case's answer words in a run, from its grading log: the
+    nearest-rank median over its repetitions that weren't infrastructure, as
+    the dashboard's shape rollup takes it. Empty when the run has no log (an
+    older run, or one that delivered nothing)."""
     path = directory / GRADING_LOG
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -184,21 +190,26 @@ def read_answer_words(directory: Path) -> dict[str, float]:
     except OSError as err:
         raise UnreadableRun(f"{path}: {err}") from err
     words: dict[str, list[int]] = {}
-    case = None
+    case, infra = None, set()
     for line in lines:
         if m := TASK_LINE.match(line):
-            case = m.group(1)
-        elif case and (m := ANSWER_WORDS.search(line)):
-            words.setdefault(case, []).append(int(m.group(1)))
-    return {c: sum(w) / len(w) for c, w in words.items()}
+            case, infra = m.group(1), set()
+        elif case and (m := REP_LINE.match(line)):
+            if m.group(2) == INFRA_OUTCOME:
+                infra.add(m.group(1))
+        elif case and (m := ANSWER_WORDS.match(line)) and m.group(1) not in infra:
+            words.setdefault(case, []).append(int(m.group(2)))
+    return {c: sorted(w)[(len(w) - 1) // 2] for c, w in words.items() if w}
 
 
 def wordier(a_words: float | None, b_words: float | None) -> bool:
-    """Whether B's mean answer is longer than A's by more than LENGTH_MARGIN."""
+    """Whether B's answer is longer than A's by more than LENGTH_MARGIN and
+    by at least MIN_EXTRA_WORDS."""
     return (
         a_words is not None
         and b_words is not None
         and b_words > a_words * (1 + LENGTH_MARGIN)
+        and b_words - a_words >= MIN_EXTRA_WORDS
     )
 
 
@@ -251,7 +262,8 @@ def markdown(
             1 for case, *_ in rows if wordier(a_words.get(case), b_words.get(case))
         )
         lines.append(
-            f"Answer length: {flagged} cases wordier on B (mean answer words over A's by more than {LENGTH_MARGIN:.0%})"
+            f"Answer length: {flagged} {'case' if flagged == 1 else 'cases'} wordier on B "
+            f"(median answer words over A's by more than {LENGTH_MARGIN:.0%} and {MIN_EXTRA_WORDS} words)"
         )
     lines += [
         "",
@@ -296,10 +308,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     sys.stdout.write(markdown(rows, a_words, b_words))
     if any(kind == REGRESSION for _, kind, _, _ in rows):
         return 1
-    if args.length_gate and any(
-        wordier(a_words.get(c), b_words.get(c)) for c, *_ in rows
-    ):
-        return 1
+    if args.length_gate:
+        if not a_words or not b_words:
+            print(
+                f"ERROR: --length-gate needs both runs' {GRADING_LOG} with answer shapes; one has none",
+                file=sys.stderr,
+            )
+            return 2
+        if any(wordier(a_words.get(c), b_words.get(c)) for c, *_ in rows):
+            return 1
     return 0
 
 

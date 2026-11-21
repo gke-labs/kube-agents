@@ -192,7 +192,7 @@ class CompareTest(unittest.TestCase):
             {"long": [200, 200, 200], "close": [240, 240, 240]},
         )
         self.assertEqual(code, 0)
-        self.assertIn("Answer length: 1 cases wordier on B", out)
+        self.assertIn("Answer length: 1 case wordier on B", out)
         self.assertIn("| `long` | same | 3/3 | 3/3 | 100 | 200 | wordier |", out)
         self.assertIn("| `close` | same | 3/3 | 3/3 | 200 | 240 |  |", out)
 
@@ -205,6 +205,39 @@ class CompareTest(unittest.TestCase):
             {"long": [100]}, {"long": [110]}, "--length-gate"
         )
         self.assertEqual(code, 0)
+
+    def test_infra_repetitions_are_left_out_and_the_median_is_taken(self) -> None:
+        """An infrastructure repetition's shape doesn't count, and one long
+        repetition among three moves the median, not the whole figure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / ab.GRADING_LOG).write_text(
+                "Task c Result: [PASSED]\n"
+                "  rep 1: pass -- ok\n  rep 1 shape: answer_words=100\n"
+                "  rep 2: infra -- cut short\n  rep 2 shape: answer_words=5\n"
+                "  rep 3: pass -- ok\n  rep 3 shape: answer_words=900\n"
+                "  rep 4: pass -- ok\n  rep 4 shape: answer_words=120\n"
+                "  rep 9 report: quoted text with rep 1 shape: answer_words=99999\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(ab.read_answer_words(d), {"c": 120})
+
+    def test_the_length_gate_needs_shapes_on_both_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp, "a"), Path(tmp, "b")
+            for d in (a, b):
+                d.mkdir()
+                write_case(d, "held", 3, 3)
+            (b / ab.FRONT_DOOR_FILE).write_text("session\n", encoding="utf-8")
+            errout = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(errout):
+                self.assertEqual(ab.main(["--length-gate", str(a), str(b)]), 2)
+            self.assertIn("--length-gate needs", errout.getvalue())
+
+    def test_a_small_absolute_difference_is_not_wordier(self) -> None:
+        self.assertFalse(ab.wordier(0, 5))
+        self.assertFalse(ab.wordier(10, 19))
+        self.assertTrue(ab.wordier(10, 30))
 
     def test_runs_without_grading_logs_show_no_length_columns(self) -> None:
         code, out, _ = self.run_ab({"held": (3, 3)}, {"held": (3, 3)})
