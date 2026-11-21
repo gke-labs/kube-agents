@@ -181,7 +181,7 @@ var (
 // this list does not build green.
 // agentScheduleWriteVerbs are the built-in schedule renderer's writes on
 // agentschedules.
-var agentScheduleWriteVerbs = []string{"create", "update", "delete"}
+var agentScheduleWriteVerbs = rbacNamespacedWriteVerbs
 
 var requiredPermissions = []requiredPermission{
 	// The custom resources, each verb with a caller (the markers above
@@ -214,7 +214,7 @@ var requiredPermissions = []requiredPermission{
 	// (platformagent_builtin_schedules.go). Only the operator and, later, the
 	// broker write schedules: no agent ServiceAccount does.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: rbacReadVerbs},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: agentScheduleWriteVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: agentScheduleWriteVerbs, Namespaced: true},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules/status"}, Verbs: []string{"get", "update"}},
 	// Every rendered kind is two tuples: the reads cluster-wide, for the
 	// informers and for escalation prevention, and the writes namespaced, in

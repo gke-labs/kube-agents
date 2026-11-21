@@ -126,6 +126,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins
+      - agentschedules
       - tiers
     verbs:
       - get
@@ -155,17 +156,6 @@ rules:
     verbs:
       - get
       - update
-  - apiGroups:
-      - kubeagents.x-k8s.io
-    resources:
-      - agentschedules
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - update
-      - watch
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
@@ -394,6 +384,7 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - agentschedules
       - dispatchjobtemplates
     verbs:
       - create

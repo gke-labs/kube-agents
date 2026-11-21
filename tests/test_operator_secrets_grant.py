@@ -142,6 +142,7 @@ NAMESPACED_WRITE_KINDS = frozenset({
     ("apps", "statefulsets"),
     ("batch", "jobs"),
     ("coordination.k8s.io", "leases"),
+    ("kubeagents.x-k8s.io", "agentschedules"),
     ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
     ("networking.gke.io", "fqdnnetworkpolicies"),
     ("networking.k8s.io", "networkpolicies"),
@@ -212,11 +213,9 @@ NAMESPACED_VERBS_BY_KIND = {
 #   agentschedules            list/watch: the For() informer and the Lists
 #                             that map a profile or PlatformAgent change to
 #                             its schedules (schedulesForProfile,
-#                             schedulesInNamespace); get: the reconciler's Get;
-#                             create/update/delete: the built-in renderer
-#                             (reconcileBuiltinSchedules), which writes only
-#                             schedules carrying its own marks, and a squatter
-#                             on an exact reserved name.
+#                             schedulesInNamespace); get: the reconciler's Get.
+#                             (The built-in renderer's create/update/delete are
+#                             on the install namespace's Role, not here.)
 #   agentschedules/status     update: Status().Update (writeStatus); get: the
 #                             read half.
 #   (no agentprofiles/finalizers: nothing the operator renders carries an
@@ -233,7 +232,7 @@ CR_VERBS_BY_RESOURCE = {
     "agentplugins/status": frozenset({"get", "patch"}),
     "agentprofiles": frozenset({"get", "list", "watch", "patch"}),
     "agentprofiles/status": frozenset({"get", "update"}),
-    "agentschedules": frozenset({"get", "list", "watch", "create", "update", "delete"}),
+    "agentschedules": frozenset({"get", "list", "watch"}),
     "agentschedules/status": frozenset({"get", "update"}),
 }
 # Subresources the ClusterRole must not name at all: a row here with any verb

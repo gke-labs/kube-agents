@@ -33,8 +33,10 @@ import (
 // on an exact reserved name.
 
 // The renderer creates, rewrites and deletes the built-in schedules: the only writes the
-// operator makes to agentschedules, and checked against its own marks before each one.
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentschedules,verbs=get;list;watch;create;update;delete
+// operator makes to agentschedules, and checked against its own marks before each one. In the
+// install namespace only, like every other write the operator makes there (the reads stay
+// cluster-wide, on the schedule reconciler's marker).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentschedules,verbs=create;update;patch;delete,namespace=kubeagents-system
 
 // builtinCanarySuffix ends a canary row's name. A canary runs a built-in in shadow beside the
 // job it will replace: its own name gives it its own report stream (the stream is the schedule's
