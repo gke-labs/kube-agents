@@ -1495,6 +1495,15 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			if last, ok := rec.chainLast(root); ok {
 				msg.TaskID = last.ID
 			}
+		} else if ok && isChatStopPress(msg, backend) && activeRef.ID != "" &&
+			root.rootID() == activeRef.rootID() && g.liveNode(ctx, rec, root) {
+			// Google Chat's Stop button on a fan-out child's line: once the
+			// delegating turn's line has closed, the children's lines carry the
+			// only Stop buttons. A press on a child still live in the running
+			// tree is a stop of that tree, so it takes the active task's stop
+			// path (stopTree). A press on a child that has ended stays a stale
+			// button below.
+			msg.TaskID = active.TaskID
 		}
 	}
 	// Google Chat's Stop button with the card stop armed: a press on the
@@ -1847,6 +1856,13 @@ func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
 // nothing to heal and, for a detached task, the cancel already published is
 // the answer the conversation is waiting on.
 func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
+	// Tasks a stop canceled whose terminal never came are ended first,
+	// whatever holds the conversation now (healStoppedTasks).
+	if g.healStoppedTasks(ctx, rec) {
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
+		}
+	}
 	active := rec.ActiveTask
 	if active == nil || active.Detached {
 		return
@@ -3498,6 +3514,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
 	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
+	ref.Lineless = lineless
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
 		// The message the chain's mark is drawn on (mark.go).
@@ -3831,6 +3848,9 @@ func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, auth
 		g.publishDispatchStop(ctx, ref)
 	}
 	g.cancelWaitingProfileParents(ctx, rec, active.TaskID, authority)
+	// And down: every other live task of the tree, a fan-out's children
+	// included, so one stop stops them all, with this one notice.
+	g.stopTree(ctx, rec, active.TaskID, authority, quiet)
 	return true
 }
 

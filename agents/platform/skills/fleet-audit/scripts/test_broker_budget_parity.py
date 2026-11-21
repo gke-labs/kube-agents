@@ -30,7 +30,7 @@ class BrokerBudgetParityTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(self.ae.parse_budget(text))
         self.assertEqual(self.ae.FIX_TYPE, audit_report.GENERATED_FIX_CHECK)
-        self.assertEqual(self.ae.BUDGET_SUFFIX, audit_report.GENERATED_PDB_SUFFIX)
+        self.assertEqual(self.ae.BUDGET_SUFFIX, audit_report._no_pdb_fix().BUDGET_SUFFIX)
 
     def test_what_the_audit_will_not_write_the_broker_will_not_read(self):
         base = {"cluster": CLUSTER, "object": "Deployment/checkout", "namespace": NS, "pod_selector": {"matchLabels": LABELS}}
@@ -52,7 +52,7 @@ class BrokerBudgetParityTest(unittest.TestCase):
                 self.assertIsNone(self.ae.parse_budget(text))
 
     def test_the_brokers_field_patterns_are_the_generators(self):
-        self.assertEqual(self.ae.KUBERNETES_NAME.pattern, audit_report.KUBERNETES_NAME_PATTERN.pattern.strip("^$"))
+        self.assertEqual(self.ae.KUBERNETES_NAME.pattern, audit_report._no_pdb_fix().KUBERNETES_NAME_PATTERN.pattern.strip("^$"))
         self.assertEqual(self.ae.FINDING_ID.pattern, audit_report.FINDING_ID_RE.pattern.removeprefix("^").removesuffix("\\Z"))
 
 
