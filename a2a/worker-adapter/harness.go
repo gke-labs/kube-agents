@@ -97,7 +97,7 @@ type harnessEvent struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype"`
 	// type:"assistant" carries an API Message; content blocks are inspected
-	// for text / thinking / tool_use.
+	// for text / thinking / tool_use. type:"user" carries the tool results.
 	Message *harnessMessage `json:"message,omitempty"`
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
@@ -213,8 +213,15 @@ type harnessBlock struct {
 	Type     string          `json:"type"`
 	Text     string          `json:"text,omitempty"`
 	Thinking string          `json:"thinking,omitempty"`
+	ID       string          `json:"id,omitempty"`    // tool_use
 	Name     string          `json:"name,omitempty"`  // tool_use
 	Input    json.RawMessage `json:"input,omitempty"` // tool_use
+	// A type:"user" line's tool_result block: the call it answers, what the
+	// tool printed (a string or text blocks), and whether the call failed.
+	// Read only for write refusals (refusal.go).
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
 }
 
 // userMessage is the stream-json stdin shape for both the opening prompt and

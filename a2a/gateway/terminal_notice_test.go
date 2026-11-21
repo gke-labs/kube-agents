@@ -76,6 +76,8 @@ func TestTerminalNoticeCarriesNoToken(t *testing.T) {
 			"🚫 the executor rejected the task — the cluster name is empty"},
 		{"rejected with a known token and the executor's detail", lib.StateRejected, "reason: no-text-parts - the submission message carries nothing hermes can be asked",
 			"🚫 the executor rejected the task — " + reasonSentences["no-text-parts"]},
+		{"rejected at a write refusal names the rule and verb", lib.StateRejected, "reason: write-refused - the task stopped after a write refusal: the command policy's kubernetes.read-only rule refused the verb scale.",
+			"🚫 the executor rejected the task — the task stopped after a write refusal: the command policy's kubernetes.read-only rule refused the verb scale."},
 		{"rejected with an unknown bare token", lib.StateRejected, "reason: something-new", "🚫 the executor rejected the task"},
 		{"rejected with plain text", lib.StateRejected, "no capability", "🚫 the executor rejected the task: no capability"},
 		{"rejected with nothing", lib.StateRejected, "", "🚫 the executor rejected the task"},

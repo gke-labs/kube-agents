@@ -591,6 +591,15 @@ GC - replay is not tied to the pod's existence.
   implement. The janitor (below) writes the terminal event on the dead task's behalf.
   `activeDeadlineSeconds` is the same path triggered by the clock.
 
+**Stopped at a write refusal.** A profile task's adapter reads every tool result the
+harness prints. At the first definitive write refusal (the predicate is
+`deploy/docker/patches/permission_refusal_stop.py`'s, and
+[the dispatch design](spec-profiles-dispatch.md) states it) it stops the harness as a cancel
+does and publishes terminal `rejected` with `reason: write-refused`, naming the policy rule
+and the refused verb and nothing else of the output. Nothing the harness prints after the
+refusal is published. `rejected` is the state no supervisor retries, and the gateway shows
+its detail.
+
 **Evicted.** Node drains, spot preemptions, and GKE upgrades deliver `SIGTERM` with a
 grace period, and the adapter MUST trap it: flush the pending output buffer, publish
 terminal `failed` with `reason: worker-evicted`, exit 143. That keeps an infrastructure

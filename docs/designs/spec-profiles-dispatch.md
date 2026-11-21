@@ -437,6 +437,17 @@ leave open:
   refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
   SIGTERM ends it as `worker-evicted`.
 
+- **Write refusals.** A model-turn task's worker reads each tool result in the harness's
+  stream-json. At the first definitive write refusal it stops the harness (closed stdin, SIGTERM to
+  its process group, SIGKILL after the kill grace) and ends the task `rejected` with
+  `reason: write-refused`, whose detail names the policy rule and the refused verb and carries no
+  other tool output. The predicate is the Hermes runtime's
+  (`deploy/docker/patches/permission_refusal_stop.py`): the action boundary notice and a
+  `kubernetes.read-only` block whose `policy verb:` is a mutating kubectl verb, with no
+  `policy render: local` line. A `gcp.read-only` refusal, a refused read spelling, a local render
+  and an API 403 don't stop the task. Both runtimes are tested against
+  `tests/conformance/fixtures/write-refusal-results.json`.
+
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker

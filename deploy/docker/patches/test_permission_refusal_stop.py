@@ -374,6 +374,35 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(observe(controller, REFUSAL).action, "halt")
 
 
+#: The tool results this module and the profile worker's stop (a2a/worker-adapter/refusal.go)
+#: both classify, each labelled halt or no_halt, so the two predicates cannot drift.
+_SHARED_FIXTURE = Path(__file__).resolve().parents[3] / "tests" / "conformance" / "fixtures" / "write-refusal-results.json"
+
+
+class SharedFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.cases = json.loads(_SHARED_FIXTURE.read_text(encoding="utf-8"))["cases"]
+
+    def test_each_shared_case_classifies_and_halts_as_labelled(self):
+        self.assertTrue(any(c["expect"] == "halt" for c in self.cases))
+        self.assertTrue(any(c["expect"] == "no_halt" for c in self.cases))
+        for case in self.cases:
+            want = None if case["kind"] == "none" else case["kind"]
+            self.assertEqual(want == "policy", case["expect"] == "halt", case["name"])
+            # The shim's text as the tool printed it, and inside a terminal result's JSON.
+            for result in (case["result"], _result(case["result"], 77 if case["failed"] else 0)):
+                self.assertEqual(stop.classify_refusal(case["command"], result, failed=case["failed"]), want, case["name"])
+            controller = FakeController()
+            decision = observe(controller, case["result"], args={"command": case["command"]}, failed=case["failed"])
+            halted = decision is not None and decision.action == "halt"
+            self.assertEqual(halted, case["expect"] == "halt", case["name"])
+
+    def test_the_shared_cases_carry_the_policys_current_text(self):
+        for case in self.cases:
+            if "argv" in case:
+                self.assertEqual(case["result"], "\n".join(shim_lines(a) for a in case["argv"]), case["name"])
+
+
 class NudgeTests(unittest.TestCase):
     def test_the_halt_nudge_names_the_refusal_and_the_board_call(self):
         decision = Decision("halt", stop.HALT_CODE, "", "terminal", 2, None)
