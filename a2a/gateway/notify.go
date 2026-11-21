@@ -148,8 +148,9 @@ type notifyFeedbackTarget interface {
 
 // notifyReportKeeper is the optional extension NotifyConversations
 // implements to keep the text of a report the route posted into a
-// conversation (Gateway.reports), under the root of the task it reported
-// on, so a reply under it can carry the report to the executor.
+// conversation (Gateway.reports): under the root of the task it reported
+// on for a console post, under the key alone (root "") for a post into a
+// chat thread, so a reply under it can carry the report to the executor.
 type notifyReportKeeper interface {
 	KeepReport(conversation, root, text string)
 }
@@ -461,11 +462,13 @@ func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 	job.answer(r)
 	// A report that landed is kept for the reply under it: a post the
 	// kanban notifier marked as a card's report (report, set on the settled
-	// card's report post alone) that names the task it reports on
-	// (reply_to, which the notifier puts on every post into a console
-	// thread, progress notes included, so reply_to alone cannot tell them
-	// apart).
-	if r.Error == "" && r.MessageID != "" && job.req.Report && job.rootTask != "" {
+	// card's report post alone). Into a console conversation it is kept
+	// under the task it reports on (reply_to, which the notifier puts on
+	// every post into a console thread, progress notes included, so
+	// reply_to alone cannot tell them apart); into a chat thread
+	// (lib.ThreadKeyedConversation), under the key alone, for the next
+	// human turn there to take once, since a thread reply names no task.
+	if r.Error == "" && r.MessageID != "" && job.req.Report && (job.rootTask != "" || lib.ThreadKeyedConversation(job.req.Conversation)) {
 		if keeper, ok := n.conv.(notifyReportKeeper); ok {
 			keeper.KeepReport(job.req.Conversation, job.rootTask, job.req.Text)
 		}
@@ -1627,7 +1630,8 @@ func (c gatewayConversations) ReplyToRoot(ctx context.Context, conversation, tas
 }
 
 // KeepReport keeps a report the route posted into a conversation, under
-// the root of the task it reported on (notifyReportKeeper).
+// the root of the task it reported on, or under the conversation alone
+// when root is "" (notifyReportKeeper).
 func (c gatewayConversations) KeepReport(conversation, root, text string) {
 	c.g.reports.put(conversation, root, text)
 }
