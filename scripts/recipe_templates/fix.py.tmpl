@@ -1,0 +1,21 @@
+"""The {kind} fix, written by code: the same input always gives the same bytes.
+
+The broker trusts a fix pull request only when re-running `generate` on the
+inputs the file names (`read_inputs`) gives the file byte for byte
+(`automerge_eligibility.verify_added_manifest`). Stdlib only: the credential
+proxy loads this file.
+"""
+
+from __future__ import annotations
+
+KIND = "{kind}"
+
+
+def generate(candidate: dict, finding_id: str) -> tuple[str, str] | None:
+    """`(name, text)` of the manifest the fix writes for `candidate`, or None where it cannot be written exactly."""
+    raise NotImplementedError("RECIPE-TEMPLATE: write the {kind} fix")
+
+
+def read_inputs(text: str) -> tuple[dict, str] | None:
+    """`(candidate, finding_id)` a generated file names, or None for a file `generate` could not have written."""
+    raise NotImplementedError("RECIPE-TEMPLATE: read back what the {kind} fix names")
