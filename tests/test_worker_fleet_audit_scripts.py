@@ -35,6 +35,15 @@ SOURCES = (
 )
 
 
+def scripts_dir(tmp: str) -> Path:
+    """The image's own layout under tmp, <tmp>/opt/fleet-audit/scripts:
+    audit_report.py reads Path(__file__).parents[3] at import, which a
+    shallow directory doesn't have."""
+    d = Path(tmp) / "opt" / "fleet-audit" / "scripts"
+    d.mkdir(parents=True)
+    return d
+
+
 def copy_sources(dockerfile: str) -> list[str]:
     """The sources of the COPY whose destination is DEST."""
     joined = re.sub(r"\\\n\s*", " ", dockerfile)
@@ -51,17 +60,18 @@ class WorkerFleetAuditScriptsTest(unittest.TestCase):
 
     def test_the_closure_imports_from_one_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
+            d = scripts_dir(tmp)
             for src in SOURCES:
-                shutil.copy(REPO_ROOT / src, Path(tmp) / Path(src).name)
+                shutil.copy(REPO_ROOT / src, d / Path(src).name)
             env = {"PATH": os.environ.get("PATH", ""), "HOME": tmp, "PYTHONDONTWRITEBYTECODE": "1"}
             modules = [Path(s).stem for s in SOURCES]
             subprocess.run(
                 [sys.executable, "-c", "import sys; sys.path[:0] = ['.']; [__import__(m) for m in sys.argv[1:]]", *modules],
-                cwd=tmp, env=env, check=True, capture_output=True, text=True,
+                cwd=d, env=env, check=True, capture_output=True, text=True,
             )
             out = subprocess.run(
                 [sys.executable, "audit_report.py", "finish", "--help"],
-                cwd=tmp, env=env, check=True, capture_output=True, text=True,
+                cwd=d, env=env, check=True, capture_output=True, text=True,
             )
             self.assertIn("--dry-run", out.stdout)
 
@@ -76,8 +86,9 @@ class WorkerFleetAuditScriptsTest(unittest.TestCase):
             sys.path.pop(0)
         document = test_audit_report.make_doc()
         with tempfile.TemporaryDirectory() as tmp:
+            d = scripts_dir(tmp)
             for src in SOURCES:
-                shutil.copy(REPO_ROOT / src, Path(tmp) / Path(src).name)
+                shutil.copy(REPO_ROOT / src, d / Path(src).name)
             findings = Path(tmp) / "findings.json"
             findings.write_text(json.dumps(document))
             env = {"PATH": os.environ.get("PATH", ""), "HOME": tmp, "PYTHONDONTWRITEBYTECODE": "1",
@@ -85,7 +96,7 @@ class WorkerFleetAuditScriptsTest(unittest.TestCase):
             run = subprocess.run(
                 [sys.executable, "audit_report.py", "finish", "--audit", test_audit_report.AUDIT,
                  "--findings-file", str(findings), "--no-collector-manifest", "test", "--dry-run"],
-                cwd=tmp, env=env, capture_output=True, text=True,
+                cwd=d, env=env, capture_output=True, text=True,
             )
             self.assertNotIn("ModuleNotFoundError", run.stderr)
             self.assertEqual(run.returncode, 0, run.stderr[-2000:])

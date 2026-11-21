@@ -512,9 +512,6 @@ class AgentProfileFieldGuardTest(unittest.TestCase):
             self.assertIn(want, self.guard)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 _FLEET_AUDIT_PERSONA = _REPO_ROOT / "agents" / "fleet-audit" / "persona" / "persona.yaml"
 
@@ -589,3 +586,7 @@ class HelmFleetAuditProfileReuseValuesTest(unittest.TestCase):
         stripped = self._render("--set", "profiles.fleetAudit.enabled=true", *nulls)
         defaults = self._render("--set", "profiles.fleetAudit.enabled=true")
         self.assertEqual(stripped, defaults)
+
+
+if __name__ == "__main__":
+    unittest.main()
