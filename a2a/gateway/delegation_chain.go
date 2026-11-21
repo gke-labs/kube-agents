@@ -16,8 +16,10 @@ const clusterScopeSegments = 6
 // "Scale rules" and "Replacing kanban's plumbing" item 3; 09, "Profile
 // tasks"). A profile task's child is minted a fresh root, not a hop, so the
 // verifier never compares parent with child: the gateway's mint is where
-// these hold. A child is never wider than its parent on tier (minted at the
-// parent's, by profileRouteFor), scope or targets, and no profile appears
+// these hold. A child is minted at its parent's tier (by profileRouteFor), or at
+// read below an unattended parent, which runs work only through profile tasks
+// and whose children may never write (#6744). It is never wider than its
+// parent on scope or targets, and no profile appears
 // twice on a chain except the chain head's one self-nest.
 
 // childProfileChain is the chain a child of parent carries: the parent's

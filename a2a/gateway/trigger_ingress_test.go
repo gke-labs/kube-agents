@@ -1229,3 +1229,41 @@ func TestAScheduledRunsChildCarriesTheScheduledMark(t *testing.T) {
 		t.Fatal("an unmarked read task reads as below a schedule")
 	}
 }
+
+// TestAScheduledRunHandsNoTaskWhereAPinnedProfileTakesNoScheduledWork: a
+// trigger submitted straight to a profile on a cluster whose pinned
+// profile doesn't list unattended is refused, so a scheduled run's child
+// sent there is refused too, though it runs at read.
+func TestAScheduledRunHandsNoTaskWhereAPinnedProfileTakesNoScheduledWork(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	tr.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Tiers: []string{"read"},
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		return rec != nil && strings.Contains(rec.delegationEndFor(origin.TaskID), "prod-east")
+	})
+	for _, m := range tr.submissions() {
+		if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+			t.Fatalf("a child was minted on %s", m.Subject)
+		}
+	}
+}

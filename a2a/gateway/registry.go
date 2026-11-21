@@ -350,7 +350,7 @@ type TaskRef struct {
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// Tier is the tier a task addressed to an AgentProfile runs at; empty
 	// for a task addressed to platform or a session. A profile task's child
-	// runs at its tier, and the child's end reaches it as a childResult on
+	// runs at its tier (at read below an unattended task, #6744), and the child's end reaches it as a childResult on
 	// its .in rather than as a wake (deliverChildResult).
 	Tier string `json:"tier,omitempty"`
 	// Scope is a profile task's scope, recorded at mint: its target's

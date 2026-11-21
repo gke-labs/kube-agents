@@ -297,8 +297,9 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// platform.
 	check := func(e lib.DelegateTask) (*profileRoute, bool) {
 		// Anything but platform is an AgentProfile: resolved, its target checked
-		// against the scope, and minted at the parent's tier, which for a
-		// session parent is its requester's (profileRouteFor).
+		// against the scope, and minted at the parent's tier (read when the
+		// parent is unattended, #6744), which for a session parent is its
+		// requester's (profileRouteFor).
 		var route *profileRoute
 		var err error
 		addressee := strings.TrimSpace(e.Addressee)
@@ -341,6 +342,18 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 				// does a grandchild: the mark rides the chain.
 				if card, ok := g.profiles.lookup(route.Profile); !ok || !cardAllowsTier(card, capability.TierUnattended) {
 					refuse(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+fmt.Sprintf(noticeUnattendedChild, route.Profile), "child", route.Profile)
+					return nil, false
+				}
+				// And a profile pinned to the child's target must list it
+				// too, as a trigger submitted there directly is held to
+				// (profileRouteFor's checkPinnedTiers at unattended).
+				// resolveProfile already succeeded for this address above.
+				_, target, rerr := resolveProfile(g.profiles, addressee, e.Parameters)
+				if rerr == nil {
+					rerr = g.checkPinnedTiers(route.Profile, target, capability.TierUnattended)
+				}
+				if rerr != nil {
+					refuse(ruleDelegationUnattendedChild, refusalNotice(noticeDelegationRefusedFor, rerr), "child", route.Profile)
 					return nil, false
 				}
 			}
