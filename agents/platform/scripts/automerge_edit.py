@@ -10,8 +10,12 @@ writes at the recipe's `edit_paths` on that base, and nothing else:
 - the diff changes one file, already on the base, mode 100644, with no rename,
   copy, mode change, binary patch or missing final newline
   (`modified_file_from_diff`), at a path inside a cluster's own tree;
-- the head is the base with the diff's hunks applied, strictly
-  (`apply_hunks`): every context and removed line must match the base;
+- the base with the diff's hunks applied, strictly (`apply_hunks`: every
+  context and removed line must match), is byte for byte the head file the
+  broker read itself at the proposal's exact revision. The base and head are
+  both read by the broker, never taken from the diff, so a base branch that
+  moved since the diff was taken (where a hunk applied by line number could
+  land on another object) is refused by content, not by an abbreviated id;
 - both files are at most `MAX_FILE_BYTES`, and every changed line lies in one
   document, whose `kind` is the recipe's `edit_kind`;
 - the new values are read from the head only in the forms `set_scalar` writes
@@ -35,11 +39,13 @@ import hashlib
 import re
 from typing import Any, NamedTuple
 
+from automerge_eligibility import CLUSTER_TREE_ROOT
 from fix_recipes import yaml_edit
 from fix_recipes.registry import Recipe
 
 MAX_FILE_BYTES = yaml_edit.MAX_FILE_BYTES
-CLUSTER_TREE_ROOT = "clusters"
+# A path segment of the cluster tree: ASCII letters, digits, `.`, `_`, `-`.
+_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 MANIFEST_SUFFIXES = (".yaml", ".yml")
 _DIFF_HEADER = re.compile(r"diff --git a/(?P<a>[^\s\"]+) b/(?P<b>[^\s\"]+)")
 # Git prints the mode on the index line only when it did not change.
@@ -147,18 +153,30 @@ def apply_hunks(base: str, hunks: tuple[Hunk, ...]) -> str | None:
 
 def cluster_of(path: str) -> str | None:
     """The short cluster name of a manifest inside `clusters/<name>/`, or None
-    for any other path, or one with an empty, `.` or dot-led segment."""
+    for any other path, or one with a segment that is empty, dot-led, or holds
+    anything but ASCII letters, digits, `.`, `_` and `-` (so no `..`,
+    backslash or lookalike separator)."""
     parts = path.split("/")
     if len(parts) < 3 or parts[0] != CLUSTER_TREE_ROOT or not parts[-1].endswith(MANIFEST_SUFFIXES):
         return None
-    if any(not part or part.startswith(".") for part in parts):
+    if not all(_SEGMENT.fullmatch(part) for part in parts):
         return None
     return parts[1]
 
 
-def verify_edited_manifest(recipe: Recipe, fix_module: Any, diff: Any, path: str, base: str) -> EditedManifest:
-    """The edit `diff` makes to `path`, proven against `base` (the file as the
-    broker read it on the base branch), or EditRefused."""
+def verify_edited_manifest(
+    recipe: Recipe, fix_module: Any, diff: Any, path: str, base: str, head: str
+) -> EditedManifest:
+    """The edit `diff` makes to `path`, proven against `base` and `head`: the
+    file as the broker read it on the base branch and at the proposal's own
+    revision. EditRefused for anything else."""
+    try:
+        return _verify_edit(recipe, fix_module, diff, path, base, head)
+    except UnicodeError as exc:
+        raise EditRefused(f"the manifest is not valid text ({type(exc).__name__})") from None
+
+
+def _verify_edit(recipe: Recipe, fix_module: Any, diff: Any, path: str, base: str, head: str) -> EditedManifest:
     if recipe.verify != "edit-manifest":
         raise EditRefused(f"the {recipe.kind} recipe does not verify edits")
     parsed = modified_file_from_diff(diff)
@@ -167,16 +185,22 @@ def verify_edited_manifest(recipe: Recipe, fix_module: Any, diff: Any, path: str
     cluster = cluster_of(path)
     if cluster is None:
         raise EditRefused(f"{path} is not a manifest inside a cluster's own tree")
-    # The forge diffs the head against the merge base. Applied by line number
-    # to a base that has moved since, a hunk can land on another object of
-    # the same shape, so the base read here must be the very blob the diff
-    # was taken against (which also rules out `git archive`'s attribute
-    # rewrites). A SHA-256 repository never matches and is refused.
+    # A cheap first check only: a forge prints an abbreviated id (7 hex
+    # digits on GitHub), which a crafted base can match. What binds the diff
+    # to the base is the content comparison below.
     if not git_blob_id(base).startswith(parsed[2]):
         raise EditRefused("the diff was not taken against the base the broker read (the base branch moved)")
-    head = apply_hunks(base, parsed[1])
-    if head is None:
+    applied = apply_hunks(base, parsed[1])
+    if applied is None:
         raise EditRefused("the diff does not apply exactly to the base the broker read")
+    # The forge diffs the head against the merge base. If the base branch has
+    # moved since, the hunks, applied by line number to the base read here,
+    # give a file that is not the head: every line outside the hunks differs
+    # where the bases differ. So equality with the head the broker read at the
+    # proposal's revision proves the base is the one the diff was taken
+    # against, and the edit merges as it was judged.
+    if applied != head:
+        raise EditRefused("the diff applied to the base the broker read is not the proposal's head (the base branch moved)")
     if max(len(base.encode()), len(head.encode())) > MAX_FILE_BYTES:
         raise EditRefused(f"the manifest is larger than {MAX_FILE_BYTES} bytes")
     try:
