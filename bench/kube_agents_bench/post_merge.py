@@ -15,7 +15,9 @@ ticks itself rather than waiting on the five-minute cron. On its first poll it:
 2. merges it with the harness's write token (:data:`WRITE_TOKEN_ENV`), never
    the agent's;
 3. applies every manifest the pull request adds to the cluster carrying
-   ``apply_fixture_role``, as a reconciler would. No reconciler names the merge
+   ``apply_fixture_role``, as a reconciler would, under the runner's own
+   identity (:func:`writable_kubeconfig`), not the fleet's read-only
+   one. No reconciler names the merge
    commit, so the check's apply step sees the object the fix adds instead.
    Reconciler matching is covered by ``post_merge_check``'s unit tests;
 4. runs ``post_merge_check.py`` (the cron job's own entry, no arguments) in
@@ -49,8 +51,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -231,6 +235,48 @@ def _github_write(method: str, url: str, token: str, body: dict) -> tuple[int, A
         return 0, {"message": str(exc)}
 
 
+def writable_kubeconfig(role: str) -> str:
+    """A kubeconfig for the cluster carrying `role`, as the runner's own identity.
+
+    Not `fleet.kubeconfig_for_role`: that one authenticates as the fleet's
+    read-only account (hack/fleet-kubeconfigs.sh), on purpose, because the
+    checks read through it and a check must not write. This check writes, as a
+    reconciler would, so it asks gcloud for the cluster's credential under the
+    runner's identity, which holds `roles/container.admin` on every pool
+    project (scripts/provision_ci_pool_project.sh), into a file of its own.
+
+    Raises:
+        fleet.FleetRoleUnresolved: The runner recorded no cluster or project
+            for the role, or gcloud refused the credential.
+    """
+    slot = fleet.slot_of_role(role)
+    cluster = fleet.recorded_clusters().get(slot)
+    project = fleet.provisioned_project()
+    if not cluster or not cluster[0] or not cluster[1] or not project:
+        raise fleet.FleetRoleUnresolved(
+            f"the runner recorded no cluster, location or project for fixture role {role!r} (slot {slot!r})"
+        )
+    name, location = cluster
+    handle, path = tempfile.mkstemp(prefix="post-merge-apply-", suffix=".kubeconfig")
+    os.close(handle)
+    try:
+        done = subprocess.run(
+            ["gcloud", "container", "clusters", "get-credentials", name, "--location", location,
+             "--project", project, "--quiet"],
+            env={**os.environ, "KUBECONFIG": path}, capture_output=True, text=True,
+            timeout=APPLY_TIMEOUT_SEC, check=False,
+        )
+        why = "" if done.returncode == 0 else (
+            (done.stderr or done.stdout or "").strip()[-300:] or f"gcloud exited {done.returncode}"
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        why = str(exc)
+    if why:
+        os.remove(path)
+        raise fleet.FleetRoleUnresolved(f"no credential for {name} in {project}: {why}")
+    return path
+
+
 def _apply(manifest: str, kubeconfig: str) -> tuple[bool, str]:
     try:
         done = subprocess.run(
@@ -279,6 +325,9 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     _added: list[tuple[str, str]] = PrivateAttr(default_factory=list)
     _repo: tuple[str, str] | None = PrivateAttr(default=None)
     _kubeconfig: str = PrivateAttr(default="")
+    # The file writable_kubeconfig wrote, removed by _clean_up whatever happened
+    # after it. Separate from _kubeconfig, which also gates deleting what was applied.
+    _credential_file: str = PrivateAttr(default="")
     _touched: list[tuple[str, str]] = PrivateAttr(default_factory=list)
     _base: str = PrivateAttr(default="")
     _number: int | None = PrivateAttr(default=None)
@@ -308,6 +357,11 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 logger.warning("post_merge_outcome: could not delete an applied manifest: %s", exc)
+        if self._credential_file:
+            try:
+                os.remove(self._credential_file)
+            except OSError:
+                pass
         token = (os.environ.get(WRITE_TOKEN_ENV) or "").strip()
         if not token or self._repo is None:
             return
@@ -445,7 +499,7 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         owner, repo, number = refs[0]
         # Before the merge: a role the runner cannot resolve must not cost a merge and its undo.
         try:
-            kubeconfig = fleet.kubeconfig_for_role(self.apply_fixture_role)
+            kubeconfig = self._credential_file = writable_kubeconfig(self.apply_fixture_role)
         except fleet.FleetRoleUnresolved as exc:
             return "error", str(exc)
         api = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}"
