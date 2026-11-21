@@ -1,9 +1,10 @@
 """Set one scalar in a block-style YAML manifest and leave every other byte alone.
 
-This is the first half of the `edit-manifest` verb: a recipe's fix generator
-calls `set_scalar` on the manifest it read, and the broker later re-runs the
-same generator on the base it reads itself and requires the pull request's head
-to match byte for byte. So the editor has two jobs, and they pull the same way:
+This is the editing half of the `edit-manifest` verb (`automerge_edit`): a
+recipe's fix calls `set_scalar` on the manifest it read, and the broker re-runs
+`set_scalar` on the base it reads itself, with the values the pull request's
+head carries at the recipe's declared paths, and requires the head to match
+byte for byte. So the editor has two jobs, and they pull the same way:
 
 - be exact and deterministic. Only the edited value's characters change (or,
   in create mode, one line is inserted); comments, key order, indentation,
@@ -719,3 +720,48 @@ def _verify(old, new, changed, *, create, doc_index, path, value) -> None:
     got = _decode_rendered(new[changed][node.start : node.end])
     if got != value or type(got) is not type(value):
         raise RefusedEdit("internal", f"edited value reads back as {got!r}")
+
+
+def document_spans(text: str) -> list[tuple[int, int]]:
+    """Each document's line range `[start, end)` (0-based, split on "\\n"), counted
+    as PyYAML counts them; RefusedEdit for a file this module refuses outright."""
+    _check_file(text)
+    return _documents(text.split("\n"))
+
+
+_DOUBLE_READABLE = re.compile(r'(?:[^\\"]|\\[\\"])*')
+_INT_PLAIN = re.compile(r"-?(?:0|[1-9][0-9]*)")
+
+
+def read_scalar(text: str, doc_index: int, path: list[PathSegment]) -> Value:
+    """The scalar at `path` in document `doc_index`, read only in the forms
+    `set_scalar` writes: a plain int, `true`/`false`, a plain string that
+    cannot be read as anything else, a single-quoted string, or a
+    double-quoted one whose only escapes are `\\\\` and `\\"`. RefusedEdit for
+    anything else, and for every file `set_scalar` refuses. Unlike
+    `set_scalar` it reads the identity fields (`kind`, `metadata.name`,
+    `metadata.namespace`), which the verb needs to name the object."""
+    _check_file(text)
+    lines = text.split("\n")
+    node, _ = _walk(_parse_target(lines, doc_index), list(path))
+    where = ".".join(map(str, path))
+    if node is None:
+        raise RefusedEdit("path-missing", f"{where}: no such key")
+    if isinstance(node, Opaque):
+        raise RefusedEdit("flow-on-path" if node.kind == "flow" else "block-scalar", f"{where}: target is a {node.kind}")
+    if not isinstance(node, Scalar):
+        raise RefusedEdit("not-scalar", f"{where}: target is not a scalar value")
+    raw = lines[node.line][node.start : node.end]
+    if node.style == "single":
+        return raw[1:-1].replace("''", "'")
+    if node.style == "double":
+        if not _DOUBLE_READABLE.fullmatch(raw[1:-1]):
+            raise RefusedEdit("unreadable-value", f"{where}: escape this module does not read")
+        return re.sub(r"\\(.)", r"\1", raw[1:-1])
+    if raw in ("true", "false"):
+        return raw == "true"
+    if _INT_PLAIN.fullmatch(raw) and INT_MIN <= int(raw) <= INT_MAX:
+        return int(raw)
+    if _SAFE_PLAIN.match(raw) and not _NONSTRING_PLAIN.match(raw):
+        return raw
+    raise RefusedEdit("unreadable-value", f"{where}: plain value {raw!r} is not one this module reads")
