@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite`, `suite_part`, `recipe` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key

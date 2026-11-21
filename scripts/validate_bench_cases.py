@@ -57,9 +57,6 @@ import yaml
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import case_owner  # noqa: E402
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "agents" / "platform" / "scripts"))
-from fix_recipes import registry as fix_recipes  # noqa: E402
 import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -1656,11 +1653,10 @@ def validate_case(
     # The filer routes a red with case_owner's line scan, not this YAML read.
     # Where the two read `owner:` or `domain:` differently (`owner: null`, a
     # block scalar, an anchor, a quoted key), the lint would show one person
-    # and the bug would go to another, so the case is rejected here. `recipe:`
-    # is held to the same line scan, which `make recipe-check` reads it with.
+    # and the bug would go to another, so the case is rejected here.
     if len(problems) == owner_problems:
         text = path.read_text(encoding="utf-8")
-        for key in ("owner", "domain", "recipe"):
+        for key in ("owner", "domain"):
             parsed = spec.get(key)
             if parsed is not None and not isinstance(parsed, str):
                 continue  # already reported above as not a string
@@ -1674,27 +1670,6 @@ def validate_case(
                     "key), and check for such a line inside another field's text or "
                     "an invisible character such as a byte-order mark before it"
                     + (", or delete an empty 'owner:' line" if key == "owner" else "")
-                )
-
-    # The fix recipe whose end-to-end case this is, optional. `make recipe-check`
-    # reads the other direction (the recipe's `eval_case` carries this key);
-    # here a case may name only a recipe that names it back.
-    recipe = spec.get("recipe")
-    if recipe is not None:
-        try:
-            recipes = {r.kind: r for r in fix_recipes.recipes()}
-        except fix_recipes.RecipeError as exc:
-            problems.append(f"names recipe {recipe!r}, but the fix recipes do not load: {exc}")
-        else:
-            if not isinstance(recipe, str) or recipe not in recipes:
-                problems.append(
-                    f"'recipe:' {recipe!r} is not a fix recipe under "
-                    f"agents/platform/scripts/fix_recipes/ (known: {', '.join(sorted(recipes))})"
-                )
-            elif recipes[recipe].eval_case != name:
-                problems.append(
-                    f"'recipe: {recipe}' names a recipe whose eval_case is "
-                    f"{recipes[recipe].eval_case!r}, not this case; set eval_case in its recipe.yaml"
                 )
 
     # The audit streams a case drives without grading their ledger. The runner
