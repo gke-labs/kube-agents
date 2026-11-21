@@ -150,13 +150,9 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 				w.WriteHeader(http.StatusRequestEntityTooLarge)
 				return
 			}
-			// The path names the model and nothing else. The error is
-			// unwrapped from its *url.Error, whose text carries the outbound
-			// URL and its query; the body is never logged.
-			var uerr *url.Error
-			if errors.As(err, &uerr) {
-				err = uerr.Err
-			}
+			// The path names the model and nothing else. The transport's
+			// error names the connection, not the outbound URL or its query
+			// (TestAFailedGatewayCallLogsNoQuery); the body is never logged.
 			log.Warn("gateway proxy: the call to the gateway failed", "path", r.URL.Path, "err", err)
 			w.WriteHeader(http.StatusBadGateway)
 		},
