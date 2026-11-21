@@ -4,9 +4,9 @@ A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one ins
 
 It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
-## Turn it on
+## Turning it off
 
-The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's, which the chart sets from `operator.mcpServer.enabled`. With it set, the operator renders, beside the console server:
+The server runs by default beside the console server:
 
 - `<agent>-a2a-mcp`: a Deployment running `/mcp` from the `a2a-console` image, and a ClusterIP Service on port 8089;
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;
@@ -14,7 +14,7 @@ The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator
 
 The operator also renders the server's ServiceAccount, `<agent>-a2a-mcp`, and its token Secret, `<agent>-a2a-mcp-token`. If either name is already taken by an object the operator does not control, the server is not rendered and the PlatformAgent carries the `A2AMCPServer` condition ([conditions](../../docs/site/src/content/docs/operator/platformagent-crd.md)).
 
-Unset the flag and all of it is removed, the token included.
+Set `operator.mcpServer.enabled: false` in the chart (or `A2A_MCP_DOOR=false` on the operator) to turn it off; all of its objects are removed, the token included.
 
 ## Connect a client
 
