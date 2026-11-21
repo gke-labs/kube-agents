@@ -270,6 +270,13 @@ POLICY_BLOCKED_CODES = frozenset({SECURITY_POLICY_BLOCKED_CODE, SESSION_BUDGET_E
 WRITE_REFUSAL_KEY = "write_refusal"
 REFUSAL_FILE_ENV = "CREDENTIAL_PROXY_REFUSAL_FILE"
 REFUSAL_TASK_ENV = "CREDENTIAL_PROXY_REFUSAL_TASK"
+# The write-refusal record's fields and its timestamp form.
+REFUSAL_RECORD_RULE = "rule"
+REFUSAL_RECORD_VERB = "verb"
+REFUSAL_RECORD_ROUTE = "route"
+REFUSAL_RECORD_TIME = "time"
+REFUSAL_RECORD_TASK = "task"
+REFUSAL_RECORD_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _REFUSAL_RULE_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
 _REFUSAL_VERB_WORDS = 3
 # The line a malformed exec URL writes, once per process, when the stateful
@@ -1974,21 +1981,21 @@ def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
     target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
     if not target:
         return
-    rule = payload.get("rule")
+    rule = payload.get(REFUSAL_RECORD_RULE)
     if not isinstance(rule, str) or not _REFUSAL_RULE_RE.match(rule):
         return
     words = verb_words if isinstance(verb_words, list) else []
     verb = " ".join(_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in words[:_REFUSAL_VERB_WORDS] if str(w))
     record = {
         WRITE_REFUSAL_KEY: True,
-        "rule": rule,
-        "verb": verb,
-        "route": _VERB_WORD_SAFE_RE.sub("_", route)[:_VERB_WORD_MAX],
-        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        REFUSAL_RECORD_RULE: rule,
+        REFUSAL_RECORD_VERB: verb,
+        REFUSAL_RECORD_ROUTE: _VERB_WORD_SAFE_RE.sub("_", route)[:_VERB_WORD_MAX],
+        REFUSAL_RECORD_TIME: time.strftime(REFUSAL_RECORD_TIME_FORMAT, time.gmtime()),
     }
     task = os.environ.get(REFUSAL_TASK_ENV, "").strip()
     if task and CALLER_LABEL_RE.match(task):
-        record["task"] = task
+        record[REFUSAL_RECORD_TASK] = task
     line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
     # No O_CREAT: the adapter makes the file. O_NONBLOCK so a FIFO put in its
     # place cannot hold the call; the fstat below then refuses anything but a
