@@ -227,10 +227,12 @@ they cannot go stale:
 | `judge_model`     | `$JUDGE_MODEL`                 | The judge, pinned independently of the agent |
 | `fleet`           | `VERSIONS.json`                | The `bench/tf/fleet` state a task audits     |
 | `verifiers`       | `VERSIONS.json`                | `kube_agents_bench/verifiers.py` behaviour   |
-| `mode`            | constant                       | `next`: the stack every install runs         |
+| `mode`            | `$EVAL_FRONT_DOOR`             | `next`, or `next-session` on a session run   |
 
-`mode` is `next` on every key a run writes: every install runs the A2A stack
-and every CI lane grades it through the inject door. `today` is the legacy
+`mode` is `next` on every key a run writes, since every install runs the A2A stack
+and every CI lane grades it through the inject door, except a run that deployed the
+default session as its front door (`EVAL_FRONT_DOOR=session`, #6539), which writes
+`next-session` so a front-door A/B run never moves the main nightly's bar. `today` is the legacy
 reading of a key with no `mode`: the lines recorded before the component
 existed, and the retired today-mode nightly's, carry it, and `setupId` names
 the same agent model and harness under either stack, so without the component
