@@ -70,6 +70,11 @@ def test_every_recipe_that_names_a_case_is_graded_by_it():
             f"{case} grades recipe {[c.get('recipe') for c in checks]}, not {fields['kind']!r}"
         )
         assert all(check.get("outcome") == "verified_fixed" and check.get("apply_fixture_role") for check in checks)
+        edits = fields.get("applied") == "field_equals"
+        assert all(bool(check.get("apply_edits")) == edits for check in checks), (
+            f"{case} must set apply_edits: {str(edits).lower()} for {fields['kind']}, whose applied probe is "
+            f"{fields.get('applied') or 'unset'}"
+        )
     assert named, "no recipe names its end-to-end case; no-pdb's is post-merge-verified-fixed"
 
 

@@ -14,8 +14,8 @@ ticks itself rather than waiting on the five-minute cron. On its first poll it:
 1. finds the one pull request the run's reply names, under ``owner``;
 2. merges it with the harness's write token (:data:`WRITE_TOKEN_ENV`), never
    the agent's;
-3. applies every manifest the pull request adds, and the head version of every
-   manifest it edits (a ``kustomization.yaml`` aside, which is not an object),
+3. applies every manifest the pull request adds, and, for a recipe that edits a
+   field (``apply_edits``), the head version of every object manifest it edits,
    to the cluster carrying ``apply_fixture_role``, as a reconciler would. No reconciler names the merge
    commit, so the check's apply step sees the object the fix adds instead.
    Reconciler matching is covered by ``post_merge_check``'s unit tests;
@@ -272,6 +272,10 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     # The fix recipe the case grades: the record's `kind`, a directory under
     # agents/platform/scripts/fix_recipes/ whose recipe.yaml names this case.
     recipe: str = Field(min_length=1)
+    # Whether the fix edits a manifest already on the branch (a recipe whose
+    # recipe.yaml declares `applied: field_equals`). Off, edited files are
+    # restored on the branch afterwards but never applied, as for no-pdb.
+    apply_edits: bool = False
 
     @field_validator("recipe")
     @classmethod
@@ -458,6 +462,10 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
             time.sleep(TICK_INTERVAL_SEC)
 
     def _merge_and_apply(self, timeout: float) -> tuple[VerificationStatus, str]:
+        if self._repo is not None:
+            # Merged on an earlier poll whose apply failed: keep what cleanup needs to undo the
+            # merge and retry only the apply, never the reads or the merge.
+            return self._apply_all()
         # A poll that errored before the merge is retried from scratch, so nothing is listed twice.
         self._touched, self._added, self._edited = [], [], []
         snap = transcript.get()
@@ -503,7 +511,7 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                     text = _added_file_text(entry)
                     if text:
                         self._added.append((path, text))
-                elif (path.endswith(MANIFEST_SUFFIXES) and entry.get("status") == "modified"
+                elif (self.apply_edits and path.endswith(MANIFEST_SUFFIXES) and entry.get("status") == "modified"
                       and path.rsplit("/", 1)[-1] not in NOT_OBJECTS):
                     head = str((pull.get("head") or {}).get("sha") or "")
                     texts = [self._file_at(owner, repo, path, ref, read_token, timeout) for ref in (head, self._base)]
@@ -528,11 +536,16 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         self._repo = (owner, repo)
         self._number = number
         self._kubeconfig = kubeconfig
+        return self._apply_all()
+
+    def _apply_all(self) -> tuple[VerificationStatus, str]:
+        """Apply what the merged pull request adds (and, with ``apply_edits``, edits); ``_merged`` once all applied."""
+        owner, repo = self._repo
         for manifest in [text for _, text in self._added] + [head for _, head, _ in self._edited]:
             ok, why = _apply(manifest, self._kubeconfig)
             if not ok:
-                return "error", f"applying {owner}/{repo}#{number}'s manifest failed: {why}"
-        self._merged = (owner, repo, number)
+                return "error", f"applying {owner}/{repo}#{self._number}'s manifest failed: {why}"
+        self._merged = (owner, repo, self._number)
         return "pass", ""
 
     @staticmethod

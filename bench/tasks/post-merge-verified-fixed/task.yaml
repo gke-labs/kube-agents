@@ -14,16 +14,14 @@
 # post_merge.py) merges the agent's pull request with a token the ledger App
 # mints for the job's GitOps repository (hack/ci-eval-pr.sh), because nothing
 # merges inside a run; applies the manifest the pull request adds to the
-# seeded cluster (and the head version of any object manifest it edits),
-# because the pool repositories have no reconciler; and runs
+# seeded cluster, because the pool repositories have no reconciler; and runs
 # the `post-merge-check` cron job's script back to back in the agent container
 # rather than waiting on its five-minute schedule. The schedule itself is
 # graded: the check requires the job in the platform profile's jobs.json. No
 # reconciler names the merge commit, so the apply is confirmed by observing
 # the budget; reconciler matching is post_merge_check's unit tests' to cover.
-# Afterwards the check deletes the budget from the cluster (re-applying the base
-# version of anything it edited) and the merged file from the default branch, so
-# the pool's no-pdb fixture reads unbudgeted again.
+# Afterwards the check deletes the budget from the cluster and the merged file
+# from the default branch, so the pool's no-pdb fixture reads unbudgeted again.
 #
 # RED BEFORE #6311. Without that change the platform profile has no
 # post-merge-check job, so the check fails at that gate, before it merges
@@ -45,7 +43,11 @@
 # (eval_case), and the check grades a record of that kind (recipe: no-pdb).
 # Another recipe gets one case of its own in the same shape: its fixture role,
 # a prompt that opens its fix, and `recipe:` set to its kind
-# (bench/tests/test_recipe_eval_cases.py holds the two to each other).
+# (bench/tests/test_recipe_eval_cases.py holds the two to each other). A
+# recipe whose fix edits a field of an object already on the branch
+# (`applied: field_equals`) also sets `apply_edits: true`: the grader then
+# applies the head version of each object the fix edits, and the base version
+# back afterwards. no-pdb's fix adds a file, so this case leaves it off.
 #
 # ONE FIX, THIS RUN'S. post_merge_outcome merges the single pull request the
 # reply names, and needs the record this install's pr_opened plugin wrote for
