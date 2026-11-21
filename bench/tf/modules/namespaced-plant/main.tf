@@ -81,3 +81,16 @@ resource "null_resource" "plant" {
     }
   }
 }
+
+# An optional wait after the plant, for a case that grades what the product
+# does about the planted object on its own (an alert and its triage card): the
+# apply returns only once that had time to start. Zero, the default, is no
+# wait.
+resource "terraform_data" "settle" {
+  count      = var.settle_seconds > 0 ? 1 : 0
+  depends_on = [null_resource.plant]
+
+  provisioner "local-exec" {
+    command = "sleep ${var.settle_seconds}"
+  }
+}

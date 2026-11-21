@@ -305,6 +305,13 @@ class TickTest(unittest.TestCase):
         self.assertEqual(ran, ["fill_edited", "report"], "outcomes already reached are still reported")
         self.assertTrue(post_merge_outcome.errored(seen))
 
+    def test_every_step_tick_runs_has_a_plain_task_for_the_chat_line(self):
+        # The names come from a real run, so a step added to tick() without a phrase fails here.
+        names = set(self.tick(0, **self.fakes([])))
+        self.assertLessEqual(names, set(post_merge_outcome.STEP_TASKS))
+        # A plain phrase, never the bare internal name.
+        self.assertTrue(all(" " in task and task not in names for task in post_merge_outcome.STEP_TASKS.values()))
+
     def test_every_step_runs_in_order_with_the_environment_before_the_follow_ups(self):
         ran = []
         seen = self.tick(0, **self.fakes(ran))
@@ -331,7 +338,7 @@ class TickTest(unittest.TestCase):
         with mock.patch.object(post_merge_check, "notice_merges", broken), \
                 self.assertLogs("post_merge_check", level="WARNING"):
             seen = self.tick(1)
-        self.assertEqual(seen["notice"], {"errors": ["RuntimeError: forge module missing"]})
+        self.assertEqual(seen["notice"], {"errors": ["checking which fixes merged"], "fault": "RuntimeError: forge module missing"})
         self.assertIn("outcomes", seen)
 
 
@@ -413,8 +420,13 @@ class CronRunTest(unittest.TestCase):
         # Exit 0: a non-zero exit makes the scheduler say the check "didn't run", and it did.
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(len(out.strip().splitlines()), 1, out)
-        self.assertTrue(out.startswith("The post-merge check ran, but 1 record(s) or step(s) failed"), out)
-        self.assertIn("logs/post_merge_check.log", out)
+        self.assertTrue(out.startswith("I checked merged fixes, but this failed: "), out)
+        # No plumbing in chat: no file path, step name or exception text, so the line is the same every run.
+        self.assertNotIn("logs/", out)
+        self.assertNotIn("render unreadable", out)
+        self.assertIn("reading this install's declared scope.", out)
+        self.assertIn("say so again tomorrow", out)
+        self.assertNotIn("keep trying", out, "no promise to retry: a given-up record is never retried")
 
 
 class FailuresToReportTest(unittest.TestCase):
