@@ -206,3 +206,91 @@ func TestAStoppedFanOutChildsLineIsNeverWrittenAgain(t *testing.T) {
 		}
 	}
 }
+
+// stopLinesOn counts the posts and edits of messageID that carried a Stop
+// control.
+func stopLinesOn(r *rig, messageID string) int {
+	n := 0
+	for _, l := range r.adapter.stopLinesCopy() {
+		if l.MessageID == messageID {
+			n++
+		}
+	}
+	return n
+}
+
+// TestAParkedParentLineIsNotMovedByTheParentsEvents: a single child holds
+// the active task, and its delegating turn's line waits on the turn's entry
+// for the turn's own terminal. A late working or progress event from the
+// still-running turn edits that line not at all, and so never draws its Stop
+// control again.
+func TestAParkedParentLineIsNotMovedByTheParentsEvents(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-parked-parent-line"
+	exec, origin, session := sessionTurn(t, r, spawn, conv, "how is the fleet?")
+	before, _ := r.g.reg.Get(ctx, conv)
+	parentLine := before.ActiveTask.StatusMsgID
+	if parentLine == "" {
+		t.Fatal("the parent turn has no rolling line")
+	}
+	if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	child := r.awaitTask(t, targetPlatform)
+	waitFor(t, "the child holds the conversation and the parent's line is parked", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && pref.StatusMsgID == parentLine
+	})
+	edits, stops := r.adapter.editsOf(parentLine), stopLinesOn(r, parentLine)
+	r.g.relayBatch(conv, []relayItem{workingItem(t, origin, session)})
+	r.g.relayBatch(conv, []relayItem{progressItem(t, origin, session, "late parent progress")})
+	if got := r.adapter.editsOf(parentLine); strings.Join(got, "|") != strings.Join(edits, "|") {
+		t.Fatalf("the parked parent line was edited: %q, want it left at %q", got, edits)
+	}
+	if got := stopLinesOn(r, parentLine); got != stops {
+		t.Fatalf("the parked parent line drew its Stop control again: %d writes with it, want %d", got, stops)
+	}
+}
+
+// TestLiveLineOfFindsOnlyAnOpenLine: the live line is the active task's,
+// with its Stop control unless detached and none once a stop closed it, or a
+// fan-out child's while it runs. A child canceled or ended, and a delegating
+// turn's line parked on its entry, have none, even with a message still on
+// the entry: every path that cancels or ends a child takes its message off
+// too, so these entries are the guard's own cases.
+func TestLiveLineOfFindsOnlyAnOpenLine(t *testing.T) {
+	t.Parallel()
+	parent := TaskRef{ID: "t-parent", BatchSize: 2, Children: []string{"t-kid"}}
+	kid := TaskRef{ID: "t-kid", Role: taskRoleChild, ParentTaskID: "t-parent", BatchIndex: 1, StatusMsgID: "m-kid", LineNote: "(note)"}
+	parked := TaskRef{ID: "t-turn", StatusMsgID: "m-turn"}
+	single := TaskRef{ID: "t-single", Role: taskRoleChild, ParentTaskID: "t-turn"}
+	with := func(edit func(*TaskRef)) TaskRef { k := kid; edit(&k); return k }
+	type want struct{ msg, note, stop string }
+	for _, c := range []struct {
+		name   string
+		active *ActiveTask
+		tasks  []TaskRef
+		taskID string
+		want   want
+	}{
+		{"the active task", &ActiveTask{TaskID: "t-a", StatusMsgID: "m-a", LineNote: "(n)"}, nil, "t-a", want{"m-a", "(n)", "t-a"}},
+		{"a detached active task", &ActiveTask{TaskID: "t-a", StatusMsgID: "m-a", Detached: true}, nil, "t-a", want{"m-a", "", ""}},
+		{"an active task whose stop closed its line", &ActiveTask{TaskID: "t-a", StatusMsgID: "m-a", LineClosed: true}, nil, "t-a", want{}},
+		{"an active task with no line", &ActiveTask{TaskID: "t-a"}, nil, "t-a", want{}},
+		{"a running fan-out child", nil, []TaskRef{parent, kid}, "t-kid", want{"m-kid", "(note)", "t-kid"}},
+		{"a canceled fan-out child", nil, []TaskRef{parent, with(func(k *TaskRef) { k.Canceled = true })}, "t-kid", want{}},
+		{"an ended fan-out child", nil, []TaskRef{parent, with(func(k *TaskRef) { k.BatchEnd = &BatchEnd{State: lib.StateFailed} })}, "t-kid", want{}},
+		{"a fan-out child with no line", nil, []TaskRef{parent, with(func(k *TaskRef) { k.StatusMsgID = "" })}, "t-kid", want{}},
+		{"a delegating turn's parked line", &ActiveTask{TaskID: "t-single", StatusMsgID: "m-single"}, []TaskRef{parked, single}, "t-turn", want{}},
+		{"a task the record does not hold", nil, nil, "t-gone", want{}},
+	} {
+		rec := &SessionRecord{ActiveTask: c.active, Tasks: c.tasks}
+		msg, note, stop := liveLineOf(rec, c.taskID)
+		if got := (want{msg, note, stop}); got != c.want {
+			t.Errorf("%s: liveLineOf = %+v, want %+v", c.name, got, c.want)
+		}
+	}
+}

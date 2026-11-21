@@ -353,7 +353,9 @@ The exception is a task the agent delegates to an AgentProfile, since nothing el
 
 #### On Google Chat and the A2A console
 
-Each turn that becomes a task posts a status line, `⏳ submitted…`, which the gateway edits as the task moves: `⚙️ **working**`, followed by the agent's latest progress note. When the agent hands work to several agents at once, each of those tasks gets a status line of its own, `⏳ submitted… (delegated to <agent>)`, which moves with that task the same way and closes when it ends. On Google Chat the line has a **Stop** button while the task runs ([Google Chat's Stop button](#follow-ups-while-a-task-runs)). The note shows only with `googleChat.mode: debug`, and that setting also governs the console when the gateway holds Google Chat. A gateway without Google Chat (Slack, or no chat backend) is rendered no mode, so its console always shows the note.
+Each turn that becomes a task posts a status line, `⏳ submitted…`, which the gateway edits as the task moves: `⚙️ **working**`, followed by the agent's latest progress note. On Google Chat the line has a **Stop** button while the task runs ([Google Chat's Stop button](#follow-ups-while-a-task-runs)). The note shows only with `googleChat.mode: debug`, and that setting also governs the console when the gateway holds Google Chat. A gateway without Google Chat (Slack, or no chat backend) is rendered no mode, so its console always shows the note.
+
+When the agent hands work to several agents at once, each of those tasks gets a status line of its own, which moves the same way and closes when that task ends. It reads `⏳ submitted… (delegated to <profile>)`, or `(delegated to platform)` for a task handed to the Platform Agent.
 
 On the A2A console the answer posts as a message of its own, and the status line then reads `✅ **completed**`. On Google Chat the answer posts as a message of its own, with its 👍 and 👎 buttons, and the status line ends as a bare ✅. When the agent hands the work to a card, its one-line acknowledgement replaces the status line instead, and the card's plan and report follow. Nothing reads `completed`. Chat marks the edited line as edited.
 
