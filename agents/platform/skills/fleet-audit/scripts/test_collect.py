@@ -8790,6 +8790,20 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
         )
         self.assertEqual(len(self.run_on(configsync_object("RootSync", "root-sync"), pods=[pod])), 1)
 
+    def test_an_ended_pod_beside_its_replacement_is_not_this_finding(self):
+        """A killed pod can stay listed in phase Failed while a new pod of the
+        same reconciler runs. Only a live pod is the reconciler."""
+        ended = configsync_reconciler_pod(
+            "RootSync", "root-sync", restarts=4, killed="OOMKilled", killed_at=self.LAST_KILL, running=False, pod="root-reconciler-7f99b9c746-old00"
+        )
+        replacement = configsync_reconciler_pod("RootSync", "root-sync", pod="root-reconciler-7f99b9c746-new00")
+        for phase in ("Failed", "Succeeded"):
+            with self.subTest(phase=phase):
+                ended["status"]["phase"] = phase
+                self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync"), pods=[ended, replacement]), [])
+        ended["status"]["phase"] = "Running"
+        self.assertEqual(len(self.run_on(configsync_object("RootSync", "root-sync"), pods=[ended, replacement])), 1)
+
     def test_another_container_of_the_pod_in_a_loop_is_not_this_finding(self):
         """Only the container that applies the repository is read: whether the
         repository is still applied while a sibling is killed was not tested."""
@@ -8876,16 +8890,15 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
 
     def test_a_healthy_start_is_not_a_finding(self):
         """A healthy start held this state for 12 and 14 seconds on a live
-        cluster. The wait is far above that, and below the ten minutes after
-        which Config Sync says `Stalled` itself."""
+        cluster. The wait is the ten minutes after which Config Sync says
+        `Stalled` itself for a Deployment that made no progress."""
         for age in (14, collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS - 1):
             with self.subTest(age=age):
                 starting = configsync_object(
                     "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(age), reconciling_message=self.DEPLOYMENT_DOWN
                 )
                 self.assertEqual(self.run_on(starting), [])
-        self.assertLess(14 * 10, collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS)
-        self.assertLess(collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS, 600)
+        self.assertEqual(collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS, 10 * 60)
 
     def test_reconciling_for_another_reason_is_not_a_finding_however_old(self):
         syncing = configsync_object(

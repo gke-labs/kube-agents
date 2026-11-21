@@ -19,8 +19,8 @@
 # (source, rendering, sync) are not planted; the check does not read them.
 #
 # What the case does not cover, by the same live tests: a reconciler that is
-# killed for memory in a loop. Each restart counts as progress, so in the
-# loops tested (up to 23 minutes) that RootSync did not read `Stalled`; it
+# killed for memory in a loop. In the loops tested (up to 23 minutes) its
+# Deployment kept `Progressing` True and that RootSync did not read `Stalled`; it
 # read `Reconciling` True with reason `Deployment` while the pod was down and
 # `Reconciling` False between two kills. The check finds that state on the
 # reconciler's pod, and gitops-configsync-rootsync-oomkilled grades it on

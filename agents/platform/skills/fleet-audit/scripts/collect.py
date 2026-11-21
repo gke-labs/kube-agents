@@ -673,13 +673,20 @@ MAX_CONFIGSYNC_MESSAGE_CHARS = MAX_KCC_WEDGE_MESSAGE_CHARS
 CONFIGSYNC_RECONCILING_CONDITION = "Reconciling"
 CONFIGSYNC_DEPLOYMENT_REASON = "Deployment"
 # How long `Reconciling` has to have held that reason before the Deployment is
-# read as down. A healthy start holds it for seconds (12 and 14 were measured
-# on Config Sync v1.25.2; a slow image pull was not), and at ten minutes
-# without progress Config Sync reports `Stalled` itself.
-CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS = 300
+# read as down: the ten minutes after which Config Sync itself reports
+# `Stalled` for a Deployment that made no progress. A daily audit loses
+# nothing by waiting for the vendor's own verdict, and a shorter wait would
+# file a slow healthy start (new images on a new node, a scale-up) as a
+# critical finding. Past the ten minutes with no `Stalled`, Config Sync is
+# still waiting on a Deployment it does not call failed. A healthy start held
+# the condition for 12 and 14 seconds (two samples, Config Sync v1.25.2).
+CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS = 600
 # Config Sync runs every reconciler, root and namespace alike, in this
 # namespace, and labels each reconciler pod with the sync object it serves
-# (read on v1.25.2). The container named below is the one that applies the
+# (read on a live v1.25.2). Its source defines the three label names from
+# v1.14.0 (pkg/metadata/labels.go); v1.13.0 has no `sync-kind`. On a version
+# whose pods lack the labels no pod is kept, and the memory rule sees nothing
+# and says nothing. The container named below is the one that applies the
 # repository; the pod's other containers fetch, render and export metrics.
 CONFIGSYNC_RECONCILER_NAMESPACE = "config-management-system"
 CONFIGSYNC_RECONCILER_CONTAINER = "reconciler"
@@ -8486,6 +8493,11 @@ def _configsync_oom_loop(pods: list, kind: str, name: str, namespace: str, now_s
     for pod in pods:
         if not isinstance(pod, dict):
             continue
+        # A pod that ended (phase Failed, left beside its replacement) is not
+        # the reconciler any more; a container in a restart loop keeps its pod
+        # in phase Running.
+        if not _is_live_pod({"phase": (pod.get("status") or {}).get("phase")}):
+            continue
         labels = (pod.get("metadata") or {}).get("labels") or {}
         if (
             labels.get(CONFIGSYNC_SYNC_KIND_LABEL) != kind
@@ -8552,13 +8564,19 @@ def check_configsync_reconciler_stalled(context: dict, *, now: datetime.datetime
     so a count over them fires on a fix in flight.
 
     The other two cover a reconciler that is down and did not read `Stalled`
-    in the live tests (Config Sync v1.25.2, loops of up to 23 minutes). One
-    killed for memory at every start makes progress at every restart, so the
-    ten minutes do not run out: its pod says so (`_configsync_oom_loop`). One
-    that has not come up at all holds `Reconciling=True` with the reason
-    `Deployment` (`_configsync_deployment_down`). `Reconciling=True` for any
-    other reason, or for less than the wait, is not a finding: it is the
-    state of every first sync.
+    in the live tests (Config Sync v1.25.2, loops of up to 23 minutes): the
+    Deployment of a reconciler killed for memory at every start kept
+    `Progressing` True through the loop, and the object read `Reconciling`
+    True or, between two kills, False. Its pod says what the object does not
+    (`_configsync_oom_loop`). A reconciler that has not come up at all holds
+    `Reconciling=True` with the reason `Deployment`
+    (`_configsync_deployment_down`). `Reconciling=True` for any other reason,
+    or for less than the wait, is not a finding: it is the state of every
+    first sync.
+
+    Both ages are measured from the moment the check runs, which is after the
+    stream's last read of the cluster and so later than the read of the pods
+    by the time those reads took.
     """
     now_s = (now if now is not None else datetime.datetime.now(datetime.timezone.utc)).timestamp()
     pods = context.get("configsync_reconciler_pods") or []
