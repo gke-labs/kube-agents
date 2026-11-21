@@ -1050,14 +1050,11 @@ def _is_report_credential(token: str) -> bool:
     return isinstance(nats, dict) and "target" not in nats
 
 
-def task_id_from_credential() -> str | None:
-    """The task id (`nats.task`) of this pod's task credential, read unverified, or None.
+def _task_credential_nats_claims() -> dict | None:
+    """The `nats` claims of this pod's task credential, read unverified, or None.
 
-    A profile worker's run id for its run-start record (#6812): its own task,
-    which no other run shares. Read, not trusted: the broker verifies the
-    credential on every request, and the id only names the record. None when
-    there is no task credential, it cannot be read, or the claim is not a
-    DNS-1123 label.
+    None when there is no task credential, it cannot be read, or it is not a
+    compact JWT whose payload holds a `nats` object.
     """
     token_file = os.environ.get(TASK_TOKEN_FILE_ENV, "").strip()
     if not token_file:
@@ -1076,8 +1073,49 @@ def task_id_from_credential() -> str | None:
     except (ValueError, RecursionError):
         return None
     nats = claims.get("nats") if isinstance(claims, dict) else None
-    task = nats.get("task") if isinstance(nats, dict) else None
+    return nats if isinstance(nats, dict) else None
+
+
+def task_id_from_credential() -> str | None:
+    """The task id (`nats.task`) of this pod's task credential, read unverified, or None.
+
+    A profile worker's run id for its run-start record (#6812): its own task,
+    which no other run shares. Read, not trusted: the broker verifies the
+    credential on every request, and the id only names the record. None when
+    there is no task credential, it cannot be read, or the claim is not a
+    DNS-1123 label.
+    """
+    nats = _task_credential_nats_claims()
+    task = nats.get("task") if nats is not None else None
     return task if isinstance(task, str) and RUN_ID_RE.match(task) else None
+
+
+# task_credential.TRIGGER_ORIGINS and TRIGGER_SCHEDULE_SOURCE, restated
+# stdlib-only: a trigger of this origin named `schedule/<name>` is a builtin
+# schedule's.
+TASK_TRIGGER_BUILTIN_ORIGIN = "builtin"
+TASK_TRIGGER_SCHEDULE_PREFIX = "schedule/"
+
+
+def task_trigger_is_schedule() -> bool:
+    """Whether this pod's task credential carries a builtin schedule's trigger.
+
+    The `nats.trigger` claim with `origin: builtin` and a name
+    `schedule/<name>`, read unverified as `task_id_from_credential` reads the
+    task. `start` marks such a run scheduled on its run-start record (#6812).
+    The broker verifies the credential on the record's write and refuses a
+    profile task's write unless its verified trigger is exactly that, the
+    builtin schedule of the record's stream, so a profile task's record that
+    reaches the broker store says scheduled truthfully.
+    """
+    nats = _task_credential_nats_claims()
+    trigger = nats.get("trigger") if nats is not None else None
+    if not isinstance(trigger, dict) or trigger.get("origin") != TASK_TRIGGER_BUILTIN_ORIGIN:
+        return False
+    name = trigger.get("name")
+    if not isinstance(name, str) or not name.startswith(TASK_TRIGGER_SCHEDULE_PREFIX):
+        return False
+    return RUN_ID_RE.match(name[len(TASK_TRIGGER_SCHEDULE_PREFIX):]) is not None
 
 
 def _audit_reports_path(path: str) -> bool:

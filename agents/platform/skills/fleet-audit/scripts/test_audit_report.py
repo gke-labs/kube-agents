@@ -3367,11 +3367,12 @@ class TestAuditCatalogue(unittest.TestCase):
         for audit_id, spec in sorted(audit_report.AUDITS.items()):
             with self.subTest(audit=audit_id):
                 self.assertIn(audit_id, jobs, f"{audit_id} has no cron job")
-                # `start` records it on the run-start record (#6812).
+                # `start` works out "scheduled" for the run-start record by
+                # itself (#6812), so the prompt does not pass it there.
                 phrase = (
-                    "pass --scheduled to start, precheck and finish"
+                    "pass --scheduled to precheck and finish"
                     if audit_id in PRECHECK_STREAMS
-                    else "pass --scheduled to start and finish"
+                    else "pass --scheduled to finish"
                 )
                 self.assertIn(
                     phrase,
@@ -6631,10 +6632,14 @@ class TestRunStartRecord(HarnessTestCase):
     def unfinished(self):
         return report_status.unfinished_run_of(str(self.reports_dir), AUDIT, "acme/fleet")
 
-    def as_task(self, task_id):
-        """This process holds a task credential naming `task_id`, as a profile worker does."""
+    def as_task(self, task_id, trigger=None):
+        """This process holds a task credential naming `task_id`, as a profile worker does,
+        with `trigger` as its `nats.trigger` claim when given."""
         token = self.tmp_path / "task-token"
-        claims = base64.urlsafe_b64encode(json.dumps({"nats": {"task": task_id}}).encode()).decode().rstrip("=")
+        nats = {"task": task_id}
+        if trigger is not None:
+            nats["trigger"] = trigger
+        claims = base64.urlsafe_b64encode(json.dumps({"nats": nats}).encode()).decode().rstrip("=")
         token.write_text(f"e30.{claims}.sig")
         env = patch.dict(os.environ, {report_status.TASK_TOKEN_FILE_ENV: str(token)})
         env.start()
@@ -6659,11 +6664,46 @@ class TestRunStartRecord(HarnessTestCase):
         self.assertTrue(record["outcome"])
         self.assertIsNone(self.unfinished())
 
-    def test_a_run_without_scheduled_is_recorded_as_on_demand(self):
+    def test_a_run_started_by_hand_is_recorded_not_scheduled(self):
+        # The shell, no cron run, no task credential, no flag: a run a person asked for.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
         (record,) = self.records().values()
+        self.assertTrue(record["run_id"].startswith(audit_report.RUN_ID_LOCAL_PREFIX))
         self.assertIs(record["scheduled"], False)
+
+    def test_a_hermes_cron_run_is_recorded_scheduled_without_the_flag(self):
+        # Rule (a): HERMES_CRON_RUN, or a cwd under <home>/cron/runs/<name>,
+        # the detection the run id uses. No prompt passes --scheduled.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        (record,) = self.records().values()
+        self.assertTrue(record["run_id"].startswith(audit_report.RUN_ID_CRON_PREFIX))
+        self.assertIs(record["scheduled"], True)
+        # Only the run directory, as in the agent pod.
+        self.as_cron_run("")
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        directory = (self.tmp_path / "home/cron/runs/job_7c1e2a_e2").resolve()
+        directory.mkdir(parents=True)
+        os.chdir(directory)
+        self.assertTrue(audit_report.run_is_scheduled())
+        os.chdir(here)
+        self.assertFalse(audit_report.run_is_scheduled())
+
+    def test_a_profile_task_under_a_builtin_schedule_is_recorded_scheduled_without_the_flag(self):
+        # Rule (b): the task credential carries a builtin schedule's trigger.
+        self.as_task("task-sched", trigger={"name": f"schedule/{AUDIT}", "origin": "builtin", "stream": AUDIT})
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertIs(self.records()["task-sched"]["scheduled"], True)
+        # A task with no trigger, or one that is not a builtin schedule's, is not scheduled.
+        for trigger in (None, {"name": "slack", "origin": "builtin"}, {"name": f"schedule/{AUDIT}", "origin": "user"}):
+            with self.subTest(trigger=trigger):
+                self.as_task("task-other", trigger=trigger)
+                self.assertFalse(audit_report.run_is_scheduled())
+        # The flag is still taken as an override.
+        self.assertTrue(audit_report.run_is_scheduled(True))
 
     def test_a_run_that_never_finished_reads_as_unfinished(self):
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)

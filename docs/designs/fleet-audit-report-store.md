@@ -431,8 +431,13 @@ of its working directory `<home>/cron/runs/<name>`, which `session-command.sh` e
 `HERMES_CRON_RUN`. Its run id is `cron-` and the first 16 hex digits of that name's SHA-256, taken
 from `HERMES_CRON_RUN` when set, else from the cwd, and `start` and `finish` each compute it, never
 reading it from the note. Only a run started by hand in the shell gets a `local-<hex>` id.
-`start --scheduled`, which the cron prompts pass as they do to `precheck` and
-`finish`, sets `scheduled`. `finish` reads its own run's record by run id, and only after a publish
+`start` sets `scheduled` by itself, so no prompt has to remember a flag: a run is scheduled
+when it is a Hermes cron run (`HERMES_CRON_RUN` is set, or the cwd lies under
+`<home>/cron/runs/<name>`, the detection the run id uses), or a profile task whose task credential
+carries a builtin schedule's trigger (`origin: builtin`, named `schedule/<name>`). The broker
+verifies that credential on the record's write and admits a profile task's record only under the
+builtin schedule of its stream. `start --scheduled` is still taken as an override, and any other
+run, one started by hand in the shell, is recorded as not scheduled. `finish` reads its own run's record by run id, and only after a publish
 rewrites it with `done_at` and `outcome` (the stored envelope's `status`, or `unstored`), keeping
 `started_at`. A `precheck` that closes the run does the same. A `finish` that raised, or a
 `--dry-run`, marks nothing, and a run with no record writes no done mark. A stream's first run on a

@@ -1589,7 +1589,7 @@ section says so. The one limit: an on-demand run that goes through `hermes cron 
 the cron prompt, so it counts as a scheduled run and can be silent.
 
 The flag comes from the cron prompt and from nowhere else. Every fleet-audit job in
-`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `start` and `finish`, and, on a
+`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`, and, on a
 stream whose SOP runs `precheck` after its collector, to `precheck` too; a run `precheck` closes
 from the stored document is decided by this rule unchanged, since the close is `finish --scheduled`
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). The SOPs do

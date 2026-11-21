@@ -4399,6 +4399,24 @@ def new_run_id() -> str:
     )
 
 
+def run_is_scheduled(flag: bool = False) -> bool:
+    """Whether the run `start` is opening is a scheduled one (#6812).
+
+    `start` works this out itself, so no prompt has to remember a flag:
+
+    - a Hermes cron run: HERMES_CRON_RUN is set, or the cwd lies under
+      `<home>/cron/runs/<name>`, the detection `cron_run_id` makes for the run
+      id;
+    - a profile task whose task credential carries a builtin schedule's
+      trigger (`origin: builtin`, named `schedule/<name>`,
+      `report_status.task_trigger_is_schedule`).
+
+    `start --scheduled` (`flag`) is still taken as an override. Any other run,
+    one started by hand in the shell, is not scheduled.
+    """
+    return bool(flag) or cron_run_id() is not None or _report_status().task_trigger_is_schedule()
+
+
 def this_run_id(audit_id: str) -> str | None:
     """The id of the run `finish` is closing, or None when it cannot be told.
 
@@ -22763,7 +22781,11 @@ def _start(args: argparse.Namespace, audit_id: str, run_id: str | None = None) -
     # mark, which readers show as a run that did not finish (#6812).
     if run_id:
         record_run_start(
-            audit_id, repo, run_id, bool(getattr(args, "scheduled", False)), datetime.now(timezone.utc)
+            audit_id,
+            repo,
+            run_id,
+            run_is_scheduled(bool(getattr(args, "scheduled", False))),
+            datetime.now(timezone.utc),
         )
     # The relay posts what this file holds instead of the run's final message,
     # so a run that dies before its `finish` must not leave the previous run's
@@ -28055,9 +28077,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--scheduled",
         action="store_true",
         help=(
-            "The run is a scheduled run: the cron prompt passes this flag, to start, precheck and "
-            "finish. start records it on the run's run-start record. Do not pass it on a run a "
-            "person asked for."
+            "Mark the run's run-start record scheduled. Optional: start already marks a Hermes "
+            "cron run, or a profile task under a builtin schedule's trigger, scheduled by itself. "
+            "Do not pass it on a run a person asked for."
         ),
     )
 

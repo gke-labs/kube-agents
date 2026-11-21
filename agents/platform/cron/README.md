@@ -1190,8 +1190,8 @@ same numbers to go stale, and the test above checks the roster against the SOPs
 
 ## The `--scheduled` sentence in audit prompts
 
-Every fleet-audit prompt tells the worker to pass `--scheduled` to `start` and
-`finish`, and every stream whose SOP runs `audit_report.py precheck` after its collector
+Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`,
+and every stream whose SOP runs `audit_report.py precheck` after its collector
 (every collector stream but `upgrade-retrospective`, whose recorded weeks move
 every run: `PRECHECK_STREAMS` in the test file below) tells it to pass the
 flag to `precheck` too. Only a run with that
@@ -1202,13 +1202,14 @@ same, which is what spares a static fleet the by-hand drafting every day. It
 is in the prompt and not in the SOP, because a scheduled run and an on-demand
 run read the same SOP: an SOP that passed the flag would let every on-demand
 run of its stream go silent, or be closed from a stored document. `start`
-records the flag on the run's run-start record, so a reader can tell a scheduled
-run that did not finish from an on-demand one
+needs no flag: it marks the run's run-start record scheduled by itself, for a
+Hermes cron run or a profile task under a builtin schedule's trigger, so a
+reader can tell a scheduled run that did not finish from an on-demand one
 ([report store design §5](../../../docs/designs/fleet-audit-report-store.md#5-liveness)).
 `test_every_audit_cron_prompt_passes_scheduled_to_finish` in
 `../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
-prompt has the phrase `pass --scheduled to start, precheck and finish` (`pass
---scheduled to start and finish` on a stream without the step) and that no SOP passes
+prompt has the phrase `pass --scheduled to precheck and finish` (`pass
+--scheduled to finish` on a stream without the step) and that no SOP passes
 the flag; `test_every_collector_sop_runs_precheck_after_its_collector` beside
 it holds the step to exactly those SOPs. A prompt without the sentence
 only makes its job noisier. The rule is in
