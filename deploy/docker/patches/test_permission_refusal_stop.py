@@ -45,8 +45,8 @@ def setUpModule():
     sys.modules["tools.command_policy"] = command_policy
 
 
-def _result(output, exit_code=77):
-    return json.dumps({"output": output, "exit_code": exit_code, "error": None})
+def _result(output, exit_code=77, ensure_ascii=True):
+    return json.dumps({"output": output, "exit_code": exit_code, "error": None}, ensure_ascii=ensure_ascii)
 
 
 def shim_lines(argv):
@@ -389,8 +389,11 @@ class SharedFixtureTests(unittest.TestCase):
         for case in self.cases:
             want = None if case["kind"] == "none" else case["kind"]
             self.assertEqual(want == "policy", case["expect"] == "halt", case["name"])
-            # The shim's text as the tool printed it, and inside a terminal result's JSON.
-            for result in (case["result"], _result(case["result"], 77 if case["failed"] else 0)):
+            # The shim's text as the tool printed it, and inside a terminal result's JSON. The
+            # JSON keeps non-ASCII as is, as Go's encoder does in refusal_test.go: a \uXXXX
+            # escape is a different text (its backslash ends a word), not a different predicate.
+            wrapped = _result(case["result"], 77 if case["failed"] else 0, ensure_ascii=False)
+            for result in (case["result"], wrapped):
                 self.assertEqual(stop.classify_refusal(case["command"], result, failed=case["failed"]), want, case["name"])
             controller = FakeController()
             decision = observe(controller, case["result"], args={"command": case["command"]}, failed=case["failed"])

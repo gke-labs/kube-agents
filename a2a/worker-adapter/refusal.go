@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // A profile task's harness is stopped at its first definitive write refusal
@@ -39,13 +41,29 @@ const (
 // result carries as a literal `\n`.
 const lineStart = `(?:^|\n|\\n)`
 
+// Python's re is Unicode by default and Go's \w, \b, \d and \s are ASCII, so
+// the patterns spell Python's classes out: a word character is a letter, a
+// number or `_` (str.isalnum), and a \b beside a word character is a
+// non-word character or an end of the text, consumed: no reader here uses
+// where a boundary match ends, only whether it matched and where a rule line
+// starts.
+const (
+	pyWord       = `\p{L}\p{N}_`
+	pyNotWordL   = `(?:^|[^` + pyWord + `])`
+	pyNotWordR   = `(?:[^` + pyWord + `]|$)`
+	pyDigit      = `\p{Nd}`
+	pyWhitespace = `[\t\n\v\f\r\x1c-\x1f\x85\p{Z}]`
+)
+
 var (
 	policyActionRE = regexp.MustCompile(`refused however it is attempted`)
-	ruleLineRE     = regexp.MustCompile(lineStart + `policy rule: ([\w.-]+)`)
+	ruleLineRE     = regexp.MustCompile(lineStart + `policy rule: ([` + pyWord + `.-]+)`)
 	verbLineRE     = regexp.MustCompile(lineStart + `policy verb: ([^\n\\"]+)`)
-	renderLineRE   = regexp.MustCompile(lineStart + `policy render: local\b`)
+	renderLineRE   = regexp.MustCompile(lineStart + `policy render: local` + pyNotWordR)
 	// Kubernetes and Google Cloud API denials. 401 and Unauthenticated are absent on purpose.
-	apiDeniedRE = regexp.MustCompile(`Error from server \(Forbidden\)|\bis forbidden:|\bPERMISSION_DENIED\b|"code":\s*403\b|\bHTTP(?:/[\d.]+)? 403\b`)
+	apiDeniedRE = regexp.MustCompile(`Error from server \(Forbidden\)|` + pyNotWordL + `is forbidden:|` +
+		pyNotWordL + `PERMISSION_DENIED` + pyNotWordR + `|"code":` + pyWhitespace + `*403` + pyNotWordR + `|` +
+		pyNotWordL + `HTTP(?:/[` + pyDigit + `.]+)? 403` + pyNotWordR)
 	// Where one command ends and the next begins, and an argv literal's list punctuation.
 	separatorRE = regexp.MustCompile(`\|\||&&|[;|&\n]`)
 	listPunctRE = regexp.MustCompile(`[\[\],'"()]`)
@@ -118,7 +136,7 @@ func refusalBlocks(result string) []refusalBlock {
 		block := result[m[0]:end]
 		var verb []string
 		if v := verbLineRE.FindStringSubmatch(block); v != nil {
-			verb = strings.Fields(v[1])
+			verb = pyFields(v[1])
 		}
 		blocks = append(blocks, refusalBlock{rule: result[m[2]:m[3]], verb: verb, render: renderLineRE.MatchString(block)})
 	}
@@ -214,7 +232,7 @@ func kubectlVerbs(command string) [][]string {
 			if i+1 < len(starts) {
 				end = starts[i+1]
 			}
-			argv := strings.Fields(listPunctRE.ReplaceAllString(piece[start:end], " "))
+			argv := pyFields(listPunctRE.ReplaceAllString(piece[start:end], " "))
 			if len(argv) == 0 {
 				continue
 			}
@@ -238,15 +256,24 @@ func kubectlWordStarts(piece string) []int {
 		}
 		at := from + i
 		after := at + len(word)
-		if (at == 0 || !isWordOrHyphen(piece[at-1])) && (after == len(piece) || !isWordOrHyphen(piece[after])) {
+		before, _ := utf8.DecodeLastRuneInString(piece[:at])
+		next, _ := utf8.DecodeRuneInString(piece[after:])
+		if (at == 0 || !isWordOrHyphen(before)) && (after == len(piece) || !isWordOrHyphen(next)) {
 			starts = append(starts, at)
 		}
 		from = at + 1
 	}
 }
 
-func isWordOrHyphen(c byte) bool {
-	return c == '_' || c == '-' || ('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+// isWordOrHyphen is Python's [\w-]: a letter, a number, `_` or `-`.
+func isWordOrHyphen(r rune) bool {
+	return r == '_' || r == '-' || unicode.IsLetter(r) || unicode.IsNumber(r)
+}
+
+// pyFields is str.split(): the words between runs of what str.isspace calls
+// whitespace, which adds \x1c-\x1f to Go's unicode.IsSpace.
+func pyFields(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || (0x1c <= r && r <= 0x1f) })
 }
 
 // joinBracketedLines replaces each newline inside square brackets with a

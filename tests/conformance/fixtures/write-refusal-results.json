@@ -459,6 +459,118 @@
         ]
       ],
       "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: scale deploy/kube-dns"
+    },
+    {
+      "name": "refused auth reconcile",
+      "expect": "halt",
+      "kind": "policy",
+      "failed": true,
+      "command": "kubectl auth reconcile -f rbac.yaml",
+      "argv": [
+        [
+          "kubectl",
+          "auth",
+          "reconcile",
+          "-f",
+          "rbac.yaml"
+        ]
+      ],
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: auth reconcile"
+    },
+    {
+      "name": "refused uncordon",
+      "expect": "halt",
+      "kind": "policy",
+      "failed": true,
+      "command": "kubectl uncordon gke-node-1",
+      "argv": [
+        [
+          "kubectl",
+          "uncordon",
+          "gke-node-1"
+        ]
+      ],
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: uncordon gke-node-1"
+    },
+    {
+      "name": "a JSON-escaped refusal block with literal backslash-n line breaks",
+      "expect": "halt",
+      "kind": "policy",
+      "failed": true,
+      "command": "jq .output last-run.json",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\\npolicy rule: kubernetes.read-only\\npolicy verb: scale deploy/kube-dns"
+    },
+    {
+      "name": "an exit-0 multi-line argv list that runs a refused write, then a read",
+      "expect": "halt",
+      "kind": "policy",
+      "failed": false,
+      "command": "python3 - <<EOF\nimport subprocess\nsubprocess.run([\n    \"kubectl\",\n    \"scale\",\n    \"deploy/kube-dns\",\n    \"-n\", \"kube-system\",\n    \"--replicas=3\",\n])\nsubprocess.run([\"kubectl\", \"get\", \"deploy\", \"-n\", \"kube-system\"])\nEOF",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: scale deploy/kube-dns"
+    },
+    {
+      "name": "a failed report that quotes the refusal block (tee then gh failing)",
+      "expect": "halt",
+      "kind": "policy",
+      "failed": true,
+      "command": "tee pr.md <<EOF\nAgents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: scale deploy/kube-dns\nEOF\n&& gh pr create --title scale --body-file pr.md",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: scale deploy/kube-dns\nHTTP 422: Validation Failed (https://api.github.com/graphql)"
+    },
+    {
+      "name": "a non-ASCII word character after the rule token",
+      "expect": "no_halt",
+      "kind": "advisory",
+      "failed": true,
+      "command": "kubectl scale deploy/kube-dns -n kube-system --replicas=3",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-onlyé\npolicy verb: scale deploy/kube-dns"
+    },
+    {
+      "name": "a non-ASCII word character after the render token",
+      "expect": "halt",
+      "kind": "policy",
+      "failed": true,
+      "command": "kubectl patch deploy kube-dns -n kube-system -p {}",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: patch deploy\npolicy render: localé"
+    },
+    {
+      "name": "a non-ASCII word character after the verb token",
+      "expect": "no_halt",
+      "kind": "advisory",
+      "failed": true,
+      "command": "kubectl scale deploy/kube-dns -n kube-system --replicas=3",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: scaleé deploy/kube-dns"
+    },
+    {
+      "name": "an exit-0 call whose kubectl touches a non-ASCII word character",
+      "expect": "no_halt",
+      "kind": "advisory",
+      "failed": false,
+      "command": "kubectlé scale deploy/kube-dns -n kube-system --replicas=3; kubectl get deploy -n kube-system",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: scale deploy/kube-dns"
+    },
+    {
+      "name": "an exit-0 call whose kubectl follows a non-ASCII word character",
+      "expect": "no_halt",
+      "kind": "advisory",
+      "failed": false,
+      "command": "ékubectl scale deploy/kube-dns -n kube-system --replicas=3; kubectl get deploy -n kube-system",
+      "result": "Agents hold read-only access to Kubernetes. Propose this change as a pull request instead. This is a permission boundary, not an error to work around: if this command would change cluster or cloud state, that change is refused however it is attempted, so do not retry it through another command, tool, flag, or identity. If it only reads, use a spelling this policy allows or report the gap instead of working around it.\npolicy rule: kubernetes.read-only\npolicy verb: scale deploy/kube-dns"
+    },
+    {
+      "name": "PERMISSION_DENIED touching a non-ASCII word character",
+      "expect": "no_halt",
+      "kind": "none",
+      "failed": true,
+      "command": "gcloud projects get-iam-policy p",
+      "result": "ERROR: (gcloud.projects.get-iam-policy) PERMISSION_DENIEDé"
+    },
+    {
+      "name": "an HTTP 403 with non-ASCII digits in its version",
+      "expect": "no_halt",
+      "kind": "api",
+      "failed": true,
+      "command": "curl -i https://example.invalid",
+      "result": "HTTP/١.١ 403 Forbidden"
     }
   ]
 }
