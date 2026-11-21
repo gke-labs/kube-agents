@@ -22,7 +22,7 @@
 
 set -euo pipefail
 # DO NOT MERGE: a session-mode smoke twin exports the session front door.
-export EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-session}"
+export EVAL_FRONT_DOOR=session  # forced: the job env may set it to platform
 
 # The eval rosters, four files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, what
