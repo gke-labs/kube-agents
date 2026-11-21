@@ -1767,7 +1767,7 @@ Mutation(
     Mutation(
         "C1-broker-exec-output-unredacted",
         "agents/platform/scripts/credential_proxy.py",
-        ("        stdout, stdout_count = redact_tool_output(stdout, len(stdout) if result.stdout_truncated else None)\n"
+        ("        stdout, stdout_count = redact_tool_output(stdout, stdout_cut_at)\n"
          "        stderr, stderr_count = redact_tool_output(stderr, result.stderr_cut_at)\n",
          "        stdout_count = stderr_count = 0\n"),
         "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
@@ -1779,7 +1779,7 @@ Mutation(
     Mutation(
         "C1-broker-mcp-reply-unredacted",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if role not in REDACTED_OUTPUT_ROLES or not body:\n",
+        ("    if role not in roles or not body:\n",
          "    if True:\n"),
         "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
         "pass the MCP relay's reply through untouched because the upstream is "

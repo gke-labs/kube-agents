@@ -377,6 +377,39 @@ class ReadRedactionTest(RoutesTestCase):
         self.assertEqual(200, status, answer)
         self.assertEqual(json.loads(stored), answer)
 
+    def _a2a_reports_read(self, stored, writer):
+        # The A2A gateway's relay posts the report to chat. A profile worker's
+        # raw store PUT skips `finish`'s redaction, so the read is redacted here.
+        self.authenticator.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:platformagent-gateway", uid="gw-uid",
+            role=credential_proxy.CALLER_ROLE_A2A_REPORTS,
+        )
+        self.store.answer = (200, stored)
+        self.store.answer_writer = writer
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.request("GET", f"/v1/audit-reports/{AUDIT}/publish/runs/{RUN}")
+        response = connection.getresponse()
+        raw = response.read()
+        self.assertEqual(200, response.status, raw)
+        # The publish word still resolves to the install's key upstream.
+        self.assertEqual(f"{STREAM}/runs/{RUN}", self.store.seen[-1]["path"])
+        return response.getheader(credential_proxy.REPORT_WRITER_HEADER), raw
+
+    def test_an_a2a_reports_read_is_redacted_and_keeps_the_writer(self):
+        stored = json.dumps({"summary": f"found {_REPORT_TOKEN_SHAPE} in a ConfigMap"}).encode()
+        writer, raw = self._a2a_reports_read(stored, "builtin-schedule:compliance-audit:task-1")
+        self.assertEqual({"summary": "found [REDACTED] in a ConfigMap"}, json.loads(raw))
+        self.assertEqual("builtin-schedule:compliance-audit:task-1", writer)
+        self.assertTrue(any("audit-report read redacted shapes=1" in record for record in self.records), self.records)
+
+    def test_an_a2a_reports_read_with_nothing_to_redact_passes_byte_for_byte(self):
+        # Unusual spacing and key order, which a re-serialisation would change.
+        stored = b'{ "summary" : "all clear",\n  "b": 1, "a": [1,  2] }'
+        writer, raw = self._a2a_reports_read(stored, "builtin-schedule:compliance-audit:task-1")
+        self.assertEqual(stored, raw)
+        self.assertEqual("builtin-schedule:compliance-audit:task-1", writer)
+
     def test_a_profile_write_is_relayed_as_sent(self):
         # Only reads are redacted: what a profile writes is stored as it sent it.
         path = f"{STREAM}/runs/{RUN}"
