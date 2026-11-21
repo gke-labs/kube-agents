@@ -524,17 +524,6 @@ func tiersInUse(profiles []agentv1alpha1.AgentProfile) []string {
 	return out
 }
 
-// builtinTiers are the compiled-in tiers, sorted: a tier key the map no
-// longer names is still found by these.
-func builtinTiers() []string {
-	out := make([]string, 0, len(builtinTierCatalog()))
-	for tier := range builtinTierCatalog() {
-		out = append(out, tier)
-	}
-	slices.Sort(out)
-	return out
-}
-
 // inferenceKeysCondition is a condition of the type this file writes.
 func inferenceKeysCondition(status metav1.ConditionStatus, reason, message string) *metav1.Condition {
 	return &metav1.Condition{Type: inferenceKeysServedCondition, Status: status, Reason: reason, Message: message}
@@ -731,9 +720,10 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	// profile namespace there; a key whose delete fails keeps its record.
 	var removed []string
 	if tiersKnown && profileNamespaceReady {
-		candidates := append(append(append([]string(nil), previousTiers...), builtinTiers()...), recordedTiers(agent, recorded)...)
+		// Only recorded tiers: deleteStaleTierKeys deletes nothing else, so
+		// any other candidate would be an uncached read for nothing.
 		var gone []string
-		removed, gone = r.deleteStaleTierKeys(ctx, agent, candidates, tiers, recorded)
+		removed, gone = r.deleteStaleTierKeys(ctx, agent, recordedTiers(agent, recorded), tiers, recorded)
 		if len(gone) > 0 {
 			if err := r.updateSecretUIDs(ctx, agent, nil, gone); err != nil {
 				log.Info("could not drop the records of removed tier keys; the next pass drops them", "failure", apiFailure(err))

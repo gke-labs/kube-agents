@@ -1575,3 +1575,33 @@ func TestATerminatingReservedSecretIsWaitedFor(t *testing.T) {
 		}
 	})
 }
+
+// The tier cleanup reads only the recorded tiers' Secrets: a built-in tier
+// no profile uses costs a steady pass no Secret read.
+func TestAnUnusedTierCostsNoRead(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	profile := &agentv1alpha1.AgentProfile{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcileInferenceKeys(ctx, agent)
+	unused := tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret
+	var reads atomic.Int32
+	r.APIReader = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok && key == unused {
+				reads.Add(1)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r.reconcileInferenceKeys(ctx, agent)
+	if n := reads.Load(); n != 0 {
+		t.Errorf("%d reads of an unused tier's Secret on a steady pass", n)
+	}
+}
