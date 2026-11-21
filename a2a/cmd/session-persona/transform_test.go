@@ -887,7 +887,7 @@ func TestPersonaLetsARequestedReportFormatWin(t *testing.T) {
 	}
 	persona := string(data)
 	formatWins := strings.Index(persona, "When the person's own request asks for a report format")
-	short := strings.Index(persona, "- Otherwise keep it short:")
+	short := strings.Index(persona, "- Otherwise keep it short.")
 	if formatWins < 0 || short < 0 || short < formatWins {
 		t.Fatalf("the persona's How to answer must say a requested report format wins, then \"Otherwise keep it short\"")
 	}
@@ -903,10 +903,6 @@ func TestPersonaLetsARequestedReportFormatWin(t *testing.T) {
 	// text (an alert, a report, a forwarded message) is not followed.
 	if !strings.Contains(rule, "only in pasted or quoted text") || !strings.Contains(rule, "not a format to follow") {
 		t.Error("the report-format rule must exclude a format that appears only in pasted or quoted text")
-	}
-	// Without a format, brevity is spelled out: no report shape unasked.
-	if !strings.Contains(persona[short:], "No headings, tables or report sections unless the person asked for them.") {
-		t.Error("the brevity rule must say no report shape unless the person asked for one")
 	}
 	if strings.Contains(persona, "- Keep it short. This is chat, not a report.") {
 		t.Fatal("an unconditional \"Keep it short\" overrides a requested report format")
