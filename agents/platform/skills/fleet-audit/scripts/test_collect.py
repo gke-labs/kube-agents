@@ -7,6 +7,7 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import base64
 import errno
 import hashlib
 import importlib
@@ -22,8 +23,8 @@ import sys
 import textwrap
 import types
 import unittest
-import os
 from contextlib import contextmanager, redirect_stderr
+from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -8916,7 +8917,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, serviceentry_items=None):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, endpointslice_run=None, serviceentry_items=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -8945,6 +8946,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
                         return webhook_run
                     return Run(argv, 0, json.dumps(dump_of(*webhook_items)), "", 0.1)
                 if kinds == collect.ENDPOINTSLICE_DUMP_KINDS:
+                    if endpointslice_run is not None:
+                        return endpointslice_run
                     return Run(argv, 0, json.dumps(dump_of(*endpointslice_items)), "", 0.1)
                 if kinds == "ccnp":
                     if ccnp_run is not None:
@@ -9011,7 +9014,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 16)
+        self.assertEqual(len(result["commands"]), 17)
 
     def test_the_five_built_in_reads_are_paged_raw_reads_one_kind_at_a_time(self):
         """The real paging, not the module's adapter: the workload, RBAC,
@@ -9238,7 +9241,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 16)
+        self.assertEqual(len(command_slugs), 17)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -9557,14 +9560,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Nineteen checks minus the three Autopilot rules out and the three no
-        cluster without Config Connector, Config Sync or Istio can run is thirteen,
+        Twenty checks minus the three Autopilot rules out and the three no
+        cluster without Config Connector, Config Sync or Istio can run is fourteen,
         each with a command behind it, and the six dispositioned rather than silently
         absent -- absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 13)
+        self.assertEqual(len(command_slugs), 14)
         self.assertEqual(len(na_slugs), 6)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
@@ -13473,32 +13476,78 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         self.assertIn("kcc-object-wedged", {e["check"] for e in result["checks_not_applicable"]})
         self.assertNotIn("checks_unevaluated", result)
 
-    # §2.18's two reads, best-effort like `ccnp`: an identity that cannot list
-    # webhook configurations or EndpointSlices keeps its other checks.
+    # §2.18 and §2.20's best-effort reads, like `ccnp`: an identity that cannot
+    # list webhook configurations or EndpointSlices keeps its other checks.
     def test_a_failed_webhook_read_is_unevaluated_and_the_other_checks_still_run(self):
         result = self.compliance(webhook_run=Run(["x"], 1, "", "Error from server (Forbidden): validatingwebhookconfigurations is forbidden", 0.05))
         self.assertEqual(result["outcome"], "collected", result.get("error"))
         unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
-        self.assertIn("Undetermined", unevaluated["webhook-backend-unreachable"])
-        self.assertIn("Forbidden", unevaluated["webhook-backend-unreachable"])
+        for slug in ("webhook-backend-unreachable", "webhook-ca-bundle-expired"):
+            self.assertIn("Undetermined", unevaluated[slug])
+            self.assertIn("Forbidden", unevaluated[slug])
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertNotIn("webhook-backend-unreachable", command_slugs)
+        self.assertNotIn("webhook-ca-bundle-expired", command_slugs)
         self.assertIn("lb-world-open", command_slugs)
-        self.assertNotIn("webhook-backend-unreachable", {c["check"] for c in result["candidates"]})
+        candidate_slugs = {c["check"] for c in result["candidates"]}
+        self.assertNotIn("webhook-backend-unreachable", candidate_slugs)
+        self.assertNotIn("webhook-ca-bundle-expired", candidate_slugs)
 
     def test_a_failed_import_of_the_readiness_module_is_unevaluated_not_a_crash(self):
         """The predicate lives in the sibling skill. A packaging fault that drops
-        it must cost this check alone, never the cluster's other seventeen."""
+        it must cost §2.18 alone, never §2.20 or the cluster's other checks."""
         with patch.object(collect, "_upgrade_readiness", side_effect=ImportError("No module named 'upgrade_readiness'")):
             result = self.compliance(webhook_items=[webhook_configuration("strict-policy-webhook")])
         self.assertEqual(result["outcome"], "collected", result.get("error"))
         unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
         self.assertIn("Undetermined", unevaluated["webhook-backend-unreachable"])
         self.assertIn("upgrade_readiness", unevaluated["webhook-backend-unreachable"])
+        self.assertNotIn("webhook-ca-bundle-expired", unevaluated)
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertNotIn("webhook-backend-unreachable", command_slugs)
-        self.assertEqual(len(command_slugs), 15)
+        self.assertIn("webhook-ca-bundle-expired", command_slugs)
+        self.assertEqual(len(command_slugs), 16)
         self.assertNotIn("webhook-backend-unreachable", {c["check"] for c in result["candidates"]})
+
+    def test_a_planted_expired_ca_bundle_webhook_runs_when_endpointslices_fail(self):
+        pem_path = Path(__file__).resolve().parents[5] / "bench" / "tf" / "prebuilt" / "security-expiring-node-bootstrap-and-webhook-certs" / "expired-ca.pem"
+        ca_b64 = base64.b64encode(pem_path.read_bytes()).decode("ascii")
+        planted = webhook_configuration(
+            "bench-expiring-webhook-ca",
+            policy="Ignore",
+            ca_bundle=ca_b64,
+            namespace_selector={
+                "matchExpressions": [
+                    {"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "config-management-system", "kubeagents-system"]}
+                ]
+            },
+        )
+        result = self.compliance(
+            webhook_items=[planted],
+            endpointslice_run=Run(
+                ["x"],
+                1,
+                "",
+                "Error from server (Forbidden): endpointslices.discovery.k8s.io is forbidden",
+                0.05,
+            ),
+        )
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated["webhook-backend-unreachable"])
+        self.assertIn("Forbidden", unevaluated["webhook-backend-unreachable"])
+        self.assertNotIn("webhook-ca-bundle-expired", unevaluated)
+        command_slugs = {c["check"] for c in result["commands"]}
+        self.assertNotIn("webhook-backend-unreachable", command_slugs)
+        self.assertEqual(len(command_slugs), 16)
+        candidates = [c for c in result["candidates"] if c["check"] == "webhook-ca-bundle-expired"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["object"], "ValidatingWebhookConfiguration/bench-expiring-webhook-ca")
+        self.assertEqual(candidates[0]["severity"], "major")
+        self.assertTrue(candidates[0].get("impact_authoritative"))
+        command = {c["check"]: c["command"] for c in result["commands"]}["webhook-ca-bundle-expired"]
+        self.assertIn("validatingwebhookconfigurations", command)
+        self.assertNotIn("endpointslices", command)
 
     def test_a_planted_fail_closed_webhook_with_no_service_is_a_candidate_with_both_reads_recorded(self):
         planted = webhook_configuration(
@@ -14286,7 +14335,7 @@ class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
 
 
 def webhook_configuration(name, kind="ValidatingWebhookConfiguration", policy="Fail", service=("seeded-security", "strict-policy-webhook"),
-                          url=None, rules=None, namespace_selector=None, labels=None, annotations=None, port=None, hooks=None):
+                          url=None, rules=None, namespace_selector=None, labels=None, annotations=None, port=None, ca_bundle=None, hooks=None):
     """One configuration with one webhook entry, shaped as the paged dump stamps it
     (`kind` on the item). `policy=None` leaves `failurePolicy` out, which the v1 API
     defaults to Fail. `rules=None` is one rule on an inert bench group; `rules=[]` is a
@@ -14300,6 +14349,8 @@ def webhook_configuration(name, kind="ValidatingWebhookConfiguration", policy="F
             hook["clientConfig"] = {"url": url}
         else:
             hook["clientConfig"] = {"service": {"namespace": service[0], "name": service[1], "path": "/validate", **({"port": port} if port else {})}}
+        if ca_bundle is not None:
+            hook["clientConfig"]["caBundle"] = ca_bundle
         if namespace_selector is not None:
             hook["namespaceSelector"] = namespace_selector
         hooks = [hook]
@@ -14777,6 +14828,305 @@ class TestServiceEntryCollection(unittest.TestCase):
         command = {c["check"]: c["command"] for c in result["commands"]}[collect.SERVICEENTRY_HOST_COLLISION_SLUG]
         self.assertIn(collect.SERVICEENTRY_KIND, command)
         self.assertIsNone(self.reason(result))
+
+
+def _der_wrap(tag: int, body: bytes) -> bytes:
+    n = len(body)
+    if n < 0x80:
+        return bytes([tag, n]) + body
+    length_bytes = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([tag, 0x80 | len(length_bytes)]) + length_bytes + body
+
+
+def _synthetic_cert_pem(
+    not_after_tag: int,
+    not_after_text: str,
+    *,
+    not_before_tag: int = 0x17,
+    not_before_text: str = "250101000000Z",
+    v1: bool = False,
+    padding_bytes: int = 0,
+) -> str:
+    """Build a minimal syntactically valid DER X.509 Certificate wrapped in PEM."""
+    version_el = b"" if v1 else _der_wrap(0xA0, _der_wrap(0x02, b"\x02"))
+    serial_el = _der_wrap(0x02, b"\x01")
+    sig_alg_el = _der_wrap(0x30, _der_wrap(0x06, b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b"))
+    issuer_el = _der_wrap(0x30, _der_wrap(0x04, b"x" * padding_bytes) if padding_bytes else b"")
+    validity_el = _der_wrap(
+        0x30,
+        _der_wrap(not_before_tag, not_before_text.encode("ascii"))
+        + _der_wrap(not_after_tag, not_after_text.encode("ascii")),
+    )
+    subject_el = _der_wrap(0x30, b"")
+    spki_el = _der_wrap(0x30, b"")
+    tbs = _der_wrap(0x30, version_el + serial_el + sig_alg_el + issuer_el + validity_el + subject_el + spki_el)
+    sig_val = _der_wrap(0x03, b"\x00\x01")
+    cert_der = _der_wrap(0x30, tbs + sig_alg_el + sig_val)
+    b64 = base64.b64encode(cert_der).decode("ascii")
+    lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
+    return "-----BEGIN CERTIFICATE-----\n" + "\n".join(lines) + "\n-----END CERTIFICATE-----\n"
+
+
+def _b64_pem(*pems: str) -> str:
+    return base64.b64encode("".join(pems).encode("ascii")).decode("ascii")
+
+
+class TestWebhookCaBundleExpired(unittest.TestCase):
+    """§2.20 (`webhook-ca-bundle-expired`): admission webhooks whose CA bundle
+    certificate has expired or expires within 30 days (#4960)."""
+
+    NOW = datetime(2026, 11, 17, 0, 0, 0, tzinfo=timezone.utc)
+    SYSTEM_NAMESPACES = [namespace("kube-system"), namespace("config-management-system")]
+    PLANTED_PEM = (
+        Path(__file__).resolve().parents[5]
+        / "bench"
+        / "tf"
+        / "prebuilt"
+        / "security-expiring-node-bootstrap-and-webhook-certs"
+        / "expired-ca.pem"
+    ).read_text(encoding="ascii")
+
+    def run_on(self, *configs, namespaces=None, now=None, unevaluated=None):
+        ctx = {
+            "webhook_configurations": list(configs),
+            "namespaces": self.SYSTEM_NAMESPACES if namespaces is None else namespaces,
+        }
+        if unevaluated:
+            ctx["unevaluated"] = unevaluated
+        return collect.check_webhook_ca_bundle_expired(ctx, now=self.NOW if now is None else now)
+
+    def test_planted_bench_fixture_is_flagged_as_major_with_ignore_expired_impact(self):
+        excluded = {
+            "matchExpressions": [
+                {
+                    "key": "kubernetes.io/metadata.name",
+                    "operator": "NotIn",
+                    "values": ["kube-system", "config-management-system", "kubeagents-system"],
+                }
+            ]
+        }
+        cfg = webhook_configuration(
+            "bench-expiring-webhook-ca",
+            policy="Ignore",
+            ca_bundle=_b64_pem(self.PLANTED_PEM),
+            namespace_selector=excluded,
+        )
+        hits = self.run_on(cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ValidatingWebhookConfiguration/bench-expiring-webhook-ca")
+        self.assertEqual(hits[0]["namespace"], "")
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertEqual(hits[0]["impact"], collect._IMPACT_WEBHOOK_CA_IGNORE_EXPIRED)
+        self.assertIn("failurePolicy Ignore", hits[0]["excerpt"])
+        self.assertIn("2025-12-31T00:00:00Z passed (321d ago)", hits[0]["excerpt"])
+        self.assertNotIn("BEGIN CERTIFICATE", hits[0]["excerpt"])
+
+    def test_fail_closed_pods_webhook_expiring_next_week_is_critical(self):
+        """#4960 Acceptance: a failurePolicy: Fail webhook on pods whose bundle
+        expires next week is graded critical."""
+        next_week_pem = _synthetic_cert_pem(0x17, "261124000000Z")
+        cfg = webhook_configuration(
+            "pod-policy",
+            policy="Fail",
+            rules=[{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["CREATE"]}],
+            ca_bundle=_b64_pem(next_week_pem),
+        )
+        hits = self.run_on(cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertEqual(hits[0]["impact"], collect._IMPACT_WEBHOOK_CA_FAIL_EXPIRING)
+        self.assertIn("2026-11-24T00:00:00Z is within 30d (7d remaining)", hits[0]["excerpt"])
+        self.assertIn("CREATE pods in core", hits[0]["excerpt"])
+        self.assertIn("admits kube-system, config-management-system", hits[0]["excerpt"])
+
+    def test_absent_failure_policy_defaults_to_fail_and_expired_is_critical(self):
+        expired_pem = _synthetic_cert_pem(0x17, "261101000000Z")
+        hits = self.run_on(webhook_configuration("unscoped", policy=None, ca_bundle=_b64_pem(expired_pem)))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertEqual(hits[0]["impact"], collect._IMPACT_WEBHOOK_CA_FAIL_EXPIRED)
+
+    def test_fail_closed_scoped_away_from_system_namespaces_is_major(self):
+        excluded = {
+            "matchExpressions": [
+                {"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "config-management-system"]}
+            ]
+        }
+        for ts in ("261101000000Z", "261201000000Z"):
+            with self.subTest(not_after=ts):
+                hits = self.run_on(
+                    webhook_configuration("tenant-hook", policy="Fail", namespace_selector=excluded, ca_bundle=_b64_pem(_synthetic_cert_pem(0x17, ts)))
+                )
+                self.assertEqual(len(hits), 1)
+                self.assertEqual(hits[0]["severity"], "major")
+                self.assertIn("admits neither kube-system nor config-management-system", hits[0]["excerpt"])
+
+    def test_ignore_policy_expiring_within_thirty_days_is_minor(self):
+        soon_pem = _synthetic_cert_pem(0x17, "261210000000Z")
+        hits = self.run_on(webhook_configuration("advisory-hook", policy="Ignore", ca_bundle=_b64_pem(soon_pem)))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+        self.assertEqual(hits[0]["impact"], collect._IMPACT_WEBHOOK_CA_IGNORE_EXPIRING)
+
+    def test_thirty_day_boundary_is_exact(self):
+        at_30d = _synthetic_cert_pem(0x17, "261217000000Z")
+        past_30d = _synthetic_cert_pem(0x17, "261217000001Z")
+        self.assertEqual(len(self.run_on(webhook_configuration("exact-30d", ca_bundle=_b64_pem(at_30d)))), 1)
+        self.assertEqual(self.run_on(webhook_configuration("past-30d", ca_bundle=_b64_pem(past_30d))), [])
+
+    def test_multi_cert_bundle_with_one_valid_root_ca_is_not_flagged(self):
+        expired_old = _synthetic_cert_pem(0x17, "250601000000Z")
+        valid_new = _synthetic_cert_pem(0x17, "280601000000Z")
+        self.assertEqual(
+            self.run_on(webhook_configuration("rotated-ca", ca_bundle=_b64_pem(expired_old, valid_new))),
+            [],
+        )
+
+    def test_multi_cert_bundle_where_all_certs_are_expired_names_count_and_latest(self):
+        older = _synthetic_cert_pem(0x17, "240101000000Z")
+        newer = _synthetic_cert_pem(0x17, "251231000000Z")
+        hits = self.run_on(webhook_configuration("both-expired", ca_bundle=_b64_pem(older, newer)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("all 2 caBundle certificates expired (latest notAfter 2025-12-31T00:00:00Z", hits[0]["excerpt"])
+
+    def test_multi_cert_bundle_with_expired_and_expiring_soon_reports_expiring_window(self):
+        expired = _synthetic_cert_pem(0x17, "250101000000Z")
+        soon = _synthetic_cert_pem(0x17, "261127000000Z")
+        hits = self.run_on(webhook_configuration("expiring-bundle", ca_bundle=_b64_pem(expired, soon)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("caBundle (2 certificates) latest notAfter 2026-11-27T00:00:00Z is within 30d (10d remaining)", hits[0]["excerpt"])
+
+    def test_asn1_utctime_pivot_and_generalized_time_and_v1_and_long_der(self):
+        """RFC 5280 §4.1.2.5: UTCTime >=50 is 19xx (expired), <50 is 20xx;
+        GeneralizedTime handles 2050+, fractional seconds, and timezone offsets;
+        X.509 v1 omits the explicit [0] version element; padding >300B exercises
+        multi-octet DER length encoding."""
+        y1950 = _synthetic_cert_pem(0x17, "500101000000Z", v1=True, padding_bytes=320)
+        y2049 = _synthetic_cert_pem(0x17, "491231235959Z", v1=True, padding_bytes=320)
+        y2050 = _synthetic_cert_pem(0x18, "20500601000000Z")
+        y9999 = _synthetic_cert_pem(0x18, "99991231235959Z")
+        tz_offset_expired = _synthetic_cert_pem(0x18, "20261116200000.500+0200")
+        hits_1950 = self.run_on(webhook_configuration("v1-1950", ca_bundle=_b64_pem(y1950)))
+        self.assertEqual(len(hits_1950), 1)
+        self.assertIn("1950-01-01T00:00:00Z", hits_1950[0]["excerpt"])
+        self.assertEqual(self.run_on(webhook_configuration("v1-2049", ca_bundle=_b64_pem(y2049))), [])
+        self.assertEqual(self.run_on(webhook_configuration("gen-2050", ca_bundle=_b64_pem(y2050))), [])
+        self.assertEqual(self.run_on(webhook_configuration("gen-9999", ca_bundle=_b64_pem(y9999))), [])
+        hits_tz = self.run_on(webhook_configuration("gen-tz", ca_bundle=_b64_pem(tz_offset_expired)))
+        self.assertEqual(len(hits_tz), 1)
+        self.assertIn("2026-11-16T18:00:00Z", hits_tz[0]["excerpt"])
+
+    def test_empty_or_corrupt_ca_bundle_never_crashes_or_fires(self):
+        corrupt_pem = "-----BEGIN CERTIFICATE-----\n" + base64.b64encode(b"\x30\x80\x00\x00").decode("ascii") + "\n-----END CERTIFICATE-----\n"
+        non_minimal = "-----BEGIN CERTIFICATE-----\n" + base64.b64encode(b"\x30\x81\x02\x30\x00").decode("ascii") + "\n-----END CERTIFICATE-----\n"
+        overflow_hi = _synthetic_cert_pem(0x18, "99991231235959-0001")
+        overflow_lo = _synthetic_cert_pem(0x18, "00010101000000+0001")
+        trailing_nl_utc = _synthetic_cert_pem(0x17, "251231000000Z\n")
+        trailing_nl_gen = _synthetic_cert_pem(0x18, "20251231000000Z\n")
+        frac_no_secs = _synthetic_cert_pem(0x18, "202512310000.5Z")
+        for bad in (
+            None,
+            "",
+            "   ",
+            "Cg==",
+            "!!!not-base64!!!",
+            _b64_pem("not a pem"),
+            _b64_pem(corrupt_pem),
+            _b64_pem(non_minimal),
+            _b64_pem(overflow_hi),
+            _b64_pem(overflow_lo),
+            _b64_pem(trailing_nl_utc),
+            _b64_pem(trailing_nl_gen),
+            _b64_pem(frac_no_secs),
+        ):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_on(webhook_configuration("bad-ca", ca_bundle=bad)), [])
+        # A corrupt or trailing-newline cert beside a real expired cert still catches the expired cert,
+        # and an unclosed BEGIN header followed by whitespace parses in linear time.
+        mixed = _b64_pem(corrupt_pem, overflow_hi, trailing_nl_gen, self.PLANTED_PEM)
+        self.assertEqual(len(self.run_on(webhook_configuration("mixed", policy="Ignore", ca_bundle=mixed))), 1)
+        unclosed = _b64_pem(self.PLANTED_PEM, "-----BEGIN CERTIFICATE-----\n" + (" " * 20000))
+        self.assertEqual(len(self.run_on(webhook_configuration("unclosed", policy="Ignore", ca_bundle=unclosed))), 1)
+
+    def test_one_hit_per_configuration_with_worst_severity_and_impact_across_multiple_hooks(self):
+        expired_pem = _synthetic_cert_pem(0x17, "251231000000Z")
+        expiring_pem = _synthetic_cert_pem(0x17, "261124000000Z")
+        healthy_pem = _synthetic_cert_pem(0x17, "271231000000Z")
+        excluded = {
+            "matchExpressions": [
+                {"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "config-management-system"]}
+            ]
+        }
+        base_rule = [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["CREATE"]}]
+        cfg = {
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "multi-hook-policy"},
+            "webhooks": [
+                {
+                    "name": "minor-ignore.example.internal",
+                    "failurePolicy": "Ignore",
+                    "rules": base_rule,
+                    "namespaceSelector": excluded,
+                    "clientConfig": {"url": "https://a.example.internal/v", "caBundle": _b64_pem(expiring_pem)},
+                },
+                {
+                    "name": "critical-fail.example.internal",
+                    "failurePolicy": "Fail",
+                    "rules": base_rule,
+                    "clientConfig": {"url": "https://b.example.internal/v", "caBundle": _b64_pem(expired_pem)},
+                },
+                {
+                    "name": "healthy.example.internal",
+                    "failurePolicy": "Fail",
+                    "rules": base_rule,
+                    "clientConfig": {"url": "https://c.example.internal/v", "caBundle": _b64_pem(healthy_pem)},
+                },
+                {
+                    "name": "major-ignore.example.internal",
+                    "failurePolicy": "Ignore",
+                    "rules": base_rule,
+                    "namespaceSelector": excluded,
+                    "clientConfig": {"url": "https://d.example.internal/v", "caBundle": _b64_pem(expired_pem)},
+                },
+            ],
+        }
+        hits = self.run_on(cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ValidatingWebhookConfiguration/multi-hook-policy")
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertEqual(hits[0]["impact"], collect._IMPACT_WEBHOOK_CA_FAIL_EXPIRED)
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("minor-ignore.example.internal", excerpt)
+        self.assertIn("critical-fail.example.internal", excerpt)
+        self.assertIn("major-ignore.example.internal", excerpt)
+        self.assertNotIn("healthy.example.internal", excerpt)
+        self.assertEqual(excerpt.count(collect._WEBHOOK_HIT_JOIN), 2)
+
+    def test_url_webhook_with_expired_ca_bundle_is_flagged_and_suppressions_hold(self):
+        hits = self.run_on(
+            webhook_configuration("mutating-url", kind="MutatingWebhookConfiguration", url="https://webhook.example.internal/mutate", ca_bundle=_b64_pem(self.PLANTED_PEM))
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "MutatingWebhookConfiguration/mutating-url")
+        self.assertEqual(self.run_on(webhook_configuration("no-rules", rules=[], ca_bundle=_b64_pem(self.PLANTED_PEM))), [])
+        self.assertEqual(
+            self.run_on(webhook_configuration("addon", labels={collect._ADDON_MANAGER_MODE_LABEL: "Reconcile"}, ca_bundle=_b64_pem(self.PLANTED_PEM))),
+            [],
+        )
+        self.assertEqual(
+            self.run_on(webhook_configuration("gke-comp", annotations={collect._GKE_COMPONENT_ANNOTATION: "vpa"}, ca_bundle=_b64_pem(self.PLANTED_PEM))),
+            [],
+        )
+        self.assertEqual(
+            self.run_on(webhook_configuration("uneval", ca_bundle=_b64_pem(self.PLANTED_PEM)), unevaluated={"webhook-ca-bundle-expired": "Undetermined: x"}),
+            [],
+        )
+
+    def test_the_check_is_on_the_compliance_roster_with_webhooks_source(self):
+        spec = next(c for c in collect.COMPLIANCE_CHECKS if c.slug == "webhook-ca-bundle-expired")
+        self.assertEqual(spec.kind, "cluster")
+        self.assertEqual(spec.severity, "critical")
+        self.assertEqual(collect._COMPLIANCE_CHECK_SOURCES["webhook-ca-bundle-expired"], ("webhooks",))
 
 
 if __name__ == "__main__":

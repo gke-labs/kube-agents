@@ -141,7 +141,10 @@ const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
 const (
 	envImagePullRefs = "A2A_IMAGE_PULL_REFS"
-	imagePullRefSep  = ","
+	// envTriggerEventKinds lists the event triggers the trigger ingress
+	// admits (Config.TriggerEventKinds).
+	envTriggerEventKinds = "A2A_TRIGGER_EVENT_KINDS"
+	imagePullRefSep      = ","
 )
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
@@ -680,6 +683,17 @@ type Config struct {
 	// ingress accepts (trigger_ingress.go): a token bucket that holds this
 	// many and refills at this rate. Zero takes DefaultTriggerRatePerHour.
 	TriggerRatePerHour int
+	// TriggerEventKinds are the event triggers (#6572) whose submissions the
+	// trigger ingress admits, each <source>/<kind>: a source the callout
+	// binds to its own identity, and one kind of event it reports
+	// (A2A_TRIGGER_EVENT_KINDS, comma-separated). Empty, the default, admits
+	// none: only the schedule source submits. Listing kinds, not sources,
+	// bounds the rate buckets a source can open to the kinds named here.
+	TriggerEventKinds []string
+	// TriggerEventRatePerHour is the cap on each admitted event kind's
+	// submissions, a bucket per <source>/<kind>. Zero takes
+	// DefaultTriggerEventRatePerHour.
+	TriggerEventRatePerHour int
 
 	// CapabilityOptional relaxes exactly one thing: what happens when this
 	// gateway cannot mint. Zero value — the safe one — refuses the turn.
@@ -924,6 +938,11 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	for _, kind := range strings.Split(os.Getenv(envTriggerEventKinds), ",") {
+		if kind = strings.TrimSpace(kind); kind != "" {
+			cfg.TriggerEventKinds = append(cfg.TriggerEventKinds, kind)
+		}
+	}
 	seenPullRefs := make(map[string]struct{})
 	for _, refName := range strings.Split(os.Getenv(envImagePullRefs), imagePullRefSep) {
 		refName = strings.TrimSpace(refName)
@@ -1081,6 +1100,15 @@ func FromEnv() (*Config, error) {
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
 	// it is checked where the spawner is built (gateway.New).
+	for _, kind := range cfg.TriggerEventKinds {
+		// Neither "schedule" nor "run-now" as a source: each opens a
+		// schedule's idempotency key, and an event source's keys must not
+		// spell one.
+		src, k, ok := strings.Cut(kind, "/")
+		if !ok || !lib.ValidSubjectToken(src) || !lib.ValidSubjectToken(k) || src == lib.TriggerSourceSchedule || src == lib.TriggerRunNowKeyPrefix {
+			return nil, fmt.Errorf(envTriggerEventKinds+" entry %q is not <source>/<kind> of dot-free DNS-1123 labels for an event source", kind)
+		}
+	}
 	if !lib.ValidSubjectToken(cfg.DefaultAddressee) {
 		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE %q is not a dot-free DNS-1123 label", cfg.DefaultAddressee)
 	}

@@ -235,6 +235,9 @@ type Gateway struct {
 	// first use (triggerLimiter).
 	triggerLimiterOnce sync.Once
 	triggerLimits      *triggerRateLimiter
+	// triggerEventLimits is the same for event sources' kinds (#6572).
+	triggerEventLimiterOnce sync.Once
+	triggerEventLimits      *triggerRateLimiter
 	// triggerMint, when set, mints trigger run grants in place of the cap
 	// bucket's minter (tests: a mint that fails).
 	triggerMint func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error)
