@@ -32,6 +32,10 @@ This reads both and puts every case in one class:
 - ``a-only`` / ``b-only``: the case ran on one side.
 
 It prints a Markdown table and exits 1 when any case regressed, 0 otherwise.
+When both runs carry their grading log (``eval-grading.log``), it also compares
+each case's mean answer words and flags a case whose answer runs over A's by
+more than ``LENGTH_MARGIN``; ``--length-gate`` makes such a case exit 1 too, since
+answer length is part of front-door parity.
 It exits 2 when the two runs can't be compared: a directory it can't read, a
 run with no case hand-offs (often a path one level too high), every case of B
 unscored or missing (the session route broke before any case could be graded,
@@ -47,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -57,6 +62,16 @@ CASE_GLOB = "case-*.json"
 # The deploy writes the front door it chose here (hack/ci-deploy.sh); a run
 # without it predates the switch and is taken as platform.
 FRONT_DOOR_FILE = "front-door.txt"
+# The grading log the eval script writes beside the hand-offs: each graded
+# repetition's delivered reply shape, `rep N shape: ... answer_words=W`, under
+# its case's `Task <case> Result:` line (bench-gate case).
+GRADING_LOG = "eval-grading.log"
+TASK_LINE = re.compile(r"^Task (\S+) Result:")
+ANSWER_WORDS = re.compile(r"\brep \d+ shape:.*\banswer_words=(\d+)")
+# A case is wordier on B when its mean answer runs longer than A's by more
+# than this share: 3 repetitions carry noise, so small differences aren't
+# flagged.
+LENGTH_MARGIN = 0.25
 
 
 class UnreadableRun(Exception):
@@ -158,6 +173,35 @@ def check_comparable(
         )
 
 
+def read_answer_words(directory: Path) -> dict[str, float]:
+    """Each case's mean answer words in a run, from its grading log; empty
+    when the run has no log (an older run, or one that delivered nothing)."""
+    path = directory / GRADING_LOG
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise UnreadableRun(f"{path}: {err}") from err
+    words: dict[str, list[int]] = {}
+    case = None
+    for line in lines:
+        if m := TASK_LINE.match(line):
+            case = m.group(1)
+        elif case and (m := ANSWER_WORDS.search(line)):
+            words.setdefault(case, []).append(int(m.group(1)))
+    return {c: sum(w) / len(w) for c, w in words.items()}
+
+
+def wordier(a_words: float | None, b_words: float | None) -> bool:
+    """Whether B's mean answer is longer than A's by more than LENGTH_MARGIN."""
+    return (
+        a_words is not None
+        and b_words is not None
+        and b_words > a_words * (1 + LENGTH_MARGIN)
+    )
+
+
 def classify(a: Side | None, b: Side | None) -> str:
     if a is None:
         return B_ONLY
@@ -189,21 +233,41 @@ def compare(
     return sorted(rows, key=lambda row: (ORDER.index(row[1]), row[0]))
 
 
-def markdown(rows: list[tuple[str, str, Side | None, Side | None]]) -> str:
+def markdown(
+    rows: list[tuple[str, str, Side | None, Side | None]],
+    a_words: dict[str, float] | None = None,
+    b_words: dict[str, float] | None = None,
+) -> str:
     counts = {kind: sum(1 for row in rows if row[1] == kind) for kind in ORDER}
     summary = ", ".join(f"{counts[kind]} {kind}" for kind in ORDER if counts[kind])
+    lengths = bool(a_words) and bool(b_words)
     lines = [
         "Front-door A/B: platform (A) vs the default session (B)",
         "",
         f"{len(rows)} cases: {summary or 'none'}",
+    ]
+    if lengths:
+        flagged = sum(
+            1 for case, *_ in rows if wordier(a_words.get(case), b_words.get(case))
+        )
+        lines.append(
+            f"Answer length: {flagged} cases wordier on B (mean answer words over A's by more than {LENGTH_MARGIN:.0%})"
+        )
+    lines += [
         "",
-        "| Case | Class | A passes | B passes |",
-        "|---|---|---|---|",
+        "| Case | Class | A passes | B passes |"
+        + (" A words | B words | |" if lengths else ""),
+        "|---|---|---|---|" + ("---|---|---|" if lengths else ""),
     ]
     for case, kind, a, b in rows:
-        lines.append(
-            f"| `{case}` | {kind} | {a.cell() if a else '-'} | {b.cell() if b else '-'} |"
-        )
+        row = f"| `{case}` | {kind} | {a.cell() if a else '-'} | {b.cell() if b else '-'} |"
+        if lengths:
+            aw, bw = a_words.get(case), b_words.get(case)
+            cell = lambda w: "-" if w is None else str(round(w))
+            row += (
+                f" {cell(aw)} | {cell(bw)} | {'wordier' if wordier(aw, bw) else ''} |"
+            )
+        lines.append(row)
     return "\n".join(lines) + "\n"
 
 
@@ -215,16 +279,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "run_b", type=Path, help="run B's artifact directory (EVAL_FRONT_DOOR=session)"
     )
+    parser.add_argument(
+        "--length-gate",
+        action="store_true",
+        help="also exit 1 when a case is wordier on B (answer length is part of front-door parity)",
+    )
     args = parser.parse_args(argv)
     try:
         a_run, b_run = read_run(args.run_a), read_run(args.run_b)
         check_comparable(args.run_a, args.run_b, a_run, b_run)
         rows = compare(a_run, b_run)
+        a_words, b_words = read_answer_words(args.run_a), read_answer_words(args.run_b)
     except UnreadableRun as err:
         print(f"ERROR: {err}", file=sys.stderr)
         return 2
-    sys.stdout.write(markdown(rows))
-    return 1 if any(kind == REGRESSION for _, kind, _, _ in rows) else 0
+    sys.stdout.write(markdown(rows, a_words, b_words))
+    if any(kind == REGRESSION for _, kind, _, _ in rows):
+        return 1
+    if args.length_gate and any(
+        wordier(a_words.get(c), b_words.get(c)) for c, *_ in rows
+    ):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

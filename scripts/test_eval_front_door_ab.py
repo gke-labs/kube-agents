@@ -162,6 +162,55 @@ class CompareTest(unittest.TestCase):
             with self.assertRaises(ab.UnreadableRun):
                 ab.read_run(Path(tmp))
 
+    def run_ab_with_words(
+        self, a_words: dict[str, list[int]], b_words: dict[str, list[int]], *extra: str
+    ) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp, "a"), Path(tmp, "b")
+            for d, words in ((a, a_words), (b, b_words)):
+                d.mkdir()
+                log = []
+                for case, reps in words.items():
+                    write_case(d, case, 3, 3)
+                    log.append(f"Task {case} Result: [PASSED]")
+                    log += [
+                        f"  rep {i + 1} shape: opens_on_verdict=1 answer_words={w}"
+                        for i, w in enumerate(reps)
+                    ]
+                (d / ab.GRADING_LOG).write_text("\n".join(log) + "\n", encoding="utf-8")
+            (b / ab.FRONT_DOOR_FILE).write_text("session\n", encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                code = ab.main([*extra, str(a), str(b)])
+            return code, out.getvalue()
+
+    def test_answer_length_is_compared_from_the_grading_logs(self) -> None:
+        """A case whose mean answer on B runs over A's by more than the margin
+        is flagged wordier; within the margin it isn't."""
+        code, out = self.run_ab_with_words(
+            {"long": [100, 100, 100], "close": [200, 200, 200]},
+            {"long": [200, 200, 200], "close": [240, 240, 240]},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Answer length: 1 cases wordier on B", out)
+        self.assertIn("| `long` | same | 3/3 | 3/3 | 100 | 200 | wordier |", out)
+        self.assertIn("| `close` | same | 3/3 | 3/3 | 200 | 240 |  |", out)
+
+    def test_the_length_gate_fails_a_wordier_case(self) -> None:
+        code, _ = self.run_ab_with_words(
+            {"long": [100]}, {"long": [200]}, "--length-gate"
+        )
+        self.assertEqual(code, 1)
+        code, _ = self.run_ab_with_words(
+            {"long": [100]}, {"long": [110]}, "--length-gate"
+        )
+        self.assertEqual(code, 0)
+
+    def test_runs_without_grading_logs_show_no_length_columns(self) -> None:
+        code, out, _ = self.run_ab({"held": (3, 3)}, {"held": (3, 3)})
+        self.assertEqual(code, 0)
+        self.assertNotIn("A words", out)
+
     def test_counts_that_do_not_add_up_are_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             write_case(Path(tmp), "odd", 4, 3)
