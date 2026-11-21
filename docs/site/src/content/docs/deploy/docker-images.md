@@ -129,7 +129,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
-| `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
+| `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (hermes-upstream stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.6` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
 | `node` | `docker.io/library/node` | `24-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
@@ -146,7 +146,7 @@ Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each
 
 ### `platform-agent`
 
-The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates:
+The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) from the files of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates:
 
 - the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint;
 - the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`;
@@ -240,12 +240,16 @@ Docker builds source `tags.env` via the `HERMES_AGENT_TAG` build arg:
 ```dockerfile
 ARG HERMES_AGENT_TAG
 ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
-FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
+FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS hermes-upstream
 ```
+
+The agent images do not build on that image's layers. The build copies its files into an empty stage and leaves out GSAP (`/opt/hermes/node_modules/gsap`), an animation library that Hermes' dashboard workspace installs under a licence that is not an open-source one. Hermes' built dashboard does not contain it, and no layer of `platform-agent` or `credential-proxy` holds it. The Hermes image itself still does, so a mirror of it carries the package.
 
 The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-agents` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
+
+A copy of files does not carry the Hermes image's own configuration, so the Dockerfile declares its `ENV`, `WORKDIR` and `VOLUME` again, and the build compares the `ENV` and `WORKDIR` with the pinned image. A bump that changes either fails the build at that comparison and prints the difference. Nothing compares the `VOLUME` or any other setting.
 
 The tool-call audit trail does not depend on Hermes' log line format: the `tool_call_audit` plugin and the `chat_message_audit` hook write their records to a file of their own that the `fluent-bit` sidecar tails as JSON ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)). What a bump can still change is the plugin and hook interfaces the two emitters are loaded through. Once a bumped `platform-agent` is running, has made a tool call and has answered a chat turn, query `jsonPayload.audit_event:*` in Logs Explorer. A `tool_call_start` record with a `jsonPayload.file_path` ending in `audit.jsonl` means the plugin still loads and writes, and a `chat_message_start` record means the hook does. None means the plugin or the hook no longer registers, which the agent container's startup output and `agent.log` name.
 

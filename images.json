@@ -295,7 +295,7 @@
         "key": "HERMES_AGENT_TAG"
       },
       "buildArg": "HERMES_AGENT_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile (agent-base stage).",
+      "pulledBy": "deploy/docker/Dockerfile (hermes-upstream stage).",
       "description": "The Hermes harness the agent images are built on."
     },
     {
