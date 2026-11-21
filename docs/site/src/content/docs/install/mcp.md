@@ -13,7 +13,7 @@ You need three things:
 
 - **An installed `PlatformAgent`.** The MCP server runs by default as a client of the install's message bus. Check with `kubectl get platformagent -A`.
 - **A kubeconfig context for the cluster** the install runs on, which works from a terminal on the same machine. [Reach the cluster](#reach-the-cluster) checks it, including for a private cluster.
-- **Go 1.27 or later**, to build the bridge, on Linux or macOS. The bridge does not build for Windows yet.
+- **Linux or macOS.** The bridge comes prebuilt for both; there is no Windows build yet. Building it yourself instead needs Go 1.27 or later.
 
 ## Check the MCP server
 
@@ -86,7 +86,7 @@ kubectl --context <context> -n kubeagents-system get service platform-agent-a2a-
 kubectl --context <context> -n kubeagents-system auth can-i create pods/portforward
 ```
 
-When all three work, skip to [Build the bridge](#build-the-bridge).
+When all three work, skip to [Get the bridge](#get-the-bridge).
 
 ### Reaching a private cluster
 
@@ -104,7 +104,22 @@ KUBECTL_PORT_FORWARD_WEBSOCKETS=false kubectl --context <context> -n kubeagents-
 
 The bridge reads the same kubeconfig settings as `kubectl`, a `proxy-url` included, so a context that passes the checks works for the bridge too. Keep any tunnel open while your host runs the bridge.
 
-## Build the bridge
+## Get the bridge
+
+Each GitHub Release from 0.36.0 on attaches the bridge prebuilt for macOS and Linux on amd64 and arm64, as `kube-agents-mcp_<version>_<os>_<arch>.tar.gz`, covered by the release's `checksums.txt`. Download the archive for your machine and the checksums, check it, and put the binary on your `PATH`. For example, for 0.36.0 on an Apple silicon Mac:
+
+```bash
+VERSION=0.36.0 OS=darwin ARCH=arm64
+gh release download "$VERSION" --repo gke-labs/kube-agents \
+  -p "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz" -p checksums.txt
+grep "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz" checksums.txt | shasum -a 256 -c -
+tar -xzf "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz"
+install -m 0755 "kube-agents-mcp_${VERSION}_${OS}_${ARCH}/kube-agents-mcp" ~/.local/bin/
+```
+
+Any directory on your `PATH` works in place of `~/.local/bin`. Without `gh`, download the same two files from the release's page. On Linux, `sha256sum -c -` takes the place of `shasum -a 256 -c -`.
+
+### Build from source
 
 The bridge is a Go program in the `a2a` module of the kube-agents repository. Install it into `$(go env GOPATH)/bin`:
 
@@ -112,15 +127,15 @@ The bridge is a Go program in the `a2a` module of the kube-agents repository. In
 go install github.com/gke-labs/kube-agents/a2a/cmd/kube-agents-mcp@main
 ```
 
-The module needs Go 1.27; an older `go` command fetches the right toolchain by itself unless `GOTOOLCHAIN=local` is set. To build from a clone instead, run `go build -o kube-agents-mcp ./cmd/kube-agents-mcp` in its `a2a` directory. Check the binary:
+The module needs Go 1.27; an older `go` command fetches the right toolchain by itself unless `GOTOOLCHAIN=local` is set. To build from a clone instead, run `go build -o kube-agents-mcp ./cmd/kube-agents-mcp` in its `a2a` directory.
+
+### Check the binary
 
 ```bash
 kube-agents-mcp --version
 ```
 
 It prints `kube-agents-mcp` and a version: the release for a binary from a release archive, or for a build from source the module version Go recorded (a pseudo-version for `@main`; `dev` when it recorded none). Note the binary's full path (`command -v kube-agents-mcp`): your host starts it by that path.
-
-Newer GitHub Releases also attach the bridge prebuilt for macOS and Linux on amd64 and arm64, as `kube-agents-mcp_<version>_<os>_<arch>.tar.gz`, covered by the release's `checksums.txt`. Releases from before those archives began carry none, so build from source when yours has none.
 
 ## Configure your MCP host
 
@@ -188,7 +203,7 @@ agy --print "Call the kube-agents connection_status tool." \
 ```
 
 :::caution
-A bridge built before the `KUBE_AGENTS_MCP_STREAM_STEPS` setting existed ignores it. Check with `kube-agents-mcp --help`; if its usage lists no `stream-steps` flag, rebuild it, or have the agent pass `stream_steps: false` to `send_message` instead, for example "Use the kube-agents send_message tool with stream_steps false to ask: …".
+A bridge built before the `KUBE_AGENTS_MCP_STREAM_STEPS` setting existed ignores it. Check with `kube-agents-mcp --help`. If its usage lists no `stream-steps` flag, replace it with a release from 0.36.0 on or a build from source. Or have the agent pass `stream_steps: false` to `send_message` instead, for example "Use the kube-agents send_message tool with stream_steps false to ask: …".
 :::
 
 ### Antigravity editor
