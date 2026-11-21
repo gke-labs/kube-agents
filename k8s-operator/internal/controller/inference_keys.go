@@ -325,9 +325,14 @@ func wellFormedInferenceKey(apiKey string) bool {
 }
 
 // inferenceKeyDigest is the map's index for a key: its sha256, lowercase
-// hex, as the hook computes it. A fast hash is the right one: the key is 256
-// random bits, so its digest can't be guessed back.
+// hex, as the hook computes it.
 func inferenceKeyDigest(apiKey string) string {
+	// A fast digest is the right one, not a password KDF: every input is a
+	// 256-bit random key the operator minted (newInferenceKey), so its digest
+	// can't be guessed back, and the gateway's hook compares this same
+	// sha256. CodeQL's weak-sensitive-data-hashing query reads apiKey as a
+	// password; the name stays so its clear-text-logging query keeps
+	// watching it.
 	sum := sha256.Sum256([]byte(apiKey))
 	return hex.EncodeToString(sum[:])
 }
