@@ -148,6 +148,17 @@ type Config struct {
 	// configuration in which this executor runs work a verifier refused.
 	CapabilityOptional bool
 
+	// StopOnWriteRefusal stops the harness at the first definitive write
+	// refusal the broker client recorded in WriteRefusalFile (refusal.go)
+	// and ends the task rejected with the refused rule and verb. No tool
+	// output is read for it. applyDefaults sets it for a profile pod
+	// (ProfileExecutor); a test sets it directly.
+	StopOnWriteRefusal bool
+	// WriteRefusalFile is the task's record file (EnvWriteRefusalFile),
+	// which the profile worker makes beside the task token. Empty reads
+	// nothing, and the task is never stopped at a refusal.
+	WriteRefusalFile string
+
 	// TaskDeadline bounds the harness wall clock below the pod's own
 	// activeDeadlineSeconds so the failure is ours to report, not the
 	// enforcer's.
@@ -251,6 +262,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Scope == "" {
 		c.Scope = capability.NamespaceScope(c.Namespace)
+	}
+	if c.ProfileExecutor {
+		c.StopOnWriteRefusal = true
 	}
 }
 
@@ -945,6 +959,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// another turn, and the task's deliverable is the result that
 		// settles the count.
 		pendingTurns = 1
+		// refused is the definitive write refusal that stopped the harness
+		// (StopOnWriteRefusal): the task's end is decided, and nothing the
+		// harness says after it changes that.
+		refused *writeRefusal
+		// refusalReadFailed keeps an unreadable record file to one log line.
+		refusalReadFailed bool
 	)
 
 	// stopForAbandon reports an abandon, from whichever arm finds it first,
@@ -976,6 +996,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			if stopForAbandon() {
 				continue
 			}
+			// A harness stopped at a write refusal is drained, not
+			// published, but for what its turn cost.
+			if refused != nil {
+				if ev.Type == "result" {
+					a.publishUsage(ctx, ev)
+				}
+				continue
+			}
 			switch ev.Type {
 			case "system":
 				if ev.Subtype == "init" {
@@ -989,6 +1017,28 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
+			case "user":
+				// A user line carries tool results: each call that wrote a
+				// record has exited before its result is printed. Only the
+				// record is read, never the results.
+				if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
+					continue
+				}
+				r, err := readWriteRefusal(a.cfg.WriteRefusalFile, a.taskID)
+				if err != nil && !refusalReadFailed {
+					refusalReadFailed = true
+					log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
+				}
+				if refused = r; refused != nil {
+					// Stopped the way cancel stops it: closed stdin, SIGTERM
+					// to the process group, SIGKILL after KillGrace. The loop
+					// still drains its stdout and reaps it before the
+					// terminal below.
+					log.Info("the broker refused a write; stopping the harness",
+						"task", a.taskID, "rule", refused.rule, "verb", refused.verb)
+					proc.closeStdin()
+					proc.kill(a.cfg.KillGrace)
+				}
 			case "result":
 				// What the turn cost goes out first, whatever the turn
 				// decided: a delegating turn, a steered one and an errored
@@ -1037,7 +1087,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				log.Info("steer for an abandoned task dropped", "task", a.taskID)
 				continue
 			}
-			if sawResult || exited {
+			if sawResult || exited || refused != nil {
 				// Post-deliverable steer: the deliverable is chosen and
 				// the harness is wrapping up, so this correction cannot be
 				// absorbed. The payload spec requires the refusal be
@@ -1070,7 +1120,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Cancel and the deadline end the turn when they fire, not when
 			// the harness finally dies: a call in that window would publish
 			// a child and turn the canceled task into a completed one.
-			if sawResult || exited || canceled || deadlineHit || stopForAbandon() {
+			if sawResult || exited || canceled || deadlineHit || refused != nil || stopForAbandon() {
 				ask.reply <- delegateReply{Message: "this turn has already ended"}
 				continue
 			}
@@ -1141,6 +1191,11 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			if delegated {
 				return a.completeWith(resultText)
 			}
+			// Nor is it a failure of a task already stopped at a write
+			// refusal: that refusal is its end.
+			if refused != nil {
+				return a.endRefused(refused)
+			}
 			state := lib.StateFailed
 			err := a.finalize(state, a.evictedReason(), resultText)
 			return Result{State: state, Evicted: true}, err
@@ -1153,12 +1208,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	}
 
 	// Harness exited and stdout is drained. Decide the terminal in strict
-	// precedence: a clean deliverable beats everything (cancel lost the
-	// race, legal per the payload spec), then deadline, then cancel, then
-	// failure with evidence.
+	// precedence: a write refusal that stopped the harness (no result line
+	// is read after it), then a clean deliverable (cancel lost the race,
+	// legal per the payload spec), then deadline, then cancel, then failure
+	// with evidence.
 	switch {
 	case a.abandoned():
 		return Result{Abandoned: true}, nil
+	case refused != nil:
+		return a.endRefused(refused)
 	case sawResult && resultErr == "":
 		return a.completeWith(resultText)
 	case sawResult:
@@ -1179,6 +1237,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			proc.stderrEvidence()
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
+}
+
+// endRefused publishes the terminal of a task stopped at a definitive write
+// refusal: rejected, the state no supervisor retries and the gateway renders
+// with its reason, carrying the refused rule and verb and no other output.
+func (a *adapter) endRefused(r *writeRefusal) (Result, error) {
+	state := lib.StateRejected
+	return Result{State: state}, a.finalize(state, writeRefusedReason(r), "")
 }
 
 // completeWith publishes the deliverable and the completed terminal: the

@@ -591,6 +591,19 @@ GC - replay is not tied to the pod's existence.
   implement. The janitor (below) writes the terminal event on the dead task's behalf.
   `activeDeadlineSeconds` is the same path triggered by the clock.
 
+**Stopped at a write refusal.** A profile task's adapter stops the harness at the first
+definitive write refusal the credential broker made, as the in-pod broker client recorded
+it, and never on a tool's output. The client appends a record to the task's
+`write-refusals` file (on the task token's tmpfs, named in `CREDENTIAL_PROXY_REFUSAL_FILE`)
+when the broker's 403 carries `write_refusal: true`;
+[the dispatch design](spec-profiles-dispatch.md) states which refusals those are. The
+adapter reads the file after each tool result, stops the harness as a cancel does, and
+publishes terminal `rejected` with `reason: write-refused`, naming the record's rule and
+verb and nothing of the output. Nothing the harness prints after the refusal is published.
+`rejected` is the state no supervisor retries, and a delegating parent reads its reason. The broker
+refuses the write either way: a record that is lost leaves the task running, and every
+further write is refused too.
+
 **Evicted.** Node drains, spot preemptions, and GKE upgrades deliver `SIGTERM` with a
 grace period, and the adapter MUST trap it: flush the pending output buffer, publish
 terminal `failed` with `reason: worker-evicted`, exit 143. That keeps an infrastructure

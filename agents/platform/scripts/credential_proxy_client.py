@@ -254,6 +254,31 @@ SECURITY_POLICY_BLOCKED_CODE = "SECURITY_POLICY_BLOCKED"
 SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
 LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
 POLICY_BLOCKED_CODES = frozenset({SECURITY_POLICY_BLOCKED_CODE, SESSION_BUDGET_EXCEEDED_CODE, LOOP_BREAKER_CODE})
+# A profile worker's out-of-band record of a definitive write refusal. The
+# broker marks such a refusal's body (credential_proxy.WRITE_REFUSAL_KEY): the
+# read-only rule refusing a mutating kubectl verb, or a profile task's
+# permit-gated version-control write refused for want of the permit. On a 403
+# carrying that mark, the client appends one JSON line to the file the worker
+# adapter names in REFUSAL_FILE_ENV (a file on the task's tmpfs, beside the
+# task token), and the adapter stops the task at the first record
+# (a2a/worker-adapter/refusal.go). The record carries the task (REFUSAL_TASK_ENV,
+# when set), the rule, the verb, the route and the time, all from the broker's
+# answer and this call, never from a command's output. The file is opened
+# append-only, without following a symlink and without creating it: the adapter
+# makes it for each task, so a missing or unwritable file is a line on stderr
+# and the call's result is unchanged.
+WRITE_REFUSAL_KEY = "write_refusal"
+REFUSAL_FILE_ENV = "CREDENTIAL_PROXY_REFUSAL_FILE"
+REFUSAL_TASK_ENV = "CREDENTIAL_PROXY_REFUSAL_TASK"
+# The write-refusal record's fields and its timestamp form.
+REFUSAL_RECORD_RULE = "rule"
+REFUSAL_RECORD_VERB = "verb"
+REFUSAL_RECORD_ROUTE = "route"
+REFUSAL_RECORD_TIME = "time"
+REFUSAL_RECORD_TASK = "task"
+REFUSAL_RECORD_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_REFUSAL_RULE_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
+_REFUSAL_VERB_WORDS = 3
 # The line a malformed exec URL writes, once per process, when the stateful
 # broker takes its place. No "credential proxy" prefix, for the same reason as
 # EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
@@ -1942,6 +1967,57 @@ def _exit_status(exit_code: int) -> int:
     return _SIGNAL_EXIT_BASE - exit_code if exit_code < 0 else exit_code
 
 
+def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
+    """Append the worker's record of a definitive write refusal, when this answer is one.
+
+    Only a 403 whose body carries the broker's ``write_refusal`` mark as true
+    is recorded; every other answer, and a call with REFUSAL_FILE_ENV unset,
+    writes nothing. ``verb_words`` is the verb the broker resolved (an exec
+    refusal's ``verb``) or the version-control verb the call named. Never
+    raises: the record is the worker's signal, not the call's outcome.
+    """
+    if status != 403 or not isinstance(payload, dict) or payload.get(WRITE_REFUSAL_KEY) is not True:
+        return
+    target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
+    if not target:
+        return
+    rule = payload.get(REFUSAL_RECORD_RULE)
+    if not isinstance(rule, str) or not _REFUSAL_RULE_RE.match(rule):
+        return
+    words = verb_words if isinstance(verb_words, list) else []
+    verb = " ".join(_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in words[:_REFUSAL_VERB_WORDS] if str(w))
+    record = {
+        WRITE_REFUSAL_KEY: True,
+        REFUSAL_RECORD_RULE: rule,
+        REFUSAL_RECORD_VERB: verb,
+        REFUSAL_RECORD_ROUTE: _VERB_WORD_SAFE_RE.sub("_", route)[:_VERB_WORD_MAX],
+        REFUSAL_RECORD_TIME: time.strftime(REFUSAL_RECORD_TIME_FORMAT, time.gmtime()),
+    }
+    task = os.environ.get(REFUSAL_TASK_ENV, "").strip()
+    if task and CALLER_LABEL_RE.match(task):
+        record[REFUSAL_RECORD_TASK] = task
+    line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    # No O_CREAT: the adapter makes the file. O_NONBLOCK so a FIFO put in its
+    # place cannot hold the call; the fstat below then refuses anything but a
+    # regular file.
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as exc:
+        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=sys.stderr)
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            print("credential proxy: the write refusal was not recorded (not a regular file)", file=sys.stderr)
+            return
+        # One write of one short line: an O_APPEND write lands whole.
+        os.write(fd, line)
+    except OSError as exc:
+        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=sys.stderr)
+    finally:
+        os.close(fd)
+
+
 def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
     """Print a refusal from `/v1/exec` the way the agent reads it, and its exit code."""
     if payload is None:
@@ -1955,6 +2031,7 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
     # The far side composes the payload: a `code` that is not a string (a
     # list, an object) is not a refusal code, and must not raise out of here.
     if isinstance(payload.get("code"), str) and payload["code"] in POLICY_BLOCKED_CODES:
+        record_write_refusal(exc.code, payload, EXEC_ROUTE, payload.get("verb"))
         print(
             payload.get("message", "Command blocked for security reasons."),
             file=sys.stderr,
@@ -2593,6 +2670,7 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
             # every other refusal because it is the one a caller cannot fix by
             # asking differently.
             raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
+        record_write_refusal(exc.code, answer, route, [verb])
         raise _vcs_refusal(exc, answer, answer) from exc
     except urllib.error.URLError:
         # Out untouched: the send never landed, and `vcs_client.call` has an
