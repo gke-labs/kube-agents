@@ -12320,13 +12320,15 @@ spec:
                           backend:
                             description: |-
                               Backend is the surface the person writes from: one whose requester is
-                              one verified person. The a2a door isn't one: its callers name
-                              themselves under a shared token.
+                              one verified person. The a2a door's eval class isn't one: its callers
+                              name themselves under a shared token; its Google and Entra sign-in
+                              classes are.
                             enum:
                               - gchat
                               - slack
                               - discord
                               - a2a-google
+                              - a2a-entra
                             type: string
                           tier:
                             description: Tier is the name of an interactive-mode Tier.
@@ -12337,6 +12339,7 @@ spec:
                             description: |-
                               User is the person's id on that backend: their email on Google Chat
                               (compared without case) and on a2a-google (as their Google token
+                              carries it), their Entra object id on a2a-entra (as their Entra token
                               carries it), their user id on Slack or Discord.
                             maxLength: 128
                             minLength: 1
@@ -12646,6 +12649,13 @@ spec:
                       description: |-
                         Provider is the LiteLLM provider slug, the text before the first "/" of the
                         default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
+                      type: string
+                    reasoningEffort:
+                      description: |-
+                        ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+                        the default model's entry, as typed: low, medium or high from the chart, or
+                        whatever a hand-edited config says. Absent when the entry states none, so the
+                        model thinks at its own default, and absent while the served CRD predates it.
                       type: string
                   type: object
                 lastReconcileTime:

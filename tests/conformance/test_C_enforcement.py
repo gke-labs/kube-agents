@@ -2817,6 +2817,38 @@ class C2FailClosed(unittest.TestCase):
         # The commercial domain itself is still the default universe.
         self.assertEqual(client.DEFAULT_UNIVERSE_DOMAIN, client.normalize_universe_domain("googleapis.com"))
 
+    def test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts(self) -> None:
+        """A universe domain from the environment is held to the metadata server's answer.
+
+        The environment's value decides which hosts get the broker's credential.
+        A value that the host's metadata server contradicts would send that
+        credential to another universe, or to commercial hosts under other
+        names (`clients6.google.com` is well-formed and is not under
+        `googleapis.com`). The start check refuses it, in both directions; a
+        value the metadata server confirms, and a host with no universe route,
+        start as before.
+        """
+        proxy = h.credential_proxy
+
+        def check(configured, answer):
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answer
+            try:
+                proxy.check_universe_domain_against_metadata(configured, sleep=lambda _s: None)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                with self.assertRaises(RuntimeError):
+                    check(configured, (reported, True))
+        check("universe.example.test", ("universe.example.test", True))
+        check("universe.example.test", (None, True))
+
 
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""
