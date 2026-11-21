@@ -1847,6 +1847,16 @@ Mutation(
         "which are commercial hosts, are relayed",
     ),
     Mutation(
+        "C2-universe-domain-metadata-check",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if reported != configured:\n",
+         "    if False and reported != configured:\n"),
+        "test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts",
+        "trust the universe domain the environment names again, so a value "
+        "the host's metadata server contradicts starts the broker and its "
+        "credential goes to that domain's hosts",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
