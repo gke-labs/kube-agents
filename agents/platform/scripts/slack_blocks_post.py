@@ -38,6 +38,10 @@ POST_METHOD = "chat.postMessage"
 #: The relay patch's own bound on one relayed call.
 POST_TIMEOUT_S = 35
 UNKNOWN_ERROR = "unknown"
+# The relay is the credential broker, an in-cluster Service: a proxy from the
+# environment must not get this request and its bearer token, and urllib does
+# not leave out a cluster host by itself.
+_RELAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 #: Slack's codes for blocks it will not render; any other refusal is not about the blocks.
 BLOCK_ERRORS = frozenset({"invalid_blocks", "invalid_blocks_format"})
 #: Below this, the relay answered without calling Slack (authentication, a bad request).
@@ -94,7 +98,7 @@ def post(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _RELAY_OPENER.open(request, timeout=timeout) as response:
             data = (json.load(response) or {}).get("response") or {}
     except urllib.error.HTTPError as exc:
         fields = relayed_slack_error(exc)

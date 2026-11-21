@@ -11,10 +11,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import automation_rules
-import automerge_checks as ac
+from fix_recipes import registry
 import automerge_eligibility as ae
 import vcs_broker
 from workspace_paths import WorkspaceError
+
+ac = registry.checks_module("no-pdb")
 
 CLUSTER = "acme-prod-1/us-central1/fleet-1"
 CONTEXT = "gke_acme-prod-1_us-central1_fleet-1"

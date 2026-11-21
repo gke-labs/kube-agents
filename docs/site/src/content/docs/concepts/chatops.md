@@ -502,6 +502,7 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 
 - the image tag, the mode, the Kubernetes version, and the install's age and readiness;
 - the model as `provider/name` from the resource's `status.inference` (`unavailable` while the operator has not written it);
+- the reasoning effort configured on that model, from the same status (`unset` when the config states none, `unavailable` with the model);
 - the `status.usage` counters and readings;
 - one `proposals by origin:` line, the origins whose count is above zero, as the agent reports them (`none` when all are zero, `no reading` when the status has none);
 - the credential broker's top five `tool/subcommand` pairs since its pod started, from `status.usage.topTools` (`unavailable` while the status holds no list);
@@ -605,6 +606,8 @@ An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) c
 The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched. External inbound Bot Framework webhook ingress is not yet shipped in the operator: `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods.
 
 Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`). See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
+
+What this means for an evaluator: enabling `spec.integration.teams` gives you the outbound half only. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams does not reach the agent: Microsoft delivers it to the bot's messaging endpoint, and the install provides none. The broker's event queue that the gateway reads admits only the gateway pod, so nothing outside the install can feed a message in either.
 
 ## Proactive alerts (both channels)
 

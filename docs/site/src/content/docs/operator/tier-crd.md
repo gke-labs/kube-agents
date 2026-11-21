@@ -45,8 +45,8 @@ The PlatformAgent's `spec.tiers.membership` lists the people whose profile tasks
 spec:
   tiers:
     membership:
-      - backend: slack # gchat, slack, discord or a2a-google
-        user: U0ABC123 # an email on gchat and a2a-google, a user id on slack and discord
+      - backend: slack # gchat, slack, discord, a2a-google or a2a-entra
+        user: U0ABC123 # an email on gchat and a2a-google, an object id on a2a-entra, a user id on slack and discord
         tier: oncall
 ```
 
