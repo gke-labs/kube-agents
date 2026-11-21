@@ -25,10 +25,9 @@ import (
 // gateway it was given: it is not an open proxy, and nothing it logs comes
 // from a request or response body.
 const (
-	// GatewayProxyPathPrefix is the only path the proxy forwards: the
-	// Gemini-format model calls (`/v1beta/models/<model>:streamGenerateContent`
-	// and its siblings).
-	GatewayProxyPathPrefix = "/v1beta/models/"
+	// gatewayProxyPathPrefix is where every path the proxy forwards starts:
+	// the Gemini-format model calls (gatewayProxyPath).
+	gatewayProxyPathPrefix = "/v1beta/models/"
 	// gatewayProxyMaxRequestBytes bounds one model call's body. A call
 	// carries the whole conversation so far, so it is generous; anything
 	// larger is refused before it reaches the gateway.
@@ -61,12 +60,19 @@ const (
 	// call at a time; the cap is for a process on loopback that is not the
 	// harness.
 	gatewayProxyMaxConns = 16
+	// gatewayProxyIdleConnsToGateway is how many kept-alive connections to
+	// the gateway the proxy holds between calls; a harness makes one call
+	// at a time.
+	gatewayProxyIdleConnsToGateway = 4
+	// gatewayProxyMaxHeaderBytes bounds a request's headers. A model call's
+	// headers are a few short lines.
+	gatewayProxyMaxHeaderBytes = 64 << 10
 )
 
 // gatewayProxyPath is every path the proxy forwards: a model name, then one
 // of the Gemini-format calls. Anything else, an encoded character, a second
 // slash or a climb included, is refused.
-var gatewayProxyPath = regexp.MustCompile(`^/v1beta/models/[A-Za-z0-9._-]+:(generateContent|streamGenerateContent|countTokens)$`)
+var gatewayProxyPath = regexp.MustCompile(`^` + regexp.QuoteMeta(gatewayProxyPathPrefix) + `[A-Za-z0-9._-]+:(generateContent|streamGenerateContent|countTokens)$`)
 
 // gatewayProxyForwardedHeaders are the only request headers the proxy
 // passes to the gateway: what a Gemini-format call needs. Everything else a
@@ -117,7 +123,7 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 		DialContext:           (&net.Dialer{Timeout: gatewayProxyDialTimeout}).DialContext,
 		ResponseHeaderTimeout: gatewayProxyResponseHeaderTimeout,
 		TLSHandshakeTimeout:   gatewayProxyDialTimeout,
-		MaxIdleConnsPerHost:   4,
+		MaxIdleConnsPerHost:   gatewayProxyIdleConnsToGateway,
 		MaxConnsPerHost:       gatewayProxyMaxConns,
 		IdleConnTimeout:       gatewayProxyIdleTimeout,
 	}
@@ -198,7 +204,7 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 		Handler:           mux,
 		ReadHeaderTimeout: gatewayProxyHeaderTimeout,
 		IdleTimeout:       gatewayProxyIdleTimeout,
-		MaxHeaderBytes:    64 << 10,
+		MaxHeaderBytes:    gatewayProxyMaxHeaderBytes,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	go func() {
