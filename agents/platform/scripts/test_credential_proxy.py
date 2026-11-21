@@ -3402,6 +3402,46 @@ class ExecOutputRedactionTest(unittest.TestCase):
                         self.assertTrue(body[stream].endswith(" [REDACTED]"), body[stream][-40:])
                         self.assertEqual([], sorted(f for f in _fragments(token) if f in body[stream]))
 
+    def assert_cut_tokens_redacted(self, body, kept):
+        # A command killed mid-write ends mid-token, as a capped one does: the
+        # prefix left is shorter than the shape and must not pass.
+        prefix = _REDACT_GITHUB_TOKEN[:kept]
+        for stream in ("stdout", "stderr"):
+            self.assertNotIn(prefix, body[stream], body[stream][-120:])
+        self.assertTrue(body["stdout"].endswith("token: [REDACTED]"), body["stdout"][-40:])
+        self.assertTrue(body["stderr"].startswith("warning: [REDACTED]"), body["stderr"][:80])
+
+    def test_a_token_a_timeout_cuts_leaves_no_prefix_behind(self):
+        kept = 12
+        CredentialProxyHandler.executor.timeout_seconds = 1
+        self.kubectl_that(
+            f"printf 'token: {_REDACT_GITHUB_TOKEN[:kept]}'; printf 'warning: {_REDACT_GITHUB_TOKEN[:kept]}' >&2; "
+            "exec sleep 30"
+        )
+        _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        self.assertTrue(shell["timedOut"], shell)
+        self.assertTrue(shell["stdout"].endswith(_REDACT_GITHUB_TOKEN[:kept]), shell["stdout"][-40:])
+        _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((True, 124), (body["timedOut"], body["exitCode"]), body)
+        self.assert_cut_tokens_redacted(body, kept)
+        # The broker's timeout note comes after the cut and is kept whole.
+        self.assertIn("[credential-proxy] kubectl command timed out", body["stderr"])
+
+    def test_a_token_a_drain_stop_cuts_leaves_no_prefix_behind(self):
+        kept = 12
+        executor = CredentialProxyHandler.executor
+        self.kubectl_that(
+            f"printf 'token: {_REDACT_GITHUB_TOKEN[:kept]}'; printf 'warning: {_REDACT_GITHUB_TOKEN[:kept]}' >&2; "
+            "exec sleep 30"
+        )
+        timer = threading.Timer(1.0, executor.end_commands.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(credential_proxy.DRAINED_COMMAND_EXIT_CODE, body["exitCode"], body)
+        self.assert_cut_tokens_redacted(body, kept)
+        self.assertIn(credential_proxy.DRAINED_COMMAND_NOTE, body["stderr"])
+
     def test_output_that_is_not_utf8_keeps_its_decoding_and_is_redacted(self):
         self.kubectl_that(f"printf '\\xff\\xfe token {_REDACT_GITHUB_TOKEN}\\n'")
         _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
@@ -3436,6 +3476,16 @@ class ExecResponseRedactionTest(unittest.TestCase):
         self.assertEqual((1, 124, True), (redacted, response["exitCode"], response["timedOut"]))
         shell, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_SHELL)
         self.assertEqual((cut + note, 0), (shell["stderr"], redacted))
+
+    def test_a_timed_out_stdout_is_redacted_across_its_end(self):
+        # A timeout kills the command mid-write: its stdout's end is a cut even
+        # when the cap was not reached and no explicit offset was recorded.
+        cut = "token: " + _REDACT_GITHUB_TOKEN[:12]
+        result = self.result(exit_code=124, stdout=cut, timed_out=True)
+        response, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(("token: [REDACTED]", 1), (response["stdout"], redacted))
+        explicit = self.result(exit_code=124, stdout=cut, timed_out=True, stdout_cut_at=len(cut))
+        self.assertEqual("token: [REDACTED]", credential_proxy.exec_response(explicit, credential_proxy.CALLER_ROLE_SESSION)[0]["stdout"])
 
     def test_a_private_key_the_cap_cut_goes_from_its_begin_line_to_the_cut(self):
         # The cut took its END line; the key body past the 16 KiB span goes too.

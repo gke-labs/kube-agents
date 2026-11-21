@@ -971,15 +971,18 @@ Consequences:
   literals matched, with their leading boundary and at least four characters
   of a body (`redact_cut_tail`), so a token the cap left shorter than its
   shape's minimum length is replaced too, and a word ending in `ghs_` or
-  `ASIA` is not. On stderr the cut is where the cap
-  fell, before any `[credential-proxy]` line the broker appends. The exit code,
+  `ASIA` is not. A command killed mid-write, for a timeout or a stop (the
+  drain, a caller's ceiling), is cut the same way, on both streams. On stderr
+  the cut is where the output ended, before any `[credential-proxy]` line the
+  broker appends. The exit code,
   the flags and `bytesWritten` (the command's own stdout bytes the cap kept)
   are the same as for any caller; the log records how many shapes were
   replaced and nothing of what they were. The shell's output is returned as
   captured: the Hermes runtime behind it redacts tool results on its side.
   The same redaction, on every string value and object key of the JSON
-  answer, applies to these roles' MCP relay replies, their audit-report reads,
-  and the version-control reads whose answer is a forge's text
+  answer, applies to these roles' MCP relay replies, their audit-report reads
+  and the `a2a-reports` role's (the A2A gateway's relay, which posts a report
+  to chat; `REDACTED_REPORT_READ_ROLES`), and the version-control reads whose answer is a forge's text
   (`REDACTED_VCS_READ_VERBS`: proposal and issue views and lists, proposal
   commits, branch view), and to the A2A MCP server's one verb,
   `proposal-view`, which it answers to MCP clients outside the cluster
@@ -994,12 +997,13 @@ Consequences:
   Not redacted either: the `kubeconfig` field of a `get-credentials` answer,
   which is the file gcloud wrote (the cluster's endpoint, its public CA
   certificate and a `gke-gcloud-auth-plugin` exec stanza, with no token or
-  client key), and the `a2a-reports` role's report reads: `audit_report.py
-finish` applies its redaction backstop (`redact_secrets`) to every string
-  of a report on the way into the store, and the report's `ledger_body` is the
-  body already published on the ledger issue, so the control sits at the
-  write, where it covers every reader and the published copy
-  ([`fleet-audit-report-store.md`](designs/fleet-audit-report-store.md)).
+  client key). `audit_report.py finish` redacts a report's strings on the way
+  into the store, but a profile worker's raw store `PUT` does not go through
+  `finish`, so the read is redacted as well
+  ([`fleet-audit-report-store.md`](designs/fleet-audit-report-store.md)). The
+  listener checks the writer stamp's sha256 against the stored bytes before
+  it answers; the broker redacts after that, passes `X-Report-Writer` on
+  unchanged, and passes a report with nothing to replace byte for byte.
   What the redaction is: a guard against a credential the model reads by
   accident in output. It is not an exfiltration control against a model that
   reshapes output on purpose; the broker's read-only gates and the

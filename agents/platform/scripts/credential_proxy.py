@@ -2543,6 +2543,14 @@ REDACTED_VCS_READ_VERBS: frozenset[str] = frozenset(
 # comments and diff as the install's forge credential fetched them, from a
 # repository the client may hold no read on of its own.
 REDACTED_VCS_READ_ROLES: frozenset[str] = REDACTED_OUTPUT_ROLES | {CALLER_ROLE_MCP}
+# The roles an audit-report read is redacted for: the two above, and the A2A
+# gateway's report relay, which posts the report it reads to chat. `finish`
+# redacts a report's strings before it stores them, but a profile worker's raw
+# store PUT does not go through `finish`, so the read is redacted here too. The
+# listener checks the writer stamp's sha256 against the stored bytes before it
+# answers, so the redaction comes after that check, and the X-Report-Writer
+# header is passed on unchanged. A body with nothing to redact passes as it came.
+REDACTED_REPORT_READ_ROLES: frozenset[str] = REDACTED_OUTPUT_ROLES | {CALLER_ROLE_A2A_REPORTS}
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
 # whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the profile role keeps
@@ -8451,11 +8459,17 @@ class ExecutionResult:
     # Whether the cut fell on stdout. `truncated` covers either stream; the
     # shim's non-zero exit is for a cut payload, not for cut diagnostics.
     stdout_truncated: bool = False
-    # Where the cap cut stderr, as an offset into `stderr`, or None when it
-    # did not. What follows the offset is the broker's own note (a kubectl
-    # timeout, a drain), appended after the bound. `exec_response` redacts
-    # across the cut at this offset, as it does at the end of a cut stdout.
+    # Where stderr was cut, as an offset into `stderr`, or None when it was
+    # not: by the cap, or by the command being killed mid-write for a timeout
+    # or a stop (the drain, a caller's ceiling), which ends the output
+    # mid-token as a cap does. What follows the offset is the broker's own note
+    # (a kubectl timeout, a drain), appended after the bound. `exec_response`
+    # redacts across the cut at this offset.
     stderr_cut_at: int | None = None
+    # The same for stdout, which takes no note, so a cut is at its end.
+    # `stdout_truncated` alone stays the cap's flag the caller sees; this one
+    # also covers a timeout or a stop.
+    stdout_cut_at: int | None = None
 
 
 def redact_tool_output(text: str, cut_at: int | None = None) -> tuple[str, int]:
@@ -8495,7 +8509,10 @@ def exec_response(result: ExecutionResult, role: str | None) -> tuple[dict[str, 
     """
     stdout, stderr, redacted = result.stdout, result.stderr, 0
     if role in REDACTED_OUTPUT_ROLES:
-        stdout, stdout_count = redact_tool_output(stdout, len(stdout) if result.stdout_truncated else None)
+        stdout_cut_at = result.stdout_cut_at
+        if stdout_cut_at is None and (result.stdout_truncated or result.timed_out):
+            stdout_cut_at = len(stdout)
+        stdout, stdout_count = redact_tool_output(stdout, stdout_cut_at)
         stderr, stderr_count = redact_tool_output(stderr, result.stderr_cut_at)
         redacted = stdout_count + stderr_count
     response: dict[str, Any] = {
@@ -8558,11 +8575,13 @@ def _redact_json_strings(value: Any) -> tuple[Any, int]:
     return value, 0
 
 
-def redact_reply_body(body: bytes, role: str | None) -> tuple[bytes, int]:
+def redact_reply_body(
+    body: bytes, role: str | None, roles: frozenset[str] = REDACTED_OUTPUT_ROLES
+) -> tuple[bytes, int]:
     """A JSON reply body (the MCP relay's, an audit report read) as the caller receives it, and the count.
 
-    For a role in REDACTED_OUTPUT_ROLES the reply is parsed and every string
-    value redacted, so a token inside a tool result's text is matched on the
+    For a role in ``roles`` (REDACTED_OUTPUT_ROLES unless the caller names
+    another set) the reply is parsed and every string value redacted, so a token inside a tool result's text is matched on the
     text the tool wrote rather than on its JSON escaping (where a `\\n` before a
     token would hide its word boundary). The document is re-serialised only
     when something was replaced. When nothing was, the bytes are still
@@ -8575,7 +8594,7 @@ def redact_reply_body(body: bytes, role: str | None) -> tuple[bytes, int]:
     rather than cutting it, and the report store answers whole reports, so
     there is no cut to carry the redaction across.
     """
-    if role not in REDACTED_OUTPUT_ROLES or not body:
+    if role not in roles or not body:
         return body, 0
     try:
         document = json.loads(body)
@@ -13558,8 +13577,13 @@ class CommandExecutor:
             )
         stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
         stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
-        # Taken before the notes below are appended, which is where the cap cut.
-        stderr_cut_at = len(stderr_text) if captured.stderr_truncated or stderr_cut else None
+        # Taken before the notes below are appended, which is where the output
+        # was cut: by the cap, or by the kill of a command that timed out or was
+        # stopped (the drain, a caller's ceiling) mid-write, which can end
+        # either stream mid-token just as the cap can.
+        killed = captured.timed_out or captured.stopped
+        stdout_cut_at = len(stdout_text) if captured.stdout_truncated or stdout_cut or killed else None
+        stderr_cut_at = len(stderr_text) if captured.stderr_truncated or stderr_cut or killed else None
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
             target_str = (
                 f"target kubeconfig {kubeconfig_path}"
@@ -13596,6 +13620,7 @@ class CommandExecutor:
             stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
             output_limit=self.max_output_bytes,
             stdout_truncated=captured.stdout_truncated or stdout_cut,
+            stdout_cut_at=stdout_cut_at,
             stderr_cut_at=stderr_cut_at,
         )
 
@@ -15714,8 +15739,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         if not write:
             # A report is agent-written text a profile caller reads back as
-            # tool output; the writer stamp still names who wrote the stored one.
-            payload, redacted = redact_reply_body(payload, role)
+            # tool output, and the a2a-reports relay posts to chat
+            # (REDACTED_REPORT_READ_ROLES); the writer stamp still names who
+            # wrote the stored one.
+            payload, redacted = redact_reply_body(payload, role, REDACTED_REPORT_READ_ROLES)
             if redacted:
                 LOGGER.info("audit-report read redacted shapes=%d", redacted)
         self._log_audit_report(status, "relayed")
