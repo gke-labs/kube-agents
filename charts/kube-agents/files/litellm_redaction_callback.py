@@ -398,10 +398,15 @@ class KubeAgentsRedactionCallback(CustomLogger):
         if isinstance(node, dict) and set(node) == {JSON_WRAPPER_KEY, JSON_DOCUMENT_KEY} and isinstance(node[JSON_WRAPPER_KEY], int):
             source = sources[node[JSON_WRAPPER_KEY]]
             document = self._collapse_json(node[JSON_DOCUMENT_KEY], sources, counts)
+            # The text rules run over the canonical encoding as well as the
+            # raw string: escapes in the raw string (a key written as
+            # \u-sequences) can hide a value the canonical one shows.
+            canonical = json.dumps(document, ensure_ascii=False)
+            encoded, made = AuditRedactor.redact_text_counted(canonical, self._rules)
             raw, _ = AuditRedactor.redact_text_counted(source, self._rules)
-            if raw == source and document == json.loads(source.strip()) and not self._has_duplicate_keys(source):
+            unchanged = encoded == canonical and raw == source and document == json.loads(source.strip())
+            if unchanged and not self._has_duplicate_keys(source):
                 return source
-            encoded, made = AuditRedactor.redact_text_counted(json.dumps(document, ensure_ascii=False), self._rules)
             for name, count in made.items():
                 counts[name] = counts.get(name, 0) + count
             return encoded
