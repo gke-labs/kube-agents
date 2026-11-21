@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` held at 1, the only value the gateway accepts until a stop walks the whole tree; a batch's results already come back in one wake); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
 
 ## Purpose
 
@@ -163,9 +163,39 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   the posted replies: the console and Discord draw no button, and the posts are their
   contract; Slack's typed `stop` keeps its rule beside the native Stop.
   A stopped task whose terminal event has not yet arrived DETACHES: it stops
-  serializing the conversation - new turns start new tasks - while its events, if
-  they ever arrive, still relay. "Detached" and "non-detached" below mean exactly
-  this state and its absence.
+  serializing the conversation - new turns start new tasks. "Detached" and
+  "non-detached" below mean exactly this state and its absence.
+  One stop cancels the conversation's whole task tree (amended for fan-out, #5682):
+  the task holding the conversation, the AgentProfile parents waiting open on it,
+  and, walking down from the chain's root through each task's children, every
+  other task of the tree the gateway hasn't seen end, a fan-out's children
+  included. Each gets a cancel on its own addressee's `…in`, is marked canceled on
+  its history entry, and gets its `DISPATCH_STOPS` record when it is a
+  profile task; a task that keeps its own line on its history entry (a batch child,
+  a delegating turn) has it closed on "🛑 stopped". A task that has already ended is
+  left alone. The stop posts its one notice for the conversation, never one per task.
+  A cancel doesn't end a task: a stopped task may work on until its executor reads
+  the cancel, so it counts as running, for the conversation's one live delegation and
+  for its batch, until its terminal arrives or the heal ends it (nothing within
+  `A2A_FIRST_EVENT_GRACE`). A task whose cancel couldn't be published is marked
+  canceled all the same, so its writes are dropped, and also `CancelUnsent`: the
+  next stop, or the next turn's heal, sends its cancel again (under the delegation's
+  authority at the heal, with an empty requester and a logged warning when that
+  attribution can't be read), until one goes out or the task ends.
+  **No late writes:** nothing a task the gateway canceled writes afterwards reaches
+  the room, whether it detached or not and whichever chain it is in, a single
+  delegation's included. Its status notes, questions (`input-required`), notices,
+  turn answers, result, terminal notice and steer shortfall are dropped, each with a
+  log line (`relay: dropped a canceled task's write`). Its rolling line loses its
+  Stop control at the first drop, edited to "🛑 cancel sent — the task ends when the
+  executor confirms", and is closed by the terminal's edit, which reads stopped
+  ("🛑 canceled") whatever the task ended with; nor does its executor's terminal mark
+  draw. The stop's own reply is the only output, with one exception: a task started
+  with no rolling line at all (`TaskRef.Lineless`: its backend shows task status
+  itself, so a delegated child has none) has no line to close, so its terminal posts
+  its one "🛑 canceled", unless the stop answered for itself. A program's observer hears the
+  chain end canceled and is handed no deliverable, and a console's terminal frame says
+  canceled with no answer text.
 
   **Stopping the cards (gke-labs#3263).** The front door's turn often ends
   seconds after it files a kanban card, and the card is not a task the gateway holds. With
@@ -462,9 +492,9 @@ Depth is bounded by `A2A_DELEGATION_DEPTH_MAX` (default 3; a child's depth is it
 one, and a wake inherits its child's) - `FromEnv` refuses a configured value under 1 at boot
 rather than read it as "off", which is the worker's own `A2A_DELEGATE_TOOL` switch, a different
 knob. Width, the number of children one request may ask for, is bounded by
-`A2A_DELEGATION_WIDTH_MAX`. For now `FromEnv` accepts only 1 and refuses anything wider at boot:
-a batch's children report back in one wake, but a stop doesn't yet cancel every child of the
-tree, so fan-out stays off until it does, and the ceiling it will open to is `lib.DelegateBatchMax` (16). A batch wider than the setting is refused whole,
+`A2A_DELEGATION_WIDTH_MAX`, 10 by default and at most 10: `FromEnv` refuses anything wider at
+boot, naming the variable. Every reader holds a batch to `lib.DelegateBatchMax` (16) whatever the
+setting. A batch wider than the setting is refused whole,
 with a notice naming the cap, so the session can split it or choose (`delegation.width`). An absent `AllowedUsers`, or one that renders as `[""]`, admits every authenticated user, the
 same as today's ingress door; a list present but blank once its entries are trimmed and split
 admits nobody, the rule #2207 already holds for the Chat ingress list. The A2A door (backend
@@ -492,7 +522,7 @@ the next cold start, which fails closed. A turn whose requester is no longer on
 record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
 reads text whose authors the check can't count. The bound is the conversation as the primer
 carries it, not one incarnation. What else a session carries across incarnations is
-#2370. One live delegation per conversation, a detached-but-still-running child counting as live:
+#2370. One live delegation per conversation, a detached-but-still-running child counting as live until its terminal arrives or the heal ends it:
 the delegating turn's own repeat, a batch included, is ignored and logged, while a later turn's
 request reaching the gateway while any child of an earlier request still runs is refused with a
 notice naming the running task (`delegation.busy`) - a human asking again deserves an answer, the
@@ -501,14 +531,19 @@ checked (target, parameters, the lists, depth) before it mints any, so one entry
 the whole batch with nothing minted. Its children don't take the conversation's active task or
 its addressee: the delegating turn keeps both, and each child records its parent, which lists them
 all. A child that can't be submitted partway through withdraws the batch: the children already
-submitted are canceled and dropped from the record, except one whose cancel couldn't be published, which stays on it, marked canceled, so a stop and the reaper can still find it. A batch of one is a
+submitted are canceled and dropped from the record, except one whose cancel couldn't be published, which stays on it, marked canceled with its cancel unsent, so it still counts as live and the next turn's heal sends its cancel again. A batch of one is a
 single child, which takes the active task as before. Width bounds what one conversation asks for,
 not what runs at once: children queue at the dispatcher, held to each profile's concurrency. At the
 `cluster` profile's default concurrency of 2, ten children run two at a time, about five rounds
-of one cluster task. A stop that cancels every child is the next step of fan-out and isn't built
-yet. Until it is, a stop during a fan-out cancels only the delegating turn, so no wake follows,
-while its children run on; a child that then never starts never ends, and the stopped turn keeps
-the conversation (a heal leaves a stopped turn alone) until that tree-wide stop exists. The batch's plan, how many children it asked for, goes on the delegating turn's entry in one
+of one cluster task. A stop during a fan-out cancels the delegating turn and every child still
+running or queued (Stop, above). The batch ends, and the conversation's next delegation can
+mint, once every child has ended: each stopped child's terminal counts it ended, stopped, and
+posts nothing (a child with no line of its own posts its one "🛑 canceled", as above), and when the last has ended no wake runs and the chain ends once, canceled. A
+stopped batch caught partway through minting mints no more, so only the children on the record
+count. A stopped child whose terminal never comes is ended by the next turn's heal once its
+terminal is on the stream or it has produced nothing within `A2A_FIRST_EVENT_GRACE`: its end
+logged and its route retired, with nothing posted (`TaskRef.StopPending`), so a child that never
+starts doesn't hold the conversation for good. The batch's plan, how many children it asked for, goes on the delegating turn's entry in one
 record write before any child is submitted, so a gateway that stops partway through leaves a
 record that says so: the request, redelivered or read back from the stream by the relay or the
 heal, finishes the batch with every check applied again, minting only the entries not yet on the
@@ -601,6 +636,10 @@ replay.
 **A fan-out's wake.** A batch of two or more wakes the session once, when the last of its children
 has ended, with every child's outcome. Each child's end is kept on its own history entry as it
 arrives (`BatchEnd`): its result, its reason, or its question, already cut to its share of the wake.
+That text is content under the content rule, and the session record outlives the stream copy it was
+read from, so it is cleared once the wake is on the bus, and at `A2A_ASK_TTL` from the child's start
+for a wake that hasn't run; the rest of the end (its state and source) stays, so the batch still
+counts the child ended.
 The children before the last wake nothing and end nothing, and the chain's root terminal is
 announced once, by the wake's end, or at the last child when no wake runs. The wake opens with the
 ask as a single child's does, then `You delegated N tasks, and all of them have ended.` and, under
@@ -618,11 +657,22 @@ batch that was withdrawn: the chain then ends canceled at the last child. The de
 keeps the conversation's active task while its children run, its line closed at its own terminal,
 and gives it up when the last child ends. Meanwhile a status ask lists each child still running by
 its addressee and parameters with the state its stream shows (`waiting to start` for one queued
-with no events yet), a stop reaches the delegating turn (so no wake follows), and any other text
+with no events yet), a stop cancels the delegating turn and every child, and any other text
 is refused with `N delegated tasks are running. Say stop to cancel them.` rather than sent: the
 turn it would steer has ended, and which child it was meant for isn't the gateway's to guess. A
 heal during a fan-out looks at each child still running as it looks at a single child, a terminal
-on the stream or nothing past `A2A_FIRST_EVENT_GRACE`, so the last one it finds wakes the session.
+on the stream or nothing past its grace, so the last one it finds wakes the session. A child's grace
+is `A2A_FIRST_EVENT_GRACE`, except for a profile child not stopped: a batch wider than its
+profile's concurrency leaves children queued at the dispatcher, which publishes nothing for a
+queued submission (it holds it back until a slot frees) and ends one itself, with a
+`queue-timeout` terminal the heal reads, once it has waited past the profile's queue timeout. So a
+profile child's grace is the dispatcher's default queue timeout, an hour, then
+`A2A_FIRST_EVENT_GRACE` for the pod to start after it is admitted (`batchChildQueueAllowance`):
+a fan-out of three to `cluster`, at its concurrency of 2, keeps its third child however long the
+first two take, up to that bound. A profile whose queue timeout is set longer than an hour can
+still have a queued child ended as never started past it; its stop record then drops the child
+from the dispatcher's queue. A stopped child's stop record ends it at the dispatcher at once, so it
+gets `A2A_FIRST_EVENT_GRACE` alone, as a platform child does.
 The history cap of fifty entries never drops a fan-out still running: its root, its delegating
 turn and every child stay, ended or not, and the oldest of the rest go first.
 
@@ -3143,8 +3193,9 @@ every message through either stamps its own backend.
   when the task is canceled; the client polls `tasks/get` for that terminal as for any other. Once
   a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response,
   or one queued behind the first for the conversation's turn) is answered with the `Task` and
-  publishes nothing, whatever terminal it has reached since: `canceled`, or `completed` or `failed`
-  if the turn finished before the cancel took. A task that ended with no cancel published refuses
+  publishes nothing, whatever terminal it has reached since. That terminal reads `canceled` even
+  when the executor finished the turn before the cancel took, since nothing a canceled task writes
+  afterwards reaches the room or the door ("Stop"). A task that ended with no cancel published refuses
   one with `TaskNotCancelableError` (-32002). A queued cancel checks, while it waits and in the same
   critical section as any claim, whether a cancel is on the bus or the task has ended. It answers as
   soon as either is true, without taking a turn (#5777).
