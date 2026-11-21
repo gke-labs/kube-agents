@@ -25,13 +25,14 @@ type fakeGateway struct {
 
 type recordedCall struct {
 	method, path, query, host, auth string
+	hdr                             http.Header
 	body                            []byte
 }
 
 func (g *fakeGateway) handler(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	g.mu.Lock()
-	g.calls = append(g.calls, recordedCall{r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.Header.Get("Authorization"), body})
+	g.calls = append(g.calls, recordedCall{r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.Header.Get("Authorization"), r.Header.Clone(), body})
 	g.mu.Unlock()
 	w.Header().Set("Content-Type", "text/event-stream")
 	for i := 1; i <= 3; i++ {
@@ -140,7 +141,14 @@ func TestTheGatewayProxyIsNotAnOpenProxy(t *testing.T) {
 		{"admin route", "GET /key/list HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
 		{"anthropic route", "POST /v1/messages HTTP/1.1\r\nHost: " + addr + "\r\nContent-Length: 0\r\n\r\n", http.StatusNotFound},
 		{"climbing path", "GET /v1beta/models/../../key/list HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
-		{"delete", "DELETE /v1beta/models/x HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusMethodNotAllowed},
+		{"encoded climb", "GET /v1beta/models/%2e%2e/%2e%2e/key/list HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
+		{"encoded slash", "GET /v1beta/models/m%2F..%2Fx:generateContent HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
+		{"double encoded", "GET /v1beta/models/%252e%252e:generateContent HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
+		{"double slash", "GET /v1beta/models//m:generateContent HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
+		{"another call", "GET /v1beta/models/m:embedContent HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
+		{"model list", "GET /v1beta/models/ HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusNotFound},
+		{"upgrade", "GET /v1beta/models/m:generateContent HTTP/1.1\r\nHost: " + addr + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", http.StatusBadRequest},
+		{"delete", "DELETE /v1beta/models/x:generateContent HTTP/1.1\r\nHost: " + addr + "\r\n\r\n", http.StatusMethodNotAllowed},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if got := raw(c.req); got != c.want {
@@ -190,8 +198,114 @@ func TestTheGatewayProxyBoundsWhatPassesThrough(t *testing.T) {
 	}
 	n, _ := io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	if n > gatewayProxyMaxResponseBytes {
-		t.Errorf("the response passed %d bytes, over the %d cap", n, gatewayProxyMaxResponseBytes)
+	if n > gatewayProxyMaxResponseBytes || n < gatewayProxyMaxResponseBytes-(1<<20) {
+		t.Errorf("the response passed %d bytes; want it cut off at the %d cap", n, gatewayProxyMaxResponseBytes)
+	}
+
+	exact := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chunk := bytes.Repeat([]byte("z"), 1<<20)
+		for i := 0; i < gatewayProxyMaxResponseBytes>>20; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(exact.Close)
+	ep := startProxyFor(t, exact.URL)
+	resp, err = http.Post(ep.URL+"/v1beta/models/m:generateContent", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if err != nil || n != gatewayProxyMaxResponseBytes {
+		t.Errorf("a response of exactly the cap passed %d bytes, err %v; want all %d", n, err, gatewayProxyMaxResponseBytes)
+	}
+
+	// A chunked body, with no length to refuse up front, is cut at the cap.
+	pr, pw := io.Pipe()
+	go func() {
+		chunk := bytes.Repeat([]byte("c"), 1<<20)
+		for i := 0; i <= gatewayProxyMaxRequestBytes>>20; i++ {
+			if _, err := pw.Write(chunk); err != nil {
+				return
+			}
+		}
+		pw.Close()
+	}()
+	req, _ := http.NewRequest(http.MethodPost, p.URL+"/v1beta/models/m:generateContent", pr)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("an oversized chunked request got %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestTheGatewayProxyDropsWhatACallerMayNotSay: credentials and attribution
+// a caller sets, in a header or the query, never reach the gateway; the
+// rest of the query does.
+func TestTheGatewayProxyDropsWhatACallerMayNotSay(t *testing.T) {
+	g := &fakeGateway{}
+	up := httptest.NewServer(http.HandlerFunc(g.handler))
+	t.Cleanup(up.Close)
+	p := startProxyFor(t, up.URL)
+	req, _ := http.NewRequest(http.MethodPost, p.URL+"/v1beta/models/m:streamGenerateContent?alt=sse&key=caller-secret", strings.NewReader("{}"))
+	for _, h := range []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key", "X-Litellm-Tags", "X-Litellm-End-User-Id"} {
+		req.Header.Set(h, "caller-secret")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	calls := g.seen()
+	if len(calls) != 1 {
+		t.Fatalf("gateway saw %d calls, want 1", len(calls))
+	}
+	c := calls[0]
+	if c.query != "alt=sse" {
+		t.Errorf("query %q, want alt=sse alone", c.query)
+	}
+	for h, v := range c.hdr {
+		if strings.Contains(strings.Join(v, ","), "caller-secret") {
+			t.Errorf("header %s reached the gateway", h)
+		}
+	}
+	if c.hdr.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type %q did not pass through", c.hdr.Get("Content-Type"))
+	}
+}
+
+// TestAFailedGatewayCallLogsNoQuery: when the gateway can't be reached, the
+// log line names the path and the cause, not the outbound URL's query.
+func TestAFailedGatewayCallLogsNoQuery(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := "http://" + ln.Addr().String()
+	ln.Close()
+	var buf bytes.Buffer
+	p, err := StartGatewayProxy(dead, slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	resp, err := http.Post(p.URL+"/v1beta/models/m:generateContent?alt=QUERYMARK", "application/json", strings.NewReader("{\"BODYMARK\":1}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status %d, want 502", resp.StatusCode)
+	}
+	if out := buf.String(); strings.Contains(out, "QUERYMARK") || strings.Contains(out, "BODYMARK") || !strings.Contains(out, "gateway proxy") {
+		t.Errorf("log %q: want the failure, without the query or body", out)
 	}
 }
 

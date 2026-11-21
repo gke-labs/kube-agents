@@ -10,8 +10,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/net/netutil"
 )
 
 // The gateway proxy (#6714) carries a harness's model calls from loopback to
@@ -43,7 +46,34 @@ const (
 	gatewayProxyResponseHeaderTimeout = 10 * time.Minute
 	gatewayProxyDialTimeout           = 10 * time.Second
 	gatewayProxyShutdownTimeout       = 5 * time.Second
+	// gatewayProxyIdleTimeout bounds a kept-alive connection between
+	// requests. There is deliberately no server ReadTimeout: once a request's
+	// body is read, net/http cancels the request's context when that deadline
+	// passes, which would cut off a model's answer that streams for longer.
+	// A caller that drips a body is bounded instead by gatewayProxyMaxConns
+	// and gatewayProxyCallTimeout.
+	gatewayProxyIdleTimeout = time.Minute
+	// gatewayProxyCallTimeout bounds one model call end to end, so a gateway
+	// that streams forever under the response cap still ends.
+	gatewayProxyCallTimeout = 30 * time.Minute
+	// gatewayProxyMaxConns caps the connections the proxy holds at once, in
+	// from the harness and out to the gateway alike. A harness makes one
+	// call at a time; the cap is for a process on loopback that is not the
+	// harness.
+	gatewayProxyMaxConns = 16
 )
+
+// gatewayProxyPath is every path the proxy forwards: a model name, then one
+// of the Gemini-format calls. Anything else, an encoded character, a second
+// slash or a climb included, is refused.
+var gatewayProxyPath = regexp.MustCompile(`^/v1beta/models/[A-Za-z0-9._-]+:(generateContent|streamGenerateContent|countTokens)$`)
+
+// gatewayProxyCallerHeaders are request headers a caller may not set, since
+// the gateway reads each as the caller's credential or attribution: a key
+// the harness sent would decide which caller the gateway charges, once the
+// proxy speaks for the worker (#6706). Any header starting x-litellm- is
+// dropped too.
+var gatewayProxyCallerHeaders = []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key", "Proxy-Authorization"}
 
 // GatewayProxy is a running gateway proxy. URL is what the harness is told
 // (`http://127.0.0.1:<port>`).
@@ -72,25 +102,41 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 		return nil, fmt.Errorf("gateway proxy listen: %w", err)
 	}
 	self := ln.Addr().String()
+	ln = netutil.LimitListener(ln, gatewayProxyMaxConns)
 	transport := &http.Transport{
 		Proxy:                 nil, // straight to the gateway, whatever the pod's proxy env says
 		DialContext:           (&net.Dialer{Timeout: gatewayProxyDialTimeout}).DialContext,
 		ResponseHeaderTimeout: gatewayProxyResponseHeaderTimeout,
 		TLSHandshakeTimeout:   gatewayProxyDialTimeout,
 		MaxIdleConnsPerHost:   4,
+		MaxConnsPerHost:       gatewayProxyMaxConns,
+		IdleConnTimeout:       gatewayProxyIdleTimeout,
 	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstream)
 			r.Out.Host = upstream.Host
+			// A key in the query is a credential to the gateway as well.
+			q := r.Out.URL.Query()
+			q.Del("key")
+			r.Out.URL.RawQuery = q.Encode()
+			for _, h := range gatewayProxyCallerHeaders {
+				r.Out.Header.Del(h)
+			}
+			for h := range r.Out.Header {
+				if strings.HasPrefix(strings.ToLower(h), "x-litellm-") {
+					r.Out.Header.Del(h)
+				}
+			}
 			// #6706: once the gateway mints a key per caller class, the
 			// worker's key reaches the pod as ANTHROPIC_API_KEY, and goes
 			// here as `Authorization: Bearer <key>`, which the gateway's
 			// caller check reads. Only a real key: unset, empty or a
 			// placeholder sends nothing, since the gateway refuses a key it
 			// doesn't know and admits a keyless call. Until then the call
-			// passes through as the harness sent it: in gateway mode the
-			// Antigravity CLI sends no key.
+			// passes through as the harness sent it, less the caller headers
+			// above: in gateway mode the Antigravity CLI sends no key. The
+			// key is Set, never Added.
 		},
 		Transport:     transport,
 		FlushInterval: -1, // stream each chunk as it comes: the answers are SSE
@@ -99,8 +145,18 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			// The path names the model and nothing else; the body is never
-			// logged.
+			var tooBig *http.MaxBytesError
+			if errors.As(err, &tooBig) {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return
+			}
+			// The path names the model and nothing else. The error is
+			// unwrapped from its *url.Error, whose text carries the outbound
+			// URL and its query; the body is never logged.
+			var uerr *url.Error
+			if errors.As(err, &uerr) {
+				err = uerr.Err
+			}
 			log.Warn("gateway proxy: the call to the gateway failed", "path", r.URL.Path, "err", err)
 			w.WriteHeader(http.StatusBadGateway)
 		},
@@ -114,8 +170,13 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 			http.Error(w, "not a proxy", http.StatusForbidden)
 			return
 		}
-		if !strings.HasPrefix(r.URL.Path, GatewayProxyPathPrefix) || strings.Contains(r.URL.Path, "..") {
+		if r.URL.RawPath != "" || !gatewayProxyPath.MatchString(r.URL.Path) {
 			http.NotFound(w, r)
+			return
+		}
+		// No upgrade: a tunnel would carry bytes past every cap here.
+		if r.Header.Get("Upgrade") != "" || strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+			http.Error(w, "upgrade not allowed", http.StatusBadRequest)
 			return
 		}
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
@@ -127,11 +188,14 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, gatewayProxyMaxRequestBytes)
-		rp.ServeHTTP(w, r)
+		ctx, cancel := context.WithTimeout(r.Context(), gatewayProxyCallTimeout)
+		defer cancel()
+		rp.ServeHTTP(w, r.WithContext(ctx))
 	})
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: gatewayProxyHeaderTimeout,
+		IdleTimeout:       gatewayProxyIdleTimeout,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
@@ -165,6 +229,11 @@ var errGatewayResponseTooLarge = errors.New("gateway proxy: the gateway's respon
 
 func (b *cappedBody) Read(p []byte) (int, error) {
 	if b.left <= 0 {
+		// Exactly at the cap is fine if the body ends there.
+		var one [1]byte
+		if n, err := b.r.Read(one[:]); n == 0 && errors.Is(err, io.EOF) {
+			return 0, io.EOF
+		}
 		return 0, errGatewayResponseTooLarge
 	}
 	if int64(len(p)) > b.left {
