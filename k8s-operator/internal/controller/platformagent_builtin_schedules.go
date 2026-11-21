@@ -51,7 +51,7 @@ const builtinCanarySuffix = "-canary"
 // no findings queue, no remediation PRs, no cluster change). It is behaviour, not enforcement:
 // what stops a shadow run writing is that its unattended grant holds no write permit. The
 // profile declares it on its card, so the gateway's declared-parameter check carries it.
-const builtinDryRunParameter = "dryRun"
+const builtinDryRunParameter = "dry_run"
 
 // builtinSchedule is one row of the built-in table.
 type builtinSchedule struct {

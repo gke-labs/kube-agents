@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -473,5 +474,15 @@ func TestAgentScheduleAccessDeniedIgnoresTheRenderersWrites(t *testing.T) {
 	}
 	if got := AgentScheduleAccessDenied(reads); len(got) != 1 {
 		t.Fatalf("a list denial = %v, want it", got)
+	}
+}
+
+// The dry-run parameter is a name the gateway accepts: a task parameter's
+// name is a2a/lib's TaskParameterNameRE, ^[a-z][a-z0-9_]{0,62}$, and an
+// undeclared or ill-formed one refuses the run. (dryRun, the first spelling,
+// would have refused every canary run.)
+func TestTheDryRunParameterIsANameTheGatewayAccepts(t *testing.T) {
+	if !regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`).MatchString(builtinDryRunParameter) {
+		t.Fatalf("%q isn't a task parameter name the gateway accepts", builtinDryRunParameter)
 	}
 }
