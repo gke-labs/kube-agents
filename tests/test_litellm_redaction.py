@@ -613,14 +613,19 @@ class TestCallback(unittest.TestCase):
         # never reaches the walk. A key name: the walk reads values. Either
         # way the original string is not sent as it was.
         repeated = '{"note": "on prod-eu-1", "note": "safe"}'
+        # Hidden from both the walk (dropped by the decoder) and the raw text
+        # rules (after an escaped newline, the IP has no word boundary).
+        repeated_escaped = '{"cmd": "get pods\\n10.0.0.7", "cmd": "safe"}'
         keyed = json.dumps({"10.0.0.5": "pod", "ok": 1})
         data = {"messages": [{"role": "assistant", "content": None, "tool_calls": [
             {"id": "a", "type": "function", "function": {"name": "t", "arguments": repeated}},
             {"id": "b", "type": "function", "function": {"name": "t", "arguments": keyed}},
+            {"id": "c", "type": "function", "function": {"name": "t", "arguments": repeated_escaped}},
         ]}]}
-        first, second = (call["function"]["arguments"] for call in self._run(data)["messages"][0]["tool_calls"])
+        first, second, third = (call["function"]["arguments"] for call in self._run(data)["messages"][0]["tool_calls"])
         self.assertNotIn("prod-eu-1", first)
         self.assertNotIn("10.0.0.5", second)
+        self.assertNotIn("10.0.0.7", third)
         json.loads(first)
         json.loads(second)
 
