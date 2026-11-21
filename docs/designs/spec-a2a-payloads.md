@@ -815,6 +815,12 @@ The end names no `childTaskId`, except for a child whose cancel couldn't be sent
 still run. A withdrawn child's own later end sends nothing more, and a stopped parent gets
 nothing.
 
+**A refused request.** A profile parent whose delegate request mints no child, because the gateway
+refused it or nothing started, gets a `message` on its `…in` carrying `{"delegationRefused": {"text"}}`
+(#4860), so it stops waiting for a child that won't exist. `text` is the notice the room sees, at most
+64 KiB. A waiting parent reads it as the end of the whole wait. A batch whose plan was written gets
+its per-entry ends instead, and a stopped or ended parent gets nothing.
+
 This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A
 profile parent that has already ended gets no child result; the gateway drops it and logs it. A
 chat session's turn ends when it delegates, so a session parent keeps the chatops wake instead

@@ -651,3 +651,28 @@ func TestDelegateTargetsCarryTheWidth(t *testing.T) {
 		}
 	}
 }
+
+// TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText: the
+// parent's model reads the text, so it must be there and within the cap.
+func TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText(t *testing.T) {
+	p, err := DelegationRefusalPart(DelegationRefusal{Text: "⚠️ delegation refused: out of scope"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := DelegationRefusalOf([]Part{{Kind: "text", Text: "x"}, p})
+	if !ok || got.Text != "⚠️ delegation refused: out of scope" {
+		t.Fatalf("round trip = %+v, %v", got, ok)
+	}
+	if _, ok := ChildResultOf([]Part{p}); ok {
+		t.Fatal("a refusal read as a child result")
+	}
+	for _, text := range []string{"", strings.Repeat("a", ChildResultTextCap+1)} {
+		if _, err := DelegationRefusalPart(DelegationRefusal{Text: text}); err == nil {
+			t.Fatalf("a refusal with %d bytes of text was built", len(text))
+		}
+	}
+	bad := Part{Kind: "data", Data: []byte(`{"delegationRefused":{"text":""}}`)}
+	if _, ok := DelegationRefusalOf([]Part{bad}); ok {
+		t.Fatal("an empty refusal was read")
+	}
+}

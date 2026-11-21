@@ -98,6 +98,12 @@ const (
 const (
 	noticeTurnNotStarted       = "⚠️ not started: "
 	noticeDelegationRefusedFor = "⚠️ delegation refused: "
+	// noticeDelegationNotStarted begins a profile parent's word that its
+	// request was accepted but started no child (#4860).
+	noticeDelegationNotStarted = "⚠️ delegation not started: "
+	// noticeProfileDoesNotDelegate refuses a task of a profile whose card
+	// doesn't say it delegates (AgentProfile spec.delegates, #6789).
+	noticeProfileDoesNotDelegate = "%s isn't set up to hand tasks on"
 )
 
 // How noticeParamUndeclared and noticeParamMissing spell a profile's

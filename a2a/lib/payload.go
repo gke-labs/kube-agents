@@ -738,6 +738,48 @@ func ChildResultOf(parts []Part) (ChildResult, bool) {
 	return ChildResult{}, false
 }
 
+// DelegationRefusal is the delegationRefused data part: the gateway's word
+// to a profile parent, on its .in, that its delegate request minted no child
+// (#4860). A refused request mints nothing, so there is no child to end and no
+// childResult to send; without this the parent waits to its deadline. Text is
+// the notice the room sees, at most ChildResultTextCap bytes. A parent that
+// waits on children reads it as the end of the whole wait.
+type DelegationRefusal struct {
+	Text string `json:"text"`
+}
+
+const delegationRefusedKey = "delegationRefused"
+
+// DelegationRefusalPart wraps r as the delegationRefused data part. A refusal
+// with no text, or text over the cap, is refused: the parent's model reads it.
+func DelegationRefusalPart(r DelegationRefusal) (Part, error) {
+	if r.Text == "" || len(r.Text) > ChildResultTextCap {
+		return Part{}, fmt.Errorf("delegation refusal: needs text of at most %d bytes", ChildResultTextCap)
+	}
+	data, err := json.Marshal(map[string]DelegationRefusal{delegationRefusedKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegationRefusalOf finds the delegationRefused part among parts, skipping
+// one DelegationRefusalPart would refuse.
+func DelegationRefusalOf(parts []Part) (DelegationRefusal, bool) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegationRefusedKey)
+		if !ok {
+			continue
+		}
+		var r DelegationRefusal
+		if json.Unmarshal(raw, &r) != nil || r.Text == "" || len(r.Text) > ChildResultTextCap {
+			continue
+		}
+		return r, true
+	}
+	return DelegationRefusal{}, false
+}
+
 // wrappedData is a data part's payload under key, when p is a data part
 // wrapping one.
 func wrappedData(p Part, key string) (json.RawMessage, bool) {
@@ -1025,6 +1067,11 @@ type AgentCard struct {
 	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
 	// Parameters are the task parameters the profile's persona declares.
 	Parameters []ProfileParameter `json:"parameters,omitempty"`
+	// Delegates says the profile's tasks may delegate (AgentProfile
+	// spec.delegates, #6789). The gateway refuses a delegate request from a
+	// task of a profile whose card doesn't say so; a card from an operator
+	// that predates the field doesn't, so it fails closed.
+	Delegates bool `json:"delegates,omitempty"`
 	// YieldToPinned hands a task addressed to this profile to the profile
 	// pinned to its target cluster, when there is one: the generic cluster
 	// agent sets it, and a specialist addressed by name keeps the task.

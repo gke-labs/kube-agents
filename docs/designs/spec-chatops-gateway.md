@@ -843,10 +843,12 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent runs at `unattended`
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); when the parent's profile doesn't delegate
+(`delegation.profile-not-delegating`: its card lacks `delegates`, from AgentProfile `spec.delegates`, so an operator's card
+from before the field fails closed); and when the parent runs at `unattended`
 (`delegation.unattended-parent`), whose trigger binding a child's grant doesn't carry yet. A child's
-end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
-reads while it waits open, and the parent holds the conversation again, so a stop or a steer
+end reaches a profile parent as a `childResult` message on the parent's `.in`, and a refusal as a
+`delegationRefused` one (#4860), which the parent reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
 chain's end, delegated or not. A stop while the child runs cancels the child and every profile
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,

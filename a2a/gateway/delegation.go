@@ -45,6 +45,9 @@ const (
 	// ruleDelegationParentChainMismatch refuses when an ancestor the record
 	// still holds contradicts the parent's carried chain.
 	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
+	// ruleDelegationProfileNotDelegating refuses a task of a profile whose
+	// card doesn't say it delegates (AgentProfile spec.delegates, #6789).
+	ruleDelegationProfileNotDelegating = "delegation.profile-not-delegating"
 	// ruleDelegationUnattendedParent refuses a child of an unattended task:
 	// the child's grant would not carry the parent's trigger binding.
 	ruleDelegationUnattendedParent = "delegation.unattended-parent"
@@ -167,6 +170,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 			g.log.Error("session record write failed after a delegation minted no child", "conversation", rec.Key, "err", err)
 		}
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason)
 	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
@@ -273,6 +277,13 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	if profileParent {
+		// Only a profile whose card says it delegates (spec.delegates):
+		// the worker's tool is the profile admin's opt-in, and this is
+		// where it holds, not the tool's absence on the worker (#6789).
+		if card, ok := g.profiles.lookup(parent.Addressee); !ok || !card.Delegates {
+			refuse(ruleDelegationProfileNotDelegating, noticeDelegationRefusedFor+fmt.Sprintf(noticeProfileDoesNotDelegate, parent.Addressee))
+			return
+		}
 		if rule, notice := profileParentRefusal(parent); rule != "" {
 			refuse(rule, noticeDelegationRefusedFor+notice)
 			return
@@ -1337,4 +1348,68 @@ func wakeToDoor(parent *TaskRef) bool {
 		return true
 	}
 	return false
+}
+
+// tellProfileParentNoChild sends a profile parent the refusal its delegate
+// request ended in (#4860), on its .in, so it stops waiting for a child that
+// will never exist. A session parent's turn has already ended on the hand-off
+// and needs nothing; nor does a batch whose plan was written, whose entries
+// each get their own end (endWithdrawnProfileBatch), nor a parent a stop
+// cancelled or that has ended (profileParentListens).
+func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string) {
+	parent, ok := rec.TaskRefFor(taskID)
+	if !ok || parent.Tier == "" || session != parent.Addressee || parent.BatchSize > 0 || len(parent.Children) > 0 {
+		return
+	}
+	if !g.profileParentListens(ctx, &parent, "") {
+		return
+	}
+	text := delegationRefusalText(reason)
+	if err := g.publishDelegationRefusal(ctx, rec, parent, text); err != nil {
+		g.log.Error("delegation refusal not delivered to its parent", "parent", parent.ID, "err", err)
+		return
+	}
+	g.log.Info("delegation refusal delivered to its parent", "parent", parent.ID)
+}
+
+// delegationRefusalText is the parent's line for a DelegationEnd reason:
+// a refusal's own notice, or what didn't start and why.
+func delegationRefusalText(reason string) string {
+	if notice, ok := strings.CutPrefix(reason, "reason: "+reasonDelegationRefused+" - "); ok {
+		return notice
+	}
+	if why, ok := strings.CutPrefix(reason, "reason: "+reasonDelegationNotStarted+" - "); ok {
+		return noticeDelegationNotStarted + why
+	}
+	return reason
+}
+
+// publishDelegationRefusal publishes a lib.DelegationRefusal on the parent's
+// .in, under the parent's own capability, as publishChildResult does.
+func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionRecord, parent TaskRef, text string) error {
+	if len(text) > lib.ChildResultTextCap {
+		text = truncateBytes(text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
+	}
+	part, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: text})
+	if err != nil {
+		return fmt.Errorf("build: %w", err)
+	}
+	payload, err := messagePayloadParts([]lib.Part{part}, parent.ID, rec.ContextID)
+	if err != nil {
+		return fmt.Errorf("payload: %w", err)
+	}
+	authority, err := AuthorityFromAttribution(parent.Attribution)
+	if err != nil {
+		return fmt.Errorf("authority: %w", err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, parent.ID, rec.ContextID, parent.CorrelationID, payload,
+		lib.WithTo(lib.Party{Session: parent.Addressee}),
+		lib.WithAuthority(authority.Render(parent.Capability)))
+	if err != nil {
+		return fmt.Errorf("envelope: %w", err)
+	}
+	if err := g.client.Publish(ctx, lib.TaskInSubject(parent.Addressee, parent.ID), env); err != nil {
+		return fmt.Errorf("publish: %w", err)
+	}
+	return nil
 }
