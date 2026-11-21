@@ -3,28 +3,35 @@
 # control-plane-to-node calls (logs, exec, webhooks, the metrics API) fail. A
 # declared gap: expected_fail until the check lands (gke-labs/kube-agents#5415,
 # which proposes `konnectivity-agent-exhaustion`).
-# What live tests showed (2026-11-20, one scratch cluster, GKE Standard 1.35.8,
-# 1 agent against GKE's 6): on Standard a hand edit of the ConfigMap
-# `konnectivity-agent-autoscaler-config` stays and the agent count follows it;
-# a hand scale of the Deployment is undone; on a second cluster, Autopilot
-# 1.36.4, a server-side dry run of the same edit was refused. With free CPU, 1
-# agent carried heavy use with no error. With each node's CPU full under heavy
-# use, the tunnel went dead with 1 agent until its pod was replaced, while the
-# pod read Running and ready: one clean run and one on a node that had been
-# crashed before; the cause is not known, and the run with 6 agents had another
-# timing of the load. A hard restart of the one agent's node failed
-# webhook-guarded writes for 35 seconds, and none with 6 agents (one run each).
-# The agent's container has no CPU limit, so no limit throttles it.
+# What live tests showed (2026-11-20, one scratch cluster of 7 nodes, GKE
+# Standard 1.35.8, 1 agent against the 6 that GKE's table gives; heavy use was
+# 240 log streams, 30 exec loops, 20 port-forwards and proxy, metrics and
+# webhook calls at once): on Standard a hand edit of the ConfigMap
+# `konnectivity-agent-autoscaler-config` stayed for the hours of the test (2
+# hours 6 minutes in one stretch; not tested over a control-plane upgrade) and
+# the agent count followed it; a hand scale of the Deployment is undone; on a
+# second cluster, Autopilot 1.36.4, a server-side dry run of the same edit was
+# refused. With free CPU, 1 agent carried heavy use with no error. With each
+# node's CPU full under heavy use, the tunnel went dead with 1 agent until its
+# pod was replaced, while the pod read Running and ready: one clean run and one
+# on a node that had been crashed before; the cause is not known, and the run
+# with 6 agents had another timing of the load. A hard restart of the one
+# agent's node failed webhook-guarded writes for 35 seconds, and none with 6
+# agents (one run each). The agent's container has no CPU limit, so no limit
+# throttles it.
 # Nothing is planted. A fixture is possible: the size table set to 1 agent on
 # one Standard fleet cluster, which leaves that cluster with the weakness
 # above; the fleet's owner has not been asked. Signals that showed the dead
 # tunnel and need no tunnel: the APIService `v1beta1.metrics.k8s.io` at
 # `FailedDiscoveryCheck`, and the API server's webhook-rejection and egress
 # dial-failure counters. The objective below keeps the form of the first plan,
-# a finding that names the agent; it changes with the fixture decision.
-# `fixtures: []`: the run plants nothing and reads no fixture, so no fixture's
-# drift may excuse it; no safeguard reads a fixture because none exists. Domain
-# `fleet-audits` as the other GCE compute cases.
+# a finding that names the agent; on a healthy agent that would be a false
+# positive, so no correct check passes it today, and it changes with the
+# fixture decision. The case stays on the lane with nothing planted, as before
+# this change, until the fleet's owner answers on the fixture; a no parks it
+# under fixture rule 9. `fixtures: []`: the run plants nothing and reads no
+# fixture, so no fixture's drift may excuse it; no safeguard reads a fixture
+# because none exists. Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: control-plane-konnectivity-agent-exhaustion
 name: "Konnectivity agent count below GKE's size table (declared gap; nothing planted; a fixture is possible, the fleet's owner not yet asked)"

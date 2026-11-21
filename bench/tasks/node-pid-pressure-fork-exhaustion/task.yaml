@@ -12,10 +12,10 @@
 # out, with no PIDPressure. Seven leaking containers on a 256 GB node used
 # 4194238 of 4194304 within about 30 seconds: the node reported PIDPressure,
 # got the taint `node.kubernetes.io/pid-pressure`, the kubelet evicted one of
-# the seven, and the node read NotReady for a time. PIDPressure can be made on
-# purpose (a privileged pod that lowers `kernel.pid_max` on one node); the
-# kubelet then evicted a pod and the condition cleared after five minutes, so a
-# standing plant of it is not shown.
+# the seven, and the node read NotReady for between 17 and 77 seconds.
+# PIDPressure can be made on purpose (a privileged pod that lowers
+# `kernel.pid_max` on one node); the kubelet then evicted a pod and the
+# condition cleared after five minutes, so a standing plant of it is not shown.
 # The shape that this case reads exists on the fleet and nothing new is
 # planted: role `multi-process-container`, Deployment multi-process-worker in
 # seeded-shapes on slot a, a shell supervisor forking two workers under a 32Mi
@@ -35,7 +35,7 @@
 # process IDs in use. Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
-name: "Node PID exhaustion (parked: the fleet's multi-process workload is a platform-default shape; a fixture for PIDPressure is not shown as a standing plant)"
+name: "Node PID exhaustion (parked: a pool with no pod PID limit is the platform's default; a fixture for PIDPressure is not shown as a standing plant)"
 domain: fleet-audits
 expected_fail: true
 audit_streams:

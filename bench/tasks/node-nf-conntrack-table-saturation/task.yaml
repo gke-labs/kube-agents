@@ -2,26 +2,29 @@
 # connection tracking table is full, and the kernel drops new connections. A
 # declared gap: expected_fail until the check lands (gke-labs/kube-agents#5409,
 # which proposes `node-conntrack-saturation`).
-# What a live test showed (2026-11-20, GKE Standard 1.35.8, one node, one
-# minute): a fresh node used 432 of 131072 entries. With `nf_conntrack_max`
-# lowered to just above the use, 400 new connections filled the table, and the
-# kernel wrote "nf_conntrack: table full, dropping packet" 40 times; the line
-# was in the node's serial console and in Cloud Logging within 90 seconds. No
-# node condition and no event changed. GKE's system metrics have no series for
-# the table, so a share of nf_conntrack_max cannot be read without a new data
-# source, and the collection of the serial console log can be turned off for a
-# cluster (node metadata `serial-port-logging-enable`) or for an organization
-# (the constraint `compute.disableSerialPortLogging`), by GKE's logging and
-# Autopilot troubleshooting pages. A real load at the default size was not
-# tested.
+# What a live test showed (2026-11-20, GKE Standard 1.35.8, one node with 2
+# CPUs and 8 GB, one minute): a fresh node used 432 of 131072 entries. With
+# `nf_conntrack_max` lowered to just above the use, 400 new connections filled
+# the table, and the kernel wrote "nf_conntrack: table full, dropping packet"
+# 40 times; the line was in the node's serial console and in Cloud Logging
+# within 90 seconds. No node condition and no event changed. GKE's list of
+# system metrics (read 2026-11-21) has no series for the table, so a share of
+# nf_conntrack_max cannot be read without a new data source, and the collection
+# of the serial console log can be turned off for a cluster (node metadata
+# `serial-port-logging-enable`) or for an organization (the constraint
+# `compute.disableSerialPortLogging`), by GKE's logging and Autopilot
+# troubleshooting pages. A real load at the default size was not tested.
 # Nothing is planted. A fixture is possible: a privileged pod on a node of its
 # own that lowers the limit and fills the table again and again. That repeating
 # form was not run, and the fleet's owner has not been asked. The objective
-# below keeps the form of the first plan, a finding on a default-pool node; it
-# changes with the fixture decision. `fixtures: []`: the run plants nothing and
-# reads no fixture, so no fixture's drift may excuse it; no safeguard reads a
-# fixture because none exists. Domain `fleet-audits` as the other GCE compute
-# cases.
+# below keeps the form of the first plan, a finding on a default-pool node; on
+# a healthy node that would be a false positive, so no correct check passes it
+# today, and it changes with the fixture decision. The case stays on the lane
+# with nothing planted, as before this change, until the fleet's owner answers
+# on the fixture; a no parks it under fixture rule 9. `fixtures: []`: the run
+# plants nothing and reads no fixture, so no fixture's drift may excuse it; no
+# safeguard reads a fixture because none exists. Domain `fleet-audits` as the
+# other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-nf-conntrack-table-saturation
 name: "Node conntrack table full (declared gap; nothing planted; a fixture is possible, the fleet's owner not yet asked)"

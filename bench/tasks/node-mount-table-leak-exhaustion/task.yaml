@@ -20,13 +20,16 @@
 # a pod that holds, and a victim pod deleted after it. By reasoning, not
 # tested: it does not survive a node's replacement, and the stuck pod can hold
 # a drain. The fleet's owner has not been asked. The objective below keeps the
-# form of the first plan, a finding that names a propagation-mounting
-# DaemonSet. A check on the pod template alone also names agents that hold
-# nothing (`manifests/nodeExporter-daemonset.yaml` of kube-prometheus, read
-# 2026-11-21, has the same propagation), so the objective changes with the
-# fixture decision. `fixtures: []`: the run plants nothing and reads no
-# fixture, so no fixture's drift may excuse it; no safeguard reads a fixture
-# because none exists. Domain `fleet-audits` as the other GCE compute cases.
+# form of the first plan: a finding that names `volume-mount-agent`, the first
+# plan's DaemonSet, which is in no fleet file, so no check passes it today. A
+# check on the pod template alone also names agents that hold nothing
+# (`manifests/nodeExporter-daemonset.yaml` of kube-prometheus, read 2026-11-21,
+# has the same propagation), so the objective changes with the fixture
+# decision. The case stays on the lane with nothing planted, as before this
+# change, until the fleet's owner answers on the fixture; a no parks it under
+# fixture rule 9. `fixtures: []`: the run plants nothing and reads no fixture,
+# so no fixture's drift may excuse it; no safeguard reads a fixture because
+# none exists. Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-mount-table-leak-exhaustion
 name: "Node mounts held by an agent (declared gap; nothing planted; a fixture is possible, the fleet's owner not yet asked)"
