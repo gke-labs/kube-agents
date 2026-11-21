@@ -1408,8 +1408,9 @@ object — and the content policy only selects manifests carrying the
 Another, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
-ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", exactly the session labels, no runtime
+ServiceAccount, no automount, the session token audiences, no Secret volume, no
+Secret read but the session's own inference key, no host access, Pod Security
+"restricted", exactly the session labels, no runtime
 class, node selector, affinity or positive priority, and only the scheduler and
 tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a

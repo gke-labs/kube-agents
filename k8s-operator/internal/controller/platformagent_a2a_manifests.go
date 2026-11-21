@@ -6387,7 +6387,9 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 // ValidatingAdmissionPolicy kube-agents-a2a-gateway-pod
 // (config/admission/a2a-gateway-pod-policy.yaml) holds this subject's pod
 // creates to the session pod spawn.go builds: the session ServiceAccount, no
-// automount, the session token audiences, no Secret, the session labels. The
+// automount, the session token audiences, no Secret volume and no Secret read
+// but the session's own inference key (ANTHROPIC_API_KEY from key api-key of
+// <name>-inference-key-a2a-session), the session labels. The
 // chart installs it only under admissionPolicy.enabled on Kubernetes >= 1.30
 // and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
 // this grant is as wide as written.

@@ -238,6 +238,7 @@ The A2A gateway creates session pods (one per delegated task, or one per convers
 - It runs as the session ServiceAccount, `<name>-a2a-session`, which holds no RBAC.
 - `automountServiceAccountToken` is `false`, and its projected tokens are only for the bus and the credential broker's session audience.
 - It mounts no Secret and no host path, uses no host namespace, host port or fixed node, and runs no init container.
+- It may read one Secret into its environment and no other: `ANTHROPIC_API_KEY` from key `api-key` of `<name>-inference-key-a2a-session`, the session's inference key, not marked optional. No `envFrom` from a Secret. The name follows the gateway's own, so one agent's gateway can't hand its session pods another agent's key.
 - It meets Pod Security "restricted": non-root, seccomp `RuntimeDefault`, no added capabilities, no privilege escalation, and no `Unconfined` AppArmor.
 - It carries exactly the session labels, so the session network policies select it and no other workload's policies or Services do.
 - It leaves scheduling alone: no runtime class, node selector, affinity or positive priority, and no scheduler or toleration beyond those the API server and GKE add to every pod. A default PriorityClass with a positive value, a default GKE ComputeClass (which adds a node selector to every pod), or any other mutating webhook that adds a scheduling field, refuses every session pod.
