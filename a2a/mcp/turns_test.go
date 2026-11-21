@@ -504,17 +504,16 @@ func TestAFollowedTaskTooLargeToReadIsReadOnce(t *testing.T) {
 	// Sent through SendTurn, not the tool: a tool call's one wait covers both
 	// reading the running task and following the new turn, which never ends
 	// here, so a wait long enough for the read on a loaded runner would be
-	// spent in full on the follow. SendTurn returns once the message has
-	// gone, so its wait bounds the read alone and costs only what the read
-	// takes. At the tool's 3s the read of the 4 MiB task did not finish
-	// under load, and the conversation answered busy.
+	// spent in full on the follow. SendTurn returns once the gateway has
+	// submitted the turn's task, so its wait bounds the read alone and costs
+	// only what the read takes. At the tool's 3s the read of the task, which
+	// is past the 4 MiB read budget, did not finish under load, and the
+	// conversation answered busy. A busy answer here is the failure: the read
+	// did not find the task too large and let the message through.
 	sent, w, err := b.SendTurn(t.Context(), convs, token, "delegate check it again", TurnAddress{}, time.Minute)
 	defer w.close()
 	if err != nil || sent.Task == nil {
 		t.Fatalf("a second message after a too-large task: sent=%+v err=%v", sent, err)
-	}
-	if running, ok := convs.runningTask(token); ok && running == child {
-		t.Errorf("the conversation still waits on %s after the read found it too large", child)
 	}
 }
 
@@ -536,8 +535,9 @@ func TestATaskPastItsEventCapIsTooLargeToRead(t *testing.T) {
 	}
 }
 
-// A wait folds a task when a status-update arrives, not after an artifact:
-// an artifact cannot end a task, and a fold parses every payload read so far.
+// A wait checks for the task's end when a status-update arrives, not after
+// an artifact: an artifact cannot end a task, and a fold parses every payload
+// read so far.
 // Folding after each artifact of a task near readMaxBytes took the gap
 // between pulls past taskConsumerIdle on a loaded runner, and the server
 // reaped the consumer under the read.

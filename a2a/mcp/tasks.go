@@ -18,7 +18,8 @@ const (
 	// taskReadTimeout bounds one plain read of a task.
 	taskReadTimeout = 10 * time.Second
 	// taskConsumerIdle is how long the server keeps a read's consumer once
-	// it goes idle; every read or watch here ends well inside it.
+	// it goes idle; the gap between one pull and the next has to stay well
+	// inside it.
 	taskConsumerIdle = 5 * time.Second
 	taskFetchBatch   = 256
 	taskFetchWait    = 2 * time.Second
@@ -288,13 +289,14 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 
 func (w *taskWatch) fold() (*lib.Task, error) { return lib.FoldTask(w.ref.TaskID, w.events) }
 
-// ended reports the task once it is final, folding only when a status-update
-// has been read since the last fold: nothing else ends a task (FoldTask sets
-// Final from a status-update alone). A fold parses every payload read so
-// far, so folding after each artifact of a task near readMaxBytes costs the
-// whole task again between one pull and the next. On a slow pod that took
-// the gap between pulls past taskConsumerIdle, the server reaped the
-// consumer under the read, and the next pull failed with "no responders".
+// ended reports a final task, one time for each status-update read: it folds
+// only when a status-update has been read since the last fold, because
+// nothing else ends a task (FoldTask sets Final from a status-update alone).
+// A fold parses every payload read so far, so folding after each artifact of
+// a task near readMaxBytes costs the whole task again between one pull and
+// the next. On a loaded test runner that took the gap between pulls past
+// taskConsumerIdle, the server reaped the consumer under the read, and the
+// next pull failed with "no responders".
 func (w *taskWatch) ended() (*lib.Task, bool) {
 	if !w.statusUnfolded {
 		return nil, false
