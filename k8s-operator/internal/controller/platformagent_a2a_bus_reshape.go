@@ -38,6 +38,13 @@ const a2aBusReshapeConsumedAnnotation = "kubeagents.x-k8s.io/a2a-reshape-consume
 // started nothing, and why.
 const reasonA2ABusReshapeNotStarted = "A2ABusReshapeNotStarted"
 
+// The refusal for a served CRD that drops status.busMigration, from
+// busReshapeRefusal and from a start the CRD dropped.
+const (
+	busReshapePrunedKind    = "pruned"
+	busReshapePrunedRefusal = "the served PlatformAgent CRD drops status.busMigration, so a run started here would be lost; apply this release's CRD, then restart the operator"
+)
+
 // busReshapeRunSuffix is the part of a reshape run's ID that records the
 // request it answered: "-r" and the first 8 hex of the nonce's SHA-256. The
 // run ID is the one place a record survives an operator rolled back to one
@@ -255,13 +262,6 @@ func (r *PlatformAgentReconciler) maybeStartBusReshape(ctx context.Context, agen
 	}
 	return r.recordBusReshapeConsumed(ctx, agent, nonce)
 }
-
-// The refusal for a served CRD that drops status.busMigration, from
-// busReshapeRefusal and from a start the CRD dropped.
-const (
-	busReshapePrunedKind    = "pruned"
-	busReshapePrunedRefusal = "the served PlatformAgent CRD drops status.busMigration, so a run started here would be lost; apply this release's CRD, then restart the operator"
-)
 
 // refuseBusReshape records the Normal A2ABusReshapeNotStarted Event for a
 // refused request, once per nonce and kind of reason from this operator
