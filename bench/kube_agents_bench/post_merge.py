@@ -462,6 +462,10 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
             time.sleep(TICK_INTERVAL_SEC)
 
     def _merge_and_apply(self, timeout: float) -> tuple[VerificationStatus, str]:
+        if self._repo is not None:
+            # Merged on an earlier poll whose apply failed: keep what cleanup needs to undo the
+            # merge and retry only the apply, never the reads or the merge.
+            return self._apply_all()
         # A poll that errored before the merge is retried from scratch, so nothing is listed twice.
         self._touched, self._added, self._edited = [], [], []
         snap = transcript.get()
@@ -532,11 +536,16 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         self._repo = (owner, repo)
         self._number = number
         self._kubeconfig = kubeconfig
+        return self._apply_all()
+
+    def _apply_all(self) -> tuple[VerificationStatus, str]:
+        """Apply what the merged pull request adds (and, with ``apply_edits``, edits); ``_merged`` once all applied."""
+        owner, repo = self._repo
         for manifest in [text for _, text in self._added] + [head for _, head, _ in self._edited]:
             ok, why = _apply(manifest, self._kubeconfig)
             if not ok:
-                return "error", f"applying {owner}/{repo}#{number}'s manifest failed: {why}"
-        self._merged = (owner, repo, number)
+                return "error", f"applying {owner}/{repo}#{self._number}'s manifest failed: {why}"
+        self._merged = (owner, repo, self._number)
         return "pass", ""
 
     @staticmethod

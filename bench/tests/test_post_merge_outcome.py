@@ -420,3 +420,21 @@ def test_without_apply_edits_an_edited_object_is_never_read_or_applied(world, mo
     verifier.verify(0)
     assert len(world.applied) == 1 and "PodDisruptionBudget" in world.applied[0]
     assert verifier._edited == [] and (edited, "modified") in verifier._touched
+
+
+def test_a_retry_after_a_merged_but_failed_apply_keeps_what_cleanup_needs(world, monkeypatch):
+    applies = []
+
+    def flaky_apply(text, kubeconfig):
+        applies.append(text)
+        return (len(applies) > 1), "denied"
+
+    monkeypatch.setattr(post_merge, "_apply", flaky_apply)
+    verifier = _verifier()
+    assert verifier._merge_and_apply(5)[0] == "error"
+    merges = [url for _, url in world.forge.writes if url.endswith("/merge")]
+    # A pre-merge read failing on the retry must not matter: the retry reads nothing.
+    monkeypatch.setattr(post_merge, "_forge_get_json", lambda url, token, timeout: (500, {}))
+    assert verifier._merge_and_apply(5)[0] == "pass"
+    assert [url for _, url in world.forge.writes if url.endswith("/merge")] == merges, "merged once"
+    assert len(verifier._added) == 1 and verifier._touched and verifier._merged is not None
