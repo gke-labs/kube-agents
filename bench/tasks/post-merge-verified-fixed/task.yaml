@@ -68,6 +68,9 @@ domain: reliability
 
 owner: jayantid
 
+# The fix recipe this case grades after merge (agents/platform/scripts/fix_recipes/no-pdb/).
+recipe: no-pdb
+
 fixtures:
   - no-pdb-workload
 

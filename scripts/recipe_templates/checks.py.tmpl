@@ -1,0 +1,14 @@
+"""The {kind} fix's safety checks: live facts that must hold before it may merge unattended.
+
+Stdlib only: the credential proxy imports recipe modules.
+"""
+
+from __future__ import annotations
+
+#: The kubectl kinds one read of the target namespace must fetch, separated by commas.
+READ_KINDS = "RECIPE-TEMPLATE"
+
+
+def checks(change: dict, live: dict) -> list[tuple[str, str, str]]:
+    """``(name, "pass" | "fail" | "unknown", evidence)`` for each check, on the namespace read in ``live``."""
+    raise NotImplementedError("RECIPE-TEMPLATE: write the {kind} safety checks")

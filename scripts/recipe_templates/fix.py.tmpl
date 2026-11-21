@@ -1,0 +1,14 @@
+"""The {kind} fix, written by code: the same input always gives the same bytes.
+
+Stdlib only: the credential proxy imports recipe modules.
+"""
+
+from __future__ import annotations
+
+
+def generate(finding: dict, base_text: str) -> str:
+    """The manifest text the fix leaves, given the finding and the file as it is on the base branch.
+
+    Raise ValueError, saying why, when the fix cannot be written exactly.
+    """
+    raise NotImplementedError("RECIPE-TEMPLATE: write the {kind} fix")

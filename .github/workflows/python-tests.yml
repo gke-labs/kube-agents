@@ -542,6 +542,21 @@ jobs:
         with:
           python-version-file: ".python-version"
 
+      # The fix recipes: each loads, names an eval case that names it back, and
+      # carries no scaffold line. On a pull request it also flags a change that
+      # edits a recipe and the shared plumbing beside it (a warning, for a
+      # platform owner's review). The base is fetched by sha, since the
+      # checkout is one commit deep; the sha comes in through env, never
+      # spliced into the script.
+      - name: Check the fix recipes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
+          make recipe-check RECIPE_CHECK_BASE="$BASE_SHA"
+
       - name: Install bench and its test runner
         run: |
           python3 -m pip install --upgrade pip

@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""The {kind} recipe: its file, its fix and its safety checks.
+
+Run: python3 agents/platform/scripts/fix_recipes/{kind}/test_recipe.py
+"""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[1]))
+
+import checks  # noqa: E402
+import fix  # noqa: E402
+from fix_recipes import registry  # noqa: E402
+
+
+class RecipeTest(unittest.TestCase):
+    def test_the_registry_reads_it(self):
+        (recipe,) = [r for r in registry.recipes() if r.kind == "{kind}"]
+        self.assertEqual(recipe.kind, HERE.name)
+
+    def test_the_fix(self):
+        # RECIPE-TEMPLATE: the same finding and base give the same bytes, and a
+        # finding the fix cannot write exactly raises ValueError.
+        self.assertTrue(callable(fix.generate))
+
+    def test_the_checks(self):
+        # RECIPE-TEMPLATE: each check passes on a namespace where the fix is safe
+        # and fails or says unknown on one where it is not.
+        self.assertTrue(callable(checks.checks))
+
+
+if __name__ == "__main__":
+    unittest.main()

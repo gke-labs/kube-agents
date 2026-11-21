@@ -16,9 +16,9 @@ owner: platform
 # permits no eviction (`blocking-pdb`).
 recheck_kinds: deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers
 recheck_siblings: pdb-overlapping blocking-pdb
-# The end-to-end case that grades the fix on the cluster after it merges; empty
-# until that case exists.
-eval_case: ""
+# The end-to-end case that grades the fix on the cluster after it merges; it
+# carries `recipe: no-pdb` in its task.yaml.
+eval_case: post-merge-verified-fixed
 # Without a reconciler to ask, the fix is applied once a PodDisruptionBudget
 # in the namespace selects the workload; the health window then watches it.
 applied: object_present
