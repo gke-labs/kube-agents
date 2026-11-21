@@ -314,9 +314,9 @@ def test_an_edited_manifest_is_applied_at_its_head_and_put_back_at_its_base(worl
 
     def get(url, token, timeout):
         if f"/contents/{edited}?ref=head1" in url:
-            return 200, {"sha": "h", "content": base64.b64encode(b"kind: LimitRange # head\n").decode()}
+            return 200, {"sha": "h", "content": base64.b64encode(b"apiVersion: v1\nkind: LimitRange # head\n").decode()}
         if f"/contents/{edited}?ref=base1" in url:
-            return 200, {"sha": "b", "content": base64.b64encode(b"kind: LimitRange # base\n").decode()}
+            return 200, {"sha": "b", "content": base64.b64encode(b"apiVersion: v1\nkind: LimitRange # base\n").decode()}
         if url.endswith("/pulls/7"):
             return 200, {"merged": True, "base": {"sha": "base1"}, "head": {"sha": "head1"}}
         return real_get(url, token, timeout)
@@ -324,8 +324,8 @@ def test_an_edited_manifest_is_applied_at_its_head_and_put_back_at_its_base(worl
     monkeypatch.setattr(post_merge, "_forge_get_json", get)
     _set_record(world.pod.db, outcome="verified_fixed")
     _verifier().verify(0)
-    assert "kind: LimitRange # head\n" in world.applied
-    assert world.applied[-1] == "kind: LimitRange # base\n", "cleanup applies the base back"
+    assert "apiVersion: v1\nkind: LimitRange # head\n" in world.applied
+    assert world.applied[-1] == "apiVersion: v1\nkind: LimitRange # base\n", "cleanup applies the base back"
     assert not any("kustomization" in text for text in world.applied)
 
 
@@ -370,3 +370,41 @@ def test_the_tick_runs_the_cron_script_under_the_jobs_lock(tmp_path, monkeypatch
     held.close()
     runner.join(30)
     assert "ticked" in out[0] and f"{post_merge.TICK_READ} 3" in out[0]
+
+
+def test_an_edited_file_that_is_not_an_object_is_never_applied(world, monkeypatch):
+    import base64
+
+    monkeypatch.setattr(post_merge, "DRIVE_DEADLINE_SEC", 0.0)
+    values = "clusters/seeded-a/seeded-reliability/values.yaml"
+    world.forge.extra_files = [{"filename": values, "status": "modified"}]
+    real_get = world.forge.get
+
+    def get(url, token, timeout):
+        if f"/contents/{values}?ref=" in url:
+            return 200, {"sha": "v", "content": base64.b64encode(b"replicas: 3\n").decode()}
+        if url.endswith("/pulls/7"):
+            return 200, {"merged": True, "base": {"sha": "base1"}, "head": {"sha": "head1"}}
+        return real_get(url, token, timeout)
+
+    monkeypatch.setattr(post_merge, "_forge_get_json", get)
+    _set_record(world.pod.db, outcome="verified_fixed")
+    _verifier().verify(0)
+    assert world.applied and not any("replicas: 3" in text for text in world.applied)
+
+
+def test_a_retried_poll_lists_each_file_once(world, monkeypatch):
+    calls = []
+    real_write = world.forge.write
+
+    def flaky(method, url, token, body):
+        calls.append(url)
+        if url.endswith("/merge") and len(calls) == 1:
+            return 500, {"message": "try again"}
+        return real_write(method, url, token, body)
+
+    monkeypatch.setattr(post_merge, "_github_write", flaky)
+    verifier = _verifier()
+    assert verifier._merge_and_apply(5)[0] == "error"
+    assert verifier._merge_and_apply(5)[0] == "pass"
+    assert len(verifier._added) == 1 and len(verifier._touched) == 1

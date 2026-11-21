@@ -14,14 +14,16 @@
 # post_merge.py) merges the agent's pull request with a token the ledger App
 # mints for the job's GitOps repository (hack/ci-eval-pr.sh), because nothing
 # merges inside a run; applies the manifest the pull request adds to the
-# seeded cluster, because the pool repositories have no reconciler; and runs
+# seeded cluster (and the head version of any object manifest it edits),
+# because the pool repositories have no reconciler; and runs
 # the `post-merge-check` cron job's script back to back in the agent container
 # rather than waiting on its five-minute schedule. The schedule itself is
 # graded: the check requires the job in the platform profile's jobs.json. No
 # reconciler names the merge commit, so the apply is confirmed by observing
 # the budget; reconciler matching is post_merge_check's unit tests' to cover.
-# Afterwards the check deletes the budget from the cluster and the merged file
-# from the default branch, so the pool's no-pdb fixture reads unbudgeted again.
+# Afterwards the check deletes the budget from the cluster (re-applying the base
+# version of anything it edited) and the merged file from the default branch, so
+# the pool's no-pdb fixture reads unbudgeted again.
 #
 # RED BEFORE #6311. Without that change the platform profile has no
 # post-merge-check job, so the check fails at that gate, before it merges

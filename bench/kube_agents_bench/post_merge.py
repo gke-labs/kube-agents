@@ -114,6 +114,8 @@ MANIFEST_SUFFIXES = (".yaml", ".yml")
 NOT_OBJECTS = ("kustomization.yaml", "kustomization.yml")
 #: A fix recipe's kind, as `fix_recipes/registry.KIND_RE` checks it.
 RECIPE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+#: A manifest that is a Kubernetes object: top-level `apiVersion:` and `kind:` lines.
+OBJECT_KEY = re.compile(r"(?ms)^apiVersion:.*^kind:|^kind:.*^apiVersion:")
 MAX_FILES_PAGES = 5
 FILES_PAGE_SIZE = 100
 MAX_COMMENT_PAGES = 5
@@ -456,6 +458,8 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
             time.sleep(TICK_INTERVAL_SEC)
 
     def _merge_and_apply(self, timeout: float) -> tuple[VerificationStatus, str]:
+        # A poll that errored before the merge is retried from scratch, so nothing is listed twice.
+        self._touched, self._added, self._edited = [], [], []
         snap = transcript.get()
         if snap is None:
             return "error", _NO_TRANSCRIPT_REASON
@@ -505,7 +509,10 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                     texts = [self._file_at(owner, repo, path, ref, read_token, timeout) for ref in (head, self._base)]
                     if not head or not self._base or None in texts:
                         return "error", f"{path} in {owner}/{repo}#{number} could not be read at its head and base"
-                    self._edited.append((path, texts[0], texts[1]))
+                    # Only an object is applied: a values file or a Kustomize patch beside the fix is
+                    # restored on the branch afterwards, as before, but never sent to the cluster.
+                    if all(OBJECT_KEY.search(text) for text in texts):
+                        self._edited.append((path, texts[0], texts[1]))
             if len(files) < FILES_PAGE_SIZE:
                 break
         if not self._added and not self._edited:
