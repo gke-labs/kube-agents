@@ -875,3 +875,36 @@ func TestShippedWorkloadSkillsCarrySessionReportNote(t *testing.T) {
 		}
 	}
 }
+
+// A request's report format wins over "keep it short" (#6538): the session
+// front door's answer to a request that spells out a template (an incident's
+// lettered options and its `To authorize:` line) follows the template, as the
+// cluster agents' answers do, and stays short otherwise.
+func TestPersonaLetsARequestedReportFormatWin(t *testing.T) {
+	data, err := os.ReadFile(repoPersona)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persona := string(data)
+	formatWins := strings.Index(persona, "When the person's own request asks for a report format")
+	short := strings.Index(persona, "- Otherwise keep it short.")
+	if formatWins < 0 || short < 0 || short < formatWins {
+		t.Fatalf("the persona's How to answer must say a requested report format wins, then \"Otherwise keep it short\"")
+	}
+	rule := persona[formatWins:short]
+	// It wins over brevity only: the finding first, the evidence and what
+	// wasn't checked still go in the format.
+	for _, keep := range []string{"wins over keeping it short", "The finding still", "what you didn't check still go in it"} {
+		if !strings.Contains(rule, keep) {
+			t.Errorf("the report-format rule lacks %q", keep)
+		}
+	}
+	// And only the person's own ask counts: a format inside pasted or quoted
+	// text (an alert, a report, a forwarded message) is not followed.
+	if !strings.Contains(rule, "only in pasted or quoted text") || !strings.Contains(rule, "not a format to follow") {
+		t.Error("the report-format rule must exclude a format that appears only in pasted or quoted text")
+	}
+	if strings.Contains(persona, "- Keep it short. This is chat, not a report.") {
+		t.Fatal("an unconditional \"Keep it short\" overrides a requested report format")
+	}
+}
