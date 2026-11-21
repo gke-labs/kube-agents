@@ -258,6 +258,26 @@ class RefusedContent(unittest.TestCase):
         self.assertRefused(BASE, unchanged_ok=True)
 
 
+class PlainStringsInTheBase(unittest.TestCase):
+    def test_unquoted_percentages_quantities_and_digit_led_names(self):
+        base = BASE.replace('maxUnavailable: "25%"', "maxUnavailable: 25%").replace("name: checkout-pdb", "name: 3ds-pdb")
+        edit = verify(base.replace("minAvailable: 1  #", "minAvailable: 2  #"), base=base)
+        self.assertEqual((edit.name, edit.changes), ("3ds-pdb", ((("spec", "minAvailable"), 1, 2),)))
+        # set_scalar writes a new percentage quoted, so that is the only head it accepts.
+        self.assertEqual(verify(base.replace("maxUnavailable: 25%", 'maxUnavailable: "50%"'), base=base).changes,
+                         ((("spec", "maxUnavailable"), "25%", "50%"),))
+        with self.assertRaises(ae.EditRefused):
+            verify(base.replace("maxUnavailable: 25%", "maxUnavailable: 50%"), base=base)
+
+    def test_plain_forms_yaml_reads_as_other_types_stay_unreadable(self):
+        from fix_recipes import yaml_edit
+
+        for raw in ("yes", "0x10", "1_000", "2.5", "~", "2024-01-01", "1:20"):
+            with self.subTest(raw=raw), self.assertRaises(yaml_edit.RefusedEdit):
+                yaml_edit.read_scalar(f"a: {raw}\n", 0, ["a"])
+        self.assertEqual(yaml_edit.read_scalar("a: 128Mi\n", 0, ["a"]), "128Mi")
+
+
 class Hardening(unittest.TestCase):
     def test_a_failing_allowed_edit_is_a_refusal(self):
         def broken(path, old, new):

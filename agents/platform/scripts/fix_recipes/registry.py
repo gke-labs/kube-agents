@@ -95,8 +95,6 @@ HEALTH_PROBES = ("restart_flat", "none")
 #: (one new file, `automerge_eligibility.verify_added_manifest`) or
 #: `edit-manifest` (one scalar edit to an existing manifest, `automerge_edit`).
 VERIFY_VERBS = ("add-manifest", "edit-manifest")
-#: The object fields an edit may never touch (`yaml_edit.PROTECTED_PATHS`).
-EDIT_FORBIDDEN = ("apiVersion", "kind", "metadata.name", "metadata.namespace")
 #: Segments refused anywhere in an `edit_paths` entry: identity at any depth
 #: (a List's items, a pod template), what an object selects or is selected
 #: by, ownership, and status, which the cluster writes.

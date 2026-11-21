@@ -735,8 +735,9 @@ _INT_PLAIN = re.compile(r"-?(?:0|[1-9][0-9]*)")
 
 def read_scalar(text: str, doc_index: int, path: list[PathSegment]) -> Value:
     """The scalar at `path` in document `doc_index`, read only in the forms
-    `set_scalar` writes: a plain int, `true`/`false`, a plain string that
-    cannot be read as anything else, a single-quoted string, or a
+    `set_scalar` writes, and the plain strings a manifest carries: a plain
+    int, `true`/`false`, a plain scalar YAML reads as a string (`25%`,
+    `100m`), a single-quoted string, or a
     double-quoted one whose only escapes are `\\\\` and `\\"`. RefusedEdit for
     anything else, and for every file `set_scalar` refuses. Unlike
     `set_scalar` it reads the identity fields (`kind`, `metadata.name`,
@@ -762,6 +763,9 @@ def read_scalar(text: str, doc_index: int, path: list[PathSegment]) -> Value:
         return raw == "true"
     if _INT_PLAIN.fullmatch(raw) and INT_MIN <= int(raw) <= INT_MAX:
         return int(raw)
-    if _SAFE_PLAIN.match(raw) and not _NONSTRING_PLAIN.match(raw):
+    # Any other plain scalar the parser accepted is a string to YAML 1.1
+    # (`25%`, `100m`, `3ds-pdb`) unless it is one of the forms it reads as
+    # something else, which are refused rather than guessed at.
+    if not _NONSTRING_PLAIN.match(raw):
         return raw
     raise RefusedEdit("unreadable-value", f"{where}: plain value {raw!r} is not one this module reads")
