@@ -479,6 +479,8 @@ Any other exit is named by the container's PID 1 as `start-services: … exited 
 
 **The broker exits during startup.** The credential runtime runs `CREDENTIAL_PROXY_BOOTSTRAP_COMMAND` before it begins serving, and a non-zero exit stops the container, so the Deployment never has a ready endpoint. The command's stdout and stderr go to the container's log. Bootstrap failures usually mean the Pod cannot reach the cluster or mint a token; see [Security & IAM](/kube-agents/reference/security-and-iam/) for the Workload Identity binding it depends on.
 
+Another cause is a universe domain mismatch. The log then ends with `credential proxy failed to start`, and the record says that the universe domain in the broker's environment differs from the domain the metadata server reports. Set `spec.harness.universeDomain` to the reported domain, or omit it.
+
 ## Where to go next
 
 - [Security & IAM](/kube-agents/reference/security-and-iam/) — Workload Identity, the GCP permission sets, and the read-only Kubernetes RBAC.

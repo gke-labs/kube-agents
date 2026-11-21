@@ -45,6 +45,8 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
+from fix_recipes import probes
+
 logger = logging.getLogger("post_merge_check")
 
 RECORDS_TABLE = "post_merge_records"
@@ -213,10 +215,6 @@ KUBECTL_REQUEST_TIMEOUT_SECONDS = 20
 KUBECTL_HOP_TIMEOUT_SECONDS = 45
 #: The workload kinds a disruption-budget fix covers.
 WORKLOAD_RESOURCES = {"Deployment": "deployments.apps", "StatefulSet": "statefulsets.apps"}
-#: How the fix is seen when no reconciler on the cluster targets the record's
-#: namespace: the object the fix adds, read directly (design: "the driver
-#: observes the object directly").
-DIRECT_OBJECTS = {"no-pdb": "poddisruptionbudgets.policy"}
 #: ``sync_state``'s reading for a fix observed directly.
 OBSERVED = "observed"
 
@@ -241,6 +239,14 @@ class ScopeRefused(Exception):
 
 #: ``post_merge_scope.UNKNOWN_PREFIX``, repeated so this module does not import it.
 SCOPE_UNKNOWN_PREFIX = "unknown: "
+
+
+class _Judged(Exception):
+    """A record :func:`watch_health` reached a result for before reading the workload; ``bucket`` is where it goes."""
+
+    def __init__(self, bucket: str):
+        super().__init__(bucket)
+        self.bucket = bucket
 
 
 class WorkloadGone(ClusterReadError):
@@ -685,18 +691,22 @@ def _read_workload(kubectl_json: KubectlJson, record: dict) -> tuple[dict, dict]
     return workload, pods
 
 
-def observed_directly(kubectl_json: KubectlJson, record: dict, workload: dict) -> tuple[bool, str]:
-    """Whether the object the fix adds is on the cluster: for ``no-pdb``, a PodDisruptionBudget selecting the workload."""
-    namespace = record["namespace"] or "default"
-    resource = DIRECT_OBJECTS.get(record["kind"] or "")
-    if resource is None:
-        return False, f"a {record['kind']} fix cannot be observed directly"
-    labels = (((workload.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("labels") or {}
-    budgets = kubectl_json(record, ["get", resource, "-n", namespace, "-o", "json"])
-    for budget in budgets.get("items", []):
-        if selects((budget.get("spec") or {}).get("selector") or {}, labels):
-            return True, f"budget {budget['metadata']['name']} selects the workload"
-    return False, "no budget selects the workload yet"
+def _recipe(record: dict):
+    """The registry's recipe for the record's kind, or None."""
+    from fix_recipes import registry
+
+    return registry.recipe(record["kind"] or "")
+
+
+def _names_workload(record: dict) -> bool:
+    return str(record["object"] or "").partition("/")[0] in WORKLOAD_RESOURCES
+
+
+def observed_directly(kubectl_json: KubectlJson, record: dict, workload: dict | None) -> tuple[bool, str]:
+    """Whether the fix is on the cluster, by the recipe's ``applied`` probe (``fix_recipes/probes.py``):
+    for ``no-pdb``, a PodDisruptionBudget selecting the workload (design: "the driver observes the object
+    directly")."""
+    return probes.applied(_recipe(record), kubectl_json, record, workload, selects)
 def cluster_coordinates(record: dict) -> tuple[str, str, str]:
     """``(project, name, location)`` for ``gcloud``: the fleet audit names a cluster
     ``<project>/<location>/<name>``, so a qualified ``cluster`` gives the bare name, and its parts
@@ -860,7 +870,13 @@ def watch_health(
                     return found
 
                 objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists, changed)
-                workload, pods = _read_workload(kubectl_json, record)
+                watched = probes.holds_health_window(_recipe(record))
+                # A kind with no health window reads a workload only when the record names one, for
+                # an ``object_present`` probe that matches on its selector.
+                if watched or _names_workload(record):
+                    workload, pods = _read_workload(kubectl_json, record)
+                else:
+                    workload, pods = None, {"items": []}
                 if objects:
                     state, detail = combined_sync(objects, record["merge_commit"], asked)
                     applied = state == reconciler_sync.APPLIED
@@ -883,7 +899,7 @@ def watch_health(
                     # apply (a scale-up, a drain) is waited for rather than judged NotReady on the next reading.
                     # Its restart counts are kept too, under STARTING_PREFIX, so a restart from before the
                     # apply never reads as one after it.
-                    owned = _owned_pods(workload, pods)
+                    owned = _owned_pods(workload, pods) if watched else []
                     baseline = restart_baseline({"items": [pod for pod in owned if _is_ready(pod)]})
                     starting = restart_baseline({"items": [pod for pod in owned if not _is_ready(pod)]})
                     baseline.update({STARTING_PREFIX + key: count for key, count in starting.items()})
@@ -895,6 +911,11 @@ def watch_health(
                 applied_at = _parse_time(record["applied_at"])
                 if applied_at is None:
                     raise WorkloadGone("the apply time is unreadable")
+                if not probes.holds_health_window(_recipe(record)):
+                    # ``health: none``: the fix's object is not a workload, so applied is the whole check.
+                    updates.update(health_result=HEALTH_PASSED, health_at=stamp,
+                                   health_detail=f"no health window: {record['kind']} declares health: none")
+                    raise _Judged("passed")
                 window = max(HEALTH_WINDOW.get(record["kind"] or "", max(HEALTH_WINDOW.values())), HEALTHY_AFTER_SYNC)
                 last = record["health_detail"]
                 # The limit is weighed after this tick's reading, never on the last one alone: a record that
@@ -939,6 +960,8 @@ def watch_health(
                 else:
                     updates["health_detail"] = f"{SAMPLED}{samples}, last {stamp}"
                     bucket = "waiting"
+        except _Judged as judged:
+            bucket = judged.bucket
         except ScopeRefused as exc:
             # Not read; the reason goes on the row, and the stamp moves it to the back of the queue.
             unknown = str(exc).startswith(SCOPE_UNKNOWN_PREFIX)

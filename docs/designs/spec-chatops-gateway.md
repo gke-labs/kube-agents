@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` held at 1, the only value the gateway accepts until a stop walks the whole tree; a batch's results already come back in one wake); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` held at 1, the only value the gateway accepts until a stop walks the whole tree; a batch's results already come back in one wake); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
 
 ## Purpose
 
@@ -468,8 +468,9 @@ tree, so fan-out stays off until it does, and the ceiling it will open to is `li
 with a notice naming the cap, so the session can split it or choose (`delegation.width`). An absent `AllowedUsers`, or one that renders as `[""]`, admits every authenticated user, the
 same as today's ingress door; a list present but blank once its entries are trimmed and split
 admits nobody, the rule #2207 already holds for the Chat ingress list. The A2A door (backend
-`a2a`) is the exception that fails closed: its principal map admits programs, not people an
-operator listed, so a delegation checked against anyone who came in through it - requester,
+`a2a`, and its sign-in classes `a2a-google` and `a2a-entra`) is the exception that fails closed:
+its principal map admits programs, and its sign-in classes' lists are the door's own, not people
+the target listed, so a delegation checked against anyone who came in through it - requester,
 steer author or incarnation-set member - needs a list for that backend, and no list is nobody
 (`delegation.door-unlisted`). Nothing renders one yet (#2478 is the CR field), so a door turn
 cannot delegate today. The inject door is deliberately not held to that rule: it exists only where
@@ -1151,7 +1152,8 @@ each adapter section are instances of this rule:
    Google's asserted email arriving over a topic only its Chat service may publish to;
    Slack's immutable `user_id` on the bot's own Socket Mode connection; Discord's snowflake;
    the console's NATS grant; the email Google's tokeninfo answers for the A2A door's
-   signed-in class. A field a sender can type or edit (a display name, a profile email the
+   Google class, and the object id in the Entra token whose signature the door verified for
+   its Entra class. A field a sender can type or edit (a display name, a profile email the
    workspace lets the user change, the `author` or `caller` a door request names) is not an
    identity. A backend whose only sender field is one of those is the two doors' bearer
    class, the inject door and the A2A door's static token: the token admits the call, the
@@ -1159,21 +1161,22 @@ each adapter section are instances of this rule:
    to `eval:` identities for that reason. Neither is an ingress for people.
 2. That subject resolves to exactly one principal by a rule the operator or the install
    admin owns and the agent cannot write: the identity function where the subject already
-   is the principal (Google Chat, the A2A door's signed-in class); the member id, or the IdP
+   is the principal (Google Chat, the A2A door's two signed-in classes); the member id, or the IdP
    identity a mapping table joins it to (Slack); a hand-made test table mounted as a
    ConfigMap (Discord); a map of the door's own at a prefixed key (the bearer class); a
    constant (the console). The rule lives outside the agent's reach: environment or a map
    the operator renders, or an admin-owned Secret or ConfigMap it mounts (the Slack adapter
-   section says who writes it); the A2A door's `A2A_DOOR_ALLOWED_USERS` is set by hand today.
+   section says who writes it); the A2A door's `A2A_DOOR_ALLOWED_USERS` and
+   `A2A_DOOR_ENTRA_ALLOWED_USERS` are set by hand today.
 3. The gate is applied at ingress, to the subject the backend authenticated, before a task
    is minted or a placeholder posted: an allowlist of subjects (Google Chat, Slack, the A2A
-   door's signed-in class) or the presence of a map entry (Discord, the bearer class). On
+   door's two signed-in classes) or the presence of a map entry (Discord, the bearer class). On
    the chat backends an unlisted sender gets the once-per-sender notice and no turn, and an
    empty list means what the CR's rule says, rendered as an explicit allow-all variable
    beside it (`A2A_GCHAT_ALLOW_ALL_USERS`, `A2A_SLACK_ALLOW_ALL_USERS`) rather than inferred
    at the gateway. An unmapped sender at a bearer door gets the same notice and a refusal on
-   every request. The A2A door's signed-in class has a list with no allow-all: empty admits
-   nobody, and the door answers an unlisted account 403 before any turn.
+   every request. Each of the A2A door's signed-in classes has a list of its own with no
+   allow-all: empty admits nobody, and the door answers an unlisted account 403 before any turn.
 4. The resolution rides the envelope, pseudonymized, for audit: `authority.requester`
    carries `principal` and `subject`, HMAC-hashed under the install salt as the roster is,
    beside the plaintext `backend` and `verifiedBy` names of the ingress and the mechanism
@@ -3183,9 +3186,10 @@ events through as they come.
 callers naming the same `contextId` do not share a conversation; a caller that sends none is
 minted one and reads it back on the `Task`. `Roster` is the caller alone, complete;
 `openDirect` returns the caller's last conversation, as on the inject door. A Google-verified
-caller (below) is `:google:<email>` inside the door, so its conversation is
-`a2a::google:<email>:<contextId>`: an eval caller may not contain a colon, so no eval key starts
-`a2a::` and no eval caller equals a Google one, which keeps the two classes' conversations and
+caller (below) is `:google:<email>` inside the door and an Entra-verified one `:entra:<object id>`,
+so their conversations are `a2a::google:<email>:<contextId>` and
+`a2a::entra:<object id>:<contextId>`: an eval caller may not contain a colon, so no eval key starts
+`a2a::` and no eval caller equals a verified one, which keeps the three classes' conversations and
 task scopes apart even though the static token's holder names their caller freely.
 
 **Identity, first version: the eval class.** The caller names itself - the `X-A2A-Caller` header,
@@ -3199,7 +3203,9 @@ submission and an eval harness's are distinguishable downstream even though both
 the eval namespace today.
 
 **Identity, second class: a developer signed in with Google.** A bearer that is not the door's
-static token is checked, when `A2A_DOOR_GOOGLE_CLIENT_ID` is set, as a Google OAuth access token:
+static token is checked, when `A2A_DOOR_GOOGLE_CLIENT_ID` is set, as a Google OAuth access
+token (with the Entra class also armed, only a bearer carrying Google's `ya29.` prefix comes
+here; every other bearer goes to the Entra class):
 Google's tokeninfo endpoint must answer for it with the install's one pre-registered client as
 its audience or authorized party, a verified email, and an expiry still ahead. The email, as
 Google sent it, is the principal - the same string the Google Chat adapter carries for the same
@@ -3223,10 +3229,45 @@ Validating a token at the door is not the per-user token brokerage the permissio
 declined: the door holds a client id and an allowlist (which the gateway checks again), never a refresh token or a
 client secret. The principal this class asserts is attribution: the task's capability is the
 install's, as it is for every ingress. Still to come as verifiers of their own, each with its
-own `verifiedBy`: JWT access tokens from an OpenID Connect provider (Entra, Okta). The
+own `verifiedBy`: JWT access tokens from other OpenID Connect providers (Okta). The
 unattended class (`verifiedBy: unattended-ksa`, a trigger's ServiceAccount bound by the callout)
 is built as the trigger ingress (scheduling-on-profiles.md §3), dark until the callout grants a
 source its submit subject.
+
+**Identity, third class: a person signed in with Microsoft Entra ID.** A bearer without Google's `ya29.` prefix is
+checked, when `A2A_DOOR_ENTRA_TENANT_ID` and `A2A_DOOR_ENTRA_CLIENT_ID` are both set, as a
+token the tenant issued for the install's one application registration. The check is local:
+the door reads the tenant's published signing keys once (refetched when a token names a key the
+cached set does not hold, at most once a minute, and daily otherwise), pins the algorithm to RS256
+before it reads a key, verifies the signature, and then requires the install's tenant as issuer
+(the v2.0 form, or the v1.0 `sts.windows.net` form an application registration issues for its
+own scopes by default) and `tid`, the client id or its `api://` application id URI as audience,
+and an expiry still ahead and a not-before already past, each within a five-minute skew, and a
+delegated scope (`scp`), which an access token a person obtained carries and an ID token for the
+same application does not (an ID token's `roles` are no substitute). Nothing
+is asked of Microsoft per request, so the class has no per-check concurrency bound. The
+principal is the token's object id (`oid`), as Entra sent it and held to the GUID shape (anything
+else is refused as not minted for a person), never the user principal name or the display name:
+the object id is immutable for the account's life, and it is the string the Teams backend reads
+for the same person (`from.aadObjectId`), so one person's Teams turns and API calls share one
+principal; `preferred_username` (or `upn`, which a v1.0 access token carries instead) is logged
+only when the account is refused off the allowlist, so an admin can see whose object id to add,
+and goes nowhere else. It
+is admitted only if it is on the class's own allowlist (`A2A_DOOR_ENTRA_ALLOWED_USERS`, object
+ids compared case-insensitively; empty admits nobody, no allow-all), checked at the door before
+it holds any state for the caller and again by the gateway before it resolves the principal. The
+caller is prefixed `:entra:` inside the door, disjoint from the eval class and from the Google
+class's `:google:` for the reason the Google prefix has its colon. The authority block records
+backend `a2a-entra` and `verifiedBy` `a2a-entra-token`; the hermes bridge treats the class as a
+person, as it treats the Google class. A token the tenant would not vouch for (wrong algorithm,
+unknown key after a fresh read of the set, bad signature, another tenant or application, no
+delegated scope,
+expired or not yet valid, an object id that is not a GUID) is a 401; an object id off the list
+is a 403; a check that could not be made (the key
+set unreachable with the token's key not cached, or a key the set does not hold inside the minute
+since it was last read) is a 503. A request carrying the token may not also name a caller, as for
+the Google class. The three variables are set by hand on the gateway, as the Google class's are:
+the operator renders neither class, and the door itself stays an operator-level flag.
 
 **The card is the catalog.** One skill per destination this door routes to, which today is the
 gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
@@ -3235,13 +3276,15 @@ built from. The card is the one unauthenticated route, because discovery reads i
 security scheme to present; it discloses the endpoint URL, the scheme and the default
 destination's name, none of which a 401 hides. With the Google class armed the card lists a
 second scheme beside the bearer, `openIdConnect` at Google's OpenID configuration, as an
-alternative.
+alternative; with the Entra class armed, another `openIdConnect` scheme at the tenant's OpenID
+configuration.
 
 **Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
 `A2A_DOOR_LISTEN` is set, no unauthenticated mode), or, with the Google class armed, a Google
-access token in its place; a bearer shaped like a Google access token (`ya29.`) is then sent
-to Google's tokeninfo endpoint to be checked, and any other is refused without leaving the
-cluster; the caller map is its own file
+access token in its place, or, with the Entra class armed, an Entra token; a bearer shaped like
+a Google access token (`ya29.`) is then sent to Google's tokeninfo endpoint to be checked, a
+bearer shaped like a JWT is checked against the tenant's cached keys, and any other is refused
+without leaving the cluster; the caller map is its own file
 (`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
 the address the card was fetched from (the request's host, or the forwarded host and scheme
 behind a proxy), since behind a port-forward or an ingress the listen address is reachable by
@@ -3253,8 +3296,8 @@ under the door's own name, so each door comes and goes with its own flag. The re
 the door as a backend the way it counts the inject door (`a2aGatewayBackend`): a `mode: next`
 install with no `discord-bot` Secret and this door armed gets its gateway rather than the
 `NoChatBackend` condition, which is what the gateway's own start-up check already accepts. The
-operator does not yet render the Google class's env; until it does, and until the door has
-ingress a customer reaches, it is a dev and eval door like the other.
+operator does not yet render either sign-in class's env (Google or Entra); until it does, and
+until the door has ingress a customer reaches, it is a dev and eval door like the other.
 
 _Update 2026-10-22: superseded, every `mode: next` install runs a console-only gateway, so the door
 no longer decides whether the gateway renders; `a2aGatewayBackend` and the `NoChatBackend` path are
@@ -3332,7 +3375,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_gchat_api_rate_limited_total`       | `method`: as above                                                                                                                                                                                       | Each Chat API call the Chat API answered 429, which the relay carries under `chat` in a 502 after its own retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_a2a_gateway_chat_messages_total`                | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                                                                                 | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`         | none                                                                                                                                                                                                     | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `kubeagents_a2a_gateway_messages_inbound_total`             | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                                                                         | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                                   |
+| `kubeagents_a2a_gateway_messages_inbound_total`             | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                                                                         | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google, a2a-entra) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                        |
 | `kubeagents_a2a_gateway_answer_feedback_total`              | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`                                                                    | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
 | `kubeagents_a2a_gateway_post_feedback_total`                | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `kind`: `alert`, `report`, `other`                                                                    | Each rating change a verified sender made on a home post the agent made on its own, counted as `answer_feedback_total` counts and apart from it: `alert` for a keyed home post (the event watcher's alert, rewritten in place by its triage), `report` for any other (a scheduled or audit report, a digest).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
