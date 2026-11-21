@@ -31,7 +31,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -96,27 +95,6 @@ const (
 	// pod (lib.EnvProfileExecutor), which reaches clusters its own way.
 	noClusterPrompt = "You have no access to any cluster or the fleet on this turn, and this pod's files and environment hold no cluster credentials or tools, so don't search them for any. When an ask needs a cluster, delegate it if you can; otherwise say plainly that you can't reach it from here."
 
-	// strictMCPConfigFlag makes the harness load MCP servers from
-	// --mcp-config only, ignoring .mcp.json in the cwd and the user config's
-	// servers. Without --mcp-config it means no MCP servers at all. Every
-	// argv carries it: in a reused pod the cwd (/scratch) and the config dir
-	// have hosted an earlier turn's harness, which had Write.
-	strictMCPConfigFlag = "--strict-mcp-config"
-	// settingSourcesFlag and adapterSettingSources: the harness reads
-	// settings only from the user source ($CLAUDE_CONFIG_DIR, where the image
-	// puts the persona's CLAUDE.md and skills, which load under that source
-	// and no other) plus the flag and managed sources it always reads. The
-	// project and local sources, .claude/ under the cwd, are where an earlier
-	// turn's Write could leave hooks, permissions or env for the next turn's
-	// harness; the adapter puts nothing there.
-	settingSourcesFlag    = "--setting-sources"
-	adapterSettingSources = "user"
-	// The user source's file (harnessUserSettings): the harness reads
-	// settings.json in $CLAUDE_CONFIG_DIR, which defaults to ~/.claude.
-	claudeConfigDirEnv     = "CLAUDE_CONFIG_DIR"
-	claudeDefaultConfigDir = ".claude"
-	claudeUserSettingsFile = "settings.json"
-
 	// delegateToolID is the MCP-qualified tool name the harness's
 	// --allowedTools expects: "mcp__" + server name + "__" + tool name
 	// (worker-adapter/mcp.go names both halves so this can't drift from the
@@ -128,18 +106,6 @@ const (
 		"When the person asks for one of those agents by name, delegate to it under that name. " +
 		"The gateway checks that the user may reach that agent before anything runs. Calling `delegate` ends your turn; the agent's result arrives as your next turn, so say what you are delegating and why in one line first. " +
 		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can."
-
-	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey
-	// is not a credential: the gateway here runs keyless and the harness only
-	// checks that the variable is non-empty.
-	defaultModelBaseURL = "http://inference-gateway"
-	defaultModelAPIKey  = "a2a-playground" // #nosec G101 -- placeholder, not a secret
-
-	// The env names that tell the harness how to reach the model.
-	modelBaseURLEnv   = "ANTHROPIC_BASE_URL"
-	modelAPIKeyEnv    = "ANTHROPIC_API_KEY"    // #nosec G101 -- env name, not a credential
-	modelAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN" // #nosec G101 -- env name, not a credential
-	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
 func main() {
@@ -399,7 +365,7 @@ func harnessCommand() []string {
 	}
 	path := os.Getenv("A2A_HARNESS_PATH")
 	if path == "" {
-		path = workeradapter.DefaultHarnessPath
+		path = activeHarness.defaultPath()
 	}
 	model := os.Getenv("A2A_MODEL")
 	if model == "" {
@@ -454,45 +420,24 @@ func harnessCommand() []string {
 		allowed += "," + delegateToolID
 		prompts = append(prompts, delegatePrompt)
 	}
-	argv := []string{
-		path,
-		"--print",
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--model", model,
-		"--max-turns", maxTurns,
-		"--allowedTools", allowed,
-		"--disallowedTools", disallowed,
-		settingSourcesFlag, adapterSettingSources,
-		// With or without the delegate tool: a wake's argv has no
-		// --mcp-config, and without this flag it would load whatever MCP
-		// config an earlier turn in the same pod left on disk.
-		strictMCPConfigFlag,
+	spec := harnessSpec{
+		path:       path,
+		model:      model,
+		maxTurns:   maxTurns,
+		tools:      true,
+		allowed:    allowed,
+		disallowed: disallowed,
+		prompts:    prompts,
+		extra:      strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
-		// and speaks MCP to it over stdio; strictMCPConfigFlag above keeps a
-		// stray project or user MCP config from adding tools the gateway
-		// never vetted.
-		self := selfPath()
-		sock := workeradapter.DelegateSocketPath()
-		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
-			workeradapter.DelegateMCPServer: map[string]any{
-				"command":               self,
-				"args":                  []string{"mcp"},
-				workeradapter.MCPEnvKey: map[string]string{workeradapter.EnvDelegateSocket: sock},
-			},
-		}})
-		argv = append(argv, workeradapter.MCPConfigFlag, string(mcpCfg))
+		// and speaks MCP to it over stdio; the builder keeps any other MCP
+		// config the harness might find from adding tools the gateway never
+		// vetted.
+		spec.delegate = &delegateServer{command: selfPath(), socket: workeradapter.DelegateSocketPath()}
 	}
-	if len(prompts) > 0 {
-		argv = append(argv, "--append-system-prompt", strings.Join(prompts, "\n\n"))
-	}
-	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
-		argv = append(argv, strings.Fields(extra)...)
-	}
-	return argv
+	return activeHarness.command(spec)
 }
 
 // profileHarnessCommand is a profile worker's base argv: the harness over the
@@ -507,7 +452,7 @@ func profileHarnessCommand() []string {
 	}
 	path := os.Getenv("A2A_HARNESS_PATH")
 	if path == "" {
-		path = workeradapter.DefaultHarnessPath
+		path = activeHarness.defaultPath()
 	}
 	model := os.Getenv("A2A_MODEL")
 	if model == "" {
@@ -517,19 +462,12 @@ func profileHarnessCommand() []string {
 	if maxTurns == "" {
 		maxTurns = defaultMaxTurns
 	}
-	argv := []string{
-		path,
-		"--print",
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--model", model,
-		"--max-turns", maxTurns,
-	}
-	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
-		argv = append(argv, strings.Fields(extra)...)
-	}
-	return argv
+	return activeHarness.command(harnessSpec{
+		path:     path,
+		model:    model,
+		maxTurns: maxTurns,
+		extra:    strings.Fields(os.Getenv("A2A_HARNESS_EXTRA_ARGS")),
+	})
 }
 
 // delegateToolEnabled is the delegate tool's single switch: everything that
@@ -558,18 +496,10 @@ func harnessCommandWithoutDelegate() []string {
 }
 
 // harnessUserSettings is the settings file the harness reads for its user
-// source: settings.json in $CLAUDE_CONFIG_DIR, else in ~/.claude. "" when
-// neither is known.
+// source, removed before each turn of a reused pod, or "" when there is none
+// to find.
 func harnessUserSettings() string {
-	dir := os.Getenv(claudeConfigDirEnv)
-	if dir == "" {
-		home := os.Getenv("HOME")
-		if home == "" {
-			return ""
-		}
-		dir = filepath.Join(home, claudeDefaultConfigDir)
-	}
-	return filepath.Join(dir, claudeUserSettingsFile)
+	return activeHarness.userSettings(os.Getenv)
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare
@@ -638,34 +568,7 @@ func harnessEnv() []string {
 		}
 		env = append(env, kv)
 	}
-	has := func(key string) bool {
-		return os.Getenv(key) != ""
-	}
-	if !has(modelBaseURLEnv) && !has(modelUseVertexEnv) && !has(modelAPIKeyEnv) {
-		env = append(env, modelBaseURLEnv+"="+defaultModelBaseURL)
-	}
-	// The gateway runs keyless. The placeholder only satisfies the harness's
-	// "an API key exists" check. The adapter adds it here, in the child env,
-	// also when the pod sets ANTHROPIC_BASE_URL (an AgentProfile worker sets
-	// the full gateway name). Thus a pod spec does not need a literal model
-	// key, which the AI workload audit flags (fleet-audit check 3.5,
-	// model-credential-plaintext-env). Vertex and a bearer token do not use
-	// the key, so the adapter does not add it.
-	if !has(modelAPIKeyEnv) && !has(modelUseVertexEnv) && !has(modelAuthTokenEnv) {
-		env = append(env, modelAPIKeyEnv+"="+defaultModelAPIKey)
-	}
-	for _, kv := range []string{
-		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-		"DISABLE_AUTOUPDATER=1",
-		"DISABLE_TELEMETRY=1",
-		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-	} {
-		key := kv[:strings.Index(kv, "=")]
-		if !has(key) {
-			env = append(env, kv)
-		}
-	}
-	return env
+	return activeHarness.env(env, func(key string) bool { return os.Getenv(key) != "" })
 }
 
 // originSeq reads the submission's stream sequence from the pod env, and
