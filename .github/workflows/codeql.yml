@@ -98,7 +98,20 @@ jobs:
     # spend four analyses' runner-minutes on every sync. On a pull
     # request from a fork `github.repository` is this repository, the base,
     # so the guard does not skip the run this workflow exists for.
-    if: github.repository == 'gke-labs/kube-agents'
+    #
+    # The second clause skips a pull request run whose ref is not the pull
+    # request's. A push to a pull request that is in the merge queue starts
+    # its `synchronize` runs only after the queue has merged it; GitHub then
+    # resolves the run to the base branch (`github.ref` is `refs/heads/main`,
+    # the commit is the merge commit) while the payload still says the pull
+    # request is open, so only the ref tells. Code scanning accepts a fork's
+    # read-only upload for `refs/pull/<n>/merge` and nothing else, so every
+    # leg of such a run failed at upload with "Resource not accessible by
+    # integration". Nothing is lost by the skip: the commit is on `main`, and
+    # the push run analyses it there with a token that can upload.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      (github.event_name != 'pull_request' || startsWith(github.ref, 'refs/pull/'))
     runs-on: ubuntu-latest
     # Local timings on 8 vCPUs: Python about 10 minutes, Go about 9 with the
     # explicit build. A standard runner has 4, so an hour leaves room for a
