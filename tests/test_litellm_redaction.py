@@ -79,7 +79,10 @@ _OAUTH_TOKEN = "ya29." + "A" * 195
 _URL_PASSWORD = "hunter2-example-pw"
 # Strict base64 that a text rule would still rewrite (the GCP API-key shape),
 # so a test can tell a kept payload from a walked one.
-_RULE_MATCHING_BASE64 = "AIza" + "B" * 35
+_RULE_MATCHING_BASE64 = "iVBORw0KGgoAIza" + "B" * 37  # a PNG header, then the GCP API-key shape
+# A small real PNG start, for parts whose payload only has to be a PNG.
+_PNG_BASE64 = "iVBORw0KGgo="
+_PDF_BASE64 = "JVBERi0xLjQK"  # %PDF-1.4
 
 
 def _stub_litellm() -> None:
@@ -187,7 +190,7 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(result["model"], "model-default")
 
     def test_text_content_parts_are_redacted_and_other_parts_left_alone(self) -> None:
-        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _PNG_BASE64}}
         data = {
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "node 10.0.0.9"}, image]}
@@ -348,7 +351,7 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(block["cache_control"], {"type": "ephemeral"})
 
     def test_anthropic_tool_results_and_tool_inputs_are_redacted_and_thinking_kept(self) -> None:
-        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64}}
         opaque = {"type": "redacted_thinking", "data": "opaque-blob"}
         data = {
             "messages": [
@@ -416,7 +419,7 @@ class TestCallback(unittest.TestCase):
     # Antigravity CLI sends it.
 
     def test_gemini_contents_function_calls_and_responses_are_redacted(self) -> None:
-        inline = {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}
+        inline = {"inlineData": {"mimeType": "image/png", "data": _PNG_BASE64}}
         data = {
             "contents": [
                 {"role": "user", "parts": [{"text": "pods on prod-eu-1"}, inline]},
@@ -463,7 +466,7 @@ class TestCallback(unittest.TestCase):
                         # A payload a text rule would rewrite if it were walked.
                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _RULE_MATCHING_BASE64}, "title": "node 10.0.0.9"},
                         {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "on prod-eu-1"}, "context": "my-proj-4"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _PNG_BASE64}},
                         {"type": "image_url", "image_url": {"url": f"https://example.com/x?token={_OAUTH_TOKEN}"}},
                     ],
                 }
@@ -474,7 +477,7 @@ class TestCallback(unittest.TestCase):
         self.assertNotIn("10.0.0.9", image["title"])
         self.assertNotIn("prod-eu-1", json.dumps(document))
         self.assertNotIn("my-proj-4", json.dumps(document))
-        self.assertEqual(inline["image_url"]["url"], "data:image/png;base64,AAAA")
+        self.assertEqual(inline["image_url"]["url"], "data:image/png;base64," + _PNG_BASE64)
         self.assertNotIn(_OAUTH_TOKEN, json.dumps(linked))
 
     def test_gemini_binary_inline_data_keeps_its_payload_and_text_inline_data_is_refused(self) -> None:
@@ -556,6 +559,34 @@ class TestCallback(unittest.TestCase):
         with self.assertRaises(self.module.UnwalkableRequestError):
             self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/svg+xml", "data": "PHN2Zz4="}}]}]}, "agenerate_content")
 
+    def test_thinking_is_exempt_only_in_the_assistants_own_turn(self) -> None:
+        data = {
+            "messages": [
+                {"role": "user", "content": [{"type": "thinking", "thinking": "on prod-eu-1", "signature": "s"}]},
+                {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "opaque", "note": "on prod-eu-1"}]},
+            ]
+        }
+        user, assistant = self._run(data, "anthropic_messages")["messages"]
+        self.assertNotIn("prod-eu-1", user["content"][0]["thinking"])
+        self.assertEqual(assistant["content"][0]["data"], "opaque")
+        self.assertNotIn("prod-eu-1", assistant["content"][0]["note"])
+        gemini = {"contents": [{"role": "user", "parts": [{"text": "x", "thoughtSignature": _RULE_MATCHING_BASE64}]}]}
+        sent = self._run(gemini, "agenerate_content")["contents"][0]["parts"][0]
+        self.assertNotEqual(sent["thoughtSignature"], _RULE_MATCHING_BASE64)
+
+    def test_a_payload_that_is_not_the_media_it_claims_is_refused(self) -> None:
+        import base64 as b64
+
+        text_as_png = b64.b64encode(b"on prod-eu-1, token here").decode()
+        for part in (
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": text_as_png}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + text_as_png}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;name=on-prod-eu-1;base64," + _PNG_BASE64}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}},  # bad padding
+        ):
+            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+                self._run({"messages": [{"role": "user", "content": [part]}]})
+
     # Fail closed.
 
     def test_a_request_in_a_shape_the_hook_cannot_walk_is_refused(self) -> None:
@@ -616,7 +647,7 @@ class TestCallback(unittest.TestCase):
                     "content": [
                         {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": payload}}]},
                         {"type": "input_audio", "input_audio": {"format": "wav", "data": payload}},
-                        {"type": "file", "file": {"filename": "r.pdf", "file_data": "data:application/pdf;base64," + payload}},
+                        {"type": "file", "file": {"filename": "r.pdf", "file_data": "data:application/pdf;base64," + _PDF_BASE64}},
                     ],
                 }
             ]
@@ -624,7 +655,7 @@ class TestCallback(unittest.TestCase):
         result, audio, filed = self._run(data)["messages"][0]["content"]
         self.assertEqual(result["content"][0]["source"]["data"], payload)
         self.assertEqual(audio["input_audio"]["data"], payload)
-        self.assertEqual(filed["file"]["file_data"], "data:application/pdf;base64," + payload)
+        self.assertEqual(filed["file"]["file_data"], "data:application/pdf;base64," + _PDF_BASE64)
         for part in (
             {"type": "image_url", "image_url": {"url": "data:text/plain;base64,b24gcHJvZC1ldS0x"}},
             {"type": "file", "file": {"file_data": "data:application/json;base64,e30="}},

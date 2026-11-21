@@ -20,10 +20,12 @@ per-message field -- and JSON held in a string stays valid JSON.
 Left exactly as they came, and only at the positions the provider APIs
 define (content parts, a tool result's own content list, `system`,
 `thinking_blocks`, Gemini parts; never inside a tool's input or output or a
-function's arguments): a thinking block's text and signature (the provider
-checks the text against the signature, and the model wrote it from input
-this hook had already redacted); redacted thinking and a thought signature;
-and binary payloads of a known binary media type in strict base64. Generation
+function's arguments): in an assistant's or the model's own turn, a thinking
+block's text and signature (the provider checks the text against the
+signature, and the model wrote it from input this hook had already redacted),
+redacted thinking's data and a thought signature; and, anywhere a part may
+carry one, a binary payload of a known binary media type that decodes as
+base64 and starts the way that media does. Generation
 settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
 `messages` or `contents` that is not a list of objects, or anything at a
@@ -43,6 +45,8 @@ never the payload.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
 import importlib.util
 import logging
@@ -125,8 +129,20 @@ BINARY_MEDIA_PATTERN = re.compile(
     r"^(?:image/(?:png|jpeg|gif|webp|heic|heif)|application/pdf|audio/[a-z0-9.+-]+|video/[a-z0-9.+-]+)$",
     re.IGNORECASE,
 )
-STRICT_BASE64 = re.compile(r"^[A-Za-z0-9+/=\s]*$")
-STRICT_DATA_URL = re.compile(r"^data:([^;,]+)(?:;[^,;]+)*;base64,([A-Za-z0-9+/=\s]*)$", re.IGNORECASE)
+# A data URL with no parameter but `;base64`: a parameter is text the check
+# would otherwise pass along unread.
+STRICT_DATA_URL = re.compile(r"^data:([^;,]+);base64,(.*)$", re.IGNORECASE | re.DOTALL)
+# The first bytes each binary media type starts with, where it has a fixed
+# signature: a payload that does not start with them is not that media, and is
+# refused rather than kept unread.
+MEDIA_MAGIC = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+    "application/pdf": (b"%PDF-",),
+}
+ASSISTANT_ROLES = frozenset({"assistant", "model"})
+DATA_KEY = "data"
 
 
 class UnwalkableRequestError(ValueError):
@@ -198,11 +214,21 @@ class KubeAgentsRedactionCallback(CustomLogger):
         return UnwalkableRequestError(f"the gateway redaction hook refuses a request it cannot walk: {what}")
 
     def _keep_payload(self, media: Any, data: Any, path: tuple, kept: List[tuple]) -> None:
-        """Keep a base64 payload of a known binary media type; refuse anything else."""
+        """Keep a base64 payload of a known binary media type that decodes as
+        that media; refuse anything else."""
         if not (isinstance(media, str) and BINARY_MEDIA_PATTERN.match(media.strip())):
             raise self._refuse(f"a payload of media type {media!r}")
-        if not (isinstance(data, str) and STRICT_BASE64.match(data)):
-            raise self._refuse(f"a {media} payload that is not base64")
+        media = media.strip().lower()
+        if not isinstance(data, str):
+            raise self._refuse(f"a {media} payload that is not a string")
+        try:
+            decoded = base64.b64decode("".join(data.split()), validate=True)
+        except (binascii.Error, ValueError):
+            raise self._refuse(f"a {media} payload that is not base64") from None
+        magic = MEDIA_MAGIC.get(media)
+        webp = media == "image/webp" and not (decoded[:4] == b"RIFF" and decoded[8:12] == b"WEBP")
+        if webp or (magic is not None and not decoded.startswith(magic)):
+            raise self._refuse(f"a payload that does not start as {media}")
         kept.append((path, data))
 
     def _keep_data_url(self, url: str, path: tuple, kept: List[tuple]) -> None:
@@ -213,17 +239,19 @@ class KubeAgentsRedactionCallback(CustomLogger):
         # The whole URL is what goes back.
         kept[-1] = (path, url)
 
-    def _carve_part(self, part: Dict[str, Any], path: tuple, kept: List[tuple], nested: bool) -> None:
-        """A chat or Anthropic content part, at a position the API defines."""
+    def _carve_part(self, part: Dict[str, Any], path: tuple, kept: List[tuple], nested: bool, assistant: bool) -> None:
+        """A chat or Anthropic content part, at a position the API defines.
+        Thinking is exempt only in an assistant's own turn, never in a user's
+        or a tool's, and never inside a tool result."""
         kind = part.get(TYPE_KEY)
-        if kind == THINKING_TYPE:
+        if kind == THINKING_TYPE and assistant and not nested:
             for key in THINKING_KEPT_KEYS:
-                if key in part:
+                if isinstance(part.get(key), str):
                     kept.append((path + (key,), part[key]))
             return
-        if kind == REDACTED_THINKING_TYPE:
-            for key in part:
-                kept.append((path + (key,), part[key]))
+        if kind == REDACTED_THINKING_TYPE and assistant and not nested:
+            if isinstance(part.get(DATA_KEY), str):
+                kept.append((path + (DATA_KEY,), part[DATA_KEY]))
             return
         source = part.get("source")
         if isinstance(source, dict) and source.get(TYPE_KEY) == "base64":
@@ -242,21 +270,22 @@ class KubeAgentsRedactionCallback(CustomLogger):
         # A tool result's own content list holds parts too (an image a tool
         # returned); one level only, since deeper is the tool's own output.
         if kind == TOOL_RESULT_TYPE and not nested and isinstance(part.get("content"), list):
-            self._carve_parts(part["content"], path + ("content",), kept, nested=True)
+            self._carve_parts(part["content"], path + ("content",), kept, nested=True, assistant=False)
 
-    def _carve_parts(self, parts: List[Any], path: tuple, kept: List[tuple], nested: bool = False) -> None:
+    def _carve_parts(self, parts: List[Any], path: tuple, kept: List[tuple], nested: bool = False, assistant: bool = False) -> None:
         for i, part in enumerate(parts):
             if isinstance(part, dict):
-                self._carve_part(part, path + (i,), kept, nested)
+                self._carve_part(part, path + (i,), kept, nested, assistant)
 
-    def _carve_gemini_parts(self, parts: Any, path: tuple, kept: List[tuple]) -> None:
+    def _carve_gemini_parts(self, parts: Any, path: tuple, kept: List[tuple], model: bool) -> None:
         if not isinstance(parts, list):
             return
         for i, part in enumerate(parts):
             if not isinstance(part, dict):
                 continue
+            # A thought signature is exempt only in the model's own turn.
             for key in GEMINI_OPAQUE_PART_KEYS:
-                if key in part:
+                if model and isinstance(part.get(key), str):
                     kept.append((path + (i, key), part[key]))
             for key in GEMINI_INLINE_KEYS:
                 inline = part.get(key)
@@ -268,17 +297,19 @@ class KubeAgentsRedactionCallback(CustomLogger):
         """The fields to leave as they are, as (path from the request, value)."""
         kept: List[tuple] = []
         for i, message in enumerate(data.get(MESSAGES_KEY) or []):
+            assistant = message.get("role") in ASSISTANT_ROLES
             if isinstance(message.get("content"), list):
-                self._carve_parts(message["content"], (MESSAGES_KEY, i, "content"), kept)
-            if isinstance(message.get("thinking_blocks"), list):
-                self._carve_parts(message["thinking_blocks"], (MESSAGES_KEY, i, "thinking_blocks"), kept)
+                self._carve_parts(message["content"], (MESSAGES_KEY, i, "content"), kept, assistant=assistant)
+            if assistant and isinstance(message.get("thinking_blocks"), list):
+                self._carve_parts(message["thinking_blocks"], (MESSAGES_KEY, i, "thinking_blocks"), kept, assistant=True)
         if isinstance(data.get("system"), list):
             self._carve_parts(data["system"], ("system",), kept)
         for i, content in enumerate(data.get(CONTENTS_KEY) or []):
-            self._carve_gemini_parts(content.get("parts"), (CONTENTS_KEY, i, "parts"), kept)
+            model = content.get("role") in ASSISTANT_ROLES
+            self._carve_gemini_parts(content.get("parts"), (CONTENTS_KEY, i, "parts"), kept, model)
         for key in GEMINI_SYSTEM_KEYS:
             if isinstance(data.get(key), dict):
-                self._carve_gemini_parts(data[key].get("parts"), (key, "parts"), kept)
+                self._carve_gemini_parts(data[key].get("parts"), (key, "parts"), kept, False)
         return kept
 
     @staticmethod
