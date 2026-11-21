@@ -382,17 +382,17 @@ FIXTURE_NOT_READY = {
         "after the agent's DaemonSet; no present fleet pool makes such a node, and the cost, not "
         "tried, is a pool of its own with one standing small node whose two times stay readable"
     ),
-    # The shape the first plan reads, the fleet's multi-process workload on a
-    # pool with no pod PID limit, is a setting at the platform's default, which
-    # fixture rule 9 does not take as a fixture. A fixture for the node's own
-    # PIDPressure needs a node of its own and a privileged pod that lowers
-    # kernel.pid_max; in a test the kubelet evicted a pod and the condition
-    # cleared after five minutes, so a standing plant is not shown. #5410 owns
-    # the gap.
+    # A fixture for the node's own PIDPressure needs a node of its own and a
+    # privileged pod that lowers kernel.pid_max; in a test the kubelet evicted
+    # a pod and the condition cleared after five minutes, so a standing plant
+    # is not shown. The shape the first plan reads, the fleet's multi-process
+    # workload on a pool with no pod PID limit, is a setting at the platform's
+    # default, which fixture rule 9 does not take as a fixture. #5410 owns the
+    # gap.
     "node-pid-pressure-fork-exhaustion": (
-        "#5410: the fleet's multi-process workload on a pool with no pod PID limit is a setting at "
-        "the platform's default (fixture rule 9); a fixture for the node's PIDPressure needs a node "
-        "of its own and a privileged pod that lowers kernel.pid_max, and held five minutes in a test"
+        "#5410: a fixture for the node's PIDPressure needs a node of its own and a privileged pod "
+        "that lowers kernel.pid_max, and held five minutes in a test; the pool setting that the "
+        "case reads today is the platform's default (fixture rule 9)"
     ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the

@@ -10,10 +10,10 @@
 # logged "target is busy" and wrote no event. An idle pod of that shape left
 # nothing. (B) A privileged container with `Bidirectional` propagation that
 # mounts and does not unmount left 5 of 5 mounts until the test removed them;
-# this is the path on which `fs.mount-max` can be reached. Neither fault filled
-# a table: (A) reached 240 entries against a limit of 100000. With the node's
-# limit lowered in a separate step, a full table wrote FailedMount, "No space
-# left on device".
+# by reasoning, this is the path on which `fs.mount-max` could be reached.
+# Neither fault filled a table: (A) reached 240 entries against a limit of
+# 100000. With the node's limit lowered in a separate step, a full table wrote
+# FailedMount, "No space left on device".
 # The GCE compute collector reads serial consoles, MIG counters, sole-tenant
 # groups and snapshots and no DaemonSet or node mount count; no other stream
 # reads them on a schedule. Nothing is planted. A fixture for (A) is possible:
@@ -26,13 +26,14 @@
 # (`manifests/nodeExporter-daemonset.yaml` of kube-prometheus, read 2026-11-21,
 # has the same propagation), so the objective changes with the fixture
 # decision. The case stays on the lane with nothing planted, as before this
-# change, until the fleet's owner answers on the fixture; a no parks it under
-# fixture rule 9. `fixtures: []`: the run plants nothing and reads no fixture,
-# so no fixture's drift may excuse it; no safeguard reads a fixture because
-# none exists. Domain `fleet-audits` as the other GCE compute cases.
+# change, until the fleet's owner answers on the fixture, a question that the
+# case's owner posts after this change; a no parks it under fixture rule 9.
+# `fixtures: []`: the run plants nothing and reads no fixture, so no fixture's
+# drift may excuse it; no safeguard reads a fixture because none exists. Domain
+# `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-mount-table-leak-exhaustion
-name: "Node mounts held by an agent (declared gap; nothing planted; a fixture is possible, the fleet's owner not yet asked)"
+name: "Node mounts held by an agent (declared gap; nothing planted; a fixture is possible; not decided)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2
