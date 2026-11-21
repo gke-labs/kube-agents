@@ -414,9 +414,11 @@ const a2aGatewayUser = "gateway"
 const (
 	a2aTriggerSubmitWildcard  = "a2a.trigger.*.submit"
 	a2aTriggerStatusWildcard  = "a2a.trigger.*.status"
+	a2aTriggerStopSubjects    = "a2a.trigger.*.stop"
 	a2aTriggerReplySubjects   = "a2a.trigger.reply.>"
 	a2aTriggerScheduleSubmit  = "a2a.trigger." + triggerScheduleSource + ".submit"
 	a2aTriggerScheduleStatus  = "a2a.trigger." + triggerScheduleSource + ".status"
+	a2aTriggerScheduleStop    = "a2a.trigger." + triggerScheduleSource + ".stop"
 	a2aTriggerScheduleReplies = "a2a.trigger.reply." + triggerScheduleSource + ".>"
 )
 
@@ -505,11 +507,12 @@ func operatorIdentity() (a2aIdentity, bool) {
 	}
 	// With schedules on (A2A_AGENT_SCHEDULES, the switch that registers the
 	// AgentSchedule reconciler), the operator is the schedule source on
-	// attested trigger ingress (#5617): it submits a due run and asks
-	// after the runs it started, and reads the gateway's answers in its
-	// source's reply namespace. Nothing else holds the schedule source.
+	// attested trigger ingress (#5617): it submits a due run, asks after
+	// the runs it started and stops one on request (#6052), and reads the
+	// gateway's answers in its source's reply namespace. Nothing else holds
+	// the schedule source.
 	if a2aAgentSchedulesEnabled() {
-		id.publish = append(id.publish, a2aTriggerScheduleSubmit, a2aTriggerScheduleStatus)
+		id.publish = append(id.publish, a2aTriggerScheduleSubmit, a2aTriggerScheduleStatus, a2aTriggerScheduleStop)
 		id.subscribe = append(id.subscribe, a2aTriggerScheduleReplies)
 	}
 	// With a dispatcher, the operator also makes and removes the profiles'
@@ -733,11 +736,14 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			a2aNotifySubjectConsole,
 			// The bridge's answer to a board request.
 			a2aBoardReplySubjects,
-			// Attested trigger ingress (#5617): every source's submissions
-			// and status queries. The callout binds a source's subject to
-			// its ServiceAccount, so the subject token names the caller.
+			// Attested trigger ingress (#5617): every source's submissions,
+			// status queries and stops (#6052). The callout binds a source's
+			// subject to its ServiceAccount, so the subject token names the
+			// caller, and the gateway answers a stop only for that source's
+			// own recorded runs.
 			a2aTriggerSubmitWildcard,
 			a2aTriggerStatusWildcard,
+			a2aTriggerStopSubjects,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
