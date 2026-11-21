@@ -1952,7 +1952,7 @@ func (b *Bridge) clearSeenSecrets(run *taskRun) {
 	if a == nil {
 		return
 	}
-	if n := a.secrets.clear(); n > 0 {
+	if n := a.secrets.Clear(); n > 0 {
 		b.cfg.Logger.Debug(fmt.Sprintf("seen-set refused %d values", n), "task", run.origin.TaskID, "refused", n)
 	}
 }

@@ -704,8 +704,8 @@ failures name themselves in the status message:
 
 The answer stays on `TASKS`, because the gateway delivers it from there, so the copy a person is
 shown and the copy the stream keeps are the same message. The bridge scrubs it once, before it is
-published (`scrubAnswer` in `answer_scrub.go`, #5280). That covers the `result` artifact and the
-chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
+published (`scrubAnswer` in `answer_scrub.go`, over `answerscrub.Scrub` in `a2a/lib/answerscrub`,
+#5280). That covers the `result` artifact and the chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
 answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
 a failed CLI run's stdout and stderr tails, and an API error's body or error tail. Each is
 scrubbed before it is cut to its tail: the CLI executor keeps the last 64 KiB of each stream
@@ -759,7 +759,7 @@ a status message is the bridge's own text. There are two passes:
    result and the terminal are published, so a delivery still on its way past the door adds
    nothing. None of it is logged or published.
 
-2. **Shape rules.** `scrubInlineSecrets` runs over the answer (the classes are listed under
+2. **Shape rules.** `answerscrub.ScrubInline` runs over the answer (the classes are listed under
    "Activity" below).
 
 The bridge sees a tool's result only through the activity door. Hermes's `post_tool_call`
