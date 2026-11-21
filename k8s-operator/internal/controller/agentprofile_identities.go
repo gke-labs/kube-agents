@@ -173,6 +173,7 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 		a2aCuratorName(agent):                 "the OKF memory curator's ServiceAccount",
 		scopePublisherName(agent):             "the scope publisher's ServiceAccount, the broker's scope caller",
 		a2aDispatcherName(agent):              "the profile dispatcher's ServiceAccount, which carries its bus principal and Jobs RBAC",
+		teamsInboundName(agent):               "the Teams inbound receiver's ServiceAccount, the broker's teams-inbound caller",
 	}
 }
 

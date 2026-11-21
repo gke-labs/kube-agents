@@ -78,6 +78,7 @@ export REQUIRED_RELEASE_IMAGES=(
   "a2a-verifier"
   "a2a-dispatcher"
   "a2a-console"
+  "a2a-teams-inbound"
   "hermes-bridge"
   "web-console"
 )

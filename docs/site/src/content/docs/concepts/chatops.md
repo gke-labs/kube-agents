@@ -607,13 +607,11 @@ An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) c
 
 The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the Hermes gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched.
 
-External inbound Bot Framework webhook ingress is not yet shipped in the operator. `CREDENTIAL_PROXY_ALLOWED_CALLERS` and the credential-proxy `NetworkPolicy` admit connections on `TCP/8765` only from the gateway and shell-sandbox pods, and from the A2A gateway pod when a relay backend is armed on it. With the gateway backend armed and `homeChannel` set, proactive alerts and cron reports reach that Teams conversation through the gateway's `chat.notify` route. See [`docs/chatops/microsoft-teams.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/chatops/microsoft-teams.md) for configuration details.
-
 Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`).
 
 When the operator runs with `A2A_TEAMS_BACKEND=true`, the A2A chat gateway consumes that queue instead of the Hermes adapter (`a2a/gateway/teams.go`, the `A2A_TEAMS_*` env), the broker admits the gateway pod as a caller, and the Hermes Teams platform is not rendered.
 
-What this means for an evaluator: enabling `spec.integration.teams` gives you the outbound half only. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams does not reach the agent: Microsoft delivers it to the bot's messaging endpoint, and the install provides none. The broker's event queue that the gateway reads admits only the gateway pod, so nothing outside the install can feed a message in either.
+What this means for an evaluator: enabling `spec.integration.teams` alone gives you the outbound half. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams reaches the agent only with the inbound receiver on (`spec.integration.teams.inbound.enabled`, with `tenantId`). The operator then runs a pod that accepts the requests Microsoft delivers for the bot, verifies Microsoft's signature on each one, and hands the message to the install. You expose its Service with your own Ingress and TLS certificate and register that address as the bot's messaging endpoint; the setup guide walks through it.
 
 ## Proactive alerts (both channels)
 

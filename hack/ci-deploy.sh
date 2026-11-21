@@ -746,6 +746,7 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
+readonly A2A_TEAMS_INBOUND_IMAGE_ENV_VAR="A2A_TEAMS_INBOUND_IMAGE"
 readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
@@ -762,6 +763,7 @@ readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
+readonly A2A_TEAMS_INBOUND_IMAGE_NAME="a2a-teams-inbound"
 readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
 # The cluster AgentProfile's persona image (a2a/Dockerfile.persona-cluster,
 # context agents/cluster/persona), built beside the A2A images so the lane runs
@@ -1996,6 +1998,7 @@ A2A_CALLOUT_URI="${A2A_IMAGE_PREFIX}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
 A2A_WORKER_URI="${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
 A2A_VERIFIER_URI="${A2A_IMAGE_PREFIX}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
 A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
+A2A_TEAMS_INBOUND_URI="${A2A_IMAGE_PREFIX}/${A2A_TEAMS_INBOUND_IMAGE_NAME}:${TAG}"
 A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
 A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
 PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
@@ -2053,6 +2056,10 @@ A2A_OPERATOR_ENV_ARGS=(
   # The bus's debug logging, for #5708 (above).
   --set-string "operator.extraEnv[12].name=${A2A_NATS_DEBUG_ENV_VAR}"
   --set-string "operator.extraEnv[12].value=${A2A_NATS_DEBUG_ON}"
+  # The Teams inbound receiver's image, from this build, so an eval that
+  # enables spec.integration.teams.inbound pulls the candidate (#1034).
+  --set-string "operator.extraEnv[13].name=${A2A_TEAMS_INBOUND_IMAGE_ENV_VAR}"
+  --set-string "operator.extraEnv[13].value=${A2A_TEAMS_INBOUND_URI}"
 )
 
 # Skipped whole on the release-candidate path: the candidate's images are what
@@ -2089,8 +2096,8 @@ else
   # The web console, built on every lane for the same reason: the deploy
   # installs it on every lane, at the reference section 2a gave the chart.
   WEB_CONSOLE_BUILD_SUBSTITUTIONS=",_WEB_CONSOLE_URI=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}:${TAG}"
-  A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI}"
-  echo "also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar"
+  A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_TEAMS_INBOUND_URI=${A2A_TEAMS_INBOUND_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI}"
+  echo "also building the A2A gateway, auth callout, worker, verifier, dispatcher, console and Teams inbound receiver images, the cluster and tse personas and the Hermes bridge sidecar"
   REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
   if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
     REPLAY_SHADOW_BUILD_SUBSTITUTIONS=",_REPLAY_SHADOW_PROXY_URI=${REPLAY_SHADOW_PROXY_URI}"

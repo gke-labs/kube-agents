@@ -214,8 +214,8 @@ steps:
           docker push "$$uri"
         done
 
-  # The A2A stack's six first-party images (a2a/Dockerfile.gateway,
-  # .authcallout, .worker, .verifier, .console, .dispatcher), built only when hack/ci-deploy.sh
+  # The A2A stack's seven first-party images (a2a/Dockerfile.gateway,
+  # .authcallout, .worker, .verifier, .console, .dispatcher, .teams-inbound), built only when hack/ci-deploy.sh
   # passes their URIs. With the substitutions at their
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
@@ -264,6 +264,8 @@ steps:
         build_and_push verifier "$_A2A_VERIFIER_URI" a2a
         build_and_push console "$_A2A_CONSOLE_URI" a2a
         build_and_push dispatcher "$_A2A_DISPATCHER_URI" a2a
+        # The Teams inbound receiver (#1034), the same shape as the console.
+        build_and_push teams-inbound "$_A2A_TEAMS_INBOUND_URI" a2a
         # The cluster profile's persona: busybox and the persona directory.
         build_and_push persona-cluster "$_PERSONA_CLUSTER_URI" agents/cluster/persona
         # The tse profile's persona, the same shape (#3842).
@@ -405,6 +407,7 @@ substitutions:
   _A2A_WORKER_URI: ""
   _A2A_VERIFIER_URI: ""
   _A2A_CONSOLE_URI: ""
+  _A2A_TEAMS_INBOUND_URI: ""
   _A2A_BRIDGE_URI: ""
   _A2A_DISPATCHER_URI: ""
   _PERSONA_CLUSTER_URI: ""

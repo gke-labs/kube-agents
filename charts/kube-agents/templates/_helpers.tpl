@@ -3635,6 +3635,26 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
     {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
   {{- end -}}
+  {{- /* The Teams inbound receiver: one pod while platformAgent.integration.teams.inbound
+         is enabled beside teams.enabled, at the footprint's per-pod entry
+         (operatorRenderedPerReplica.teamsInboundReceiver, read from the operator's fixed
+         constants, so no resources override reaches it). Outside the loop above: the
+         default golden renders no receiver. A switch on with no entry fails rather than
+         counting the pod as zero. No surge term: the receiver rolls Recreate. */ -}}
+  {{- $teamsValues := .Values.platformAgent.integration.teams | default dict -}}
+  {{- if and $teamsValues.enabled (dig "inbound" "enabled" false $teamsValues) -}}
+    {{- $inbound := index ((index $footprint "operatorRenderedPerReplica") | default dict) "teamsInboundReceiver" | default dict -}}
+    {{- if not $inbound -}}
+      {{- fail "quota preflight: platformAgent.integration.teams.inbound.enabled is set, but footprint.yaml has no operatorRenderedPerReplica.teamsInboundReceiver entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" ($inbound.pods | default 1 | int64)) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($inbound.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($inbound.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($inbound.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($inbound.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($inbound.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($inbound.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+  {{- end -}}
   {{- /* The session pods (a2a-worker): the gateway creates one per delegation or /session
          conversation, up to maxSessions at once, in this namespace. No golden renders one,
          so the footprint carries one pod's worth (operatorRenderedPerReplica.sessionPod,
