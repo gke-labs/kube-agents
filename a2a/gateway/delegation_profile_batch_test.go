@@ -568,3 +568,46 @@ func TestASupervisorEndForAProfileParentCancelsItsBatch(t *testing.T) {
 		return true
 	})
 }
+
+// TestAProfileParentThatEndsCancelsItsSingleLiveChild: the cancel keys on a
+// profile task's own terminal with any live descendant, not on a batch, so
+// a single child, which holds the conversation while it runs, is cancelled
+// too when its parent ends at its deadline.
+func TestAProfileParentThatEndsCancelsItsSingleLiveChild(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	ctx := context.Background()
+	conv := "console:tab-profile-single-parent-ends"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(lib.DelegateRequest{Addressee: "cluster", Text: "look at a", Parameters: targetParams("p1", "us-east1", "a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-single-" + lib.ArtifactDelegate, Name: lib.ArtifactDelegate,
+		Parts: []lib.Part{{Kind: "data", Data: data}}}); err != nil {
+		t.Fatal(err)
+	}
+	child := submissionOn(t, r, "cluster")
+	waitForRecord(t, r, conv, "the child holding the conversation", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID
+	})
+	if err := parent.PublishStatus(ctx, lib.StateFailed, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the live child cancelled with its stop record", func() bool {
+		cancelled := false
+		for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject("cluster", child.TaskID)) {
+			cancelled = cancelled || e.env.Kind == lib.KindCancel
+		}
+		_, stop := dispatchStopFor(t, r.url, "cluster", child.TaskID)
+		return cancelled && stop
+	})
+}

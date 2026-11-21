@@ -959,6 +959,12 @@ func reasonInPlainWords(reason string) (string, bool) {
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
 	ref, _ := rec.TaskRefFor(taskID)
+	// A profile task's own terminal, the executor's or the supervisor's,
+	// ends its wait: its live children, a batch or a single child holding
+	// the conversation, are cancelled now. Nothing else here triggers it.
+	if !ref.Canceled {
+		g.cancelOrphanedChildren(ctx, rec, taskID)
+	}
 	// A task the gateway canceled posts nothing at its end: no turn answer,
 	// result, notice or steer shortfall (applyCanceledEvent). Its line is
 	// still closed below, once, and its end logged and observed. A task with
@@ -1226,7 +1232,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			// children. Its line is closed above. A profile parent's
 			// terminal is its real end, not a hand-off: it waited open for
 			// its children and stopped waiting, so it lets go here as any
-			// task does, and its children are cancelled (cancelOrphanedBatch).
+			// task does, and its children are cancelled (cancelOrphanedChildren).
 			active.StatusMsgID = ""
 		} else {
 			g.releaseEndedTask(ctx, rec, active)

@@ -131,31 +131,44 @@ func (g *Gateway) cancelTreeNode(ctx context.Context, rec *SessionRecord, ref Ta
 
 // releaseEndedTask lets go of the conversation's active task, which has
 // ended, for the relay's terminal and the heal's alike, so the two can't
-// drift: a profile parent that ended while its batch ran has its live
-// children cancelled first (cancelOrphanedBatch). A session parent's batch
-// never reaches here while it runs, since its turn's end only hands off.
+// drift. An ended profile task's live descendants are cancelled first
+// (cancelOrphanedChildren). A session parent's batch never reaches here
+// while it runs, since its turn's end only hands off.
 func (g *Gateway) releaseEndedTask(ctx context.Context, rec *SessionRecord, active *ActiveTask) {
-	if !active.Detached && rec.profileTask(active.TaskID) && rec.fanOutPending(active.TaskID) {
-		g.cancelOrphanedBatch(ctx, rec, active.TaskID)
+	if !active.Detached {
+		g.cancelOrphanedChildren(ctx, rec, active.TaskID)
 	}
 	rec.ActiveTask = nil
 }
 
-// cancelOrphanedBatch cancels the live descendants of a profile parent that
-// ended while its batch ran: nothing reads their results now, so each is
-// cancelled, quietly, with its stop record, as a stop would, rather than
-// left holding a dispatcher slot. The parent itself has ended and is left
-// alone, and a batch caught partway through minting mints no more. The
-// cancels ride the delegation's own authority, as its mint did. Called
-// under the session lock; the caller writes the record.
-func (g *Gateway) cancelOrphanedBatch(ctx context.Context, rec *SessionRecord, parentID string) {
+// cancelOrphanedChildren cancels the live descendants of a profile task that
+// has ended, whatever ended it: its own final status, or the supervisor's
+// at its deadline or its worker's loss. It waited open for them, so nothing
+// reads their results now, and each is cancelled, quietly, with its stop
+// record, as a stop would, rather than left holding a dispatcher slot. That
+// covers a batch and a single child alike. A task that isn't a profile task
+// is left alone: a session turn's end only hands off. The task itself has
+// ended and isn't touched. A batch cut short mints no more either way: its
+// request, redelivered, is stale once the task no longer holds the
+// conversation. The cancels ride the delegation's own authority, as its
+// mint did. An attribution that can't be read is logged, and each cancel
+// then carries the child's capability with no authority block, which an
+// executor may refuse; the dispatch stop record carries no authority and
+// still ends a child the dispatcher holds. Called under the
+// session lock; the caller writes the record.
+func (g *Gateway) cancelOrphanedChildren(ctx context.Context, rec *SessionRecord, parentID string) {
 	parent, ok := rec.TaskRefFor(parentID)
-	if !ok {
+	if !ok || parent.Tier == "" || len(parent.Children) == 0 {
 		return
 	}
-	authority, _ := delegationAuthority(parent)
+	authority, ok := delegationAuthority(parent)
+	if !ok {
+		g.log.Warn("an ended profile task's attribution is unreadable; its children's cancels carry no authority, their stop records still go",
+			"parent", parentID, "conversation", rec.Key)
+	}
 	seen := map[string]bool{parentID: true}
 	queue := slices.Clone(parent.Children)
+	cancelled := 0
 	for len(queue) > 0 && len(seen) <= len(rec.Tasks) {
 		id := queue[0]
 		queue = queue[1:]
@@ -168,16 +181,15 @@ func (g *Gateway) cancelOrphanedBatch(ctx context.Context, rec *SessionRecord, p
 			continue
 		}
 		queue = append(queue, ref.Children...)
-		if ref.fanOut() {
-			rec.markStoppedBatch(id)
-		}
 		if g.liveNode(ctx, rec, ref) {
 			g.cancelTreeNode(ctx, rec, ref, authority, true)
+			cancelled++
 		}
 	}
-	rec.markStoppedBatch(parentID)
-	g.log.Info("a profile parent ended with its batch running; its live children were cancelled",
-		"parent", parentID, "conversation", rec.Key)
+	if cancelled > 0 {
+		g.log.Info("an ended profile task's live children were cancelled",
+			"parent", parentID, "conversation", rec.Key, "cancelled", cancelled)
+	}
 }
 
 // markStoppedBatch records that a stopped fan-out caught partway through
