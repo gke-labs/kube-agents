@@ -1715,7 +1715,7 @@ fi
 # nothing queues) doesn't land on a multi-turn case between its turns; shipped
 # leaves the cap at the install default, what a customer install gets, and an
 # eviction or refusal there is a finding about that default.
-EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
+EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-session}"
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
 platform | session) ;;
