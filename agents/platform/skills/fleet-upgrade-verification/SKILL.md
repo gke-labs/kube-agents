@@ -343,7 +343,7 @@ found behind, two cron jobs on the Platform Agent's roster run the whole report 
 (`cron/README.md` in the platform profile says how):
 
 - `upgrade-readiness-watch`, daily: for a cluster below a version its release channel offers; the
-  report lands under `upgrade-readiness/reports/<version>/` on the agent's volume with one chat line.
+  report lands under `upgrade-readiness/reports/<version>/` on the agent's volume with a short chat message.
 - `upgrade-readiness-weekly-review`, Saturdays: every cluster in scope, every blocker and risk
   registered on the findings queue; the technical report is `upgrade-readiness/weekly/latest.md`
   on the agent's volume, with a copy at `/opt/data/upgrade-readiness/weekly/latest.md` in the
