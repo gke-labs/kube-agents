@@ -3089,7 +3089,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "9683f7e153999d02",
+      "version": "c825e0fa8fe7db93",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3170,6 +3170,7 @@ data:
               "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
               "chat.notify.gchat",
               "chat.notify.slack",
+              "chat.notify.teams",
               "chat.notify.console",
               "_INBOX.agent.>"
             ],
@@ -3252,6 +3253,7 @@ data:
               "chat.console.*.confirm",
               "chat.notify.gchat",
               "chat.notify.slack",
+              "chat.notify.teams",
               "chat.notify.console",
               "chat.board.reply.gateway.>",
               "a2a.trigger.*.submit",
@@ -3310,7 +3312,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 9683f7e153999d02
+    kubeagents.x-k8s.io/a2a-authmap-version: c825e0fa8fe7db93
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3888,6 +3890,7 @@ stringData:
           { stream: { account: APP, subject: "a2a.cap.verify.*" } }
           { stream: { account: APP, subject: "chat.notify.gchat" } }
           { stream: { account: APP, subject: "chat.notify.slack" } }
+          { stream: { account: APP, subject: "chat.notify.teams" } }
           { stream: { account: APP, subject: "chat.notify.console" } }
           { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
         ]
@@ -3980,6 +3983,7 @@ stringData:
                   "chat.console.*.confirm",
                   "chat.notify.gchat",
                   "chat.notify.slack",
+                  "chat.notify.teams",
                   "chat.notify.console",
                   "chat.board.reply.gateway.>",
                   "a2a.trigger.*.submit",
@@ -4204,6 +4208,7 @@ stringData:
           { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
           { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
           { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+          { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
           { stream: "chat.notify.console", accounts: [ TRUSTED ] }
           { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
         ]

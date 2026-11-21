@@ -212,13 +212,13 @@ func withTasksFixedDurableDeny(base []string) []string {
 func a2aCapBucketReadDeny() (publish, subscribe []string) {
 	stream := "KV_" + a2aCapBucket
 	return []string{
-			"$JS.API.*.*." + stream,
-			"$JS.API.*.*." + stream + ".>",
-			"$JS.API.*.*.*." + stream,
-			"$JS.API.*.*.*." + stream + ".>",
-		}, []string{
-			"$KV." + a2aCapBucket + ".>",
-		}
+		"$JS.API.*.*." + stream,
+		"$JS.API.*.*." + stream + ".>",
+		"$JS.API.*.*.*." + stream,
+		"$JS.API.*.*.*." + stream + ".>",
+	}, []string{
+		"$KV." + a2aCapBucket + ".>",
+	}
 }
 
 // a2aCapBucket is the KV bucket the capability chain lives in, created by the
@@ -265,6 +265,7 @@ const (
 	a2aNotifySubjectGchat   = "chat.notify.gchat"
 	a2aNotifySubjectSlack   = "chat.notify.slack"
 	a2aNotifySubjectConsole = "chat.notify.console"
+	a2aNotifySubjectTeams   = "chat.notify.teams"
 	a2aNotifyReplySubjects  = "chat.notify.reply.agent.>"
 
 	// The board route (a2a/gateway/board.go, a2a/hermes-bridge/board.go,
@@ -733,6 +734,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
 			a2aNotifySubjectSlack,
+			a2aNotifySubjectTeams,
 			a2aNotifySubjectConsole,
 			// The bridge's answer to a board request.
 			a2aBoardReplySubjects,
@@ -1013,7 +1015,7 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	// task plane: a notify mints no capability and starts no executor, and
 	// the gateway posts it to the home channel or to a conversation it holds a
 	// live session record for, and nowhere else.
-	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)
+	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{
