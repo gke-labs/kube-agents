@@ -92,7 +92,7 @@ The operator looks for AgentProfiles once, at startup. If the CRD isn't installe
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 
-`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
+`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Work a scheduled run delegates runs at `read`, but the gateway hands it only to a profile that also lists `unattended`. Absent means `read` alone.
 
 A listed tier name is at most 10 lowercase letters or digits, with no hyphen. It becomes part of the profile's bus identity (`profile-<name>-<tier>`, one 63-character label) and of its queue names, so the cap keeps every derived name valid, and the missing hyphen keeps two profiles' queue names from colliding. A longer or hyphenated `Tier` can exist, but no profile can list it.
 

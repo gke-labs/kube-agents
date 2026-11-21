@@ -810,7 +810,7 @@ leaves the record as it was:
    console is `read`, and a requester with no identity is refused. The one path that mints
    `unattended` is the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which
    ships dark until the callout grants a trigger source its submit subject. A delegated profile child runs at its
-   parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
+   parent's tier when the parent is a profile task (`read` when the parent is `unattended`), and at its requester's otherwise. A profile
    task can't delegate to `platform`, whose child would be minted at the install's tier and
    scope.
 4. **Submit.** The submission goes on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the `PROFILE_SUBMITS` stream, `top`
@@ -839,7 +839,9 @@ cluster the install admits); when the parent's scope and chain aren't on its rec
 contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
 (a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
 parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
-trigger. A scheduled run whose delegation was refused, or never started, reads `failed` in the trigger
+trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
+(`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
+child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A scheduled run whose delegation was refused, or never started, reads `failed` in the trigger
 status reply, not `completed`: its own `completed` is only the hand-off line. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
