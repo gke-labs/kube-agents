@@ -801,13 +801,18 @@ when it completed and its reason otherwise, at most 64 KiB and cut by the gatewa
 `result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
 
 A profile parent's batch gets one end per entry. `entry` is the entry's 1-based index in the
-batch, on every end of a batch, and absent for a single delegation. Each end is delivered at least
-once, since a gateway restart between the send and the record write sends it again. So a parent
-waiting on a batch dedupes its ends on `entry` and counts them to the batch's size, and a single
-delegation's on `childTaskId`. A batch child that reaches `input-required` is cancelled and ends
+batch, on every end of a batch, and absent for a single delegation. A `tasks` list of one entry is
+a single delegation, so its end has no `entry`. An end can arrive twice, so a parent waiting on a
+batch dedupes its ends on `entry` and counts them to the batch's size, and a single delegation's
+on `childTaskId`. An end can also be lost: a send that fails is left unrecorded and sent again when
+the gateway's heal next reads the conversation, and a gateway restart at the wrong moment can drop
+one. Nothing heals a conversation no one writes to, so the parent's own deadline is what bounds its
+wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the
+gateway cancels its live children, each with its stop record, since nothing reads their results. A batch child that reaches `input-required` is cancelled and ends
 `canceled`, with its question as `text`. A batch withdrawn whole (cut short, or a child that
-couldn't reach the bus) ends every entry `failed`, with the reason as `text` and no
-`childTaskId`. A withdrawn child's own later end sends nothing more, and a stopped parent gets
+couldn't reach the bus) ends each entry that has no end yet `failed`, with the reason as `text`.
+The end names no `childTaskId`, except for a child whose cancel couldn't be sent and which may
+still run. A withdrawn child's own later end sends nothing more, and a stopped parent gets
 nothing.
 
 This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A

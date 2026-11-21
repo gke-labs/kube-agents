@@ -1219,13 +1219,19 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
-		if !active.Detached && rec.fanOutPending(taskID) {
+		if !active.Detached && rec.fanOutPending(taskID) && !rec.profileTask(taskID) {
 			// A turn whose batch is still running keeps the conversation
 			// until the last child ends (wakeBatch releases it): a stop
 			// reaches it, a steer is refused and a status lists the
-			// children. Its line is closed above.
+			// children. Its line is closed above. A profile parent's
+			// terminal is its real end, not a hand-off: it waited open for
+			// its children and stopped waiting, so it lets go here as any
+			// task does, and its children are cancelled (cancelOrphanedBatch).
 			active.StatusMsgID = ""
 		} else {
+			if !active.Detached && rec.fanOutPending(taskID) {
+				g.cancelOrphanedBatch(ctx, rec, taskID)
+			}
 			rec.ActiveTask = nil
 		}
 		// An executor's end of a live task is activity. The Slack adapter's

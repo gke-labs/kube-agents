@@ -322,3 +322,109 @@ func TestAWithdrawnProfileBatchEndsEveryEntry(t *testing.T) {
 		t.Fatalf("%d ends after the withdrawn child's terminal, want 2: %+v", len(got), got)
 	}
 }
+
+// TestAProfileParentThatEndsBeforeItsBatchGivesTheConversationUp: a profile
+// parent's own terminal is its real end, not a hand-off line, so it releases
+// the conversation even while its batch runs, and its children's later ends
+// send nothing to a parent that no longer reads. Its live children are
+// cancelled.
+func TestAProfileParentThatEndsBeforeItsBatchGivesTheConversationUp(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-parent-ends"
+	parent, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+	if err := parent.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitForRecord(t, r, conv, "the conversation released", func(rec *SessionRecord) bool {
+		return rec.ActiveTask == nil
+	})
+	// Nothing reads the children's results now, so each is cancelled, with
+	// a dispatch stop record, rather than left holding a dispatcher slot.
+	waitFor(t, "each live child cancelled", func() bool {
+		for _, k := range kids {
+			cancelled := false
+			for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject("cluster", k.TaskID)) {
+				cancelled = cancelled || e.env.Kind == lib.KindCancel
+			}
+			if _, stop := dispatchStopFor(t, r.url, "cluster", k.TaskID); !cancelled || !stop {
+				return false
+			}
+		}
+		return true
+	})
+	completeChild(t, r, kids[0], "a is fine")
+	completeChild(t, r, kids[1], "b is fine")
+	waitForRecord(t, r, conv, "both ends recorded", func(rec *SessionRecord) bool {
+		n := 0
+		for _, k := range childrenOf(rec, origin.TaskID) {
+			if k.BatchEnd != nil {
+				n++
+			}
+		}
+		return n == 2
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if rec.ActiveTask != nil {
+		t.Fatalf("active = %+v after the batch, want none", rec.ActiveTask)
+	}
+	if got := childResultsOn(t, r, "chat", origin.TaskID); len(got) != 0 {
+		t.Fatalf("%d ends sent to an ended parent", len(got))
+	}
+}
+
+// TestAWithdrawnProfileBatchLeavesAnEndedEntryAlone: when a cut-short
+// batch's first child had already ended, and been sent, before the batch was
+// withdrawn, that entry keeps its one end and only the entry that never ran
+// gets a failed one.
+func TestAWithdrawnProfileBatchLeavesAnEndedEntryAlone(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-withdrawn-ended"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	first := submissionOn(t, r, "cluster")
+	completeChild(t, r, first, "a is fine")
+	waitFor(t, "a's end", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 1 })
+	r.g.profiles.put("cluster", nil)
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "entry 2's end", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) >= 2 })
+	time.Sleep(200 * time.Millisecond)
+	got := childResultsOn(t, r, "chat", origin.TaskID)
+	if len(got) != 2 {
+		t.Fatalf("%d ends, want one per entry: %+v", len(got), got)
+	}
+	for _, c := range got {
+		switch c.Entry {
+		case 1:
+			if c.State != lib.StateCompleted || c.ChildTaskID != first.TaskID {
+				t.Fatalf("entry 1's end = %+v, want a's completed end", c)
+			}
+		case 2:
+			if c.State != lib.StateFailed || c.ChildTaskID != "" {
+				t.Fatalf("entry 2's end = %+v, want failed with no child", c)
+			}
+		default:
+			t.Fatalf("an end for entry %d", c.Entry)
+		}
+	}
+}

@@ -615,6 +615,24 @@ func (rec *SessionRecord) fanOutPending(taskID string) bool {
 	return ok && ref.fanOut() && ref.DelegationEnd == "" && rec.batchLeft(ref) > 0
 }
 
+// endedBatchEntries is the entries of taskID's batch whose child has ended.
+func (rec *SessionRecord) endedBatchEntries(taskID string) map[int]bool {
+	ended := map[int]bool{}
+	for _, k := range rec.batchChildren(taskID) {
+		if k.BatchEnd != nil {
+			ended[k.BatchIndex] = true
+		}
+	}
+	return ended
+}
+
+// profileTask reports a task addressed to an AgentProfile, which waits open
+// for its children rather than being woken (it has a tier).
+func (rec *SessionRecord) profileTask(taskID string) bool {
+	ref, ok := rec.TaskRefFor(taskID)
+	return ok && ref.Tier != ""
+}
+
 // batchComplete reports a turn whose batch has every planned child on the
 // record: true for any turn that did not ask for a batch of two or more.
 func (ref TaskRef) batchComplete() bool {

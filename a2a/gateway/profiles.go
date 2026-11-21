@@ -746,24 +746,27 @@ func (g *Gateway) profileParentListens(ctx context.Context, parent *TaskRef, chi
 	return true
 }
 
-// sendChildResult publishes a child's end to its profile parent and logs
-// how that went. A failed publish is logged and not retried here: the
-// parent's own deadline bounds its wait.
-func (g *Gateway) sendChildResult(ctx context.Context, rec *SessionRecord, parent, child TaskRef, state lib.TaskState, result, reason string) {
+// sendChildResult publishes a child's end to its profile parent, logs how
+// that went, and reports whether it was published.
+func (g *Gateway) sendChildResult(ctx context.Context, rec *SessionRecord, parent, child TaskRef, state lib.TaskState, result, reason string) bool {
 	if err := g.publishChildResult(ctx, rec, parent, child, state, result, reason); err != nil {
 		g.log.Error("child result not delivered", "child", child.ID, "entry", child.BatchIndex, "parent", parent.ID, "err", err)
-	} else {
-		g.log.Info("child result delivered", "child", child.ID, "entry", child.BatchIndex, "parent", parent.ID, "state", state)
+		return false
 	}
+	g.log.Info("child result delivered", "child", child.ID, "entry", child.BatchIndex, "parent", parent.ID, "state", state)
+	return true
 }
 
 // profileBatchChildEnded sends a profile parent one batch child's end as it
 // ends, with its entry, since the parent waits open and counts its batch's
 // ends (lib.ChildResult). Nothing is sent once the batch was withdrawn,
-// whose entries were each ended then (endWithdrawnProfileBatch).
-func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord, parent, child TaskRef, end BatchEnd, reason string) {
+// whose entries were each ended then (endWithdrawnProfileBatch), or to a
+// parent that no longer reads. It reports false only for a send that
+// failed, so the caller leaves the end unrecorded and the heal finds the
+// child ended and tries again.
+func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord, parent, child TaskRef, end BatchEnd, reason string) bool {
 	if parent.DelegationEnd != "" || !g.profileParentListens(ctx, &parent, child.ID) {
-		return
+		return true
 	}
 	state, text := end.State, end.Text
 	if state == lib.StateInputRequired {
@@ -771,23 +774,37 @@ func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord
 		// question is its result: the parent decides whether to ask.
 		state = lib.StateCanceled
 	}
-	g.sendChildResult(ctx, rec, parent, child, state, text, text)
+	return g.sendChildResult(ctx, rec, parent, child, state, text, text)
 }
 
-// endWithdrawnProfileBatch ends every entry of a profile parent's batch that
-// was withdrawn (it was cut short, or a child couldn't reach the bus), so a
-// parent counting its batch's ends isn't left waiting for children that
-// never ran. Each end is failed with why, and names the entry and no child:
-// a withdrawn child was cancelled before it could deliver anything. A
-// parent that isn't a profile task is left alone; a session parent is woken
-// by nothing for a batch that minted nothing.
-func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionRecord, taskID string, size int, why string) {
+// endWithdrawnProfileBatch ends each entry of a profile parent's batch that
+// was withdrawn (it was cut short, or a child couldn't reach the bus) and
+// had no end yet, so a parent counting its batch's ends isn't left waiting
+// for children that never ran. ended is the entries whose child had already
+// ended, and been sent, before the withdrawal (endedBatchEntries); they get
+// nothing more. Each other end is failed with why. A child still on the
+// record after withdrawBatch is one whose cancel couldn't be sent, so it
+// may still run: its end names it. The rest name only the entry. A parent
+// that isn't a profile task is left alone; a session parent is woken by
+// nothing for a batch that minted nothing.
+func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionRecord, taskID string, size int, why string, ended map[int]bool) {
 	parent, ok := rec.TaskRefFor(taskID)
 	if !ok || parent.Tier == "" || !g.profileParentListens(ctx, &parent, "") {
 		return
 	}
+	kept := map[int]TaskRef{}
+	for _, k := range rec.batchChildren(taskID) {
+		kept[k.BatchIndex] = k
+	}
 	for i := 1; i <= size; i++ {
-		g.sendChildResult(ctx, rec, parent, TaskRef{BatchIndex: i}, lib.StateFailed, "", why)
+		if ended[i] {
+			continue
+		}
+		child, ok := kept[i]
+		if !ok {
+			child = TaskRef{BatchIndex: i}
+		}
+		g.sendChildResult(ctx, rec, parent, child, lib.StateFailed, "", why)
 	}
 }
 

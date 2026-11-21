@@ -676,12 +676,13 @@ type ChildResult struct {
 	// gave otherwise; at most ChildResultTextCap bytes, cut by the gateway.
 	Text string `json:"text,omitempty"`
 	// Entry is the 1-based index of the batch entry this result ends, on
-	// every end of a batch, and 0 for a single delegation. Each entry of a
-	// batch gets exactly one end, delivered at least once: a parent waiting
-	// on a batch dedupes its ends on Entry and counts them to the batch's
-	// size, and a single delegation's on ChildTaskID. An entry that never
-	// got a child (its batch was cut short and withdrawn) ends failed with
-	// no ChildTaskID.
+	// every end of a batch, and 0 for a single delegation (a tasks list of
+	// one included). The gateway sends each entry of a batch one end, which
+	// can arrive twice or, across a restart, be lost: a parent waiting on a
+	// batch dedupes its ends on Entry and counts them to the batch's size,
+	// with its own deadline bounding the wait, and dedupes a single
+	// delegation's on ChildTaskID. An entry that never got a child (its
+	// batch was cut short and withdrawn) ends failed with no ChildTaskID.
 	Entry int `json:"entry,omitempty"`
 }
 

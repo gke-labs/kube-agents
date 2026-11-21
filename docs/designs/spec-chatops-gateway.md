@@ -828,7 +828,11 @@ be a batch (above, the delegation primitive), and so may a profile task's. A pro
 batch is minted as a session's is, the checks below applying to every entry and the batch whole
 or not run, and the parent keeps the conversation while its children run. It isn't woken at the
 last end: each child's end reaches it as its own `childResult`, naming the batch entry, as that
-child ends (`spec-a2a-payloads.md`, "Task parameters and child results"). A profile parent is also held to its own chain
+child ends (`spec-a2a-payloads.md`, "Task parameters and child results"). While the batch runs,
+text in the conversation is refused, as during any fan-out, since which task it was meant for
+isn't the gateway's to guess; a stop reaches the parent and every child. The parent's own end
+gives the conversation up, even with children still running, and those children are cancelled,
+as a stop would cancel them. A profile parent is also held to its own chain
 and scope, checked at the child's mint because the child is a fresh root the verifier never
 compares with its parent. Each profile task records its scope and the profiles of the waiting
 profile tasks above it (its chain) when it's minted. The chain starts afresh at a top submission,

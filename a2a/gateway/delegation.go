@@ -525,9 +525,13 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			// The parent records that its request ran nothing, whether or
 			// not a child whose cancel failed stays on the record: a
 			// withdrawn batch wakes nothing (batchChildEnded).
+			// The entries' ends go out before noChild writes the record,
+			// which marks the batch withdrawn: after that write nothing
+			// would send them.
+			ended := rec.endedBatchEntries(taskID)
 			g.withdrawBatch(ctx, rec, taskID, minted, authority)
+			g.endWithdrawnProfileBatch(ctx, rec, taskID, len(tasks), whyChildOffBus, ended)
 			noChild(notStartedEnd(whyChildOffBus))
-			g.endWithdrawnProfileBatch(ctx, rec, taskID, len(tasks), whyChildOffBus)
 			log.Warn("delegation batch withdrawn: a child could not be started", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
 			return
 		}
@@ -628,9 +632,10 @@ func (g *Gateway) withdrawCutShortBatch(ctx context.Context, rec *SessionRecord,
 	if authority.Via == nil {
 		authority.Via = &AuthorityVia{TaskID: taskID, Session: parent.Addressee}
 	}
+	ended := rec.endedBatchEntries(taskID)
 	kept := g.withdrawBatch(ctx, rec, taskID, parent.Children, authority)
 	rec.markDelegationEnd(taskID, notStartedEnd(whyBatchCutShort))
-	g.endWithdrawnProfileBatch(ctx, rec, taskID, parent.BatchSize, whyBatchCutShort)
+	g.endWithdrawnProfileBatch(ctx, rec, taskID, parent.BatchSize, whyBatchCutShort, ended)
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed after a cut-short batch was withdrawn", "conversation", rec.Key, "err", err)
 	}

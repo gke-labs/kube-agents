@@ -198,12 +198,14 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 	if known && parent.Tier != "" {
 		// A profile parent waits open and takes each end as it comes, so
 		// nothing is held for a wake: the end is sent now and recorded
-		// without its text, which only a wake would read. It is recorded
-		// after the send, so a restart in between sends it again; the
-		// parent dedupes on the entry. The last end changes nothing: the
-		// parent holds the conversation throughout and its own end is the
-		// chain's.
-		g.profileBatchChildEnded(ctx, rec, parent, child, end, reason)
+		// without its text, which only a wake would read. A send that
+		// failed leaves the end unrecorded, so the heal can find the child
+		// ended and send it again; the parent dedupes on the entry. The
+		// last end changes nothing: the parent holds the conversation until
+		// its own end, which is the chain's.
+		if !g.profileBatchChildEnded(ctx, rec, parent, child, end, reason) {
+			return
+		}
 		end.Text = ""
 		rec.setBatchEnd(child.ID, &end)
 		log.Info("fan-out child ended", "state", end.State, "left", rec.batchLeft(parent), "parent", "profile")

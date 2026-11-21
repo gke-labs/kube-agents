@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -126,6 +127,45 @@ func (g *Gateway) cancelTreeNode(ctx context.Context, rec *SessionRecord, ref Ta
 		g.editLine(rec.Key, ref.StatusMsgID, withLineNote(noticeTreeTaskStopped, ref.LineNote), "")
 		setParentLine(rec, ref.ID, "")
 	}
+}
+
+// cancelOrphanedBatch cancels the live descendants of a profile parent that
+// ended while its batch ran: nothing reads their results now, so each is
+// cancelled, quietly, with its stop record, as a stop would, rather than
+// left holding a dispatcher slot. The parent itself has ended and is left
+// alone, and a batch caught partway through minting mints no more. The
+// cancels ride the delegation's own authority, as its mint did. Called
+// under the session lock; the caller writes the record.
+func (g *Gateway) cancelOrphanedBatch(ctx context.Context, rec *SessionRecord, parentID string) {
+	parent, ok := rec.TaskRefFor(parentID)
+	if !ok {
+		return
+	}
+	authority, _ := delegationAuthority(parent)
+	seen := map[string]bool{parentID: true}
+	queue := slices.Clone(parent.Children)
+	for len(queue) > 0 && len(seen) <= len(rec.Tasks) {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ref, held := rec.TaskRefFor(id)
+		if !held {
+			continue
+		}
+		queue = append(queue, ref.Children...)
+		if ref.fanOut() {
+			rec.markStoppedBatch(id)
+		}
+		if g.liveNode(ctx, rec, ref) {
+			g.cancelTreeNode(ctx, rec, ref, authority, true)
+		}
+	}
+	rec.markStoppedBatch(parentID)
+	g.log.Info("a profile parent ended with its batch running; its live children were cancelled",
+		"parent", parentID, "conversation", rec.Key)
 }
 
 // markStoppedBatch records that a stopped fan-out caught partway through
