@@ -179,10 +179,8 @@ func run() int {
 
 	if os.Getenv(lib.EnvProfileWorker) == "true" {
 		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
-		harness := persona.Harness(os.Getenv(lib.EnvProfileHarness))
-		if harness == "" {
-			harness = persona.ClaudeCode
-		}
+		// The harness configFromEnv selected: its driver names it.
+		harness := cfg.Driver.Harness()
 		cfg = profileModeConfig(cfg)
 		pw := workeradapter.ProfileWorkerConfig{
 			Tier:       os.Getenv(lib.EnvProfileTier),
@@ -305,6 +303,16 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		return workeradapter.Config{}, false
 	}
 
+	harness, driver, builder, err := selectHarness(os.Getenv)
+	if err != nil {
+		log.Error("the worker's harness is not one it can run; set "+lib.EnvHarness+" to "+string(persona.ClaudeCode)+" or leave it unset",
+			lib.EnvHarness, os.Getenv(lib.EnvHarness), lib.EnvProfileHarness, os.Getenv(lib.EnvProfileHarness), "err", err)
+		return workeradapter.Config{}, false
+	}
+	// Chosen before anything below builds an argv or env from it.
+	activeHarness = builder
+	log.Info("harness selected", "harness", string(harness))
+
 	originSeq, originSeqStated := originSeq(log)
 	// delegateSocket feeds Config.DelegateSocket (commented in adapter.go):
 	// it answers only the tool's own switch and knows nothing of
@@ -338,6 +346,7 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		CapabilityOptional: capability.OptionalFromEnv(),
 		OriginSeq:          originSeq,
 		OriginSeqStated:    originSeqStated,
+		Driver:             driver,
 		HarnessCommand:     harnessCommand(),
 		HarnessEnv:         harnessEnv(),
 		// Removed before each turn of a reused pod; see the field's comment.
@@ -640,4 +649,23 @@ func selfPath() string {
 		return "/usr/local/bin/worker-adapter"
 	}
 	return self
+}
+
+// selectHarness picks the pod's harness: lib.EnvHarness, else on a profile
+// worker lib.EnvProfileHarness (its older name), else Claude Code. It returns
+// the harness's stream driver and argv builder. A value the worker doesn't
+// know is an error, never a fall back to Claude Code: a typo would otherwise
+// run the wrong harness without a word.
+func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.Driver, harnessBuilder, error) {
+	h := persona.Harness(getenv(lib.EnvHarness))
+	if h == "" && getenv(lib.EnvProfileWorker) == "true" {
+		h = persona.Harness(getenv(lib.EnvProfileHarness))
+	}
+	driver, err := workeradapter.DriverFor(h)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	// DriverFor answers only for the harnesses below; Claude Code is the one
+	// with a driver today.
+	return driver.Harness(), driver, claudeBuilder{}, nil
 }
