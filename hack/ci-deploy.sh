@@ -93,8 +93,11 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 #   workload and waits for that repetition's own card
 #   (autoops-warning-event-triage, autoops-crashloop-config-triage,
 #   autoops-warning-event-no-action-triage, whose plant also fails on any
-#   answer but `injected`). A window longer than the gap folds repetition 2's
-#   incident into repetition 1's and no card comes. The fan-out in
+#   answer but `injected`; the workload-image-pull-refused-* cases also
+#   re-plant one workload, where the turn and not the plant waits for the
+#   card, and their shortest measured repetition is 5.5 minutes). A window
+#   longer than the gap folds repetition 2's incident into repetition 1's
+#   and no card comes. The fan-out in
 #   hack/ci-eval-pr.sh queues case by case and can launch a case's next
 #   repetition as soon as its last ends (#3939), so the gap can be as short
 #   as one repetition: at least 4.5 minutes (the third's shortest). Under

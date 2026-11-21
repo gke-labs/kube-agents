@@ -1921,6 +1921,33 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             self.assertIn("the bootstrap_onboarding plugin is missing", proc.stderr)
             self.assertNotIn("keeps the previous image's copy", proc.stderr)
 
+    def test_a_file_in_the_place_of_a_plugin_folder_is_no_earlier_copy(self):
+        # A file where the plugin's folder must be fails the copy for each user, root or
+        # not. It is no copy of the plugin: the warning names the plugin as missing, and
+        # the start goes on. Without the `[ -d "$_plugin_dst" ]` test of step 2b, `find`
+        # prints the file itself and the warning says that a previous copy is kept.
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            in_the_way = pvc / "plugins" / "bootstrap_onboarding"
+            in_the_way.parent.mkdir(parents=True)
+            in_the_way.write_text("not a folder\n", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(in_the_way.read_text(encoding="utf-8"), "not a folder\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("the bootstrap_onboarding plugin is missing", proc.stderr)
+        self.assertNotIn("keeps the previous image's copy", proc.stderr)
+
 
 class ManagedScopeAssertionTest(unittest.TestCase):
     """Step 2d's other half: the check that the operator's pins actually arrived.

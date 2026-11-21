@@ -1206,6 +1206,7 @@ at nothing and the policies silently inert:
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
 kubectl apply -f config/admission/a2a-dispatcher-job-policy.yaml
+kubectl apply -f config/admission/agentschedule-builtin-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no

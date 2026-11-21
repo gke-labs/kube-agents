@@ -26,6 +26,7 @@ order, and with what exit.
 
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import tempfile
@@ -33,7 +34,18 @@ import time
 import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_SCRIPT = _REPO_ROOT / "bench" / "tf" / "modules" / "namespaced-plant" / "namespaced_plant.sh"
+_MODULE = _REPO_ROOT / "bench" / "tf" / "modules" / "namespaced-plant"
+_SCRIPT = _MODULE / "namespaced_plant.sh"
+_PREBUILT = _REPO_ROOT / "bench" / "tf" / "prebuilt"
+_TASKS = _REPO_ROOT / "bench" / "tasks"
+
+# The module's optional wait after the plant, and what a stack's value is held to.
+_SETTLE_INPUT_RE = re.compile(r"^\s*settle_seconds\s*=\s*(\d+)\s*$", re.MULTILINE)
+_MAX_AGE_RE = re.compile(r"^\s*max_age_sec:\s*(\d+)\s*$", re.MULTILINE)
+# Seconds between the end of the apply and the start of the agent turn, which
+# the fold check's age bound also has to cover: generous, the measured gap is
+# a few seconds.
+_APPLY_TO_TURN_MARGIN_SECONDS = 120
 
 _NAMESPACE = "seeded-workloads"
 _STACK = "workload-missing-memory-limits-oom-baseline"
@@ -289,6 +301,47 @@ class NamespacedPlantTest(unittest.TestCase):
     def test_an_unknown_verb_is_refused(self):
         completed, _ = self._run("prune")
         self.assertEqual(completed.returncode, 2, "NP_EXIT_USAGE")
+
+
+class NamespacedPlantSettleTest(unittest.TestCase):
+    """The optional wait after the plant: off by default, after the plant when
+    on, and short enough for the fold check of the case that asks for it."""
+
+    def test_the_wait_is_off_by_default_and_takes_whole_seconds(self):
+        variables = (_MODULE / "variables.tf").read_text()
+        block = variables[variables.index('variable "settle_seconds"') :]
+        self.assertRegex(block, r"default\s*=\s*0\b")
+        self.assertIn("floor(var.settle_seconds) == var.settle_seconds", block)
+        self.assertIn("var.settle_seconds >= 0", block)
+
+    def test_the_wait_runs_only_when_positive_and_after_the_plant(self):
+        main = (_MODULE / "main.tf").read_text()
+        block = main[main.index('resource "terraform_data" "settle"') :]
+        self.assertRegex(block, r"count\s*=\s*var\.settle_seconds > 0 \? 1 : 0")
+        self.assertRegex(block, r"depends_on\s*=\s*\[null_resource\.plant\]")
+        self.assertIn('command = "sleep ${var.settle_seconds}"', block)
+
+    def test_a_stacks_wait_fits_inside_its_cases_fold_check_age_bound(self):
+        # The age bound counts back from the turn that follows the apply, so a
+        # wait as long as the bound ages the run's own incident out of it.
+        waits = {}
+        for stack_main in sorted(_PREBUILT.glob("*/main.tf")):
+            found = _SETTLE_INPUT_RE.search(stack_main.read_text())
+            if found:
+                waits[stack_main.parent.name] = int(found.group(1))
+        self.assertTrue(waits, "no stack passes settle_seconds; drop this test with the input")
+        for stack, wait in waits.items():
+            cases = [t for t in sorted(_TASKS.glob("*/task.yaml")) if f'stack: "prebuilt/{stack}"' in t.read_text()]
+            self.assertTrue(cases, f"no case uses the stack {stack}")
+            for case in cases:
+                for bound in _MAX_AGE_RE.findall(case.read_text()):
+                    with self.subTest(stack=stack, case=case.parent.name):
+                        self.assertLess(
+                            wait + _APPLY_TO_TURN_MARGIN_SECONDS,
+                            int(bound),
+                            f"{stack} waits {wait}s after the plant, too close to {case.parent.name}'s "
+                            f"max_age_sec of {bound}",
+                        )
 
 
 if __name__ == "__main__":
