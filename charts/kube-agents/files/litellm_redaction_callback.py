@@ -17,15 +17,17 @@ walked whole with the key-aware walk the audit hooks use, so a value is
 redacted wherever it sits -- a tool's input, what a tool returned, a
 per-message field -- and JSON held in a string stays valid JSON.
 
-Left exactly as they came: a thinking block's text and signature (the
-provider checks the text against the signature, and the model wrote it from
-input this hook had already redacted); opaque blocks (redacted thinking, a
-thought signature, encrypted content); and binary payloads (base64 image or
-document data, Gemini inline data, input audio, a `data:` URL). Generation
+Left exactly as they came, and only at the positions the provider APIs
+define (content parts, a tool result's own content list, `system`,
+`thinking_blocks`, Gemini parts; never inside a tool's input or output or a
+function's arguments): a thinking block's text and signature (the provider
+checks the text against the signature, and the model wrote it from input
+this hook had already redacted); redacted thinking and a thought signature;
+and binary payloads of a known binary media type in strict base64. Generation
 settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
-`messages` or `contents` that is not a list of objects, or a payload whose
-media type is text. Responses are not touched; the limitation is documented
+`messages` or `contents` that is not a list of objects, or anything at a
+payload position that is not binary base64. Responses are not touched; the limitation is documented
 on the site's inference-gateway page.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
@@ -96,37 +98,40 @@ CONTROL_KEYS = frozenset(
     }
 )
 CONTROL_KEY_PREFIXES = ("litellm_", "langfuse_", "_")
-# Fields left exactly as they came, because the provider checks them or
-# because they are binary:
+# Fields left exactly as they came, and only at the positions the provider
+# APIs define them -- a content part directly under `messages[].content`, a
+# tool result's own content list, `system`, an assistant's `thinking_blocks`,
+# Gemini `parts` -- never inside a tool's input, a tool's output or a
+# function's arguments, where any shape can appear:
 # - a thinking block's text and signature: the provider verifies the text
 #   against the signature, and the model wrote that text from input this hook
 #   had already redacted;
-# - redacted thinking, Gemini's thought signature and encrypted blobs: opaque;
-# - base64 payloads (an image or document source, Gemini inline data, input
-#   audio) and `data:` URLs: no text rule applies, and a substitution would
-#   corrupt them. A payload whose media type is text is refused instead,
-#   since it carries text the walk cannot reach without decoding it.
+# - redacted thinking and Gemini's thought signature: opaque;
+# - a binary payload (base64 image, document, audio or video, as a source, a
+#   `data:` URL or Gemini inline data): no text rule applies, and a
+#   substitution would corrupt it. It is kept only if its media type is a
+#   known binary one and its data is strict base64; anything else in that
+#   position is refused, since it may carry text the walk cannot read.
 TYPE_KEY = "type"
 THINKING_TYPE = "thinking"
-THINKING_KEPT_KEYS = frozenset({"thinking", "signature"})
+THINKING_KEPT_KEYS = ("thinking", "signature")
 REDACTED_THINKING_TYPE = "redacted_thinking"
-OPAQUE_KEYS = frozenset({"thoughtSignature", "thought_signature", "encrypted_content", "encrypted_index"})
-DATA_KEY = "data"
-BASE64_SOURCE_TYPE = "base64"
-# An Anthropic document whose source is plain text: its data is text, walked.
-TEXT_SOURCE_TYPE = "text"
-MEDIA_TYPE_KEYS = ("media_type", "mimeType", "mime_type")
-INPUT_AUDIO_KEY = "input_audio"
-DATA_URL_PATTERN = re.compile(r"^data:([^;,]*)(?:;[^,]*)?;base64,", re.IGNORECASE)
-TEXT_MEDIA_PREFIXES = ("text/", "application/json", "application/xml", "application/yaml", "application/x-yaml", "application/javascript")
+TOOL_RESULT_TYPE = "tool_result"
+GEMINI_OPAQUE_PART_KEYS = ("thoughtSignature", "thought_signature")
+GEMINI_INLINE_KEYS = ("inlineData", "inline_data")
+GEMINI_MIME_KEYS = ("mimeType", "mime_type")
+GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
+BINARY_MEDIA_PATTERN = re.compile(
+    r"^(?:image/(?:png|jpeg|gif|webp|heic|heif)|application/pdf|audio/[a-z0-9.+-]+|video/[a-z0-9.+-]+)$",
+    re.IGNORECASE,
+)
+STRICT_BASE64 = re.compile(r"^[A-Za-z0-9+/=\s]*$")
+STRICT_DATA_URL = re.compile(r"^data:([^;,]+)(?:;[^,;]+)*;base64,([A-Za-z0-9+/=\s]*)$", re.IGNORECASE)
 
 
 class UnwalkableRequestError(ValueError):
     """A request in a shape the redaction hook does not know how to walk."""
 
-
-def _is_text_media(media_type: Any) -> bool:
-    return isinstance(media_type, str) and media_type.strip().lower().startswith(TEXT_MEDIA_PREFIXES)
 
 
 def _load_redactor():
@@ -188,45 +193,93 @@ class KubeAgentsRedactionCallback(CustomLogger):
     def rules(self) -> List[RedactionRule]:
         return list(self._rules)
 
-    def _keep(self, value: Any, path: tuple, kept: List[tuple], where: str) -> None:
-        """Record a field to leave as it is; refuse a text payload."""
-        if isinstance(value, str):
-            match = DATA_URL_PATTERN.match(value)
-            if match and _is_text_media(match.group(1)):
-                raise UnwalkableRequestError(
-                    f"the gateway redaction hook refuses a request it cannot walk: a {match.group(1)} data URL at {where}"
-                )
-        kept.append((path, value))
+    @staticmethod
+    def _refuse(what: str) -> UnwalkableRequestError:
+        return UnwalkableRequestError(f"the gateway redaction hook refuses a request it cannot walk: {what}")
 
-    def _carve(self, node: Any, path: tuple, kept: List[tuple]) -> None:
-        """Find the fields to leave as they are, anywhere in node."""
-        if isinstance(node, list):
-            for i, item in enumerate(node):
-                if isinstance(item, str) and DATA_URL_PATTERN.match(item):
-                    self._keep(item, path + (i,), kept, "a list item")
-                else:
-                    self._carve(item, path + (i,), kept)
+    def _keep_payload(self, media: Any, data: Any, path: tuple, kept: List[tuple]) -> None:
+        """Keep a base64 payload of a known binary media type; refuse anything else."""
+        if not (isinstance(media, str) and BINARY_MEDIA_PATTERN.match(media.strip())):
+            raise self._refuse(f"a payload of media type {media!r}")
+        if not (isinstance(data, str) and STRICT_BASE64.match(data)):
+            raise self._refuse(f"a {media} payload that is not base64")
+        kept.append((path, data))
+
+    def _keep_data_url(self, url: str, path: tuple, kept: List[tuple]) -> None:
+        match = STRICT_DATA_URL.match(url)
+        if match is None:
+            raise self._refuse("a data URL that is not base64")
+        self._keep_payload(match.group(1), match.group(2), path, kept)
+        # The whole URL is what goes back.
+        kept[-1] = (path, url)
+
+    def _carve_part(self, part: Dict[str, Any], path: tuple, kept: List[tuple], nested: bool) -> None:
+        """A chat or Anthropic content part, at a position the API defines."""
+        kind = part.get(TYPE_KEY)
+        if kind == THINKING_TYPE:
+            for key in THINKING_KEPT_KEYS:
+                if key in part:
+                    kept.append((path + (key,), part[key]))
             return
-        if not isinstance(node, dict):
+        if kind == REDACTED_THINKING_TYPE:
+            for key in part:
+                kept.append((path + (key,), part[key]))
             return
-        kind = node.get(TYPE_KEY)
-        media = next((node[k] for k in MEDIA_TYPE_KEYS if k in node), None)
-        for key, value in node.items():
-            here = path + (key,)
-            if (kind == THINKING_TYPE and key in THINKING_KEPT_KEYS) or kind == REDACTED_THINKING_TYPE or key in OPAQUE_KEYS:
-                kept.append((here, value))
-            elif key == DATA_KEY and kind != TEXT_SOURCE_TYPE and (
-                kind == BASE64_SOURCE_TYPE or media is not None or (path and path[-1] == INPUT_AUDIO_KEY)
-            ):
-                if _is_text_media(media):
-                    raise UnwalkableRequestError(
-                        f"the gateway redaction hook refuses a request it cannot walk: an inline {media} payload"
-                    )
-                kept.append((here, value))
-            elif isinstance(value, str) and DATA_URL_PATTERN.match(value):
-                self._keep(value, here, kept, key)
-            else:
-                self._carve(value, here, kept)
+        source = part.get("source")
+        if isinstance(source, dict) and source.get(TYPE_KEY) == "base64":
+            self._keep_payload(source.get("media_type"), source.get("data"), path + ("source", "data"), kept)
+        image_url = part.get("image_url")
+        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str) and image_url["url"].startswith("data:"):
+            self._keep_data_url(image_url["url"], path + ("image_url", "url"), kept)
+        elif isinstance(image_url, str) and image_url.startswith("data:"):
+            self._keep_data_url(image_url, path + ("image_url",), kept)
+        audio = part.get("input_audio")
+        if isinstance(audio, dict) and "data" in audio:
+            self._keep_payload(f"audio/{audio.get('format', '')}", audio.get("data"), path + ("input_audio", "data"), kept)
+        filed = part.get("file")
+        if isinstance(filed, dict) and isinstance(filed.get("file_data"), str):
+            self._keep_data_url(filed["file_data"], path + ("file", "file_data"), kept)
+        # A tool result's own content list holds parts too (an image a tool
+        # returned); one level only, since deeper is the tool's own output.
+        if kind == TOOL_RESULT_TYPE and not nested and isinstance(part.get("content"), list):
+            self._carve_parts(part["content"], path + ("content",), kept, nested=True)
+
+    def _carve_parts(self, parts: List[Any], path: tuple, kept: List[tuple], nested: bool = False) -> None:
+        for i, part in enumerate(parts):
+            if isinstance(part, dict):
+                self._carve_part(part, path + (i,), kept, nested)
+
+    def _carve_gemini_parts(self, parts: Any, path: tuple, kept: List[tuple]) -> None:
+        if not isinstance(parts, list):
+            return
+        for i, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            for key in GEMINI_OPAQUE_PART_KEYS:
+                if key in part:
+                    kept.append((path + (i, key), part[key]))
+            for key in GEMINI_INLINE_KEYS:
+                inline = part.get(key)
+                if isinstance(inline, dict):
+                    mime = next((inline[k] for k in GEMINI_MIME_KEYS if k in inline), None)
+                    self._keep_payload(mime, inline.get("data"), path + (i, key, "data"), kept)
+
+    def _carve(self, data: Dict[str, Any]) -> List[tuple]:
+        """The fields to leave as they are, as (path from the request, value)."""
+        kept: List[tuple] = []
+        for i, message in enumerate(data.get(MESSAGES_KEY) or []):
+            if isinstance(message.get("content"), list):
+                self._carve_parts(message["content"], (MESSAGES_KEY, i, "content"), kept)
+            if isinstance(message.get("thinking_blocks"), list):
+                self._carve_parts(message["thinking_blocks"], (MESSAGES_KEY, i, "thinking_blocks"), kept)
+        if isinstance(data.get("system"), list):
+            self._carve_parts(data["system"], ("system",), kept)
+        for i, content in enumerate(data.get(CONTENTS_KEY) or []):
+            self._carve_gemini_parts(content.get("parts"), (CONTENTS_KEY, i, "parts"), kept)
+        for key in GEMINI_SYSTEM_KEYS:
+            if isinstance(data.get(key), dict):
+                self._carve_gemini_parts(data[key].get("parts"), (key, "parts"), kept)
+        return kept
 
     @staticmethod
     def _put(root: Any, path: tuple, value: Any) -> None:
@@ -242,13 +295,11 @@ class KubeAgentsRedactionCallback(CustomLogger):
         except (KeyError, IndexError, TypeError):
             return
 
-    def _redact_field(self, value: Any, counts: Dict[str, int]) -> Any:
+    def _redact_field(self, value: Any, kept: List[tuple], counts: Dict[str, int]) -> Any:
         """One top-level field: every string redacted, key names counted, the
         kept fields put back as they came. The original is left unchanged
         (the walk returns a copy)."""
-        kept: List[tuple] = []
-        self._carve(value, (), kept)
-        if isinstance(value, (dict, list)):
+        if kept and isinstance(value, (dict, list)):
             placeholder = copy.deepcopy(value)
             for path, _ in kept:
                 self._put(placeholder, path, None)
@@ -287,11 +338,13 @@ class KubeAgentsRedactionCallback(CustomLogger):
         and never their values.
         """
         self._check_shape(data)
+        kept = self._carve(data)
         counts: Dict[str, int] = {}
         for key in list(data):
             if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
                 continue
-            data[key] = self._redact_field(data[key], counts)
+            mine = [(path[1:], value) for path, value in kept if path[0] == key]
+            data[key] = self._redact_field(data[key], mine, counts)
         return counts
 
 

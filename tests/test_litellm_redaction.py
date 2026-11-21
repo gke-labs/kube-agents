@@ -77,6 +77,9 @@ _OAUTH_TOKEN = "ya29." + "A" * 195
 # reads a whole `postgres://user:password@host/db` literal as a leaked connection
 # string, and the redactor's URL rule does not depend on this placeholder's value.
 _URL_PASSWORD = "hunter2-example-pw"
+# Strict base64 that a text rule would still rewrite (the GCP API-key shape),
+# so a test can tell a kept payload from a walked one.
+_RULE_MATCHING_BASE64 = "AIza" + "B" * 35
 
 
 def _stub_litellm() -> None:
@@ -458,7 +461,7 @@ class TestCallback(unittest.TestCase):
                     "role": "user",
                     "content": [
                         # A payload a text rule would rewrite if it were walked.
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "prod-eu-1AAAA"}, "title": "node 10.0.0.9"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _RULE_MATCHING_BASE64}, "title": "node 10.0.0.9"},
                         {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "on prod-eu-1"}, "context": "my-proj-4"},
                         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
                         {"type": "image_url", "image_url": {"url": f"https://example.com/x?token={_OAUTH_TOKEN}"}},
@@ -467,7 +470,7 @@ class TestCallback(unittest.TestCase):
             ]
         }
         image, document, inline, linked = self._run(data, "anthropic_messages")["messages"][0]["content"]
-        self.assertEqual(image["source"]["data"], "prod-eu-1AAAA")
+        self.assertEqual(image["source"]["data"], _RULE_MATCHING_BASE64)
         self.assertNotIn("10.0.0.9", image["title"])
         self.assertNotIn("prod-eu-1", json.dumps(document))
         self.assertNotIn("my-proj-4", json.dumps(document))
@@ -475,8 +478,8 @@ class TestCallback(unittest.TestCase):
         self.assertNotIn(_OAUTH_TOKEN, json.dumps(linked))
 
     def test_gemini_binary_inline_data_keeps_its_payload_and_text_inline_data_is_refused(self) -> None:
-        binary = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": "prod-eu-1AAAA"}}]}]}
-        self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], "prod-eu-1AAAA")
+        binary = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": _RULE_MATCHING_BASE64}}]}]}
+        self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], _RULE_MATCHING_BASE64)
         for mime in ("text/plain", "application/json"):
             text = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": "b24gcHJvZC1ldS0x"}}]}]}
             with self.assertRaises(self.module.UnwalkableRequestError, msg=mime):
@@ -505,6 +508,51 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(result["api_key"], f"Bearer {_OAUTH_TOKEN}")
         self.assertEqual(result["litellm_call_id"], "prod-eu-1")
         self.assertEqual(result["model"], "prod-eu-1")
+
+    def test_exempt_looking_shapes_inside_tool_traffic_are_walked(self) -> None:
+        # Only the positions the APIs define are exempt. The same shapes inside
+        # a tool's input, a tool's output or a function's arguments are data,
+        # and walked.
+        secret = _RULE_MATCHING_BASE64
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t", "name": "x", "input": {"type": "thinking", "thinking": f"token {_OAUTH_TOKEN}", "signature": "s"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": f"data:image/png;base64,{secret}"},
+                        {"type": "tool_result", "tool_use_id": "u", "content": [{"type": "text", "text": "x", "nested": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": secret}}]}]},
+                    ],
+                },
+            ]
+        }
+        sent = json.dumps(self._run(data, "anthropic_messages"))
+        self.assertNotIn(_OAUTH_TOKEN, sent)
+        self.assertNotIn(secret, sent)
+        gemini = {
+            "contents": [
+                {"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {"inlineData": {"mimeType": "image/png", "data": secret}, "thoughtSignature": secret}}}]}
+            ]
+        }
+        self.assertNotIn(secret, json.dumps(self._run(gemini, "agenerate_content")))
+
+    def test_a_payload_position_holding_anything_but_binary_base64_is_refused(self) -> None:
+        for part in (
+            {"type": "image", "source": {"type": "base64", "media_type": "image/svg+xml", "data": "PHN2Zz4="}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not base64 at all!"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,not base64!"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png,plain"}},
+            {"type": "input_audio", "input_audio": {"format": "wav", "data": "not base64!"}},
+        ):
+            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+                self._run({"messages": [{"role": "user", "content": [part]}]})
+        with self.assertRaises(self.module.UnwalkableRequestError):
+            self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/svg+xml", "data": "PHN2Zz4="}}]}]}, "agenerate_content")
 
     # Fail closed.
 
@@ -558,7 +606,7 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(message["thinking_blocks"], [{"type": "thinking", "thinking": "signed", "signature": "sig"}])
 
     def test_a_binary_payload_is_kept_wherever_it_sits_and_a_text_one_is_refused(self) -> None:
-        payload = "prod-eu-1AAAA"  # a text rule would rewrite it if it were walked
+        payload = _RULE_MATCHING_BASE64
         data = {
             "messages": [
                 {
