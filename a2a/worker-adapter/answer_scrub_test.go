@@ -278,3 +278,57 @@ func TestStderrTailIsScrubbedBeforeItIsCut(t *testing.T) {
 		t.Fatalf("the tail is %d bytes, over stderrTailBytes", len(got)-len(stderrTailHeading))
 	}
 }
+
+// assistantBlockLine is an assistant message carrying one content block.
+func assistantBlockLine(t *testing.T, block map[string]any) string {
+	t.Helper()
+	return eventLine(t, map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []any{block}}})
+}
+
+// The model's thinking is scrubbed before it's published: a value seen in a
+// tool result and echoed in the reasoning comes out redacted.
+func TestASeenSecretEchoedInThinkingIsRedacted(t *testing.T) {
+	task, _, res := runLines(t, "chat-heron-s7c7", "task-scrub-thinking",
+		toolResultLine(t, secretManifest(t, synthSeenValue)),
+		assistantBlockLine(t, map[string]any{"type": "thinking", "thinking": "the secret decodes to " + synthSeenValue + ", so I'll report it"}),
+		resultLine(t, "The database secret exists."),
+	)
+	if res.State != lib.StateCompleted {
+		t.Fatalf("state %q", res.State)
+	}
+	got := artifactText(task, lib.ArtifactThinking)
+	if got == "" || strings.Contains(got, synthSeenValue) || !strings.Contains(got, answerscrub.Redacted) {
+		t.Fatalf("thinking artifact = %q, want the seen value redacted", got)
+	}
+}
+
+// An activity entry carries the tool and a short title, never the call's
+// arguments: a token on a command line doesn't reach the activity artifact.
+func TestAnActivityEntryCarriesNoRawArgument(t *testing.T) {
+	cmd := "curl -H 'Authorization: Bearer " + synthShapeValue + "' https://example.invalid/api"
+	task, _, res := runLines(t, "chat-heron-s8c8", "task-scrub-activity",
+		assistantBlockLine(t, map[string]any{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": map[string]any{"command": cmd}}),
+		assistantBlockLine(t, map[string]any{"type": "tool_use", "id": "toolu_2", "name": "Read", "input": map[string]any{"file_path": "/opt/data/notes/runbook.md"}}),
+		resultLine(t, "done"),
+	)
+	if res.State != lib.StateCompleted {
+		t.Fatalf("state %q", res.State)
+	}
+	art := task.Artifact(lib.ArtifactActivity)
+	if art == nil || len(art.Parts) != 2 {
+		t.Fatalf("activity artifact = %+v, want two entries", art)
+	}
+	want := []map[string]any{{"tool": "Bash", "title": "Bash curl"}, {"tool": "Read", "title": "Read runbook.md"}}
+	for i, p := range art.Parts {
+		var entry map[string]any
+		if err := json.Unmarshal(p.Data, &entry); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(p.Data), synthShapeValue) || strings.Contains(string(p.Data), "example.invalid") || entry["input"] != nil {
+			t.Fatalf("activity entry %d = %s, want no arguments", i, p.Data)
+		}
+		if entry["tool"] != want[i]["tool"] || entry["title"] != want[i]["title"] {
+			t.Fatalf("activity entry %d = %v, want %v", i, entry, want[i])
+		}
+	}
+}

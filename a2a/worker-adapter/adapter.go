@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -1258,8 +1259,10 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 	for _, block := range ev.Message.Content {
 		switch block.Type {
 		case "thinking":
-			if block.Thinking != "" {
-				a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: block.Thinking}, false)
+			// Scrubbed as the answer is before it's published: the debug
+			// and audit views read it from TASKS.
+			if text := a.scrub(block.Thinking); text != "" {
+				a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: text}, false)
 			}
 		case "text":
 			// The model's prose is scrubbed as the answer is (scrub).
@@ -1267,9 +1270,11 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: text}, false)
 			}
 		case "tool_use":
+			// The bridge's shape: the tool and a short scrubbed title, no
+			// arguments (activityTitle).
 			entry, err := json.Marshal(map[string]any{
 				"tool":  block.Name,
-				"input": json.RawMessage(block.Input),
+				"title": activityTitle(block.Name, block.Input),
 			})
 			if err != nil {
 				continue
@@ -2139,4 +2144,52 @@ func chunkString(s string, size int) []string {
 		chunks = append(chunks, s)
 	}
 	return chunks
+}
+
+// activityTitle is a tool call's title for the activity artifact, with none
+// of its arguments: a shell command's program and subcommand, a file tool's
+// file name, otherwise the tool's name. It goes through the scrub's shape
+// rules all the same.
+func activityTitle(tool string, input json.RawMessage) string {
+	var args map[string]any
+	_ = json.Unmarshal(input, &args)
+	str := func(k string) string { v, _ := args[k].(string); return strings.TrimSpace(v) }
+	title := tool
+	switch tool {
+	case "Bash":
+		if bin, sub := leadingCommand(str("command")); bin != "" {
+			title = strings.TrimSpace(tool + " " + bin + " " + sub)
+		}
+	case "Read", "Write", "Edit", "NotebookEdit":
+		path := str("file_path")
+		if path == "" {
+			path = str("notebook_path")
+		}
+		if path != "" {
+			title = tool + " " + filepath.Base(path)
+		}
+	}
+	return answerscrub.ScrubInline(title)
+}
+
+// leadingCommand is a shell command's program (its base name) and, when the
+// next word isn't a flag, an assignment or a quoted or path-like value, its
+// subcommand. Nothing after those two words is kept.
+func leadingCommand(cmd string) (bin, sub string) {
+	fields := strings.Fields(cmd)
+	i := 0
+	for i < len(fields) && strings.Contains(fields[i], "=") && !strings.HasPrefix(fields[i], "-") {
+		i++ // leading VAR=value assignments are dropped
+	}
+	if i >= len(fields) {
+		return "", ""
+	}
+	bin = filepath.Base(fields[i])
+	if i+1 < len(fields) {
+		next := fields[i+1]
+		if next != "" && !strings.ContainsAny(next[:1], "-'\"/$~.") && !strings.ContainsAny(next, "=:/@") && len(next) <= 32 {
+			sub = next
+		}
+	}
+	return bin, sub
 }
