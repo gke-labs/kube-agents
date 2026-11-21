@@ -29,6 +29,13 @@ class ParseTest(unittest.TestCase):
         recipe = registry.parse(text)
         self.assertEqual((recipe.owner, recipe.eval_case), ("platform", ""))
 
+    def test_the_recheck_fields(self):
+        recipe = registry.parse(GOOD + "recheck_kinds: deployments,poddisruptionbudgets\n"
+                                       "recheck_siblings: pdb-overlapping blocking-pdb\n")
+        self.assertEqual(recipe.recheck_kinds, "deployments,poddisruptionbudgets")
+        self.assertEqual(recipe.siblings(), ("pdb-overlapping", "blocking-pdb"))
+        self.assertEqual(registry.parse(GOOD).siblings(), ())
+
     def test_what_it_refuses(self):
         refused = {
             "unknown key": GOOD + "tier: 1\n",
@@ -49,6 +56,9 @@ class ParseTest(unittest.TestCase):
             "a value YAML reads as null": GOOD + "owner: null\n",
             "a value YAML reads as a bool": GOOD + "owner: true\n",
             "a value YAML reads as a number": GOOD + "owner: 12\n",
+            "siblings without kinds": GOOD + "recheck_siblings: blocking-pdb\n",
+            "a sibling that is not a check id": GOOD + "recheck_kinds: deployments\nrecheck_siblings: Blocking_PDB\n",
+            "kinds that are not resource names": GOOD + "recheck_kinds: deployments, pods\n",
             "oversize": GOOD + "# " + "x" * registry.MAX_RECIPE_BYTES + "\n",
         }
         for why, text in refused.items():
@@ -63,7 +73,7 @@ class ParseTest(unittest.TestCase):
         for path in sorted(registry.HERE.glob(f"*/{registry.RECIPE_FILE}")):
             text = path.read_text(encoding="utf-8")
             loaded = {k: ("" if v is None else str(v)) for k, v in yaml.safe_load(text).items()}
-            self.assertEqual(registry.parse(text)._asdict(), {**dict.fromkeys(registry.OPTIONAL, ""), **loaded})
+            self.assertEqual(registry.parse(text)._asdict(), {**registry.Recipe._field_defaults, **loaded})
 
 
 class LoadTest(unittest.TestCase):
