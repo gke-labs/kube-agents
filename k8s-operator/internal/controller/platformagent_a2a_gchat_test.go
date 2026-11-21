@@ -276,8 +276,8 @@ func TestTheBrokerArmsTheA2ARelay(t *testing.T) {
 		t.Errorf("GOOGLE_CHAT_SUBSCRIPTION_NAME=%q rendered beside the A2A subscription: two relay instances would split one subscription, and the proxy refuses to start on the pair", value)
 	}
 	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
-	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
-		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third", callers)
+	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway,system:serviceaccount:test-ns:test-agent-a2a-mcp" {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third and the MCP server's fourth", callers)
 	}
 }
 
@@ -388,8 +388,8 @@ func TestNoRenderCarriesBothChatSubscriptions(t *testing.T) {
 func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 	armed := buildCredentialProxyNetworkPolicy(gchatTestAgent("next", true))
 	from := armed.Spec.Ingress[0].From
-	if len(from) != 3 {
-		t.Fatalf("armed: %d peers on the broker port, want 3 (sandbox, gateway, A2A gateway): %#v", len(from), from)
+	if len(from) != 4 {
+		t.Fatalf("armed: %d peers on the broker port, want 4 (sandbox, gateway, A2A gateway, MCP): %#v", len(from), from)
 	}
 	var found bool
 	for _, peer := range from {
@@ -406,8 +406,8 @@ func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 	// Unarmed, the A2A gateway is still a peer: its report reader calls the
 	// store routes on every install (a2a_report_reader.go).
 	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("next", false), a2aTestAgent()} {
-		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 3 {
-			t.Errorf("unarmed: %d peers, want the two main renders and the A2A gateway", got)
+		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 4 {
+			t.Errorf("unarmed: %d peers, want the four default renders (sandbox, gateway, A2A gateway, MCP)", got)
 		}
 	}
 }

@@ -853,10 +853,13 @@ report up by the conversation alone.
 **Pushed report.** A turn under a report the gateway's notify route posted into the conversation
 carries `{"pushedReport": {"taskId"?, "text"}}`: the report's text, kept by the gateway from the
 report it posted (a post the kanban notifier marks as a card's report, `report`, naming its task
-with `reply_to`; `spec-chatops-gateway.md`, "Proactive posts"), and the root of the task it reported on. The gateway
+with `reply_to` on a console post; `spec-chatops-gateway.md`, "Proactive posts"), and, for a console
+report, the root of the task it reported on. The gateway
 attaches it to a human turn, on any route, that names the task (`replyTo`, read as its chain's
-root): a console or MCP turn, since only console posts name their task today; a chat thread reply
-keeps the executor's lookup. The hermes-bridge (the platform route, the install's default) frames
+root), a console or MCP turn, and to the next human turn that opens in a chat thread (a Slack or
+Google Chat thread key, `lib.ThreadKeyedConversation`), which names no task and carries the newest
+report kept for the thread's key, after which the gateway forgets the reports that turn read
+(`taskId` absent; `spec-chatops-gateway.md`, "Proactive posts"). The hermes-bridge (the platform route, the install's default) frames
 the text as it frames a report it looked up, untrusted and ahead of the words, and skips the lookup
 (`a2a/docs/hermes-bridge.md`). `text` is at most 64 KiB (`lib.PushedReportTextCap`), cut by the
 gateway with a note; a part with no text, text past the cap, a task id that is not a subject

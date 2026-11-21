@@ -846,6 +846,8 @@ Layout:
   `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
+  **Amended:** the MCP server now runs by default unless `A2A_MCP_DOOR` is `false` (set by
+  the chart's `operator.mcpServer.enabled: false`).
 
 - **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
