@@ -118,6 +118,7 @@ It starts only when all of these hold. Otherwise a Normal `A2ABusReshapeNotStart
 - no migration is under way, and the last one isn't a `Failed` run waiting for a person;
 - the bus is provisioned (`BusProvisioned`), or its provision Job refused only TASKS's width, as it does after a reshape given up with TASKS still narrow;
 - the operator has its own image (`OPERATOR_IMAGE`);
+- the installed PlatformAgent CRD keeps `status.busMigration`. An older CRD drops the run's record, so the request is refused, naming the CRD; once this release's CRD is applied and the operator restarted, the same request starts;
 - the live TASKS is narrower than the width this PlatformAgent renders. A TASKS with no limit is never narrower;
 - TASKS fits the limits the restore puts on it, as for one to three.
 

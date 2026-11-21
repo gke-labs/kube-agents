@@ -507,34 +507,58 @@ func TestTheReshapeRecordsAreForgottenWithTheCR(t *testing.T) {
 
 // On a served CRD that drops status.busMigration, the start's write comes
 // back without the run. Nothing is recorded on the StatefulSet, so the
-// request isn't read as answered; the next pass refuses it, naming the CRD
-// (#6600).
+// request isn't read as answered (#6600), and the same pass refuses it,
+// naming the CRD, rather than leaving that to a pass nothing asks for
+// (#6692). A later pass doesn't repeat the Event. The earlier record the
+// failed write leaves in place decides nothing: whether it is no run, a
+// finished run of another leg, or a finished reshape for another request,
+// none of them answers this one.
 func TestAReshapeStartAPruningCRDDroppedIsNotRecorded(t *testing.T) {
-	m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
-	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "first"}
-	pruning := interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
-		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-			if err := c.SubResource(sub).Patch(ctx, obj, patch, opts...); err != nil {
-				return err
+	for _, c := range []struct {
+		name    string
+		earlier *agentv1alpha1.BusMigrationStatus
+	}{
+		{"no earlier run", nil},
+		{"an earlier run of another leg", &agentv1alpha1.BusMigrationStatus{
+			Leg: string(busMigrationGrow), RunID: "1-grow", Phase: string(busMigrationDone)}},
+		{"an earlier reshape for another request", &agentv1alpha1.BusMigrationStatus{
+			Leg: string(busMigrationReshape), RunID: "1" + busReshapeRunSuffix("older"), Phase: string(busMigrationDone)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
+			m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "first"}
+			m.agent.Status.BusMigration = c.earlier.DeepCopy()
+			pruning := interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					if err := cl.SubResource(sub).Patch(ctx, obj, patch, opts...); err != nil {
+						return err
+					}
+					if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && sub == "status" {
+						pa.Status.BusMigration = nil // the served CRD pruned it
+					}
+					return nil
+				},
+			})
+			m.r.Client = pruning
+			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+				t.Fatal(err)
 			}
-			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && sub == "status" {
-				pa.Status.BusMigration = nil // the served CRD pruned it
+			if got := m.stsReshapeRecord(); got != "" {
+				t.Errorf("StatefulSet record %q after a start the CRD dropped, want none", got)
 			}
-			return nil
-		},
-	})
-	m.r.Client = pruning
-	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
-		t.Fatal(err)
-	}
-	if got := m.stsReshapeRecord(); got != "" {
-		t.Errorf("StatefulSet record %q after a start the CRD dropped, want none", got)
-	}
-	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
-		t.Fatal(err)
-	}
-	if ev := m.reshapeEvents(); len(ev) != 1 || !strings.Contains(ev[0], "drops status.busMigration") {
-		t.Errorf("events %q, want one naming the CRD that drops status.busMigration", ev)
+			if ev := m.reshapeEvents(); len(ev) != 1 || !strings.Contains(ev[0], "drops status.busMigration") {
+				t.Errorf("events after the dropped start %q, want one naming the CRD that drops status.busMigration", ev)
+			}
+			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+				t.Fatal(err)
+			}
+			if got := m.stsReshapeRecord(); got != "" {
+				t.Errorf("StatefulSet record %q after the next pass, want none", got)
+			}
+			if ev := m.reshapeEvents(); len(ev) != 0 {
+				t.Errorf("events after the next pass %q, want none: the first pass's Event stands", ev)
+			}
+		})
 	}
 }
 
