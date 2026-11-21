@@ -29,8 +29,11 @@
 # half, and its name says only that.
 #
 # The object is planted for one run. A run stopped between plant and removal
-# leaves it on the host until this stack's next plant clears it, and a
-# compliance audit of that install files the finding in the meantime. A
+# leaves it on the host. On the lane the sweep at the lease's start and end
+# removes the CRD, and the object with it; on another install it stays until
+# this stack's next plant clears it, and a compliance audit of that install
+# files the finding in the meantime. The emptied namespace stays in either
+# case until the next plant. A
 # standing object on the seeded fleet is the form not taken: it adds one
 # critical finding to every compliance audit of every pool project for as
 # long as it stands.

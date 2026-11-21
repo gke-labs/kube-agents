@@ -346,6 +346,15 @@ class CrdScriptTest(unittest.TestCase):
                 self.assertEqual(self._kubectl(calls, "delete crd"), [])
                 self.assertEqual(self._kubectl(calls, "create -f -"), [])
 
+    def test_a_failed_plant_leaves_a_crd_whose_shape_is_not_this_stacks_or_is_unread(self):
+        for label, scenario in (("a subresource", {"CRD_SUBRESOURCES": '{"status":{}}'}), ("an unread shape", {"CRD_SHAPE_RC": 1})):
+            with self.subTest(label):
+                if self._calls.exists():
+                    self._calls.unlink()
+                done, calls = self._run("plant", CRD_WAIT_RC=1, **scenario)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertEqual(self._kubectl(calls, "delete crd"), [])
+
     def test_a_plant_that_fails_after_the_create_removes_its_crd(self):
         # Terraform taints the resource and skips its destroy provisioner.
         done, calls = self._run("plant", CRD_WAIT_RC=1)

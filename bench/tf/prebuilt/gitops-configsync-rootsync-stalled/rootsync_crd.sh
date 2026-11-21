@@ -88,15 +88,17 @@ rc_plant() {
   # A plant that fails after the CRD exists removes it on the way out:
   # Terraform taints the resource and skips its destroy provisioner. The flag
   # is set before the create is sent, and the trap deletes only a CRD that
-  # carries this stack's label, so a refused create over a foreign CRD
-  # deletes nothing.
+  # carries this stack's label and still has this stack's shape, so a refused
+  # create over a foreign CRD deletes nothing. A shape it cannot read is not
+  # this stack's shape.
   rc_on_exit() {
     local status=$?
     set +e
     if [ "$status" -ne 0 ] && [ -n "$rc_planted" ]; then
-      local owner
+      local owner shape
       owner="$(rc_owner 2>/dev/null)"
-      if [ "$owner" = "$RC_CRD/$RC_STACK" ]; then
+      shape="$(rc_subresources 2>/dev/null)" || shape="unread"
+      if [ "$owner" = "$RC_CRD/$RC_STACK" ] && [ -z "$shape" ]; then
         echo "Plant failed (exit $status); deleting $RC_CRD so the next run starts clean." >&2
         kubectl delete crd "$RC_CRD" --ignore-not-found --wait=false >&2
       fi

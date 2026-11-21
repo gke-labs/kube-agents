@@ -9,7 +9,8 @@
 # first remover; this is the backstop hack/ci-teardown.sh runs at every lease
 # start and end, since a run killed between apply and destroy runs no destroy,
 # and a leftover ComputeClass or webhook is read by the next lease's audits
-# while a leftover pool bills.
+# while a leftover pool bills. A leftover CRD is read the same way: the
+# objects of its kind stay with it, and an audit files them.
 #
 # Dry run by default: every leg lists the names it matches and prints what it
 # would delete. --delete acts. Each leg lists first and deletes by name, so the
@@ -17,7 +18,9 @@
 # (a planted hook must not refuse the deletes after it), the readiness rules
 # next (the controller untaints before the pools go), the compute classes
 # before the pools (a class with nodePoolAutoCreation could provision a new
-# pool after the sweep), the pools last and --async: a synchronous pool delete
+# pool after the sweep), the planted CRDs after the classes (a CRD's delete
+# removes every object of its kind, in every namespace, so the sweep needs no
+# leg for those objects), the pools last and --async: a synchronous pool delete
 # is minutes, and the next sweep lists what is still going. Kubernetes deletes
 # are --wait=false for the same reason: a class held by a finalizer is listed
 # again next time instead of hanging this run.
@@ -47,6 +50,7 @@ readonly PLANT_KINDS=(
   mutatingwebhookconfigurations.admissionregistration.k8s.io
   nodereadinessrules.readiness.node.x-k8s.io
   computeclasses.cloud.google.com
+  customresourcedefinitions.apiextensions.k8s.io
 )
 # The gcloud filter is client-side; a pool without the key evaluates false.
 # STOPPING is a pool already deleting: a second delete answers 409.

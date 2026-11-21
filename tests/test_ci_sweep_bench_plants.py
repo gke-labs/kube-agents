@@ -34,6 +34,7 @@ _KINDS = (
     "mutatingwebhookconfigurations.admissionregistration.k8s.io",
     "nodereadinessrules.readiness.node.x-k8s.io",
     "computeclasses.cloud.google.com",
+    "customresourcedefinitions.apiextensions.k8s.io",
 )
 _POOL_FILTER = "config.resourceLabels.managed-by=kube-agents-bench AND status!=STOPPING"
 _ABSENT_STDERR = "error: the server doesn't have a resource type \"nodereadinessrules\""
@@ -178,6 +179,7 @@ class BenchPlantSweepTest(unittest.TestCase):
                 f"{_KINDS[0]}|validatingwebhookconfiguration.admissionregistration.k8s.io/bench-hook",
                 f"{_KINDS[1]}|mutatingwebhookconfiguration.admissionregistration.k8s.io/bench-mutate",
                 f"{_KINDS[3]}|computeclass.cloud.google.com/general-ccc",
+                f"{_KINDS[4]}|customresourcedefinition.apiextensions.k8s.io/rootsyncs.configsync.gke.io",
             )
         )
         completed, calls = self._run(*_ARGS, "--delete", PLANT_NAMES=names)
@@ -189,6 +191,9 @@ class BenchPlantSweepTest(unittest.TestCase):
                 "validatingwebhookconfiguration.admissionregistration.k8s.io/bench-hook",
                 "mutatingwebhookconfiguration.admissionregistration.k8s.io/bench-mutate",
                 "computeclass.cloud.google.com/general-ccc",
+                # A planted CRD goes after the classes; its delete takes the
+                # objects of its kind with it, in whatever namespace they are.
+                "customresourcedefinition.apiextensions.k8s.io/rootsyncs.configsync.gke.io",
             ],
             deletes,
         )
