@@ -354,6 +354,35 @@ class PermittedTest(RoutesTestCase):
         self.assertTrue(self.store.seen[1]["authorization"] == "Bearer a-rotated-store-token")
 
 
+# A synthetic token of a shape credential_shapes redacts.
+_REPORT_TOKEN_SHAPE = "ghp_SyntheticReportReadToken0123456789ab"
+
+
+class ReadRedactionTest(RoutesTestCase):
+    """A report read is redacted for a profile caller and relayed as stored for the shell."""
+
+    def test_a_profile_callers_report_read_is_redacted(self):
+        self.store.answer = (200, json.dumps({"summary": f"found {_REPORT_TOKEN_SHAPE} in a ConfigMap"}).encode())
+        status, answer = self.request("GET", f"{STREAM}/latest", token=REPORT["token"])
+        self.assertEqual(200, status, answer)
+        self.assertEqual({"summary": "found [REDACTED] in a ConfigMap"}, answer)
+        self.assertTrue(any("audit-report read redacted shapes=1" in record for record in self.records), self.records)
+        self.assertFalse(any(_REPORT_TOKEN_SHAPE in record for record in self.records))
+
+    def test_the_shells_report_read_is_relayed_as_stored(self):
+        self.authenticator.principal = self.shell
+        stored = json.dumps({"summary": f"found {_REPORT_TOKEN_SHAPE}"}).encode()
+        self.store.answer = (200, stored)
+        status, answer = self.request("GET", f"{STREAM}/latest")
+        self.assertEqual(200, status, answer)
+        self.assertEqual(json.loads(stored), answer)
+
+    def test_a_profile_write_is_relayed_as_sent(self):
+        # Only reads are redacted: what a profile writes is stored as it sent it.
+        path = f"{STREAM}/runs/{RUN}"
+        self.assert_relayed("PUT", path, self.request("PUT", path, token=REPORT["token"]), BODY)
+
+
 class RefusalTest(RoutesTestCase):
     def test_a_wrong_stream(self):
         path = f"/v1/audit-reports/{OTHER_AUDIT}/{GITOPS_KEY}/latest"

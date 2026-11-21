@@ -132,7 +132,17 @@ SOURCES: dict[str, Source] = {
             "DESTRUCTIVE_SLACK_VERBS",
             "SLACK_REMOVE_ALLOWLIST",
             "SLACK_METHOD_SHAPE",
+            "REDACTED_OUTPUT_ROLES",
+            "def exec_response(",
+            "def redact_reply_body(",
         ),
+    ),
+    # C1 runs every tool-output case of this file through the broker's exec
+    # and MCP relay replies. The answer scrubber's tests read the same file,
+    # so a case is added here once for both.
+    "credential_shapes_fixture": Source(
+        "tests/conformance/fixtures/credential-shapes.json",
+        ('"version": 1', '"cases"', '"tool-output"'),
     ),
     # B1 imports this module: the per-tool allowlist the broker applies to
     # every remote MCP call.
