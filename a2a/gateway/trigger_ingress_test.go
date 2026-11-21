@@ -1182,3 +1182,50 @@ func TestAScheduledRunThatMintedAChildReadsItsOwnEnd(t *testing.T) {
 		t.Fatalf("a run that minted a child reads %+v, want completed", got)
 	}
 }
+
+// TestAScheduledRunsChildCarriesTheScheduledMark: the child runs at read,
+// so the card check can't key on its tier when it delegates in turn; the
+// mark it carries (TaskRef.Scheduled) holds its own children to the same
+// cards. A child can't delegate while it is the conversation's live task
+// today (delegation.busy), so this checks the mark, not a grandchild.
+func TestAScheduledRunsChildCarriesTheScheduledMark(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	var child TaskRef
+	waitFor(t, "the child's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		if rec == nil {
+			return false
+		}
+		p, ok := rec.TaskRefFor(origin.TaskID)
+		if !ok || len(p.Children) == 0 {
+			return false
+		}
+		child, ok = rec.TaskRefFor(p.Children[0])
+		return ok
+	})
+	if child.Tier != string(capability.TierRead) || !child.Scheduled || !child.belowSchedule() {
+		t.Fatalf("the child's entry = tier %q scheduled %v, want read and marked", child.Tier, child.Scheduled)
+	}
+	if (TaskRef{Tier: string(capability.TierRead)}).belowSchedule() {
+		t.Fatal("an unmarked read task reads as below a schedule")
+	}
+}

@@ -125,3 +125,9 @@ func clusterForRoom(s capability.Scope) (string, bool) {
 	}
 	return "", false
 }
+
+// belowSchedule reports whether a task is a scheduled run (the unattended
+// tier) or a profile task below one (#6744).
+func (t TaskRef) belowSchedule() bool {
+	return t.Tier == string(capability.TierUnattended) || t.Scheduled
+}

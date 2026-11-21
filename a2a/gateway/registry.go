@@ -366,6 +366,11 @@ type TaskRef struct {
 	// profile task waiting open. Carried rather than walked, because the
 	// bounded history can evict an ancestor and a walk would then miss it.
 	ProfileChain []string `json:"profileChain,omitempty"`
+	// Scheduled marks a profile task below a scheduled run (#6744): a child
+	// of an unattended task, or of one marked. Carried down the chain at
+	// mint, like ProfileChain, so a grandchild's profile is held to the
+	// same card check as a child's even though both run at read.
+	Scheduled bool `json:"scheduled,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.

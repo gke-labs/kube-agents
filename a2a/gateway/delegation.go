@@ -334,10 +334,11 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
 				return nil, false
 			}
-			if profileParent && capability.Tier(parent.Tier) == capability.TierUnattended {
+			if profileParent && parent.belowSchedule() {
 				// The child runs at read, but for a schedule, with nobody
 				// watching: only a profile whose card lists unattended takes
-				// it, as only such a profile takes the trigger itself.
+				// it, as only such a profile takes the trigger itself. So
+				// does a grandchild: the mark rides the chain.
 				if card, ok := g.profiles.lookup(route.Profile); !ok || !cardAllowsTier(card, capability.TierUnattended) {
 					refuse(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+fmt.Sprintf(noticeUnattendedChild, route.Profile), "child", route.Profile)
 					return nil, false
@@ -447,6 +448,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		LineNote:             lineNote,
 		Route:                route,
 		ProfileChain:         childProfileChain(parent, profileParent),
+		Scheduled:            profileParent && parent.belowSchedule(),
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),
