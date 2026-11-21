@@ -28,7 +28,9 @@ An envelope carries `audit_id`, `repo`, `started_at`, `finished_at`, `status`, `
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `scheduled`, `scheduled_coverage_gaps`, `scheduled_published_ids`, `scheduled_reported_under_gap`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
-`document`, and sometimes `ledger_document`, `reported_under_gap`, `silent_floor`, `inspect_s`, `publish_s` and `collect_s`.
+`document`, and sometimes `ledger_document`, `reported_under_gap`, `silent_floor`, `inspect_s`, `publish_s`, `collect_s` and `report`.
+`report` is the chat report the A2A gateway posts for a scheduled run; `report_status.py` leaves it out, and its
+`silent` is not the run's `silent_ok`. Don't answer from it.
 The `scheduled_*` keys record the last scheduled run, not this run: an on-demand run copies them
 forward.
 

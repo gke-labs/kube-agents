@@ -53,6 +53,7 @@ class ReportStatusTestCase(unittest.TestCase):
             "resolved_ids": [],
             "current_ids": ["a", "b"],
             "ledger_body": "the rendered body",
+            "report": {"schema": "kube-agents.report/v1", "text": "for the relay", "silent": False},
             "document": {
                 "findings": [{"severity": "critical"}, {"severity": "major"}],
                 "scope": {"clusters": [{}, {}, {}], "skipped": [{}]},
@@ -92,7 +93,7 @@ class TestProjection(ReportStatusTestCase):
         self.assertEqual((latest["clusters"], latest["skipped"]), (3, 1))
         self.assertEqual(latest["repo"], "acme/fleet")
         self.assertEqual(latest["chat"], "kept")
-        for key in ("document", "ledger_body", "new_ids", "current_ids"):
+        for key in ("document", "ledger_body", "new_ids", "current_ids", "report"):
             self.assertNotIn(key, latest)
         self.assertIsNone(latest["prs_opened"])
         self.assertEqual(stream["repos"][REPO]["runs"], ["20260801T093000.000000Z.json"])

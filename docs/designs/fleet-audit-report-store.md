@@ -131,6 +131,17 @@ the collector-held ids, and the ids under _Not re-checked this run_ ([ledger des
 When that last list is not empty, `not_rechecked` gives the title and place of each of its findings,
 because the body may have no row for them and the document does not carry them. A held-open clean
 run copies it from the previous record.
+`report` is the chat-ready report the A2A gateway's relay posts for a scheduled run in place of its
+final message (#5618, [`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 2):
+`{"schema": "kube-agents.report/v1", "text", "silent"}`. `text` is this `finish`'s chat text for its
+repository, cut to 24 KiB as written: the part it adds to the chat record, without the record's
+refinish or rerun label and without other repositories' parts. `silent` is `finish`'s quiet verdict
+(`silent_ok`). The gateway also reads an optional `card` (a `kube-agents.chat/v1` message), which
+`finish` doesn't write yet: its builder, `slack_audit_report`, isn't in the sandbox a profile run
+uses (#6162). The report is best-effort: one that cannot be built leaves the envelope without it,
+and the store write goes on. A no-forge or store-ledger run renders it as stored, since it is
+read only once the store holds it. Nothing reads `report` for whose run it is: the gateway trusts
+only the broker's writer stamp beside the envelope.
 
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
