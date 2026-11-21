@@ -841,8 +841,7 @@ contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A p
 parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
 trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
 (`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
-child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A scheduled run whose delegation was refused, or never started, reads `failed` in the trigger
-status reply, not `completed`: its own `completed` is only the hand-off line. A child's
+child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its

@@ -519,24 +519,7 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	if task.Final && task.State == lib.StateCompleted && rec.delegationEndFor(q.TaskID) != "" {
-		// The run handed off to a child that was never minted (a refused
-		// or unstarted delegation): its own `completed` is only the
-		// hand-off line, never a deliverable, so the run failed. Without
-		// this a refused fan-out would read Succeeded.
-		return lib.TriggerStatusReply{Found: true, State: lib.StateFailed, Terminal: true}
-	}
 	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
-}
-
-// delegationEndFor is the reason a task's delegation minted no child
-// (TaskRef.DelegationEnd), or "" - also when it did mint one on another
-// request, whose result its `completed` may carry (as handOffEnd reads it).
-func (rec *SessionRecord) delegationEndFor(taskID string) string {
-	if ref, ok := rec.TaskRefFor(taskID); ok && len(ref.Children) == 0 {
-		return ref.DelegationEnd
-	}
-	return ""
 }
 
 // triggerConversationKey is a trigger's own conversation:
