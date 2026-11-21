@@ -66,7 +66,9 @@ rc_owner() {
 # What tells this stack's CRD from a Config Sync CRD that was applied over a
 # leftover and kept its label: the product's serves a status subresource,
 # this one none. Prints the subresources of every version; "" for this
-# stack's shape.
+# stack's shape. Callers assign the output first and test it after: inside a
+# test the read's exit status is dropped, and a failed read would be taken
+# for "no subresource".
 rc_subresources() {
   kubectl get crd "$RC_CRD" --ignore-not-found -o jsonpath='{.spec.versions[*].subresources}'
 }
@@ -117,7 +119,9 @@ rc_plant() {
       echo "ERROR: $RC_CRD is already served on $RC_HOST_CLUSTER and was not installed by this stack ($RC_LABEL_OWNER='${owner#*/}'); it will not be touched. A host that runs Config Sync cannot take this plant." >&2
       exit 1
     fi
-    if [ -n "$(rc_subresources)" ]; then
+    local shape
+    shape="$(rc_subresources)"
+    if [ -n "$shape" ]; then
       echo "ERROR: $RC_CRD carries this stack's label and is not this stack's CRD (it serves a subresource): a Config Sync install wrote over a leftover. It will not be touched." >&2
       exit 1
     fi
@@ -186,7 +190,9 @@ rc_destroy() {
     echo "$RC_CRD was not installed by this stack ($RC_LABEL_OWNER='${owner#*/}'); leaving it in place."
     return 0
   fi
-  if [ -n "$(rc_subresources)" ]; then
+  local shape
+  shape="$(rc_subresources)"
+  if [ -n "$shape" ]; then
     echo "$RC_CRD carries this stack's label and is not this stack's CRD (it serves a subresource); leaving it in place."
     return 0
   fi

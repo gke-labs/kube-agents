@@ -40,7 +40,12 @@
 #
 # A host that runs Config Sync serves the kind and holds var.namespace
 # already: the CRD step and the module each read that as foreign and stop the
-# plant, and nothing of the product's is touched.
+# plant, and nothing of the product's is touched. One path is not guarded: the
+# module owns a namespace by its label alone, so a destroy from a kept state,
+# after Config Sync was applied over this stack's plant, deletes the
+# namespace with what the product put in it. A run starts from an empty
+# state, and the CRD step stops a plant over such a host before the module
+# runs, so the lane does not reach it.
 #
 # Isolation class: one namespace, the namespaced-plant module's, and one
 # cluster-scoped CRD with the module's guards: created only on a host that
