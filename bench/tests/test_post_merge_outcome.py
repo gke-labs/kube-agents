@@ -323,7 +323,7 @@ def test_an_edited_manifest_is_applied_at_its_head_and_put_back_at_its_base(worl
 
     monkeypatch.setattr(post_merge, "_forge_get_json", get)
     _set_record(world.pod.db, outcome="verified_fixed")
-    _verifier().verify(0)
+    _verifier(apply_edits=True).verify(0)
     assert "apiVersion: v1\nkind: LimitRange # head\n" in world.applied
     assert world.applied[-1] == "apiVersion: v1\nkind: LimitRange # base\n", "cleanup applies the base back"
     assert not any("kustomization" in text for text in world.applied)
@@ -334,7 +334,7 @@ def test_an_edited_manifest_unreadable_at_its_base_errors_before_the_merge(world
     real_get = world.forge.get
     monkeypatch.setattr(post_merge, "_forge_get_json",
                         lambda url, token, timeout: (404, {}) if "limits.yaml?ref=" in url else real_get(url, token, timeout))
-    status, reason, _ = _verifier()._check(5)
+    status, reason, _ = _verifier(apply_edits=True)._check(5)
     assert status == "error" and "could not be read at its head and base" in reason
     assert not any(url.endswith("/merge") for _, url in world.forge.writes)
 
@@ -389,7 +389,7 @@ def test_an_edited_file_that_is_not_an_object_is_never_applied(world, monkeypatc
 
     monkeypatch.setattr(post_merge, "_forge_get_json", get)
     _set_record(world.pod.db, outcome="verified_fixed")
-    _verifier().verify(0)
+    _verifier(apply_edits=True).verify(0)
     assert world.applied and not any("replicas: 3" in text for text in world.applied)
 
 
@@ -408,3 +408,15 @@ def test_a_retried_poll_lists_each_file_once(world, monkeypatch):
     assert verifier._merge_and_apply(5)[0] == "error"
     assert verifier._merge_and_apply(5)[0] == "pass"
     assert len(verifier._added) == 1 and len(verifier._touched) == 1
+
+
+def test_without_apply_edits_an_edited_object_is_never_read_or_applied(world, monkeypatch):
+    # no-pdb's case: edited files are restored on the branch afterwards, never applied, as before.
+    monkeypatch.setattr(post_merge, "DRIVE_DEADLINE_SEC", 0.0)
+    edited = "clusters/seeded-a/seeded-reliability/limits.yaml"
+    world.forge.extra_files = [{"filename": edited, "status": "modified"}]
+    _set_record(world.pod.db, outcome="verified_fixed")
+    verifier = _verifier()
+    verifier.verify(0)
+    assert len(world.applied) == 1 and "PodDisruptionBudget" in world.applied[0]
+    assert verifier._edited == [] and (edited, "modified") in verifier._touched
