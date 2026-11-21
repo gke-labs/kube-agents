@@ -369,6 +369,17 @@ FIXTURE_NOT_READY = {
         "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
         "$9 an hour standing or about $7 a run on a per-run cluster"
     ),
+    # Needs the order of two times on one node: a workload container that
+    # starts before a per-node agent's pod is Ready. That order is evidence
+    # only on a node made after the agent's DaemonSet; a fleet node is made
+    # only at an upgrade or a repair, and a workload's restart resets it. The
+    # first plan's signal, a label only a fixture writes, is not a fixture
+    # (fixture rule 9). #5411 owns the gap.
+    "node-kubelet-startup-admission-race": (
+        "#5411: needs a workload that starts before a per-node agent is Ready on a node made "
+        "after the agent's DaemonSet; that order does not stand on a fleet node (made only at an "
+        "upgrade or a repair, reset by a restart), and a fixture-only label is not a fixture"
+    ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the
     # kubectl cost table's fleet tier. No pool project carries one.

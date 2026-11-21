@@ -1,27 +1,34 @@
-# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): a DaemonSet or
-# CSI driver that mounts host paths with mount propagation leaks mount entries
-# across restarts until the kernel's fs.mount-max is reached, and no new pod on
-# the node can mount a volume. A declared gap: expected_fail until the check
-# lands (gke-labs/kube-agents#5408, which proposes `node-mount-table-leak`).
+# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): a node agent with
+# host mount propagation keeps mounts on a node. A declared gap: expected_fail
+# until the check lands (gke-labs/kube-agents#5408, which proposes
+# `node-mount-table-leak`).
+# What live tests showed (2026-11-20, GKE Standard 1.35.8, one node): two
+# faults. (A) An unprivileged pod that mounts `/var/lib/kubelet/pods` read-only
+# with `HostToContainer` and holds a directory inside other pods' volumes kept
+# those volumes' mounts on the node, the deleted pods in Terminating and their
+# disks attached, until it let go (three rounds; 4 of 4 disks). The kubelet
+# logged "target is busy" and wrote no event. An idle pod of that shape left
+# nothing. (B) A privileged container with `Bidirectional` propagation that
+# mounts and does not unmount left 5 of 5 mounts until the test removed them;
+# this is the path on which `fs.mount-max` can be reached, and a full table
+# writes FailedMount, "No space left on device". In (A) a full table was not
+# reached: 240 entries against a limit of 100000.
 # The GCE compute collector reads serial consoles, MIG counters, sole-tenant
 # groups and snapshots and no DaemonSet or node mount count; no other stream
-# reads them on a schedule. Nothing is planted today: the shape (a DaemonSet
-# `volume-mount-agent` in seeded-shapes with a read-only hostPath mounted
-# HostToContainer) lands in the pull request that adds the check, which
-# rebinds this case to its role and flips the marker in the same diff. The
-# customer failure, a real leak with FailedMount events, is never reproduced:
-# a synthetic event would open an incident on every install that onboards the
-# fleet, and a real leak needs privilege. Two flip conditions: a check that
-# reads a DaemonSet's mount propagation (in this stream, or another, which
-# edits `audit:` and `finding_check` in the same diff) flips this case once
-# the shape is planted; a check keyed on a kernel log line or a node condition
-# reads nothing here. `fixtures: []`: the run plants nothing and reads no
-# fixture, so no fixture's drift may excuse it; no safeguard reads a fixture
-# because none exists yet. Domain
+# reads them on a schedule. Nothing is planted. A fixture for (A) is possible:
+# a pod that holds, and a victim pod deleted after it. By reasoning, not
+# tested: it does not survive a node's replacement, and the stuck pod can hold
+# a drain. The fleet's owner has not been asked. The objective below keeps the
+# form of the first plan, a finding that names a propagation-mounting
+# DaemonSet. A check on the pod template alone also names agents that hold
+# nothing (the kube-prometheus node-exporter manifest has the same
+# propagation), so the objective changes with the fixture decision. `fixtures:
+# []`: the run plants nothing and reads no fixture, so no fixture's drift may
+# excuse it; no safeguard reads a fixture because none exists. Domain
 # `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-mount-table-leak-exhaustion
-name: "Node mount-table leak (declared gap; planted as a propagation-mounting DaemonSet when its check lands)"
+name: "Node mounts held by an agent (declared gap; nothing planted; a fixture waits for the fleet owner's decision)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2
@@ -33,12 +40,12 @@ prompt: >-
   Run the gce-compute-fleet-audit audit across the fleet, following the
   gce-compute-fleet-audit SOP.
 expected_output: >-
-  Planted as a DaemonSet with host mount propagation on a seeded Standard
-  cluster, once its check lands. Customer failure: a real mount-table leak with
-  FailedMount events. Validated means: the ledger issue carries a finding that
-  names DaemonSet `volume-mount-agent` as a propagation-mounting DaemonSet on
-  its node pool. The closing response is the SOP's one line with the ledger
-  URL.
+  Nothing planted. Customer failure, as live tests showed it: deleted pods that
+  stay in Terminating and disks that stay attached while a node agent holds a
+  directory in their volumes; a full mount table was not reached. Validated
+  needs a fixture and a check on that state; the present objective accepts a
+  finding that names DaemonSet `volume-mount-agent`. The closing response is the
+  SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
 validated: false

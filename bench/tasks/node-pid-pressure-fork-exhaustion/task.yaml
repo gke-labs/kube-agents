@@ -1,22 +1,28 @@
-# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): a workload leaks
-# threads or zombie processes on a node pool with no pod PID limit (GKE's
-# default), takes the node's PID space, and the kubelet sets PIDPressure and
-# evicts. A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#5410, which proposes `node-pid-pressure`). The shape
-# already exists on the fleet and nothing new is planted: role
-# `multi-process-container`, Deployment multi-process-worker in seeded-shapes
-# on slot a, a shell supervisor forking two workers, on the default pool,
-# whose kubelet configuration sets no pod PID limit. The readiness rule
-# group-oom-kill and the case upgrades-fleet-readiness-multi-process-container
-# assert it is the fleet's only forking container, so no second forking plant
-# may land. The customer failure, kubelet PIDPressure and eviction, stays far
-# away: PIDPressure is kubelet-owned and cannot be planted, and exhaustion is
-# the fault. Two flip conditions: a check that reads a pool's kubelet
-# configuration for a pod PID limit against the multi-process workloads it
-# hosts (in this stream, or another, which edits `audit:` and `finding_check`
-# in the same diff) flips this case; a check keyed on the PIDPressure
-# condition or on pid_used reads nothing here. Domain `fleet-audits` as the
-# other GCE compute cases.
+# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): workloads leak
+# threads or processes until a node's process IDs run out, and the kubelet sets
+# PIDPressure and evicts. A declared gap: expected_fail until the check lands
+# (gke-labs/kube-agents#5410, which proposes `node-pid-pressure`).
+# What live tests showed (2026-11-20, scratch clusters, GKE Standard 1.35.8,
+# one run each): a pool has no pod PID limit by default, but each container
+# showed `pids.max = 629145`, 15 percent of the node's 4194304. On an 8 GB node
+# six thread-making processes in one container reached 96195, then memory ran
+# out, with no PIDPressure. Seven leaking containers on a 256 GB node used
+# 4194238 of 4194304 within about 30 seconds: the node reported PIDPressure,
+# got the taint `node.kubernetes.io/pid-pressure`, and read NotReady for a
+# time. PIDPressure can be made on purpose (a privileged pod that lowers
+# `kernel.pid_max` on one node); the kubelet then evicted a pod and the
+# condition cleared after five minutes, so a standing plant of it is not shown.
+# The shape that this case reads exists on the fleet and nothing new is
+# planted: role `multi-process-container`, Deployment multi-process-worker in
+# seeded-shapes on slot a, a shell supervisor forking two workers under a 32Mi
+# memory limit, on the default pool, whose kubelet configuration sets no pod
+# PID limit. By that text it cannot hold many processes, and the tests above do
+# not support a finding on it as the fault. The readiness rule group-oom-kill
+# and the case upgrades-fleet-readiness-multi-process-container assert it is
+# the fleet's only forking container, so no second forking plant may land. The
+# objective below keeps the form of the first plan, a finding on that workload;
+# a check keyed on the PIDPressure condition or on pid_used reads nothing here.
+# Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
 name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit)"
