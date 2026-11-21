@@ -1,5 +1,5 @@
 {
-  "version": "b0e0af322201e3f2",
+  "version": "88dffa276c9d4583",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -183,6 +183,7 @@
           "chat.board.reply.gateway.>",
           "a2a.trigger.*.submit",
           "a2a.trigger.*.status",
+          "a2a.trigger.*.stop",
           "_INBOX.gateway.>"
         ],
         "denyPublish": [
