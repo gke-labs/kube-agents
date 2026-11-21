@@ -1,4 +1,4 @@
-package hermesbridge
+package answerscrub
 
 import (
 	"slices"
@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// The shape classes scrubInlineSecrets must catch, and the ordinary ops text
+// The shape classes ScrubInline must catch, and the ordinary ops text
 // it must leave alone. Every value is synthetic. A positive names the values
 // that must not survive and the text that must; a negative must come back
 // unchanged.
@@ -212,15 +212,15 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 	}
 	for _, tc := range positives {
 		t.Run(tc.name, func(t *testing.T) {
-			got := scrubInlineSecrets(tc.in)
+			got := ScrubInline(tc.in)
 			for _, f := range tc.forbidden {
 				if strings.Contains(got, f) {
-					t.Errorf("scrubInlineSecrets(%q) = %q: leaked %q", tc.in, got, f)
+					t.Errorf("ScrubInline(%q) = %q: leaked %q", tc.in, got, f)
 				}
 			}
 			for _, w := range tc.wantSub {
 				if !strings.Contains(got, w) {
-					t.Errorf("scrubInlineSecrets(%q) = %q: missing %q", tc.in, got, w)
+					t.Errorf("ScrubInline(%q) = %q: missing %q", tc.in, got, w)
 				}
 			}
 		})
@@ -259,8 +259,8 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		"Rotation: the password is currently being reset by the operator.",
 	}
 	for _, in := range negatives {
-		if got := scrubInlineSecrets(in); got != in {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		if got := ScrubInline(in); got != in {
+			t.Errorf("ScrubInline(%q) = %q, want it unchanged", in, got)
 		}
 	}
 }
@@ -298,8 +298,8 @@ func TestScrubInlineSecretsMarkdownLayouts(t *testing.T) {
 		{"| Name | Token |\n|:--|:--|\n| ci | " + tok + " |", "| Name | Token |\n|:--|:--|\n| ci | [redacted] |"},
 	}
 	for _, tc := range positives {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 	// Markdown with no credential value in it, and a lone mark that may be
@@ -327,8 +327,8 @@ func TestScrubInlineSecretsMarkdownLayouts(t *testing.T) {
 		"`Deployment/token-reader` in `seeded-token` is declared intent.",
 	}
 	for _, in := range negatives {
-		if got := scrubInlineSecrets(in); got != in {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		if got := ScrubInline(in); got != in {
+			t.Errorf("ScrubInline(%q) = %q, want it unchanged", in, got)
 		}
 	}
 }
@@ -361,8 +361,8 @@ func TestScrubInlineSecretsKeepsTheStrictnessOfBefore(t *testing.T) {
 		{"authorization:\n  Bearer lanternmeadowfield", "authorization:\n  Bearer [redacted]"},
 	}
 	for _, tc := range positives {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 	negatives := []string{
@@ -372,8 +372,8 @@ func TestScrubInlineSecretsKeepsTheStrictnessOfBefore(t *testing.T) {
 		"Bearer tokens are short-lived.",
 	}
 	for _, in := range negatives {
-		if got := scrubInlineSecrets(in); got != in {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		if got := ScrubInline(in); got != in {
+			t.Errorf("ScrubInline(%q) = %q, want it unchanged", in, got)
 		}
 	}
 }
@@ -402,8 +402,8 @@ func TestScrubInlineSecretsMarkdownExclusionsStayNarrow(t *testing.T) {
 		{"`app-db-password` is `" + word + "`.", "`app-db-password` is `[redacted]`."},
 	}
 	for _, tc := range positives {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 	negatives := []string{
@@ -411,8 +411,8 @@ func TestScrubInlineSecretsMarkdownExclusionsStayNarrow(t *testing.T) {
 		"**Password (status):** enabled",
 	}
 	for _, in := range negatives {
-		if got := scrubInlineSecrets(in); got != in {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		if got := ScrubInline(in); got != in {
+			t.Errorf("ScrubInline(%q) = %q, want it unchanged", in, got)
 		}
 	}
 }
@@ -430,8 +430,8 @@ func TestScrubInlineSecretsValueColumnsAndDecodeParens(t *testing.T) {
 		{"Password (prod): readyvalue123", "Password (prod): [redacted]"},
 	}
 	for _, tc := range positives {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -451,8 +451,8 @@ func TestScrubInlineSecretsAllValueColumnsAndWholeStatusValue(t *testing.T) {
 		{"Password (prod): ready quietpasture", "Password (prod): [redacted]"},
 	}
 	for _, tc := range positives {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -474,8 +474,8 @@ func TestScrubInlineSecretsEnvNameValuePairs(t *testing.T) {
 		{"env: [{name: DB_PASSWORD, value: " + word + "}]", "env: [{name: DB_PASSWORD, value: [redacted]}]"},
 	}
 	for _, tc := range positives {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 	negatives := []string{
@@ -486,8 +486,8 @@ func TestScrubInlineSecretsEnvNameValuePairs(t *testing.T) {
 		"- name: DB_PASSWORD\n  value: \"\"",
 	}
 	for _, in := range negatives {
-		if got := scrubInlineSecrets(in); got != in {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		if got := ScrubInline(in); got != in {
+			t.Errorf("ScrubInline(%q) = %q, want it unchanged", in, got)
 		}
 	}
 }
@@ -505,8 +505,8 @@ func TestScrubInlineSecretsArgListFlagBeforeACredentialFlag(t *testing.T) {
 			"args:\n  - --verbose\n  - --db-password\n  - [redacted]\n"},
 	}
 	for _, tc := range cases {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -523,15 +523,15 @@ func TestScrubInlineSecretsTwoParentheticalLabelsOnALine(t *testing.T) {
 		{"| Password (decoded): " + word + " | Token (prod): " + word + " |", "| Password (decoded): [redacted] | Token (prod): [redacted] |"},
 	}
 	for _, tc := range cases {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 	for _, in := range []string{
 		"- **Binary Authorization (`WARN`):** `Binary Authorization is DISABLED`, Shielded Nodes (`OK`): enabled",
 	} {
-		if got := scrubInlineSecrets(in); got != in {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		if got := ScrubInline(in); got != in {
+			t.Errorf("ScrubInline(%q) = %q, want it unchanged", in, got)
 		}
 	}
 }
@@ -552,13 +552,13 @@ func TestScrubInlineSecretsCodeSpannedValueIsBoundedByItsBackticks(t *testing.T)
 		{"- `password` → `synth pass, 0001`", "- `password` → `[redacted]`"},
 	}
 	for _, tc := range cases {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 	// The whole code-spanned value reaches the seen-values sink.
 	var got []string
-	scrubInlineSecretsTo("The password is `Synth2026!prod`.", func(v string) { got = append(got, v) })
+	scrubInlineTo("The password is `Synth2026!prod`.", func(v string) { got = append(got, v) })
 	if len(got) != 1 || got[0] != "Synth2026!prod" {
 		t.Errorf("sink got %q, want the whole value", got)
 	}
@@ -573,8 +573,8 @@ func TestScrubInlineSecretsCodeSpanWithACredentialAndMoreWords(t *testing.T) {
 		{"note github_token_id: `Synth3t1cT0kenValue01 (prod)` here", "note github_token_id: `[redacted]` here"},
 	}
 	for _, tc := range cases {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -586,8 +586,8 @@ func TestScrubInlineSecretsTableHeaderWithADigit(t *testing.T) {
 	for _, h := range []string{"Base64", "B64", "Value1"} {
 		in := "| Key | Status | " + h + " |\n|---|---|---|\n| password | set | " + v + " |\n"
 		want := "| Key | Status | " + h + " |\n|---|---|---|\n| password | set | [redacted] |\n"
-		if got := scrubInlineSecrets(in); got != want {
-			t.Errorf("header %s: scrubInlineSecrets(%q)\n got %q\nwant %q", h, in, got, want)
+		if got := ScrubInline(in); got != want {
+			t.Errorf("header %s: ScrubInline(%q)\n got %q\nwant %q", h, in, got, want)
 		}
 	}
 }
@@ -610,8 +610,8 @@ func TestScrubInlineSecretsValuelessFlagBeforeACredentialFlag(t *testing.T) {
 		{"app -password=-synthetic)pass-0001 x", "app -password=[redacted] x"},
 	}
 	for _, tc := range cases {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -649,8 +649,8 @@ func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
 		{"``--token synthetic-token-0001``.", "``--token [redacted]``."},
 	}
 	for _, tc := range cases {
-		if got := scrubInlineSecrets(tc.in); got != tc.want {
-			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -671,12 +671,12 @@ func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
 		budget *= 10
 	}
 	start := time.Now()
-	scrubInlineSecrets(b.String())
+	ScrubInline(b.String())
 	if took := time.Since(start); took > budget {
 		t.Errorf("a 256 KiB line took %s to scrub", took)
 	}
 	// The lead is still honoured inside the window.
-	if got := scrubInlineSecrets(`"authorization": "Bearer abcdEFGH1234ijkl5678"`); strings.Contains(got, "abcdEFGH1234ijkl5678") {
+	if got := ScrubInline(`"authorization": "Bearer abcdEFGH1234ijkl5678"`); strings.Contains(got, "abcdEFGH1234ijkl5678") {
 		t.Errorf("the authorization value leaked: %q", got)
 	}
 }
@@ -686,18 +686,18 @@ func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
 // Fuxiao-Gao). A key/value table with a value column is still redacted.
 func TestAKubectlSecretListingKeepsItsTypeColumn(t *testing.T) {
 	listing := "| NAME | TYPE | DATA | AGE |\n|---|---|---|---|\n| db-password | Opaque | 1 | 5d |\n| api-token | kubernetes.io/service-account-token | 3 | 9d |\n"
-	if got := scrubInlineSecrets(listing); got != listing {
+	if got := ScrubInline(listing); got != listing {
 		t.Errorf("the listing changed:\n%s", got)
 	}
 	// The header alone doesn't carry a value past the scrub: a row that
 	// isn't kubectl's (a value where the key count goes) is scrubbed as
 	// before.
 	disguised := "| NAME | TYPE | DATA | AGE |\n|---|---|---|---|\n| db-password | Synth3tic-Pass-0042 | Synth3tic-Pass-0043 | 5d |\n"
-	if got := scrubInlineSecrets(disguised); strings.Contains(got, "Synth3tic-Pass-0043") {
+	if got := ScrubInline(disguised); strings.Contains(got, "Synth3tic-Pass-0043") {
 		t.Errorf("a value under a kubectl-shaped header leaked: %q", got)
 	}
 	kv := "| Key | Value |\n|---|---|\n| db-password | Synth3tic-Pass-0042 |\n"
-	if got := scrubInlineSecrets(kv); strings.Contains(got, "Synth3tic-Pass-0042") {
+	if got := ScrubInline(kv); strings.Contains(got, "Synth3tic-Pass-0042") {
 		t.Errorf("a key/value table leaked: %q", got)
 	}
 }
@@ -727,8 +727,8 @@ func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
 		"* password: correct quietpasture battery staple *",
 		"* **Passphrase**: *correct quietpasture battery staple*",
 	} {
-		if got := scrubInlineSecrets(in); strings.Contains(got, "quietpasture") {
-			t.Errorf("scrubInlineSecrets(%q) = %q: the value is not redacted", in, got)
+		if got := ScrubInline(in); strings.Contains(got, "quietpasture") {
+			t.Errorf("ScrubInline(%q) = %q: the value is not redacted", in, got)
 		}
 	}
 	// Shapes the markdown pass handles through its pairing, as at main.
@@ -745,8 +745,8 @@ func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
 		"password: *quietpasture":              "password: [redacted]",
 		"password: quietpasture **":            "password: [redacted]",
 	} {
-		if got := scrubInlineSecrets(in); got != want {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		if got := ScrubInline(in); got != want {
+			t.Errorf("ScrubInline(%q) = %q, want %q", in, got, want)
 		}
 	}
 	// The wider separator changes nothing else: a later "key*:" inside a
@@ -759,8 +759,8 @@ func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
 		`{"password_": "Synth3tic-Pass-0001"}`:  `{"password_": "[redacted]"}`,
 		`"DB_PASSWORD_": "Synth3tic-Pass-0001"`: `"DB_PASSWORD_": "[redacted]"`,
 	} {
-		if got := scrubInlineSecrets(in); got != want {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		if got := ScrubInline(in); got != want {
+			t.Errorf("ScrubInline(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -782,8 +782,8 @@ func TestScrubInlineSecretsAMarkLeftAgainstALabel(t *testing.T) {
 		"a * b *the token* was quietpasture",
 		"Note _ _password_ is quietpasture",
 	} {
-		if got := scrubInlineSecrets(in); strings.Contains(got, "quietpasture") {
-			t.Errorf("scrubInlineSecrets(%q) = %q: the value is not redacted", in, got)
+		if got := ScrubInline(in); strings.Contains(got, "quietpasture") {
+			t.Errorf("ScrubInline(%q) = %q: the value is not redacted", in, got)
 		}
 	}
 	for in, want := range map[string]string{
@@ -806,8 +806,8 @@ func TestScrubInlineSecretsAMarkLeftAgainstALabel(t *testing.T) {
 		"--Authorization _=Bearer Synth3tic-Pass-0001":     "--Authorization [redacted] [redacted]",
 		"--Authorization *:Bearer Synth3tic-Pass-0001":     "--Authorization [redacted] [redacted]",
 	} {
-		if got := scrubInlineSecrets(in); got != want {
-			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		if got := ScrubInline(in); got != want {
+			t.Errorf("ScrubInline(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
