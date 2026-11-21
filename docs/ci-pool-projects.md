@@ -678,7 +678,7 @@ The plan is inspected before it is applied. Creates and in-place updates are app
 
 A fixture pull request follows from this. It merges with its case parked in `FIXTURE_NOT_READY` (`docs/designs/bench-case-format.md`, "Registration"); the postsubmit plants the fixture; the un-park pull request cites a reconcile report that visited every mapped project with none failed, and a scan that reads the role healthy on every project with zero project-level errors and none absent. A fixture whose resource type needs a role the reconciler does not hold is the two-step case in section 3: the role in the same pull request, the grant on every project before the merge. The one exception to "from `main` only" is proving a branch on a real project: one leased pool project (`--project <id>` from the branch's checkout, which the script leases through Boskos; `--no-lease` is for a dev project Boskos does not hold). That project stays at the branch until the merge, when the postsubmit finds it converged; until then every run from `main` plans deletes of the branch's additions on that one project and refuses it, so the daily and the postsubmit are red on it. A branch that will not merge is taken back off by hand, from a checkout that drops its resources and lists their deletes in `reconcile-allow.json` locally; `main`'s run refuses those deletes by design. A project that keeps failing reds the daily, whose Chat note names it each time; it stays in the pool, since one project out of `free` stalls presubmits. A half-applied project (an apply that failed after creating a cluster, before the fixtures) is released with a consistent state; the next run applies what is missing, and a presubmit that leases it in between is unaffected while the dependent cases are parked.
 
-### 6.3 A scope exclusion a run left behind
+### 6.3 A scope exclusion or hold a run left behind
 
 A case that declares `scope_exclude:` ([`bench-case-format.md`](designs/bench-case-format.md)) adds seeded clusters (and, with `absent`, clusters that do not exist) to the install's `spec.scope.exclude.clusters` for its repetitions and saves the scope it replaced in the PlatformAgent's `bench.kubeagents.x-k8s.io/scope-before-exclude` annotation. The run restores it after the case, and the EXIT trap puts the scope back but leaves the annotation, so the next run still re-creates the profiles. A run killed past its grace can still leave the annotation, and with it an excluded cluster whose Cluster Agent profile is gone. The next run on that project restores the scope before anything is graded and stops as infrastructure when that restore does not take effect, with `Scope exclusion (lease): an earlier run's exclusion could not be undone`. To repair by hand, with the project's kubeconfig, print the next restore step and apply it, then repeat until it prints nothing:
 
@@ -689,6 +689,15 @@ kubectl -n kubeagents-system patch platformagent platform-agent --type json -p '
 ```
 
 The restore takes two steps, and the annotation goes only in the second. Between them, wait for the gateway to roll and run the Cluster Agent reconcile once in its `platform-agent` container (`/opt/data/scripts/cluster_agent_reconcile.py`), so the excluded clusters' profiles are re-created; for a CR that had no scope block the reconcile also has to read the emptied block before the block is removed, because it reads a missing block as keeping the last exclusions. If the helper names the annotation itself as the problem (not a scope object or null), delete the annotation by hand.
+
+A case that declares `scope_hold:` leaves the same kind of trace: it sets the install's `spec.hold` for its repetitions and saves the hold it replaced in the `bench.kubeagents.x-k8s.io/scope-hold-before` annotation, and a run killed past its grace can leave the cluster held. The next lease's preflight restores it. To repair by hand, with the project's kubeconfig, run the restore, which puts the saved hold back (or clears `spec.hold`) in one patch and waits for the lift to reach the pods:
+
+```bash
+PYTHONPATH=bench python3 -m kube_agents_bench.scope_hold restore \
+  --context "$(kubectl config current-context)" --namespace kubeagents-system --name platform-agent --wait
+```
+
+If the helper refuses the annotation as not a saved hold, delete `bench.kubeagents.x-k8s.io/scope-hold-before` by hand, then remove `spec.hold` if the hold is still on.
 
 ## 7. Pre-flight verification
 

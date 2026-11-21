@@ -10558,6 +10558,75 @@ spec:
                     - location
                     - projectId
                   type: object
+                hold:
+                  description: |-
+                    Hold pauses the agents' access to clusters' Kubernetes APIs without taking
+                    them out of scope: an operator's lever for an incident, set with kubectl
+                    patch and lifted by removing it. The credential broker and kube-proxy
+                    refuse a held cluster's API to every caller, on the routes
+                    spec.scope.exclude.clusters is refused on, and the refusal names the hold
+                    and its reason so the agent reports it and stops rather than working
+                    around it. A Cluster Agent task that targets a held cluster is refused for
+                    every command, metadata reads included; the Platform Agent's own reads of
+                    the GKE control plane for it (the project's cluster list, a describe) stay
+                    allowed. Unlike an exclusion, a held cluster keeps its Cluster Agent
+                    profile and its place in fleet answers and audits, and nothing restarts:
+                    the operator renders the hold into the <name>-hold ConfigMap, which no
+                    pod-template hash covers, the kubelet syncs the mounted file (usually
+                    within a minute or two), and both components re-read it on the next
+                    request. Like an exclusion it is checked when a request starts: a watch, a
+                    followed log, or an exec, attach, port-forward or proxy stream opened before the
+                    hold reached them keeps running until it ends. The installer does not
+                    carry it: an upgrade keeps the live value.
+                  properties:
+                    all:
+                      description:
+                        All holds every cluster, the one the harness runs
+                        in included.
+                      type: boolean
+                    clusters:
+                      description: |-
+                        Clusters holds single clusters by the full triple, matched as
+                        spec.scope.exclude.clusters entries are.
+                      items:
+                        description: ScopeClusterRef identifies one GKE cluster.
+                        properties:
+                          clusterName:
+                            description: ClusterName is the GKE cluster's name.
+                            maxLength: 63
+                            pattern: ^[a-z0-9][a-z0-9-]*$
+                            type: string
+                          location:
+                            description: Location is the cluster's region or zone.
+                            maxLength: 63
+                            pattern: ^[a-z0-9][a-z0-9-]*$
+                            type: string
+                          projectId:
+                            description:
+                              ProjectID is the project the cluster lives
+                              in.
+                            maxLength: 63
+                            pattern: ^[a-z0-9][a-z0-9-]*$
+                            type: string
+                        required:
+                          - clusterName
+                          - location
+                          - projectId
+                        type: object
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-map-keys:
+                        - projectId
+                        - location
+                        - clusterName
+                      x-kubernetes-list-type: map
+                    reason:
+                      description: |-
+                        Reason is shown in every refusal, so the agent can tell its user why
+                        the cluster is paused (an incident link, a change window).
+                      maxLength: 256
+                      type: string
+                  type: object
                 integration:
                   description: Integration configures platform-specific external connections.
                   properties:

@@ -698,7 +698,7 @@ lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scra
 task file, which the unit hands devops-bench, over the leased project's GitOps repository exported
 as `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
 request, the stopped asks and the cases that declare `writes_alone: true` run in a second phase
-after every first-phase unit (a case that declares `scope_exclude:` runs after them, in a phase
+after every first-phase unit (a case that declares `scope_exclude:` or `scope_hold:` runs after them, in a phase
 of its own), one at a time and each after a settle, so no repetition that requests nothing shares
 the repository with one that writes by design and no window reaches back into the unit before;
 and after the fan-out the script lists in the job log what the run left on that repository,

@@ -197,6 +197,8 @@ The exception is `gcp.scoped-sa.unmapped-scope`, which is not a verb problem at 
 
 `scope.excluded-cluster` isn't a verb problem either. The install's [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope) names that cluster, so the refusal is the exclusion working; remove the entry to let the agents back in. `scope.exclude-unreadable` means the broker can't read the scope file the operator mounts, and it reaches no cluster until it can.
 
+`scope.held-cluster` is an operator's pause: [`spec.hold`](/kube-agents/operator/platformagent-crd/#spechold) names that cluster, or every cluster, and the refusal quotes its reason. Removing the hold lifts the refusal, usually within a minute or two. `scope.hold-unreadable` means the hold file can't be read, and the broker reaches no cluster until it can.
+
 ## Credential placement
 
 | Data                             | `<name>-shell`                                             | `platform-agent`                          | Credential broker                                                                                                                                                                                                                                                          |
