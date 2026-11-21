@@ -3,15 +3,12 @@
 # manual-pools-compute-class) turns node pool auto-creation off and lists a
 # `nodepools` rule the labelled default pool backs and two machine-family
 # rules nothing backs, so a stockout on the first rule leaves pods Pending
-# with no fallback. The stockout audit leaves a class whose first rule is a
-# `nodepools` rule under `checks_unevaluated` for 3.1 `ccc-missing-fallbacks`
-# (the rule names no machine), and 3.12 `dangling-compute-class` (c) flags
-# auto-creation off only where the referenced pools lack the class label:
-# one labelled pool satisfies it, so the one-pool-of-many shape passes both.
-# A declared gap: expected_fail until the check lands; the gap is item 1 of
-# gke-labs/kube-agents#2565 (`ccc-unbacked-manual-fallback`: a class with
-# auto-creation off needs a manual pool behind each priority rule), whose
-# slug the objective accepts first. What the fixture plants versus the
+# with no fallback. The stockout audit's 3.13 `ccc-unbacked-manual-fallback`
+# files the class: with auto-creation off, each priority rule needs a manual
+# pool. 3.1 `ccc-missing-fallbacks` leaves such a class under
+# `checks_unevaluated` (a `nodepools` rule names no machine), and 3.12
+# `dangling-compute-class` (c) passes on one labelled pool, so neither names
+# the shape. A baseline. What the fixture plants versus the
 # customer failure: the fixture plants a class with auto-creation off and two
 # unbacked priority rules; the customer failure is pods Pending in a stockout
 # with no fallback pool. The shape needs a Standard cluster with a manual
@@ -23,7 +20,6 @@ id: ccc-manual-pools-single-rule-unbacked
 name: "ComputeClass With Auto-Creation Off Backed by a Manual Pool for Only One Priority Rule (ccc-manual-pools-unbacked)"
 domain: capacity
 suite: validated-capabilities
-expected_fail: true
 audit_streams:
   - stockout-prevention
 fixtures:
@@ -47,9 +43,8 @@ verification_spec:
   # One finding must carry both the check and the planted class: a body
   # phrase alone matches every finding on the class, and a slug among the
   # ids alone matches the check on any class. Under scope: finding the phrase
-  # is read on the Where: line of a finding whose id starts with one of the
-  # accepted slugs. The gap issue's own slug comes first; a fixing pull
-  # request that spells its slug otherwise edits this list in the same diff.
+  # is read on the Where: line of a finding whose id starts with the check's
+  # slug.
   - name: ledger-files-the-manual-pools-check-on-the-planted-class
     role: objective
     mode: assert
@@ -57,13 +52,7 @@ verification_spec:
       type: ledger_issue_contains
       audit: stockout-prevention
       scope: finding
-      finding_check:
-        [
-          "ccc-unbacked-manual-fallback",
-          "ccc-manual-pools-unbacked",
-          "unbacked-manual-fallback-pools",
-          "ccc-autocreation-disabled-unbacked",
-        ]
+      finding_check: "ccc-unbacked-manual-fallback"
       required_phrases: ["ComputeClass/general-ccc"]
   # The in-cluster write this case tempts is the fix it describes, auto-
   # creation turned on for the fixture's class; the audit may not apply it (the SOP's
