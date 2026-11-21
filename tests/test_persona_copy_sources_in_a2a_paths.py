@@ -8,6 +8,7 @@ stale copy (#6661). This holds every `scriptSources` source to the push list;
 `test_push_paths_match_change_filter.py` holds the push list to the filter.
 """
 
+import posixpath
 import re
 import unittest
 from pathlib import Path
@@ -21,11 +22,14 @@ WORKFLOW = REPO / ".github/workflows/a2a-test.yml"
 _PREFIX = "../../../../"
 # One scriptSources entry: a quoted persona path, then its source written as a
 # literal path relative to the test's package. Any other shape (a constant, a
-# concatenation, a path outside the repository) can't be read here, and fails.
+# concatenation, a path with `..` in it or outside the repository) can't be read
+# here, and fails.
 _ENTRY = re.compile(r'^\s*"[^"]+":\s*"' + re.escape(_PREFIX) + r'([^"]+)",\s*$')
 # stall_report.py, audit_cluster.sh, workload_triage.py and vcs.py; a read that
 # found fewer saw too little.
 _SOURCES_FLOOR = 4
+# An entry assigned outside the map literal, which _script_sources doesn't read.
+_ASSIGNED = re.compile(r"scriptSources\[[^\]]+\]\s*=")
 
 
 def _script_sources():
@@ -38,10 +42,13 @@ def _script_sources():
         if not line.strip() or line.strip().startswith("//"):
             continue
         m = _ENTRY.match(line)
-        if m:
+        # A normalized path names one file; `a2a/../k8s-operator/x` would pass
+        # as under `a2a/**` while naming a file outside it.
+        if m and posixpath.normpath(m.group(1)) == m.group(1) and not m.group(1).startswith(".."):
             sources.append(m.group(1))
         else:
             unreadable.append(line.strip())
+    unreadable += [f"assigned outside the map: {a}" for a in _ASSIGNED.findall(text)]
     return sources, unreadable
 
 
