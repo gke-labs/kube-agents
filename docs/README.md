@@ -144,7 +144,8 @@ CI enforcement: `make docs-check` runs the same checks as
   `scripts/gen_crd_docs.go` and `scripts/gen_condition_docs.go` read from the
   operator's Go source, and `helm` for the install footprint, which
   `scripts/install_footprint.py` renders from the chart.
-- `docs-check-links` — `scripts/check_docs_links.py`; relative links must
+- `docs-check-links` — `scripts/check_docs_links.py` and
+  `scripts/check_okf_knowledge.py`; relative links must
   resolve to **git-tracked** targets; a `#fragment` on a relative link, a
   same-page link or a site route whose target is a tracked Markdown file must
   name a heading there (slugged as GitHub and Starlight slug it) or an explicit
@@ -174,7 +175,10 @@ CI enforcement: `make docs-check` runs the same checks as
   unreachable when the rule arrived are named in the script's allowlist, which
   only shrinks: an entry that becomes reachable, becomes exempt by shape, or is
   deleted fails the check until it is dropped. A new document is linked from
-  the page that owns its topic, not listed anywhere.
+  the page that owns its topic, not listed anywhere. `scripts/check_okf_knowledge.py`
+  validates every `knowledge/` tree against the Open Knowledge Format v0.2
+  frontmatter, reserved `index.md`/`log.md` rules, recommended trust and
+  lifecycle field shapes, per-type `status` vocabularies, and relative links.
 - `docs-check-terminology` — `hack/check-docs-terminology.sh`; identifiers in
   prose must match their source (service-account names, versions, the
   fleet-audit finding-id pattern and rendering caps, …).
@@ -377,7 +381,8 @@ identifier appears, add its source here.
 | Stock `PlatformAgent.metadata.name` used as the admin-console installation ID | `charts/kube-agents/values.yaml` (`platformAgent.name`) |
 | Terraform module defaults (GSA/KSA/namespace, role set, channel) | `terraform/modules/*/variables.tf` |
 | Memory bank name, scope-tag spelling, and provider name | `agents/chat/plugins/memory/kube_agents_memory/config_schema.py` (Layer 1 bank `kube-agents-memory` and `scope:shared`); `DefaultBankID` (`kube-agents-decisions`), `SharedTag` (`scope:shared`), `DocPrefix` (`okf:`), and `RecordStrategy` (`record`) in `a2a/memory/types.go`; decision memory bank name (`DEFAULT_BANK_ID`), record directories (`RECORD_DIRS`, mirrored in `agents/platform/scripts/okf_guard.py` and as `DECISION_MEMORY_DIRS` in `agents/platform/scripts/vcs_client.py`), statuses (`STATUSES`), severities (`SEVERITIES`), and broker publish/label refusal codes (`DECISION_MEMORY_BLOCKED`, `DECISION_MEMORY_CHECK_FAILED`, `DECISION_MEMORY_HEADING`, `FORBIDDEN_LABEL`, `DECISION_OVERRIDE_PREFIX`) in `agents/platform/skills/decision-memory/scripts/decision_memory.py`, `agents/platform/scripts/vcs_client.py`, and `agents/platform/scripts/vcs_broker.py` |
-| OKF Curator and Dreamer schemas (`kube-agents.memory.outcome/v1`, `kube-agents.memory.blueprint/v1`, `kube-agents.memory.query/v1`), NATS subjects (`_INBOX.agent.curator.outcomes`, `_INBOX.agent.memory.query`), proposal branch prefix (`platform-agent/memory/`), store default (`/opt/data/memory/knowledge-store`), and `CURATOR_*` / `DECISION_MEMORY_*` environment variables | `a2a/memory/types.go`, `a2a/memory/curator.go`, `a2a/memory/llm.go`, and `a2a/cmd/curator/main.go` |
+| OKF Curator and Dreamer schemas (`kube-agents.memory.outcome/v1`, `kube-agents.memory.blueprint/v1`, `kube-agents.memory.query/v1`), NATS subjects (`a2a.topics.agent.platform.curator-outcomes`, `a2a.memory.query`, `a2a.memory.reply.`), proposal branch prefix (`platform-agent/memory/`), store default (`/opt/data/memory/knowledge-store`), and `CURATOR_*` / `DECISION_MEMORY_*` environment variables | `a2a/memory/types.go`, `a2a/memory/curator.go`, `a2a/memory/llm.go`, and `a2a/cmd/curator/main.go` |
+| OKF `knowledge/` frontmatter rules: `index.md` and `log.md` reserved at every level (plus root overview files `STATE_OF_BEING.md` and `README.md`), required `type`, recommended v0.2 provenance and lifecycle keys (`sources`, `generated`, `verified`, `status`, `stale_after`, plus tolerated legacy `timestamp`), and per-type `status` vocabularies (`proposed`, `active`, `rejected`, `superseded`, `retired` on `decision`/`lesson` vs. `draft`, `stable`, `deprecated` on other OKF types) | `RESERVED_ROOT_FILENAMES`, `ALLOWED_UNTYPED_ROOT_FILENAMES`, `RESERVED_TYPES`, `DECISION_LESSON_TYPES`, `DECISION_LESSON_STATUSES`, and `STANDARD_OKF_STATUSES` in `scripts/check_okf_knowledge.py`; contract in `docs/architecture/06-api-and-data-contracts.md` §5 |
 | Per-profile Hindsight recall settings the agent uses | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Gateway rollout budgets: `StartupProbe` (`agentAPIProbe`), `gatewayProgressDeadlineSeconds`, and the rollout gates in `upgrade.sh` and `scripts/release/wait_for_gke_readiness.sh` (`GATEWAY_READINESS_TIMEOUT`) | `k8s-operator/internal/controller/platformagent_manifests.go`, `upgrade.sh`, `scripts/release/wait_for_gke_readiness.sh`, and `scripts/release/a2a_readiness.sh` (`A2A_READINESS_GATE_TIMEOUT_SECONDS`), held in order by `tests/test_gateway_rollout_budgets.py` |

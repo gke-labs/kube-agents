@@ -328,7 +328,7 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 	c.sub = sub
 
-	// Subscribe to the dedicated Curator outcome subject (_INBOX.agent.curator.outcomes,
+	// Subscribe to the dedicated Curator outcome subject (a2a.topics.agent.platform.curator-outcomes,
 	// reserved to the agent principal by NATS auth callout so worker/session pods
 	// cannot forge approved, resolved-merged, modified-merged, or refused outcomes).
 	outcomeSubjects := []string{SubjectCuratorOutcomes}
@@ -348,7 +348,7 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 
 	// Register the NATS request-reply responder for semantic memory queries on
-	// SubjectMemoryQuery (_INBOX.agent.memory.query, covered by the agent
+	// SubjectMemoryQuery (a2a.memory.query, covered by the agent
 	// principal's publish and subscribe grants) so callers can query memory over
 	// NATS without coupling to a specific storage backend.
 	querySubjects := []string{SubjectMemoryQuery}

@@ -7,7 +7,7 @@ REST API only, and reads and writes git. Every subcommand prints JSON on stdout
 so any harness (a Hermes skill, a mode-next worker, a Kubernetes CronJob, a CI
 step) can drive it.
 
-System of record: Operational Knowledge Framework (OKF) records in the GitOps
+System of record: Open Knowledge Format (OKF) records in the GitOps
 repository, ``knowledge/decision/*.md`` / ``knowledge/decisions/*.md`` and
 ``knowledge/lesson/*.md`` / ``knowledge/lessons/*.md`` (Markdown + YAML
 frontmatter). The Hindsight bank is a derived index of them and can be rebuilt
@@ -100,6 +100,8 @@ RECORD_TYPES = (
 STATUSES = ("proposed", "active", "rejected", "superseded", "retired")
 SEVERITIES = ("block", "warn", "info")
 VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
+SKIP_FILENAMES = frozenset({"index.md", "log.md", "readme.md", "template.md", "state_of_being.md"})
+SKIP_EXTERNAL_DOC_FILENAMES = SKIP_FILENAMES | frozenset({"0000-template.md"})
 RECORD_STRATEGY = "record"
 DOC_PREFIX = "okf:"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
@@ -407,7 +409,7 @@ def load_records(repo: Path) -> List[Record]:
         if not base.is_dir():
             continue
         for p in sorted(base.glob("*.md")):
-            if p.name.lower() in ("index.md", "readme.md", "template.md", "state_of_being.md"):
+            if p.name.lower() in SKIP_FILENAMES:
                 continue
             rel = str(p.relative_to(repo))
             if rel in seen:
@@ -693,7 +695,7 @@ def load_external_doc_records(repo: Path, extra_repos: Optional[Iterable[str]] =
             if not base.is_dir():
                 continue
             for p in sorted(base.rglob("*.md")):
-                if p.name.lower() in ("index.md", "readme.md", "template.md", "state_of_being.md", "0000-template.md"):
+                if p.name.lower() in SKIP_EXTERNAL_DOC_FILENAMES:
                     continue
                 rel = f"{prefix}{p.relative_to(rdir).as_posix()}"
                 try:

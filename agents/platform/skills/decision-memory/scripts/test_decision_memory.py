@@ -164,6 +164,22 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(out["records"], 2)
 
+    def test_load_records_and_external_docs_skip_log_md(self):
+        self.r.write(".kube-agents/intent.yaml", "paths:\n  - knowledge\n")
+        self.r.write("knowledge/log.md", "# History\n\n- Initial records.\n")
+        self.r.write("knowledge/decisions/log.md", "# Decisions history\n")
+        self.r.write("knowledge/runbooks/log.md", "# Runbooks history\n")
+        self.r.write(
+            "knowledge/runbooks/RUN-001.md",
+            "---\ntype: runbook\ntitle: Restart checkout\n---\n\n# Restart checkout\n",
+        )
+        rc, out = self.r.run("validate")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["records"], 2)
+        ext = dm.load_external_doc_records(self.r.path)
+        self.assertEqual([r.path for r in ext], ["knowledge/runbooks/RUN-001.md"])
+
     def test_validate_rejects_unscoped_and_unevidenced_lesson(self):
         self.r.write("knowledge/lessons/LES-2026-002-x.md",
                      "---\ntype: lesson\nid: LES-2026-002\ntitle: x\nstatus: active\n---\nbody\n")
