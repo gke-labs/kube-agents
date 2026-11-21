@@ -509,10 +509,13 @@ func TestTheReshapeRecordsAreForgottenWithTheCR(t *testing.T) {
 // back without the run. Nothing is recorded on the StatefulSet, so the
 // request isn't read as answered (#6600), and the same pass refuses it,
 // naming the CRD, rather than leaving that to a pass nothing asks for
-// (#6692). A later pass doesn't repeat the Event. The earlier record the
-// failed write leaves in place decides nothing: whether it is no run, a
-// finished run of another leg, or a finished reshape for another request,
-// none of them answers this one.
+// (#6692). A later pass refuses it too, without trying the start again or
+// repeating the Event. The earlier record the failed write leaves in place
+// decides nothing: whether it is no run, a finished run of another leg, or a
+// finished reshape for another request, none of them answers this one. A
+// pruning CRD also strips the record on read, so in a cluster the earlier
+// record is always none; the other two cases hold the check's leg and
+// request parts, which a later change could otherwise narrow to "no run".
 func TestAReshapeStartAPruningCRDDroppedIsNotRecorded(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -528,8 +531,13 @@ func TestAReshapeStartAPruningCRDDroppedIsNotRecorded(t *testing.T) {
 			m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
 			m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "first"}
 			m.agent.Status.BusMigration = c.earlier.DeepCopy()
+			starts := 0
 			pruning := interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
 				SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					// A write that starts this request carries its run ID.
+					if data, err := patch.Data(obj); err == nil && sub == "status" && strings.Contains(string(data), busReshapeRunSuffix("first")) {
+						starts++
+					}
 					if err := cl.SubResource(sub).Patch(ctx, obj, patch, opts...); err != nil {
 						return err
 					}
@@ -557,6 +565,9 @@ func TestAReshapeStartAPruningCRDDroppedIsNotRecorded(t *testing.T) {
 			}
 			if ev := m.reshapeEvents(); len(ev) != 0 {
 				t.Errorf("events after the next pass %q, want none: the first pass's Event stands", ev)
+			}
+			if starts != 1 {
+				t.Errorf("%d status writes started this reshape, want 1: the next pass refuses rather than trying again", starts)
 			}
 		})
 	}
