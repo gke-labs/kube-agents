@@ -24,13 +24,10 @@ const (
 	ruleDelegationBusy          = "delegation.busy"
 	ruleDelegationDepth         = "delegation.depth"
 	ruleDelegationWidth         = "delegation.width"
-	// ruleDelegationProfileBatch ignores a batch from a profile task, which
-	// waits open for one child result and has no way yet to take several.
-	ruleDelegationProfileBatch = "delegation.profile-batch"
-	ruleDelegationNoRequester  = "delegation.no-requester"
-	ruleDelegationStale        = "delegation.stale"
-	ruleDelegationMalformed    = "delegation.malformed"
-	ruleDelegationDoorUnlisted = "delegation.door-unlisted"
+	ruleDelegationNoRequester   = "delegation.no-requester"
+	ruleDelegationStale         = "delegation.stale"
+	ruleDelegationMalformed     = "delegation.malformed"
+	ruleDelegationDoorUnlisted  = "delegation.door-unlisted"
 	// ruleDelegationChildSteer refuses a steer into a delegated child from
 	// an author the target's list refuses (gke-labs#2531 item 5).
 	ruleDelegationChildSteer = "delegation.child-steer"
@@ -75,7 +72,6 @@ const (
 	whyRequestMalformed = "the request was malformed"
 	whyNoChild          = "the request minted no child"
 	whyRequestUnread    = "the delegate request could not be read from the stream"
-	whyProfileBatch     = "a profile task can't hand out a batch yet"
 	// whyBatchPlanUnwritten: the batch's plan could not be written to the
 	// record before its first child, so none was minted (mintBatch).
 	whyBatchPlanUnwritten = "the batch could not be recorded before its tasks were started"
@@ -237,13 +233,6 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		noChild(notStartedEnd(whyTurnStopped))
 		return
 	}
-	// A profile task waits open for its child's result, and nothing yet
-	// lets it take several, so a batch from one is not served.
-	if parsed && req.IsBatch() && profileParent {
-		ignore(ruleDelegationProfileBatch, "tasks", len(req.Tasks))
-		noChild(notStartedEnd(whyProfileBatch))
-		return
-	}
 	// A batch wider than this gateway's setting is refused whole, naming
 	// the cap, so the session can split it or choose. The adapter holds the
 	// width it was told, so this is a setting changed under a running turn,
@@ -398,7 +387,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	if len(routes) > 1 {
 		minting = true
-		g.mintBatch(ctx, rec, taskID, parent, req.Tasks, routes, authority, noChild, log)
+		g.mintBatch(ctx, rec, taskID, parent, profileParent, req.Tasks, routes, authority, noChild, log)
 		return
 	}
 	route := routes[0]
@@ -475,7 +464,7 @@ const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delega
 // a cancel and dropped, and the parent records that its request minted no
 // child, so the record is as it was before the request. A child whose cancel
 // couldn't be published stays on the record, canceled, linked and indexed.
-func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, tasks []lib.DelegateTask,
+func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, profileParent bool, tasks []lib.DelegateTask,
 	routes []*profileRoute, authority Authority, noChild func(string), log *slog.Logger) {
 	correlationID := rec.ActiveTask.CorrelationID
 	// The plan goes on the parent before any child is published, in its own
@@ -522,20 +511,29 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			Depth:                parent.Depth + 1,
 			LineNote:             lineNote,
 			Route:                routes[i],
+			ProfileChain:         childProfileChain(parent, profileParent),
 			SteerAuthors:         parent.SteerAuthors,
 			SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 			RootTaskID:           parent.rootID(),
-			LinkParent:           true,
-			Addressee:            addressee,
-			KeepActive:           true,
-			BatchIndex:           i + 1,
-			Target:               batchTarget(batchParams(e, routes[i])),
+			// The parent's entry, as for a single child: a child can't
+			// raise it.
+			ChangeRequested: parent.ChangeRequested,
+			LinkParent:      true,
+			Addressee:       addressee,
+			KeepActive:      true,
+			BatchIndex:      i + 1,
+			Target:          batchTarget(batchParams(e, routes[i])),
 		})
 		if !ok {
 			// The parent records that its request ran nothing, whether or
 			// not a child whose cancel failed stays on the record: a
 			// withdrawn batch wakes nothing (batchChildEnded).
+			// The entries' ends go out before noChild writes the record,
+			// which marks the batch withdrawn: after that write nothing
+			// would send them.
+			ended := rec.endedBatchEntries(taskID)
 			g.withdrawBatch(ctx, rec, taskID, minted, authority)
+			g.endWithdrawnProfileBatch(ctx, rec, taskID, len(tasks), whyChildOffBus, ended)
 			noChild(notStartedEnd(whyChildOffBus))
 			log.Warn("delegation batch withdrawn: a child could not be started", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
 			return
@@ -637,8 +635,10 @@ func (g *Gateway) withdrawCutShortBatch(ctx context.Context, rec *SessionRecord,
 	if authority.Via == nil {
 		authority.Via = &AuthorityVia{TaskID: taskID, Session: parent.Addressee}
 	}
+	ended := rec.endedBatchEntries(taskID)
 	kept := g.withdrawBatch(ctx, rec, taskID, parent.Children, authority)
 	rec.markDelegationEnd(taskID, notStartedEnd(whyBatchCutShort))
+	g.endWithdrawnProfileBatch(ctx, rec, taskID, parent.BatchSize, whyBatchCutShort, ended)
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed after a cut-short batch was withdrawn", "conversation", rec.Key, "err", err)
 	}

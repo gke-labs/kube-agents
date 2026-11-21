@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -125,6 +126,69 @@ func (g *Gateway) cancelTreeNode(ctx context.Context, rec *SessionRecord, ref Ta
 	if ref.StatusMsgID != "" {
 		g.editLine(rec.Key, ref.StatusMsgID, withLineNote(noticeTreeTaskStopped, ref.LineNote), "")
 		setParentLine(rec, ref.ID, "")
+	}
+}
+
+// releaseEndedTask lets go of the conversation's active task, which has
+// ended, for the relay's terminal and the heal's alike, so the two can't
+// drift. An ended profile task's live descendants are cancelled first
+// (cancelOrphanedChildren). A session parent's batch never reaches here
+// while it runs, since its turn's end only hands off.
+func (g *Gateway) releaseEndedTask(ctx context.Context, rec *SessionRecord, active *ActiveTask) {
+	if !active.Detached {
+		g.cancelOrphanedChildren(ctx, rec, active.TaskID)
+	}
+	rec.ActiveTask = nil
+}
+
+// cancelOrphanedChildren cancels the live descendants of a profile task that
+// has ended, whatever ended it: its own final status, or the supervisor's
+// at its deadline or its worker's loss. It waited open for them, so nothing
+// reads their results now, and each is cancelled, quietly, with its stop
+// record, as a stop would, rather than left holding a dispatcher slot. That
+// covers a batch and a single child alike. A task that isn't a profile task
+// is left alone: a session turn's end only hands off. The task itself has
+// ended and isn't touched. A batch cut short mints no more either way: its
+// request, redelivered, is stale once the task no longer holds the
+// conversation. The cancels ride the delegation's own authority, as its
+// mint did. An attribution that can't be read is logged, and each cancel
+// then carries the child's capability with no authority block, which an
+// executor may refuse; the dispatch stop record carries no authority and
+// still ends a child the dispatcher holds. Called under the
+// session lock; the caller writes the record.
+func (g *Gateway) cancelOrphanedChildren(ctx context.Context, rec *SessionRecord, parentID string) {
+	parent, ok := rec.TaskRefFor(parentID)
+	if !ok || parent.Tier == "" || len(parent.Children) == 0 {
+		return
+	}
+	authority, ok := delegationAuthority(parent)
+	if !ok {
+		g.log.Warn("an ended profile task's attribution is unreadable; its children's cancels carry no authority, their stop records still go",
+			"parent", parentID, "conversation", rec.Key)
+	}
+	seen := map[string]bool{parentID: true}
+	queue := slices.Clone(parent.Children)
+	cancelled := 0
+	for len(queue) > 0 && len(seen) <= len(rec.Tasks) {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ref, held := rec.TaskRefFor(id)
+		if !held {
+			continue
+		}
+		queue = append(queue, ref.Children...)
+		if g.liveNode(ctx, rec, ref) {
+			g.cancelTreeNode(ctx, rec, ref, authority, true)
+			cancelled++
+		}
+	}
+	if cancelled > 0 {
+		g.log.Info("an ended profile task's live children were cancelled",
+			"parent", parentID, "conversation", rec.Key, "cancelled", cancelled)
 	}
 }
 
