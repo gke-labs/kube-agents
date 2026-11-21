@@ -72,14 +72,25 @@ exit 0
 # POOL_LIST is the newline-separated names the list answers with (the stub
 # cannot evaluate the filter; the test asserts the filter is passed);
 # POOL_LIST_RC its exit; POOL_DELETE_FAIL a pool whose delete answers 409;
-# CREDS_RC the get-credentials exit.
+# CREDS_RC the get-credentials exit. STUB_AUTOPILOT is what the describe of
+# `autopilot.enabled` prints (nothing by default, as for a Standard cluster);
+# STUB_AUTOPILOT_RC its exit. With STUB_AUTOPILOT=True the list answers as the
+# API does for an Autopilot cluster: code 400. The names differ from the
+# script's own AUTOPILOT, so the script gets the answer from the describe only.
 _GCLOUD_STUB = """#!/bin/bash
 echo "gcloud $*" >> "$CALLS"
 case "$*" in
   *"clusters get-credentials --help"*) echo "--dns-endpoint"; exit 0 ;;
+  *"clusters describe"*"autopilot.enabled"*)
+    [ "${STUB_AUTOPILOT_RC:-0}" = "0" ] || { echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED" >&2; exit "$STUB_AUTOPILOT_RC"; }
+    [ -n "${STUB_AUTOPILOT:-}" ] && echo "$STUB_AUTOPILOT"
+    exit 0 ;;
   *"clusters describe"*) exit 0 ;;
   *"clusters get-credentials"*) exit "${CREDS_RC:-0}" ;;
   *"node-pools list"*)
+    if [ "${STUB_AUTOPILOT:-}" = "True" ]; then
+      echo "ERROR: (gcloud.container.node-pools.list) ResponseError: code=400, message=Autopilot node pools cannot be accessed or modified." >&2; exit 1
+    fi
     [ "${POOL_LIST_RC:-0}" = "0" ] || { echo "ERROR: (gcloud.container.node-pools.list) PERMISSION_DENIED" >&2; exit "$POOL_LIST_RC"; }
     [ -n "${POOL_LIST:-}" ] && printf '%s\\n' "$POOL_LIST"
     exit 0 ;;
@@ -273,7 +284,66 @@ class BenchPlantSweepTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1, completed.stdout)
         self.assertIn("node pools: list failed", completed.stdout)
 
-    # --- (e) it authenticates itself, and refuses to guess a target -----------
+    # --- (e) an Autopilot cluster has no pool to sweep ------------------------
+
+    @staticmethod
+    def _pool_lists(calls):
+        return [c for c in calls if c.startswith("gcloud container node-pools list ")]
+
+    @staticmethod
+    def _autopilot_reads(calls):
+        return [c for c in calls if c.startswith("gcloud container clusters describe ") and "autopilot.enabled" in c]
+
+    def test_an_autopilot_cluster_gets_no_pool_list_and_the_sweep_stays_green(self):
+        for mode in ((), ("--delete",)):
+            with self.subTest(mode=mode):
+                self._calls.unlink(missing_ok=True)
+                completed, calls = self._run(
+                    *_ARGS, *mode, STUB_AUTOPILOT="True", PLANT_NAMES=f"{_KINDS[3]}|computeclass.cloud.google.com/general-ccc"
+                )
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertEqual([c for c in calls if "node-pools" in c], [])
+                self.assertIn("node pools: Autopilot cluster, no pool to sweep", completed.stdout)
+                self.assertIn("1 matched, 0 failed", completed.stdout)
+                # The kinds before the pool leg are swept as on any cluster.
+                self.assertEqual([g.split()[2] for g in self._kubectl_gets(calls)], list(_KINDS))
+
+    def test_the_autopilot_read_names_this_cluster_and_comes_before_the_pool_list(self):
+        completed, calls = self._run(*_ARGS)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        reads = self._autopilot_reads(calls)
+        self.assertEqual(len(reads), 1, calls)
+        self.assertIn(f"clusters describe {_CLUSTER} ", reads[0])
+        for flag, value in (("--location", _LOCATION), ("--project", _PROJECT)):
+            self.assertIn(f"{flag} {value}", reads[0])
+        self.assertIn("--format=value(autopilot.enabled)", reads[0])
+        (pool_list,) = self._pool_lists(calls)
+        self.assertLess(calls.index(reads[0]), calls.index(pool_list), calls)
+
+    def test_a_cluster_that_is_not_autopilot_keeps_its_pool_leg(self):
+        # value() prints nothing for a field GKE did not set, and False for one
+        # it set to false. Each is a Standard cluster.
+        for answer in ("", "False"):
+            with self.subTest(answer=answer):
+                self._calls.unlink(missing_ok=True)
+                completed, calls = self._run(*_ARGS, "--delete", STUB_AUTOPILOT=answer, POOL_LIST="bench-a")
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertEqual(len(self._pool_lists(calls)), 1, calls)
+                self.assertEqual([d.split()[4] for d in self._pool_deletes(calls)], ["bench-a"])
+                self.assertNotIn("Autopilot", completed.stdout)
+
+    def test_a_failed_autopilot_read_reds_the_exit_and_no_pool_is_listed_or_deleted(self):
+        completed, calls = self._run(*_ARGS, "--delete", STUB_AUTOPILOT_RC=1, POOL_LIST="bench-a")
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertIn("node pools: could not read whether the cluster is Autopilot", completed.stdout)
+        # The line gives no cause; the error of gcloud is the record of it.
+        self.assertIn("PERMISSION_DENIED", completed.stderr)
+        self.assertIn("0 matched, 1 failed", completed.stdout)
+        self.assertEqual([c for c in calls if "node-pools" in c], [])
+        # The kinds before the pool leg still ran.
+        self.assertEqual([g.split()[2] for g in self._kubectl_gets(calls)], list(_KINDS))
+
+    # --- (f) it authenticates itself, and refuses to guess a target -----------
 
     def test_credentials_go_into_a_private_kubeconfig_before_any_kubectl_call(self):
         completed, calls = self._run(*_ARGS, "--delete", PLANT_NAMES=f"{_KINDS[3]}|computeclass.cloud.google.com/x")
