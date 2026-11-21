@@ -9,6 +9,10 @@ from urllib.parse import urlencode
 # on an ephemeral port; every pod deployment leaves it at the default. Read at
 # import, like the rest of this module's configuration.
 SESSION_KV_URL = os.environ.get("SESSION_KV_URL", "http://127.0.0.1:8699")
+# The server is on the pod's loopback: a proxy from the environment must not get
+# a request and its bearer token, and urllib does not leave out a loopback host
+# by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +388,7 @@ def _post(path, body):
         f"{SESSION_KV_URL}{path}", data=json.dumps(body).encode(), headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(request, timeout=POST_TIMEOUT_S):
+        with _SESSION_KV_OPENER.open(request, timeout=POST_TIMEOUT_S):
             pass
     except Exception:
         pass
@@ -400,7 +404,7 @@ def _get(path):
         headers["Authorization"] = f"Bearer {token}"
     url = f"{SESSION_KV_URL}{path}"
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=2) as r:
+        with _SESSION_KV_OPENER.open(urllib.request.Request(url, headers=headers), timeout=2) as r:
             if r.status == 200:
                 return json.load(r)
     except Exception:
