@@ -42,6 +42,9 @@ PULL_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}:pull"
 ACK_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}:acknowledge"
 NACK_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}:modifyAckDeadline"
 GET_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}"
+# Where a redirect answer of the fake server points, on the second server. A
+# fixed path: no value of the request goes into the Location header.
+REDIRECT_PATH = "/redirected"
 
 
 def _message(message_id, payload, ack_id):
@@ -69,7 +72,7 @@ class FakeBroker:
         # pull parked at the broker past the adapter's stop.
         self.pull_hold = None
         # When set, each call is answered with this 3xx status and a Location
-        # on the server at `redirect_to`, with the same path.
+        # on the server at `redirect_to`, at REDIRECT_PATH.
         self.redirect_status = None
         self.redirect_to = None
         self.lock = threading.Lock()
@@ -82,7 +85,7 @@ class FakeBroker:
                 if broker.redirect_status is None:
                     return False
                 self.send_response(broker.redirect_status)
-                self.send_header("Location", broker.redirect_to + self.path)
+                self.send_header("Location", broker.redirect_to + REDIRECT_PATH)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return True
