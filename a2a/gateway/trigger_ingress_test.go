@@ -1176,3 +1176,210 @@ func TestTriggerRecordMapsAreBounded(t *testing.T) {
 		t.Errorf("at 60 an hour the key cap is %d, under a day's runs", got)
 	}
 }
+
+// A scheduled run may fan out (#6744): its child is minted at the read tier,
+// as a fresh root on the parent's scope, with no trigger, so it can read for
+// its parent and never write under the schedule's trigger. The child's result
+// reaches the parent on its .in, and nothing is posted to chat, since a
+// trigger's conversation has no backend.
+func TestAScheduledRunsChildIsAReadRootWithNoTrigger(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	postsBefore := len(tr.adapter.posts) + len(tr.adapter.stopPostsCopy())
+
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "list this cluster's nodes",
+		targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	var childMsg *nats.Msg
+	waitFor(t, "the child's submission", func() bool {
+		for _, m := range tr.submissions() {
+			if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+				childMsg = m
+				return true
+			}
+		}
+		return false
+	})
+	profile, tier, _, _, _ := lib.ParseSubmitSubject(childMsg.Subject)
+	if profile != "cluster" || tier != string(capability.TierRead) {
+		t.Fatalf("child submitted on %s, want a read child of cluster", childMsg.Subject)
+	}
+	var childEnv lib.Envelope
+	if err := json.Unmarshal(childMsg.Data, &childEnv); err != nil {
+		t.Fatal(err)
+	}
+	if trig, err := capability.TriggerFromAuthority(childEnv.Authority); err != nil || trig != nil {
+		t.Fatalf("the child's authority claims trigger %+v (%v); a child carries none", trig, err)
+	}
+	ref, present, err := capability.RefFromAuthority(childEnv.Authority)
+	if err != nil || !present {
+		t.Fatalf("the child pins no grant: %v", err)
+	}
+	entry := readCapEntry(t, tr.url, ref)
+	if entry.Tier != capability.TierRead || entry.Trigger != nil || entry.Profile != "cluster" {
+		t.Fatalf("the child's grant = %+v, want read tier on cluster with no trigger", entry)
+	}
+
+	child := tr.execFor(t, &childEnv, "cluster")
+	if err := child.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "three nodes, all ready"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child result on the parent's .in", func() bool {
+		for _, e := range streamEnvelopes(t, tr.url, lib.TaskInSubject("fleet-audit", origin.TaskID)) {
+			if c, ok := lib.ChildResultOf(messageParts(t, e.env)); ok && c.ChildTaskID == childEnv.TaskID && c.Text == "three nodes, all ready" {
+				return true
+			}
+		}
+		return false
+	})
+	if n := len(tr.adapter.posts) + len(tr.adapter.stopPostsCopy()); n != postsBefore {
+		t.Fatalf("the fan-out posted to chat: %d posts, was %d", n, postsBefore)
+	}
+}
+
+// TestAScheduledRunHandsNoTaskToAProfileThatTakesNoScheduledWork: the
+// child runs at read, but for a schedule, so its profile's card must list
+// unattended, as the trigger's own profile's must (#6744).
+func TestAScheduledRunHandsNoTaskToAProfileThatTakesNoScheduledWork(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifact(t, "readonly", "look")); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		return rec != nil && strings.Contains(rec.delegationEndFor(origin.TaskID), fmt.Sprintf(noticeUnattendedChild, "readonly"))
+	})
+	for _, m := range tr.submissions() {
+		if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+			t.Fatalf("a child was minted on %s", m.Subject)
+		}
+	}
+}
+
+// TestAScheduledRunsChildCarriesTheScheduledMark: the child runs at read,
+// so the card check can't key on its tier when it delegates in turn; the
+// mark it carries (TaskRef.Scheduled) holds its own children to the same
+// cards. A child can't delegate while it is the conversation's live task
+// today (delegation.busy), so this checks the mark, not a grandchild.
+func TestAScheduledRunsChildCarriesTheScheduledMark(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	var child TaskRef
+	waitFor(t, "the child's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		if rec == nil {
+			return false
+		}
+		p, ok := rec.TaskRefFor(origin.TaskID)
+		if !ok || len(p.Children) == 0 {
+			return false
+		}
+		child, ok = rec.TaskRefFor(p.Children[0])
+		return ok
+	})
+	if child.Tier != string(capability.TierRead) || !child.Scheduled || !child.belowSchedule() {
+		t.Fatalf("the child's entry = tier %q scheduled %v, want read and marked", child.Tier, child.Scheduled)
+	}
+	if (TaskRef{Tier: string(capability.TierRead)}).belowSchedule() {
+		t.Fatal("an unmarked read task reads as below a schedule")
+	}
+}
+
+// TestAScheduledRunHandsNoTaskWhereAPinnedProfileTakesNoScheduledWork: a
+// trigger submitted straight to a profile on a cluster whose pinned
+// profile doesn't list unattended is refused, so a scheduled run's child
+// sent there is refused too, though it runs at read.
+func TestAScheduledRunHandsNoTaskWhereAPinnedProfileTakesNoScheduledWork(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	tr.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Tiers: []string{"read"},
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		return rec != nil && strings.Contains(rec.delegationEndFor(origin.TaskID), "prod-east")
+	})
+	for _, m := range tr.submissions() {
+		if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+			t.Fatalf("a child was minted on %s", m.Subject)
+		}
+	}
+}
+
+// delegationEndFor is the reason a task's delegation minted no child
+// (TaskRef.DelegationEnd), or "".
+func (rec *SessionRecord) delegationEndFor(taskID string) string {
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		return ref.DelegationEnd
+	}
+	return ""
+}
