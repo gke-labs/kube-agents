@@ -6,12 +6,14 @@ rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
 (`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
 A recipe's safety checks are its `checks.py`, which the broker's label gate
-loads through :func:`checks_module`.
+and the sandbox's pre-flight (`fleet-audit/scripts/fix_preflight.py`) both load
+through :func:`checks_module`.
 Those are the lists; the code that handles one kind's fix is still per kind
-(`automerge_eligibility.FIX_TYPE`, `audit_report.GENERATED_FIX_CHECK`), so a
-recipe alone gets a dial row and post-merge records but no broker label. How the
-post-merge check sees the fix applied, and whether it holds a health window, is
-declared here (`applied`, `health`) and run by `fix_recipes/probes.py`.
+(`automerge_eligibility.FIX_TYPE`, `audit_report.GENERATED_FIX_CHECK`,
+`fix_preflight.CHANGES`), so a recipe alone gets a dial row and post-merge
+records but no broker label. How the post-merge check sees the fix applied, and
+whether it holds a health window, is declared here (`applied`, `health`) and run
+by `fix_recipes/probes.py`.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
 through `automation_rules`, and neither may depend on PyYAML being there. So

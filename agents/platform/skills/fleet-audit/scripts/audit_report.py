@@ -2899,7 +2899,7 @@ def _manifest_delta():
 # The install's auto-merge switch (`KUBEAGENTS_AUTOMERGE`, read by
 # kubeagents_switches.py in the shared scripts directory). Anything but "off"
 # has every disruption-budget fix checked against its cluster before its pull
-# request opens, and the answer written into the body (pdb_safety.py).
+# request opens, and the answer written into the body (fix_preflight.py).
 AUTOMERGE_SWITCH = "AUTOMERGE"
 SWITCH_OFF = "off"
 AUTOMERGE_PRACTICE = "practice"
@@ -2920,7 +2920,7 @@ def automerge_switch() -> str:
         return SWITCH_OFF
 
 
-def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
+def safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
     """The safety-check section for a group's disruption-budget fixes, or "".
 
     "" while the auto-merge switch is off, and for a group with no `no-pdb`
@@ -2942,7 +2942,7 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:
         sys.path.insert(0, here)
-    import pdb_safety  # lazy, as manifest_delta is
+    import fix_preflight as preflight  # lazy, as manifest_delta is
 
     read = {
         str(entry.get("name") or "")
@@ -2960,13 +2960,14 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(
+                "checks": preflight.unanswered(
+                    GENERATED_FIX_CHECK,
                     "the audit did not write this file on this run at the path it chooses for the budget, so it was not read again"
                 ),
             })
             continue
         try:
-            answer = pdb_safety.check_fix(
+            answer = preflight.check_fix(
                 finding,
                 raw.decode("utf-8", errors="replace") if raw is not None else None,
                 in_manifest=str(finding.get("cluster") or "") in read,
@@ -2976,12 +2977,12 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(f"the check failed ({type(exc).__name__}: {exc})"),
+                "checks": preflight.unanswered(GENERATED_FIX_CHECK, f"the check failed ({type(exc).__name__}: {exc})"),
             }
         answers.append(answer)
     eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
     log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
-    return pdb_safety.render_section(
+    return preflight.render_section(
         answers, eligible=eligible, noun=noun, clean=publishable_text, practice=automerge_switch() == AUTOMERGE_PRACTICE
     )
 
@@ -15291,7 +15292,7 @@ def render_remediation_pr_body(
     `unlabelled` is a forge with no labels: the body then also carries the
     stream marker, which is how the next run finds this pull request.
 
-    `safety` is `pdb_safety_section`'s answer, placed after the files.
+    `safety` is `safety_section`'s answer, placed after the files.
     """
     ordered = sort_findings(group)
     ids = sorted(str(f.get("id", "")) for f in ordered if f.get("id"))
@@ -18134,7 +18135,7 @@ def open_remediation_pr(
     # known is taken to have labels, and the label write below corrects it.
     labelled = _LABELS.get(repo, True)
     # Read once: the label fallback below re-renders the same body.
-    safety = pdb_safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
+    safety = safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
     body = render_remediation_pr_body(
         audit_id,
         group,
@@ -18234,7 +18235,7 @@ def carries_practice_label(pr: dict | None) -> bool:
 def request_practice_label(repo: str, number: int | str) -> None:
     """Ask the broker to judge pull request `number` for the auto-merge label.
 
-    Called where `pdb_safety_section` wrote a section (the switch on, a group
+    Called where `safety_section` wrote a section (the switch on, a group
     holding a disruption-budget fix), and on a refresh of a pull request that
     already carries the label. The broker reads everything itself and decides;
     this sends the number and logs the answer. A refusal is logged and nothing
@@ -23369,7 +23370,7 @@ def _open_promoted_prs(
     """Open (or refresh) one pull request per group holding a promoted finding.
 
     `on_open` runs after each one, before the next is tried. `manifest` is the
-    run's collector manifest, which `pdb_safety_section` needs.
+    run's collector manifest, which `safety_section` needs.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
