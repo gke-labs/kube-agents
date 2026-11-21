@@ -25,6 +25,23 @@ REVIEW_STATES = {
 }
 
 
+def _text(value: Any) -> str:
+    """`value` when the forge sent a text, else `""`, which is what an absent field gives.
+
+    A `title` or a `body` goes to callers that print it and match patterns on
+    it. A value of another type (a list, an object, however deep) stops here.
+    """
+    return value if isinstance(value, str) else ""
+
+
+def _number(value: Any) -> int | None:
+    """`value` when the forge sent an integer, else `None`, which is what an absent field gives.
+
+    A boolean is an `int` to Python and is not a proposal's or an issue's number.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def actor(node: dict[str, Any] | None) -> str:
     """A login, with the App suffix removed.
 
@@ -95,8 +112,8 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
         state = "open" if node.get("state") == "open" else "closed"
     head = node.get("head") or {}
     return {
-        "number": node.get("number"),
-        "title": node.get("title") or "",
+        "number": _number(node.get("number")),
+        "title": _text(node.get("title")),
         "state": state,
         "draft": bool(node.get("draft")),
         "author": actor(node.get("user")),
@@ -116,14 +133,14 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
         "mergeCommit": (node.get("merge_commit_sha") or None)
         if state == "merged"
         else None,
-        "body": node.get("body") or "",
+        "body": _text(node.get("body")),
     }
 
 
 def issue(node: dict[str, Any]) -> dict[str, Any]:
     return {
-        "number": node.get("number"),
-        "title": node.get("title") or "",
+        "number": _number(node.get("number")),
+        "title": _text(node.get("title")),
         "state": node.get("state") or "",
         "author": actor(node.get("user")),
         "labels": [
@@ -135,7 +152,7 @@ def issue(node: dict[str, Any]) -> dict[str, Any]:
         "url": node.get("html_url") or "",
         "created": node.get("created_at") or "",
         "updated": node.get("updated_at") or "",
-        "body": node.get("body") or "",
+        "body": _text(node.get("body")),
     }
 
 
@@ -166,7 +183,7 @@ def comment(node: dict[str, Any], kind: str = "issue") -> dict[str, Any]:
         # one thing that suffix was ever read for.
         "bot": is_automation(node.get("user")),
         "created": node.get("submitted_at") or node.get("created_at") or "",
-        "body": node.get("body") or "",
+        "body": _text(node.get("body")),
         "url": node.get("html_url") or "",
         "path": node.get("path") or "",
         "line": node.get("line"),
@@ -213,7 +230,7 @@ def authored(node: dict[str, Any]) -> dict[str, Any]:
     else:
         state = "open" if node.get("state") == "open" else "closed"
     return {
-        "number": node.get("number"),
+        "number": _number(node.get("number")),
         "state": state,
         "author": actor(user),
         "authorBot": is_automation(user),
