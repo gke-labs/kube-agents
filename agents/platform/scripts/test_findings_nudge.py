@@ -592,6 +592,7 @@ class DetectorWordingTests(unittest.TestCase):
         )
         self.assertEqual(nudge.clean_action("Upgrade the 1.31.1 nodes first"), "Upgrade the 1.31.1 nodes first.")
         self.assertEqual(nudge.clean_action("Upgrade the pool-1 nodes first."), "Upgrade the pool-1 nodes first.")
+        self.assertEqual(nudge.clean_title("api has 0/1 pods ready"), "api has 0/1 pods ready")
 
     def test_a_subject_is_peeled_only_right_after_the_first_colon(self):
         for obj, title in (

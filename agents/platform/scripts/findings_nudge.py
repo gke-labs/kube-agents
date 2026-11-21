@@ -156,8 +156,9 @@ EXPECTED_PODS_RE = re.compile(r"\(>=\s*(\d+)\s+expected\s+pods?\)", re.IGNORECAS
 EXPECTED_PODS_PLAIN = "({pods} expected)"
 NESTED_PARENS_RE = re.compile(r"\(([^()]+?)\s+\(([^()]+)\)\)")
 NESTED_PARENS_FLAT = r"(\1, \2)"
-# "1 replicas" is a count; the "1" that ends a version or a name ("1.31.1 nodes", "pool-1 nodes") is not.
-ONE_PLURAL_RE = re.compile(r"(?<![\d.-])\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
+# "1 replicas" is a count; the "1" that ends a version, a name or a fraction
+# ("1.31.1 nodes", "pool-1 nodes", "0/1 pods") is not.
+ONE_PLURAL_RE = re.compile(r"(?<![\d./-])\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
 
 # A recommendation is text this script did not write, so it is shown as written
 # or not at all: nothing is cut out of it and nothing is edited around a
