@@ -326,6 +326,151 @@ class TestCallback(unittest.TestCase):
                 self._run(dict(data))
         self.assertEqual(self._run(data), data)
 
+    # The Anthropic messages shape (/v1/messages), as a coding harness sends it:
+    # the system text at the top level, and content blocks that carry text
+    # under keys other than `text`.
+
+    def test_anthropic_system_text_is_redacted_as_a_string_and_as_blocks(self) -> None:
+        as_string = self._run({"system": "you run on prod-eu-1", "messages": []}, "anthropic_messages")
+        self.assertRegex(as_string["system"], r"^you run on \[cluster-name:[0-9a-f]{12}\]$")
+        as_blocks = self._run(
+            {
+                "system": [{"type": "text", "text": "project my-proj-7", "cache_control": {"type": "ephemeral"}}],
+                "messages": [],
+            },
+            "anthropic_messages",
+        )
+        block = as_blocks["system"][0]
+        self.assertEqual(block["text"], "project [REDACTED_PROJECT]")
+        self.assertEqual(block["cache_control"], {"type": "ephemeral"})
+
+    def test_anthropic_tool_results_tool_inputs_and_thinking_are_redacted(self) -> None:
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        opaque = {"type": "redacted_thinking", "data": "opaque-blob"}
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "the node is 10.0.0.9", "signature": "sig"},
+                        opaque,
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {"command": f"curl -H 'Authorization: Bearer {_OAUTH_TOKEN}' http://10.0.0.5/"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "pod ip 10.0.0.5"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t2",
+                            "content": [{"type": "text", "text": f"token {_OAUTH_TOKEN}"}, image],
+                        },
+                    ],
+                },
+            ]
+        }
+        result = self._run(data, "anthropic_messages")
+        thinking, kept, tool_use = result["messages"][0]["content"]
+        self.assertRegex(thinking["thinking"], r"^the node is \[ip:[0-9a-f]{12}\]$")
+        self.assertEqual(thinking["signature"], "sig")
+        self.assertEqual(kept, opaque)
+        self.assertNotIn(_OAUTH_TOKEN, json.dumps(tool_use["input"]))
+        self.assertNotIn("10.0.0.5", json.dumps(tool_use["input"]))
+        self.assertEqual(tool_use["name"], "Bash")
+        first, second = result["messages"][1]["content"]
+        self.assertRegex(first["content"], r"^pod ip \[ip:[0-9a-f]{12}\]$")
+        self.assertEqual(second["content"][0]["text"], "token [REDACTED_SECRET]")
+        self.assertEqual(second["content"][1], image)
+
+    def test_a_tool_input_sent_as_a_json_string_stays_a_json_string(self) -> None:
+        data = {
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "x", "input": json.dumps({"host": "10.0.0.5"})}]}
+            ]
+        }
+        sent = self._run(data, "anthropic_messages")["messages"][0]["content"][0]["input"]
+        self.assertIsInstance(sent, str)
+        self.assertNotIn("10.0.0.5", sent)
+        json.loads(sent)
+
+    def test_a_part_type_this_file_does_not_know_is_walked_whole(self) -> None:
+        data = {"messages": [{"role": "user", "content": [{"type": "input_text", "text": "on prod-eu-1"}, {"type": "search_result", "source": "x", "content": [{"type": "text", "text": "my-proj-3"}]}]}]}
+        parts = self._run(data)["messages"][0]["content"]
+        self.assertNotIn("prod-eu-1", json.dumps(parts))
+        self.assertNotIn("my-proj-3", json.dumps(parts))
+        self.assertEqual(parts[1]["type"], "search_result")
+
+    # The Gemini shape (/v1beta/models/<model>:generateContent), as the
+    # Antigravity CLI sends it.
+
+    def test_gemini_contents_function_calls_and_responses_are_redacted(self) -> None:
+        inline = {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}
+        data = {
+            "contents": [
+                {"role": "user", "parts": [{"text": "pods on prod-eu-1"}, inline]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {"text": "checking 10.0.0.9", "thought": True},
+                        {"functionCall": {"name": "run_command", "args": {"command": f"export TOKEN={_OAUTH_TOKEN}"}}, "thoughtSignature": "sig"},
+                    ],
+                },
+                {"role": "user", "parts": [{"functionResponse": {"name": "run_command", "response": {"output": "project my-proj-12 at 10.0.0.5"}}}]},
+            ],
+            "generationConfig": {"temperature": 0},
+        }
+        result = self._run(data, "agenerate_content")
+        user, model, response = result["contents"]
+        self.assertRegex(user["parts"][0]["text"], r"^pods on \[cluster-name:[0-9a-f]{12}\]$")
+        self.assertEqual(user["parts"][1], inline)
+        self.assertRegex(model["parts"][0]["text"], r"^checking \[ip:[0-9a-f]{12}\]$")
+        self.assertTrue(model["parts"][0]["thought"])
+        call = model["parts"][1]
+        self.assertNotIn(_OAUTH_TOKEN, json.dumps(call["functionCall"]["args"]))
+        self.assertEqual(call["thoughtSignature"], "sig")
+        output = json.dumps(response["parts"][0]["functionResponse"]["response"])
+        self.assertNotIn("my-proj-12", output)
+        self.assertNotIn("10.0.0.5", output)
+        self.assertEqual(result["generationConfig"], {"temperature": 0})
+
+    def test_gemini_system_instruction_is_redacted_under_either_spelling(self) -> None:
+        for key in ("systemInstruction", "system_instruction"):
+            data = {key: {"parts": [{"text": "you run on prod-eu-1"}]}, "contents": []}
+            text = self._run(data, "agenerate_content_stream")[key]["parts"][0]["text"]
+            self.assertRegex(text, r"^you run on \[cluster-name:[0-9a-f]{12}\]$", key)
+
+    # Fail closed.
+
+    def test_a_request_in_a_shape_the_hook_cannot_walk_is_refused(self) -> None:
+        for data in (
+            {"model": "m", "query": f"token {_OAUTH_TOKEN}"},
+            {"model": "m", "documents": ["on prod-eu-1"]},
+            {"model": "m"},
+        ):
+            with self.assertRaises(self.module.UnwalkableRequestError) as raised:
+                self._run(dict(data), "arerank")
+            message = str(raised.exception)
+            self.assertIn("refuses a request it cannot walk", message)
+            # It names the keys and never a value.
+            self.assertNotIn(_OAUTH_TOKEN, message)
+            self.assertNotIn("prod-eu-1", message)
+
+    def test_every_shape_the_gateway_serves_is_walked_not_refused(self) -> None:
+        for call_type, data in (
+            ("acompletion", {"messages": [{"role": "user", "content": "hi"}]}),
+            ("anthropic_messages", {"system": "s", "messages": [{"role": "user", "content": "hi"}]}),
+            ("agenerate_content", {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}),
+            ("aembedding", {"input": "hi"}),
+            ("atext_completion", {"prompt": "hi"}),
+        ):
+            self.assertIsNotNone(self._run(data, call_type), call_type)
+
     def test_a_bad_rule_file_fails_the_import_rather_than_the_request(self) -> None:
         for config in (
             {"rules": [{"name": "x", "pattern": "("}]},

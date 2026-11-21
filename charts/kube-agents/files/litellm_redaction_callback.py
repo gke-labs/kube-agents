@@ -8,12 +8,24 @@ config's directory, so the three files have to share one; `proxy_handler_instanc
 is the attribute it reads.
 
 What runs: `AuditRedactor`'s credential patterns, then the operator's rules
-from the file `KUBE_AGENTS_REDACTION_CONFIG` names, over these parts of the
-request -- `messages[].content` as a string or as `text` content parts, each
-assistant message's `tool_calls[].function.arguments` (parsed and walked with
-its key names), the `input` of an embeddings request and the `prompt` of a
-text completion. Responses are not touched; the limitation is documented on
-the site's inference-gateway page.
+from the file `KUBE_AGENTS_REDACTION_CONFIG` names, over every request shape
+the gateway serves:
+
+- chat completions: `messages[].content`, as a string or as content parts,
+  and each assistant message's `tool_calls[].function.arguments` (parsed and
+  walked with its key names);
+- Anthropic messages: the same `messages`, where content blocks include a
+  tool's input (`tool_use.input`), what a tool returned (`tool_result`) and
+  the model's thinking, plus the top-level `system` text;
+- Gemini (`/v1beta/models/...`): `contents[].parts[]` (text, a function
+  call's `args`, a function response's `response`) and `systemInstruction`;
+- the `input` of an embeddings request and the `prompt` of a text completion.
+
+Binary parts (images, audio, inline file data) and opaque ones (redacted
+thinking) are left as they are; any other part is walked whole. A request
+that carries none of these shapes is refused: the hook cannot say what in it
+is text, so it does not forward it. Responses are not touched; the
+limitation is documented on the site's inference-gateway page.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
 which stops the gateway pod at startup rather than letting it forward
@@ -67,6 +79,37 @@ SCALAR_INPUT_KEYS = ("input", "prompt")
 TOOL_CALLS_KEY = "tool_calls"
 FUNCTION_KEY = "function"
 ARGUMENTS_KEY = "arguments"
+# Anthropic messages: the top-level system text, and the content blocks that
+# carry text under a key other than `text`.
+SYSTEM_KEY = "system"
+TOOL_USE_TYPE = "tool_use"
+TOOL_USE_INPUT_KEY = "input"
+TOOL_RESULT_TYPE = "tool_result"
+TOOL_RESULT_CONTENT_KEY = "content"
+THINKING_TYPE = "thinking"
+THINKING_KEY = "thinking"
+# Gemini: the conversation, its parts, and the system instruction under
+# either spelling the API takes.
+CONTENTS_KEY = "contents"
+PARTS_KEY = "parts"
+GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
+FUNCTION_CALL_KEY = "functionCall"
+FUNCTION_CALL_ARGS_KEY = "args"
+FUNCTION_RESPONSE_KEY = "functionResponse"
+FUNCTION_RESPONSE_KEY_RESPONSE = "response"
+# Parts left as they are: binary payloads, which no text rule applies to and
+# which a substitution would corrupt, and opaque blocks the provider checks.
+UNWALKED_PART_TYPES = frozenset(
+    {"image", "image_url", "input_image", "input_audio", "audio", "document", "file", "redacted_thinking"}
+)
+UNWALKED_GEMINI_PART_KEYS = frozenset({"inlineData", "inline_data", "fileData", "file_data", "thoughtSignature"})
+# A request has to carry at least one of these for the hook to know where its
+# text is. One that carries none is refused rather than forwarded.
+WALKED_REQUEST_KEYS = (MESSAGES_KEY, CONTENTS_KEY) + SCALAR_INPUT_KEYS
+
+
+class UnwalkableRequestError(ValueError):
+    """A request in a shape the redaction hook does not know how to walk."""
 
 
 def _load_redactor():
@@ -135,16 +178,81 @@ class KubeAgentsRedactionCallback(CustomLogger):
         return redacted
 
     def _redact_value(self, value: Any, counts: Dict[str, int]) -> Any:
-        """Strings in place; lists element-wise; `text` content parts by their text."""
+        """Strings in place; lists element-wise; content parts by what they carry."""
         if isinstance(value, str):
             return self._redact_text(value, counts)
         if isinstance(value, list):
             return [self._redact_value(item, counts) for item in value]
         if isinstance(value, dict):
-            if value.get(PART_TYPE_KEY) == TEXT_PART_TYPE and isinstance(value.get(TEXT_KEY), str):
-                value[TEXT_KEY] = self._redact_text(value[TEXT_KEY], counts)
-            return value
+            return self._redact_part(value, counts)
         return value
+
+    def _redact_part(self, part: Dict[str, Any], counts: Dict[str, int]) -> Dict[str, Any]:
+        """One content part or block, in place.
+
+        A text part by its text; a tool call's input and a tool result's
+        content by walking them; thinking by its text. Binary and opaque parts
+        are left alone. Any other part is walked whole, key names included:
+        a part type this file has never seen still has its text redacted.
+        """
+        kind = part.get(PART_TYPE_KEY)
+        if kind in UNWALKED_PART_TYPES:
+            return part
+        if kind == TOOL_USE_TYPE:
+            if TOOL_USE_INPUT_KEY in part:
+                part[TOOL_USE_INPUT_KEY] = self._redact_arguments(part[TOOL_USE_INPUT_KEY], counts)
+            return part
+        if kind == TOOL_RESULT_TYPE:
+            if TOOL_RESULT_CONTENT_KEY in part:
+                part[TOOL_RESULT_CONTENT_KEY] = self._redact_value(part[TOOL_RESULT_CONTENT_KEY], counts)
+            return part
+        if kind == THINKING_TYPE:
+            if isinstance(part.get(THINKING_KEY), str):
+                part[THINKING_KEY] = self._redact_text(part[THINKING_KEY], counts)
+            return part
+        if isinstance(part.get(TEXT_KEY), str) and set(part) <= {PART_TYPE_KEY, TEXT_KEY, "cache_control", "citations"}:
+            part[TEXT_KEY] = self._redact_text(part[TEXT_KEY], counts)
+            return part
+        return self._redact_structure(part, counts)
+
+    def _redact_gemini_parts(self, parts: Any, counts: Dict[str, int]) -> Any:
+        """Gemini parts, in place: text, a function call's args, a function
+        response's response; binary parts left alone; any other part walked
+        whole."""
+        if not isinstance(parts, list):
+            return self._redact_structure(parts, counts)
+        for i, part in enumerate(parts):
+            if not isinstance(part, dict):
+                parts[i] = self._redact_value(part, counts)
+                continue
+            for key in list(part):
+                value = part[key]
+                if key in UNWALKED_GEMINI_PART_KEYS:
+                    continue
+                if key == TEXT_KEY and isinstance(value, str):
+                    part[key] = self._redact_text(value, counts)
+                elif key == FUNCTION_CALL_KEY and isinstance(value, dict):
+                    if FUNCTION_CALL_ARGS_KEY in value:
+                        value[FUNCTION_CALL_ARGS_KEY] = self._redact_arguments(value[FUNCTION_CALL_ARGS_KEY], counts)
+                elif key == FUNCTION_RESPONSE_KEY and isinstance(value, dict):
+                    if FUNCTION_RESPONSE_KEY_RESPONSE in value:
+                        value[FUNCTION_RESPONSE_KEY_RESPONSE] = self._redact_structure(
+                            value[FUNCTION_RESPONSE_KEY_RESPONSE], counts
+                        )
+                elif isinstance(value, (str, list, dict)):
+                    part[key] = self._redact_structure(value, counts)
+        return parts
+
+    def _redact_gemini_content(self, content: Any, counts: Dict[str, int]) -> Any:
+        """A Gemini content (`{role, parts}`), or a bare string or parts list."""
+        if isinstance(content, str):
+            return self._redact_text(content, counts)
+        if isinstance(content, list):
+            return self._redact_gemini_parts(content, counts)
+        if isinstance(content, dict) and PARTS_KEY in content:
+            content[PARTS_KEY] = self._redact_gemini_parts(content[PARTS_KEY], counts)
+            return content
+        return self._redact_structure(content, counts)
 
     def _redact_structure(self, value: Any, counts: Dict[str, int]) -> Any:
         """A parsed document, with the key-aware walk the audit hooks use."""
@@ -186,8 +294,28 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 function[ARGUMENTS_KEY] = self._redact_arguments(function[ARGUMENTS_KEY], counts)
 
     def redact_request(self, data: Dict[str, Any]) -> Dict[str, int]:
-        """Redact `data` in place and return the substitution counts by rule name."""
+        """Redact `data` in place and return the substitution counts by rule name.
+
+        Raises UnwalkableRequestError for a request that carries none of the
+        shapes above, naming its top-level keys and never its values.
+        """
+        if not any(key in data for key in WALKED_REQUEST_KEYS):
+            raise UnwalkableRequestError(
+                "the gateway redaction hook refuses a request it cannot walk: it carries none of "
+                f"{', '.join(WALKED_REQUEST_KEYS)} (keys: {', '.join(sorted(str(k) for k in data))})"
+            )
         counts: Dict[str, int] = {}
+        if SYSTEM_KEY in data:
+            data[SYSTEM_KEY] = self._redact_value(data[SYSTEM_KEY], counts)
+        for key in GEMINI_SYSTEM_KEYS:
+            if key in data:
+                data[key] = self._redact_gemini_content(data[key], counts)
+        contents = data.get(CONTENTS_KEY)
+        if isinstance(contents, list):
+            for i, content in enumerate(contents):
+                contents[i] = self._redact_gemini_content(content, counts)
+        elif contents is not None:
+            data[CONTENTS_KEY] = self._redact_gemini_content(contents, counts)
         messages = data.get(MESSAGES_KEY)
         if isinstance(messages, list):
             for message in messages:
