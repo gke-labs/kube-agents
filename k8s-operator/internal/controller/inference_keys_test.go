@@ -1414,3 +1414,109 @@ func TestAFailedMapWriteAfterARotationConverges(t *testing.T) {
 		t.Errorf("%d probe digests in the map, want 1", probes)
 	}
 }
+
+// A failure confined to the profile namespace doesn't cost the rest of the
+// map: with a tier key's Get or Create refused, the map is still written for
+// agent, a2a-session and curator, the failure is a ProfileNamespaceFailed
+// Warning, and a tier that had an entry keeps it.
+func TestATierFailureDoesNotBlockTheMap(t *testing.T) {
+	ctx := context.Background()
+	inProfiles := func(obj client.Object, key client.ObjectKey) bool {
+		_, isSecret := obj.(*corev1.Secret)
+		return isSecret && strings.HasSuffix(key.Namespace, profileNamespaceSuffix)
+	}
+	assertCallers := func(t *testing.T, cl client.Client, agent *agentv1alpha1.PlatformAgent, rec *record.FakeRecorder) map[string]string {
+		t.Helper()
+		entries, _ := readCallerKeysMap(t, cl, agent)
+		have := map[string]bool{}
+		for _, class := range entries {
+			have[class] = true
+		}
+		for _, class := range installInferenceKeyClasses {
+			if !have[class] {
+				t.Errorf("the map lacks %s after a tier failure", class)
+			}
+		}
+		warned := false
+		for _, e := range drainEvents(rec) {
+			if strings.HasPrefix(e, corev1.EventTypeWarning) && strings.Contains(e, reasonProfileNamespaceFailed) {
+				warned = true
+			}
+		}
+		if !warned {
+			t.Errorf("no %s Warning for the tier failure", reasonProfileNamespaceFailed)
+		}
+		return entries
+	}
+	t.Run("a refused Get keeps the tier's entry", func(t *testing.T) {
+		r, cl, agent := inferenceKeysFixture(t)
+		r.reconcileInferenceKeys(ctx, agent)
+		readKey := allInferenceKeys(t, cl, agent, "read")["tier-read"]
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		r.APIReader = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if inProfiles(obj, key) {
+					return apierrors.NewForbidden(corev1.Resource("secrets"), key.Name, errors.New("denied"))
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		})
+		r.reconcileInferenceKeys(ctx, agent)
+		entries := assertCallers(t, cl, agent, rec)
+		if entries[inferenceKeyDigest(readKey)] != "tier-read" {
+			t.Error("the tier's stored entry wasn't carried over")
+		}
+	})
+	t.Run("a refused Create drops a tier that had no entry", func(t *testing.T) {
+		r, cl, agent := inferenceKeysFixture(t)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		r.Client = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if inProfiles(obj, client.ObjectKeyFromObject(obj)) {
+					return apierrors.NewForbidden(corev1.Resource("secrets"), obj.GetName(), errors.New("denied"))
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		})
+		r.reconcileInferenceKeys(ctx, agent)
+		entries := assertCallers(t, cl, agent, rec)
+		for _, class := range entries {
+			if strings.HasPrefix(class, inferenceKeyTierClassPrefix) {
+				t.Errorf("the map names %s, whose key was never created", class)
+			}
+		}
+	})
+}
+
+// With AgentProfiles unreadable, the kept tiers are written only into a
+// profile namespace that is there: once it's gone, no tier Secret is
+// created and the tiers leave the map.
+func TestUnreadableProfilesCreateNoTierKeyWithoutTheNamespace(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	ns := profileNamespaceObject(agent)
+	if err := cl.Delete(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	for _, tier := range []string{"read", "unattended"} {
+		if err := cl.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: inferenceKeySecretName(agent, inferenceKeyTierClassPrefix+tier), Namespace: profileNamespaceName(agent)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.agentProfilesUnreadable = true
+	r.reconcileInferenceKeys(ctx, agent)
+	for _, tier := range []string{"read", "unattended"} {
+		if err := cl.Get(ctx, tierInferenceKeyClass(agent, tier).secret, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Errorf("a %s tier key was created without the profile namespace: %v", tier, err)
+		}
+	}
+	entries, _ := readCallerKeysMap(t, cl, agent)
+	for _, class := range entries {
+		if strings.HasPrefix(class, inferenceKeyTierClassPrefix) {
+			t.Errorf("the map still names %s", class)
+		}
+	}
+}

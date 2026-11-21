@@ -625,14 +625,41 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		mapRecorded = recorded[callerKeysSecretName] != "" && existingMap.UID == recorded[callerKeysSecretName]
 	}
 	var previousTiers []string
+	previousEntries := map[string]string{}
 	if mapRecorded {
 		previousTiers = tierClassesInMap(existingMap.Data[callerKeysFileKey])
+		_ = json.Unmarshal(existingMap.Data[callerKeysFileKey], &previousEntries)
+	}
+	// carry keeps a tier's entry from the stored map on a pass that can't
+	// reach its key in the profile namespace, so a failure confined there
+	// costs the rest of the map nothing and that tier only its key's repair.
+	carried := map[string]string{}
+	carry := func(class string) {
+		for digest, entry := range previousEntries {
+			if entry == class {
+				carried[digest] = class
+			}
+		}
 	}
 
 	// The tiers in use. Unknown when the operator can't read AgentProfiles:
 	// then the tiers the map already names are kept as they are, so an
 	// install whose role lost the read revokes no tier's key.
 	tiers, tiersKnown, profileNamespaceReady := previousTiers, false, false
+	if r.agentProfilesUnreadable && len(previousTiers) > 0 {
+		// Kept tiers are still written only into a profile namespace that is
+		// there: one that has gone takes its keys with it.
+		switch ready, err := r.profileNamespaceExists(ctx, agent); {
+		case err != nil:
+			r.profileNamespaceFailure(ctx, agent, "read the profile namespace for the inference gateway tier keys", errors.New(apiFailure(err)))
+			for _, tier := range previousTiers {
+				carry(inferenceKeyTierClassPrefix + tier)
+			}
+			tiers = nil
+		case !ready:
+			tiers = nil
+		}
+	}
 	if !r.agentProfilesUnreadable {
 		profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
 		if err != nil {
@@ -670,6 +697,13 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	var minted []string
 	for _, c := range classes {
 		apiKey, wasMinted, err := r.ensureInferenceKey(ctx, agent, c, recorded[c.secret.Name])
+		if err != nil && c.inProfileNamespace && !errors.Is(err, errInferenceKeysStatusPruned) && !errors.Is(err, errFreshRecordUnreadable) {
+			// Confined to the profile namespace (profileNamespaceFailure):
+			// reported there, and the tier keeps its stored entry, if any.
+			r.profileNamespaceFailure(ctx, agent, "read or write the "+c.name+" inference gateway key", errors.New(apiFailure(err)))
+			carry(c.name)
+			continue
+		}
 		if err != nil {
 			log.Info("could not read or write an inference gateway key Secret; the map is left as it is", "class", c.name, "secret", c.secret.String(), "failure", apiFailure(err))
 			return r.notWrittenFor("the "+c.name+" key's Secret "+c.secret.String(), err)
@@ -701,7 +735,10 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	}
 	slices.Sort(removed)
 
-	callerDigests := make(map[string]string, len(keys))
+	callerDigests := make(map[string]string, len(keys)+len(carried))
+	for digest, class := range carried {
+		callerDigests[digest] = class
+	}
 	for class, apiKey := range keys {
 		if class != inferenceKeyClassProbe {
 			callerDigests[inferenceKeyDigest(apiKey)] = class
