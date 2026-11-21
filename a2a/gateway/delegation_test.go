@@ -1447,16 +1447,7 @@ func TestAStopOnTheChildCancelsItOnPlatform(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-child"
-	origin, session, child := delegated(t, r, spawn, conv, "")
-	// The delegating turn's answer is posted before the relay retires its
-	// route, and since #5682 a stop cancels every task of the tree the
-	// gateway hasn't seen end (liveNode reads the route). Wait for the
-	// retirement, so the stop finds the turn ended rather than racing its
-	// relay.
-	waitFor(t, "the delegating turn's route retired", func() bool {
-		key, err := r.g.lookupTaskSession(ctx, origin.TaskID)
-		return err == nil && key != conv
-	})
+	_, session, child := delegated(t, r, spawn, conv, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "cancel on platform's in subject", func() bool {
 		for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
