@@ -14,6 +14,7 @@ import base64
 import contextlib
 import copy
 import fnmatch
+import hashlib
 import importlib.util
 import io
 import argparse
@@ -6610,6 +6611,16 @@ class TestRunStartRecord(HarnessTestCase):
         audit_report._RUN_START_LOGGED.clear()
         self.addCleanup(audit_report._RUN_START_LOGGED.clear)
         self.harness.replies = {"issue-list": self.issue_list()}
+        # No cron run unless a test names one, wherever the suite runs from.
+        env = patch.dict(os.environ, {"HERMES_CRON_RUN": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def as_cron_run(self, name):
+        """This process is one Hermes cron run's command, as session-command.sh exports it."""
+        env = patch.dict(os.environ, {"HERMES_CRON_RUN": name})
+        env.start()
+        self.addCleanup(env.stop)
 
     def records(self, repo="acme/fleet"):
         directory = self.store_dir(repo=repo) / report_status.RUN_STARTS_DIR
@@ -6685,6 +6696,56 @@ class TestRunStartRecord(HarnessTestCase):
         self.assertIn("done_at", records["task-old"])
         self.assertNotIn("done_at", records["task-new"])
         self.assertEqual("task-new", self.unfinished()["run_id"])
+
+    def test_a_cron_shell_run_marks_only_its_own_record_after_a_newer_start(self):
+        # Two Hermes cron runs of the stream in the shell: the older outlived
+        # its lease, and the newer run's `start` took the in-flight note over.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        older, newer = ("cron-" + hashlib.sha256(name.encode()).hexdigest()[:16]
+                        for name in ("job_7c1e2a_e1", "job_7c1e2a_e2"))
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        stale = json.loads(note.read_text())
+        self.assertEqual(older, stale["run_id"])
+        stale["started_at"] -= audit_report.INFLIGHT_TTL_SECONDS + 1
+        note.write_text(json.dumps(stale))
+        self.as_cron_run("job_7c1e2a_e2")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.assertEqual(newer, json.loads(note.read_text())["run_id"])
+        # The older run's `finish`, now: it marks its own record, not the
+        # note's, so the newer run still reads as running.
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        records = self.records()
+        self.assertEqual({older, newer}, set(records))
+        self.assertIn("done_at", records[older])
+        self.assertNotIn("done_at", records[newer])
+        self.assertEqual(newer, self.unfinished()["run_id"])
+
+    def test_a_cron_run_id_comes_from_the_variable_or_the_run_directory(self):
+        want = "cron-" + hashlib.sha256(b"job_7c1e2a_e1").hexdigest()[:16]
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(want, audit_report.cron_run_id())
+        self.assertRegex(want, report_status.RUN_ID_RE)
+        # In the agent pod only the directory is there: read as session-command.sh reads it.
+        self.as_cron_run("")
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        for sub, expected in (
+            ("home/cron/runs/job_7c1e2a_e1", want),
+            ("home/cron/runs/job_7c1e2a_e1/sub/dir", want),
+            ("home/cron/other", None),
+            ("home/cron/runs/bad name", None),
+        ):
+            with self.subTest(cwd=sub):
+                directory = (self.tmp_path / sub).resolve()
+                directory.mkdir(parents=True, exist_ok=True)
+                os.chdir(directory)
+                self.assertEqual(expected, audit_report.cron_run_id())
+                os.chdir(here)
+        # A hand-started shell run has none, and `start` makes a random id.
+        self.assertTrue(audit_report.new_run_id().startswith(audit_report.RUN_ID_LOCAL_PREFIX))
 
     def test_a_first_run_makes_no_store_for_its_record(self):
         self.harness.replies = {"issue-list": {"issues": []}}

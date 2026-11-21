@@ -65,10 +65,18 @@ newest run started and never finished. It is kept in a sibling directory,
 newest run. So it is never a ring entry: not listed by GET runs, not pruned
 with the ring, never matched by PUT latest, and GET or DELETE latest cannot
 name it. A record is a small JSON object (RUN_START_MAX_BYTES) whose `run_id`
-is the name's and whose `started_at` is a time with a zone, no further ahead of
-this clock than a run stamp may be, so a done mark with no start is refused
-and a far-future start cannot stand as the newest for good. The stream keeps
-the newest RUN_START_HISTORY by `started_at`. The writer header is checked as
+is the name's and whose `started_at` is a time with a zone, no more than
+RUN_START_MAX_FUTURE_SECONDS ahead of this clock, so a done mark with no start
+is refused. The writer's clock orders nothing: this listener sets the record's
+`received_at` to its own clock when it first takes the run's record, replacing
+any the body sends, and a rewrite of that run's record (the done mark) keeps
+the first `received_at`, so marking a run done never moves it to the top.
+"Newest" is by `received_at`, then run id; a record written before
+`received_at` existed has none and sorts below every record that has one, by
+its `started_at`. The stream keeps the newest RUN_START_HISTORY, a bound on
+disk: the broker lets a profile task write only the record named for its own
+task (credential-isolation.md), so the records a task can push out are older
+than eight real runs. The writer header is checked as
 on a ring entry's PUT and not kept: the record is no report, and the A2A relay
 that trusts a stamp cannot read it. The stream list carries the newest record
 of each stream as `last_run_start`, when there is one. A record never creates
@@ -174,10 +182,15 @@ RUN_ID_RE = re.compile(rf"^{_RUN_ID}\Z")
 RUN_START_NAME_RE = re.compile(rf"^{RUN_START_PREFIX}(?P<run>{_RUN_ID})\Z")
 RUN_START_HISTORY = 8
 RUN_START_MAX_BYTES = 4096
+# How far ahead of this clock a record's `started_at` may be: `start` stamps it
+# as the run begins, so an honest writer needs only clock skew.
+RUN_START_MAX_FUTURE_SECONDS = 60
+# Set by this listener alone, from its own clock: the order of the records.
+RUN_START_RECEIVED_KEY = "received_at"
 # The keys a stream listing passes on from the newest record, each only with
-# its own type: `run_id`, `started_at`, `done_at` and `outcome` strings,
-# `scheduled` a boolean.
-RUN_START_LISTED_KEYS = ("run_id", "started_at", "scheduled", "done_at", "outcome")
+# its own type: `run_id`, `started_at`, `received_at`, `done_at` and `outcome`
+# strings, `scheduled` a boolean.
+RUN_START_LISTED_KEYS = ("run_id", "started_at", "received_at", "scheduled", "done_at", "outcome")
 RUN_START_OUTCOME_MAX_CHARS = 64
 
 AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
@@ -988,8 +1001,11 @@ def _record_time(value: object) -> float | None:
         return None
 
 
-def _validated_run_start(body: bytes, run_id: str) -> bytes:
-    """A run-start record's body, unchanged, once it is one (the module docstring)."""
+def _validated_run_start(body: bytes, run_id: str) -> dict:
+    """A run-start record's body as an object, once it is one (the module docstring).
+
+    Any `received_at` it sends is dropped: only this listener sets it.
+    """
     if len(body) > RUN_START_MAX_BYTES:
         raise Refused(413, f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
     try:
@@ -1004,7 +1020,7 @@ def _validated_run_start(body: bytes, run_id: str) -> bytes:
     if started is None:
         # A done mark with no start of its own is no record of a run.
         raise Refused(400, "the run-start record has no started_at")
-    if started > _now() + RUN_STAMP_MAX_FUTURE_SECONDS:
+    if started > _now() + RUN_START_MAX_FUTURE_SECONDS:
         raise Refused(400, "the run-start record is stamped in the future")
     if "scheduled" in record and not isinstance(record["scheduled"], bool):
         raise Refused(400, "the run-start record's scheduled is not a boolean")
@@ -1013,13 +1029,41 @@ def _validated_run_start(body: bytes, run_id: str) -> bytes:
     outcome = record.get("outcome")
     if outcome is not None and (not isinstance(outcome, str) or len(outcome) > RUN_START_OUTCOME_MAX_CHARS):
         raise Refused(400, "the run-start record's outcome is not a short string")
-    return body
+    record.pop(RUN_START_RECEIVED_KEY, None)
+    return record
 
 
-def _run_start_records(starts_fd: int) -> tuple[list[tuple[float, str, str, dict]], list[str]]:
-    """The readable records, oldest first by `started_at` then run id, and the names that are not.
+def _received_order(record: dict, started: float) -> tuple[int, float]:
+    """A record's place in the order: by this listener's `received_at`; a record
+    with none (written before it existed) below all that have one, by `started_at`."""
+    received = _record_time(record.get(RUN_START_RECEIVED_KEY))
+    return (1, received) if received is not None else (0, started)
 
-    Each record as (started, run id, file name, record). A file named for a run
+
+def _stamped_run_start(starts_fd: int, name: str, record: dict) -> bytes:
+    """`record` with its `received_at`: the run's first record's, when one is
+    there, else this clock's now. A done mark never moves a record to the top."""
+    received = None
+    try:
+        existing = json.loads(_read_at(starts_fd, name).decode("utf-8"))
+    except (Refused, UnicodeDecodeError, ValueError, RecursionError):
+        existing = None
+    if isinstance(existing, dict) and existing.get("run_id") == record.get("run_id"):
+        kept = existing.get(RUN_START_RECEIVED_KEY)
+        if _record_time(kept) is not None:
+            received = kept
+    if received is None:
+        received = datetime.fromtimestamp(_now(), timezone.utc).isoformat(timespec="microseconds")
+    data = json.dumps({**record, RUN_START_RECEIVED_KEY: received}, sort_keys=True).encode("utf-8")
+    if len(data) > RUN_START_MAX_BYTES:
+        raise Refused(413, f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
+    return data
+
+
+def _run_start_records(starts_fd: int) -> tuple[list[tuple[tuple[int, float], str, str, dict]], list[str]]:
+    """The readable records, oldest first by `received_at` then run id, and the names that are not.
+
+    Each record as (order, run id, file name, record), the order _received_order's. A file named for a run
     that does not read back as that run's record (another run's id inside, no
     `started_at`, over RUN_START_MAX_BYTES, not a regular file) is in the
     second list, for the prune; anything not named `<run id>.json` (a temp
@@ -1048,7 +1092,7 @@ def _run_start_records(starts_fd: int) -> tuple[list[tuple[float, str, str, dict
         if started is None:
             invalid.append(name)
             continue
-        records.append((started, run_id, name, record))
+        records.append((_received_order(record, started), run_id, name, record))
     records.sort(key=lambda entry: (entry[0], entry[1]))
     return records, invalid
 
@@ -1214,7 +1258,9 @@ def _handle_run_start(
         with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
             starts_fd = _open_child_dir(chain.fd, RUN_STARTS_DIR, create=True)
             try:
-                _write_at(starts_fd, name, data)
+                # Under the store's lock, so two writes of one run's record
+                # cannot both find none and both stamp now.
+                _write_at(starts_fd, name, _stamped_run_start(starts_fd, name, data))
                 try:
                     _prune_run_starts(starts_fd)
                 except Exception as exc:  # noqa: BLE001 - the record is written; extra records cost disk only

@@ -1177,6 +1177,60 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         self.assertEqual(cp.REPORT_ROUTE_RUN_START, cp.report_route_kind(start))
         self.assertNotIn(cp.REPORT_ROUTE_RUN_START, cp.REPORT_A2A_READ_ROUTES)
 
+    def test_A3_a_profile_task_writes_only_its_own_run_start_record(self) -> None:
+        # A run-start record (#6812) names its run, and readers trust the
+        # newest record to say whether the stream's last run finished. So a
+        # profile task writes only the record named for its own task id, the
+        # verified credential's `task` claim: never another run's, which it
+        # could overwrite, mark done, or crowd out of the stream's few. The
+        # shell is unbound: it writes the ring itself.
+        cp = h.credential_proxy
+        received: list = []
+
+        class Store:
+            def relay(self, method, path, body, writer=None):
+                received.append((method, path))
+                return 200, b"{}", None
+
+        publish = "acme%2Fgitops"
+        stream = f"/v1/audit-reports/compliance-audit/{publish}"
+        grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+        worker = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                              task=types.SimpleNamespace(task="task-7f3a", profile="fleet-audit", trigger=grant))
+        shell = cp.Principal(workload="shell", uid="u", role=cp.CALLER_ROLE_SHELL)
+
+        def handle(method: str, path: str, principal) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.headers = email.message.Message()
+            handler.principal = principal
+            handler.report_store = Store()
+            handler.report_profiles = frozenset({"fleet-audit"})
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._read_audit_report_body = lambda: b"{}"
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
+            handler._handle_audit_reports()
+            return replies
+
+        with mock.patch.object(cp, "report_install_store_keys", return_value=(publish, frozenset({publish}))):
+            self.assertEqual([200], handle("PUT", f"{stream}/runs/started-task-7f3a", worker))
+            for other in ("task-7f3b", "task-7f3a0", "task-7f3", "local-0a1b2c3d4e5f", "cron-0123456789abcdef"):
+                with self.subTest(refused=other):
+                    path = f"{stream}/runs/started-{other}"
+                    received.clear()
+                    self.assertEqual([(403, cp.RULE_REPORT_RUN_START_TASK)], handle("PUT", path, worker))
+                    self.assertEqual([], received)
+                    # A read is a read, and the shell writes any run's record.
+                    self.assertEqual([200], handle("GET", path, worker))
+                    self.assertEqual([200], handle("PUT", path, shell))
+            # A ring entry is not bound to the task id: its stamp names the task already.
+            self.assertEqual([200], handle("PUT", f"{stream}/runs/20261201T000000.000000Z", worker))
+        self.assertEqual(
+            cp.RULE_REPORT_RUN_START_TASK, cp.report_run_start_permitted(cp.CALLER_ROLE_PROFILE, None, "started-task-7f3a")
+        )
+
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches
         # only the servers whose tools name no cluster: Developer Knowledge's

@@ -476,6 +476,18 @@ class TestRunStartRecords(ReportStatusTestCase):
         super().setUp()
         self.write_latest()
         self.store = Path(report_status.store_path(str(self.root), AUDIT, REPO))
+        # The file store's clock moves a millisecond a write, so each record is
+        # received after the one before it, whatever its `started_at` says.
+        ticks = [NOW.timestamp()]
+
+        def clock():
+            ticks[0] += 0.001
+            return ticks[0]
+
+        # create: a seam a store from before `received_at` lacks.
+        clock_patch = patch.object(report_status, "_clock", clock, create=True)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
 
     def started(self, run_id, minutes, done=False, scheduled=True):
         record = report_status.run_start_record(
@@ -561,15 +573,39 @@ class TestRunStartRecords(ReportStatusTestCase):
             report_status.write_run_start(str(self.root), AUDIT, "acme/other", record)
         self.assertFalse(Path(report_status.store_path(str(self.root), AUDIT, "acme/other")).exists())
 
-    def test_the_newest_records_are_kept_by_their_start(self):
+    def test_the_newest_records_are_kept_by_their_receipt(self):
         for n in range(report_status.RUN_START_HISTORY + 2):
             self.started(f"task-{n}", n)
-        # An older run's record written last is the one pruned, not a newer one.
+        # A record written last stays, whatever start its writer claims; the
+        # first written goes.
         self.started("task-ancient", -60)
         kept = sorted(path.name for path in (self.store / report_status.RUN_STARTS_DIR).iterdir())
         self.assertEqual(
-            sorted(f"task-{n}.json" for n in range(2, report_status.RUN_START_HISTORY + 2)), kept
+            sorted([f"task-{n}.json" for n in range(3, report_status.RUN_START_HISTORY + 2)] + ["task-ancient.json"]),
+            kept,
         )
+
+    def test_a_later_started_at_received_earlier_is_not_the_newest(self):
+        self.started("task-planted", 50)
+        self.started("task-real", -60)
+        self.assertEqual("task-real", self.unfinished()["run_id"])
+        # And through the listing a broker sends: by its received_at.
+        listed = [
+            {"run_id": "task-planted", "started_at": (NOW + timedelta(minutes=50)).isoformat(),
+             "received_at": NOW.isoformat()},
+            {"run_id": "task-real", "started_at": (NOW - timedelta(hours=1)).isoformat(),
+             "received_at": (NOW + timedelta(seconds=1)).isoformat()},
+        ]
+        self.assertEqual("task-real", report_status.newest_run_start(listed)["run_id"])
+
+    def test_a_done_mark_keeps_its_received_at(self):
+        self.started("task-old", 0)
+        path = self.store / report_status.RUN_STARTS_DIR / "task-old.json"
+        first = json.loads(path.read_text())["received_at"]
+        self.started("task-new", -60)
+        self.started("task-old", 0, done=True)
+        self.assertEqual(first, json.loads(path.read_text())["received_at"])
+        self.assertEqual("task-new", self.unfinished()["run_id"])
 
     def test_a_task_credential_names_the_run(self):
         claims = base64_claims({"nats": {"task": "task-7f3a", "profile": "fleet-audit"}})

@@ -81,6 +81,13 @@ RUN_START_PREFIX = "started-"
 RUN_ID_RE = re.compile(r"\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 RUN_START_HISTORY = 8
 RUN_START_MAX_BYTES = 4096
+# The store's own time of first receipt, which orders the records: the
+# listener sets it, replacing any a writer sends, and the done mark keeps it;
+# the file store sets it as it writes. A record with none (written before it
+# existed) sorts below every record that has one, by its `started_at`.
+RUN_START_RECEIVED_KEY = "received_at"
+# The file store's clock for `received_at`; a seam for the tests.
+_clock = time.time
 # What a reader says beside the report when the newest record never got its
 # done mark: the run that started last did not reach `finish` (or is still
 # running), so the report is the run before it.
@@ -675,12 +682,22 @@ def _run_start_of(value: object, run_id: str | None = None) -> dict | None:
     return value
 
 
+def _received_order(record: dict) -> tuple:
+    """A record's place among a stream's: the store's `received_at`, never the
+    writer's `started_at`, unless it predates `received_at` (then below all
+    that have one); then the run id."""
+    received = _record_epoch(record.get(RUN_START_RECEIVED_KEY))
+    if received is not None:
+        return (1, received, record["run_id"])
+    return (0, _record_epoch(record["started_at"]), record["run_id"])
+
+
 def newest_run_start(records: list) -> dict | None:
-    """The record that started last, by `started_at` then run id; None when none is one."""
+    """The record the store received first latest (`received_at`); None when none is one."""
     valid = [record for record in (_run_start_of(value) for value in records) if record is not None]
     if not valid:
         return None
-    return max(valid, key=lambda record: (_record_epoch(record["started_at"]), record["run_id"]))
+    return max(valid, key=_received_order)
 
 
 def run_start_record(
@@ -700,15 +717,18 @@ def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
     FileNotFoundError when the stream has no store for `repo` yet: a record
     never creates one (a store that exists is one a run published to), so a
     stream's first run is not tracked. The broker store's listener and this
-    file store keep the newest RUN_START_HISTORY by `started_at`.
+    file store keep the newest RUN_START_HISTORY by `received_at`, which the
+    store sets (any `received_at` in `record` is dropped) and a rewrite of the
+    run's record keeps.
     """
+    record = {key: value for key, value in record.items() if key != RUN_START_RECEIVED_KEY}
     run_id = record.get("run_id")
     if _run_start_of(record) is None:
         raise ValueError("not a run-start record: it needs a run id and a started_at")
-    data = json.dumps(record, sort_keys=True).encode("utf-8")
-    if len(data) > RUN_START_MAX_BYTES:
-        raise ValueError(f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
     if isinstance(root, BrokerReportStore):
+        data = json.dumps(record, sort_keys=True).encode("utf-8")
+        if len(data) > RUN_START_MAX_BYTES:
+            raise ValueError(f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
         root.write_run_start(audit_id, repo, run_id, data)
         return
     store = store_path(root, audit_id, repo)
@@ -719,6 +739,20 @@ def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
     directory = os.path.join(store, RUN_STARTS_DIR)
     os.makedirs(directory, exist_ok=True)
     target = os.path.join(directory, f"{run_id}.json")
+    # As the listener: the run's first record's receipt, else now.
+    received = None
+    try:
+        existing = read_json(target)
+    except (OSError, ValueError):
+        existing = None
+    if isinstance(existing, dict) and existing.get("run_id") == run_id:
+        if _record_epoch(existing.get(RUN_START_RECEIVED_KEY)) is not None:
+            received = existing[RUN_START_RECEIVED_KEY]
+    if received is None:
+        received = datetime.fromtimestamp(_clock(), timezone.utc).isoformat(timespec="microseconds")
+    data = json.dumps({**record, RUN_START_RECEIVED_KEY: received}, sort_keys=True).encode("utf-8")
+    if len(data) > RUN_START_MAX_BYTES:
+        raise ValueError(f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
     staged = f"{target}.{os.getpid()}.tmp"
     try:
         with open(staged, "wb") as handle:
@@ -762,7 +796,7 @@ def _prune_run_starts(directory: str) -> None:
         records = _file_run_starts(directory)
         valid = sorted(
             ((name, record) for name, record in records if record is not None),
-            key=lambda entry: (_record_epoch(entry[1]["started_at"]), entry[1]["run_id"]),
+            key=lambda entry: _received_order(entry[1]),
         )
         stale = [name for name, record in records if record is None] + [name for name, _ in valid[:-RUN_START_HISTORY]]
         for name in stale:

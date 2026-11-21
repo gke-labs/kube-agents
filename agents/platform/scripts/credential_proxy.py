@@ -3235,8 +3235,9 @@ def required_roles(path: str) -> tuple[str, ...]:
 # A run is the ring's `%Y%m%dT%H%M%S.%fZ` stamp
 # (audit_report.REPORT_STAMP_FORMAT). The routes validate each segment again.
 # The one other run name is a run-start record's (#6812), `started-<run id>`
-# (REPORT_RUN_START_PREFIX), admitted on the GET and PUT of one run alone and
-# under exactly a run write's rules (fleet-audit-report-store.md §3).
+# (REPORT_RUN_START_PREFIX), admitted on the GET and PUT of one run alone,
+# under a run write's rules and, for a profile task, only for its own task id
+# (report_run_start_permitted; fleet-audit-report-store.md §3).
 _REPORT_AUDIT_ID = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _REPORT_STORE_KEY = r"(?!\.{1,2}/)[A-Za-z0-9._~%-]+"
 _REPORT_RUN_STAMP = r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z"
@@ -3368,6 +3369,9 @@ RULE_REPORT_NO_TRIGGER = "audit-report.no-trigger"
 RULE_REPORT_TRIGGER_ORIGIN = "audit-report.trigger-origin"
 RULE_REPORT_TRIGGER_STREAM = "audit-report.trigger-stream"
 RULE_REPORT_REPOSITORY_KEY = "audit-report.repository-key"
+# A profile task's PUT of a run-start record named for any run but its own
+# task (#6812): it may write its own record alone (report_run_start_permitted).
+RULE_REPORT_RUN_START_TASK = "audit-report.run-start-task"
 # The A2A gateway's report reader (#5618): a write, a route other than one
 # report, and a key segment other than REPORT_A2A_PUBLISH_KEY are each their
 # own refusal.
@@ -3536,8 +3540,9 @@ def report_write_permitted(
 ) -> str | None:
     """The rule a write to the store breaks, or None when the caller may write.
 
-    A write is a ring entry, a run-start record (decided exactly as a ring
-    entry: nothing here reads the route), latest, or dropping latest. ``key`` is the
+    A write is a ring entry, a run-start record (decided here exactly as a
+    ring entry, nothing here reads the route; report_run_start_permitted then
+    binds a profile task to its own record), latest, or dropping latest. ``key`` is the
     request's raw store-key segment, compared whole with the install's own:
     ``gitops_key``, the key `finish` publishes to (report_publish_store_key),
     or, when that rule yields no repository (``gitops_key`` None),
@@ -3584,6 +3589,25 @@ def report_write_permitted(
     if role == CALLER_ROLE_SHELL and key != REPORT_NO_FORGE_STORE_KEY and key in registered_keys:
         return None
     return RULE_REPORT_REPOSITORY_KEY
+
+
+def report_run_start_permitted(role: Any, task: Any, run_name: Any) -> str | None:
+    """The rule a permitted write of a run-start record still breaks, or None.
+
+    Asked after report_write_permitted, for a PUT whose route is
+    REPORT_ROUTE_RUN_START. A profile caller writes only the record named for
+    its own run: ``run_name`` (the path's last segment) must be
+    `started-<task id>`, with the task id the verified task credential's `task`
+    claim, so a task cannot overwrite, mark done or crowd out another run's
+    record. The shell is not bound: it writes the ring itself. Every other
+    role was refused by report_write_permitted already, and is refused here too.
+    """
+    if role == CALLER_ROLE_SHELL:
+        return None
+    task_id = getattr(task, "task", None) if role == CALLER_ROLE_PROFILE else None
+    if not isinstance(task_id, str) or not task_id or run_name != f"{REPORT_RUN_START_PREFIX}{task_id}":
+        return RULE_REPORT_RUN_START_TASK
+    return None
 
 
 def report_writer_for(role: Any, task: Any, audit_id: Any) -> str | None:
@@ -15462,7 +15486,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             # The PUT of a ring entry carries the writer stamp, made from the
             # verified caller and nothing the request says. A run-start record
-            # (REPORT_ROUTE_RUN_START) is relayed unstamped: it is no report.
+            # (REPORT_ROUTE_RUN_START) is relayed unstamped: it is no report,
+            # and a profile task writes only its own run's.
+            if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN_START:
+                rule = report_run_start_permitted(role, task, segments[-1])
             if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN:
                 writer = report_writer_for(role, task, segments[3])
                 if writer is None:

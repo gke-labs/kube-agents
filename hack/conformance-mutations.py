@@ -387,6 +387,16 @@ MUTATIONS: list[Mutation] = [
         "that died reads as never started",
     ),
     Mutation(
+        "A3-report-run-start-any-task",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                rule = report_run_start_permitted(role, task, segments[-1])\n",
+         "                pass\n"),
+        "test_A3_a_profile_task_writes_only_its_own_run_start_record",
+        "let a profile task write any run's record, since the run write's stream "
+        "and key rules already hold it to its own stream -- a task then marks the "
+        "newest real run done, or crowds it out, and a run that died reads as finished",
+    ),
+    Mutation(
         "A3-report-no-role-is-shell",
         "agents/platform/scripts/credential_proxy.py",
         ("    if role == CALLER_ROLE_SHELL:\n        pass\n",

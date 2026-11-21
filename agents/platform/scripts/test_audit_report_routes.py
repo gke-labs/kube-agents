@@ -1522,6 +1522,23 @@ class RunStartRouteTest(RoutesTestCase):
                 path = f"/v1/audit-reports/{AUDIT}/{key}/runs/started-task-1"
                 self.assert_refused(self.request("PUT", path, token=REPORT["token"]), credential_proxy.RULE_REPORT_REPOSITORY_KEY)
 
+    def test_a_profile_task_writes_only_its_own_runs_record(self):
+        # The run id in the name must be the verified credential's task id: a
+        # task cannot overwrite, mark done or crowd out another run's record.
+        self.assertEqual("task-1", REPORT["claims"]["task"])
+        for other in ("task-2", "local-0a1b2c3d4e5f", "cron-0123456789abcdef", "task-10"):
+            with self.subTest(run=other):
+                path = f"{STREAM}/runs/started-{other}"
+                self.assert_refused(
+                    self.request("PUT", path, token=REPORT["token"]), credential_proxy.RULE_REPORT_RUN_START_TASK
+                )
+        # Reading another run's record stays a read, and the shell is unbound.
+        other = f"{STREAM}/runs/started-task-2"
+        self.assert_relayed("GET", other, self.request("GET", other, token=REPORT["token"]))
+        self.store.seen.clear()
+        self.authenticator.principal = self.shell
+        self.assert_relayed("PUT", other, self.request("PUT", other), BODY)
+
     def test_a_task_with_no_trigger_writes_no_record(self):
         self.set_gate("read")
         self.assert_refused(self.request("PUT", self.START, token=VALID["token"]), credential_proxy.RULE_REPORT_NO_TRIGGER)

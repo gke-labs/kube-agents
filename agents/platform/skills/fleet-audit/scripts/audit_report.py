@@ -4163,6 +4163,17 @@ INFLIGHT_RUN_ID_KEY = "run_id"
 # RUN_ID_RANDOM_BYTES random bytes in hex, a DNS-1123 label.
 RUN_ID_LOCAL_PREFIX = "local-"
 RUN_ID_RANDOM_BYTES = 6
+# A Hermes-scheduled run in the shell has a per-run name of its own:
+# deploy/sandbox/session-command.sh exports it as HERMES_CRON_RUN, taken from
+# the run's working directory `<home>/cron/runs/<job>_<execution>`, and where
+# only the directory is there (the agent pod) it is read from the cwd the same
+# way, in the same grammar. The run id is this prefix and the first
+# RUN_ID_CRON_HEX hex digits of the name's sha256, a DNS-1123 label.
+CRON_RUN_ENV = "HERMES_CRON_RUN"
+CRON_RUNS_SEGMENT = "/cron/runs/"
+CRON_RUN_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+RUN_ID_CRON_PREFIX = "cron-"
+RUN_ID_CRON_HEX = 16
 
 
 def _in_flight_since(path: Path) -> float | None:
@@ -4349,29 +4360,57 @@ def release_in_flight(audit_id: str) -> None:
     Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
 
 
+def cron_run_id() -> str | None:
+    """The run id of a Hermes-scheduled run in the shell, or None for any other run.
+
+    From HERMES_CRON_RUN when set, else from the cwd when it lies under
+    `<...>/cron/runs/<name>`, read as session-command.sh's
+    export_cron_run_var reads it; the name in that function's grammar alone.
+    The same for every command of one run, and for no other run, so `start`
+    and `finish` each compute it without the in-flight note.
+    """
+    name = os.environ.get(CRON_RUN_ENV, "")
+    if not name:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            return None
+        _, found, rest = cwd.partition(CRON_RUNS_SEGMENT)
+        name = rest.split("/", 1)[0] if found else ""
+    if not CRON_RUN_NAME_RE.match(name):
+        return None
+    return RUN_ID_CRON_PREFIX + hashlib.sha256(name.encode("utf-8")).hexdigest()[:RUN_ID_CRON_HEX]
+
+
 def new_run_id() -> str:
     """The id of the run `start` is opening (#6812).
 
     A profile worker's task id, from its own task credential: no other run
-    has it, so a late `finish` of an older task cannot mark this one done. In
-    the shell, where no credential names a task, a fresh random id, which
-    `start` keeps in the in-flight note for `finish`.
+    has it, so a late `finish` of an older task cannot mark this one done. A
+    Hermes-scheduled run in the shell: its cron run's id (`cron_run_id`),
+    which `finish` computes again for itself. A run started by hand in the
+    shell: a fresh random id, which `start` keeps in the in-flight note for
+    `finish`.
     """
-    return _report_status().task_id_from_credential() or (
-        RUN_ID_LOCAL_PREFIX + secrets.token_hex(RUN_ID_RANDOM_BYTES)
+    return (
+        _report_status().task_id_from_credential()
+        or cron_run_id()
+        or RUN_ID_LOCAL_PREFIX + secrets.token_hex(RUN_ID_RANDOM_BYTES)
     )
 
 
 def this_run_id(audit_id: str) -> str | None:
     """The id of the run `finish` is closing, or None when it cannot be told.
 
-    The task credential's task id, as `new_run_id`; else the id `start` kept
-    in the stream's in-flight note. That note is the stream's, not the run's:
-    in the shell, a run that outlived its lease after a later `start` replaced
-    the note reads the later run's id, the known limit `release_in_flight`
-    names. Read before `finish` releases the note.
+    The task credential's task id, or the cron run's id, each computed here
+    as `new_run_id` computed it, never read from the note. Only a run started
+    by hand in the shell falls back to the id `start` kept in the stream's
+    in-flight note. That note is the stream's, not the run's: such a run that
+    outlived its lease after a later `start` replaced the note reads the later
+    run's id, the known limit `release_in_flight` names. Read before `finish`
+    releases the note.
     """
-    task = _report_status().task_id_from_credential()
+    task = _report_status().task_id_from_credential() or cron_run_id()
     if task:
         return task
     try:
