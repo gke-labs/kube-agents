@@ -454,7 +454,8 @@ class TestCallback(unittest.TestCase):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}, "title": "node 10.0.0.9"},
+                        # A payload a text rule would rewrite if it were walked.
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "prod-eu-1AAAA"}, "title": "node 10.0.0.9"},
                         {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "on prod-eu-1"}, "context": "my-proj-4"},
                         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
                         {"type": "image_url", "image_url": {"url": f"https://example.com/x?token={_OAUTH_TOKEN}"}},
@@ -463,7 +464,7 @@ class TestCallback(unittest.TestCase):
             ]
         }
         image, document, inline, linked = self._run(data, "anthropic_messages")["messages"][0]["content"]
-        self.assertEqual(image["source"]["data"], "AAAA")
+        self.assertEqual(image["source"]["data"], "prod-eu-1AAAA")
         self.assertNotIn("10.0.0.9", image["title"])
         self.assertNotIn("prod-eu-1", json.dumps(document))
         self.assertNotIn("my-proj-4", json.dumps(document))
@@ -471,8 +472,8 @@ class TestCallback(unittest.TestCase):
         self.assertNotIn(_OAUTH_TOKEN, json.dumps(linked))
 
     def test_gemini_binary_inline_data_keeps_its_payload_and_text_inline_data_is_refused(self) -> None:
-        binary = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]}]}
-        self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], "AAAA")
+        binary = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": "prod-eu-1AAAA"}}]}]}
+        self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], "prod-eu-1AAAA")
         for mime in ("text/plain", "application/json"):
             text = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": "b24gcHJvZC1ldS0x"}}]}]}
             with self.assertRaises(self.module.UnwalkableRequestError, msg=mime):
