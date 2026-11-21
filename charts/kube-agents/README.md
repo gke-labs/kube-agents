@@ -982,11 +982,14 @@ install runs at once and renders only when set.
 
 ### MCP server (`operator.mcpServer.enabled`)
 
-`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
-then renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
-manages. It defaults to `false`. An
-`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
-still works and wins over the value. The
+The operator renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
+manages by default (`operator.mcpServer.enabled: true`). Setting `operator.mcpServer.enabled: false`
+sets `A2A_MCP_DOOR=false` on the controller manager and removes the server, its Service, its
+ServiceAccount, its NetworkPolicy and its token Secret. An `A2A_MCP_DOOR` entry in
+`operator.extraEnv` still works and wins over the value. A hand-run `helm upgrade` from a
+release where `operator.mcpServer.enabled` defaulted to `false` uses
+`--reset-then-reuse-values` (or `--set operator.mcpServer.enabled=true`), since
+`--reuse-values` preserves the earlier chart's default. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
 
@@ -1507,11 +1510,12 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an operator flag,
-listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning).
-The profile dispatcher runs by default, so it is in `footprint.yaml`, and switched off
-(`operator.profileDispatcher.enabled: false`) it is still counted. It has a ceiling: about 200
+It also counts the standing pods the operator renders only behind an opt-in operator flag,
+listed with their sizes in `files/flagged-pods.yaml` (such as the OKF memory curator when
+`A2A_CURATOR` is `true`).
+The MCP server and the profile dispatcher both run by default, so they are in `footprint.yaml`,
+and switched off (`operator.mcpServer.enabled: false` or `operator.profileDispatcher.enabled: false`)
+each is still counted. The profile dispatcher has a ceiling: about 200
 AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 1.30+, where each
 carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
 profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones

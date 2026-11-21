@@ -2788,8 +2788,9 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, on every install the A2A gateway's, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
+the same listener, on every install the A2A gateway's, the A2A MCP server's own
+ServiceAccount unless `A2A_MCP_DOOR=false` (and while this `PlatformAgent` controls it), under
+the operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
@@ -2825,8 +2826,8 @@ Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
 ([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). With the
-A2A MCP server on, a fifth, `mcp`, is the MCP pod's: its token is minted for
-`kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
+A2A MCP server on (the default unless `A2A_MCP_DOOR=false`), a fifth, `mcp`, is the MCP
+pod's: its token is minted for `kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
 admits `proposal-view` only, checked on the normalised verb before the body is read, with that
 verb's managed-repository check still applying. It is bound the same way:
 `CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
