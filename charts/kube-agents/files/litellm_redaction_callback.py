@@ -143,6 +143,23 @@ MEDIA_MAGIC = {
     "application/pdf": (b"%PDF-",),
 }
 ASSISTANT_ROLES = frozenset({"assistant", "model"})
+# Field names the carve reads, as the provider APIs spell them.
+SOURCE_KEY = "source"
+MEDIA_TYPE_KEY = "media_type"
+BASE64_SOURCE_TYPE = "base64"
+IMAGE_URL_KEY = "image_url"
+URL_KEY = "url"
+DATA_URL_PREFIX = "data:"
+INPUT_AUDIO_KEY = "input_audio"
+AUDIO_FORMAT_KEY = "format"
+AUDIO_MEDIA_PREFIX = "audio/"
+FILE_KEY = "file"
+FILE_DATA_KEY = "file_data"
+CONTENT_KEY = "content"
+ROLE_KEY = "role"
+THINKING_BLOCKS_KEY = "thinking_blocks"
+SYSTEM_KEY = "system"
+PARTS_KEY = "parts"
 # A string holding a JSON object or array (a tool call's arguments, a tool's
 # JSON output) is decoded and walked as a document, so key names count and a
 # value after an escaped newline is matched, then re-encoded only if a rule
@@ -261,24 +278,24 @@ class KubeAgentsRedactionCallback(CustomLogger):
             if isinstance(part.get(DATA_KEY), str):
                 kept.append((path + (DATA_KEY,), part[DATA_KEY]))
             return
-        source = part.get("source")
-        if isinstance(source, dict) and source.get(TYPE_KEY) == "base64":
-            self._keep_payload(source.get("media_type"), source.get("data"), path + ("source", "data"), kept)
-        image_url = part.get("image_url")
-        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str) and image_url["url"].startswith("data:"):
-            self._keep_data_url(image_url["url"], path + ("image_url", "url"), kept)
-        elif isinstance(image_url, str) and image_url.startswith("data:"):
-            self._keep_data_url(image_url, path + ("image_url",), kept)
-        audio = part.get("input_audio")
-        if isinstance(audio, dict) and "data" in audio:
-            self._keep_payload(f"audio/{audio.get('format', '')}", audio.get("data"), path + ("input_audio", "data"), kept)
-        filed = part.get("file")
-        if isinstance(filed, dict) and isinstance(filed.get("file_data"), str):
-            self._keep_data_url(filed["file_data"], path + ("file", "file_data"), kept)
+        source = part.get(SOURCE_KEY)
+        if isinstance(source, dict) and source.get(TYPE_KEY) == BASE64_SOURCE_TYPE:
+            self._keep_payload(source.get(MEDIA_TYPE_KEY), source.get(DATA_KEY), path + (SOURCE_KEY, DATA_KEY), kept)
+        image_url = part.get(IMAGE_URL_KEY)
+        if isinstance(image_url, dict) and isinstance(image_url.get(URL_KEY), str) and image_url[URL_KEY].startswith(DATA_URL_PREFIX):
+            self._keep_data_url(image_url[URL_KEY], path + (IMAGE_URL_KEY, URL_KEY), kept)
+        elif isinstance(image_url, str) and image_url.startswith(DATA_URL_PREFIX):
+            self._keep_data_url(image_url, path + (IMAGE_URL_KEY,), kept)
+        audio = part.get(INPUT_AUDIO_KEY)
+        if isinstance(audio, dict) and DATA_KEY in audio:
+            self._keep_payload(f"{AUDIO_MEDIA_PREFIX}{audio.get(AUDIO_FORMAT_KEY, '')}", audio.get(DATA_KEY), path + (INPUT_AUDIO_KEY, DATA_KEY), kept)
+        filed = part.get(FILE_KEY)
+        if isinstance(filed, dict) and isinstance(filed.get(FILE_DATA_KEY), str):
+            self._keep_data_url(filed[FILE_DATA_KEY], path + (FILE_KEY, FILE_DATA_KEY), kept)
         # A tool result's own content list holds parts too (an image a tool
         # returned); one level only, since deeper is the tool's own output.
-        if kind == TOOL_RESULT_TYPE and not nested and isinstance(part.get("content"), list):
-            self._carve_parts(part["content"], path + ("content",), kept, nested=True, assistant=False)
+        if kind == TOOL_RESULT_TYPE and not nested and isinstance(part.get(CONTENT_KEY), list):
+            self._carve_parts(part[CONTENT_KEY], path + (CONTENT_KEY,), kept, nested=True, assistant=False)
 
     def _carve_parts(self, parts: List[Any], path: tuple, kept: List[tuple], nested: bool = False, assistant: bool = False) -> None:
         for i, part in enumerate(parts):
@@ -299,25 +316,25 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 inline = part.get(key)
                 if isinstance(inline, dict):
                     mime = next((inline[k] for k in GEMINI_MIME_KEYS if k in inline), None)
-                    self._keep_payload(mime, inline.get("data"), path + (i, key, "data"), kept)
+                    self._keep_payload(mime, inline.get(DATA_KEY), path + (i, key, DATA_KEY), kept)
 
     def _carve(self, data: Dict[str, Any]) -> List[tuple]:
         """The fields to leave as they are, as (path from the request, value)."""
         kept: List[tuple] = []
         for i, message in enumerate(data.get(MESSAGES_KEY) or []):
-            assistant = message.get("role") in ASSISTANT_ROLES
-            if isinstance(message.get("content"), list):
-                self._carve_parts(message["content"], (MESSAGES_KEY, i, "content"), kept, assistant=assistant)
-            if assistant and isinstance(message.get("thinking_blocks"), list):
-                self._carve_parts(message["thinking_blocks"], (MESSAGES_KEY, i, "thinking_blocks"), kept, assistant=True)
-        if isinstance(data.get("system"), list):
-            self._carve_parts(data["system"], ("system",), kept)
+            assistant = message.get(ROLE_KEY) in ASSISTANT_ROLES
+            if isinstance(message.get(CONTENT_KEY), list):
+                self._carve_parts(message[CONTENT_KEY], (MESSAGES_KEY, i, CONTENT_KEY), kept, assistant=assistant)
+            if assistant and isinstance(message.get(THINKING_BLOCKS_KEY), list):
+                self._carve_parts(message[THINKING_BLOCKS_KEY], (MESSAGES_KEY, i, THINKING_BLOCKS_KEY), kept, assistant=True)
+        if isinstance(data.get(SYSTEM_KEY), list):
+            self._carve_parts(data[SYSTEM_KEY], (SYSTEM_KEY,), kept)
         for i, content in enumerate(data.get(CONTENTS_KEY) or []):
-            model = content.get("role") in ASSISTANT_ROLES
-            self._carve_gemini_parts(content.get("parts"), (CONTENTS_KEY, i, "parts"), kept, model)
+            model = content.get(ROLE_KEY) in ASSISTANT_ROLES
+            self._carve_gemini_parts(content.get(PARTS_KEY), (CONTENTS_KEY, i, PARTS_KEY), kept, model)
         for key in GEMINI_SYSTEM_KEYS:
             if isinstance(data.get(key), dict):
-                self._carve_gemini_parts(data[key].get("parts"), (key, "parts"), kept, False)
+                self._carve_gemini_parts(data[key].get(PARTS_KEY), (key, PARTS_KEY), kept, False)
         return kept
 
     @staticmethod
