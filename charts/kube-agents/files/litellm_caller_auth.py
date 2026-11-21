@@ -77,8 +77,12 @@ KEYLESS_CLASS = "keyless"
 # config says api_key "none" (deploy/shared/defaults/config.yaml,
 # platformagent_manifests.go), but Hermes's provider resolver replaces it with
 # its own placeholder (hermes_cli/runtime_provider.py in the agent image), so
-# "no-key-required" is what an agent turn actually sends.
-PLACEHOLDER_KEYS = frozenset({"none", "a2a-playground", "no-key-required"})
+# "no-key-required" is what an agent turn actually sends. And while the agent
+# pod rolls onto its key, Hermes reloads the new config before the env that
+# fills it arrives and sends the reference unexpanded, "${LITELLM_API_KEY}";
+# admitted as keyless until callers can no longer be keyless.
+AGENT_KEY_REFERENCE = "${LITELLM_API_KEY}"
+PLACEHOLDER_KEYS = frozenset({"none", "a2a-playground", "no-key-required", AGENT_KEY_REFERENCE})
 # The routes a non-admin caller may use, matched exactly. LiteLLM's own
 # allowed_routes check also admits every path under an entry, which would
 # take in /health/test_connection and /health/drain beside /health.

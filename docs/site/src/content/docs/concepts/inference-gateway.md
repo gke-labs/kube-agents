@@ -120,7 +120,7 @@ A model that LiteLLM's cost map does not price costs `0` on every call, so `lite
 The gateway checks the key each caller sends. The chart runs LiteLLM with a master key, which it generates into the `litellm-master-key` Secret on first install and keeps across upgrades (`litellm.masterKey.generate: false` turns that off for offline renders such as [Argo CD](/kube-agents/deploy/gitops-argocd/)). Only the gateway container reads that Secret, and the master key is what reaches LiteLLM's admin routes. Every other caller goes through a LiteLLM `custom_auth` hook that the chart mounts beside the gateway's `config.yaml` (`charts/kube-agents/files/litellm_caller_auth.py`):
 
 - A key whose SHA-256 is listed in the `litellm-caller-keys` Secret is admitted as the caller class the entry names. LiteLLM reports the class as the `api_key_alias` and `team` labels on its spend and token metrics, and the key's digest, never the key, as `hashed_api_key`.
-- A call with no key, or with a placeholder the install's own clients send (`none`, `a2a-playground`, and the agent runtime's `no-key-required`), is admitted as the class `keyless`.
+- A call with no key, or with a placeholder the install's own clients send (`none`, `a2a-playground`, and the agent runtime's `no-key-required`), is admitted as the class `keyless`. So is the unexpanded `${LITELLM_API_KEY}`, which the agent can send for a moment while its pod rolls onto its own key.
 - A key listed under the reserved class `gateway-probe` reaches `GET /v1/models` and nothing else. It lets a readiness check confirm that a gateway pod has loaded the current map without sending any caller's key.
 - Any other key is refused with HTTP 401.
 
