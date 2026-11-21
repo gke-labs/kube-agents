@@ -1254,6 +1254,7 @@ spec:
       adaptiveCards: {{ $integ.teams.adaptiveCards }}
       {{- end }}
       {{- if dig "inbound" "enabled" false $integ.teams }}
+      {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.integration.teams.inbound.enabled" "path" (list "integration" "teams") "field" "inbound") }}
       inbound:
         enabled: true
       {{- end }}

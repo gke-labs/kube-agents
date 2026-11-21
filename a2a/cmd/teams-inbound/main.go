@@ -33,6 +33,10 @@ const (
 	// (Verifier.Warm runs its fetch on this context); a failure is logged
 	// and the first request fetches again.
 	warmTimeout = 15 * time.Second
+	// warmRetryFirst and warmRetryMost bound the wait between attempts to
+	// read the keys when the first fails: 2 s, doubling to a minute.
+	warmRetryFirst = 2 * time.Second
+	warmRetryMost  = time.Minute
 )
 
 func main() {
@@ -47,11 +51,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	warmCtx, cancel := context.WithTimeout(ctx, warmTimeout)
-	if err := srv.Verifier().Warm(warmCtx); err != nil {
-		log.Warn("teams inbound: Microsoft's signing keys were not read at startup; the first request will read them", "err", err)
-	}
-	cancel()
+	// The key read runs beside the listeners: /readyz answers 503 until it
+	// succeeds, and it retries on its own, so an outage of Microsoft's
+	// endpoints at startup delays readiness rather than requiring a restart.
+	go srv.Verifier().WarmUntilReady(ctx, warmTimeout, warmRetryFirst, warmRetryMost, func(err error, next time.Duration) {
+		log.Warn("teams inbound: Microsoft's signing keys were not read; the pod stays unready and tries again", "err", err, "next", next)
+	})
 
 	public := &http.Server{Addr: cfg.Listen, Handler: srv.Handler(), ReadHeaderTimeout: headerTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout}
 	status := &http.Server{Addr: cfg.StatusListen, Handler: srv.StatusHandler(), ReadHeaderTimeout: headerTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout}

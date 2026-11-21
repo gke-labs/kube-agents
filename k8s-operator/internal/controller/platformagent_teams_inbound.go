@@ -60,8 +60,7 @@ const (
 	// publishes no stable address for its key endpoint, so the rule is the
 	// internet on 443 less the private, carrier-grade and link-local
 	// ranges (teamsInboundEgressExcept), the same list the agent's egress
-	// policy carries; the FQDN policy, where the cluster has one, narrows it
-	// further.
+	// policy carries.
 	teamsInboundAnyIPv4 = "0.0.0.0/0"
 
 	// The receiver's environment, as a2a/teamsinbound reads it.

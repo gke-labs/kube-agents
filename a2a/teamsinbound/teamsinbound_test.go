@@ -332,6 +332,82 @@ func TestAKeyOutageIsUncheckedNotRefusedAndCachedKeysStillServe(t *testing.T) {
 	}
 }
 
+func TestAFailedStartupReadRetriesOnItsOwnUntilReady(t *testing.T) {
+	r := newRig(t)
+	r.ms.failKeys.Store(true)
+	fails := 0
+	r.srv.verifier.WarmUntilReady(context.Background(), time.Second, time.Millisecond, 4*time.Millisecond, func(err error, next time.Duration) {
+		if err == nil {
+			t.Fatal("onFail called without an error")
+		}
+		fails++
+		if fails == 3 {
+			// Microsoft recovers before the fourth attempt.
+			r.ms.failKeys.Store(false)
+		}
+	})
+	if fails != 3 || !r.srv.verifier.Ready() {
+		t.Fatalf("fails=%d ready=%v: the read should have been retried until it succeeded", fails, r.srv.verifier.Ready())
+	}
+	if rec := r.post(t, r.ms.mint(t, testKid, signingAlgorithm, claimsAt(r.now)), activityJSON(nil)); rec.Code != http.StatusAccepted {
+		t.Fatalf("after recovery: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWarmUntilReadyStopsWhenTheProcessDoes(t *testing.T) {
+	r := newRig(t)
+	r.ms.failKeys.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		r.srv.verifier.WarmUntilReady(ctx, time.Second, time.Hour, time.Hour, func(error, time.Duration) { cancel() })
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WarmUntilReady kept waiting after its context ended")
+	}
+	if r.srv.verifier.Ready() {
+		t.Fatal("ready without a key set")
+	}
+}
+
+func TestAFailedRefreshIsRetriedAfterAMinuteNotAfterADay(t *testing.T) {
+	r := newRig(t)
+	if rec := r.post(t, r.ms.mint(t, testKid, signingAlgorithm, claimsAt(r.now)), activityJSON(nil)); rec.Code != http.StatusAccepted {
+		t.Fatalf("first: %d", rec.Code)
+	}
+	// The set goes stale and the refresh fails; the cached key still serves.
+	r.ms.failKeys.Store(true)
+	r.now = r.now.Add(keysTTL + time.Minute)
+	r.srv.verifier.now = func() time.Time { return r.now }
+	before := r.ms.fetches.Load()
+	if rec := r.post(t, r.ms.mint(t, testKid, signingAlgorithm, claimsAt(r.now)), activityJSON(nil)); rec.Code != http.StatusAccepted {
+		t.Fatalf("stale set during outage: %d %s", rec.Code, rec.Body.String())
+	}
+	if r.ms.fetches.Load() != before+1 {
+		t.Fatalf("a stale set should be refreshed once: fetches %d -> %d", before, r.ms.fetches.Load())
+	}
+	// Inside the minute after the failed attempt: served from the cache, no fetch.
+	r.now = r.now.Add(30 * time.Second)
+	if rec := r.post(t, r.ms.mint(t, testKid, signingAlgorithm, claimsAt(r.now)), activityJSON(nil)); rec.Code != http.StatusAccepted || r.ms.fetches.Load() != before+1 {
+		t.Fatalf("inside the minute: %d, fetches %d", rec.Code, r.ms.fetches.Load())
+	}
+	// A minute after it: tried again, not a day after.
+	r.now = r.now.Add(31 * time.Second)
+	if rec := r.post(t, r.ms.mint(t, testKid, signingAlgorithm, claimsAt(r.now)), activityJSON(nil)); rec.Code != http.StatusAccepted || r.ms.fetches.Load() != before+2 {
+		t.Fatalf("after the minute: %d, fetches %d", rec.Code, r.ms.fetches.Load())
+	}
+	// Microsoft recovers: the next retry reads the set and a new key is found.
+	r.ms.failKeys.Store(false)
+	r.ms.addKey(t, "key-2", "msteams")
+	r.now = r.now.Add(2 * time.Minute)
+	if rec := r.post(t, r.ms.mint(t, "key-2", signingAlgorithm, claimsAt(r.now)), activityJSON(nil)); rec.Code != http.StatusAccepted {
+		t.Fatalf("after recovery under the rotated key: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestTheBrokersAnswerIsMappedAndItsFaultsAreNotMicrosofts(t *testing.T) {
 	r := newRig(t)
 	tok := r.ms.mint(t, testKid, signingAlgorithm, claimsAt(r.now))

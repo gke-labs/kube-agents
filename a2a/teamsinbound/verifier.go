@@ -81,9 +81,12 @@ type Verifier struct {
 	// rather than starting another.
 	keysMu sync.Mutex
 	keys   map[string]signingKey
-	// fetched is when the last fetch started, successful or not; keysTTL
-	// and keysMinRefresh are measured from it.
-	fetched time.Time
+	// fetched is when the key set was last read successfully; keysTTL is
+	// measured from it. attempted is when a fetch last started, successful
+	// or not; keysMinRefresh is measured from it, so a failed fetch is tried
+	// again after a minute rather than after a day.
+	fetched   time.Time
+	attempted time.Time
 	// fetchErr is the last fetch's failure.
 	fetchErr error
 	// everFetched is set by the first successful fetch; readiness reads it.
@@ -121,20 +124,75 @@ func (v *Verifier) Ready() bool {
 }
 
 // Warm reads the key set once, ahead of the first request, bounded by ctx
-// (unlike a request's fetch, which outlives its requester). Failure is not
-// fatal: the first request fetches again. Nothing else runs before the
-// listeners start, so no fetch is pending when it is called.
+// (unlike a request's fetch, which outlives its requester). It announces
+// itself through pending like a request's fetch, so a request arriving
+// while it runs waits for it rather than starting another.
 func (v *Verifier) Warm(ctx context.Context) error {
+	v.keysMu.Lock()
+	if done := v.pending; done != nil {
+		v.keysMu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return fmt.Errorf("%w: the warm-up ended while Microsoft's signing keys were being fetched", ErrUnchecked)
+		}
+		v.keysMu.Lock()
+		err := v.fetchErr
+		v.keysMu.Unlock()
+		return err
+	}
+	done := make(chan struct{})
+	v.pending = done
+	v.attempted = v.now()
+	v.keysMu.Unlock()
 	keys, err := v.fetchKeys(ctx)
 	v.keysMu.Lock()
 	defer v.keysMu.Unlock()
-	v.fetched = v.now()
+	v.record(keys, err)
+	v.pending = nil
+	close(done)
+	return err
+}
+
+// WarmUntilReady calls Warm until a key set is read or ctx ends, each
+// attempt bounded by attemptTimeout, waiting first between the first two
+// attempts and twice as long after each failure, up to most. onFail is told
+// each failure and the wait before the next attempt. It returns once a key
+// set is held, so the receiver's readiness probe, which answers 200 only
+// then, recovers on its own from an outage of Microsoft's endpoints at
+// startup rather than waiting for someone to restart the pod.
+func (v *Verifier) WarmUntilReady(ctx context.Context, attemptTimeout, first, most time.Duration, onFail func(err error, next time.Duration)) {
+	wait := first
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		err := v.Warm(attemptCtx)
+		cancel()
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		if onFail != nil {
+			onFail(err, wait)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		wait = min(wait*2, most)
+	}
+}
+
+// record stores a fetch's outcome; the caller holds keysMu. A fetch that
+// fails leaves the old set in place.
+func (v *Verifier) record(keys map[string]signingKey, err error) {
 	v.fetchErr = err
 	if err == nil {
 		v.keys = keys
+		v.fetched = v.now()
 		v.everFetched = true
 	}
-	return err
 }
 
 type tokenHeader struct {
@@ -266,13 +324,11 @@ func sameServiceURL(claimed, named string) bool {
 // key returns the signing key for kid, fetching the set when it is stale or
 // does not hold the key, at most once a minute. Callers that need a fetch
 // share the one in progress. A key a fresh set does not hold is a refusal;
-// a key that could not be looked for is a failure to check. The empty kid
-// is Warm's: it fetches and refuses, and Warm drops the refusal.
+// a key that could not be looked for is a failure to check.
 func (v *Verifier) key(ctx context.Context, kid string) (signingKey, error) {
 	v.keysMu.Lock()
 	now := v.now()
-	age := now.Sub(v.fetched)
-	if sk, ok := v.keys[kid]; ok && age < keysTTL {
+	if sk, ok := v.keys[kid]; ok && now.Sub(v.fetched) < keysTTL {
 		v.keysMu.Unlock()
 		return sk, nil
 	}
@@ -288,22 +344,17 @@ func (v *Verifier) key(ctx context.Context, kid string) (signingKey, error) {
 		}
 		v.keysMu.Lock()
 		fresh = true
-	case age >= keysMinRefresh || v.fetched.IsZero():
+	case now.Sub(v.attempted) >= keysMinRefresh || v.attempted.IsZero():
 		done := make(chan struct{})
 		v.pending = done
-		v.fetched = now
+		v.attempted = now
 		v.keysMu.Unlock()
 		// Not on the requester's context: others may be waiting on this
 		// fetch, and a client that leaves must not fail theirs. The HTTP
-		// client's timeout bounds it. A fetch that fails leaves the old
-		// set in place.
+		// client's timeout bounds it.
 		keys, err := v.fetchKeys(context.WithoutCancel(ctx))
 		v.keysMu.Lock()
-		v.fetchErr = err
-		if err == nil {
-			v.keys = keys
-			v.everFetched = true
-		}
+		v.record(keys, err)
 		v.pending = nil
 		close(done)
 		fresh = true

@@ -22,8 +22,8 @@ sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent i
 for itself. They get the same registry and tag, so an install at a release pulls them at that
 release and a mirrored install pulls them from the mirror. A `PlatformAgent`'s own
 `spec.deployment.image` does not move them; `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`,
-`A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE`, `A2A_CONSOLE_IMAGE` and `A2A_DISPATCHER_IMAGE` on the operator
-override one at a time.
+`A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE`, `A2A_CONSOLE_IMAGE`, `A2A_DISPATCHER_IMAGE` and
+`A2A_TEAMS_INBOUND_IMAGE` on the operator override one at a time.
 
 The AgentProfile dispatcher runs by default, from the release set's image, which on a mirror is the mirror's copy. `A2A_DISPATCHER_IMAGE` overrides the image, and the chart's `operator.profileDispatcher.enabled: false` switches the dispatcher off.
 
