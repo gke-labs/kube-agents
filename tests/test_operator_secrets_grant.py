@@ -212,7 +212,11 @@ NAMESPACED_VERBS_BY_KIND = {
 #   agentschedules            list/watch: the For() informer and the Lists
 #                             that map a profile or PlatformAgent change to
 #                             its schedules (schedulesForProfile,
-#                             schedulesInNamespace); get: the reconciler's Get.
+#                             schedulesInNamespace); get: the reconciler's Get;
+#                             create/update/delete: the built-in renderer
+#                             (reconcileBuiltinSchedules), which writes only
+#                             schedules carrying its own marks, and a squatter
+#                             on an exact reserved name.
 #   agentschedules/status     update: Status().Update (writeStatus); get: the
 #                             read half.
 #   (no agentprofiles/finalizers: nothing the operator renders carries an
@@ -229,7 +233,7 @@ CR_VERBS_BY_RESOURCE = {
     "agentplugins/status": frozenset({"get", "patch"}),
     "agentprofiles": frozenset({"get", "list", "watch", "patch"}),
     "agentprofiles/status": frozenset({"get", "update"}),
-    "agentschedules": frozenset({"get", "list", "watch"}),
+    "agentschedules": frozenset({"get", "list", "watch", "create", "update", "delete"}),
     "agentschedules/status": frozenset({"get", "update"}),
 }
 # Subresources the ClusterRole must not name at all: a row here with any verb

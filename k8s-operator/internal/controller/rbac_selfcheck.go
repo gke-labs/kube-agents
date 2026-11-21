@@ -179,6 +179,10 @@ var (
 // necessity; TestRequiredPermissionsMatchTheGeneratedRole parses role.yaml and
 // fails on any difference in either direction, so a marker change that forgets
 // this list does not build green.
+// agentScheduleWriteVerbs are the built-in schedule renderer's writes on
+// agentschedules.
+var agentScheduleWriteVerbs = []string{"create", "update", "delete"}
+
 var requiredPermissions = []requiredPermission{
 	// The custom resources, each verb with a caller (the markers above
 	// Reconcile and tests/test_operator_secrets_grant.py name them): no
@@ -205,9 +209,12 @@ var requiredPermissions = []requiredPermission{
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers/status"}, Verbs: []string{"get", "update", "patch"}},
 	// agentschedules: the AgentSchedule reconciler reads each schedule and
-	// writes its run state (gke-labs/kube-agents#5617). Only the operator and,
-	// later, the broker write schedules: no agent ServiceAccount does.
+	// writes its run state (gke-labs/kube-agents#5617), and the PlatformAgent
+	// reconciler renders the built-in schedules: create, rewrite, delete
+	// (platformagent_builtin_schedules.go). Only the operator and, later, the
+	// broker write schedules: no agent ServiceAccount does.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: rbacReadVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: agentScheduleWriteVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules/status"}, Verbs: []string{"get", "update"}},
 	// Every rendered kind is two tuples: the reads cluster-wide, for the
 	// informers and for escalation prevention, and the writes namespaced, in
@@ -682,6 +689,11 @@ func TierAccessDenied(c *RBACChecker) []string {
 // agentschedules, as TierAccessDenied does for tiers: an operator image
 // deployed ahead of its ClusterRole skips the AgentSchedule controller rather
 // than crashloop.
+//
+// Only the reads and the status write count: the built-in renderer's writes
+// (agentScheduleWriteVerbs) don't, so an older ClusterRole that lacks them
+// keeps the schedule controller running, and the renderer reports the
+// refusal itself (reconcileBuiltinSchedules).
 func AgentScheduleAccessDenied(c *RBACChecker) []string {
 	denied := c.Denied()
 	if len(denied) == 0 {
@@ -689,6 +701,9 @@ func AgentScheduleAccessDenied(c *RBACChecker) []string {
 	}
 	var out []string
 	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.subresource == "" && slices.Contains(agentScheduleWriteVerbs, tuple.verb) {
+			continue
+		}
 		if tuple.resource == "agentschedules" && slices.Contains(denied, tuple.label) {
 			out = append(out, tuple.label)
 		}

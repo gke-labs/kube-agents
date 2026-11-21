@@ -236,15 +236,20 @@ func AgentScheduleTriggerName(sched *agentv1alpha1.AgentSchedule) string {
 }
 
 // agentScheduleBuiltinNames is the set of built-in schedules the install's
-// PlatformAgent renders. The operator renders none yet: the change that
-// renders them fills this from the list it renders from, so a schedule is
-// read as built-in only when the operator would have written it.
+// PlatformAgent renders: the names of the table the PlatformAgent reconciler
+// renders from (builtinSchedules, platformagent_builtin_schedules.go), so a
+// schedule is read as built-in only when the operator would have written it.
 //
 // That renderer must own the whole object it renders: a schedule someone
 // created under a built-in's name before the admission policy existed has to
 // be overwritten in full (labels, references and spec) or deleted and
 // created again, never adopted by name with its content kept.
-func agentScheduleBuiltinNames(*agentv1alpha1.PlatformAgent) []string { return nil }
+func agentScheduleBuiltinNames(agent *agentv1alpha1.PlatformAgent) []string {
+	if !AgentSchedulesEnabled() {
+		return nil
+	}
+	return builtinScheduleNames(builtinSchedules(agent))
+}
 
 // builtinNames is the reconciler's built-in set: BuiltinNames when a test
 // sets it, the rendered set otherwise.
@@ -450,6 +455,9 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 
 	// 3. Run now: a token not handled yet starts a run, or adopts the one
 	// in flight. It leaves the cadence alone.
+	// run-now is handled before the slot below, whose suspend skip it must
+	// not reach: a run-now-only built-in (onboarding) renders suspended and
+	// runs only this way (TestARunNowRunsASuspendedSchedule).
 	if token := sched.Annotations[agentv1alpha1.AgentScheduleRunNowAnnotation]; token != "" && token != st.LastHandledRunNow && st.PendingSlot == nil {
 		if st.ActiveTaskID != "" {
 			st.LastHandledRunNow = token
