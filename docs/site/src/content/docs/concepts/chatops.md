@@ -347,11 +347,15 @@ A press of a Stop button, Slack's or Google Chat's, from such a sender gets no n
 
 #### On Slack
 
-The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own. The exception is a task the agent delegates to an AgentProfile, since nothing else in the thread shows a profile's progress. It gets a status line of its own, `⏳ submitted… (delegated to <profile>)`. The line moves to `⚙️ working` with the profile's progress, and closes to `✅ (delegated to <profile>)` when the profile is done.
+The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own.
+
+The exception is a task the agent delegates to an AgentProfile, since nothing else in the thread shows a profile's progress. It gets a status line of its own, `⏳ submitted… (delegated to <profile>)`. The line moves to `⚙️ working` with the profile's progress, and closes to `✅ (delegated to <profile>)` when the profile is done. A task handed out with others in one go gets no line of its own on Slack.
 
 #### On Google Chat and the A2A console
 
 Each turn that becomes a task posts a status line, `⏳ submitted…`, which the gateway edits as the task moves: `⚙️ **working**`, followed by the agent's latest progress note. On Google Chat the line has a **Stop** button while the task runs ([Google Chat's Stop button](#follow-ups-while-a-task-runs)). The note shows only with `googleChat.mode: debug`, and that setting also governs the console when the gateway holds Google Chat. A gateway without Google Chat (Slack, or no chat backend) is rendered no mode, so its console always shows the note.
+
+When the agent hands work to several agents at once, each of those tasks gets a status line of its own, which moves the same way and closes when that task ends. It reads `⏳ submitted… (delegated to <profile>)`, or `(delegated to platform)` for a task handed to the Platform Agent.
 
 On the A2A console the answer posts as a message of its own, and the status line then reads `✅ **completed**`. On Google Chat the answer posts as a message of its own, with its 👍 and 👎 buttons, and the status line ends as a bare ✅. When the agent hands the work to a card, its one-line acknowledgement replaces the status line instead, and the card's plan and report follow. Nothing reads `completed`. Chat marks the edited line as edited.
 
