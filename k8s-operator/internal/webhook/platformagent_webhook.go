@@ -66,6 +66,8 @@ const (
 	busCredsSecretForbiddenFmt       = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"                                                    // #nosec G101 -- Error message format, not a credential
 	forgeCredsSecretForbiddenFmt     = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"                                            // #nosec G101 -- Error message format, not a credential
 	forgeCredsEnvForbiddenFmt        = "container %q references Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be referenced by the CR"                                  // #nosec G101 -- Error message format, not a credential
+	// inferenceKeySecretForbiddenFmt is validateInferenceKeySource's refusal.
+	inferenceKeySecretForbiddenFmt = "volume %q mounts Secret %q, which the operator writes inference gateway caller keys into; each caller is given its own class's key by the operator, and the CR may not mount one" // #nosec G101 -- Error message format, not a credential
 )
 
 // The data volume size checks on spec.storage.size. A PersistentVolumeClaim
@@ -268,6 +270,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("extraVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("extraVolumes").Index(i))...)
+			allErrs = append(allErrs, validateInferenceKeySource(vol, platformAgent.Name, depPath.Child("extraVolumes").Index(i))...)
 			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("extraVolumes").Index(i))...)
 		}
 		for i, vol := range platformAgent.Spec.Deployment.SidecarVolumes {
@@ -279,6 +282,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("sidecarVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("sidecarVolumes").Index(i))...)
+			allErrs = append(allErrs, validateInferenceKeySource(vol, platformAgent.Name, depPath.Child("sidecarVolumes").Index(i))...)
 			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("sidecarVolumes").Index(i))...)
 		}
 
@@ -674,6 +678,29 @@ func validateBusCredentialSource(vol corev1.Volume, agentName string, path *fiel
 				at = path.Child("projected", "sources").Index(route.Source).Child("secret", "name")
 			}
 			errs = append(errs, field.Forbidden(at, fmt.Sprintf(busCredsSecretForbiddenFmt, vol.Name, route.Secret)))
+		}
+	}
+	return errs
+}
+
+// validateInferenceKeySource refuses a user-supplied volume that mounts one
+// of the Secrets the operator writes the inference gateway's caller keys into
+// (agentv1alpha1.IsInferenceKeySecretName), as a `secret` volume or a
+// projected `secret` source: a container given another class's key would be
+// admitted by the gateway as that class. A guard against a misconfiguration
+// by the CR's author, as validateBusCredentialSource is; path is the volume's
+// own path.
+func validateInferenceKeySource(vol corev1.Volume, agentName string, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	if vol.Secret != nil && agentv1alpha1.IsInferenceKeySecretName(agentName, vol.Secret.SecretName) {
+		errs = append(errs, field.Forbidden(path.Child("secret", "secretName"), fmt.Sprintf(inferenceKeySecretForbiddenFmt, vol.Name, vol.Secret.SecretName)))
+	}
+	if vol.Projected != nil {
+		for i, src := range vol.Projected.Sources {
+			if src.Secret != nil && agentv1alpha1.IsInferenceKeySecretName(agentName, src.Secret.Name) {
+				errs = append(errs, field.Forbidden(path.Child("projected", "sources").Index(i).Child("secret", "name"),
+					fmt.Sprintf(inferenceKeySecretForbiddenFmt, vol.Name, src.Secret.Name)))
+			}
 		}
 	}
 	return errs
