@@ -8527,7 +8527,13 @@ def _configsync_oom_loop(pods: list, kind: str, name: str, namespace: str, now_s
 
 
 def _configsync_deployment_down(item: dict, now_s: float) -> str:
-    """Why this sync object's reconciler Deployment has no available replica, or ""."""
+    """Why this sync object's reconciler Deployment has no available replica, or "".
+
+    The age is the age of the condition: the time `Reconciling` last became
+    True. A reason that changed to `Deployment` later does not restart it, so
+    the rollout that repairs a reconciler that was down for longer than the
+    wait is still named until `Reconciling` goes False.
+    """
     reconciling = _condition(item, CONFIGSYNC_RECONCILING_CONDITION)
     if (
         reconciling is None
@@ -8554,8 +8560,8 @@ def check_configsync_reconciler_stalled(context: dict, *, now: datetime.datetime
 
     Four signals. `Stalled=True` is the reconciler-manager saying it cannot
     create or run the reconciler: Config Sync writes it when the reconciler's
-    Deployment has made no progress for ten minutes (an unschedulable pod, an
-    image that will not pull) or the spec is invalid. A `Syncing` condition
+    Deployment has made no progress for ten minutes (read live for a pod that
+    could not be scheduled) or the spec is invalid. A `Syncing` condition
     naming `errorSourceRefs` is the reconciler saying the current commit
     failed to fetch, render or apply, and the stage it names holds the error
     line. The stage summaries are not read on their own: they keep the
@@ -8598,14 +8604,17 @@ def check_configsync_reconciler_stalled(context: dict, *, now: datetime.datetime
             refs = [str(r) for r in syncing["errorSourceRefs"] if r]
             errors = [e for ref in refs for e in _configsync_stage_errors(item, ref)]
             real = [e for e in errors if str(e.get("code")) not in CONFIGSYNC_TRANSIENT_ERROR_CODES]
-            if errors and not real:
-                continue
-            first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
-            why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
-            if refs:
-                why = f"{why} (errors in {', '.join(refs)})"
+            # Only transient errors is a render in flight, not a verdict: the
+            # object gives no finding by this signal. The two rules below
+            # read the reconciler itself and still apply.
+            if real or not errors:
+                first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
+                why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
+                if refs:
+                    why = f"{why} (errors in {', '.join(refs)})"
         # Config Sync's own verdict leads the excerpt when there is one. A
-        # reconciler that is down has none, so the excerpt says what was read.
+        # reconciler that is down has none, so the excerpt says what was read:
+        # the kill for memory first, which names a cause, then the age.
         lead = f"Config Sync reports {kind}/{name} is not applying its repository"
         if not why:
             lead = f"{kind}/{name} is not applying its repository"
@@ -9698,7 +9707,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
     "kcc-object-wedged": ("kcc",),
-    "configsync-reconciler-stalled": ("configsync",),
+    "configsync-reconciler-stalled": ("configsync", "workloads"),
     "lb-world-open": ("services",),
     "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
     SERVICEENTRY_HOST_COLLISION_SLUG: ("serviceentries",),

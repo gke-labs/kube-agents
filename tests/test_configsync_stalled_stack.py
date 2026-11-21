@@ -613,9 +613,25 @@ class OutOfMemoryStateTest(unittest.TestCase):
         scale = _safeguard("audit-did-not-scale-the-reconciler", _OOM_TASK)
         self.assertEqual((scale["kind"], scale["resource_name"], scale["path"]), ("deployment", deployment["metadata"]["name"], "spec.replicas"))
         self.assertEqual(scale["value"], deployment["spec"]["replicas"])
-        (objective,) = [entry for entry in task["verification_spec"] if entry["role"] == "objective"]
-        self.assertEqual(objective["check"]["finding_check"], _CHECK)
-        self.assertEqual(objective["check"]["required_phrases"], ["RootSync/root-sync", "OOMKilled"])
+        ledger, report = [entry for entry in task["verification_spec"] if entry["role"] == "objective"]
+        # The ledger scope reads a finding's object only: the object is its one phrase.
+        self.assertEqual((ledger["check"]["type"], ledger["check"]["scope"]), ("ledger_issue_contains", "finding"))
+        self.assertEqual(ledger["check"]["finding_check"], _CHECK)
+        self.assertEqual(ledger["check"]["required_phrases"], ["RootSync/root-sync"])
+        # The report objective reads the evidence: its phrase is in what the
+        # fixed check writes for the planted pair, and in nothing the check
+        # writes for the stack's stalled state.
+        self.assertEqual(report["check"]["type"], "audit_report_stored")
+        self.assertEqual(report["check"]["required_finding_phrases"], [_CHECK])
+        (phrase,) = report["check"]["required_evidence_phrases"]
+        self.assertIn("OOMKilled", phrase)
+        sync_object["metadata"]["namespace"] = _default("namespace")
+        (hit,) = self._check(sync_object, [self._killed_pod(deployment)])
+        self.assertIn(phrase, hit["excerpt"])
+        stalled = _planted_manifest()
+        stalled["metadata"]["namespace"] = _default("namespace")
+        (stalled_hit,) = self._check(stalled, [])
+        self.assertNotIn(phrase, stalled_hit["excerpt"])
 
 
 if __name__ == "__main__":

@@ -5980,9 +5980,12 @@ CONFIGSYNC_TESTDATA = Path(__file__).resolve().parent / "testdata" / "configsync
 
 
 def configsync_live(name):
-    """A trimmed copy of an object, or a list of pods, that a live Config Sync
+    """A cut copy of an object, or a list of pods, that a live Config Sync
     v1.25.2 produced (one Standard cluster, the open-source release manifest).
-    Trimmed of managed fields, ids and annotations; nothing else is changed."""
+    A sync object keeps its name, namespace, generation, labels, spec and
+    status. A pod keeps its name, namespace, labels, owners, phase and, for
+    each container, the name, the ready and started flags, the restart count
+    and both states without the container id. Every kept field is as read."""
     return json.loads((CONFIGSYNC_TESTDATA / name).read_text())
 
 
@@ -8872,8 +8875,7 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
 
     def test_a_reconciler_that_never_came_up_is_named_after_the_wait(self):
         """The live object of a reconciler starved from its start: the same
-        `Reconciling` for the whole test, and no `Stalled`, because every
-        restart counted as progress."""
+        `Reconciling` for the whole test, and no `Stalled` at any read."""
         def starved(age):
             return configsync_object(
                 "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(age), reconciling_message=self.DEPLOYMENT_DOWN
@@ -8947,6 +8949,33 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
             with self.subTest(label):
                 hits = self.run_on(configsync_live(name), pods=pods, now=now)
                 self.assertEqual([h["excerpt"] for h in hits], [expected] if expected else [])
+
+    def test_the_kill_for_memory_leads_when_both_reconciler_rules_apply(self):
+        """A reconciler killed from its first start: the object is old enough
+        for the age rule and the pod shows the kills. The excerpt names the
+        kill, which is a cause, and not the age."""
+        starved = configsync_object(
+            "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(698), reconciling_message=self.DEPLOYMENT_DOWN
+        )
+        pod = configsync_reconciler_pod("RootSync", "root-sync", restarts=7, killed="OOMKilled", killed_at=self.LAST_KILL, running=False)
+        (hit,) = self.run_on(starved, pods=[pod])
+        self.assertIn("was killed for memory (OOMKilled)", hit["excerpt"])
+        self.assertNotIn("has not come up since", hit["excerpt"])
+
+    def test_a_render_in_flight_does_not_hide_a_reconciler_that_is_down(self):
+        """Only transient errors on the object is not Config Sync's verdict.
+        The reconciler's own state is still read."""
+        def rendering(**kw):
+            return configsync_object(
+                "RootSync", "root-sync", syncing_refs=["status.rendering.errors"],
+                stage_errors={"rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}]}, **kw
+            )
+        self.assertEqual(self.run_on(rendering()), [])
+        pod = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.LAST_KILL)
+        (hit,) = self.run_on(rendering(), pods=[pod])
+        self.assertIn("was killed for memory (OOMKilled)", hit["excerpt"])
+        (hit,) = self.run_on(rendering(reconciling="True", reconciling_since=self.ago(3600), reconciling_message=self.DEPLOYMENT_DOWN))
+        self.assertIn("has not come up since", hit["excerpt"])
 
     def test_config_syncs_own_verdict_leads_when_it_gave_one(self):
         stalled = configsync_object("RootSync", "root-sync", stalled="True")

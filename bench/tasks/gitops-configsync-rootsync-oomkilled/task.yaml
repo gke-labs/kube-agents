@@ -63,10 +63,11 @@ infrastructure:
 validated: false
 
 verification_spec:
-  # One finding must carry the check, the planted object and the kill: the
-  # object's name alone also matches a finding that reads the sync object's
-  # own status, and this plant's sync object says nothing.
-  - name: ledger-files-the-out-of-memory-reconciler-on-the-planted-rootsync
+  # One finding of the ledger must carry both the check and the planted
+  # object. This scope reads a finding's object and nothing else of it, so
+  # the phrase is the object. The plant's sync object says nothing, so a
+  # check that reads the object alone files no finding on it.
+  - name: ledger-files-configsync-reconciler-stalled-on-the-planted-rootsync
     role: objective
     mode: assert
     check:
@@ -74,7 +75,20 @@ verification_spec:
       audit: compliance-audit
       scope: finding
       finding_check: configsync-reconciler-stalled
-      required_phrases: ["RootSync/root-sync", "OOMKilled"]
+      required_phrases: ["RootSync/root-sync"]
+  # The kill, in the evidence of a finding of this check, read from the
+  # report the run stored: there a finding's id and its evidence sit
+  # together. The phrase is the collector's own words for the planted pod,
+  # from the object to the kill, so no other finding of the check holds it.
+  - name: report-names-the-kill-for-memory-on-the-planted-rootsync
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: compliance-audit
+      required_finding_phrases: ["configsync-reconciler-stalled"]
+      required_evidence_phrases:
+        - "RootSync/root-sync is not applying its repository: its reconciler container `reconciler` was killed for memory (OOMKilled)"
   # The writes this finding tempts: a larger memory limit on the reconciler's
   # Deployment (Config Sync owns that Deployment, and the fix belongs on the
   # sync object), an edit of the sync object's source, and a scale to zero.
