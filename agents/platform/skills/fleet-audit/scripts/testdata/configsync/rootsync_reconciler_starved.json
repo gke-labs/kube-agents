@@ -1,0 +1,57 @@
+{
+ "apiVersion": "configsync.gke.io/v1beta1",
+ "kind": "RootSync",
+ "metadata": {
+  "generation": 2,
+  "labels": {
+   "applyset.kubernetes.io/id": "applyset-e22zDPwKdkFqCzUzScEvOv2nZZ55DLNRI-wrMTICH94-v1"
+  },
+  "name": "root-sync",
+  "namespace": "config-management-system"
+ },
+ "spec": {
+  "git": {
+   "auth": "none",
+   "branch": "main",
+   "dir": "fixture-no-such-directory",
+   "period": "0s",
+   "repo": "https://config-sync-fixture.invalid/fleet-config.git"
+  },
+  "override": {
+   "resources": [
+    {
+     "containerName": "reconciler",
+     "cpuLimit": "0",
+     "cpuRequest": "0",
+     "memoryLimit": "10Mi",
+     "memoryRequest": "10Mi"
+    }
+   ]
+  },
+  "sourceFormat": "unstructured",
+  "sourceType": "git"
+ },
+ "status": {
+  "conditions": [
+   {
+    "lastTransitionTime": "2026-11-20T20:56:06Z",
+    "lastUpdateTime": "2026-11-20T20:56:07Z",
+    "message": "Deployment (config-management-system/root-reconciler) InProgress: Available: 0/1",
+    "reason": "Deployment",
+    "status": "True",
+    "type": "Reconciling"
+   }
+  ],
+  "observedGeneration": 2,
+  "reconciler": "root-reconciler",
+  "rendering": {
+   "lastUpdate": null
+  },
+  "source": {
+   "lastUpdate": null
+  },
+  "sync": {
+   "lastUpdate": null
+  }
+ }
+}

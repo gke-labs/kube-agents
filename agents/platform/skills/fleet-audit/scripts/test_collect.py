@@ -5973,6 +5973,19 @@ def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDat
     return doc
 
 
+# What Config Sync v1.25.2 wrote on a live RootSync whose reconciler Deployment
+# passed its progress deadline (testdata/configsync/rootsync_stalled.json).
+CONFIGSYNC_STALLED_MESSAGE = "Deployment (config-management-system/root-reconciler) Failed: Progress deadline exceeded"
+CONFIGSYNC_TESTDATA = Path(__file__).resolve().parent / "testdata" / "configsync"
+
+
+def configsync_live(name):
+    """A trimmed copy of an object, or a list of pods, that a live Config Sync
+    v1.25.2 produced (one Standard cluster, the open-source release manifest).
+    Trimmed of managed fields, ids and annotations; nothing else is changed."""
+    return json.loads((CONFIGSYNC_TESTDATA / name).read_text())
+
+
 def configsync_object(kind, name, ns="config-management-system", stalled="False", syncing_refs=(), syncing_message="Sync Completed",
                       reconciling="False", stage_errors=None, reconciling_since=None, reconciling_reason="Deployment",
                       reconciling_message="Reconciler deployment was created"):
@@ -5995,7 +6008,7 @@ def configsync_object(kind, name, ns="config-management-system", stalled="False"
             "type": "Reconciling", "status": reconciling, "reason": reconciling_reason, "message": reconciling_message,
             **({"lastTransitionTime": reconciling_since} if reconciling_since else {}),
         },
-        {"type": "Stalled", "status": stalled, "reason": "Deployment" if stalled == "True" else "", "message": "Reconciler deployment failed" if stalled == "True" else ""},
+        {"type": "Stalled", "status": stalled, "reason": "Deployment" if stalled == "True" else "", "message": CONFIGSYNC_STALLED_MESSAGE if stalled == "True" else ""},
         syncing,
     ]
     for stage, errors in (stage_errors or {}).items():
@@ -6004,22 +6017,28 @@ def configsync_object(kind, name, ns="config-management-system", stalled="False"
 
 
 def configsync_reconciler_pod(kind, name, ns="config-management-system", restarts=0, killed=None, killed_at=None, running=True,
-                              pod="root-reconciler-7f99b9c746-h4dhh"):
-    """A reconciler pod as `kubectl get pods -n config-management-system -l
-    configsync.gke.io/sync-kind -o json` returns it, cut to what §2.17 reads.
+                              pod="root-reconciler-7f99b9c746-h4dhh", container="reconciler", state_only=False):
+    """A reconciler pod as the compliance stream's workload dump returns it,
+    cut to what §2.17 reads.
 
-    The labels and the container statuses are the ones Config Sync v1.25.2
-    wrote on a live cluster. `killed` is the reason of the `reconciler`
-    container's last termination and `killed_at` its `finishedAt`; `running`
-    False puts that termination in `state` (the container is down right now)
-    and not in `lastState` (it has restarted since).
+    The labels and the shape of the container statuses are the ones Config
+    Sync v1.25.2 wrote on a live cluster (testdata/configsync/reconciler_pods_loop.json).
+    `killed` is the reason of the last termination of `container` and
+    `killed_at` its `finishedAt`; `running` False puts that termination in
+    `state` (the container is down right now) as well as in `lastState`, and
+    `state_only` leaves `lastState` empty (the first kill after a clean start).
     """
     terminated = {"terminated": {"exitCode": 137, "reason": killed, "finishedAt": killed_at}} if killed else {}
-    reconciler = {"name": "reconciler", "ready": running, "restartCount": restarts}
+    statuses = {
+        each: {"name": each, "ready": True, "restartCount": 0, "state": {"running": {}}, "lastState": {}}
+        for each in ("git-sync", "otel-agent", "reconciler")
+    }
+    hit = statuses[container]
+    hit.update({"ready": running, "restartCount": restarts})
     if running:
-        reconciler.update({"state": {"running": {"startedAt": killed_at or "2026-11-20T23:37:40Z"}}, "lastState": terminated})
+        hit.update({"state": {"running": {"startedAt": killed_at or "2026-11-20T23:37:40Z"}}, "lastState": terminated})
     else:
-        reconciler.update({"state": terminated, "lastState": terminated})
+        hit.update({"state": terminated, "lastState": {} if state_only else terminated})
     return {
         "kind": "Pod",
         "metadata": {
@@ -6032,14 +6051,10 @@ def configsync_reconciler_pod(kind, name, ns="config-management-system", restart
                 "configsync.gke.io/sync-name": name,
                 "configsync.gke.io/sync-namespace": ns,
             },
+            "ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": pod.rsplit("-", 1)[0], "controller": True}],
         },
-        "status": {
-            "containerStatuses": [
-                {"name": "git-sync", "ready": True, "restartCount": 0, "state": {"running": {}}, "lastState": {}},
-                {"name": "otel-agent", "ready": True, "restartCount": 0, "state": {"running": {}}, "lastState": {}},
-                reconciler,
-            ]
-        },
+        "spec": {"containers": [{"name": each, "image": f"gcr.io/config-management-release/{each}:v1.25.2"} for each in statuses]},
+        "status": {"phase": "Running", "containerStatuses": list(statuses.values())},
     }
 
 
@@ -8751,12 +8766,55 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
         self.assertEqual(self.run_on(healthy_looking), [])
         hits = self.run_on(healthy_looking, pods=[pod])
         self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("config-management-system", "RootSync/root-sync")])
-        self.assertIn("RootSync/root-sync is not applying its repository", hits[0]["excerpt"])
-        self.assertIn("`reconciler` has restarted 9 times", hits[0]["excerpt"])
-        self.assertIn("OOMKilled", hits[0]["excerpt"])
-        self.assertIn(self.LAST_KILL, hits[0]["excerpt"])
+        self.assertEqual(
+            hits[0]["excerpt"],
+            "RootSync/root-sync is not applying its repository: its reconciler container `reconciler` was killed "
+            "for memory (OOMKilled) and has restarted more than once (pod root-reconciler-7f99b9c746-h4dhh)",
+        )
         # Nothing Config Sync reported: the excerpt must not put the words in its mouth.
         self.assertNotIn("Config Sync reports", hits[0]["excerpt"])
+
+    def test_the_excerpt_does_not_change_while_the_loop_goes_on(self):
+        """The ledger compares the excerpt byte for byte between two runs. A
+        restart count or a kill time in it would make the finding read as
+        changed on every run."""
+        healthy_looking = configsync_object("RootSync", "root-sync")
+        earlier = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.ago(300))
+        later = configsync_reconciler_pod("RootSync", "root-sync", restarts=40, killed="OOMKilled", killed_at=self.LAST_KILL)
+        self.assertEqual(self.run_on(healthy_looking, pods=[earlier]), self.run_on(healthy_looking, pods=[later]))
+
+    def test_the_first_kills_are_read_from_the_container_state_alone(self):
+        """Down right now, and nothing in `lastState` yet."""
+        pod = configsync_reconciler_pod(
+            "RootSync", "root-sync", restarts=2, killed="OOMKilled", killed_at=self.LAST_KILL, running=False, state_only=True
+        )
+        self.assertEqual(len(self.run_on(configsync_object("RootSync", "root-sync"), pods=[pod])), 1)
+
+    def test_another_container_of_the_pod_in_a_loop_is_not_this_finding(self):
+        """Only the container that applies the repository is read: whether the
+        repository is still applied while a sibling is killed was not tested."""
+        for container in ("otel-agent", "git-sync"):
+            with self.subTest(container=container):
+                pod = configsync_reconciler_pod(
+                    "RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.LAST_KILL, container=container
+                )
+                self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync"), pods=[pod]), [])
+
+    def test_a_pod_names_one_sync_object_by_all_three_labels(self):
+        """Two sync objects can share a name: a RootSync and a RepoSync, or two
+        RepoSyncs in two namespaces. A killed reconciler names only its own."""
+        root = configsync_object("RootSync", "sync")
+        team_a = configsync_object("RepoSync", "sync", ns="team-a")
+        team_b = configsync_object("RepoSync", "sync", ns="team-b")
+        for kind, ns, expected in (
+            ("RootSync", "config-management-system", ("config-management-system", "RootSync/sync")),
+            ("RepoSync", "team-a", ("team-a", "RepoSync/sync")),
+            ("RepoSync", "team-b", ("team-b", "RepoSync/sync")),
+        ):
+            with self.subTest(kind=kind, ns=ns):
+                pod = configsync_reconciler_pod(kind, "sync", ns=ns, restarts=4, killed="OOMKilled", killed_at=self.LAST_KILL)
+                hits = self.run_on(root, team_a, team_b, pods=[pod])
+                self.assertEqual([(h["namespace"], h["object"]) for h in hits], [expected])
 
     def test_the_loop_is_named_while_the_container_is_down_and_while_it_is_up(self):
         for running in (True, False):
@@ -8795,9 +8853,12 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
             )
         hits = self.run_on(starved(698))  # 11 minutes 38 seconds, the length of the live test
         self.assertEqual(len(hits), 1)
-        self.assertIn("has not come up for 11 minutes", hits[0]["excerpt"])
-        self.assertIn(f"Deployment: {self.DEPLOYMENT_DOWN}", hits[0]["excerpt"])
-        self.assertNotIn("Config Sync reports", hits[0]["excerpt"])
+        # The time and not the age: the excerpt must read the same on the next run.
+        self.assertEqual(
+            hits[0]["excerpt"],
+            f"RootSync/root-sync is not applying its repository: its reconciler has not come up since {self.ago(698)} "
+            f"(Deployment: {self.DEPLOYMENT_DOWN})",
+        )
         self.assertEqual(len(self.run_on(starved(collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS))), 1)
 
     def test_a_healthy_start_is_not_a_finding(self):
@@ -8821,6 +8882,39 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
 
     def test_a_reconciling_condition_with_no_time_is_not_a_finding(self):
         self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", reconciling="True", reconciling_message=self.DEPLOYMENT_DOWN)), [])
+
+    def test_the_live_objects_of_each_reconciler_state(self):
+        """The objects a live Config Sync wrote, read at the moment each was
+        saved. The loop's pod list was saved at 00:02:33Z; its two sync objects
+        are the same loop at 23:50:45Z (between two kills) and at 00:01:13Z
+        (the reconciler down)."""
+        def at(text):
+            return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+        loop_pods = configsync_live("reconciler_pods_loop.json")["items"]
+        saved_pods_at = at("2026-11-21T00:02:33Z")
+        for label, name, pods, now, expected in (
+            ("stalled", "rootsync_stalled.json", [], at("2026-11-20T21:20:00Z"),
+             f"Config Sync reports RootSync/root-sync is not applying its repository: Deployment: {CONFIGSYNC_STALLED_MESSAGE}"),
+            ("starved from its start", "rootsync_reconciler_starved.json", [], at("2026-11-20T21:07:11Z"),
+             "RootSync/root-sync is not applying its repository: its reconciler has not come up since 2026-11-20T20:56:06Z "
+             f"(Deployment: {self.DEPLOYMENT_DOWN})"),
+            ("the loop between two kills, the object alone", "rootsync_loop_between_kills.json", [], at("2026-11-20T23:50:45Z"), None),
+            ("the loop with the reconciler down, the object alone", "rootsync_loop_reconciler_down.json", [], at("2026-11-21T00:01:13Z"), None),
+            ("the loop between two kills, with its pods", "rootsync_loop_between_kills.json", loop_pods, saved_pods_at,
+             "RootSync/root-sync is not applying its repository: its reconciler container `reconciler` was killed "
+             "for memory (OOMKilled) and has restarted more than once (pod root-reconciler-7f99b9c746-h4dhh)"),
+            ("the loop with the reconciler down, with its pods", "rootsync_loop_reconciler_down.json", loop_pods, saved_pods_at,
+             "RootSync/root-sync is not applying its repository: its reconciler container `reconciler` was killed "
+             "for memory (OOMKilled) and has restarted more than once (pod root-reconciler-7f99b9c746-h4dhh)"),
+            ("healthy", "rootsync_healthy.json", [], at("2026-11-20T23:34:00Z"), None),
+            # The saved list also holds a healthy namespace reconciler: no finding for a healthy object beside it.
+            ("healthy, beside another object's killed reconciler", "rootsync_healthy.json",
+             [pod for pod in loop_pods if pod["metadata"]["labels"]["configsync.gke.io/sync-kind"] == "RepoSync"], saved_pods_at, None),
+        ):
+            with self.subTest(label):
+                hits = self.run_on(configsync_live(name), pods=pods, now=now)
+                self.assertEqual([h["excerpt"] for h in hits], [expected] if expected else [])
 
     def test_config_syncs_own_verdict_leads_when_it_gave_one(self):
         stalled = configsync_object("RootSync", "root-sync", stalled="True")
@@ -8848,7 +8942,7 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["object"], "RootSync/root-sync")
         self.assertEqual(hits[0]["namespace"], "config-management-system")
-        self.assertIn("Deployment: Reconciler deployment failed", hits[0]["excerpt"])
+        self.assertIn(f"Deployment: {CONFIGSYNC_STALLED_MESSAGE}", hits[0]["excerpt"])
         self.assertNotIn("severity", hits[0])  # the CheckSpec's `critical` stands
 
     def test_syncing_errors_name_the_stage_and_its_first_error(self):
@@ -9062,7 +9156,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
         return pod
 
     def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, endpointslice_run=None, serviceentry_items=None, configsync_pod_items=()):
-        workload_items = [self.benign_pod()] if workload_items is None else workload_items
+        # §2.17's reconciler pods are pods of the workload dump like any other.
+        workload_items = ([self.benign_pod()] if workload_items is None else list(workload_items)) + list(configsync_pod_items)
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
         self.issued = []
@@ -9109,12 +9204,6 @@ class TestComplianceCollectCluster(unittest.TestCase):
                         answer = kcc_items
                         return serve_kcc(argv, lambda kind_argv: answer(kind_argv, **kwargs))
                     return serve_kcc(argv, kcc_items)
-                if kinds == "pods" and collect.CONFIGSYNC_SYNC_KIND_LABEL in argv:
-                    # §2.17's reconciler pods: a list, or a callable for the
-                    # failed answers no list can express.
-                    if callable(configsync_pod_items):
-                        return configsync_pod_items(argv, **kwargs)
-                    return Run(argv, 0, json.dumps(dump_of(*configsync_pod_items)), "", 0.05)
                 if kinds in collect.CONFIGSYNC_SYNC_KINDS:
                     if callable(configsync_items):
                         return configsync_items(argv, **kwargs)
@@ -13783,12 +13872,9 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         result = self.compliance(configsync_items=lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1))
         self.assertIn("could not read", self.configsync_reason(result))
 
-    # §2.17's third read. The sync object of a reconciler that is killed for
-    # memory reads healthy between kills; only its pod says it at every moment.
-    def reconciler_pod_reads(self, tester):
-        return [argv for argv in tester.issued if argv[:3] == ["kubectl", "get", "pods"] and collect.CONFIGSYNC_SYNC_KIND_LABEL in argv]
-
-    def test_an_out_of_memory_reconciler_is_a_candidate_from_the_pod_read_and_the_read_is_recorded(self):
+    # §2.17 and a reconciler killed for memory: its sync object reads healthy
+    # between two kills, and its pod is in the workload dump the stream makes.
+    def test_an_out_of_memory_reconciler_is_a_candidate_from_the_workload_dump_and_the_dump_is_recorded(self):
         last_kill = (datetime.now(timezone.utc) - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
         result = self.compliance(
             configsync_items=[configsync_object("RootSync", "root-sync")],
@@ -13798,39 +13884,32 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         candidate = next(c for c in result["candidates"] if c["check"] == "configsync-reconciler-stalled")
         self.assertEqual((candidate["object"], candidate["severity"]), ("RootSync/root-sync", "critical"))
         command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
-        # One list, one namespace, by the label every reconciler pod carries.
-        self.assertIn("kubectl get pods -n config-management-system -l configsync.gke.io/sync-kind -o json", command["command"])
-        self.assertIn("rootsyncs.configsync.gke.io -A -o json; KUBECONFIG=", command["command"])
+        # The two sync reads, then the dump the pod came from: what a reader runs to see it.
+        dump = next(c for c in result["commands"] if c["check"] == "privileged-container")
+        self.assertIn("kubectl get rootsyncs.configsync.gke.io -A -o json; ", command["command"])
+        self.assertTrue(command["command"].endswith("; " + dump["command"]), command["command"])
+        # An owned pod: no other check files the reconciler pod itself.
+        self.assertEqual([c["check"] for c in result["candidates"] if "reconciler" in c["object"]], [])
 
-    def test_the_pod_read_is_made_only_where_a_sync_object_exists(self):
-        for label, kw in (("no Config Sync", {}), ("served and empty", {"configsync_items": []})):
+    def test_the_check_makes_no_pod_read_of_its_own_and_names_the_dump_only_where_a_sync_object_exists(self):
+        for label, kw in (("no Config Sync", {}), ("served and empty", {"configsync_items": []}), ("one object", {"configsync_items": [configsync_object("RootSync", "root-sync")]})):
             with self.subTest(label):
                 tester = TestComplianceCollectCluster()
-                tester.run_with(**kw)
-                self.assertEqual(self.reconciler_pod_reads(tester), [])
-        tester = TestComplianceCollectCluster()
-        tester.run_with(configsync_items=[configsync_object("RootSync", "root-sync")])
-        self.assertEqual(
-            self.reconciler_pod_reads(tester),
-            [["kubectl", "get", "pods", "-n", "config-management-system", "-l", "configsync.gke.io/sync-kind", "-o", "json"]],
-        )
+                result = tester.run_with(**kw)
+                self.assertEqual([argv for argv in tester.issued if argv[:3] == ["kubectl", "get", "pods"]], [])
+                commands = [c["command"] for c in result["commands"] if c["check"] == "configsync-reconciler-stalled"]
+                self.assertEqual(len(commands), 1 if kw.get("configsync_items") else 0)
+                for command in commands:
+                    self.assertIn(collect.COMPLIANCE_DUMP_KINDS.split(",")[-1], command.rsplit("; ", 1)[-1])
 
-    def test_a_failed_pod_read_is_undetermined_and_clears_nothing(self):
-        for label, answer, said in (
-            ("forbidden", lambda argv, **kw: Run(argv, 1, "", 'Error from server (Forbidden): pods is forbidden in the namespace "config-management-system"', 0.1), "Forbidden"),
-            ("timed out", lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0), "did not finish"),
-            ("unreadable", lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1), "could not read"),
-        ):
-            with self.subTest(label):
-                result = self.compliance(
-                    configsync_items=[configsync_object("RootSync", "root-sync", stalled="True")], configsync_pod_items=answer
-                )
-                reason = self.configsync_reason(result)
-                self.assertIn("Undetermined", reason)
-                self.assertIn(said, reason)
-                self.assertIn("configsync-reconciler-stalled", {e["check"] for e in result["checks_unevaluated"]})
-                self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
-                self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["candidates"]})
+    def test_only_reconciler_pods_of_the_config_sync_namespace_are_kept(self):
+        """The sync labels on a pod of another namespace name nothing: Config
+        Sync runs every reconciler in its own namespace."""
+        last_kill = (datetime.now(timezone.utc) - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elsewhere = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=last_kill)
+        elsewhere["metadata"]["namespace"] = "team-a"
+        result = self.compliance(configsync_items=[configsync_object("RootSync", "root-sync")], configsync_pod_items=[elsewhere])
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["candidates"]})
 
     # Any ccnp failure read as "no cluster-wide policies".
     def test_a_forbidden_ccnp_read_leaves_netpol_missing_unevaluated(self):
@@ -14403,6 +14482,15 @@ class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
             audit_report.validate_check_command(mm_text, "clusters[0]", "ingress-gateway-healthcheck-mismatch"),
         )
         self.assertEqual(mm_text, audit_report.trim_command(mm_text))
+        # §2.17 where a sync object exists: both sync reads, then the workload dump its pods came from.
+        compliance_dump = collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig)
+        sync_reads = [
+            f"KUBECONFIG={kubeconfig} {collect.shlex.join(['kubectl', 'get', kind, '-A', '-o', 'json'])}" for kind in collect.CONFIGSYNC_SYNC_KINDS
+        ]
+        sync_text = "; ".join([*sync_reads, compliance_dump])
+        self.assertLessEqual(len(sync_text), audit_report.MAX_COMMAND_CHARS, len(sync_text))
+        self.assertEqual(sync_text, audit_report.validate_check_command(sync_text, "clusters[0]", "configsync-reconciler-stalled"))
+        self.assertEqual(sync_text, audit_report.trim_command(sync_text))
 
 
 class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):

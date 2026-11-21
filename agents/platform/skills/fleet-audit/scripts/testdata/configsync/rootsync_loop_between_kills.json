@@ -1,0 +1,79 @@
+{
+ "apiVersion": "configsync.gke.io/v1beta1",
+ "kind": "RootSync",
+ "metadata": {
+  "generation": 5,
+  "labels": {
+   "applyset.kubernetes.io/id": "applyset-e22zDPwKdkFqCzUzScEvOv2nZZ55DLNRI-wrMTICH94-v1"
+  },
+  "name": "root-sync",
+  "namespace": "config-management-system"
+ },
+ "spec": {
+  "git": {
+   "auth": "none",
+   "branch": "main",
+   "dir": "config-sync-quickstart/multirepo/root",
+   "period": "0s",
+   "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples"
+  },
+  "override": {
+   "resources": [
+    {
+     "containerName": "reconciler",
+     "memoryLimit": "72Mi",
+     "memoryRequest": "72Mi"
+    }
+   ]
+  },
+  "sourceFormat": "unstructured",
+  "sourceType": "git"
+ },
+ "status": {
+  "conditions": [
+   {
+    "lastTransitionTime": "2026-11-20T23:50:41Z",
+    "lastUpdateTime": "2026-11-20T23:50:41Z",
+    "status": "False",
+    "type": "Reconciling"
+   }
+  ],
+  "lastSyncedCommit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+  "observedGeneration": 5,
+  "reconciler": "root-reconciler",
+  "rendering": {
+   "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+   "errorSummary": {},
+   "gitStatus": {
+    "branch": "main",
+    "dir": "config-sync-quickstart/multirepo/root",
+    "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
+    "revision": "HEAD"
+   },
+   "lastUpdate": "2026-11-20T23:32:50Z",
+   "message": "Rendering skipped"
+  },
+  "source": {
+   "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+   "errorSummary": {},
+   "gitStatus": {
+    "branch": "main",
+    "dir": "config-sync-quickstart/multirepo/root",
+    "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
+    "revision": "HEAD"
+   },
+   "lastUpdate": "2026-11-20T23:32:51Z"
+  },
+  "sync": {
+   "commit": "75d46d285d33abda619209afbe8ea0ebfb377000",
+   "errorSummary": {},
+   "gitStatus": {
+    "branch": "main",
+    "dir": "config-sync-quickstart/multirepo/root",
+    "repo": "https://github.com/GoogleCloudPlatform/anthos-config-management-samples",
+    "revision": "HEAD"
+   },
+   "lastUpdate": "2026-11-20T23:33:10Z"
+  }
+ }
+}

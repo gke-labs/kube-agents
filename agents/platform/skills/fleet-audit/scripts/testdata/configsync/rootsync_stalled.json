@@ -1,0 +1,68 @@
+{
+ "apiVersion": "configsync.gke.io/v1beta1",
+ "kind": "RootSync",
+ "metadata": {
+  "generation": 3,
+  "labels": {
+   "applyset.kubernetes.io/id": "applyset-e22zDPwKdkFqCzUzScEvOv2nZZ55DLNRI-wrMTICH94-v1"
+  },
+  "name": "root-sync",
+  "namespace": "config-management-system"
+ },
+ "spec": {
+  "git": {
+   "auth": "none",
+   "branch": "main",
+   "dir": "fixture-no-such-directory",
+   "period": "0s",
+   "repo": "https://config-sync-fixture.invalid/fleet-config.git"
+  },
+  "override": {
+   "resources": [
+    {
+     "containerName": "reconciler",
+     "cpuRequest": "64",
+     "memoryLimit": "512Mi",
+     "memoryRequest": "256Mi"
+    }
+   ]
+  },
+  "sourceFormat": "unstructured",
+  "sourceType": "git"
+ },
+ "status": {
+  "conditions": [
+   {
+    "lastTransitionTime": "2026-11-20T20:56:06Z",
+    "lastUpdateTime": "2026-11-20T21:18:23Z",
+    "message": "Setup stalled",
+    "reason": "Setup",
+    "status": "True",
+    "type": "Reconciling"
+   },
+   {
+    "errorSummary": {
+     "errorCountAfterTruncation": 1,
+     "totalCount": 1
+    },
+    "lastTransitionTime": "2026-11-20T21:18:23Z",
+    "lastUpdateTime": "2026-11-20T21:18:23Z",
+    "message": "Deployment (config-management-system/root-reconciler) Failed: Progress deadline exceeded",
+    "reason": "Deployment",
+    "status": "True",
+    "type": "Stalled"
+   }
+  ],
+  "observedGeneration": 3,
+  "reconciler": "root-reconciler",
+  "rendering": {
+   "lastUpdate": null
+  },
+  "source": {
+   "lastUpdate": null
+  },
+  "sync": {
+   "lastUpdate": null
+  }
+ }
+}
