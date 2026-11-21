@@ -950,3 +950,128 @@ func TestTriggerRecordMapsAreBounded(t *testing.T) {
 		t.Errorf("at 60 an hour the key cap is %d, under a day's runs", got)
 	}
 }
+
+// A scheduled run may fan out (#6744): its child is minted at the read tier,
+// as a fresh root on the parent's scope, with no trigger, so it can read for
+// its parent and never write under the schedule's trigger. The child's result
+// reaches the parent on its .in, and nothing is posted to chat, since a
+// trigger's conversation has no backend.
+func TestAScheduledRunsChildIsAReadRootWithNoTrigger(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	postsBefore := len(tr.adapter.posts) + len(tr.adapter.stopPostsCopy())
+
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "list this cluster's nodes",
+		targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	var childMsg *nats.Msg
+	waitFor(t, "the child's submission", func() bool {
+		for _, m := range tr.submissions() {
+			if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+				childMsg = m
+				return true
+			}
+		}
+		return false
+	})
+	profile, tier, _, _, _ := lib.ParseSubmitSubject(childMsg.Subject)
+	if profile != "cluster" || tier != string(capability.TierRead) {
+		t.Fatalf("child submitted on %s, want a read child of cluster", childMsg.Subject)
+	}
+	var childEnv lib.Envelope
+	if err := json.Unmarshal(childMsg.Data, &childEnv); err != nil {
+		t.Fatal(err)
+	}
+	if trig, err := capability.TriggerFromAuthority(childEnv.Authority); err != nil || trig != nil {
+		t.Fatalf("the child's authority claims trigger %+v (%v); a child carries none", trig, err)
+	}
+	ref, present, err := capability.RefFromAuthority(childEnv.Authority)
+	if err != nil || !present {
+		t.Fatalf("the child pins no grant: %v", err)
+	}
+	entry := readCapEntry(t, tr.url, ref)
+	if entry.Tier != capability.TierRead || entry.Trigger != nil || entry.Profile != "cluster" {
+		t.Fatalf("the child's grant = %+v, want read tier on cluster with no trigger", entry)
+	}
+
+	child := tr.execFor(t, &childEnv, "cluster")
+	if err := child.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "three nodes, all ready"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child result on the parent's .in", func() bool {
+		for _, e := range streamEnvelopes(t, tr.url, lib.TaskInSubject("fleet-audit", origin.TaskID)) {
+			if c, ok := lib.ChildResultOf(messageParts(t, e.env)); ok && c.ChildTaskID == childEnv.TaskID && c.Text == "three nodes, all ready" {
+				return true
+			}
+		}
+		return false
+	})
+	if n := len(tr.adapter.posts) + len(tr.adapter.stopPostsCopy()); n != postsBefore {
+		t.Fatalf("the fan-out posted to chat: %d posts, was %d", n, postsBefore)
+	}
+}
+
+// A scheduled run whose delegation is refused hands off to a child that is
+// never minted: its own `completed` is only the hand-off line, so its status
+// reads failed, never completed (which the reconciler would record as
+// Succeeded).
+func TestARefusedFanOutReadsFailedNotCompleted(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	// Outside the install's scope (project p9): refused, nothing minted.
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p9", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		return rec != nil && rec.delegationEndFor(origin.TaskID) != ""
+	})
+	// The worker ends its turn on the hand-off line.
+	if err := parent.PublishArtifact(ctx, lib.Artifact{ArtifactID: "r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "delegated to cluster"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	var got lib.TriggerStatusReply
+	waitFor(t, "the run's terminal in its status", func() bool {
+		got = tr.status(t, s, reply.TaskID)
+		return got.Terminal
+	})
+	if got.State != lib.StateFailed {
+		t.Fatalf("a refused fan-out's status = %+v, want failed", got)
+	}
+}

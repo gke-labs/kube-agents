@@ -48,9 +48,6 @@ const (
 	// ruleDelegationParentChainMismatch refuses when an ancestor the record
 	// still holds contradicts the parent's carried chain.
 	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
-	// ruleDelegationUnattendedParent refuses a child of an unattended task:
-	// the child's grant would not carry the parent's trigger binding.
-	ruleDelegationUnattendedParent = "delegation.unattended-parent"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root
@@ -314,6 +311,14 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		}
 		if addressee != targetPlatform {
 			tier := capability.Tier(parent.Tier)
+			if profileParent && tier == capability.TierUnattended {
+				// A child of an unattended task (#6744) is minted at the read
+				// tier, as a fresh root on the parent's scope (the chain checks
+				// below hold it there), and carries no trigger: an unattended
+				// grant is bound to its trigger, and only the parent writes
+				// under it. A child can read for its parent, never write.
+				tier = capability.TierRead
+			}
 			if !profileParent {
 				authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
 				if tier, err = g.tierFor(authors, unknown); err != nil {

@@ -33,11 +33,6 @@ func childProfileChain(parent TaskRef, profileParent bool) []string {
 // profileParentRefusal is why a profile parent may not delegate at all, as
 // a rule and a notice, or "" when it may. Checked once, before any child.
 func profileParentRefusal(parent TaskRef) (rule, notice string) {
-	// An unattended grant is bound to its trigger (09), and the child mint
-	// carries no trigger: refused until the child's inheritance is designed.
-	if capability.Tier(parent.Tier) == capability.TierUnattended {
-		return ruleDelegationUnattendedParent, noticeUnattendedParent
-	}
 	// A profile task this gateway minted always has a scope, so an empty one
 	// is a record from before #5686 or a path that didn't record it: its
 	// chain is unknown too. Refused, never read as "no chain".

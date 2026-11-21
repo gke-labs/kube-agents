@@ -77,7 +77,6 @@ const (
 	// noticeParentScopeStale: the parent's scope is neither a cluster nor this
 	// install's, as when the install's namespace changed under an open task.
 	noticeParentScopeStale = "this task's scope no longer matches this install, so it can't delegate; ask again to start a new task"
-	noticeUnattendedParent = "a task a trigger started can't delegate; ask in chat instead"
 	// noticeChainSeparator joins a chain's profiles in noticeProfileCycle.
 	noticeChainSeparator = " → "
 	// noticePlatformTakesNoParameters: platform takes its target from the text.

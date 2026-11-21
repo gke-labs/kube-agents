@@ -414,6 +414,9 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 			ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
 			Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
 			RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
+			// Its scope, recorded as a profile task's is: the scope its
+			// children are held to when it fans out (#6744).
+			Scope: string(route.Scope),
 		})
 		if len(rec.Tasks) > taskHistoryCap {
 			rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
@@ -516,7 +519,23 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
+	if task.Final && task.State == lib.StateCompleted && rec.delegationEndFor(q.TaskID) != "" {
+		// The run handed off to a child that was never minted (a refused
+		// or unstarted delegation): its own `completed` is only the
+		// hand-off line, never a deliverable, so the run failed. Without
+		// this a refused fan-out would read Succeeded.
+		return lib.TriggerStatusReply{Found: true, State: lib.StateFailed, Terminal: true}
+	}
 	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+}
+
+// delegationEndFor is the reason a task's delegation minted no child
+// (TaskRef.DelegationEnd), or "".
+func (rec *SessionRecord) delegationEndFor(taskID string) string {
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		return ref.DelegationEnd
+	}
+	return ""
 }
 
 // triggerConversationKey is a trigger's own conversation:
