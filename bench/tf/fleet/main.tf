@@ -1233,9 +1233,10 @@ resource "google_compute_instance" "startup_fail" {
 #
 # Zonal control plane with `node_locations` across two zones, not a regional
 # cluster: the fleet is standing, and a regional control plane would triple
-# the node floor for a property nothing here needs. Two e2-small nodes, one
-# per zone, is the minimum shape on which "the pods are all in one zone" is a
-# true statement about a real cluster.
+# the node floor for a property nothing here needs. Two nodes, one per zone
+# (an e2-small and an e2-standard-2; see the pool comment below), is the
+# minimum shape on which "the pods are all in one zone" is a true statement
+# about a real cluster.
 # ---------------------------------------------------------------------------
 
 resource "google_container_cluster" "seeded_d" {

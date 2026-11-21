@@ -643,8 +643,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
 - **The A2A stack**: every install runs it. The operator renders the NATS bus, the A2A gateway,
-  the auth callout, the capability verifier, the A2A console and the `hermes-bridge` container in
-  front of the agent, whatever the `PlatformAgent`'s deprecated `spec.mode` says
+  the auth callout, the capability verifier, the A2A console, the MCP server, the profile
+  dispatcher and the `hermes-bridge` container in front of the agent, whatever the
+  `PlatformAgent`'s deprecated `spec.mode` says
   ([the upgrade guide](docs/site/src/content/docs/install/upgrade.md#moving-to-the-a2a-stack)
   covers an install made before the stack was unconditional). An install that mirrors its
   third-party images (`--third-party-registry-prefix`) pulls the bus's four images from the
@@ -1206,6 +1207,7 @@ at nothing and the policies silently inert:
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
 kubectl apply -f config/admission/a2a-dispatcher-job-policy.yaml
+kubectl apply -f config/admission/agentschedule-builtin-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
