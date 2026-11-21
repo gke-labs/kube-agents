@@ -244,16 +244,17 @@ func TestTheGatewayProxyBoundsWhatPassesThrough(t *testing.T) {
 	}
 }
 
-// TestTheGatewayProxyDropsWhatACallerMayNotSay: credentials and attribution
-// a caller sets, in a header or the query, never reach the gateway; the
-// rest of the query does.
+// TestTheGatewayProxyDropsWhatACallerMayNotSay: only the headers a model
+// call needs reach the gateway, so no credential or attribution a caller
+// sets does, named or not; a key in the query is dropped, and the rest of
+// the query passes.
 func TestTheGatewayProxyDropsWhatACallerMayNotSay(t *testing.T) {
 	g := &fakeGateway{}
 	up := httptest.NewServer(http.HandlerFunc(g.handler))
 	t.Cleanup(up.Close)
 	p := startProxyFor(t, up.URL)
 	req, _ := http.NewRequest(http.MethodPost, p.URL+"/v1beta/models/m:streamGenerateContent?alt=sse&key=caller-secret", strings.NewReader("{}"))
-	for _, h := range []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key", "X-Litellm-Tags", "X-Litellm-End-User-Id"} {
+	for _, h := range []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key", "X-Litellm-Tags", "X-Litellm-End-User-Id", "Cookie", "Ocp-Apim-Subscription-Key", "X-Anything-Else"} {
 		req.Header.Set(h, "caller-secret")
 	}
 	req.Header.Set("Content-Type", "application/json")

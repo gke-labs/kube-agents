@@ -68,12 +68,21 @@ const (
 // slash or a climb included, is refused.
 var gatewayProxyPath = regexp.MustCompile(`^/v1beta/models/[A-Za-z0-9._-]+:(generateContent|streamGenerateContent|countTokens)$`)
 
-// gatewayProxyCallerHeaders are request headers a caller may not set, since
-// the gateway reads each as the caller's credential or attribution: a key
-// the harness sent would decide which caller the gateway charges, once the
-// proxy speaks for the worker (#6706). Any header starting x-litellm- is
-// dropped too.
-var gatewayProxyCallerHeaders = []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key", "Proxy-Authorization"}
+// gatewayProxyForwardedHeaders are the only request headers the proxy
+// passes to the gateway: what a Gemini-format call needs. Everything else a
+// caller sets is dropped, since the gateway can read a header as the
+// caller's credential or attribution (a key, a cookie, an x-litellm- tag or
+// end user), and that would decide which caller the gateway charges once
+// the proxy speaks for the worker (#6706). An allowlist, because the
+// credential headers a gateway might honour are not a list this file can
+// keep complete.
+var gatewayProxyForwardedHeaders = map[string]bool{
+	"Content-Type":      true,
+	"Accept":            true,
+	"Accept-Encoding":   true,
+	"User-Agent":        true,
+	"X-Goog-Api-Client": true,
+}
 
 // GatewayProxy is a running gateway proxy. URL is what the harness is told
 // (`http://127.0.0.1:<port>`).
@@ -120,11 +129,8 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 			q := r.Out.URL.Query()
 			q.Del("key")
 			r.Out.URL.RawQuery = q.Encode()
-			for _, h := range gatewayProxyCallerHeaders {
-				r.Out.Header.Del(h)
-			}
 			for h := range r.Out.Header {
-				if strings.HasPrefix(strings.ToLower(h), "x-litellm-") {
+				if !gatewayProxyForwardedHeaders[http.CanonicalHeaderKey(h)] {
 					r.Out.Header.Del(h)
 				}
 			}
@@ -134,9 +140,9 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 			// caller check reads. Only a real key: unset, empty or a
 			// placeholder sends nothing, since the gateway refuses a key it
 			// doesn't know and admits a keyless call. Until then the call
-			// passes through as the harness sent it, less the caller headers
-			// above: in gateway mode the Antigravity CLI sends no key. The
-			// key is Set, never Added.
+			// passes through with only the allowed headers above: in gateway
+			// mode the Antigravity CLI sends no key. The key is Set, never
+			// Added.
 		},
 		Transport:     transport,
 		FlushInterval: -1, // stream each chunk as it comes: the answers are SSE
