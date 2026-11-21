@@ -20,7 +20,9 @@
 # before the pools (a class with nodePoolAutoCreation could provision a new
 # pool after the sweep), the planted CRDs after the classes (a CRD's delete
 # removes every object of its kind, in every namespace, so the sweep needs no
-# leg for those objects), the pools last and --async: a synchronous pool delete
+# leg for those objects, and so it refuses a labelled CRD that holds an object
+# without the label: a product installed over a leftover keeps the label on
+# the CRD, and its objects are not the sweep's), the pools last and --async: a synchronous pool delete
 # is minutes, and the next sweep lists what is still going. Kubernetes deletes
 # are --wait=false for the same reason: a class held by a finalizer is listed
 # again next time instead of hanging this run.
@@ -56,6 +58,10 @@ readonly PLANT_KINDS=(
 # STOPPING is a pool already deleting: a second delete answers 409.
 readonly POOL_LIST_FILTER="config.resourceLabels.managed-by=kube-agents-bench AND status!=STOPPING"
 readonly POOL_NAME_NEVER_DELETED="default-pool"
+# A CRD's delete takes every object of its kind. The CRD leg lists the
+# objects that do not carry the bench label first, and refuses on any.
+readonly CRD_KIND="customresourcedefinitions.apiextensions.k8s.io"
+readonly FOREIGN_OBJECT_SELECTOR="managed-by!=kube-agents-bench"
 readonly ABSENT_KIND_RE="doesn't have a resource type"
 readonly KUBECTL_REQUEST_TIMEOUT="${BENCH_SWEEP_KUBECTL_REQUEST_TIMEOUT:-30s}"
 readonly EXIT_FAILED=1
@@ -129,6 +135,22 @@ MATCHED=0
 FAILED=0
 ABSENT=0
 
+# True when no object of the CRD's kind lacks the bench label. A list that
+# fails is not an empty list: the CRD stays, and the leg counts as failed.
+crd_holds_only_plants() { # <customresourcedefinition.../name>
+  local name="$1" foreign
+  if ! foreign="$(kubectl get "${name#*/}" --all-namespaces -l "${FOREIGN_OBJECT_SELECTOR}" -o name \
+    --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" 2>/dev/null)"; then
+    echo "✗ ${name}: could not list its objects; left in place"
+    return 1
+  fi
+  if [ -n "${foreign}" ]; then
+    echo "✗ refusing to delete ${name}: it holds objects without the bench label ($(tr '\n' ' ' <<<"${foreign}")); remove them or the CRD's label by hand"
+    return 1
+  fi
+  return 0
+}
+
 sweep_kind() { # <kind>
   local kind="$1" names err name
   err="$(mktemp)"
@@ -148,6 +170,10 @@ sweep_kind() { # <kind>
   while read -r name; do
     [ -n "${name}" ] || continue
     MATCHED=$((MATCHED + 1))
+    if [ "${kind}" = "${CRD_KIND}" ] && ! crd_holds_only_plants "${name}"; then
+      FAILED=$((FAILED + 1))
+      continue
+    fi
     if [ "${ACT}" -eq 0 ]; then
       echo "${VERB} ${name}"
     elif kubectl delete "${name}" --ignore-not-found --wait=false \

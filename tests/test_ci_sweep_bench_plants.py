@@ -4,8 +4,9 @@ and never acts on a cluster it did not authenticate to itself.
 `hack/ci_sweep_bench_plants.sh` is the backstop `hack/ci-teardown.sh` runs as
 its first step at every lease start and end: a bench case's stack that a run
 killed between apply and destroy leaves its webhook configurations, node
-readiness rules, compute classes and node pools on the host, labelled
-`managed-by=kube-agents-bench`, and nothing else removes them. The script
+readiness rules, compute classes, custom resource definitions and node pools
+on the host, labelled `managed-by=kube-agents-bench`, and nothing else
+removes them. The script
 runs here against stub `kubectl` and `gcloud` on PATH, the way
 tests/test_namespaced_plant.py runs the plant shell, and what is asserted is
 which commands it issues, in what order, with what exit. Three properties
@@ -205,6 +206,31 @@ class BenchPlantSweepTest(unittest.TestCase):
             # delete's exact target.
             self.assertNotIn("-l", argv, delete)
         self.assertIn("deleted computeclass.cloud.google.com/general-ccc", completed.stdout)
+
+    def test_a_labelled_crd_that_holds_an_object_without_the_label_is_refused(self):
+        # A CRD's delete takes every object of its kind. A product installed
+        # over a leftover keeps the label on the CRD; its objects carry none.
+        crd = "customresourcedefinition.apiextensions.k8s.io/rootsyncs.configsync.gke.io"
+        names = "\n".join((f"{_KINDS[4]}|{crd}", "rootsyncs.configsync.gke.io|rootsync.configsync.gke.io/theirs"))
+        for flag in ((), ("--delete",)):
+            with self.subTest(flag=flag):
+                if self._calls.exists():
+                    self._calls.unlink()
+                completed, calls = self._run(*_ARGS, *flag, PLANT_NAMES=names)
+                self.assertEqual(completed.returncode, 1, completed.stdout)
+                self.assertEqual(self._kubectl_deletes(calls), [])
+                self.assertIn(f"refusing to delete {crd}", completed.stdout)
+                # The list that decides: every namespace, by the absence of the bench label.
+                (listing,) = [g for g in self._kubectl_gets(calls) if g.split()[2] == "rootsyncs.configsync.gke.io"]
+                self.assertIn("--all-namespaces", listing.split())
+                self.assertIn("managed-by!=kube-agents-bench", listing.split())
+
+    def test_a_crd_whose_objects_cannot_be_listed_is_left_in_place(self):
+        crd = "customresourcedefinition.apiextensions.k8s.io/rootsyncs.configsync.gke.io"
+        completed, calls = self._run(*_ARGS, "--delete", PLANT_NAMES=f"{_KINDS[4]}|{crd}", LIST_FAIL_KIND="rootsyncs.configsync.gke.io")
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertEqual(self._kubectl_deletes(calls), [])
+        self.assertIn("could not list its objects", completed.stdout)
 
     # --- (c) one leg's failure neither stops the next nor hides ---------------
 

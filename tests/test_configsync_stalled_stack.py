@@ -452,12 +452,31 @@ class CaseBindingTest(unittest.TestCase):
         safeguards = [entry for entry in task["verification_spec"] if entry["role"] == "safeguard"]
         self.assertEqual([entry["severity"] for entry in safeguards], ["catastrophic", "catastrophic"])
         self.assertIs(task["infrastructure"]["teardown"], True)
-        (objective,) = [entry for entry in task["verification_spec"] if entry["role"] == "objective"]
-        self.assertEqual(objective["check"]["finding_check"], _CHECK)
-        # The object, and the reason Config Sync gave: the planted condition's own text.
-        (stalled,) = [c for c in _planted_manifest()["status"]["conditions"] if c["type"] == "Stalled"]
-        self.assertEqual(objective["check"]["required_phrases"], [f"RootSync/{name}", "Progress deadline exceeded"])
-        self.assertIn("Progress deadline exceeded", stalled["message"])
+        ledger, report = [entry for entry in task["verification_spec"] if entry["role"] == "objective"]
+        # The ledger objective binds the check to the object. Its scope reads a
+        # finding's object and nothing else, so the object is its one phrase.
+        self.assertEqual((ledger["check"]["type"], ledger["check"]["scope"]), ("ledger_issue_contains", "finding"))
+        self.assertEqual(ledger["check"]["finding_check"], _CHECK)
+        self.assertEqual(ledger["check"]["required_phrases"], [f"RootSync/{name}"])
+        # The report objective reads the evidence of a finding of this check:
+        # its phrase is in what the product's own check writes for the plant.
+        self.assertEqual(report["check"]["type"], "audit_report_stored")
+        self.assertEqual(report["check"]["required_finding_phrases"], [_CHECK])
+        (phrase,) = report["check"]["required_evidence_phrases"]
+        self.assertIn("Progress deadline exceeded", phrase)
+        self.assertIn(f"RootSync/{name}", phrase)
+        self.assertIn(phrase, self._planted_excerpt())
+
+    def _planted_excerpt(self):
+        for directory in _COLLECTOR_DIRS:
+            if str(directory) not in sys.path:
+                sys.path.insert(0, str(directory))
+        import collect  # noqa: PLC0415 - the collector lives outside this test's package
+
+        planted = _planted_manifest()
+        planted["metadata"]["namespace"] = _default("namespace")
+        (hit,) = collect.check_configsync_reconciler_stalled({"configsync_objects": [planted]})
+        return hit["excerpt"]
 
     def test_the_object_is_planted_after_the_crd_and_removed_before_it(self):
         stack = _MAIN.read_text()

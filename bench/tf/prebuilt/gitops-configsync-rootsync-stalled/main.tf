@@ -45,7 +45,10 @@
 # after Config Sync was applied over this stack's plant, deletes the
 # namespace with what the product put in it. A run starts from an empty
 # state, and the CRD step stops a plant over such a host before the module
-# runs, so the lane does not reach it.
+# runs, so the lane does not reach it. The lease sweep
+# (hack/ci_sweep_bench_plants.sh) also deletes the CRD by the bench label; it
+# does not read the CRD's shape, and refuses one that holds an object without
+# the label.
 #
 # Isolation class: one namespace, the namespaced-plant module's, and one
 # cluster-scoped CRD with the module's guards: created only on a host that
