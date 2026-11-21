@@ -1036,7 +1036,27 @@ func delegated(t *testing.T, r *rig, spawn *fakeSpawner, conv, backend string) (
 		return len(pref.Children) == 1
 	})
 	completeTask(t, exec, "delegated to platform")
-	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	// The terminal's own mark: the delegating turn's line closed at
+	// completed, or on a backend with no lines the answer posted alone. Not
+	// any post containing "delegated to platform", which the child's line
+	// note "(delegated to platform)" already matches before the turn ends;
+	// since one stop cancels the whole tree (#5682), a stop sent then also
+	// cancels the still-running turn (#6782).
+	waitFor(t, "parent terminal relayed", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, terminalLine(lib.StateCompleted, "")) {
+				return true
+			}
+		}
+		// A backend that shows task status itself has no lines to close:
+		// there the terminal posts the answer as a message of its own.
+		for _, p := range r.adapter.postTexts() {
+			if strings.TrimSpace(p) == "delegated to platform" {
+				return true
+			}
+		}
+		return false
+	})
 	return origin, session, child
 }
 
