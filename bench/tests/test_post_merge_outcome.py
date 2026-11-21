@@ -21,6 +21,7 @@ local jobs.json, through ``sh -c`` in place of ``kubectl exec``.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -108,7 +109,7 @@ def world(pod, monkeypatch):
     monkeypatch.setattr(post_merge, "_github_write", forge.write)
     monkeypatch.setattr(post_merge, "_forge_get_json", forge.get)
     monkeypatch.setattr(post_merge, "_apply", lambda text, kubeconfig: applied.append(text) or (True, ""))
-    monkeypatch.setattr(fleet, "kubeconfig_for_role", lambda role, directory=None: "/tmp/kc")
+    monkeypatch.setattr(post_merge, "writable_kubeconfig", lambda role: "/tmp/kc")
     monkeypatch.setattr(post_merge, "TICK_INTERVAL_SEC", 0.0)
     monkeypatch.setattr(post_merge.time, "sleep", lambda s: None)
     monkeypatch.setattr(subprocess, "run", _no_kubectl(subprocess.run))
@@ -252,10 +253,10 @@ def test_setup_failures_are_errors_not_fails(world, monkeypatch, setup, why):
 
 
 def test_an_unresolvable_role_errors_before_any_merge(world, monkeypatch):
-    def unresolved(role, directory=None):
+    def unresolved(role):
         raise fleet.FleetRoleUnresolved("no kubeconfig for no-pdb-workload")
 
-    monkeypatch.setattr(fleet, "kubeconfig_for_role", unresolved)
+    monkeypatch.setattr(post_merge, "writable_kubeconfig", unresolved)
     result = _verifier().verify(0)
     assert result.status == "error" and world.forge.writes == []
 
@@ -320,3 +321,47 @@ def test_the_tick_runs_the_cron_script_under_the_jobs_lock(tmp_path, monkeypatch
     held.close()
     runner.join(30)
     assert "ticked" in out[0] and f"{post_merge.TICK_READ} 3" in out[0]
+
+
+def test_the_apply_credential_is_the_runners_not_the_fleet_readers(tmp_path, monkeypatch):
+    calls = []
+
+    def run(argv, *args, **kwargs):
+        calls.append((argv, kwargs.get("env", {}).get("KUBECONFIG")))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(fleet, "slot_of_role", lambda role, directory=None: "a")
+    monkeypatch.setattr(fleet, "recorded_clusters", lambda directory=None: {"a": ("seeded-a", "us-central1-a")})
+    monkeypatch.setattr(fleet, "provisioned_project", lambda directory=None: "evals-42")
+    monkeypatch.setattr(fleet, "kubeconfig_for_role", lambda *a, **k: pytest.fail("the read-only kubeconfig was used"))
+    monkeypatch.setattr(subprocess, "run", run)
+    path = post_merge.writable_kubeconfig("no-pdb-workload")
+    try:
+        argv, kubeconfig = calls[0]
+        assert argv == ["gcloud", "container", "clusters", "get-credentials", "seeded-a", "--location",
+                        "us-central1-a", "--project", "evals-42", "--quiet"]
+        assert kubeconfig == path
+    finally:
+        os.remove(path)
+
+
+def test_a_refused_credential_or_missing_record_is_unresolved(monkeypatch):
+    monkeypatch.setattr(fleet, "slot_of_role", lambda role, directory=None: "a")
+    monkeypatch.setattr(fleet, "provisioned_project", lambda directory=None: "evals-42")
+    monkeypatch.setattr(fleet, "recorded_clusters", lambda directory=None: {})
+    with pytest.raises(fleet.FleetRoleUnresolved):
+        post_merge.writable_kubeconfig("no-pdb-workload")
+    monkeypatch.setattr(fleet, "recorded_clusters", lambda directory=None: {"a": ("seeded-a", "us-central1-a")})
+    written = []
+    real_mkstemp = post_merge.tempfile.mkstemp
+
+    def mkstemp(*a, **k):
+        handle, path = real_mkstemp(*a, **k)
+        written.append(path)
+        return handle, path
+
+    monkeypatch.setattr(post_merge.tempfile, "mkstemp", mkstemp)
+    monkeypatch.setattr(subprocess, "run", lambda argv, *a, **k: subprocess.CompletedProcess(argv, 1, "", "denied"))
+    with pytest.raises(fleet.FleetRoleUnresolved, match="denied"):
+        post_merge.writable_kubeconfig("no-pdb-workload")
+    assert written and not os.path.exists(written[0])
