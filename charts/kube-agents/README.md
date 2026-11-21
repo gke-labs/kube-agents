@@ -1508,6 +1508,9 @@ all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
 `platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
+The Teams inbound receiver is counted as one pod (`operatorRenderedPerReplica.teamsInboundReceiver`)
+while `platformAgent.integration.teams.inbound.enabled` is set beside `teams.enabled`; its cpu and
+memory are fixed in the operator.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
