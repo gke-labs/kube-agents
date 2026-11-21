@@ -78,8 +78,18 @@ _GCLOUD_CLUSTER_FORBIDDEN = (
 )
 
 
+# For a test that runs main with no dry run: bash that prints this marker and
+# the path of each tool that step one of main would start, or use to install a
+# missing one, when the PATH has it. Such a test puts it before main and
+# expects no marker.
+_HOST_TOOL_MARKER = "host-tool="
+_HOST_TOOL_PROBE = (
+    f'for tool in git gcloud terraform brew apt-get; do command -v "$tool" >/dev/null && echo "{_HOST_TOOL_MARKER}$tool"; done\n'
+)
+
+
 def _run_installer_bash(body, env, cwd=_REPO_ROOT):
-    """Run a bash body that sources install.sh, detached from any terminal.
+    """Run a bash body that sources or runs install.sh, detached from any terminal.
 
     install.sh's prompts read /dev/tty whenever has_controlling_tty finds one,
     and /dev/tty resolves through the controlling terminal rather than stdin,
@@ -1671,17 +1681,25 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
 
     def test_preflight_rejects_directory_github_pem_path(self):
         """Preflight must fail fast when --github-pem-path is a directory instead of a file."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        with tempfile.TemporaryDirectory() as tmp_dir, tempfile.TemporaryDirectory() as tools_dir:
+            # The installer runs with no dry run. If this check did not stop
+            # it, step one would start the host's git, gcloud and terraform,
+            # and a package manager for a tool that is missing. The PATH has
+            # none of them, and the runner keeps the terminal away from the
+            # prompt that a missing tool gets.
             test_env = get_isolated_test_env(
-                overrides={"KUBE_AGENTS_LOCK_FILE": str(self._empty_install_env.parent / "test.lock")}
+                overrides={
+                    "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+                    "KUBE_AGENTS_LOCK_FILE": str(self._empty_install_env.parent / "test.lock"),
+                    "PATH": str(create_minimal_tools_bin(tools_dir, exclude=("git",))),
+                }
             )
-            proc = subprocess.run(
-                ["bash", str(_INSTALL_SH), "--image-tag=0.1.0", f"--github-pem-path={tmp_dir}"],
-                capture_output=True,
-                text=True,
-                env=test_env,
-                cwd=str(_REPO_ROOT),
+            proc = _run_installer_bash(
+                _HOST_TOOL_PROBE
+                + f"exec bash {shlex.quote(str(_INSTALL_SH))} --image-tag=0.1.0 --github-pem-path={shlex.quote(tmp_dir)}",
+                test_env,
             )
+            self.assertNotIn(_HOST_TOOL_MARKER, proc.stdout)
             self.assertEqual(proc.returncode, 1, f"Expected exit code 1, got {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
             combined = proc.stdout + proc.stderr
             self.assertIn("not a regular file", combined)
@@ -3723,6 +3741,28 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
             "is followed by an apply it needs KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true",
         )
 
+    def test_every_applying_generator_call_refuses_to_blank_a_secret_it_could_not_read(self):
+        """#6126: a generator call whose tfvars get applied must carry
+        KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true, or a failed read of the live
+        Secret writes its keys empty over the live values. install.sh and
+        upgrade.sh only apply, so every call site in either needs it; only
+        uninstall.sh, which destroys, goes without.
+        """
+        unguarded = []
+        for script in (_INSTALL_SH, _INSTALL_SH.parent / "upgrade.sh"):
+            lines = script.read_text().splitlines()
+            for index, line in enumerate(lines):
+                code_line = line.split("#", 1)[0].strip()
+                if not re.search(r"\bwrite_tfvars_from_state\b", code_line) or code_line.startswith("write_tfvars_from_state()"):
+                    continue
+                prefix, back = [line], index - 1
+                while back >= 0 and lines[back].rstrip().endswith("\\"):
+                    prefix.append(lines[back])
+                    back -= 1
+                if "KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true" not in "\n".join(prefix):
+                    unguarded.append(f"{script.name}:{index + 1}")
+        self.assertEqual(unguarded, [], "a generator call site that applies lacks KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true")
+
     def test_accepting_the_memory_prompts_unseeded_default_is_not_an_answer(self):
         """A bare enter on the memory menu must not count as a stated mode.
 
@@ -5540,7 +5580,15 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     invocation, so dropping it again would look like nothing in a diff.
     """
 
-    def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
+    # The version of the `go` stub each run gets unless the test names one. No
+    # release of Go has it, so the line the installer prints for this version
+    # tells the stub from a host's own Go, and it is above each minimum the
+    # installer can ask for.
+    _STUB_GO_VERSION = "1.99.0"
+    # What the `git` stub says for a clone that the test did not ask to fail.
+    _NO_CLONE_ASKED = "the git stub of this test: the run cloned, and the test did not pass git_clone_fails"
+
+    def _run(self, creates_fail=False, describe_fails=True, go_version=_STUB_GO_VERSION, git_clone_fails=False,
              keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None,
              cluster=""):
         """import_github_pem against a stub gcloud that records every call.
@@ -5556,11 +5604,17 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         leaves it untested -- see the ERR-trap test below.
 
         describe_fails=False confirms the key instead, which is the only way
-        past that branch and into the import itself. go_version and
-        git_clone_fails plant the two tools the import shells out to: without
-        them the real ones on PATH decide the outcome, and a real `git clone`
-        would reach the network. Both stubs are deliberate, not incidental --
-        the paths below exist precisely for when those tools disappoint.
+        past that branch and into the import itself. The import shells out to
+        two tools. Each run gets a `go` stub, and go_version is the version it
+        prints: import_github_pem asks for `go` before it creates the key, so
+        without the stub the host's Go decides the outcome, and a host with
+        none gets auto_install_tool, which installs Go through Homebrew or apt
+        where it can. Each run also gets a `git` stub whose clone fails:
+        without it a real `git clone` would reach the network.
+        git_clone_fails makes the stub fail as a remote that cannot be read; a
+        run that clones without it gets _NO_CLONE_ASKED. The too-old Go and the
+        failed clone are deliberate, not incidental -- the paths below exist
+        precisely for when those tools disappoint.
         """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -5622,24 +5676,23 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
-            if go_version is not None:
-                go = bin_dir / "go"
-                go.write_text(
-                    "#!/usr/bin/env bash\n"
-                    f'[ "$1" = version ] && echo "go version go{go_version} linux/amd64" && exit 0\n'
-                    "exit 0\n"
-                )
-                go.chmod(go.stat().st_mode | stat.S_IEXEC)
-            if git_clone_fails:
-                git = bin_dir / "git"
-                git.write_text(
-                    "#!/usr/bin/env bash\n"
-                    "case \"$*\" in\n"
-                    "  *clone*) echo 'fatal: could not read from remote repository' >&2; exit 128 ;;\n"
-                    "esac\n"
-                    "exit 0\n"
-                )
-                git.chmod(git.stat().st_mode | stat.S_IEXEC)
+            go = bin_dir / "go"
+            go.write_text(
+                "#!/usr/bin/env bash\n"
+                f'[ "$1" = version ] && echo "go version go{go_version} linux/amd64" && exit 0\n'
+                "exit 0\n"
+            )
+            go.chmod(go.stat().st_mode | stat.S_IEXEC)
+            clone_error = "fatal: could not read from remote repository" if git_clone_fails else self._NO_CLONE_ASKED
+            git = bin_dir / "git"
+            git.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"$*\" in\n"
+                f"  *clone*) echo '{clone_error}' >&2; exit 128 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            git.chmod(git.stat().st_mode | stat.S_IEXEC)
             body = (
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 f'source "{_INSTALLER_COMMON}"\n'
@@ -5663,6 +5716,19 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
+
+    def test_the_go_the_import_asks_is_the_stub_whatever_the_host_has(self):
+        """A run asks the `go` stub, with Go on the host or without: the installer names the stub's version."""
+        proc, _ = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Go {self._STUB_GO_VERSION} meets the minimum", proc.stdout + proc.stderr)
+
+    def test_the_git_the_import_asks_is_the_stub_whatever_the_host_has(self):
+        """A run that goes on to the clone asks the `git` stub: the host's git would clone over the network."""
+        proc, _ = self._run(describe_fails=False)
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(self._NO_CLONE_ASKED, combined)
 
     def test_the_key_is_created_with_this_installs_owner_labels(self):
         """The apply's adoption step refuses an unlabelled key it doesn't hold (#3504)."""
@@ -7347,6 +7413,7 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
     _GENERATOR = (
         "  KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n"
         "    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n"
+        "    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \\\n"
         '    write_tfvars_from_state "$tfvars_file" "$image_tag"\n'
     )
     _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
@@ -8542,8 +8609,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         return get_isolated_test_env(overrides=overrides, absent=(
             "SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
             "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME", "SLACK_HOME_CHANNEL_POLICY",
-            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
-            "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
+            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "GOOGLE_CHAT_MODE",
+            "CHAT_TOPIC_NAME", "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
         ))
 
     def _run(self, body, install_env, extra_env=None):
@@ -8571,7 +8638,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     # integration's settings and nothing in the test exported them.
     _EMPTY_COMPANIONS = {
         "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\n",
-        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_MODE=''\n",
+        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_HOME_CHANNEL_POLICY=''\nGOOGLE_CHAT_MODE=''\n",
     }
 
     def _check(self, tmp, content, flags, extra_env=None):
@@ -8627,6 +8694,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("SLACK_HOME_CHANNEL_POLICY=auto\n", "--slack-home-channel-policy=manual", "SLACK_HOME_CHANNEL_POLICY", "--slack-home-channel-policy=manual"),
                 ("ALLOWED_USERS=a@example.com\n", "--google-chat-allowed-users=b@example.com", "ALLOWED_USERS", "--google-chat-allowed-users=b@example.com"),
                 ("GOOGLE_CHAT_HOME_CHANNEL=spaces/A\n", "--google-chat-home-channel=spaces/B", "GOOGLE_CHAT_HOME_CHANNEL", "--google-chat-home-channel=spaces/B"),
+                ("GOOGLE_CHAT_HOME_CHANNEL_POLICY=auto\n", "--google-chat-home-channel-policy=manual", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "--google-chat-home-channel-policy=manual"),
                 # A topic rename is a destroy and re-create of the Pub/Sub topic.
                 ("CHAT_TOPIC_NAME=topic-a\n", "--chat-topic-name=topic-b", "CHAT_TOPIC_NAME", "--chat-topic-name=topic-b"),
                 ("GOOGLE_CHAT_MODE=default\n", "--google-chat-mode=debug", "GOOGLE_CHAT_MODE", "--google-chat-mode=debug"),
@@ -8816,6 +8884,35 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     path, proc, out = self._check(tmp, f"SLACK_HOME_CHANNEL_POLICY={value}\n", f"--slack-home-channel-policy={value}")
                     self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
 
+    def test_the_google_chat_policy_is_checked_the_same_way(self):
+        # main() runs require_google_chat_home_channel_policy beside Slack's,
+        # before the file check, with the flag named only when this run typed it.
+        source = _INSTALL_SH.read_text()
+        main = source[source.index("\nmain() {"):]
+        start = main.index('require_google_chat_home_channel_policy "${PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"')
+        call = main[start:main.index("|| exit 1", start) + len("|| exit 1")]
+        self.assertIn("check_flags_against_install_env || exit 1", main[start:])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(f"parse_args --google-chat-home-channel-policy=sometimes; {call}; {self._CHECK}", path)
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'sometimes'", out)
+            self.assertIn("--google-chat-home-channel-policy", out)
+            self.assertNotIn("QUEUED=", out)
+            path = self._file(tmp, "GOOGLE_CHAT_HOME_CHANNEL_POLICY=Manual\n")
+            proc = self._run(f"parse_args; {call}; {self._CHECK}", path)
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'Manual'", out)
+            self.assertIn("Set it in install.env and run again", out)
+            self.assertNotIn("--google-chat-home-channel-policy", out)
+            for value in ("", "auto", "manual"):
+                with self.subTest(value=value):
+                    path, proc, out = self._check(tmp, f"GOOGLE_CHAT_HOME_CHANNEL_POLICY={value}\n",
+                                                  f"--google-chat-home-channel-policy={value}")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
     def test_a_bad_policy_this_run_did_not_type_is_sent_back_to_the_file(self):
         # The remedy names --slack-home-channel-policy only when this run typed
         # it. A flag cannot correct a value the file carries: the enum check
@@ -8931,6 +9028,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("--slack-home-channel-policy", "SLACK_HOME_CHANNEL_POLICY", "manual"),
                 ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
                 ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
+                ("--google-chat-home-channel-policy", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
                 ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
                 ("--google-chat-mode", "GOOGLE_CHAT_MODE", "debug"),
             ):
@@ -8992,9 +9090,11 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 (
                     "--enable-google-chat",
                     "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
-                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
+                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual "
+                    "GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
                     ["ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
-                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
+                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual",
+                     "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
                     ("CHAT_SUB_NAME",),
                 ),
             ):
@@ -9350,8 +9450,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+            # One read of the whole Secret (-o json) holding both tokens.
+            f'  *"get secret platform-agent-secrets"*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"SLACK_BOT_TOKEN\": \"{bot_b64}\", \"SLACK_APP_TOKEN\": \"{app_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -9365,6 +9466,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
             env=env,
             kubectl_script=kubectl_stub,
+            # The cluster exists (recovery runs only then); get-credentials succeeds.
+            describe_stub="printf 'False\\n'; exit 0",
+            gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n",
         )
         self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
         return dest.read_text(), proc.stdout
@@ -10704,6 +10808,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
         "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
         "--slack-home-channel-policy": ("PARAM_SLACK_HOME_CHANNEL_POLICY", "manual"),
+        "--google-chat-home-channel-policy": ("PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
         "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
         "--scope-folders": ("PARAM_SCOPE_FOLDERS", "123456789012"),
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),

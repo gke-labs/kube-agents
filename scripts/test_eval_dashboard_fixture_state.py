@@ -62,7 +62,7 @@ _verifier = importlib.util.module_from_spec(_verifier_spec)
 _verifier_spec.loader.exec_module(_verifier)
 NOTE_PATH = _verifier.GITOPS_INTENT_NOTE_PATH
 SEEDED_NOTE_SHA = _verifier.gitops_seeded_blob_sha(NOTE_PATH)
-NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
+NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering", "declared-orphan-snapshot"}
 
 
 def pool_repo(project: str) -> str:
@@ -154,8 +154,13 @@ if args[0] == "compute" and args[2] == "list":
     if objects is None:
         print(f"ERROR: (gcloud.compute.{args[1]}.list) Required 'compute.{args[1]}.list' permission for 'projects/{project}'", file=sys.stderr)
         sys.exit(1)
-    prefix = (flag("--filter") or "").split("^", 1)[-1]
-    matched = [o for o in objects if o["name"].startswith(prefix)]
+    # `name ~ ^<prefix>` is a prefix read; `name ~ ^<name>$` (the disk read
+    # behind source_disk_gone) is an exact one.
+    pattern = (flag("--filter") or "").split("^", 1)[-1]
+    if pattern.endswith("$"):
+        matched = [o for o in objects if o["name"] == pattern[:-1]]
+    else:
+        matched = [o for o in objects if o["name"].startswith(pattern)]
     if flag("--format") == "json":
         print(json.dumps(matched))
     else:
@@ -270,9 +275,22 @@ _DECLARED_ZONAL_POOL = {
     "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "declared-zonal", "effect": "NO_SCHEDULE"}]},
 }
 
+# seeded-a's missing-reservation-pool as `clusters describe` reports it
+# (main.tf): no autoscaling, tainted, no node, bound to one reservation name.
+_MISSING_RESERVATION_POOL = {
+    "name": "missing-reservation-pool",
+    "status": "RUNNING",
+    "locations": ["us-central1-a"],
+    "config": {
+        "machineType": "n2-standard-2",
+        "taints": [{"key": "seeded-role", "value": "missing-reservation", "effect": "NO_SCHEDULE"}],
+        "reservationAffinity": {"consumeReservationType": "SPECIFIC_RESERVATION", "key": "compute.googleapis.com/reservation-name", "values": ["seeded-absent-reservation"]},
+    },
+}
+
 
 def _peer():
-    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK, "nodePools": [_DECLARED_ZONAL_POOL]}
+    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK, "nodePools": [_DECLARED_ZONAL_POOL, _MISSING_RESERVATION_POOL]}
 
 
 def _cluster_c():
@@ -337,6 +355,15 @@ print(json.dumps({"sha": repo[path], "path": path, "type": "file", "encoding": "
 '''
 
 
+# A `compute snapshots list` item: the source disk's URL outlives the disk.
+_SNAPSHOT_CREATED = "2026-06-01T00:00:00.000-07:00"
+_SNAPSHOT_SOURCE_URL = "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/disks/orphan-snap-source-seeded"
+
+
+def _snapshot(name, created=_SNAPSHOT_CREATED):
+    return {"name": name, "status": "READY", "sourceDisk": _SNAPSHOT_SOURCE_URL, "creationTimestamp": created}
+
+
 def healthy_world(*projects):
     """Every role planted and in its designed state on each project, the pool
     repository's declared-intent note included, as a scan holding a
@@ -357,6 +384,13 @@ def healthy_world(*projects):
             {"name": "default", "peerings": [{"name": "default-to-mtu-peer-declared", "state": "ACTIVE"}]},
             {"name": "mtu-peer-declared", "mtu": 8896, "peerings": [{"name": "mtu-peer-declared-to-default", "state": "ACTIVE"}]},
         ],
+        # The two orphaned snapshots (bench/tf/fleet/main.tf): past the compute
+        # audit's 90-day gate, of a source disk the planter deleted.
+        "snapshots": [_snapshot("declared-orphan-snap-seeded"), _snapshot("orphan-snap-seeded")],
+        "disks": [],
+        # The reservation that missing-reservation-pool names is not there: that is
+        # the fixture. The reader can list the collection (roles/compute.viewer).
+        "reservations": [],
     }
     return {
         "clusters": {project: fleet for project in projects},
@@ -372,7 +406,7 @@ def healthy_world(*projects):
             # workloads, the class, and the labelled, untainted node.
             "deployment/app-worker-a": {"status": {"readyReplicas": 3, "replicas": 3}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}]}}}},
             "deployment/app-worker-b": {"status": {"readyReplicas": 1, "replicas": 1}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}]}}}},
-            "deployment/batch-worker-a": {"status": {"readyReplicas": 1, "replicas": 1}, "spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/compute-class": "general-ccc"}, "tolerations": [{"key": "cloud.google.com/compute-class", "value": "general-ccc", "effect": "NoSchedule"}], "containers": [{"resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}]}}}},
+            "deployment/batch-worker-a": {"status": {"readyReplicas": 1, "replicas": 1}, "spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/compute-class": "general-ccc"}, "tolerations": [{"key": "cloud.google.com/compute-class", "value": "general-ccc", "effect": "NoSchedule"}], "containers": [{"name": "worker", "resources": {"requests": {"cpu": "10m", "memory": "8Mi"}, "limits": {"memory": "16Mi"}}}]}}}},
             "computeclass/general-ccc": {"spec": {"priorities": [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}, {"machineFamily": "c3"}], "nodePoolAutoCreation": {"enabled": False}}},
             "node?cloud.google.com/compute-class=general-ccc": {"items": [{"metadata": {"name": "gke-seeded-c-default-pool-4q2m", "labels": {"cloud.google.com/compute-class": "general-ccc"}}, "spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
             "namespace/seeded-reliability": {"metadata": {"name": "seeded-reliability"}},
@@ -389,8 +423,12 @@ def healthy_world(*projects):
             "deployment/token-sidecar": {"status": {"readyReplicas": 1, "replicas": 1}},
             "serviceaccount/default": {"automountServiceAccountToken": True},
             "namespace/seeded-headroom": {"metadata": {"name": "seeded-headroom"}},
+            "namespace/seeded-family": {"metadata": {"name": "seeded-family"}},
             "namespace/seeded-qos": {"metadata": {"name": "seeded-qos"}},
             "deployment/burst-ingest": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
             "deployment/ledger-writer": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "10m", "memory": "32Mi"}}}]}}}},
             "poddisruptionbudget?": {"items": []},
             "networkpolicy?": {"items": []},
@@ -658,10 +696,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 50, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 55, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 50, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 55, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -709,13 +747,51 @@ class Drift(ScanHarness):
         self.assertEqual(doc["summary"]["drifted_projects"], 1)
         self.assertIn(f"{PROJECT}: drifted: no-pdb-workload", err)
 
+    def test_a_reservation_with_the_fixtures_name_is_drifted_and_named(self):
+        """Someone created the reservation that the pool names: the defect is
+        gone, and nothing on the cluster shows it until the pool's first node."""
+        world = healthy_world(PROJECT)
+        world["compute"][PROJECT] = {**world["compute"][PROJECT], "reservations": [{"name": "seeded-absent-reservation"}]}
+        doc, err = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["missing-reservation-pool"], "drifted")
+        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
+        self.assertTrue(detail[0].startswith('reservation/seeded-absent-reservation* name none_eq "seeded-absent-reservation": observed "seeded-absent-reservation"'), detail)
+        self.assertIn(f"{PROJECT}: drifted: missing-reservation-pool", err)
+
     def test_two_projects_scan_independently(self):
         world = healthy_world(PROJECT, OTHER)
         world["kubectl_overrides"] = {OTHER: {"pod?app=payments-api": _pods(_pod(restarts=0, last_reason=None))}}
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 99, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 109, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+
+
+    def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
+        world = healthy_world(PROJECT)
+        # From the real clock, as test_the_runners_own_age_gate_line_is_read
+        # does: the verdict comes from hack/fleet-fixture-state.py's own
+        # datetime.now(), not from the NOW this test stamps the document with,
+        # so a date fixed here would pass the gate 91 days after it.
+        taken = (datetime.now(UTC) - timedelta(days=3)).replace(microsecond=0)
+        world["compute"][PROJECT]["snapshots"][0] = _snapshot("declared-orphan-snap-seeded", created=taken.isoformat())
+        doc, err = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["declared-orphan-snapshot"], "not_ready")
+        self.assertEqual({s for r, s in states.items() if r != "declared-orphan-snapshot"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["declared-orphan-snapshot"]["detail"]
+        self.assertEqual(len(detail), 1, detail)
+        self.assertIn("ready_after_hours 2184", detail[0])
+        self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 54, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"]["not_ready"], 1)
+        self.assertEqual(doc["summary"]["drifted_projects"], 0)
+        self.assertEqual(fixture_state.drift_map(doc), {})
+        self.assertEqual(fixture_state.read_map(doc)[PROJECT].count("declared-orphan-snapshot"), 1, "a not-ready role was read")
+        self.assertIn(f"{PROJECT}: not yet ready: declared-orphan-snapshot", err)
+
 
 
 class NotChecked(ScanHarness):
@@ -740,12 +816,25 @@ class NotChecked(ScanHarness):
         states = self.states(doc)
         # The project-scoped roles are read with gcloud compute, not through a
         # cluster, so a refused cluster list leaves them readable.
-        project_roles = {"startup-fail-vm", "world-open-ingress", "declared-mtu-peering"}
+        project_roles = {"startup-fail-vm", "world-open-ingress", "declared-mtu-peering", "declared-orphan-snapshot", "orphan-snapshot"}
         self.assertEqual({s for r, s in states.items() if r not in project_roles}, {"not_checked"})
         self.assertEqual({states[r] for r in project_roles}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
         self.assertIn("could not list clusters", detail[0])
         self.assertNotIn("error", doc["projects"][PROJECT], "the runner ran and said why; that is not a scan error")
+
+    def test_a_reader_that_cannot_list_reservations_leaves_the_pool_role_not_checked(self):
+        """The scan's reader has `compute.reservations.list` through
+        roles/compute.viewer. Without it the role is not checked, never
+        drifted and never healthy, as a refused list is for the project roles."""
+        world = healthy_world(PROJECT)
+        world["compute"][PROJECT] = {k: v for k, v in world["compute"][PROJECT].items() if k != "reservations"}
+        doc, _ = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["missing-reservation-pool"], "not_checked")
+        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
+        self.assertIn("compute reservations list failed", detail[0])
 
     def test_an_unplanted_role_is_absent_with_the_runners_warning_naming_it(self):
         # Absent is a rollout state, not a failed read: the stack has not put
@@ -862,7 +951,7 @@ class NotChecked(ScanHarness):
         del world["github"]
         doc, err = self.scan(world)
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": len(self.roles), "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": len(self.roles), "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(fixture_state.read_map(doc), {PROJECT: sorted(self.roles)})
         self.assertEqual(err, "")
         report = json.loads((self.workdir / PROJECT / fixture_state.REPORT_FILE).read_text())

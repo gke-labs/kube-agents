@@ -32,10 +32,48 @@ PROJECT_ID=""
 REGION="us-central1"
 APP_ID="4675512"
 # The read half, and not settable by flag: verify_ci_pool_project.py fails a
-# project whose ledger issues this exact installation cannot read, so a
-# different one here would only mis-address the warning in step 1.4.
-LEDGER_APP_ID="4739812"
-LEDGER_INSTALLATION_ID="157029058"
+# project whose ledger issues its shard's installation cannot read, so a
+# different one here would only mis-address the warning in step 1.4. Which
+# App is the project's shard in this file (LEDGER_READER_SHARD_SIZE projects
+# per App in number order, the rule hack/ci-eval-pr.sh and the verifier
+# apply; a test holds the three sizes equal); step 1.4 reads it
+# (ledger_reader_for_project) once PROJECT_ID is known.
+LEDGER_READER_APPS_FILE="${SCRIPT_DIR}/../hack/eval/ledger-reader-apps.txt"
+LEDGER_READER_SHARD_SIZE=10
+LEDGER_APP_ID=""
+LEDGER_INSTALLATION_ID=""
+LEDGER_SHARD=""
+LEDGER_SHARD_COUNT=""
+LEDGER_READER_NUMBER=""
+# Sets the four above for <project id>: (its number - 1) / the shard size
+# picks the row (the N of kube-agents-evals-N, 1 for the bare name), the
+# rule hack/ci-eval-pr.sh (ledger_reader_shard) and
+# verify_ci_pool_project.py (ledger_reader_for) apply. A project past the
+# last row's ten has no App of its own yet: the eval reads it through the
+# first App until the row exists, and so does the warning here.
+ledger_reader_for_project() {
+  local -a apps=() fields=()
+  local line ordinal=1
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    [[ "${line}" =~ [^[:space:]] ]] && apps+=("${line}")
+  done < "${LEDGER_READER_APPS_FILE}"
+  if [ "${#apps[@]}" -eq 0 ]; then
+    echo "ERROR: ${LEDGER_READER_APPS_FILE} names no ledger-reader App." >&2
+    return 1
+  fi
+  if [[ "$1" =~ -([0-9]+)$ ]]; then ordinal="${BASH_REMATCH[1]}"; fi
+  LEDGER_SHARD_COUNT="${#apps[@]}"
+  LEDGER_SHARD=$(( (10#${ordinal} - 1) / LEDGER_READER_SHARD_SIZE ))
+  LEDGER_READER_NUMBER=$((LEDGER_SHARD + 1))
+  if [ "${LEDGER_SHARD}" -ge "${LEDGER_SHARD_COUNT}" ]; then
+    echo "WARNING: ${1} is on reader App ${LEDGER_READER_NUMBER} (${LEDGER_READER_SHARD_SIZE} projects per App, in number order) and ${LEDGER_READER_APPS_FILE} has ${LEDGER_SHARD_COUNT} row(s), so the eval would read it through reader App 1. Register App ${LEDGER_READER_NUMBER}, install it, and append its row before registering this project (docs/ci-pool-projects.md 5.4); step 1.4 below names reader App 1 meanwhile." >&2
+    LEDGER_SHARD=0
+  fi
+  read -r -a fields <<< "${apps[${LEDGER_SHARD}]}"
+  LEDGER_APP_ID="${fields[0]}"
+  LEDGER_INSTALLATION_ID="${fields[1]}"
+}
 # The identity the pool's pull-request sweep runs as (hack/ci_sweep_agent_pulls.py,
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
@@ -74,6 +112,15 @@ readonly FORGE_DENY_RULES="all"
 readonly FORGE_NETWORK_TAG="forge"
 readonly FORGE_VM_SA_ID="forge-vm"
 readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
+# A project-level binding on a service account created a moment earlier is
+# refused with "does not exist" until IAM has seen the account; evals-43, -49
+# and -50 each stopped there on 2026-11-13..15 and passed on the rerun. The
+# binding is retried for about a minute before the step gives up.
+readonly FORGE_VM_BIND_ATTEMPTS=6
+readonly FORGE_VM_BIND_DELAY_S=10
+# The one refusal the binding retries on: IAM's answer for an account it has
+# not seen yet. Any other failure stops the step at once.
+readonly FORGE_VM_BIND_RETRY_PATTERN="does not exist"
 readonly FORGE_RECORD_TTL=60
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
@@ -94,17 +141,18 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # in scripts/verify_ci_pool_project.py): the fleet's declared-no-pdb-workload role
 # runs without a budget or a NetworkPolicy, declared-token-workload's
 # token-reader keeps its mounted token, declared-overrequest-workload's
-# burst-ingest keeps its headroom, and declared-single-zone-pool's
-# declared-zonal-pool stays in one zone, all on purpose. The harness reads the
-# frontmatter, not the prose.
+# burst-ingest keeps its headroom, declared-single-zone-pool's
+# declared-zonal-pool stays in one zone, and declared-mtu-peering's
+# mtu-peer-declared network stays at 8896 beside default, all on purpose. The
+# harness reads the frontmatter, not the prose.
 # What `gh api` prints on stderr for a path that is not there; any other failure
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, declared-zonal-pool's single zone, declared-orphan-snap-seeded's retention, and the mtu-peer-declared peering's MTU mismatch, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a, the declared-orphan-snap-seeded snapshot and the mtu-peer-declared peering carry eight postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -124,6 +172,12 @@ declares:
   - check: single-zone-nodepool
     namespace: ""
     object: NodePool/declared-zonal-pool
+  - check: orphaned-snapshots
+    namespace: ""
+    object: Snapshot/declared-orphan-snap-seeded
+  - check: mtu-packet-fragmentation
+    namespace: ""
+    object: NetworkPeering/default--mtu-peer-declared
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -135,8 +189,13 @@ design: it reads the API server with that identity. Its neighbour `token-sidecar
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
 design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
 `seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
-pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
-waste and capacity audits list the six postures under Declared intent rather than as findings.'
+pool stays empty until a zonal batch needs it. The `declared-orphan-snap-seeded` snapshot is kept
+after its source disk was deleted by design: it is the retained copy of a retired disk, held until
+an operator reviews it. The `mtu-peer-declared` network stays at MTU 8896 beside `default` at 1460 by
+design: it carries jumbo frames for storage, the traffic that crosses the peering is TCP, and the VMs
+on `default` cannot all restart to adopt a new MTU. The obtainability, compliance, upgrade readiness,
+waste, capacity, GCE compute and networking audits list the eight postures under Declared intent rather
+than as findings.'
 # checkout-gateway's declaration, the file the remediation cases propose a
 # PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
 # With no manifest in the repository the agent finds nothing to fix and refuses
@@ -197,6 +256,23 @@ HOST_CLUSTER_NAME="platform-agent-host"
 # host cluster lacks this exact value and its tests pin the two copies equal
 # (HOST_OTEL_SCOPE in scripts/verify_ci_pool_project.py).
 readonly HOST_OTEL_SCOPE="COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+# GKE runs one cluster operation at a time, and right after the apply an
+# Autopilot host is still creating node pools for the pods Helm installed:
+# evals-48's update was refused CLUSTER_ALREADY_HAS_OPERATION on 2026-11-16.
+# Step 2.1 waits for the cluster's running operations before the update,
+# polling every HOST_OTEL_WAIT_DELAY_S for up to the attempt count (about
+# twenty minutes), then updates with the same retry if an operation slipped
+# in between the poll and the call.
+readonly HOST_OTEL_WAIT_ATTEMPTS=40
+readonly HOST_OTEL_WAIT_DELAY_S=30
+# GKE's refusal while another operation holds the cluster, the one error the
+# update retries on; the poll's filter matches the cluster's own operations and
+# its node pools' (targetLink ends in /clusters/<name> or continues with
+# /nodePools/...), since an Autopilot host creates pools after the apply. The
+# regex operand is quoted inside the filter: gcloud's filter lexer ends an
+# unquoted operand at "(", which would turn the alternation into a second,
+# always-false term and match nothing.
+readonly HOST_OTEL_BUSY_PATTERN="CLUSTER_ALREADY_HAS_OPERATION"
 
 usage() {
   cat <<EOF
@@ -239,6 +315,7 @@ if [ -z "${PROJECT_ID}" ]; then
   echo "ERROR: --project-id is required." >&2
   usage
 fi
+ledger_reader_for_project "${PROJECT_ID}"
 
 if [ -n "${PEM_FILE}" ]; then
   if [ ! -f "${PEM_FILE}" ]; then
@@ -562,7 +639,11 @@ if ! gcloud artifacts repositories describe kube-agents --location="${REGION}" -
 fi
 
 CLEANUP_POLICY_FILE="$(mktemp)"
-trap 'rm -f "${CLEANUP_POLICY_FILE}"' EXIT
+# The stderr of the two retried gcloud calls below (step 1.5's binding, step
+# 2.1's scope update), read back to classify the failure; per run, so two
+# provisioning runs on one host never read each other's answer.
+GCLOUD_ERR_FILE="$(mktemp)"
+trap 'rm -f "${CLEANUP_POLICY_FILE}" "${GCLOUD_ERR_FILE}"' EXIT
 cat > "${CLEANUP_POLICY_FILE}" <<'EOF'
 [
   {
@@ -666,7 +747,12 @@ fi
 # above writes the GitOps repo, and this one reads back the ledger issue the
 # bench grader scores. Missing it is the evals-6 red that #994 opened for -- and
 # step 5's Ledger Read Credential check fails the project until it is done.
-echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
+# Which reader App: the project's shard (LEDGER_READER_APPS_FILE, #6240), and
+# the check reads through that shard alone, so the repository on another
+# shard's App is the same 404 as on none.
+echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation"
+echo "  (reader App ${LEDGER_READER_NUMBER} of ${LEDGER_SHARD_COUNT}: ${LEDGER_READER_SHARD_SIZE} projects per App in number order; no other App will do,"
+echo "  except that until the Prow job mounts this App's key the eval reads through reader App 1, so keep the repository on that installation too)."
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
 
@@ -712,7 +798,29 @@ FORGE_VM_SA="${FORGE_VM_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
   gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
 fi
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
+bound=false
+bind_failed=false
+for attempt in $(seq 1 "${FORGE_VM_BIND_ATTEMPTS}"); do
+  if gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null 2>"${GCLOUD_ERR_FILE}"; then
+    bound=true
+    break
+  fi
+  if ! grep -q "${FORGE_VM_BIND_RETRY_PATTERN}" "${GCLOUD_ERR_FILE}"; then
+    cat "${GCLOUD_ERR_FILE}" >&2
+    bind_failed=true
+    break
+  fi
+  echo "  ⚠ ${FORGE_VM_SA} is not visible to IAM yet (attempt ${attempt}/${FORGE_VM_BIND_ATTEMPTS}); waiting ${FORGE_VM_BIND_DELAY_S}s..."
+  sleep "${FORGE_VM_BIND_DELAY_S}"
+done
+if [ "${bound}" != "true" ]; then
+  if [ "${bind_failed}" = "true" ]; then
+    echo "FATAL: binding ${FORGE_VM_SA_ROLE} to ${FORGE_VM_SA} failed (above)." >&2
+  else
+    echo "FATAL: ${FORGE_VM_SA} was still not visible to IAM after ${FORGE_VM_BIND_ATTEMPTS} attempts ($((FORGE_VM_BIND_ATTEMPTS * FORGE_VM_BIND_DELAY_S))s); re-run the script." >&2
+  fi
+  exit 1
+fi
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
 
 # ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
@@ -866,11 +974,35 @@ fi
 # set -e: a pool project without the scope passes every lease and exports no
 # traces, and the verifier in Step 5 would fail it anyway.
 echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
-gcloud container clusters update "${HOST_CLUSTER_NAME}" \
-  --project="${PROJECT_ID}" \
-  --location="${REGION}" \
-  --managed-otel-scope="${HOST_OTEL_SCOPE}" \
-  --quiet
+scope_set=false
+for attempt in $(seq 1 "${HOST_OTEL_WAIT_ATTEMPTS}"); do
+  running="$(gcloud container operations list --project="${PROJECT_ID}" --location="${REGION}" \
+    --filter="status!=DONE AND targetLink~'/clusters/${HOST_CLUSTER_NAME}(/|\$)'" --format="value(name,operationType)" 2>/dev/null || true)"
+  if [ -n "${running}" ]; then
+    echo "  ⏳ ${HOST_CLUSTER_NAME} is running an operation (${running//$'\n'/; }); waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
+    sleep "${HOST_OTEL_WAIT_DELAY_S}"
+    continue
+  fi
+  if gcloud container clusters update "${HOST_CLUSTER_NAME}" \
+      --project="${PROJECT_ID}" \
+      --location="${REGION}" \
+      --managed-otel-scope="${HOST_OTEL_SCOPE}" \
+      --quiet 2>"${GCLOUD_ERR_FILE}"; then
+    scope_set=true
+    break
+  fi
+  if ! grep -q "${HOST_OTEL_BUSY_PATTERN}" "${GCLOUD_ERR_FILE}"; then
+    cat "${GCLOUD_ERR_FILE}" >&2
+    break
+  fi
+  echo "  ⏳ an operation started between the poll and the update; waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
+  sleep "${HOST_OTEL_WAIT_DELAY_S}"
+done
+if [ "${scope_set}" != "true" ]; then
+  echo "FATAL: could not set the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}: the cluster kept running operations for $((HOST_OTEL_WAIT_ATTEMPTS * HOST_OTEL_WAIT_DELAY_S))s, or the update failed (above)." >&2
+  echo "       Re-run with --skip-host-cluster once \`gcloud container operations list --project=${PROJECT_ID} --filter=status!=DONE\` is empty." >&2
+  exit 1
+fi
 echo "✓ Managed OpenTelemetry scope ${HOST_OTEL_SCOPE} set on ${HOST_CLUSTER_NAME}"
 
 if [ "${SKIP_FLEET}" != "true" ]; then

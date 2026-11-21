@@ -59,6 +59,7 @@ import contextvars
 import copy
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -75,7 +76,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NamedTuple
 
-# The shared scripts dir holds github_token_refresh and gitops_workspace (see
+# The shared scripts dir holds github_token_refresh, gitops_workspace and the
+# fix_recipes package (the no-pdb generator) (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
 # copied per-profile). The import itself is lazy so `--dry-run` works on a dev
 # machine with no sandbox. The third entry is the same directory in a source
@@ -181,6 +183,8 @@ AUDITS: dict[str, AuditSpec] = {
             "anonymous-rbac-binding",
             "configsync-reconciler-stalled",
             "webhook-backend-unreachable",
+            "serviceentry-host-collision",
+            "webhook-ca-bundle-expired",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -253,6 +257,7 @@ AUDITS: dict[str, AuditSpec] = {
             "pdb-overlapping",
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
+            "ingress-gateway-healthcheck-mismatch",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -448,10 +453,11 @@ AUDITS: dict[str, AuditSpec] = {
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
             "firewall-world-open-ingress",
+            "missing-nodelocal-dnscache",
         ),
         # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
         # subnet for the IPAM check, one `project/<id>` entry for the other
-        # five. This stream enumerates no clusters.
+        # six. This stream enumerates no clusters.
         scopes=(
             ("subnet", ("subnet-ip-exhaustion",)),
             (
@@ -462,9 +468,21 @@ AUDITS: dict[str, AuditSpec] = {
                     "mtu-packet-fragmentation",
                     "cloud-armor-false-positive",
                     "firewall-world-open-ingress",
+                    "missing-nodelocal-dnscache",
                 ),
             ),
         ),
+        # §2a of the SOP: the one check that compares two values an owner
+        # sets, each peered network's MTU, and reads nothing live, so the only
+        # one a repository declaration may keep off the ledger (a jumbo-frame
+        # network peered with a 1460 one on purpose). One arm, one object kind
+        # (`NetworkPeering/<a>--<b>`), so no arm rule. The other six are
+        # faults no declaration excuses: a range under 15% free, a VM at its
+        # NAT port ceiling, a rejected PSC connection, a preview or duplicate
+        # Cloud Armor rule on a production backend, a management port open to
+        # the internet on a live external address, a Standard cluster without
+        # NodeLocal DNSCache.
+        declarable=("mtu-packet-fragmentation",),
     ),
     "gce-compute-fleet-audit": AuditSpec(
         "GCE Compute Engine and MIG Fleet Audit",
@@ -491,6 +509,16 @@ AUDITS: dict[str, AuditSpec] = {
                 ),
             ),
         ),
+        # §2a of the SOP: the one check that judges a retained object an
+        # owner may keep on purpose, a snapshot whose source disk is gone
+        # (a legal hold, a pre-migration copy), and so the only one a
+        # repository declaration may keep off the ledger; the waste audit
+        # already lets an owner declare the same shape for a kept disk. One
+        # arm, one object kind (`Snapshot/<name>`), so no arm rule. The other
+        # three are live faults no declaration excuses: a startup script that
+        # failed on the last boot, a group creating and deleting at once, a
+        # reservation with less than one host free.
+        declarable=("orphaned-snapshots",),
     ),
     "upgrade-retrospective": AuditSpec(
         "Upgrade Retrospective",
@@ -595,6 +623,21 @@ MANUAL_REMEDIATION_KIND = "manual"
 # Remediation block never come from different runs.
 CARRIED_FINDING_FIELDS = ("title", "impact")
 CARRIED_REMEDIATION_FIELDS = ("recommendation", "remediation")
+# The checks whose remediation gives a flag a value that only the cluster's
+# owner can supply, and those flags. The drift SOP forbids a copied range for
+# authorized networks, so a literal one in a carried command is one a run
+# copied. The compliance SOP also leaves `public-control-plane`'s list to a
+# human; that check has no row, so its carried range is not judged.
+OWNER_SUPPLIED_FLAGS: dict[str, tuple[str, ...]] = {
+    "authorized-networks": ("--master-authorized-networks",),
+}
+# What marks a command argument that is not one part of a cluster target: a
+# placeholder or a shell variable that the reader fills in, or a resource path
+# (`projects/p/locations/l/clusters/c`), which holds all three parts.
+COMMAND_UNCOMPARED_MARKS = ("<", "$", "{", "…", "/")
+# The names of the carry rules, as the run log prints them.
+CARRY_RULE_OTHER_CLUSTER = "a command for another cluster"
+CARRY_RULE_OWNER_VALUE = "a literal value where the SOP leaves the value to the owner"
 
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
@@ -1208,6 +1251,8 @@ CHECK_PHRASES = {
     "anonymous-rbac-binding": "{object} grants access to anonymous users",
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
     "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
+    "serviceentry-host-collision": "{object} is routed by Istio's pick in namespaces that declare none of its entries",
+    "webhook-ca-bundle-expired": "{object} has an expired or expiring webhook CA bundle",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -1246,6 +1291,7 @@ CHECK_PHRASES = {
     "pdb-overlapping": "{object} has overlapping disruption budgets",
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
+    "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -1302,7 +1348,7 @@ CHECK_PHRASES = {
     "single-zone-nodepool": "{object} node pool sits in one zone",
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
-    "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
+    "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -1310,6 +1356,7 @@ CHECK_PHRASES = {
     "mtu-packet-fragmentation": "MTU settings fragment packets",
     "cloud-armor-false-positive": "Cloud Armor blocks legitimate traffic",
     "firewall-world-open-ingress": "{object} firewall rule is open to the internet",
+    "missing-nodelocal-dnscache": "{object} cluster runs without NodeLocal DNSCache",
     # GCE Compute Engine and MIG Fleet Audit
     "gce-startup-script-status": "{object} startup script failed",
     "mig-convergence-stalled": "{object} instance group isn't converging",
@@ -1582,9 +1629,10 @@ ID_SCHEME_RE = re.compile(
 FINDING_MARKER_RE = re.compile(
     r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
-# Written on its own line under a finding's heading when this run measured the
-# finding as new since the last one, for the Slack card's "new" tag
-# (`agents/platform/scripts/slack_audit_report.py` reads it). Never written
+# Written on its own line under a finding's heading — or indented beneath its
+# one-line listed bullet (`render_listed_finding`) — when this run measured the
+# finding as new since the last one, for the Slack/Chat card's "new" tag
+# (`agents/platform/scripts/slack_audit_report.py` reads both). Never written
 # when the delta is unknown, so no finding is ever wrongly called new; and on a
 # line of its own because anything after the heading's marker stops
 # `FINDING_MARKER_RE` matching it. Model text cannot forge it: every free-text
@@ -1602,7 +1650,8 @@ LEDGER_STAMP_FORMAT = "%Y-%m-%d %H:%M UTC"
 # such a title, so it never rewrites a body that lists findings.
 COVERAGE_TITLE_RE = re.compile(r" — coverage incomplete \(\d+ gaps?, 0 findings\)$")
 # The renderer's own brackets around the one-line rows `_render_listed`
-# writes, which `parse_finding_locations` reads back with the full blocks.
+# writes, read back by `parse_finding_locations` and by
+# `agents/platform/scripts/slack_audit_report.py` alongside the full blocks.
 # Comments, like the held span's: `publishable_text` escapes `<!--` in every
 # model-written field, so no title or excerpt can spell one.
 LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
@@ -1803,6 +1852,14 @@ ALL_FINDINGS_RE = re.compile(r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n
 # What an id costs the hidden delta block beyond its own length: its two
 # quotes and the comma joining it to the next.
 DELTA_SLOT_CHARS = 3
+FINDING_ID_FIELD = "id"
+LINE_JOINER = "\n"
+LISTED_CONTINUATION_INDENT = "  "
+OMITTED_BREAKDOWN_WRAP = " ({breakdown})"
+# Margin for uncharged headings and chrome inside `_render_findings`: the
+# summary line, up to three severity headings, section joiners, and the
+# omitted-findings notice with its per-severity breakdown (~512 chars max).
+SECTION_CHROME_CHARS = 600
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 # Rows in the ledger's `## Declared intent` table: postures a check would have
@@ -2034,13 +2091,34 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
 STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     ZONE_ARM_CHECK: frozenset({"nodepool"}),
 }
+# The compute stream's one declarable check, 2.5 `orphaned-snapshots`, names
+# the snapshot and nothing else: the collector files `Snapshot/<name>` (a
+# global object, no zone segment), and a `Disk/` or a `Project/` covers no
+# snapshot. One arm: the excerpt carries nothing live, so the join needs no
+# arm rule and the plain `_declaration_covers` path moves it.
+ORPHANED_SNAPSHOT_CHECK = "orphaned-snapshots"
+COMPUTE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    ORPHANED_SNAPSHOT_CHECK: frozenset({"snapshot"}),
+}
+# The networking stream's one declarable check, 2.4 `mtu-packet-fragmentation`,
+# names the peering and nothing else: the collector files
+# `NetworkPeering/<a>--<b>` (the two network names sorted), and a `Network/`
+# or a `Project/` covers no pair. One arm: the excerpt carries nothing live,
+# so the join needs no arm rule and the plain `_declaration_covers` path moves it.
+MTU_PEERING_CHECK = "mtu-packet-fragmentation"
+NETWORKING_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    MTU_PEERING_CHECK: frozenset({"networkpeering"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
-# reads it for the measured-size title, which a stockout row does not carry.
+# reads it for the measured-size title, which a stockout, a compute or a networking row
+# does not carry.
 DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **COST_DECLARABLE_OBJECT_KINDS,
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
+    **COMPUTE_DECLARABLE_OBJECT_KINDS,
+    **NETWORKING_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
@@ -2060,9 +2138,12 @@ COST_DECLARED_MINOR = "minor"
 # stockout pool check (`ZONE_ARM_CHECK`) joins the five for the same reason:
 # its collector files `NodePool/<pool>` with no namespace, and a worker's
 # namespace on the finding would give the pool an identity no declaration and
-# no candidate matches. Every slug here belongs to one stream, so no stream
+# no candidate matches. So does the compute snapshot check
+# (`ORPHANED_SNAPSHOT_CHECK`), filed on a `project/<id>` target with no
+# namespace, and so does the networking peering check (`MTU_PEERING_CHECK`),
+# filed the same way. Every slug here belongs to one stream, so no stream
 # test is needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK})
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK, MTU_PEERING_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -2142,11 +2223,9 @@ RUN_RECORD_STARTED_KEY = "started_at"
 # cleared finding of it `manual`: a PodDisruptionBudget is fully determined by
 # the workload's selector (obtainability SOP §3.3), which the collector reads.
 GENERATED_FIX_CHECK = "no-pdb"
-# The new file `finish` writes beside the workload's declaration.
-GENERATED_PDB_SUFFIX = "-pdb"
+# The extension of the new file `finish` writes beside the workload's
+# declaration; its name is the recipe's (`fix_recipes/no-pdb/fix.py`).
 GENERATED_PDB_EXTENSION = ".yaml"
-# A DNS-1123 subdomain, what Kubernetes requires of a PDB's name and namespace.
-KUBERNETES_NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 # A clone's own directory, which no search of the repository's files enters.
 GIT_DIR_NAME = ".git"
 # What marks a directory as a Kustomize root, as the collector reads it: a
@@ -2220,8 +2299,6 @@ HTTP_TOO_MANY_REQUESTS = 429
 MANUAL_NOTE_MANIFEST_LINES = 60
 # The last line of a copied file that went past either cap.
 MANUAL_NOTE_TRUNCATED = "# (truncated)"
-# The selector keys `policy/v1` takes, and nothing else.
-LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
 GENERATED_FIX_NOTE = (
     "_(The audit wrote this PodDisruptionBudget from the workload's own selector, "
@@ -2819,7 +2896,7 @@ def _manifest_delta():
 # The install's auto-merge switch (`KUBEAGENTS_AUTOMERGE`, read by
 # kubeagents_switches.py in the shared scripts directory). Anything but "off"
 # has every disruption-budget fix checked against its cluster before its pull
-# request opens, and the answer written into the body (pdb_safety.py).
+# request opens, and the answer written into the body (fix_preflight.py).
 AUTOMERGE_SWITCH = "AUTOMERGE"
 SWITCH_OFF = "off"
 AUTOMERGE_PRACTICE = "practice"
@@ -2840,7 +2917,7 @@ def automerge_switch() -> str:
         return SWITCH_OFF
 
 
-def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
+def safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
     """The safety-check section for a group's disruption-budget fixes, or "".
 
     "" while the auto-merge switch is off, and for a group with no `no-pdb`
@@ -2862,7 +2939,7 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:
         sys.path.insert(0, here)
-    import pdb_safety  # lazy, as manifest_delta is
+    import fix_preflight as preflight  # lazy, as manifest_delta is
 
     read = {
         str(entry.get("name") or "")
@@ -2880,13 +2957,14 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(
+                "checks": preflight.unanswered(
+                    GENERATED_FIX_CHECK,
                     "the audit did not write this file on this run at the path it chooses for the budget, so it was not read again"
                 ),
             })
             continue
         try:
-            answer = pdb_safety.check_fix(
+            answer = preflight.check_fix(
                 finding,
                 raw.decode("utf-8", errors="replace") if raw is not None else None,
                 in_manifest=str(finding.get("cluster") or "") in read,
@@ -2896,12 +2974,12 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(f"the check failed ({type(exc).__name__}: {exc})"),
+                "checks": preflight.unanswered(GENERATED_FIX_CHECK, f"the check failed ({type(exc).__name__}: {exc})"),
             }
         answers.append(answer)
     eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
     log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
-    return pdb_safety.render_section(
+    return preflight.render_section(
         answers, eligible=eligible, noun=noun, clean=publishable_text, practice=automerge_switch() == AUTOMERGE_PRACTICE
     )
 
@@ -3113,7 +3191,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Nine markers. A cost collector sets `service-fronted` on an idle
+# Twelve markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -3129,6 +3207,12 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # two files, where a finding carries one `remediation.path`, so the sweep's
 # pull request would land a class nothing selects. `/remediate` opens the same
 # one-file pull request, for a person who knows to add the selector to it.
+#
+# The stockout collector also sets `reserved-pool` on a §3.10(d) finding, a
+# node pool whose named reservation is in none of its zones. Each fix creates
+# a reservation, which is billed from the moment it exists, or replaces the
+# pool. The SOP has that finding published as `manual`, and the marker keeps a
+# `manifest` the model wrote anyway out of the sweep.
 #
 # The cost collector sets `autopilot-bumped` on a sizing finding (§3.1, §3.12)
 # whose `major` grade the Autopilot bump supplied rather than its magnitude.
@@ -3149,6 +3233,9 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # whose request is its limit, so a number sized from an idle week becomes an
 # enforcement ceiling; the SOP has that finding published as `manual`, and the
 # marker keeps a `manifest` the model wrote anyway out of the sweep. The
+# stockout collector also sets `class-status` on a §3.12(b) finding, a
+# ComputeClass that GKE reports misconfigured: the fix taints or relabels a
+# node pool, which decides where every other Pod on it can schedule. The
 # compliance collector sets `default-deny` on every §2.6 finding: each arm's
 # fix leaves the namespace denying ingress by default, which drops every
 # connection no allow rule names until the team writes those rules. The
@@ -3161,6 +3248,8 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 TRIAGE_REASONS = {
     "service-fronted": "stands down a controller a Service routes to",
     "new-computeclass": "needs a new ComputeClass and a workload that selects it",
+    "class-status": "changes a node pool or a ComputeClass, and the audit did not read what else runs on that pool",
+    "reserved-pool": "creates a billed reservation or replaces the node pool",
     "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",
@@ -3168,6 +3257,7 @@ TRIAGE_REASONS = {
     "namespace-token": "turns the API token off for every pod on the namespace's default ServiceAccount",
     "service-selector": "rewrites or deletes a Service on a judgement about its backend",
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
+    "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
@@ -3624,9 +3714,9 @@ def clip_text(text: str | None, limit: int) -> str:
 
     Every free-text field is capped, not only the evidence: `title`, `impact`,
     the three `recommendation` sub-fields and `remediation.note` were uncapped,
-    and since `select_rendered_findings` guarantees at least one finding always
-    renders, a single oversized field could push the body past GitHub's limit
-    and publish nothing at all.
+    and since `split_findings_for_body` guarantees at least one finding always
+    renders in full, a single oversized field could push the body past GitHub's
+    limit and publish nothing at all.
     """
     value = publishable_text(text).strip()
     if len(value) <= limit:
@@ -4373,6 +4463,179 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     if len(segments) > 2:
         segments = [segments[0], STORE_PATH_SEPARATOR.join(segments[1:])]
     return root.joinpath(audit_id, *segments)
+
+
+# The broker store (#5619): with FLEET_AUDIT_REPORT_STORE=broker, which the
+# operator renders on the shell sandbox and on profile workers, every read and
+# write below goes to the credential broker's /v1/audit-reports instead of the
+# directory reports_dir_for names. The client is report_status.py's
+# (BrokerReportStore), so the two scripts cannot spell a request differently;
+# report_status imports nothing outside the standard library. The names,
+# semantics and order are the file store's: the ring entry, then latest as its
+# byte copy, latest dropped before each ledger rewrite and after a failed
+# write, and the server prunes the ring.
+_REPORT_STORE_LOGGED: set[str] = set()
+
+
+def _report_status():
+    """report_status.py beside this file, imported on first use, as
+    `_manifest_delta` is."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import report_status
+
+    return report_status
+
+
+def _report_store_client():
+    """The broker store client when FLEET_AUDIT_REPORT_STORE is `broker`, else
+    None for the file store. Logs which, once per choice per process, whenever
+    the switch is set to anything. With it unset the file store is used and
+    nothing is logged, so `finish`'s stderr stays what it was before the switch
+    (TestFinishWithoutAManifestIsUnchanged records it byte for byte)."""
+    status = _report_status()
+    store, line = status.select_report_store(log=log)
+    if os.environ.get(status.REPORT_STORE_ENV, "").strip() and line not in _REPORT_STORE_LOGGED:
+        _REPORT_STORE_LOGGED.add(line)
+        log(line)
+    if not isinstance(store, status.BrokerReportStore):
+        return None
+    # One client per process and URL, so a stream is checked for a seed once.
+    cached = _BROKER_CLIENTS.get(str(store))
+    if cached is None or cached.local_root != store.local_root:
+        _BROKER_CLIENTS[str(store)] = cached = store
+    return cached
+
+
+_BROKER_CLIENTS: dict = {}
+
+
+class _FileStoreDir:
+    """One stream's store for one repository in the file store: the
+    directory reports_dir_for names. Names are relative to it: `latest.json`
+    and `runs/<stamp>.json`."""
+
+    def __init__(self, directory: Path):
+        self.path = directory
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def has(self, name: str) -> bool:
+        return (self.path / name).exists()
+
+    def read(self, name: str) -> str:
+        return (self.path / name).read_text(encoding="utf-8")
+
+    def ring(self) -> list[str]:
+        """The ring's names, oldest first."""
+        return sorted(p.name for p in (self.path / REPORT_RUNS_DIR).glob("*.json"))
+
+    def write_run(self, name: str, text: str) -> None:
+        runs = self.path / REPORT_RUNS_DIR
+        _make_store_dirs(runs)
+        _atomic_write(runs / name, text)
+
+    def write_latest(self, text: str) -> None:
+        _atomic_write(self.path / REPORT_LATEST_NAME, text)
+
+    def delete_latest(self, missing_ok: bool = False) -> None:
+        (self.path / REPORT_LATEST_NAME).unlink(missing_ok=missing_ok)
+
+    def prune(self) -> None:
+        for stale in sorted((self.path / REPORT_RUNS_DIR).glob("*.json"))[:-REPORT_HISTORY]:
+            stale.unlink()
+
+
+class _BrokerStoreDir:
+    """The same stream store, through the broker (report_status.BrokerReportStore).
+
+    Reads are cached for the life of this object, which a caller makes per
+    question, so `has` then `read` is one request. A store the broker cannot
+    answer for is there and unreadable, never absent: absent would read as a
+    first run, where unreadable is a lost memory.
+    """
+
+    def __init__(self, client, audit_id: str, repo: str):
+        self.client = client
+        self.audit_id = audit_id
+        self.repo = repo
+        self._reads: dict[str, object] = {}
+
+    def __str__(self) -> str:
+        return f"{self.client} {self.audit_id}/{self.repo}"
+
+    def _get(self, name: str) -> bytes | None:
+        if name not in self._reads:
+            try:
+                if name == REPORT_LATEST_NAME:
+                    value: object = self.client.read_latest(self.audit_id, self.repo)
+                else:
+                    value = self.client.read_run(self.audit_id, self.repo, name[len(REPORT_RUNS_DIR) + 1 :])
+            except OSError as exc:
+                value = exc
+            self._reads[name] = value
+        value = self._reads[name]
+        if isinstance(value, BaseException):
+            raise value
+        return value  # type: ignore[return-value]
+
+    def exists(self) -> bool:
+        try:
+            return self.has(REPORT_LATEST_NAME) or bool(self.ring())
+        except OSError:
+            return True
+
+    def has(self, name: str) -> bool:
+        try:
+            return self._get(name) is not None
+        except OSError:
+            return True
+
+    def read(self, name: str) -> str:
+        data = self._get(name)
+        if data is None:
+            raise FileNotFoundError(f"{self}: no {name}")
+        return data.decode("utf-8")
+
+    def ring(self) -> list[str]:
+        return self.client.list_runs(self.audit_id, self.repo)
+
+    def write_run(self, name: str, text: str) -> None:
+        self._reads.clear()
+        self.client.write_run(self.audit_id, self.repo, name, text.encode("utf-8"))
+
+    def write_latest(self, text: str) -> None:
+        self._reads.clear()
+        self.client.write_latest(self.audit_id, self.repo, text.encode("utf-8"))
+
+    def delete_latest(self, missing_ok: bool = False) -> None:
+        # The broker answers 204 whether or not there was one.
+        self._reads.clear()
+        self.client.delete_latest(self.audit_id, self.repo)
+
+    def prune(self) -> None:
+        """The listener prunes the ring on every write."""
+
+
+def report_store_dir(audit_id: str, repo: str):
+    """The store for one stream's ledger in one repository: the file store's
+    directory (reports_dir_for), or the broker store's when it is selected.
+    ValueError for a `repo` reports_dir_for refuses, either way."""
+    directory = reports_dir_for(audit_id, repo)
+    client = _report_store_client()
+    if client is None:
+        return _FileStoreDir(directory)
+    return _BrokerStoreDir(client, audit_id, repo)
+
+
+def _as_store_dir(directory):
+    """A store directory; a Path is the file store's."""
+    return _FileStoreDir(directory) if isinstance(directory, Path) else directory
 
 
 def _redact_document(value: object) -> object:
@@ -5132,18 +5395,16 @@ def write_report(
     describes that body exactly.
     """
     try:
-        directory = reports_dir_for(audit_id, str(envelope.get("repo")))
+        store = report_store_dir(audit_id, str(envelope.get("repo")))
     except ValueError as exc:
         log(f"WARNING: report store write for {audit_id} skipped: {exc}")
         return False
-    runs = directory / REPORT_RUNS_DIR
     try:
-        _make_store_dirs(runs)
         text = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
         stamp = now.astimezone(timezone.utc).strftime(REPORT_STAMP_FORMAT)
-        _atomic_write(runs / f"{stamp}.json", text)
+        store.write_run(f"{stamp}.json", text)
         # A copy, not a symlink: one fewer behaviour to ask of the mount.
-        _atomic_write(directory / REPORT_LATEST_NAME, text)
+        store.write_latest(text)
     except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
         log(f"WARNING: report store write for {audit_id} failed: {exc}{_ownership_note(exc)}")
         if ledger_unchanged:
@@ -5155,7 +5416,7 @@ def write_report(
         # same ledger, same scheme, so the next run would trust a memory that
         # lacks everything this one published. Absent is honest; stale is not.
         try:
-            (directory / REPORT_LATEST_NAME).unlink(missing_ok=True)
+            store.delete_latest(missing_ok=True)
         except OSError as unlink_exc:
             log(
                 f"WARNING: could not drop the stale latest.json for {audit_id}: "
@@ -5163,8 +5424,7 @@ def write_report(
             )
         return False
     try:
-        for stale in sorted(runs.glob("*.json"))[:-REPORT_HISTORY]:
-            stale.unlink()
+        store.prune()
     except Exception as exc:  # noqa: BLE001 — the memory is already written
         # Not the invalidating path above: the envelope landed and is correct,
         # and an over-long ring costs disk rather than accuracy.
@@ -5196,12 +5456,12 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     if issue_number is None:
         return None
     try:
-        path = reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME
+        store = report_store_dir(audit_id, repo)
     except ValueError as exc:
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None
     try:
-        envelope = json.loads(path.read_text(encoding="utf-8"))
+        envelope = json.loads(store.read(REPORT_LATEST_NAME))
     except FileNotFoundError:
         log(
             f"No stored report for {audit_id} in {repo}, but issue #{issue_number} is open; "
@@ -5221,7 +5481,7 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         # A run that could not reach this repository stored its envelope here
         # with no ledger. The memory is the newest envelope a run that
         # published here wrote, from the ring.
-        envelope = _newest_published_envelope(path.parent / REPORT_RUNS_DIR)
+        envelope = _newest_published_envelope(store)
         if envelope is None:
             log(
                 f"Stored reports for {audit_id} in {repo} since the last published run are "
@@ -5246,26 +5506,51 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     return envelope
 
 
-def _ring_envelopes(runs: Path) -> list[dict]:
-    """The readable envelopes in the `runs/` ring, newest first."""
+def _ring_envelopes(store) -> list[dict]:
+    """The readable envelopes in the `runs/` ring of a store directory, newest first."""
+    return _read_ring_envelopes(store)[0]
+
+
+def _read_ring_envelopes(store) -> tuple[list[dict], bool]:
+    """`_ring_envelopes`, and whether the store answered for its whole ring:
+    False when the listing or a read of an entry failed (an OSError other
+    than the entry being gone), so a reader can tell a ring it could not read
+    from an empty one. An entry that is not a JSON object was read, and is
+    skipped."""
+    store = _as_store_dir(store)
     try:
-        paths = sorted(runs.glob("*.json"), reverse=True)
+        names = sorted(store.ring(), reverse=True)
     except OSError:
-        return []
+        return [], False
     envelopes = []
-    for path in paths:
+    answered = True
+    for name in names:
         try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            envelope = json.loads(store.read(f"{REPORT_RUNS_DIR}/{name}"))
+        except FileNotFoundError:
+            continue  # pruned since the listing: gone, not unread
+        except OSError:
+            answered = False
+            continue
+        except ValueError:
             continue
         if isinstance(envelope, dict):
             envelopes.append(envelope)
-    return envelopes
+    return envelopes, answered
 
 
-def _newest_published_envelope(runs: Path) -> dict | None:
-    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
-    return next((e for e in _ring_envelopes(runs) if not is_diverted(e)), None)
+def _newest_published_envelope(store) -> dict | None:
+    """The newest envelope in a store directory's `runs/` ring that `is_diverted` does not mark, or None."""
+    return _read_newest_published_envelope(store)[0]
+
+
+def _read_newest_published_envelope(store) -> tuple[dict | None, bool]:
+    """`_newest_published_envelope`, and whether None means the ring holds no
+    such envelope: False when none was found and part of the ring could not
+    be read (`_read_ring_envelopes`), where one may be."""
+    envelopes, answered = _read_ring_envelopes(store)
+    envelope = next((e for e in envelopes if not is_diverted(e)), None)
+    return envelope, envelope is not None or answered
 
 
 def _envelope_document(envelope: object, key: str) -> dict | None:
@@ -5309,7 +5594,7 @@ def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
     if not repo:
         return None
     try:
-        directory = reports_dir_for(audit_id, repo)
+        directory = report_store_dir(audit_id, repo)
     except ValueError:
         return None
     key = _ledger_key(repo)
@@ -5332,7 +5617,7 @@ def invalidate_report_memory(audit_id: str, repo: str) -> None:
     issue is never trusted again anyway. The ring is left alone.
     """
     try:
-        (reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME).unlink()
+        report_store_dir(audit_id, repo).delete_latest()
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:
@@ -5436,15 +5721,21 @@ def store_never_published(directory: Path) -> bool:
     that is not marked: a run that could not reach the repository creates
     the directory, but it leaves no memory of the ledger. An unreadable or
     absent `latest.json` in a directory that exists is a lost memory, not a
-    store that was never written.
+    store that was never written, and so is a ring that could not be read
+    behind a marked one: a published envelope may be in it. `directory` is a store directory
+    (report_store_dir) or the file store's Path.
     """
-    if not directory.exists():
+    store = _as_store_dir(directory)
+    if not store.exists():
         return True
     try:
-        latest = json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8"))
+        latest = json.loads(store.read(REPORT_LATEST_NAME))
     except (OSError, ValueError):
         return False
-    return is_diverted(latest) and _newest_published_envelope(directory / REPORT_RUNS_DIR) is None
+    if not is_diverted(latest):
+        return False
+    envelope, known = _read_newest_published_envelope(store)
+    return envelope is None and known
 
 
 def previous_run_memory(
@@ -5462,7 +5753,7 @@ def previous_run_memory(
     if issue_number is None:
         return None
     try:
-        never_stored = store_never_published(reports_dir_for(audit_id, repo))
+        never_stored = store_never_published(report_store_dir(audit_id, repo))
     except ValueError:
         never_stored = False
     if never_stored:
@@ -8157,6 +8448,9 @@ def _remediation_may_carry(before: object, now: object) -> bool:
     that wrote the other parts runs again after the carry, so a copied note
     gets the text two times, or keeps a statement that is not true for this
     run.
+
+    Not when the previous remediation does not pass the rules that
+    `validate_findings` has for a new one: a known `kind`, a string `note`.
     """
     if not isinstance(before, dict) or not isinstance(now, dict):
         return False
@@ -8164,7 +8458,105 @@ def _remediation_may_carry(before: object, now: object) -> bool:
         return False
     if before.get("kind") == MANUAL_REMEDIATION_KIND and now.get("kind") != MANUAL_REMEDIATION_KIND:
         return False
+    if before.get("kind") not in REMEDIATION_KINDS or not isinstance(before.get("note", ""), str):
+        return False
     return not (_harness_wrote_note(before) or _harness_wrote_note(now))
+
+
+def _command_names_another_cluster(finding: dict, command: str) -> bool:
+    """Whether a `clusters update` `command` is for a cluster other than `finding`'s.
+
+    The finding's `cluster` is `project/location/name`. Each part the command
+    gives as a literal must agree. False where there is nothing to compare: a
+    `cluster` of another shape (`project/<id>`), a command `_parse_update_target`
+    cannot read, a placeholder, a shell variable or a resource path
+    (`COMMAND_UNCOMPARED_MARKS`), a project given by number.
+    """
+    parts = str(finding.get("cluster") or "").split("/")
+    if len(parts) != CLUSTER_TARGET_SEGMENTS or not command.startswith(CLUSTERS_UPDATE_PREFIX):
+        return False
+    target = _parse_update_target(command)
+    if target is None:
+        return False
+    name, location, project = target
+    if project.isdigit():
+        project = ""
+    project_id, cluster_location, cluster_name = parts
+    return any(
+        given
+        and not any(mark in given for mark in COMMAND_UNCOMPARED_MARKS)
+        and given.lower() != want.lower()
+        for given, want in (
+            (name, cluster_name),
+            (location, cluster_location),
+            (project, project_id),
+        )
+    )
+
+
+def _is_literal_network(value: str) -> bool:
+    try:
+        ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def _command_gives_owner_value(finding: dict, command: str) -> bool:
+    """Whether `command` gives a literal range to a flag in `OWNER_SUPPLIED_FLAGS`
+    for `finding`'s check. False for a command `shlex` cannot read."""
+    flags = OWNER_SUPPLIED_FLAGS.get(str(finding.get("check") or ""), ())
+    if not flags:
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    for index, token in enumerate(argv):
+        key, sep, value = token.partition("=")
+        if key not in flags:
+            continue
+        if not sep and index + 1 < len(argv):
+            value = argv[index + 1]
+        if any(_is_literal_network(item) for item in value.split(",")):
+            return True
+    return False
+
+
+# One row per rule on a carried remediation: its name in the run log, and
+# whether one gcloud command fails it for a finding. A rule answers False
+# where it cannot tell, so a command it cannot read is never refused.
+CARRY_RULES: tuple[tuple[str, Callable[[dict, str], bool]], ...] = (
+    (CARRY_RULE_OTHER_CLUSTER, _command_names_another_cluster),
+    (CARRY_RULE_OWNER_VALUE, _command_gives_owner_value),
+)
+
+
+def _carry_rule_failed(finding: dict, source: dict) -> str:
+    """The first `CARRY_RULES` rule that `source`'s `recommendation` and
+    `remediation` fail for `finding`, or `""`.
+
+    Every field that publishes a command is read: the note, the note before
+    the route-note cut, which the carry puts back, and the Recommendation and
+    confirm lines.
+    """
+    remediation = source.get("remediation")
+    recommendation = source.get("recommendation")
+    texts: list[object] = []
+    if isinstance(remediation, dict):
+        texts += [remediation.get(field) for field in ("note", ROUTE_UNCUT_NOTE_FIELD)]
+    if isinstance(recommendation, dict):
+        texts += [recommendation.get(field) for field in COMMAND_BEARING_RECOMMENDATION_FIELDS]
+    commands = [
+        command
+        for text in texts
+        if isinstance(text, str)
+        for command, _line in _gcloud_commands(text)
+    ]
+    for name, fails in CARRY_RULES:
+        if any(fails(finding, command) for command in commands):
+            return name
+    return ""
 
 
 def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> list[str]:
@@ -8188,6 +8580,12 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
     same way before the comparison. A change in severity stops the carry: the
     collector calculates severity, so a new severity is a new observation,
     and the old impact can give the old reason.
+
+    Evidence says nothing about the remediation, so a wrong one would stay
+    for as long as the evidence does. The previous `recommendation` and
+    `remediation` are not kept when they fail a `CARRY_RULES` rule and this
+    run's pass it. When this run's fail too, the previous ones stay: new words
+    that are also wrong are no reason to change the text.
 
     The copied text did not go through `validate_findings` in this run, so
     `normalise_finding_commands` runs on it again.
@@ -8213,7 +8611,11 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
             continue
         fields = list(CARRIED_FINDING_FIELDS)
         if _remediation_may_carry(before.get("remediation"), finding.get("remediation")):
-            fields.extend(CARRIED_REMEDIATION_FIELDS)
+            failed = _carry_rule_failed(finding, before)
+            if failed and not _carry_rule_failed(finding, finding):
+                log(f"{fid}: the previous run's remediation is not carried forward ({failed}).")
+            else:
+                fields.extend(CARRIED_REMEDIATION_FIELDS)
         changed = False
         for field in fields:
             if field in before and before[field] != finding.get(field):
@@ -9558,8 +9960,9 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
     A check with fixed object kinds accepts only those
-    (`DECLARABLE_OBJECT_KINDS`: the cost checks and the stockout pool check).
-    The two controller checks file whatever
+    (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check and
+    the compute snapshot check and the networking peering check). The two
+    controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5
@@ -10069,25 +10472,30 @@ def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
     return [str(fid) for fid in stored] if isinstance(stored, list) else None
 
 
-def first_stored_record(directory: Path, trusted: Callable[[dict], bool]) -> dict | None:
+def first_stored_record(directory, trusted: Callable[[dict], bool]) -> dict | None:
     """The newest stored envelope in `directory` that `trusted` accepts.
 
     `latest.json` first, then the `runs/` ring from newest to oldest: a
     failed write drops `latest.json` and leaves the ring. `{}` when the
     directory holds no envelope at all. None when it holds envelopes and
-    none can be read or `trusted` accepts none.
+    none can be read or `trusted` accepts none, and when the ring cannot be
+    listed and no `latest.json` was read and trusted: an unlisted ring may
+    hold envelopes, so it is never "no envelope at all". `directory` is a store
+    directory (report_store_dir) or the file store's Path.
     """
-    candidates = [directory / REPORT_LATEST_NAME]
+    store = _as_store_dir(directory)
+    candidates = [REPORT_LATEST_NAME]
+    listed = True
     try:
-        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
+        candidates.extend(f"{REPORT_RUNS_DIR}/{name}" for name in sorted(store.ring(), reverse=True))
     except OSError:
-        pass
-    present = [path for path in candidates if path.exists()]
+        listed = False
+    present = [name for name in candidates if store.has(name)]
     if not present:
-        return {}
-    for path in present:
+        return {} if listed else None
+    for name in present:
         try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
+            envelope = json.loads(store.read(name))
         except (OSError, ValueError):
             continue
         if isinstance(envelope, dict) and trusted(envelope):
@@ -10112,7 +10520,7 @@ def newest_stored_record(audit_id: str, repo: str) -> dict | None:
     when the store holds only marked envelopes, the answer is None.
     """
     try:
-        directory = reports_dir_for(audit_id, repo)
+        directory = report_store_dir(audit_id, repo)
     except ValueError:
         return None
     key = _ledger_key(repo)
@@ -12287,8 +12695,8 @@ def _ident(value: str) -> str:
     Three things at once, because all three failed on the same fields.
 
     *Clipped*, because `cluster`, `namespace` and `object` were the last
-    free-text values the renderer interpolated raw, and `select_rendered_
-    findings` always renders the first finding whatever it costs — so one
+    free-text values the renderer interpolated raw, and `split_findings_for_body`
+    always renders the first finding in full whatever it costs — so one
     oversized identifier overflowed the body and published nothing at all.
 
     *Flattened*, because a newline ends an inline code span. *Backticks
@@ -12399,8 +12807,8 @@ def _anchor_id(fid: str) -> str:
 def _index_row(finding: dict, state: str, pr_url: str | None) -> str:
     """One row of the findings index.
 
-    Shared with `index_overhead` rather than duplicated, because that estimate
-    is what reserves this table's space out of the body budget: a row that
+    Shared with `_index_prefix_costs` rather than duplicated, because that table
+    cost is what budgets this index against the body limit: a row that
     renders wider than it was measured spends budget the findings were
     promised, and the two drifting apart is not visible until a body crosses
     GitHub's limit and publishes nothing.
@@ -12420,42 +12828,37 @@ def _index_row(finding: dict, state: str, pr_url: str | None) -> str:
     )
 
 
-def index_overhead(
-    findings: list[dict],
-    states: dict[str, str],
-    pr_urls: dict[str, str],
-) -> int:
-    """What the findings index will cost, measured rather than guessed.
+def _index_prefix_costs(
+    order: list[dict],
+    states: dict[str, str] | None,
+    pr_urls: dict[str, str] | None,
+) -> list[int]:
+    """State-index cost for each fair-share prefix `order[:k]` (`0 <= k <= len(order)`).
 
-    The index is not charged to any single finding, so it has to be reserved up
-    front — but the reservation cannot know the final selection, since selection
-    is what the reservation is an input to. The rendered set is always a prefix
-    of `_fair_share_order`, and the index shows the first `MAX_DELTA_ROWS` of
-    that set in display order. A prefix of the fair-share order is not a prefix
-    of the display order, so this walks every prefix and keeps the most
-    expensive table that any of them can show. That bounds the table whatever
-    the budget later admits.
-
-    This replaced a flat per-row allowance that a real finding id had already
-    outgrown — ids run to 100 characters and a state cell carries a full pull
-    request URL, so the table could quietly cost twice what was set aside.
+    `_render_findings` shows at most `MAX_DELTA_ROWS` full rows in display
+    order, and omits the table when no full row carries a state. Charging the
+    prefix that actually renders in full avoids reserving fifty index rows on
+    an overflowing body that keeps only a handful of full blocks.
     """
-    # (display key, row cost) of the rows the index shows for the current
-    # prefix, in display order.
+    if not states:
+        return [0] * (len(order) + 1)
+    urls = pr_urls or {}
     shown: list[tuple[tuple, int]] = []
     measured = 0
-    worst = 0
-    for finding in _fair_share_order(sort_findings(findings)):
-        fid = str(finding.get("id", ""))
-        row = _index_row(finding, states.get(fid, STATE_OPEN), pr_urls.get(fid))
+    has_state = False
+    costs = [0]
+    for finding in order:
+        fid = str(finding.get(FINDING_ID_FIELD, ""))
+        if states.get(fid):
+            has_state = True
+        row = _index_row(finding, states.get(fid, STATE_OPEN), urls.get(fid))
         cost = len(row) + 1  # + the newline joining it to the next row
         bisect.insort(shown, (_display_key(finding), cost))
         measured += cost
         if len(shown) > MAX_DELTA_ROWS:
             measured -= shown.pop()[1]
-        worst = max(worst, measured)
-    # Header, separator, the blank line above, and the overflow line below.
-    return worst + INDEX_OVERHEAD_MARGIN
+        costs.append(measured + INDEX_OVERHEAD_MARGIN if has_state else 0)
+    return costs
 
 
 def _blocked_note(fid: str, pr: dict, noun: str) -> str:
@@ -12695,59 +13098,6 @@ def _fair_share_order(ordered: list[dict]) -> list[dict]:
     return out
 
 
-def select_rendered_findings(
-    findings: list[dict],
-    budget: int,
-    *,
-    states: dict[str, str] | None = None,
-    pr_urls: dict[str, str] | None = None,
-    new_ids: set[str] | None = None,
-    noun: str = DEFAULT_PROPOSAL_NOUN,
-    blocked_by: dict[str, dict] | None = None,
-    file_url: str | None = None,
-    file_ref: str = DEFAULT_FILE_REF,
-    unlinked_paths: set[str] | frozenset[str] = frozenset(),
-) -> tuple[list[dict], list[dict]]:
-    """Split the sorted findings into (rendered, omitted) against a char budget.
-
-    Selection walks the severity bands in order and stops at the first finding
-    that does not fit, so truncation only ever eats the least-severe end, and
-    criticals are structurally safe. At least one finding always renders — a
-    body with a single oversized finding is still more useful than a body with
-    none.
-
-    In each band the walk follows `_fair_share_order`, not the display order, so
-    no target gets a second row before every target in the band has one. The rendered set is
-    a prefix of that order, which `index_overhead` relies on. Both lists return
-    in display order: the fair-share order decides which findings render, never
-    where they show.
-
-    Each finding is charged for its own rendered text *and* for the slot its id
-    occupies in the hidden delta block, because that block is itself unbounded:
-    1,250 ids render over 80,000 characters of marker alone.
-    """
-    candidates = _fair_share_order(sort_findings(findings))
-    used = 0
-    fitted = 0
-    for finding in candidates:
-        cost = _full_row_cost(
-            finding,
-            states=states,
-            pr_urls=pr_urls,
-            new_ids=new_ids,
-            noun=noun,
-            blocked_by=blocked_by,
-            file_url=file_url,
-            file_ref=file_ref,
-            unlinked_paths=unlinked_paths,
-        )
-        if fitted and used + cost > budget:
-            break
-        used += cost
-        fitted += 1
-    return sort_findings(candidates[:fitted]), sort_findings(candidates[fitted:])
-
-
 def _full_row_cost(
     finding: dict,
     *,
@@ -12780,22 +13130,30 @@ def _full_row_cost(
 
 
 def render_listed_finding(
-    finding: dict, *, state: str | None = None, pr_url: str | None = None
+    finding: dict,
+    *,
+    state: str | None = None,
+    pr_url: str | None = None,
+    new: bool = False,
 ) -> str:
     """One line naming a finding the body has no room to show in full.
 
-    A bullet, never a `FINDING_HEADING`: the readers that recover a finding's
-    detail from its heading (`FINDING_MARKER_RE`, the Slack card) must not
-    take a listed one for a finding whose detail is on the ledger.
+    A bullet, never a `FINDING_HEADING`: `FINDING_MARKER_RE`, which recovers a
+    finding's detail from its heading, must not take a listed one for a finding
+    whose detail is on the ledger. `parse_finding_locations` and the chat card
+    (`slack_audit_report.py`) read these bullets inside `LISTED_SECTION_BEGIN`
+    and `LISTED_SECTION_END`.
 
     A state other than open, and its pull request, follow the id: the state
     index covers full rows only, so a listed row is the one place a reader
     finds them.
 
-    A finding the shared-account shield made manual keeps the shield on an
-    indented line under the bullet: it is the instruction not to apply the
-    namespace-wide fix, and without it the row reads like any other 2.7
-    finding. `LISTED_LINE_RE` reads the bullet line alone.
+    When `new` is true, `NEW_MARKER` sits indented on the line beneath the
+    bullet so the chat card tags it like a full row. A finding the
+    shared-account shield made manual keeps the shield on an indented line
+    under the bullet: it is the instruction not to apply the namespace-wide
+    fix, and without it the row reads like any other 2.7 finding.
+    `LISTED_LINE_RE` reads the bullet line alone.
     """
     fid = str(finding.get("id", ""))
     suffix = ""
@@ -12804,13 +13162,17 @@ def render_listed_finding(
     namespace = _ident(str(finding.get("namespace", "")))
     where = f"`{_ident(str(finding.get('cluster', '')))}`"
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
-    line = (
+    lines = [
         f"- **{_cell(str(finding.get('severity', '')))}** — "
         f"{_cell(str(finding.get('title', '')))} — {where} — "
         f"`{_ident(str(finding.get('object', '')))}` (`{fid}`){suffix}"
-    )
+    ]
+    if new:
+        lines.append(f"{LISTED_CONTINUATION_INDENT}{NEW_MARKER}")
     shield = _shared_account_shield(finding)
-    return line + (f"\n  {shield}" if shield else "")
+    if shield:
+        lines.append(f"{LISTED_CONTINUATION_INDENT}{shield}")
+    return LINE_JOINER.join(lines)
 
 
 def _shared_account_shield(finding: dict) -> str:
@@ -12880,114 +13242,107 @@ def _render_listed(
     listed: list[dict],
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
+    *,
+    new_ids: set[str] | None = None,
 ) -> list[str]:
     if not listed:
         return []
+    marked = new_ids or set()
     return _listed_header(len(listed)) + [
         render_listed_finding(
             finding,
-            state=(states or {}).get(str(finding.get("id", ""))),
-            pr_url=(pr_urls or {}).get(str(finding.get("id", ""))),
+            state=(states or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+            pr_url=(pr_urls or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+            new=str(finding.get(FINDING_ID_FIELD, "")) in marked,
         )
         for finding in sort_findings(listed)
     ] + [LISTED_SECTION_END]
 
 
 def split_findings_for_body(
-    findings: list[dict], budget: int, **render_args
+    findings: list[dict],
+    budget: int,
+    *,
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
+    new_ids: set[str] | None = None,
+    **render_args,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Split the findings into (shown in full, listed on one line, omitted).
 
-    Band by band, most severe first. In the band where the full blocks stop
-    fitting, a name outranks a full block: the band shows as many full blocks
-    as still leave room to name the rest of it and every finding below it,
-    and when even that cannot fit, only its floor of full blocks. The
-    critical band reserves room for its own names only, so a critical never
-    loses its evidence to a less severe finding's name. Every band below is
-    names only, as many as fit, and a count for the rest. The first finding is always shown in full,
-    as `select_rendered_findings` guarantees. A listed finding's id rides the
-    delta block like a full one's, so every reader of that block treats it
-    as on the ledger.
+    Most severe first, fair-share across targets within each band. Once all
+    full blocks do not fit, a one-line row outranks a full block in every
+    severity band (critical included): the body shows as many full blocks from
+    the top down as still leave room to list every remaining finding on one
+    line, and when even one full block plus every remaining line cannot fit,
+    keeps the first finding in full and spends the rest of the budget listing
+    remaining findings down the severity bands, with a count for whatever
+    still cannot fit. State-index space (`_index_prefix_costs`) is charged
+    against the full-row prefix chosen whenever `states` carries a state. A
+    listed finding's id rides the delta block like a full one's, so every
+    reader of that block treats it as on the ledger.
     """
-    rendered, rest = select_rendered_findings(findings, budget, **render_args)
-    if not rest:
-        return rendered, [], []
     order = _fair_share_order(sort_findings(findings))
+    if not order:
+        return [], [], []
+    idx_costs = _index_prefix_costs(order, states, pr_urls)
+    full = [
+        _full_row_cost(
+            finding,
+            states=states,
+            pr_urls=pr_urls,
+            new_ids=new_ids,
+            **render_args,
+        )
+        for finding in order
+    ]
+    prefix_full = [0]
+    for cost in full:
+        prefix_full.append(prefix_full[-1] + cost)
+    if prefix_full[len(order)] + idx_costs[len(order)] <= budget:
+        return sort_findings(order), [], []
     # + 1 for the newline joining each line to the one before it, and the
     # id's slot in the hidden delta block.
+    marked = new_ids or set()
     line_costs = [
         len(
             render_listed_finding(
                 finding,
-                state=(render_args.get("states") or {}).get(str(finding.get("id", ""))),
-                pr_url=(render_args.get("pr_urls") or {}).get(str(finding.get("id", ""))),
+                state=(states or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+                pr_url=(pr_urls or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+                new=str(finding.get(FINDING_ID_FIELD, "")) in marked,
             )
         )
         + 1
-        + len(str(finding.get("id", "")))
+        + len(str(finding.get(FINDING_ID_FIELD, "")))
         + DELTA_SLOT_CHARS
         for finding in order
     ]
-    # Charged once, at its widest, when the first finding is listed.
-    header = len("\n".join(_listed_header(len(order)))) + len("\n" + LISTED_SECTION_END)
-    full_rows: list[dict] = []
+    # Charged once, at its widest, when at least one finding is listed.
+    header = len(LINE_JOINER.join(_listed_header(len(order)))) + len(
+        LINE_JOINER + LISTED_SECTION_END
+    )
+    tail = [0] * (len(order) + 1)
+    for index in range(len(order) - 1, -1, -1):
+        tail[index] = tail[index + 1] + line_costs[index]
+    fitted = next(
+        (
+            count
+            for count in range(len(order) - 1, 0, -1)
+            if prefix_full[count] + idx_costs[count] + header + tail[count] <= budget
+        ),
+        1,
+    )
+    left = budget - prefix_full[fitted] - idx_costs[fitted] - header
     listed: list[dict] = []
     omitted: list[dict] = []
-    left = budget
-    start = 0
-    while start < len(order):
-        end = start
-        while end < len(order) and _severity_band(order[end]) == _severity_band(order[start]):
-            end += 1
-        band = order[start:end]
-        lines = line_costs[start:end]
-        below = sum(line_costs[end:])
-        start = end
-        if listed or omitted:
-            for finding, cost in zip(band, lines):
-                if not omitted and cost <= left:
-                    listed.append(finding)
-                    left -= cost
-                else:
-                    omitted.append(finding)
-            continue
-        full = [_full_row_cost(finding, **render_args) for finding in band]
-        tail = [0] * (len(band) + 1)
-        for index in range(len(band) - 1, -1, -1):
-            tail[index] = tail[index + 1] + lines[index]
-        floor = 0 if full_rows else 1
-        # Room kept for naming every finding below this band, when that can
-        # fit at all.
-        critical = _severity_band(band[0]) == SEVERITY_RANK["critical"]
-        reserve = 0 if critical else below
-        # Below the critical band, a name outranks a full block whether or not
-        # every name fits: when they do not, this band keeps only its floor of
-        # full blocks and the rest of the budget names as many as it can.
-        names_first = not critical and sum(full[:floor]) + header + tail[floor] + below > left
-        if not names_first and sum(full) + (header + reserve if reserve else 0) <= left:
-            full_rows += band
-            left -= sum(full)
-            continue
-        fitted = floor
-        used = sum(full[:floor])
-        # A full block costs more than the line naming the same finding, so
-        # each extra full block raises the total and the first failure is final.
-        for index in range(floor, 0 if names_first else len(band)):
-            if used + full[index] + header + tail[index + 1] + reserve > left:
-                break
-            used += full[index]
-            fitted = index + 1
-        full_rows += band[:fitted]
-        # The header is paid by the first listed row; a band its floor of full
-        # blocks used up leaves it to the next band.
-        left -= used + (header if fitted < len(band) else 0)
-        for finding, cost in zip(band[fitted:], lines[fitted:]):
-            if not omitted and cost <= left:
-                listed.append(finding)
-                left -= cost
-            else:
-                omitted.append(finding)
-    return sort_findings(full_rows), sort_findings(listed), sort_findings(omitted)
+    for finding, cost in zip(order[fitted:], line_costs[fitted:]):
+        if not omitted and cost <= left:
+            listed.append(finding)
+            left -= cost
+        else:
+            omitted.append(finding)
+    return sort_findings(order[:fitted]), sort_findings(listed), sort_findings(omitted)
 
 
 def _dry_run_repo(audit_id: str, repo: str | None) -> str | None:
@@ -13372,13 +13727,20 @@ def _render_findings(
                 unlinked_paths=unlinked_paths,
             )
 
-    out += _render_listed(listed, states, pr_urls)
+    out += _render_listed(listed, states, pr_urls, new_ids=new_ids)
     if omitted:
+        omitted_counts = severity_counts(omitted)
+        breakdown = SUMMARY_BREAKDOWN_SEPARATOR.join(
+            SUMMARY_BREAKDOWN_PART.format(count=count, severity=severity)
+            for severity, count in omitted_counts.items()
+            if count
+        )
+        detail = OMITTED_BREAKDOWN_WRAP.format(breakdown=breakdown) if breakdown else ""
         out += [
             "",
             f"_{len(omitted)} further finding(s) are omitted from this description to "
             "stay inside GitHub's body limit. The counts in the title and in the "
-            "summary above are the true totals; the omitted findings are the "
+            f"summary above are the true totals; the omitted findings{detail} are the "
             "least severe. They are kept in full in this run's stored report; ask "
             "the agent for that report to read them._",
         ]
@@ -13983,6 +14345,59 @@ class RenderedIssue(NamedTuple):
         return bool(self.omitted or self.listed)
 
 
+def _group_check_evidence(
+    clusters: list[dict], audit_id: str
+) -> tuple[dict[tuple[str, str], list[str]], dict[tuple[str, str], list[str]]]:
+    """Group `(check, command)` and `(check, reason)` across clusters in appearance order."""
+    if not audit_checks(audit_id):
+        return {}, {}
+    grouped: dict[tuple[str, str], list[str]] = {}
+    na_grouped: dict[tuple[str, str], list[str]] = {}
+    for cluster in clusters:
+        name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
+        for entry in cluster.get("checks_run") or []:
+            if not isinstance(entry, dict):
+                continue
+            check = str(entry.get("check", "")).strip()
+            command = str(entry.get("command", "")).strip()
+            if check and command:
+                grouped.setdefault((check, command), []).append(name)
+        for entry in cluster.get("checks_not_applicable") or []:
+            if not isinstance(entry, dict):
+                continue
+            check = str(entry.get("check", "")).strip()
+            reason = str(entry.get("reason", "")).strip()
+            if check and reason:
+                na_grouped.setdefault((check, reason), []).append(name)
+    return grouped, na_grouped
+
+
+def _format_check_evidence_notice(ran: int, declared: int) -> list[str]:
+    """One-line notice emitted when the check-evidence table is dropped for space."""
+    excluded = f" and the {declared} exclusion(s)" if declared else ""
+    return [
+        "",
+        f"_The commands behind this run's {ran} check(s){excluded} do not "
+        "fit GitHub's body limit and are omitted here. They are kept in full in "
+        "this run's stored report; ask the agent for that report to re-run any "
+        "of them._",
+    ]
+
+
+def _check_evidence_notice(clusters: list[dict], audit_id: str) -> list[str]:
+    """The dropped-table notice when check evidence exists, else `[]`.
+
+    Shared with `_render_check_evidence` and measured before finding selection
+    so an overflowing body never drops the check-evidence table silently.
+    """
+    grouped, na_grouped = _group_check_evidence(clusters, audit_id)
+    if not grouped and not na_grouped:
+        return []
+    ran = sum(len(names) for names in grouped.values())
+    declared = sum(len(names) for names in na_grouped.values())
+    return _format_check_evidence_notice(ran, declared)
+
+
 def _render_check_evidence(
     clusters: list[dict], audit_id: str, budget: int
 ) -> list[str]:
@@ -14008,29 +14423,7 @@ def _render_check_evidence(
     same words. The row names every cluster it answers for. A command that
     names its own cluster (`kubectl --context <cluster>`) collapses nothing.
     """
-    if not audit_checks(audit_id):
-        return []
-    # Keyed by (check, command) and (check, reason), in order of first
-    # appearance, so a run where each command is different gives the same
-    # rows as one row per cluster.
-    grouped: dict[tuple[str, str], list[str]] = {}
-    na_grouped: dict[tuple[str, str], list[str]] = {}
-    for cluster in clusters:
-        name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
-        for entry in cluster.get("checks_run") or []:
-            if not isinstance(entry, dict):
-                continue
-            check = str(entry.get("check", "")).strip()
-            command = str(entry.get("command", "")).strip()
-            if check and command:
-                grouped.setdefault((check, command), []).append(name)
-        for entry in cluster.get("checks_not_applicable") or []:
-            if not isinstance(entry, dict):
-                continue
-            check = str(entry.get("check", "")).strip()
-            reason = str(entry.get("reason", "")).strip()
-            if check and reason:
-                na_grouped.setdefault((check, reason), []).append(name)
+    grouped, na_grouped = _group_check_evidence(clusters, audit_id)
     # Counted before the rows collapse: the reader is owed the number of
     # (cluster, check) pairs, not the number of different commands.
     ran = sum(len(names) for names in grouped.values())
@@ -14091,14 +14484,7 @@ def _render_check_evidence(
     # runs whose findings crowded it out, which are the runs where a fabricated
     # check would matter most, and silence there leaves a document that looks
     # complete. Name the omission and say where the commands survive.
-    excluded = f" and the {declared} exclusion(s)" if na_grouped else ""
-    notice = [
-        "",
-        f"_The commands behind this run's {ran} check(s){excluded} do not "
-        "fit GitHub's body limit and are omitted here. They are kept in full in "
-        "this run's stored report; ask the agent for that report to re-run any "
-        "of them._",
-    ]
+    notice = _format_check_evidence_notice(ran, declared)
     return notice if len("\n".join(notice)) <= budget else []
 
 
@@ -14198,7 +14584,7 @@ def render_issue_body(
 
     # Measure the footer with the held ids in the block and an empty rendered
     # set: each finding is separately charged for its own id slot inside
-    # select_rendered_findings. The held *rows* are not charged here — they
+    # `split_findings_for_body`. The held *rows* are not charged here — they
     # are measured after the findings, below, so they can never displace one.
     overhead = len("\n".join(fixed + declared_section + withheld_section))
     # The complete id list — the document's findings and the held ids, the
@@ -14210,13 +14596,21 @@ def render_issue_body(
     all_block = all_findings_block(finding_ids(findings) + held_ids)
     overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
     # And the held span's smallest form, so the list the next run carries
-    # from is never the thing the findings squeeze out.
+    # from is never the thing the findings squeeze out. The dropped
+    # check-evidence notice is reserved here too so a body that drops the
+    # evidence table always names where the commands survive. The state index
+    # is charged inside `_render_findings` against the full-row prefix
+    # `split_findings_for_body` chooses rather than reserved here for fifty
+    # full rows.
+    evidence_notice = _check_evidence_notice(clusters, audit_id)
+    evidence_notice_cost = (
+        len(LINE_JOINER) + len(LINE_JOINER.join(evidence_notice))
+        if evidence_notice
+        else 0
+    )
     overhead += len("\n".join(_render_held_ids_only(held_entries)))
-    overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
-    if states:
-        # The state index is one row per rendered finding, capped, and is not
-        # part of any single finding's charged cost.
-        overhead += index_overhead(findings, states, pr_urls)
+    overhead += evidence_notice_cost
+    overhead += len("\n".join(["", "## Findings", "", ""])) + SECTION_CHROME_CHARS
 
     def select(extra: int) -> tuple[list[str], list[dict], list[dict]]:
         return _render_findings(
@@ -14263,6 +14657,7 @@ def render_issue_body(
     # first finding renders whatever it costs, and a tier that had to compete
     # for the remainder could lose to it and drop the hold.
     held_section: list[str] = _render_held_ids_only(held_entries)
+    held_room = max(BODY_BUDGET - spent - evidence_notice_cost - len(LINE_JOINER), 0)
     for candidate_section in (
         _render_collector_held(
             held_entries,
@@ -14290,14 +14685,23 @@ def render_issue_body(
             unread_overflow=unread_overflow,
         ),
     ):
-        if len("\n".join(candidate_section)) <= max(BODY_BUDGET - spent, 0):
+        if len(LINE_JOINER.join(candidate_section)) <= held_room:
             held_section = candidate_section
             break
-    spent += len("\n".join(held_section))
+    spent = len(
+        LINE_JOINER.join(
+            fixed + findings_lines + held_section + declared_section + withheld_section + footer
+        )
+    )
     # Whatever the findings did not need. The evidence appendix is the last
     # claim on the budget, never a competitor for it — a run with 400 findings
-    # publishes the findings and drops the appendix, not the reverse.
-    evidence = _render_check_evidence(clusters, audit_id, max(BODY_BUDGET - spent, 0))
+    # publishes the findings and drops the appendix, not the reverse. Its
+    # dropped-table notice was reserved before finding selection so a dropped
+    # table always carries the notice.
+    evidence_budget = max(BODY_BUDGET - spent - len(LINE_JOINER), 0)
+    evidence = _render_check_evidence(clusters, audit_id, evidence_budget)
+    if not evidence and evidence_notice and spent + evidence_notice_cost <= MAX_BODY_CHARS:
+        evidence = evidence_notice
 
     body = "\n".join(
         fixed
@@ -14885,7 +15289,7 @@ def render_remediation_pr_body(
     `unlabelled` is a forge with no labels: the body then also carries the
     stream marker, which is how the next run finds this pull request.
 
-    `safety` is `pdb_safety_section`'s answer, placed after the files.
+    `safety` is `safety_section`'s answer, placed after the files.
     """
     ordered = sort_findings(group)
     ids = sorted(str(f.get("id", "")) for f in ordered if f.get("id"))
@@ -16477,12 +16881,12 @@ def _stored_ledger_numbers(audit_id: str, repo: str) -> list[int]:
     the list is short, and it usually has one number.
     """
     try:
-        directory = reports_dir_for(audit_id, repo)
+        store = report_store_dir(audit_id, repo)
     except ValueError:
         return []
-    envelopes = _ring_envelopes(directory / REPORT_RUNS_DIR)
+    envelopes = _ring_envelopes(store)
     try:
-        envelopes.append(json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8")))
+        envelopes.append(json.loads(store.read(REPORT_LATEST_NAME)))
     except (OSError, ValueError):
         pass
     numbers: set[int] = set()
@@ -17728,7 +18132,7 @@ def open_remediation_pr(
     # known is taken to have labels, and the label write below corrects it.
     labelled = _LABELS.get(repo, True)
     # Read once: the label fallback below re-renders the same body.
-    safety = pdb_safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
+    safety = safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
     body = render_remediation_pr_body(
         audit_id,
         group,
@@ -17828,7 +18232,7 @@ def carries_practice_label(pr: dict | None) -> bool:
 def request_practice_label(repo: str, number: int | str) -> None:
     """Ask the broker to judge pull request `number` for the auto-merge label.
 
-    Called where `pdb_safety_section` wrote a section (the switch on, a group
+    Called where `safety_section` wrote a section (the switch on, a group
     holding a disruption-budget fix), and on a refresh of a pull request that
     already carries the label. The broker reads everything itself and decides;
     this sends the number and logs the answer. A refusal is logged and nothing
@@ -18540,53 +18944,27 @@ def unwritten_refusal_message(
     return " ".join(parts)
 
 
+def _no_pdb_fix():
+    """The `no-pdb` recipe's generator (`fix_recipes/no-pdb/fix.py`).
+
+    Lazy, as `gitops_workspace` is (the module comment on `sys.path`)."""
+    from fix_recipes import registry
+
+    return registry.generator(GENERATED_FIX_CHECK)
+
+
 def _pdb_unbuildable_reason(candidate: dict) -> str:
     """Why `_pdb_manifest` builds nothing for `candidate`, in the refusal's words,
-    or "" where it builds one. The one place those refusals are decided, so the
-    note the worker reads names the refusal `_pdb_manifest` made."""
-    selector = candidate.get("pod_selector")
-    if not isinstance(selector, dict) or not selector:
-        return "the collector attached no selector to write it from"
-    if set(selector) - LABEL_SELECTOR_KEYS:
-        return "the collector's selector has keys `policy/v1` does not take"
-    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
-        return "the collector's selector is empty, and would select every pod in the namespace"
-    workload = str(candidate.get("object") or "").partition("/")[2]
-    if not KUBERNETES_NAME_PATTERN.match(f"{workload}{GENERATED_PDB_SUFFIX}"):
-        return "its name would not be a valid Kubernetes name"
-    if not KUBERNETES_NAME_PATTERN.match(str(candidate.get("namespace") or "")):
-        return "the collector named no valid namespace for it"
-    return ""
+    or "" where it builds one: the recipe's `unbuildable_reason`, so the note the
+    worker reads names the refusal `_pdb_manifest` made."""
+    return _no_pdb_fix().unbuildable_reason(candidate)
 
 
 def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
-    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None.
-
-    `maxUnavailable: 1` and the workload's `spec.selector` verbatim, which the
-    collector carries as `pod_selector`. None where that cannot be written
-    safely (`_pdb_unbuildable_reason`): no selector, an empty one (which would
-    select every pod in the namespace), keys `policy/v1` does not take, or a
-    name or namespace Kubernetes refuses.
-    """
-    if _pdb_unbuildable_reason(candidate):
-        return None
-    selector = candidate["pod_selector"]
-    name = f"{str(candidate.get('object') or '').partition('/')[2]}{GENERATED_PDB_SUFFIX}"
-    namespace = str(candidate.get("namespace") or "")
-    # JSON is YAML, so the selector is written exactly as it was read.
-    text = (
-        f"# {candidate.get('cluster', '')}: {GENERATED_FIX_CHECK} on {candidate.get('object')} "
-        f"({finding_id})\n"
-        "apiVersion: policy/v1\n"
-        "kind: PodDisruptionBudget\n"
-        "metadata:\n"
-        f"  name: {name}\n"
-        f"  namespace: {namespace}\n"
-        "spec:\n"
-        "  maxUnavailable: 1\n"
-        f"  selector: {json.dumps(selector, sort_keys=True)}\n"
-    )
-    return name, text
+    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None: the
+    `no-pdb` recipe's `generate` (`fix_recipes/no-pdb/fix.py`), which says when
+    it refuses and pins the text byte for byte."""
+    return _no_pdb_fix().generate(candidate, finding_id)
 
 
 def _broker_outage(exc: BaseException) -> bool:
@@ -22963,7 +23341,7 @@ def _open_promoted_prs(
     """Open (or refresh) one pull request per group holding a promoted finding.
 
     `on_open` runs after each one, before the next is tried. `manifest` is the
-    run's collector manifest, which `pdb_safety_section` needs.
+    run's collector manifest, which `safety_section` needs.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
@@ -23609,7 +23987,7 @@ def _previous_store_envelope(
     path, which closes fixes, reads `_store_ledger_envelope` instead.
     """
     try:
-        directory = reports_dir_for(audit_id, store_repo)
+        directory = report_store_dir(audit_id, store_repo)
     except ValueError as exc:
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None, False
@@ -23687,7 +24065,7 @@ def _store_ledger_envelope(
       one that failed; trusting it would miss what the failed run published.
     - A diverted `latest.json` (`is_diverted`) defers to the newest envelope in
       `runs/` that is not diverted (`_newest_published_envelope`). When there
-      is none, and the ring is shorter than `REPORT_HISTORY` and no fix of
+      is none in a ring read whole, and the ring is shorter than `REPORT_HISTORY` and no fix of
       this stream is open, no run ever stored a ledger here and nothing can
       close: the run is first, as when a run that could not reach the
       repository created the directory. Otherwise the memory stays lost: a
@@ -23704,7 +24082,7 @@ def _store_ledger_envelope(
       stored body of another scheme.
     """
     try:
-        directory = reports_dir_for(audit_id, repo)
+        directory = report_store_dir(audit_id, repo)
     except ValueError as exc:
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None, False
@@ -23722,9 +24100,8 @@ def _store_ledger_envelope(
             f"stream is open; {MEMORY_UNKNOWABLE}"
         )
         return None, False
-    path = directory / REPORT_LATEST_NAME
     try:
-        envelope = json.loads(path.read_text(encoding="utf-8"))
+        envelope = json.loads(directory.read(REPORT_LATEST_NAME))
     except FileNotFoundError:
         log(
             f"No stored ledger for {audit_id} in {repo}: latest.json is absent from a store "
@@ -23738,11 +24115,10 @@ def _store_ledger_envelope(
         )
         return None, False
     if is_diverted(envelope):
-        runs = directory / REPORT_RUNS_DIR
-        envelope = _newest_published_envelope(runs)
-        if envelope is None and open_fix is False:
+        envelope, known = _read_newest_published_envelope(directory)
+        if envelope is None and open_fix is False and known:
             try:
-                ring = len(list(runs.glob("*.json")))
+                ring = len(directory.ring())
             except OSError:
                 ring = REPORT_HISTORY
             if ring < REPORT_HISTORY:
@@ -25121,7 +25497,7 @@ def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | No
     except Exception as exc:  # noqa: BLE001 -- a resolver failure is a reason to run in full
         return None, f"the repository could not be resolved ({exc})"
     try:
-        directory = reports_dir_for(audit_id, store_repo)
+        directory = report_store_dir(audit_id, store_repo)
     except ValueError as exc:
         return None, f"no report store for {store_repo} ({exc})"
     key = _ledger_key(store_repo)

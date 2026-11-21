@@ -79,7 +79,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
 	dispatcher := impersonatedClient(t, cfg, agent.Namespace, a2aDispatcherName(agent))
 
-	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false)
+	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false, a2aTaskSigningKeyPlaceholder)
 	// A PodTemplate already under a param's name: the operator's dry run
 	// generates its name, so it doesn't collide.
 	mustCreate(ctx, t, admin, &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + "tse", Namespace: pns}, Template: *tse.DeepCopy()})
@@ -87,7 +87,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	// Before any operator param: DispatchJobTemplates without its labels, one
 	// posing as the index and listing tse's account, one as tse's template.
 	// Neither is selected, so the Job finds no param and is denied.
-	foreignIndex := buildDispatchJobIndex(agent, map[string]*corev1.PodTemplateSpec{"tse": tse})
+	foreignIndex := buildDispatchJobIndex(agent, unattendedJobTemplateSets(map[string]*corev1.PodTemplateSpec{"tse": tse}))
 	foreignIndex.Labels = map[string]string{"x": "y"}
 	foreignTemplate := envtestParam(ctx, t, admin, agent, "tse", tse)
 	foreignTemplate.Labels = nil
@@ -178,14 +178,14 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	for i, name := range names {
 		profile := fmt.Sprintf("s%d", i)
 		staticProfile[name] = profile
-		tmpl := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, profile)), false)
+		tmpl := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, profile)), false, a2aTaskSigningKeyPlaceholder)
 		static[name].mutate(&tmpl.Spec)
 		templates[profile] = tmpl
 	}
 	for profile, tmpl := range templates {
 		mustCreate(ctx, t, admin, envtestParam(ctx, t, admin, agent, profile, tmpl))
 	}
-	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, templates))
+	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, unattendedJobTemplateSets(templates)))
 
 	// The policy's params come from an informer; wait until the rendered
 	// template is admitted.
@@ -478,11 +478,11 @@ func applyDispatcherJobPolicy(ctx context.Context, t *testing.T, c client.Client
 func envtestParam(ctx context.Context, t *testing.T, c client.Client, agent *agentv1alpha1.PlatformAgent, profile string, tmpl *corev1.PodTemplateSpec) *agentv1alpha1.DispatchJobTemplate {
 	t.Helper()
 	r := &PlatformAgentReconciler{Client: c}
-	defaulted, err := r.defaultedJobTemplate(ctx, profileNamespaceName(agent), profile, tmpl)
+	defaulted, err := r.defaultedJobTemplate(ctx, profileNamespaceName(agent), dispatchJobTemplatePrefix+profile, tmpl)
 	if err != nil {
 		t.Fatal(err)
 	}
-	param, err := buildDispatchJobTemplate(agent, profile, tmpl, defaulted)
+	param, err := buildDispatchJobTemplate(agent, dispatchJobTemplatePrefix+profile, dispatchJobTemplateHash(tmpl), defaulted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestTheDispatcherJobPolicyFailsClosedOnAFreshInstall(t *testing.T) {
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRole(agent))
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
 	dispatcher := impersonatedClient(t, cfg, agent.Namespace, a2aDispatcherName(agent))
-	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false)
+	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false, a2aTaskSigningKeyPlaceholder)
 	wrong := tse.DeepCopy()
 	wrong.Spec.Containers[0].Image = "registry.example/evil:1"
 
@@ -564,7 +564,7 @@ func TestTheDispatcherJobPolicyFailsClosedOnAFreshInstall(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, templates))
+	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, unattendedJobTemplateSets(templates)))
 
 	admittedAt := time.Duration(0)
 	for n := 0; time.Since(start) < 2*gatewayPodPolicyActivation; n++ {

@@ -99,7 +99,8 @@ byte that reaches the broker by another route. The table matches exact text, and
 it saw must be what is forwarded; the query check is also what keeps a byte`http.client`will not put on a request line from surfacing as a traceback, and a`UnicodeError`or`InvalidURL` from the upstream request is answered with the same 400 as a second line
 (`UnicodeError`and not`ValueError`: `ssl.SSLCertVerificationError`is a`ValueError` too,
    and a TLS fault is answered as the upstream's, 502).
-3. Evaluates `api_policy.evaluate(method, host, path, query)`. A refusal answers 403 with the
+3. Evaluates `api_policy.evaluate(method, host, path, query, universe_domain=...)` with the
+   install's universe domain. A refusal answers 403 with the
    same body shape `/v1/exec` uses, so a caller that already reads `rule` and `message` reads
    these:
 
@@ -143,17 +144,27 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
 
 6. Writes two audit lines per request, on the pattern of the exec route: one before the
    decision and exactly one verdict after it. The request id is minted by the broker, so the
-   two lines of one request share it:
+   lines of one request share it. A read with a body that names one resource (today
+   `entries:list`) writes one more line between the two, when its body passes the route's
+   check:
 
    ```
    api request_id=%s principal=%s host=%s path=%s
    api rejected request_id=%s code=%s reason=%s
    api blocked request_id=%s rule=%s
-   api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d
+   api body checked request_id=%s rule=%s resource=%s
+   api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d[ resource=%s]
    ```
 
    `host` and `path` are caller text and go through `_sanitize_for_logging` as `argv[0]`
-   does (`path` at 256 characters, the width the exec route gives a `cwd`). The upstream
+   does (`path` at 256 characters, the width the exec route gives a `cwd`). The forwarded line
+   of a read with a body ends with ` resource=projects/<project>`, the one resource name its
+   body check passed: the path of such a read names no project. The `api body checked` line
+   names the same resource before the upstream call, so a verdict that is not `forwarded`
+   (over the cap, a redirect, an upstream or credential failure, a disabled relay) also
+   follows a line that says which project the read asked for. A refused body returns before
+   that line: its resource is in no line. The `audit` mapping does not carry the resource,
+   and the `api body checked` line carries no `audit` mapping. The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
    writes `api disabled request_id=%s rule=%s`. Each of these records also carries the
@@ -161,8 +172,9 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)), so
    a relayed read is in the same `tool_execution_audit` trail as a brokered command. The
    `tool` is `gcp-api`, apart from `gcloud` so that a `gcloud` record still means a process
-   ran; the `subcommand` is the service word of a host the table names (`monitoring`,
-   `cloudtrace`, `container`, `logging`) and `other` for any other host. The first line is `started`; the
+   ran; the `subcommand` is the service word of a host the table names in the install's
+   universe domain (`monitoring`, `cloudtrace`, `container`, `logging`) and `other` for any
+   other host, the commercial host on a custom universe domain included. The first line is `started`; the
    verdict is `rejected` for a 400, `blocked` with the `rule` for a 403, `completed` with
    `duration_ms` and `upstream_status` for a forwarded answer whatever its status, and
    `failed` for the disabled relay, a credential the broker cannot obtain and each upstream
@@ -202,8 +214,8 @@ Authorization: Bearer <projected caller token>
 The handler decides on the method, host and path before it reads a byte of the body. A `POST`
 that is not, exactly, a table entry with a body check is refused with `gcp.api.method` and its
 body is drained and discarded, as before. On an install with a custom universe domain the
-entry's host is that universe's Logging host, as for the `GET` routes, and the commercial host
-is refused. For the entry, in order:
+entry's host is that universe's Logging host and the commercial host is refused, by the rule
+[the policy module](#the-policy-module) states for every route. For the entry, in order:
 
 1. The query must be empty (`gcp.api.body`): the read's arguments are its body, and a query
    is a second place to put one.
@@ -292,16 +304,36 @@ validator refuses a table that names one. `PROJECT` is Google's project-id gramm
 number (a decimal int64), since an install's `projectId` may be either, and `HOST_SHAPE` the host
 grammar the table and the handler share.
 
+`evaluate` reads the table in the install's universe domain, which the handler passes to it. On
+the commercial domain, `googleapis.com`, the hosts are as the table writes them. On a custom
+universe domain each `<service>.googleapis.com` host of the table is read as
+`<service>.<universe domain>`, so the host as the table writes it is in no route there: a `GET`
+for it is refused with `gcp.api.host`, any other method at step 1. A `REFUSED_HOSTS` entry is
+refused there as written, and a `<service>.googleapis.com` entry also as
+`<service>.<universe domain>`. A universe domain that is not valid, which is a malformed one or
+one under `googleapis.com`, has no routed host, so every request is refused: a `GET` with
+`gcp.api.host`, any other method at step 1. The broker does not start with such a value.
+
+The broker also does not start with a value from its environment (`GOOGLE_CLOUD_UNIVERSE_DOMAIN`,
+then `CLOUDSDK_CORE_UNIVERSE_DOMAIN`) that the host's metadata server contradicts: a well-formed
+value can name hosts of another universe, or commercial hosts under another name, and the
+metadata server says which universe the host is in. A value that the metadata server confirms
+starts. A host with no universe route (HTTP 404) starts too, with a WARNING record that the value
+was not checked. If the metadata server gives no answer in ten tries, about 15 seconds, the
+broker starts with the value and writes the same record: a host with no metadata server, such
+as a harness on kind, never gets an answer. The operator holds `spec.harness.universeDomain` to
+the same answer before it renders; the broker's check holds what its own environment names.
+
 `evaluate` answers in this order, and the order is the security argument:
 
 1. A `POST` that is not exactly the host and path of an entry with a body check, or any
    method other than `GET` and `POST` → `gcp.api.method`. A `POST` that is such an entry is
    allowed here when its query is empty (`gcp.api.body` otherwise), and its body is still to
    pass `evaluate_body`.
-2. Host in `REFUSED_HOSTS` → `gcp.api.host-refused`. Listed separately from an unknown host so
+2. Host in `REFUSED_HOSTS`, in either of those forms → `gcp.api.host-refused`. Listed separately from an unknown host so
    the log distinguishes "asked for a token endpoint" from "asked for a service nobody has
    added".
-3. Host not in any route → `gcp.api.host`.
+3. Host not in any route for the universe domain → `gcp.api.host`.
 4. Host known, path matches no route → `gcp.api.path`, with the message naming the rule ids
    that host does have.
 5. Otherwise allowed, carrying the matching `rule_id` for the audit line.
@@ -380,13 +412,19 @@ class ApiSession:
 `relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,
 where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set and well-formed, else
 `CREDENTIAL_PROXY_URL` ([credential-broker-exec-tier.md](credential-broker-exec-tier.md) §3.2
-has the routing and the fallback). `requests` is imported inside the
+has the routing and the fallback). When the caller's environment names a custom universe domain
+(`GOOGLE_CLOUD_UNIVERSE_DOMAIN`, which the sandbox entrypoint forwards to each sandbox SSH
+session, then `CLOUDSDK_CORE_UNIVERSE_DOMAIN`), `relay_url` also rewrites a
+`<service>.googleapis.com` host to `<service>.<universe domain>`, the form in which
+[the policy module](#the-policy-module) reads the table's hosts there.
+`requests` is imported inside the
 constructor and nowhere at module scope, so the broker and every other importer of the module
 stay free of it; `http` is injectable for tests and for a caller that already holds a session.
 
 Two properties of that shape are the point. A collector's URL literal,
 `https://monitoring.googleapis.com/v3/projects/{project}/timeSeries`, stays as written, so a
-manifest's evidence label still names the real endpoint. And the object satisfies a
+manifest's evidence label still names the Google endpoint the collector reads, in its commercial
+form on a custom universe domain. And the object satisfies a
 `SessionFn`-style contract — "anything with a `requests`-shaped `.get(url, params=,
 timeout=)`" — so code written against `google.auth.transport.requests.AuthorizedSession`
 runs against it unchanged.
@@ -442,7 +480,7 @@ before the host is read.
 | Supply its own credential or an API key                              | Caller headers dropped; `key`/`access_token`/`oauth_token`/`bearer_token` stripped                                                                                                                                 |
 | Put a byte on the upstream request line the broker did not choose    | `API_RELAY_QUERY_SHAPE`: URL query characters (RFC 3986's plus `[` `]`) and complete percent-escapes only, 400 before the table                                                                                    |
 | Send the front end an over-long URL on demand                        | `API_RELAY_MAX_QUERY_BYTES`, 400 before the table; a 414 that does arrive is passed through like any other status                                                                                                  |
-| Forge an audit line                                                  | `_sanitize_for_logging` on every caller-supplied field, as on `/v1/exec`                                                                                                                                           |
+| Forge an audit line                                                  | `_sanitize_for_logging` on every caller-supplied field, as on `/v1/exec`; a body's resource name is logged only after `check_logging_entries_list` held it to `projects/<project>`                                 |
 | Call it from the gateway role                                        | `ROUTE_ROLES` admits `shell` only                                                                                                                                                                                  |
 | Exhaust the broker with a huge response, or hand it a page cut short | `API_RELAY_MAX_RESPONSE_BYTES`, read in chunks with a cap rather than `.read()`; a body short of its `Content-Length` is `UPSTREAM_TRUNCATED`, none of it relayed                                                  |
 | Park a broker thread on a stalled upstream                           | `API_RELAY_CONNECT_TIMEOUT_S` on the connect; `API_RELAY_DEADLINE_S` re-armed on the socket before every `read1`                                                                                                   |
@@ -517,7 +555,12 @@ standing in for `monitoring.googleapis.com` and the real `GoogleApiRelay.fetch` 
   included), a request that cannot be framed or has no body a 400, and one exactly at the cap
   is read. A body that stalls leaves a `started` and a `rejected` record. The chat
   and session roles are refused. Each outcome writes its audit record under the `logging`
-  subcommand, and the filter is in no log line.
+  subcommand, and the filter is in no log line. The forwarded line of an `entries:list` ends
+  with the body's `projects/<project>`, the line of a forwarded `GET` names no resource, and
+  no line of a refused body carries its project. An `entries:list` whose body passed the
+  check writes the `api body checked` line with the project before its verdict, when the
+  verdict is `forwarded` and when it is a failure (over the cap, no relay, no credential,
+  an unreachable upstream).
 - A refused `POST` carrying a body larger than the socket buffers still receives its 403,
   because the body is drained first.
 - Each policy refusal (`gcp.api.path`, `gcp.api.host-refused`, `gcp.api.host`,
@@ -591,7 +634,7 @@ The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py
 and `gke_cluster_reads.py` makes the Cluster Agent reconcile's GKE list and get reads;
 `logging_reads.py` makes the stockout collector's and the readiness report's log reads, and falls back to `gcloud logging read`),
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
-`ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
+`ApiSession()` instead of from `google.auth`, keeps its URL literals as the commercial endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's
 `limitations` note rather than as zero usage, which is the reading the cost SOP already
 prescribes for a usage check that did not run. Nothing in the sandbox can use `google.auth`,

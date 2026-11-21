@@ -6515,6 +6515,16 @@
           desc: "Reads and compares stored fleet audit reports over time.",
         },
         {
+          name: "first-run-report",
+          cat: "fleet",
+          desc: "Answers what onboarding found, the full inventory, and where the first-run report went.",
+        },
+        {
+          name: "alert-history",
+          cat: "fleet",
+          desc: "Answers what the alert path saw and did from the on-pod event ledger.",
+        },
+        {
           name: "fleet-upgrade-verification",
           cat: "fleet",
           desc: "Checks control plane and node pool versions against release channels before and after upgrades.",
@@ -6746,6 +6756,11 @@
           name: "upgrade-readiness-brief",
           cat: "lifecycle",
           desc: "Produces a pre-upgrade readiness brief covering deprecated APIs, PDBs and addon compatibility.",
+        },
+        {
+          name: "decision-memory",
+          cat: "gitops",
+          desc: "Checks, records and recalls Git-backed operational decisions and incident lessons before opening pull requests.",
         },
       ];
 

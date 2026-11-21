@@ -114,16 +114,20 @@ spec:
             - name: A2A_DISPATCHER_JOB_POLICY
               value: "true"
             {{- end }}
-            # The three images the operator resolves for pods the chart never
+            # The images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders
             # beside every agent pod, the logging sidecar it injects into
             # that pod, and the NATS bus's four images. Without these a
             # mirrored install still reaches ghcr.io and Docker Hub at
-            # reconcile time, long after `helm install` reported success. CREDENTIAL_PROXY_IMAGE is absent by design —
-            # the operator derives the broker image from the agent image by
-            # swapping the trailing name, so it follows the value below. The
-            # sandbox is not derived from the agent image, so it is named.
+            # reconcile time, long after `helm install` reported success.
+            # CREDENTIAL_PROXY_IMAGE and A2A_BRIDGE_IMAGE are absent by default:
+            # the operator derives the broker from the agent image by swapping
+            # the trailing name, and the bridge the same way when that is the
+            # release platform-agent image by tag (values.yaml, hermesBridge),
+            # so they follow the value below; credentialProxy.image and
+            # hermesBridge.image render them only when set. The sandbox is not derived from the agent image,
+            # so it is always named.
             - name: PLATFORM_AGENT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
             {{- /* The operator's own image, the same expression as the
@@ -149,6 +153,25 @@ spec:
             {{- $sandboxImage := (.Values.agentSandbox | default dict).image | default dict }}
             - name: AGENT_SANDBOX_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" ($sandboxImage.repository | default "ghcr.io/gke-labs/kube-agents/agent-sandbox") "registry" (include "kube-agents.imageRegistry" .)) }}:{{ $sandboxImage.tag | default .Chart.AppVersion }}"
+            {{- /* The credential broker and the hermes-bridge sidecar, the two
+                   images the operator derives from the agent image rather than
+                   from OPERATOR_IMAGE. Rendered only when credentialProxy.image
+                   or hermesBridge.image names a repository or a tag; empty, the
+                   default, renders nothing and the operator keeps deriving. The
+                   same `| default dict` guard as agentSandbox, and here a
+                   release without the key renders nothing, as that release
+                   already did. The repository fallbacks repeat values.yaml's
+                   documented defaults, for the same reason as the sandbox's. */}}
+            {{- $proxyImage := (.Values.credentialProxy | default dict).image | default dict }}
+            {{- if or $proxyImage.repository $proxyImage.tag }}
+            - name: CREDENTIAL_PROXY_IMAGE
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" ($proxyImage.repository | default "ghcr.io/gke-labs/kube-agents/credential-proxy") "registry" (include "kube-agents.imageRegistry" .)) }}:{{ $proxyImage.tag | default .Chart.AppVersion }}"
+            {{- end }}
+            {{- $bridgeImage := (.Values.hermesBridge | default dict).image | default dict }}
+            {{- if or $bridgeImage.repository $bridgeImage.tag }}
+            - name: A2A_BRIDGE_IMAGE
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" ($bridgeImage.repository | default "ghcr.io/gke-labs/kube-agents/hermes-bridge") "registry" (include "kube-agents.imageRegistry" .)) }}:{{ $bridgeImage.tag | default .Chart.AppVersion }}"
+            {{- end }}
             - name: FLUENT_BIT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.fluentBit.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.fluentBit.image.tag }}"
             {{- /* The A2A NATS bus's four third-party images, which the
@@ -169,30 +192,24 @@ spec:
                    pin stays out (kube-agents.a2aBusExporterFromChart), so that
                    install keeps running without the sidecar.
 
-                   `| default dict` because a2aBus is a key this chart gained,
-                   the same guard agentSandbox carries above: a render against an
-                   older release's values (`helm upgrade --reuse-values`) has no
-                   a2aBus, and skipping the four there leaves the operator on its
-                   compiled defaults, the same pins, as that release already
-                   ran. */}}
-            {{- $bus := (.Values.a2aBus | default dict).images | default dict }}
-            {{- with $bus.nats }}
+                   kube-agents.a2aBusImage falls back to the chart's own pins
+                   (kube-agents.a2aBusImageDefaults) where the values carry no
+                   a2aBus, the same guard agentSandbox carries above: a render
+                   against an older release's values (`helm upgrade
+                   --reuse-values`) has no a2aBus key, and skipping the four
+                   there would leave the operator on its compiled Docker Hub
+                   defaults while global.thirdPartyImageRegistry, carried over
+                   from that release, says the install pulls from a mirror
+                   only. */}}
             - name: A2A_NATS_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
-            {{- with $bus.natsBox }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "nats") | quote }}
             - name: A2A_PROVISION_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
-            {{- with $bus.configReloader }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "natsBox") | quote }}
             - name: A2A_NATS_RELOADER_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "configReloader") | quote }}
             {{- if include "kube-agents.a2aBusExporterFromChart" $ }}
-            {{- with $bus.prometheusExporter }}
             - name: A2A_NATS_EXPORTER_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "prometheusExporter") | quote }}
             {{- end }}
             {{- /* The pull identity for those same pods. Redundant for the CR
                    this release renders, which carries the secrets itself, and
@@ -203,8 +220,8 @@ spec:
             - name: IMAGE_PULL_SECRETS
               value: {{ . | quote }}
             {{- end }}
-            {{- /* Operator flags turned on by first-class values (operator.mcpServer.enabled
-                   sets A2A_MCP_DOOR). */}}
+            {{- /* Operator flags set by first-class values (operator.mcpServer.enabled,
+                   operator.profileDispatcher.enabled, operator.slackTestUsers). */}}
             {{- with (include "kube-agents.operatorFlagEnv" .) }}
             {{- . | nindent 12 }}
             {{- end }}

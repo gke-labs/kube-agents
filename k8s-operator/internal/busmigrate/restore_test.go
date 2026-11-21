@@ -102,8 +102,9 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 
 	for _, n := range streams {
 		var err error
+		var restored int
 		for i := 0; i < 30; i++ {
-			if err = RestoreVerified(ctx, nc, metas[n].Config, metas[n].State, metas[n].TakenAt, opener(data[n]), digests[n], policyOf(withReplicas(rendered[n], 1))); err == nil {
+			if restored, err = RestoreVerifiedCounting(ctx, nc, metas[n].Config, metas[n].State, metas[n].TakenAt, opener(data[n]), digests[n], policyOf(withReplicas(rendered[n], 1))); err == nil {
 				break
 			}
 			t.Logf("restore %s attempt %d: %v", n, i, err)
@@ -120,18 +121,74 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("restore %s: %v", n, err)
 		}
+		// As the restore pod does (cli.go's restoreAll): the server assigns
+		// the consumers a restore brought back only after it answers the
+		// restore, and a raise sent before then can bring a consumer up on
+		// the new replicas without its restored state (ack floor 0, every
+		// message pending; #6643). So wait for the assignments, then raise.
+		actx, cancel := context.WithTimeout(ctx, restoreAssignTimeout)
+		_, err = AssignedDurables(actx, nc, n, restored, metas[n].Config, 3)
+		cancel()
+		if err != nil {
+			t.Fatalf("%s: waiting for its restored consumers' assignments: %v", n, err)
+		}
 		if err := RaiseReplicas(ctx, nc, n, 3); err != nil {
 			t.Fatalf("%s to R3: %v", n, err)
 		}
 	}
-	time.Sleep(2 * time.Second)
-
 	rc, err := nats.Connect(s2.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rc.Close()
 	js, _ := rc.JetStream()
+	// RaiseReplicas only updates the stream's config: the new replicas catch
+	// up, and the restored consumer reappears on its new leader, some time
+	// after. On a CI runner a fixed 2s read found the consumer missing (#6174),
+	// and then, with only the stream and the consumer's presence waited for,
+	// present but answering from a group not yet settled (0 pending). So wait
+	// for the stream at three replicas with its followers current, and for the
+	// consumer's own group: a leader, both replicas current, and the restored
+	// state.
+	// How long it took is logged as a diagnostic: it prints with -v, and on a
+	// failing run; CI's go test runs without -v, so a passing run there
+	// doesn't keep it.
+	allCurrent := func(peers []*nats.PeerInfo) bool {
+		for _, p := range peers {
+			if p == nil || !p.Current {
+				return false
+			}
+		}
+		return true
+	}
+	waitStart := time.Now()
+	deadline := waitStart.Add(30 * time.Second)
+	for {
+		short := ""
+		si, serr := js.StreamInfo("TASKS")
+		ci, cerr := js.ConsumerInfo("TASKS", "worker")
+		switch {
+		case serr != nil:
+			short = "stream: " + serr.Error()
+		case si.Config.Replicas != 3 || si.Cluster == nil || len(si.Cluster.Replicas) != 2 || !allCurrent(si.Cluster.Replicas):
+			short = "stream not at three replicas with its followers current"
+		case cerr != nil:
+			short = "consumer: " + cerr.Error()
+		case ci.Cluster == nil || ci.Cluster.Leader == "" || len(ci.Cluster.Replicas) != 2 || !allCurrent(ci.Cluster.Replicas):
+			short = "consumer's group not settled (leader, two replicas current)"
+		case ci.AckFloor.Stream != 2 || ci.NumPending != 3:
+			short = fmt.Sprintf("consumer's state not restored yet (ack floor %d, %d pending)", ci.AckFloor.Stream, ci.NumPending)
+		}
+		if short == "" {
+			t.Logf("restore-window: consumer settled after %s (stream R3, consumer group current, state restored)", time.Since(waitStart).Round(time.Millisecond))
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Logf("restore-window: not settled after %s: %s", time.Since(waitStart).Round(time.Millisecond), short)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	si, err := js.StreamInfo("TASKS")
 	if err != nil || si.State.Msgs != 5 || si.State.FirstSeq != 1 || si.State.LastSeq != 5 || si.Config.Replicas != 3 {
 		t.Fatalf("TASKS after the restore: %+v, err %v; want 5 msgs at 1-5, R3", si, err)

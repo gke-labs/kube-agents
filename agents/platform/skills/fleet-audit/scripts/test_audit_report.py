@@ -264,6 +264,7 @@ NUMBER_WORDS = {
             "twenty-three",
             "twenty-four",
             "twenty-five",
+            "twenty-six",
         )
     )
 }
@@ -562,6 +563,11 @@ BROKER_GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "test@example.com",
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull,
+    # The default from Git 3.0, on every git the broker runs here: a call that
+    # takes a bare repository from its working directory fails.
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.bareRepository",
+    "GIT_CONFIG_VALUE_0": "explicit",
 }
 
 
@@ -2914,6 +2920,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
                 "stall-watch",
+                "post-merge-check",
                 "kanban-workspace-gc",
                 "session-retention",
                 "kanban-board-health",
@@ -5174,12 +5181,16 @@ class TestNewMarker(HarnessTestCase):
         def cost(f):
             return len("\n".join(audit_report.render_finding(f))) + 2 + len(str(f["id"])) + 3
 
-        # Room for both unmarked; marking the first leaves no room for the second.
+        # Room for both unmarked; marking the first demotes the second from full.
         budget = sum(cost(f) for f in both)
-        _, omitted = audit_report.select_rendered_findings(both, budget)
-        self.assertEqual(omitted, [])
-        _, omitted = audit_report.select_rendered_findings(both, budget, new_ids={str(finding["id"])})
-        self.assertEqual(len(omitted), 1)
+        full, listed, omitted = audit_report.split_findings_for_body(both, budget)
+        self.assertEqual(len(full), 2)
+        self.assertEqual(listed + omitted, [])
+        full, listed, omitted = audit_report.split_findings_for_body(
+            both, budget, new_ids={str(finding["id"])}
+        )
+        self.assertEqual(len(full), 1)
+        self.assertEqual(len(listed) + len(omitted), 1)
 
 
 class TestFinishClean(HarnessTestCase):
@@ -6805,7 +6816,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Four streams have no declared-intent step. A worker on one of them that writes a
+        # The streams with no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -6817,7 +6828,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 5)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 7)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -8107,6 +8118,220 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
         self.assertEqual(rc, 2, self.err)
         self.assertIn("declared[]: NodePool/zonal-full", self.err)
         self.assertIn(audit_report.CEILING_ARM_MARK, self.err)
+
+
+class TestComputeDeclaredShapes(HarnessTestCase):
+    """The compute stream's one posture: a snapshot kept after its source disk is gone. One arm, one object kind."""
+
+    COMPUTE = "gce-compute-fleet-audit"
+    PROJECT = "project/acme-prod"
+    # The collector's excerpt for 2.5 (compute_fleet_audit.py
+    # check_orphaned_snapshot): the snapshot, its gone source disk and the
+    # server-set timestamp.
+    SNAPSHOT_EXCERPT = '{"name": "legal-hold-2025", "sourceDisk": "ledger-disk", "creationTimestamp": "2025-01-10T09:00:00.000-08:00"}'
+
+    def _snapshot_finding(self, fid="snap", obj="Snapshot/legal-hold-2025", namespace=""):
+        return make_finding(fid=fid, check="orphaned-snapshots", severity="minor", cluster=self.PROJECT, namespace=namespace, obj=obj, excerpt=self.SNAPSHOT_EXCERPT, command="gcloud compute snapshots list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _startup_finding(self):
+        return make_finding(fid="boot", check="gce-startup-script-status", severity="critical", cluster=self.PROJECT, namespace="", obj="ComputeInstance/us-central1-a/vm-1", excerpt="startup-script exit status 1", command="gcloud compute instances get-serial-port-output vm-1 --zone=us-central1-a --project=acme-prod --port=1", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _doc(self, findings):
+        clusters = [{"name": self.PROJECT, "location": "global", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.COMPUTE, self.PROJECT))}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.COMPUTE, clusters=clusters), self.COMPUTE)
+
+    def _declaration(self, obj, check="orphaned-snapshots", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/legal-hold.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_orphaned_snapshot(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.COMPUTE), frozenset({"orphaned-snapshots"}))
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.COMPUTE))
+
+    def test_a_declaration_moves_the_snapshot_and_leaves_the_failed_startup_script(self):
+        # One note names the snapshot and the instance. The snapshot moves;
+        # the failed boot is a fault and is never looked up, whatever the
+        # note says.
+        doc = self._doc([self._snapshot_finding(), self._startup_finding()])
+        declarations = [self._declaration("Snapshot/legal-hold-2025"), self._declaration("ComputeInstance/us-central1-a/vm-1", check="gce-startup-script-status")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ComputeInstance/us-central1-a/vm-1"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["Snapshot/legal-hold-2025"])
+        self.assertEqual(doc["declared"][0]["declaration"]["path"], "knowledge/legal-hold.md")
+        self.assertNotIn("DECLARATION NOT APPLIED", err.getvalue())
+
+    def test_a_scoped_declaration_covers_its_project_alone(self):
+        # `cluster` on the item is the finding's `project/<id>`; a note scoped
+        # to another project leaves this one's snapshot a finding.
+        doc = self._doc([self._snapshot_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025", cluster="project/other-prod")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["Snapshot/legal-hold-2025"])
+        doc = self._doc([self._snapshot_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025", cluster=self.PROJECT)])
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+
+    def test_the_manifest_route_declares_a_covered_candidate(self):
+        candidate = {"check": "orphaned-snapshots", "cluster": self.PROJECT, "namespace": "", "object": "Snapshot/legal-hold-2025", "severity": "minor", "excerpt": self.SNAPSHOT_EXCERPT}
+        manifest = {"clusters": [{"name": self.PROJECT, "candidates": [candidate]}]}
+        doc = self._doc([])
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, [self._declaration("Snapshot/legal-hold-2025")], manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(candidate))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["Snapshot/legal-hold-2025"])
+
+    def test_an_incomplete_search_withholds_the_snapshot_and_publishes_the_faults(self):
+        doc = self._doc([self._snapshot_finding(), self._startup_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual([f["object"] for f in withheld], ["Snapshot/legal-hold-2025"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ComputeInstance/us-central1-a/vm-1"])
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_snapshot(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="orphaned-snapshots", cluster=self.PROJECT, namespace="", obj="Snapshot/legal-hold-2025", title="legal-hold-2025 is kept under a legal hold by design", repo="acme/fleet", path="knowledge/legal-hold.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "orphaned-snapshots"
+        for obj in ("Disk/ledger-disk", "Project/acme-prod", "ComputeInstance/us-central1-a/vm-1"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("snapshot", str(cm.exception))
+
+    def test_a_namespace_a_worker_wrote_onto_the_snapshot_is_folded_before_the_join(self):
+        # The collector files the snapshot with no namespace on a project
+        # target and the note writes `namespace: ""`; a worker's namespace
+        # would give the snapshot a second identity, so the validator empties
+        # it (UNNAMESPACED_CHECKS) and the declaration still joins.
+        doc = self._doc([self._snapshot_finding(namespace="default")])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.snapshot-legal-hold-2025", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025")])
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+
+
+class TestNetworkingDeclaredShapes(HarnessTestCase):
+    """The networking stream's one posture: two peered networks kept at different MTUs. One arm, one object kind."""
+
+    NETWORKING = "gcp-networking-fabric-audit"
+    PROJECT = "project/acme-prod"
+    # The collector's excerpt for 2.4 (networking_audit.py check_mtu_mismatch),
+    # the pair sorted so `default` leads.
+    MTU_EXCERPT = "default mtu=1460 peered with jumbo-storage mtu=8896"
+
+    def _mtu_finding(self, fid="mtu", obj="NetworkPeering/default--jumbo-storage", namespace=""):
+        return make_finding(fid=fid, check="mtu-packet-fragmentation", severity="major", cluster=self.PROJECT, namespace=namespace, obj=obj, excerpt=self.MTU_EXCERPT, command="gcloud compute networks list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "align the MTUs"})
+
+    def _world_open_finding(self):
+        return make_finding(fid="open", check="firewall-world-open-ingress", severity="critical", cluster=self.PROJECT, namespace="", obj="FirewallRule/allow-etcd-anywhere", excerpt="tcp:2379 from 0.0.0.0/0 reaches 1 RUNNING instance with an external address", command="gcloud compute firewall-rules list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "narrow the source range"})
+
+    def _doc(self, findings):
+        clusters = [{"name": self.PROJECT, "location": "-", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.NETWORKING, self.PROJECT))}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.NETWORKING, clusters=clusters), self.NETWORKING)
+
+    def _declaration(self, obj, check="mtu-packet-fragmentation", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/jumbo-peering.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_mtu_mismatch(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.NETWORKING), frozenset({"mtu-packet-fragmentation"}))
+        for fault in ("subnet-ip-exhaustion", "cloud-nat-exhaustion", "psc-routing-deadlock", "cloud-armor-false-positive", "firewall-world-open-ingress"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.NETWORKING))
+
+    def test_a_declaration_moves_the_peering_and_leaves_the_world_open_rule(self):
+        # One note names the peering and the firewall rule. The peering moves;
+        # the rule is a fault and is never looked up, whatever the note says.
+        doc = self._doc([self._mtu_finding(), self._world_open_finding()])
+        declarations = [self._declaration("NetworkPeering/default--jumbo-storage"), self._declaration("FirewallRule/allow-etcd-anywhere", check="firewall-world-open-ingress")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["FirewallRule/allow-etcd-anywhere"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual(doc["declared"][0]["declaration"]["path"], "knowledge/jumbo-peering.md")
+        self.assertNotIn("DECLARATION NOT APPLIED", err.getvalue())
+
+    def test_a_scoped_declaration_covers_its_project_alone(self):
+        # `cluster` on the item is the finding's `project/<id>`; a note scoped
+        # to another project leaves this one's peering a finding.
+        doc = self._doc([self._mtu_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage", cluster="project/other-prod")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPeering/default--jumbo-storage"])
+        doc = self._doc([self._mtu_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage", cluster=self.PROJECT)])
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
+
+    def test_the_manifest_route_declares_a_covered_candidate(self):
+        candidate = {"check": "mtu-packet-fragmentation", "cluster": self.PROJECT, "namespace": "", "object": "NetworkPeering/default--jumbo-storage", "severity": "major", "excerpt": self.MTU_EXCERPT}
+        manifest = {"clusters": [{"name": self.PROJECT, "candidates": [candidate]}]}
+        doc = self._doc([])
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, [self._declaration("NetworkPeering/default--jumbo-storage")], manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(candidate))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NetworkPeering/default--jumbo-storage"])
+
+    def test_an_incomplete_search_withholds_the_peering_and_publishes_the_faults(self):
+        doc = self._doc([self._mtu_finding(), self._world_open_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual([f["object"] for f in withheld], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["FirewallRule/allow-etcd-anywhere"])
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_peering(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="mtu-packet-fragmentation", cluster=self.PROJECT, namespace="", obj="NetworkPeering/default--jumbo-storage", title="jumbo-storage stays at 8896 beside default by design", repo="acme/fleet", path="knowledge/jumbo-peering.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+        for fault in ("subnet-ip-exhaustion", "cloud-nat-exhaustion", "psc-routing-deadlock", "cloud-armor-false-positive", "firewall-world-open-ingress"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "mtu-packet-fragmentation"
+        for obj in ("Network/jumbo-storage", "Project/acme-prod", "Subnet/jumbo-a"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("networkpeering", str(cm.exception))
+
+    def test_a_namespace_a_worker_wrote_onto_the_peering_is_folded_before_the_join(self):
+        # The collector files the peering with no namespace on a project
+        # target and the note writes `namespace: ""`; a worker's namespace
+        # would give the pair a second identity, so the validator empties it
+        # (UNNAMESPACED_CHECKS) and the declaration still joins.
+        doc = self._doc([self._mtu_finding(namespace="default")])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.networkpeering-default-jumbo-storage", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage")])
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):
@@ -10757,17 +10982,235 @@ class TestRenderBudget(BaseTestCase):
             listed_seen = listed_seen or bool(rendered.listed)
         self.assertTrue(listed_seen, "the sweep never reached a listed body")
 
-    def test_criticals_keep_their_full_blocks_over_names_of_minors(self):
+    def test_criticals_give_up_full_blocks_so_lower_bands_are_named(self):
+        # When every finding can be named alongside all critical full blocks,
+        # criticals keep their full blocks; when not, critical full blocks past
+        # the first yield to one-line names so lower bands stay visible.
+        fits = bulk_findings(5, severity="critical", prefix="c") + bulk_findings(
+            100, prefix="m"
+        )
+        whole = audit_report.render_issue_body(make_doc(findings=fits), generated_at=NOW)
+        self.assertEqual(whole.omitted, [])
+        self.assertEqual({f["severity"] for f in whole.listed}, {"minor"})
+
         criticals = bulk_findings(20, severity="critical", prefix="c")
         minors = bulk_findings(380, prefix="m")
         rendered = audit_report.render_issue_body(
             make_doc(findings=criticals + minors), generated_at=NOW
         )
-        for finding in criticals:
-            self.assertIn(finding["id"], rendered.rendered_ids)
-        self.assertTrue(rendered.listed)
-        self.assertEqual({f["severity"] for f in rendered.listed + rendered.omitted}, {"minor"})
+        self.assertEqual(rendered.omitted, [])
+        self.assertEqual(len(rendered.rendered_ids), len(criticals) + len(minors))
+        self.assertIn(f"<!-- finding:{criticals[0]['id']} -->", rendered.body)
+        self.assertEqual({f["severity"] for f in rendered.listed}, {"critical", "minor"})
         self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        overflow = audit_report.render_issue_body(
+            make_doc(findings=criticals + bulk_findings(600, prefix="m")), generated_at=NOW
+        )
+        for finding in criticals:
+            self.assertIn(finding["id"], overflow.rendered_ids)
+        self.assertEqual({f["severity"] for f in overflow.omitted}, {"minor"})
+        self.assertLessEqual(len(overflow.body), GITHUB_BODY_LIMIT)
+
+    def test_compliance_boundaries_at_80_120_and_300_findings_with_states(self):
+        # Realistic compliance shape (#5052): eight clusters, ~100-char derived
+        # ids, multi-line excerpts, and `states` populated for every finding as
+        # `handle_finish` passes it.
+        clusters = [
+            {
+                "name": f"seeded-cluster-{i}",
+                "location": "us-central1",
+                "project": "acme-prod",
+                "checks_run": [
+                    {
+                        "check": slug,
+                        "command": f"kubectl --context seeded-cluster-{i} get pods -A -o json",
+                    }
+                    for slug in audit_report.AUDITS[AUDIT].checks
+                ],
+            }
+            for i in range(8)
+        ]
+
+        def compliance_doc(n_crit: int, n_maj: int, n_min: int) -> dict:
+            raw: list[dict] = []
+            idx = 0
+            bands = (
+                ("critical", n_crit, "privileged-container"),
+                ("major", n_maj, "default-sa-automount"),
+                ("minor", n_min, "image-floating-tag"),
+            )
+            for sev, count, check in bands:
+                for _ in range(count):
+                    cluster = clusters[idx % len(clusters)]["name"]
+                    ns = f"seeded-workload-ns-{idx:03d}"
+                    obj = f"Deployment/metrics-agent-deploy-{idx:03d}"
+                    raw.append(
+                        make_finding(
+                            fid=f"placeholder-{idx:04d}",
+                            severity=sev,
+                            check=check,
+                            title=f"{obj} in {ns} deviates from the {check} posture baseline",
+                            cluster=cluster,
+                            namespace=ns,
+                            obj=obj,
+                            command=(
+                                f"kubectl --context {cluster} -n {ns} get deployment "
+                                f"metrics-agent-deploy-{idx:03d} -o jsonpath='{{.spec.template.spec}}'"
+                            ),
+                            excerpt="\n".join(
+                                f"container[{k}]: securityContext.privileged=true"
+                                for k in range(18)
+                            ),
+                            remediation={
+                                "kind": "manual",
+                                "path": "",
+                                "note": "Update the workload pod template in the owning manifest.",
+                            },
+                        )
+                    )
+                    idx += 1
+            return audit_report.validate_findings(
+                {"audit": AUDIT, "scope": {"clusters": clusters, "skipped": []}, "findings": raw},
+                AUDIT,
+            )
+
+        for total, counts in ((80, (20, 35, 25)), (120, (30, 50, 40))):
+            with self.subTest(total=total):
+                doc = compliance_doc(*counts)
+                findings = doc["findings"]
+                states = {f["id"]: audit_report.STATE_OPEN for f in findings}
+                rendered = audit_report.render_issue_body(
+                    doc, generated_at=NOW, audit_id=AUDIT, states=states
+                )
+                self.assertEqual(rendered.omitted, [])
+                self.assertEqual(len(rendered.rendered_ids), total)
+                self.assertEqual(
+                    {f["severity"] for f in rendered.listed},
+                    {"critical", "major", "minor"},
+                )
+                locations = audit_report.parse_finding_locations(rendered.body)
+                self.assertEqual(
+                    {fid: loc["object"] for fid, loc in locations.items()},
+                    {f["id"]: f["object"] for f in findings},
+                )
+                if "</details>" not in rendered.body:
+                    self.assertRegex(
+                        rendered.body,
+                        r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+                    )
+                self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        doc_300 = compliance_doc(50, 120, 130)
+        findings_300 = doc_300["findings"]
+        states_300 = {f["id"]: audit_report.STATE_OPEN for f in findings_300}
+        rendered_300 = audit_report.render_issue_body(
+            doc_300, generated_at=NOW, audit_id=AUDIT, states=states_300
+        )
+        self.assertTrue(rendered_300.omitted)
+        crit_ids = {f["id"] for f in findings_300 if f["severity"] == "critical"}
+        self.assertLessEqual(crit_ids, set(rendered_300.rendered_ids))
+        self.assertIn("major", {f["severity"] for f in rendered_300.listed})
+        self.assertNotIn("critical", {f["severity"] for f in rendered_300.omitted})
+        locations_300 = audit_report.parse_finding_locations(rendered_300.body)
+        self.assertEqual(set(locations_300), set(rendered_300.rendered_ids))
+        self.assertRegex(
+            rendered_300.body,
+            r"omitted findings \(\d+ major, \d+ minor\) are the least severe",
+        )
+        self.assertNotIn("</details>", rendered_300.body)
+        self.assertRegex(
+            rendered_300.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(rendered_300.body), GITHUB_BODY_LIMIT)
+
+    def test_dropped_check_evidence_notice_survives_omission_and_held_sections(self):
+        # Even when omitted findings AND collector-held rows compete for the
+        # remaining body budget, reserving the dropped-table notice up front
+        # guarantees the notice is never silently dropped.
+        doc = make_doc(findings=bulk_findings(500, severity="minor", prefix="m"))
+        held = [
+            {
+                "id": f"held.prod-us-east.ns.deploy-{i}",
+                "title": f"Held finding {i}",
+                "cluster": "prod-us-east",
+                "namespace": "ns",
+                "object": f"Deployment/held-{i}",
+                "check": "netpol-missing",
+                "commands": ["kubectl get netpol -A"],
+            }
+            for i in range(15)
+        ]
+        rendered = audit_report.render_issue_body(
+            doc, generated_at=NOW, audit_id=AUDIT, held=held
+        )
+        self.assertTrue(rendered.omitted)
+        self.assertNotIn("</details>", rendered.body)
+        self.assertRegex(
+            rendered.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        # Even if the guaranteed first finding pushes `spent` past BODY_BUDGET
+        # (while still fitting under MAX_BODY_CHARS), the dropped-table notice
+        # is still emitted.
+        one_finding_doc = make_doc(findings=[bulk_findings(1, severity="critical", prefix="c")[0]])
+        with mock.patch.object(audit_report, "BODY_BUDGET", 1000):
+            squeezed = audit_report.render_issue_body(
+                one_finding_doc, generated_at=NOW, audit_id=AUDIT
+            )
+        self.assertNotIn("</details>", squeezed.body)
+        self.assertRegex(
+            squeezed.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(squeezed.body), GITHUB_BODY_LIMIT)
+
+    def test_listed_finding_marks_new_and_charges_it_against_budget(self):
+        self.assertEqual(audit_report.split_findings_for_body([], 1000), ([], [], []))
+        finding = make_finding(fid="f-0001", severity="critical", title="Critical listed finding")
+        plain = audit_report.render_listed_finding(finding)
+        marked = audit_report.render_listed_finding(finding, new=True)
+        self.assertEqual(
+            marked,
+            f"{plain}\n{audit_report.LISTED_CONTINUATION_INDENT}{audit_report.NEW_MARKER}",
+        )
+        body = (
+            f"### Listed without detail (1)\n\n{audit_report.LISTED_SECTION_BEGIN}\n"
+            f"{marked}\n{audit_report.LISTED_SECTION_END}\n"
+        )
+        self.assertEqual(
+            audit_report._listed_locations(body)["f-0001"]["title"],
+            "Critical listed finding",
+        )
+        # Charging `NEW_MARKER` on listed rows keeps the last row out when
+        # marking it pushes it past the remaining budget.
+        items = bulk_findings(3, severity="critical", prefix="c")
+        header = len("\n".join(audit_report._listed_header(len(items)))) + len(
+            "\n" + audit_report.LISTED_SECTION_END
+        )
+        line_cost = lambda f, is_new=False: (
+            len(audit_report.render_listed_finding(f, new=is_new))
+            + 1
+            + len(f["id"])
+            + audit_report.DELTA_SLOT_CHARS
+        )
+        budget = (
+            audit_report._full_row_cost(items[0])
+            + header
+            + line_cost(items[1])
+            + line_cost(items[2])
+        )
+        _, listed_plain, omitted_plain = audit_report.split_findings_for_body(items, budget)
+        self.assertEqual(len(listed_plain), 2)
+        self.assertEqual(omitted_plain, [])
+        _, listed_new, omitted_new = audit_report.split_findings_for_body(
+            items, budget, new_ids={items[1]["id"]}
+        )
+        self.assertEqual(len(listed_new), 1)
+        self.assertEqual(len(omitted_new), 1)
 
     def test_majors_give_up_full_blocks_so_every_minor_is_named(self):
         # The live shape that left 49 minors as a count: the major band's full
@@ -11020,13 +11463,14 @@ class TestRenderBudget(BaseTestCase):
         findings = bulk_findings(3, severity="minor") + bulk_findings(
             2, severity="critical", prefix="c"
         )
-        rendered, omitted = audit_report.select_rendered_findings(findings, 1)
+        rendered, listed, omitted = audit_report.split_findings_for_body(findings, 1)
         self.assertEqual(len(rendered), 1)
         self.assertEqual(rendered[0]["severity"], "critical")
+        self.assertEqual(listed, [])
         self.assertEqual(len(omitted), 4)
 
     def test_at_least_one_finding_always_renders(self):
-        rendered, _ = audit_report.select_rendered_findings(bulk_findings(5), 0)
+        rendered, _, _ = audit_report.split_findings_for_body(bulk_findings(5), 0)
         self.assertEqual(len(rendered), 1)
 
     def test_a_target_late_in_the_alphabet_keeps_a_row_when_the_body_truncates(self):
@@ -11038,13 +11482,15 @@ class TestRenderBudget(BaseTestCase):
         late = [{**f, "cluster": "zulu"} for f in bulk_findings(2, prefix="zulu")]
         findings = early + late
         one = len("\n".join(audit_report.render_finding(early[0]))) + 2 + len(early[0]["id"]) + 3
-        rendered, omitted = audit_report.select_rendered_findings(findings, one * 4)
+        rendered, listed, omitted = audit_report.split_findings_for_body(findings, one * 6)
         clusters = [f["cluster"] for f in rendered]
         self.assertIn("zulu", clusters)
-        self.assertEqual(len(rendered) + len(omitted), len(findings))
-        # The fair-share order decides membership only. Both lists keep the
-        # display order.
+        self.assertLess(len(rendered), len(findings))
+        self.assertEqual(len(rendered) + len(listed) + len(omitted), len(findings))
+        # The fair-share order decides membership only. Every partition keeps
+        # the display order.
         self.assertEqual(rendered, audit_report.sort_findings(rendered))
+        self.assertEqual(listed, audit_report.sort_findings(listed))
         self.assertEqual(omitted, audit_report.sort_findings(omitted))
 
     def test_fair_share_never_moves_a_finding_across_a_severity_band(self):
@@ -11282,12 +11728,13 @@ class TestScopePhrase(BaseTestCase):
 
 
 class TestIndexOverhead(BaseTestCase):
-    """The index is reserved out of the budget, not charged to a finding.
+    """The state index is charged per full-row prefix via `_index_prefix_costs`.
 
-    It replaced a flat per-row allowance of 160 characters that a real id had
-    already outgrown: ids run to 100 characters and the state cell can carry a
-    full pull request URL. Under-reserving spends budget the findings were
-    promised, and the body only fails once it crosses GitHub's hard limit.
+    It replaced both a flat 160-character per-row allowance (outgrown by
+    100-character ids with pull-request URLs) and a worst-case 50-row upfront
+    reservation (which starved overflowing bodies that show only a few full
+    rows). Under-charging spends budget the findings were promised; gating on a
+    truthy state keeps stateless prefixes at zero.
     """
 
     def rendered_table(self, body):
@@ -11306,7 +11753,7 @@ class TestIndexOverhead(BaseTestCase):
             rows.append(line)
         return "\n".join(rows)
 
-    def test_the_reservation_covers_what_the_table_actually_costs(self):
+    def test_prefix_cost_covers_what_the_table_actually_costs_and_gates_on_state(self):
         # Worst realistic row: a 100-character id (the charset ceiling) and a
         # state cell carrying a pull request URL.
         fid = "f" + "-long" * 19 + "-end"
@@ -11315,6 +11762,15 @@ class TestIndexOverhead(BaseTestCase):
             make_finding(fid=f"{fid[:95]}-{i:03d}", severity="critical")
             for i in range(10)
         ]
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        self.assertEqual(
+            audit_report._index_prefix_costs(order, None, None),
+            [0] * (len(order) + 1),
+        )
+        self.assertEqual(
+            audit_report._index_prefix_costs(order, {order[-1]["id"]: audit_report.STATE_OPEN}, None)[:-1],
+            [0] * len(order),
+        )
         states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
         urls = {
             f["id"]: "https://github.com/an-org/a-repository/pull/12345"
@@ -11326,44 +11782,101 @@ class TestIndexOverhead(BaseTestCase):
             states=states,
             pr_urls=urls,
         )
-        reserved = audit_report.index_overhead(findings, states, urls)
-        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+        costs = audit_report._index_prefix_costs(order, states, urls)
+        self.assertGreaterEqual(costs[len(order)], len(self.rendered_table(body)))
 
-    def test_the_reservation_bounds_the_table_of_a_fair_share_selection(self):
+    def test_prefix_costs_bound_every_fair_share_selection_including_past_cap(self):
         # A rendered set is a prefix of the fair-share order, not of the
-        # display order. Here the display order puts the short `alpha` rows
-        # first, but a truncated selection alternates alpha and zulu, so the
-        # table shows the wide zulu rows too. The reservation must cover each
-        # table that a selection can show.
+        # display order. Check both display orders — narrow `alpha` ahead of
+        # wide `zulu`, and wide `alpha` ahead of narrow `zulu` — across
+        # selections below, at, and past `MAX_DELTA_ROWS` (`cap + 10 > 50`) so
+        # past-cap eviction (`shown.pop()`) and the overflow row are exercised.
         cap = audit_report.MAX_DELTA_ROWS
-        wide = "z" + "-wide" * 18
-        alpha = [{**f, "cluster": "alpha"} for f in bulk_findings(cap + 10, prefix="a")]
-        zulu = [
-            {**f, "id": f"{wide}-{i:03d}", "cluster": "zulu"}
-            for i, f in enumerate(bulk_findings(cap + 10, prefix="z"))
-        ]
-        findings = alpha + zulu
-        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
-        urls = {f["id"]: "https://github.com/an-org/a-repository/pull/12345" for f in zulu}
-        reserved = audit_report.index_overhead(findings, states, urls)
-        one = len("\n".join(audit_report.render_finding(alpha[0], state=audit_report.STATE_PR_OPEN)))
-        for count in (cap // 2, cap, cap + cap // 2):
-            with self.subTest(count=count):
-                rendered, _ = audit_report.select_rendered_findings(
-                    findings, one * count, states=states, pr_urls=urls
+        for wide_cluster in ("zulu", "alpha"):
+            alpha_base = bulk_findings(cap + 10, prefix="a")
+            zulu_base = bulk_findings(cap + 10, prefix="z")
+            alpha = [
+                {
+                    **f,
+                    "id": f"{'a' + '-wide' * 18}-{i:03d}" if wide_cluster == "alpha" else f["id"],
+                    "cluster": "alpha",
+                }
+                for i, f in enumerate(alpha_base)
+            ]
+            zulu = [
+                {
+                    **f,
+                    "id": f"{'z' + '-wide' * 18}-{i:03d}" if wide_cluster == "zulu" else f["id"],
+                    "cluster": "zulu",
+                }
+                for i, f in enumerate(zulu_base)
+            ]
+            findings = alpha + zulu
+            order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+            states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+            wide_rows = alpha if wide_cluster == "alpha" else zulu
+            urls = {
+                f["id"]: "https://github.com/an-org/a-repository/pull/12345"
+                for f in wide_rows
+            }
+            costs = audit_report._index_prefix_costs(order, states, urls)
+            full_costs = [
+                audit_report._full_row_cost(f, states=states, pr_urls=urls) for f in order
+            ]
+            line_costs = [
+                len(
+                    audit_report.render_listed_finding(
+                        f, state=states.get(f["id"]), pr_url=urls.get(f["id"])
+                    )
                 )
-                table = sum(
-                    len(audit_report._index_row(f, states[f["id"]], urls.get(f["id"]))) + 1
-                    for f in rendered[:cap]
+                + 1
+                + len(f["id"])
+                + audit_report.DELTA_SLOT_CHARS
+                for f in order
+            ]
+            header = len("\n".join(audit_report._listed_header(len(order)))) + len(
+                "\n" + audit_report.LISTED_SECTION_END
+            )
+            for target_full in (cap // 2, cap, cap + 10):
+                budget = (
+                    sum(full_costs[:target_full])
+                    + costs[target_full]
+                    + header
+                    + sum(line_costs[target_full:])
                 )
-                self.assertGreaterEqual(reserved, table)
+                with self.subTest(wide_cluster=wide_cluster, target_full=target_full):
+                    lines, listed, omitted = audit_report._render_findings(
+                        findings, budget, states=states, pr_urls=urls
+                    )
+                    full_count = len(findings) - len(listed) - len(omitted)
+                    self.assertEqual(full_count, target_full)
+                    self.assertEqual(omitted, [])
+                    rendered_table = self.rendered_table("\n".join(lines))
+                    if target_full > cap:
+                        self.assertIn(f"…and {target_full - cap} more below", rendered_table)
+                    self.assertGreaterEqual(costs[full_count], len(rendered_table))
+                    without_states, _, _ = audit_report.split_findings_for_body(
+                        findings, budget
+                    )
+                    self.assertGreaterEqual(len(without_states), full_count)
 
-    def test_the_reservation_bounds_a_table_that_hits_the_row_cap(self):
-        findings = bulk_findings(audit_report.MAX_DELTA_ROWS + 20)
+    def test_prefix_cost_bounds_a_table_that_hits_the_row_cap(self):
+        cap = audit_report.MAX_DELTA_ROWS
+        findings = bulk_findings(cap + 20)
         states = {f["id"]: audit_report.STATE_OPEN for f in findings}
-        reserved = audit_report.index_overhead(findings, states, {})
-        body = render_body(make_doc(findings=findings), generated_at=NOW, states=states)
-        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        costs = audit_report._index_prefix_costs(order, states, {})
+        all_full_budget = (
+            sum(audit_report._full_row_cost(f, states=states) for f in order)
+            + costs[len(order)]
+        )
+        lines, listed, omitted = audit_report._render_findings(
+            findings, all_full_budget, states=states
+        )
+        self.assertEqual(listed + omitted, [])
+        table = self.rendered_table("\n".join(lines))
+        self.assertIn("…and 20 more below", table)
+        self.assertGreaterEqual(costs[len(order)], len(table))
 
 
 # --------------------------------------------------------------------------- #
@@ -18214,6 +18727,160 @@ class TestCarryUnchangedFindings(unittest.TestCase):
         self.assertEqual(ids, [])
 
 
+class TestCarryRules(unittest.TestCase):
+    """A carried remediation that fails a `CARRY_RULES` rule gives way to this
+    run's, and one that no rule can judge stays."""
+
+    CLUSTER = "acme-prod/us-east4/seeded-c"
+    FLAGS = "--enable-master-authorized-networks --master-authorized-networks"
+    RIGHT = f"gcloud container clusters update seeded-c --location=us-east4 {FLAGS}=<ranges>"
+    REWORDED = f"gcloud container clusters update seeded-c --region us-east4 {FLAGS}=<owner-ranges>"
+
+    def finding(self, note, check="authorized-networks", cluster=CLUSTER, kind="gcloud", **overrides):
+        finding = {
+            "id": f"{check}.c._.cluster-seeded-c",
+            "check": check,
+            "cluster": cluster,
+            "title": "seeded-c has no authorized networks",
+            "impact": "The control plane answers every address.",
+            "recommendation": {"action": "Enable authorized networks.", "risk": "None."},
+            "remediation": {"kind": kind, "note": note},
+            "evidence": {"command": "gcloud container clusters list", "excerpt": "a"},
+            "severity": "critical",
+        }
+        finding.update(overrides)
+        return finding
+
+    def carry(self, before, now):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ids = audit_report.carry_unchanged_findings([now], {"findings": [before]})
+        return ids, now, err.getvalue()
+
+    def assert_kept(self, note, **kwargs):
+        """The previous note stays, and the run log does not name a rule."""
+        before = self.finding(note, title="previous title", **kwargs)
+        _, out, err = self.carry(before, self.finding(self.REWORDED, **kwargs))
+        self.assertEqual(out["remediation"]["note"], note)
+        self.assertEqual(out["title"], "previous title")
+        self.assertNotIn("not carried forward", err)
+
+    def assert_replaced(self, note, rule, **kwargs):
+        """This run's pair is published; title and impact still carry."""
+        before = self.finding(
+            note, title="previous title", recommendation={"action": "Previous action."}, **kwargs
+        )
+        now = self.finding(self.REWORDED, **kwargs)
+        ids, out, err = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], self.REWORDED)
+        self.assertEqual(out["recommendation"]["action"], "Enable authorized networks.")
+        self.assertEqual(out["title"], "previous title")
+        self.assertEqual(ids, [now["id"]])
+        self.assertIn(f"{now['id']}: the previous run's remediation is not carried forward ({rule}).", err)
+        self.assertNotIn("gcloud", err)
+
+    def test_a_right_command_for_the_same_cluster_is_kept(self):
+        self.assert_kept(self.RIGHT)
+        self.assert_kept(self.RIGHT.replace("--location=us-east4", "--location us-east4 --project=acme-prod"))
+
+    def test_a_command_for_another_cluster_is_replaced(self):
+        for wrong in (
+            self.RIGHT.replace("seeded-c", "seeded-a"),
+            self.RIGHT.replace("us-east4", "us-west1"),
+            self.RIGHT + " --project=acme-dev",
+            f"{self.RIGHT}\n{self.RIGHT.replace('seeded-c', 'seeded-a')}",
+            f"# Close the endpoint.\n$ {self.RIGHT.replace('seeded-c', 'seeded-a')}",
+        ):
+            with self.subTest(wrong=wrong):
+                self.assert_replaced(wrong, audit_report.CARRY_RULE_OTHER_CLUSTER, check="release-channel")
+
+    def test_a_wrong_command_in_a_manual_note_or_the_recommendation_is_replaced(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding(f"Run `{wrong}` in a change window.", kind="manual", check="release-channel")
+        now = self.finding("Ask the owner.", kind="manual", check="release-channel")
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], "Ask the owner.")
+        for field in audit_report.COMMAND_BEARING_RECOMMENDATION_FIELDS:
+            with self.subTest(field=field):
+                before = self.finding(self.RIGHT, recommendation={field: f"Run `{wrong}`."})
+                _, out, _ = self.carry(before, self.finding(self.REWORDED))
+                self.assertEqual(out["remediation"]["note"], self.REWORDED)
+
+    def test_the_note_before_the_route_cut_is_read(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding("See the route note.", check="release-channel")
+        before["remediation"][audit_report.ROUTE_UNCUT_NOTE_FIELD] = wrong
+        _, out, _ = self.carry(before, self.finding(self.REWORDED, check="release-channel"))
+        self.assertEqual(out["remediation"], {"kind": "gcloud", "note": self.REWORDED})
+
+    def test_a_command_the_rule_cannot_judge_is_kept(self):
+        update = "gcloud container clusters update"
+        for note in (
+            f"{update} <C> --location=<L> --project=<PROJECT> {self.FLAGS}=<CIDR>",
+            f"{update} $CLUSTER --location $LOCATION {self.FLAGS}=${{RANGES}}",
+            f"{update} seeded-c --location=us-east4 --project=123456789012 {self.FLAGS}=<ranges>",
+            f"{update} seeded-a {self.FLAGS}=<ranges>",
+            f"{update} projects/acme-prod/locations/us-east4/clusters/seeded-c --location=us-east4",
+            f"{update} SEEDED-C --location=US-EAST4 --project=Acme-Prod",
+            f"{update} seeded-a --location=us-west1 {self.FLAGS}=<ranges the cluster's own owner approves>",
+            "gcloud container node-pools update pool-1 --cluster=seeded-a --location=us-west1",
+            "Update seeded-a in us-west1 with gcloud container clusters update.",
+        ):
+            with self.subTest(note=note):
+                self.assert_kept(note)
+
+    def test_a_scope_that_is_not_one_cluster_is_kept(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        for cluster in ("project/acme-prod", "seeded-c", ""):
+            with self.subTest(cluster=cluster):
+                self.assert_kept(wrong, cluster=cluster, check="release-channel")
+
+    def test_a_literal_range_where_the_sop_leaves_it_to_the_owner_is_replaced(self):
+        for value in (
+            "=203.0.113.0/24",
+            " 203.0.113.0/24",
+            "=<ranges>,203.0.113.7",
+            '="198.51.100.0/24,203.0.113.0/24"',
+            "=2001:db8::/32",
+        ):
+            with self.subTest(value=value):
+                note = self.RIGHT.replace("=<ranges>", value)
+                self.assert_replaced(note, audit_report.CARRY_RULE_OWNER_VALUE)
+
+    def test_a_range_the_owner_rule_does_not_cover_is_kept(self):
+        literal = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        self.assert_kept(literal, check="release-channel")
+        # `public-control-plane` has no row; its carried command still gets its repair.
+        before = self.finding(literal, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        now = self.finding(self.REWORDED, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(
+            out["remediation"]["note"], f"{literal} {audit_report.GOOGLE_CLOUD_ACCESS_FLAG}"
+        )
+        self.assert_kept(self.RIGHT.replace("<ranges>", "<CIDR/len>,<X>/32"))
+        self.assert_kept(f"{self.RIGHT}  # not 203.0.113.0/24, which is a peer's")
+        self.assert_kept(f"{self.RIGHT} --cluster-ipv4-cidr=10.0.0.0/14")
+
+    def test_the_previous_pair_stays_when_this_runs_pair_fails_too(self):
+        previous = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        mine = self.RIGHT.replace("<ranges>", "198.51.100.0/24")
+        _, out, err = self.carry(self.finding(previous), self.finding(mine))
+        self.assertEqual(out["remediation"]["note"], previous)
+        self.assertNotIn("not carried forward", err)
+
+    def test_a_previous_remediation_validation_would_refuse_is_not_carried(self):
+        for remediation in ({"kind": "script", "note": "x"}, {"note": "x"}, {"kind": "manual", "note": 7}):
+            with self.subTest(remediation=remediation):
+                before = self.finding("x", title="previous title", remediation=remediation)
+                _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+                self.assertEqual(out["remediation"], {"kind": "manual", "note": "Ask the owner."})
+                self.assertEqual(out["title"], "previous title")
+
+    def test_a_previous_remediation_with_no_note_is_still_carried(self):
+        before = self.finding("x", remediation={"kind": "manual"})
+        _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+        self.assertEqual(out["remediation"], {"kind": "manual", "note": ""})
+
+
 class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
     """`finish` reads the previous run's document and keeps its wording, in a
     dry run and in the real run alike."""
@@ -18303,6 +18970,25 @@ class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
         body = self.harness.forge_calls("issue-create")[0]["body"]
         self.assertIn(self.OLD_TITLE, body)
         self.assertNotIn(self.NEW_TITLE, body)
+
+    def test_a_previous_command_for_another_cluster_is_not_published(self):
+        cluster = "acme-prod/us-east4/prod-us-east"
+        update = "gcloud container clusters update {} --location=us-east4 --enable-network-policy"
+
+        def finding(title, name):
+            return make_finding(
+                title=title, cluster=cluster, remediation={"kind": "gcloud", "note": update.format(name)}
+            )
+
+        before = finding(self.OLD_TITLE, "prod-us-west")
+        before["id"] = derived_id(cluster=cluster)
+        self.store({"findings": [before]})
+        rc = self.run_finish(make_doc(findings=[finding(self.NEW_TITLE, "prod-us-east")]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertIn(update.format("prod-us-east"), self.out)
+        self.assertNotIn("prod-us-west", self.out)
+        self.assertIn(f"not carried forward ({audit_report.CARRY_RULE_OTHER_CLUSTER})", self.err)
 
     def test_changed_evidence_publishes_the_new_wording(self):
         self.store(self.previous(excerpt="an older excerpt"))
@@ -26127,6 +26813,7 @@ class TestTriageMarkedFindings(BaseTestCase):
             "namespace-token",
             "service-selector",
             "hard-spread",
+            "reserved-pool",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
@@ -32879,7 +33566,7 @@ class TestManifestRemediationLinks(HarnessTestCase):
         ).body
         self.assertIn(f"[`{self.PATH}`]({self.PATH})", body)
 
-    def test_select_rendered_findings_charges_the_expanded_url_against_the_budget(self):
+    def test_split_findings_for_body_charges_the_expanded_url_against_the_budget(self):
         findings = [
             make_finding(
                 fid=f"netpol-missing.prod-us-east.payments.namespace-p{i}",
@@ -32888,14 +33575,17 @@ class TestManifestRemediationLinks(HarnessTestCase):
             )
             for i in range(25)
         ]
-        bare_rendered, _ = audit_report.select_rendered_findings(findings, 8000)
-        expanded_rendered, _ = audit_report.select_rendered_findings(
-            findings,
-            8000,
-            file_url=self.GITHUB_TEMPLATE,
-            file_ref=self.SHA,
-        )
-        self.assertLess(len(expanded_rendered), len(bare_rendered))
+        bare_total = sum(audit_report._full_row_cost(f) for f in findings)
+        for budget in (bare_total, bare_total // 2):
+            with self.subTest(budget=budget):
+                bare_rendered, _, _ = audit_report.split_findings_for_body(findings, budget)
+                expanded_rendered, _, _ = audit_report.split_findings_for_body(
+                    findings,
+                    budget,
+                    file_url=self.GITHUB_TEMPLATE,
+                    file_ref=self.SHA,
+                )
+                self.assertLess(len(expanded_rendered), len(bare_rendered))
 
     def test_finish_reads_capabilities_once_and_fills_links_including_relink(self):
         self.touch(self.PATH)
@@ -35330,6 +36020,23 @@ class TestPlainChatLines(unittest.TestCase):
     def test_a_row_names_the_object_the_check_judged(self):
         finding = make_finding(check="privileged-container", cluster="proj/us-central1-a/seeded-a", obj="Deployment/payments-api")
         self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a/payments: payments-api runs a privileged container")
+
+    def test_ingress_gateway_healthcheck_mismatch_is_rostered_and_phrased(self):
+        self.assertIn(
+            "ingress-gateway-healthcheck-mismatch",
+            audit_report.AUDITS["obtainability-audit"].checks,
+        )
+        finding = make_finding(
+            check="ingress-gateway-healthcheck-mismatch",
+            severity="major",
+            cluster="proj/us-central1/host",
+            namespace="seeded-networking",
+            obj="Service/backend-api-svc",
+        )
+        self.assertEqual(
+            audit_report.summary_row(finding),
+            "`major` host/seeded-networking: backend-api-svc routes or health-checks a port no pod exposes",
+        )
 
     def test_a_cluster_setting_on_an_object_names_it_in_brackets(self):
         finding = make_finding(check="workload-identity-off", obj="NodePool/pool-1", namespace="")

@@ -161,6 +161,7 @@ CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
 CONDITION_POOL_DRIFT = "pool_drift"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_FORGE_OUTAGE = "forge_outage"
 CONDITION_DEADLINE_KILL = "deadline_kill"
 # The presubmit job's timeout in minutes, as health.py owns it.
 DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // SECONDS_PER_MINUTE)
@@ -926,6 +927,12 @@ def cause_sentence(health: dict) -> str:
             f"{incident.get('reps', 0)} repetitions on {prs} PRs ended with the worker still running {window};"
             " nothing was graded and nothing counts against a case."
         )
+    if condition == CONDITION_FORGE_OUTAGE:
+        # No repetition count: gate_comment.py posts this sentence on a public
+        # pull request as it stands.
+        start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        window = clock_range(start, end) if start and end else f"since {since}"
+        return f"grading could not read GitHub on {prs} PRs {window}, so their checks did not run and nothing counts against a case."
     return health.get("cause") or "no single cause"
 
 
@@ -944,6 +951,11 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
         lines = [
             f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Those runs read NOT EVALUATED, not red; retest once workers are"
             " finishing again. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879)."
+        ]
+    elif condition == CONDITION_FORGE_OUTAGE:
+        lines = [
+            f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} The GitHub App's hourly rate limit ran out (the evals"
+            " repositories of a shard share one installation, #6105); retest once it has reset."
         ]
     elif condition == CONDITION_LOST_PODS:
         tag = issue_tag(issue)
@@ -1635,6 +1647,8 @@ def short_cause(prev: dict) -> str:
         return "pool projects had drifted"
     if condition == CONDITION_DELEGATION_CEILING:
         return "workers were not finishing"
+    if condition == CONDITION_FORGE_OUTAGE:
+        return "grading could not read GitHub"
     if condition == CONDITION_DEADLINE_KILL:
         return "runs were being killed at the deadline"
     return prev.get("cause") or "unknown cause"

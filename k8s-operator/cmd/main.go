@@ -254,6 +254,20 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
+		// Step down on shutdown rather than holding the lease until it
+		// expires, so the next pod takes over in seconds, not after the
+		// lease duration (#6217 measured ~45 s from a helm upgrade to the
+		// new pod's first reconcile). controller-runtime releases the lease
+		// after the leader-elected runnables have stopped, or once its
+		// graceful-shutdown timeout (default 30 s) runs out. The pod's
+		// terminationGracePeriodSeconds is 10, so a stop slower than that
+		// is killed first and the lease simply expires, as without this
+		// option: a release never races a reconcile that is still running.
+		// It is safe only because main returns as soon as mgr.Start does:
+		// the Start call is main's last statement, its error branch only
+		// logs and exits, and main has no defer or go statement that could
+		// act after it (manager_wiring_test.go).
+		LeaderElectionReleaseOnCancel: true,
 		// What this process holds in memory; controller.ManagerCacheOptions
 		// says what is in the cache, what is kept out of it, and why.
 		Cache:  controller.ManagerCacheOptions(),
@@ -442,6 +456,38 @@ func main() {
 	default:
 		setupLog.Error(tierMapErr, "Failed to discover the Tier kind")
 		os.Exit(1)
+	}
+
+	// The AgentSchedule reconciler (#5617), behind A2A_AGENT_SCHEDULES while
+	// scheduled runs are new, and gated as the Tier one is: a missing CRD or
+	// a role that can't read schedules skips it rather than crashlooping. It
+	// also watches and reads AgentProfiles, so it needs the AgentProfile
+	// controller's gate too: without that kind, or a role that can list it,
+	// its informer never syncs and the manager stops.
+	if controller.AgentSchedulesEnabled() {
+		schedGVK := agentv1alpha1.GroupVersion.WithKind("AgentSchedule")
+		_, schedMapErr := mgr.GetRESTMapper().RESTMapping(schedGVK.GroupKind(), schedGVK.Version)
+		schedDenied := controller.AgentScheduleAccessDenied(rbacChecker)
+		switch {
+		case schedMapErr == nil && len(schedDenied) > 0:
+			setupLog.Error(nil, "The operator's role cannot read AgentSchedules; skipping the AgentSchedule controller. Restart the operator after applying the current ClusterRole.", "denied", schedDenied)
+		case schedMapErr == nil && mapErr != nil:
+			// Only "no such kind" gets here: any other discovery error
+			// exited at the AgentProfile controller above.
+			setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentSchedule controller, which reads profiles. Restart the operator after installing the CRD to enable it.")
+		case schedMapErr == nil && len(profileDenied) > 0:
+			setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentSchedule controller, which reads profiles. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
+		case schedMapErr == nil:
+			if err := (&controller.AgentScheduleReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "Failed to create controller", "controller", "agentschedule")
+				os.Exit(1)
+			}
+		case meta.IsNoMatchError(schedMapErr):
+			setupLog.Info("AgentSchedule CRD is not installed on cluster; skipping the AgentSchedule controller. Restart the operator after installing the CRD to enable it.")
+		default:
+			setupLog.Error(schedMapErr, "Failed to discover the AgentSchedule kind")
+			os.Exit(1)
+		}
 	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {

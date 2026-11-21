@@ -417,7 +417,7 @@ func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 	}
 	largest := 0
 	for _, imageVolumes := range []bool{true, false} {
-		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -463,7 +463,7 @@ func TestUnderJobModeTheConfigLimitCutsFirst(t *testing.T) {
 	// either rendering, and at the larger it uses most of the budget: the cut
 	// is safe and not far early.
 	for _, imageVolumes := range []bool{true, false} {
-		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -508,7 +508,11 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	profiles = profiles[:len(profiles)-len(a2aDispatcherCeilingRefused(agent, profiles))]
 	until := time.Now().Add(a2aDrainingWindow).Truncate(time.Second).UTC()
 	var draining []a2aDispatchProfile
-	for i := 0; i < 300; i++ {
+	// 240: enough to take the config past one ConfigMap while the identity
+	// entry stays under its own ceiling. Each profile's grant names both
+	// supervisor forms since #5301, so the entry grows faster per drain
+	// than it did at 300.
+	for i := 0; i < 240; i++ {
 		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i), Tiers: []string{agentv1alpha1.AgentProfileTierRead}, DrainingUntil: until})
 	}
 	entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
@@ -517,7 +521,7 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	}
 	cond, over, err := a2aDispatcherCeiling(agent, profiles, draining)
 	if err != nil || !over {
-		t.Fatalf("over=%v err=%v: 300 draining entries past the config's reserve didn't read as over", over, err)
+		t.Fatalf("over=%v err=%v: 240 draining entries past the config's reserve didn't read as over", over, err)
 	}
 	if cond.Reason != dispatcherCeilingReasonOver || !strings.Contains(cond.Message, "ConfigMap") || !strings.Contains(cond.Message, "#5479") {
 		t.Errorf("condition %s: %s", cond.Reason, cond.Message)
@@ -617,7 +621,7 @@ func TestJobModeAloneNoLongerFillsTheConfig(t *testing.T) {
 	if refused := a2aDispatcherCeilingRefused(agent, profiles); len(refused) != 0 {
 		t.Errorf("%d of 400 two-tier profiles under Job mode were refused", len(refused))
 	}
-	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

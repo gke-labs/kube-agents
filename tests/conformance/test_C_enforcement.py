@@ -1920,6 +1920,29 @@ class C1IsolationIsStructural(unittest.TestCase):
             "compiled list does not name",
         )
 
+    def test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary(self) -> None:
+        """Tier membership crosses the same boundary (#3659).
+
+        The operator renders spec.tiers.membership onto the gateway as
+        A2A_TIER_MEMBERSHIP, and the gateway reads it to pick the tier a
+        person's profile task runs at. A rename on either side leaves the
+        gateway with no membership, so everyone runs at read and both Go
+        suites stay green: a mapped person silently loses their tier. The two
+        spellings are pinned equal here.
+        """
+        a2a_manifests = h.text("a2a_session_fence")
+        membership = h.text("a2a_gateway_tier_membership")
+        rendered = self._one_match(r'a2aTierMembershipEnvVar\s*=\s*"([^"]+)"', a2a_manifests, "the operator's a2aTierMembershipEnvVar")
+        read = self._one_match(r'EnvTierMembership\s*=\s*"([^"]+)"', membership, "the gateway's EnvTierMembership")
+        self.assertEqual(
+            rendered,
+            read,
+            "the operator renders %r and the gateway reads %r: every person runs at "
+            "read on an install whose Go suites are green" % (rendered, read),
+        )
+        self._one_match(r"Name:\s*a2aTierMembershipEnvVar,", a2a_manifests, "the operator's render of a2aTierMembershipEnvVar")
+        self._one_match(r"os\.(?:Getenv|LookupEnv)\(EnvTierMembership\)", h.text("a2a_gateway_config"), "the gateway's read of EnvTierMembership")
+
     def test_C1_the_delegate_artifact_is_spelled_once(self) -> None:
         """The reserved artifact name crosses a module boundary in two places.
 
@@ -2760,6 +2783,71 @@ class C2FailClosed(unittest.TestCase):
                 resolved.host.endswith(".googleapis.com"),
                 f"mcp_policy resolved {srv.name} to commercial {resolved.host} under {custom}",
             )
+
+    def test_C2_a_universe_domain_under_googleapis_com_is_refused(self) -> None:
+        """A universe domain under `googleapis.com` is refused, and no relay serves its hosts.
+
+        `<service>.mtls.googleapis.com` is a host of the commercial universe.
+        As a universe domain, `mtls.googleapis.com` would pass the rule that a
+        custom universe refuses the commercial hosts while every request stays
+        in the commercial universe under other host names. The value is refused
+        where every reader normalises it, so the broker does not start with it,
+        and the relay evaluators have no host for it.
+        """
+        under = "mtls.googleapis.com"
+        client = h.credential_proxy.credential_proxy_client
+        with self.assertRaises(ValueError):
+            client.normalize_universe_domain(under)
+        with self.assertRaises(ValueError):
+            h.credential_proxy.resolve_universe_domain(environ={client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV: under})
+
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            host = route.host.replace(".googleapis.com", f".{under}")
+            with self.subTest(api_host=host, rule=route.rule_id):
+                decision = api.evaluate("GET", host, "no/such/path", "", universe_domain=under)
+                self.assertFalse(decision.allowed)
+                # gcp.api.path here would mean the policy has a route for this host.
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+        for srv in h.mcp_policy.MCP_SERVERS:
+            self.assertIsNone(
+                h.mcp_policy.server(srv.name, universe_domain=under),
+                f"mcp_policy resolved {srv.name} under {under}",
+            )
+        # The commercial domain itself is still the default universe.
+        self.assertEqual(client.DEFAULT_UNIVERSE_DOMAIN, client.normalize_universe_domain("googleapis.com"))
+
+    def test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts(self) -> None:
+        """A universe domain from the environment is held to the metadata server's answer.
+
+        The environment's value decides which hosts get the broker's credential.
+        A value that the host's metadata server contradicts would send that
+        credential to another universe, or to commercial hosts under other
+        names (`clients6.google.com` is well-formed and is not under
+        `googleapis.com`). The start check refuses it, in both directions; a
+        value the metadata server confirms, and a host with no universe route,
+        start as before.
+        """
+        proxy = h.credential_proxy
+
+        def check(configured, answer):
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answer
+            try:
+                proxy.check_universe_domain_against_metadata(configured, sleep=lambda _s: None)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                with self.assertRaises(RuntimeError):
+                    check(configured, (reported, True))
+        check("universe.example.test", ("universe.example.test", True))
+        check("universe.example.test", (None, True))
 
 
 class C3UntrustedByDefault(unittest.TestCase):

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -24,7 +23,7 @@ func TestTheDispatchConfigIsWrittenCompactWithNoDerivedFields(t *testing.T) {
 	profiles := []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 	})}
-	templates := dispatchJobTemplates(agent, profiles, false)
+	templates := dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder)
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -42,12 +41,12 @@ func TestTheDispatchConfigIsWrittenCompactWithNoDerivedFields(t *testing.T) {
 	if _, ok := doc.Profiles[0]["durables"]; ok {
 		t.Error("the entry lists its durables; the dispatcher derives them")
 	}
-	var ref map[string]string
+	var ref map[string]any
 	if err := json.Unmarshal(doc.Profiles[0]["jobTemplateRef"], &ref); err != nil {
 		t.Fatalf("jobTemplateRef: %v", err)
 	}
-	if _, ok := ref["name"]; ok || ref["hash"] == "" {
-		t.Errorf("jobTemplateRef %v; want the hash alone", ref)
+	if _, ok := ref["name"]; ok || ref["hash"] == "" || ref["perTier"] != true || len(ref) != 2 {
+		t.Errorf("jobTemplateRef %v; want the hash alone, per tier", ref)
 	}
 	// The operator still knows the durables it creates and grants.
 	if _, durables := dispatcherGrantNames(agent, profiles, nil); len(durables) != 4 {
@@ -72,7 +71,7 @@ func TestTheDispatchConfigFitsTwentyFiveHundredTwoTierProfiles(t *testing.T) {
 			p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 		}))
 	}
-	templates := dispatchJobTemplates(agent, profiles, false)
+	templates := dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder)
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -92,8 +91,9 @@ func TestTheDispatchConfigFitsTwentyFiveHundredTwoTierProfiles(t *testing.T) {
 	}
 	size := len(cm.Data[a2aDispatchConfigKey])
 	const configMapLimit = 1 << 20
-	// Measured at 445,568 bytes (42%) with the test profile's three
-	// parameters. Held to half a ConfigMap, so the other half is headroom
+	// Measured at 483,068 bytes (46%) with the test profile's three
+	// parameters and a per-tier template reference, one hash however many
+	// tiers (#5646; 445,568 before it). Held to half a ConfigMap, so the other half is headroom
 	// for longer names and parameter lists.
 	const target = configMapLimit / 2
 	t.Logf("2,500 two-tier profiles: %d bytes, %.0f%% of a ConfigMap", size, 100*float64(size)/configMapLimit)
@@ -260,9 +260,9 @@ func TestTheDispatchConfigMeasureIsTheWrittenShape(t *testing.T) {
 				estimate += n
 			}
 			for _, imageVolumes := range []bool{true, false} {
-				var templates map[string]*corev1.PodTemplateSpec
+				var templates map[string]profileJobTemplates
 				if tc.jobMode {
-					templates = dispatchJobTemplates(agent, profiles, imageVolumes)
+					templates = dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder)
 				}
 				cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 				if err != nil {

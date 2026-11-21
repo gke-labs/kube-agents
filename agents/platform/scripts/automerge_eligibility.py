@@ -51,7 +51,7 @@ FIX_TYPE = "no-pdb"
 BUDGET_TARGET_KINDS = ("Deployment", "StatefulSet")
 SELECTOR_KEYS = ("matchLabels", "matchExpressions")
 
-#: What the generator can write in each field (`audit_report.KUBERNETES_NAME_PATTERN`,
+#: What the generator can write in each field (`fix_recipes/no-pdb/fix.py`: `KUBERNETES_NAME_PATTERN`,
 #: `audit_report.FINDING_ID_RE`); a file naming anything else is not its output.
 KUBERNETES_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 FINDING_ID = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?")

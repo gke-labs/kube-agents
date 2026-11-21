@@ -18,8 +18,8 @@ spec's layout wins and this doc binds to its subjects and topic classes.
 ## What we deploy
 
 NATS 2.10 or later (auth callout requires it), JetStream enabled, file storage on a PV.
-The operator renders the whole deployment from the mode switch: `mode: next` gets a NATS
-cluster, the default gets nothing. Dark until promoted.
+The operator renders the whole deployment for every `PlatformAgent`; the `spec.mode` switch
+that once held it dark is gone, and the field is deprecated and ignored.
 
 Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run a single
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
@@ -69,14 +69,31 @@ another `busReplicas` change while one runs.
   and web logins drop, and the gateway and bridge cannot publish), the operator's pods
   snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
   snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
-  stream, checked against the operator's policy for it before and after, and raises it to
-  three replicas.
+  stream, checked against the operator's policy for it before and after, raises it to
+  three replicas, and waits (up to 5 minutes for all streams) until every replica is
+  current and every restored durable consumer answers from its leader. Each stream comes back
+  at the rendered `max_bytes` and `max_age`, and its `max_consumers` is widened to the render's
+  but never narrowed: JetStream fixes it when a stream is created, so the restore is the one
+  moment it can grow, and a wider stream's consumers must still fit (amended 11/18). The way
+  back restores each stream as the snapshot recorded it, its width included.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
   replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
   restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.
+- **Reshape**, on request only (the `kubeagents.x-k8s.io/bus-reshape` annotation): TASKS alone is
+  snapshotted, deleted and restored at the width the CR renders, at the count the bus runs,
+  behind the same write freeze as one to three, with the same way back. It starts only on a
+  provisioned bus whose live TASKS is narrower than the render, and never twice for one
+  annotation value, which the bus StatefulSet records. The run's phases are only names the hold below
+  knows, so an operator rolled back to the release that added the hold holds a reshape too
+  (amended 11/19).
+- **A run of a leg this operator does not run** (one a later release started, found after a
+  rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
+  the bus keeps its count, until the operator that started it is back or a person gives it up
+  with the same abandon annotation. It is never retried. `Reshape` is reserved in the leg enum
+  for such a leg (amended 11/19).
 
 **Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
 The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
@@ -102,6 +119,16 @@ A server still outside after 3 minutes is restarted once, under every one of the
 The record is an annotation the operator writes before the delete, with its own patch, so the
 StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
 its one restart stays named in the condition, for a person.
+
+**Amended 11/18 (#6273): a fresh bus that agrees no meta leader at all is restarted whole, once.**
+Once in a nightly, one server campaigned alone and its peers' votes never reached it, so no leader was
+ever agreed, and there was no single stray to restart. After the same 3 minutes, every server is
+restarted once, under the same guards: the bus hasn't been provisioned, no server holds a stream or
+consumer, every server's meta node has started, and the record names none of them yet. The record is
+written first, with every server, so a pass that dies part-way, or an operator restarted mid-way,
+never tries again: a partial restart counts as the one attempt. An `A2ABusMetaGroupRestarted`
+Warning names the servers. A bus still without a leader after that keeps the condition, which says
+every server was restarted once and leaves it for a person.
 
 If a server isn't running while the others are (its pod absent, being deleted, or not Running,
 as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
@@ -146,7 +173,7 @@ Streams bind to the payload spec's subjects and topic classes:
 | Stream            | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | :---------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TASKS`           | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
-| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. No other principal holds a consumer verb here; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                                                               |
+| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. A bus migration deletes and recreates them with the stream, and its restore reads them; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                      |
 | `DISPATCH_STOPS`  | `a2a.stop.>`         | 24h, `max_msgs_per_subject: 1`, 64MiB (amended 10/30, #3655)     | The gateway's stop records for AgentProfile tasks, one per task, written only by the gateway (its grant comes with #4127) and read by the dispatcher by subject, per profile it dispatches for. Outside `a2a.dispatch.`, because the dispatcher publishes there. No consumers. The browser credentials are denied it, and the dispatch subjects.                                                                                                                         |
 | `DIRECTORY`       | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `TOPICS-STATE`    | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -410,6 +437,9 @@ and the draining profiles' names. A connection that sends the bucket `<b>/32` as
 CONNECT password beside the token gets the per-profile grants, draining profiles' included,
 of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
 from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+entry also lists, as `held`, the bound profiles the profile hold keeps out of the dispatcher
+until every bus server has loaded their config; their entries stay in the map, and a bucket's
+grants skip them until the hold lifts (#5935). The
 password picks a slice of what the token already allows; it is not a credential. A bucket the
 callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
 names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
@@ -418,8 +448,10 @@ connection per bucket beside its control connection, and is Ready only with all 
 profile the config adds reconnects only its own bucket. The dispatcher's image has to move with
 the operator's: one from before the bucket connections ignores the switch, binds no durable on
 its control connection, and stays not Ready. With a dispatcher the
-operator principal also creates and deletes those durables, and it is the only principal
-with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
+operator principal also creates and deletes those durables, and outside a bus migration it is
+the only principal that creates or deletes a consumer on that stream. A migration's clear deletes
+them with the stream, and its restore recreates them from the snapshot and lists and reads their
+info. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web` and `console`, because a browser never can;
@@ -459,9 +491,9 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest. On a single server the gateway's per-profile
-deny is left out of that hash, since a reload applies it; on a cluster it is in, so a
-profile change rolls the servers (below).
+without a credential reaching the digest. The gateway's per-profile deny is left out of
+that hash on every server count, since a reload applies it and is confirmed server by
+server (below).
 
 Layout:
 
@@ -773,6 +805,14 @@ Layout:
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
 
+  **Amended 10/30 (#3993):** a confirm has a subject of its own, `chat.console.*.confirm`:
+  a frame there is the same ask as one on `.in`, which the gateway submits with
+  `TaskParameters.ChangeRequested`, the one way a task is granted the permit to make a
+  change. `console` is its only publisher and the gateway its only subscriber (the grants
+  arrive with the account split; see the 11/3 amendment below for `console-mcp`, which holds
+  `.in` and not `.confirm`). The gateway's console adapter subscribes it beside `.in`. A
+  frame on `.in` never carries a confirm, whatever its `kind` says.
+
   **Amended 9/24:** the page is served by an operator-rendered console server
   (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
   `console` password from the creds Secret, and proxies the page's websocket to 9222. It is
@@ -806,8 +846,10 @@ Layout:
   `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
+  **Amended:** the MCP server now runs by default unless `A2A_MCP_DOOR` is `false` (set by
+  the chart's `operator.mcpServer.enabled: false`).
 
-- **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
+- **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
   publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
@@ -931,14 +973,19 @@ pod may publish, the consumers it may create over `.in`, and its capability veri
 reply subjects on that name, so a pod named after another addressee would be handed that
 addressee's task subjects. The gateway never mints such a name, but anyone who can create a
 pod under a narrowed ServiceAccount can, so the same check refuses a narrowed pod whose name
-is a fixed-name addressee. Today that is `platform`: the gateway's default addressee, which
-the operator leaves unset so the gateway keeps its own default, and the only addressee the
-bridge's grants name. The operator renders the list into the callout's
+is a fixed-name addressee. Today that is `platform` and `session`. `platform` is the only
+addressee the bridge's grants name, and the gateway's default addressee unless the
+PlatformAgent's `spec.harness.tuning.defaultRoute` says `session`; the operator renders that
+default as `A2A_DEFAULT_ADDRESSEE`. `session` is the gateway's session route: a sentinel it
+routes on rather than an addressee it publishes to, reserved so nothing holds the name. The
+operator renders the list into the callout's
 `A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
 labels. Session addressees need no entry, since each is the name of the pod that is that
-addressee. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
+addressee. The callout also refuses the pod name `p`, the marker of a profile task's six-token
+supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`, #5301), as defence in depth:
+no session grant reaches a six-token subject today, and gateway-minted names carry hyphens. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
 sets, which leaves the bridge unable to publish its own events because its grants still
 name `platform`. The other is `AgentProfile` addressees, which come and go with their CRs:
 a narrowed pod named after a profile would be handed that profile's task subjects, so
@@ -1043,9 +1090,8 @@ no current-template replica serving, and a gateway let through beside a `False` 
 has a serving replica to mint against. The stale-true paragraph above no longer applies
 to the gate: it reads the Deployment from the informer rather than a condition written a
 pass earlier, and the `Generation` check is what keeps a stale informer copy from
-standing in for a stale condition; the live read for "already there" is unchanged. The
-delay also stopped being invisible. Under
-`mode: next` the A2A gateway is one of the workloads `Ready` is computed from
+standing in for a stale condition; the live read for "already there" is unchanged. The delay also stopped being invisible. The A2A
+gateway is one of the workloads `Ready` is computed from
 (`readSplitWorkloads`), so an install held at the gate reads `Provisioning` with a
 message naming the Deployment - rather than a `Ready: True` sitting above an absent
 dispatcher.
@@ -1148,16 +1194,13 @@ route, leaves the cheap ones, and names the class while doing it.
 Two layers, and they are not the same layer. The admission refusal is unconditional, is
 the only one that tells the CR's author why, and covers mounts as well as volumes:
 `extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
-against the reserved names. The render strip is gated on the A2A surface, so it runs
-under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
-recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
-on that function). On the mounts it goes further than admission does: besides the
+against the reserved names. The render strip runs on every CR, since every install renders the A2A stack. On the mounts it goes further than admission does: besides the
 reserved names it drops any mount naming a volume it has just dropped by source, because
 a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
 layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
 at all; that is deliberate, because it is the supported route for a CR-declared Hermes
 bridge sidecar, which is meant to hold `bridge-password`. The bridge the operator renders
-under `next` gets the same key as a `secretKeyRef` the operator writes itself.
+gets the same key as a `secretKeyRef` the operator writes itself.
 
 Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
 pod-scoped and the callout cannot see which container presented one, so this is a guard
@@ -1231,17 +1274,45 @@ writes a new `nats.conf` into the pod, the reloader sends nats-server the reload
 and the server applies the new users and permissions to the connections it already holds.
 It also runs the auth callout again for each connection the callout authenticated; on
 2.10.29 those connections dropped at the reload and reconnected within a second.
-The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
-added, removed or done draining changes the config Secret and not the template: the bus is
-reloaded, not rolled. Every other config change still rolls it. The operator records the
-reload it asked for on the Secret, with the `config_load_time` it read just before writing,
-and confirms the reload when that value moves. A config written while a reload is still
+The pod template's config hash leaves out the per-profile gateway deny, on one server and
+on a cluster alike, so an AgentProfile added, removed or done draining changes the config
+Secret and not the template: every server is reloaded, and none is restarted or rolled.
+Every other config change still rolls the bus. The operator records the reload it asked for
+on the Secret, with each server's pod UID, `start` and `config_load_time` read from its
+`/varz` just before writing, by pod IP (a Service answers from whichever server it picks,
+and the per-pod names under the routes Service don't resolve), and only from a server whose
+`server_name` is its pod's. A server on the same pod and start confirms when its load time
+has moved. A server restarted in place (a new `start`) reloads whatever file the kubelet last
+synced, which can be the old one, so it confirms only when a load time later than its start
+arrives, or when it started more than the kubelet's sync window (90 seconds: the sync period
+plus the Secret cache's lag) after the write. A new pod confirms when the API server created
+it after the write, by the operator's own managedFields entry on the live Secret (another manager's later edit doesn't move it). A change to the bus's TLS Secret while a reload is pending (a renewed certificate, which the reloader also acts on) folds every server, so the move that follows re-arms the wait. A reload sent by hand can't be told apart, and is left to whoever sends it. nats-server 2.10 serves no
+config digest to compare instead. A server it can't read, or can't show holds the newest
+write, hasn't loaded the config: the reload stays pending, and so does the profile hold
+below, until every server is confirmed. A pod at an ordinal past what the StatefulSet asks
+for (a scale-down under way), or under a server's name but not the StatefulSet's (a Warning
+names it), keeps it pending too. The single-server path an earlier operator shipped took any
+moved load time as the reload, a restart included; this closes that on one server as on
+three. For a rolled-back operator, the key it reads keeps its old shape: pod -0's load time
+alone. A config written while a reload is still
 pending can't be confirmed by that move, which may be the earlier write landing, so the move
 restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
 kubelet write, so a restarted wait usually sees no further move, and nothing the server
 reports says whether the newest write was in the one it saw. If the value hasn't moved
-within three minutes, or can't be read, the operator deletes the bus pod so it restarts onto
-the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+within three minutes, or can't be read, the operator deletes that server's pod so it restarts
+onto the new config: one server per pass, only once every other server has been Ready for
+30 seconds, so a cluster keeps quorum, and none while a scale-down is under way. When exactly
+one server isn't Ready and hasn't confirmed, it goes first, since restarting it costs no
+quorum. A server that can never start (unschedulable, or crash-looping) is deleted once per bound
+while it stays unconfirmed, with a Warning each time, and the profile stays held throughout.
+An upgrade that lands in the middle of a reload: on three servers there is nothing in flight
+to carry over, since the earlier operator rolled the bus rather than reloading it and kept no
+reload record. On one server, a reload the earlier operator left pending can't be confirmed in
+place, because its record carries no pod UID or start time, so the server is restarted at that
+operator's original bound, with a `BusConfigReloadFailed` Warning, and the new pod confirms by
+its creation after the write. The fresh pod mounts the current Secret, so its creation after the write confirms
+it, and the pending record stays until it is read. A pod created after the write is given a
+full three minutes from its own creation to come up before it can be restarted. That is a `BusConfigReloadFailed` Warning, or a Normal
 `BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
 restart is kept even then: confirming by the absence of a move would admit a profile whose
 deny the server might not hold. The kubelet takes up to about a minute to write
@@ -1253,17 +1324,19 @@ door, serves the same certificate from the same files (below).
 **A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
 grant and the agent card take a newly bound AgentProfile only once every bus server has
 loaded the config carrying its deny; until then the profile's `CardPublished` condition is
-`False` with reason `BusConfigPending`. On a cluster, where a profile change rolls the
-servers, the pod template records the profile list, and the operator reads the revision
-each server runs from the StatefulSet's ControllerRevisions (the operator's one `get` on
-them). On one server the config Secret records the previous list while a reload is pending
-or the pod restarts, and the profile counts as loaded once the server is on the new config.
+`False` with reason `BusConfigPending`. The config Secret records the previous list while a
+reload is pending on any server or a server restarts, and the profile counts as loaded once
+every server is on the new config. An earlier operator rolled a cluster onto each profile
+change instead and recorded the list on the pod template; while any server still runs, or
+the StatefulSet's update revision is, a revision carrying that list (an upgrade's roll
+unfinished), the loaded set is also narrowed to what every such revision lists, read from
+the StatefulSet's ControllerRevisions (the operator's one `get` on them).
 Only the way in waits: a profile the dispatch config already lists live, or whose card is
 already published, stays, and a removed profile keeps its deny while it drains, as before.
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
-`PlatformAgent` and removed with the stack on a flip to `today`:
+`PlatformAgent`:
 
 | Object                                             | Holds                                                  |
 | -------------------------------------------------- | ------------------------------------------------------ |

@@ -119,6 +119,15 @@
             }
           }
         },
+        "cardStop": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "slackTestUsers": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
@@ -983,6 +992,42 @@
         }
       }
     },
+    "credentialProxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
+    "hermesBridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
     "platformAgent": {
       "type": "object",
       "additionalProperties": false,
@@ -1167,7 +1212,10 @@
             "universeDomain": {
               "type": "string",
               "maxLength": 253,
-              "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)?$"
+              "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)?$",
+              "not": {
+                "pattern": "\\.googleapis\\.com$"
+              }
             },
             "hermes": {
               "type": "object",
@@ -1413,6 +1461,10 @@
                 "busReplicas": {
                   "type": "integer",
                   "enum": [1, 3]
+                },
+                "defaultRoute": {
+                  "type": "string",
+                  "enum": ["session", "platform"]
                 },
                 "admission": {
                   "type": "object",
@@ -1667,6 +1719,9 @@
               "type": ["integer", "null"],
               "minimum": 0,
               "maximum": 86400
+            },
+            "evalRunTags": {
+              "type": "boolean"
             },
             "credentialProxy": {
               "type": "object",
@@ -2008,6 +2063,10 @@
                 },
                 "answerFeedback": {
                   "type": "boolean"
+                },
+                "homeChannelPolicy": {
+                  "type": "string",
+                  "enum": ["", "auto", "manual"]
                 }
               }
             },

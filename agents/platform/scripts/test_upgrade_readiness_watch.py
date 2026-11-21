@@ -176,7 +176,12 @@ class FakeSandbox:
 
 class Base(unittest.TestCase):
     def setUp(self) -> None:
+        # Each piece is undone by a cleanup and not in `tearDown`: cleanups run
+        # last-in first-out and after `tearDown`, so the environment patch of a
+        # subclass, started later, stops before this one. In the other order the
+        # subclass's stop puts the values below back for every later test.
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / "watch"
         # The scope reader looks for the reconcile's snapshot under the agent
         # home and the operator's render under its variable: an install that
@@ -197,8 +202,10 @@ class Base(unittest.TestCase):
             clear=False,
         )
         self.env.start()
+        self.addCleanup(self.env.stop)
         self.clock = mock.patch.object(watch, "now_utc", return_value=NOW)
         self.clock.start()
+        self.addCleanup(self.clock.stop)
 
     def declare_scope(
         self, projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None, retiring: list[str] | None = None
@@ -206,11 +213,6 @@ class Base(unittest.TestCase):
         (Path(self.tmp.name) / fleet_scope_targets.SNAPSHOT_FILE).write_text(
             json.dumps(declared_snapshot(projects, unread, exclude, containers, retiring)), encoding="utf-8"
         )
-
-    def tearDown(self) -> None:
-        self.clock.stop()
-        self.env.stop()
-        self.tmp.cleanup()
 
     @staticmethod
     def failed(detail: str, reason: str = watch.FAILED_REASON_ERROR, admin: bool | None = None) -> str:
@@ -2679,6 +2681,24 @@ class UnusableResolvedScope(Base):
         self.assertIn(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_SCOPE_UNREADABLE, next=watch.FAILED_NEEDS_ADMIN), out)
 
 
+class EnvironmentRestored(unittest.TestCase):
+    def test_a_tick_test_with_an_environment_of_its_own_leaves_none_of_it_behind(self) -> None:
+        # A class that patches the environment after `Base.setUp` and stops its
+        # patch as a cleanup: the two must unwind last-in first-out, or the
+        # values of `Base` stay for every test that runs later.
+        # Inside a patch of its own, so a leak that this finds does not stay for
+        # the tests that run later.
+        with mock.patch.dict(os.environ):
+            before = dict(os.environ)
+            result = unittest.TestResult()
+            UnusableResolvedScope("test_an_explicit_roster_ignores_the_resolved_scope").run(result)
+            self.assertTrue(result.wasSuccessful(), result.failures + result.errors)
+            self.assertEqual(result.skipped, [])
+            changed = sorted(key for key in set(before) | set(os.environ) if before.get(key) != os.environ.get(key))
+        # Names only: a failure must not print the environment into the log.
+        self.assertEqual(changed, [])
+
+
 class Projects(unittest.TestCase):
     def test_the_explicit_list_wins(self) -> None:
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2, p1,p2", watch.MANAGEMENT_PROJECT_ENV: "mgmt"}):
@@ -2766,6 +2786,7 @@ class Projects(unittest.TestCase):
             (root / "scope.json").write_text(json.dumps({"present": True, "projects": ["explicit-a"], "folders": ["1"]}), encoding="utf-8")
             (root / "resolved-scope.json").write_text(json.dumps({"v": 1, "state": "too-large", "projects": []}), encoding="utf-8")
             env = {watch.MANAGEMENT_PROJECT_ENV: "mgmt",
+                   watch.PROJECTS_ENV: "",
                    watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
                    watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json")}
             with mock.patch.dict(os.environ, env), mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home):
@@ -2775,9 +2796,9 @@ class Projects(unittest.TestCase):
                 self.assertIsNone(gap[watch.MEMBER_ID_KEYS[1]])
                 self.assertIn("too-large", gap[watch.MESSAGE_KEY])
             # Today mode, or a usable document, has no gap.
-            with mock.patch.dict(os.environ, {watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: ""}), mock.patch.object(
-                watch.gitops_workspace, "agent_home", return_value=home
-            ):
+            with mock.patch.dict(
+                os.environ, {watch.PROJECTS_ENV: "", watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: ""}
+            ), mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home):
                 self.assertIsNone(watch.resolved_scope_gap())
 
 class Loader(unittest.TestCase):

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -25,12 +26,6 @@ func (s *fakeSpawner) setLiveErr(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.liveErr = err
-}
-
-func (s *fakeSpawner) LiveSessions(context.Context) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.live, s.liveErr
 }
 
 // TestDelegateRefusedAtSessionCap: "Delegate:" makes pod creation
@@ -156,11 +151,11 @@ func TestSessionCapCountErrorRefusesHonestly(t *testing.T) {
 	}
 }
 
-// TestPodSpawnerLiveSessionsCountsNonTerminal: the denominator is what the
-// k8s API holds - session-labeled pods in this namespace that are not yet
-// terminal. Succeeded/Failed pods are sweep's inventory, not load; other
-// workloads and other namespaces are not ours to count.
-func TestPodSpawnerLiveSessionsCountsNonTerminal(t *testing.T) {
+// TestPodSpawnerSessionPodsListsOnlyThisNamespacesLiveSessionPods: the cap's
+// count is what the k8s API holds - session-labeled pods in this namespace
+// that are not yet terminal. Succeeded/Failed pods are sweep's inventory,
+// not load; other workloads and other namespaces are not ours to count.
+func TestPodSpawnerSessionPodsListsOnlyThisNamespacesLiveSessionPods(t *testing.T) {
 	mk := func(name, ns string, phase corev1.PodPhase, sessionLabels bool) *corev1.Pod {
 		labels := map[string]string{}
 		if sessionLabels {
@@ -171,21 +166,33 @@ func TestPodSpawnerLiveSessionsCountsNonTerminal(t *testing.T) {
 			Status:     corev1.PodStatus{Phase: phase},
 		}
 	}
+	// Part of kube-agents but not a session pod: the selector needs both
+	// labels, so a pod with only one of them is not counted.
+	halfLabelled := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "half-labelled", Namespace: "test-ns", Labels: map[string]string{labelPartOf: partOfValue}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
 	cs := k8sfake.NewSimpleClientset(
 		mk("running", "test-ns", corev1.PodRunning, true),
 		mk("pending", "test-ns", corev1.PodPending, true),
 		mk("done", "test-ns", corev1.PodSucceeded, true),
 		mk("dead", "test-ns", corev1.PodFailed, true),
 		mk("bystander", "test-ns", corev1.PodRunning, false),
+		halfLabelled,
 		mk("elsewhere", "other-ns", corev1.PodRunning, true),
 	)
 	s := &podSpawner{cfg: &Config{Namespace: "test-ns"}, client: cs, log: slog.Default()}
-	n, err := s.LiveSessions(context.Background())
+	pods, err := s.SessionPods(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
-		t.Fatalf("LiveSessions = %d, want 2 (running + pending)", n)
+	var got []string
+	for _, p := range pods {
+		got = append(got, p.PodName)
+	}
+	slices.Sort(got)
+	if want := []string{"pending", "running"}; !slices.Equal(got, want) {
+		t.Fatalf("SessionPods = %v, want %v (running + pending)", got, want)
 	}
 }
 

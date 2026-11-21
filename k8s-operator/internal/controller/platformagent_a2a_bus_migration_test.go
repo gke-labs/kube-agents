@@ -264,7 +264,7 @@ func newMigrationRig(t *testing.T, leg busMigrationLeg, phase busMigrationPhase,
 	agent.Status.BusMigration.FreezeConfirmed = busMigrationFreezeActive(agent) && phase != busMigrationFreezing
 	sts := buildA2ANATSStatefulSet(agent, "h")
 	sts.Spec.Replicas = ptr.To(running)
-	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&appsv1.StatefulSet{}, &batchv1.Job{}, &corev1.Pod{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &batchv1.Job{}, &corev1.Pod{}).Build()
 	return &migrationRig{t: t, agent: agent, cl: cl, r: &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: emptyBusStreams}, sts: sts}
 }
 
@@ -372,8 +372,8 @@ func (m *migrationRig) snapshotKept() {
 	if err := m.cl.Status().Update(ctx, pvc); err != nil {
 		m.t.Fatal(err)
 	}
-	digests, _ := parseBusDigests(validDigests())
-	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(1)})
+	digests, _ := parseBusDigests(validDigests(), a2aBusMigrationStreams())
+	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(m.agent, 1)})
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}, Data: map[string][]byte{busMigrationRunKey: body}}
 	m.own(sec)
 	if err := m.cl.Create(ctx, sec); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -474,8 +474,8 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	if err := json.Unmarshal(secret.Data[busMigrationRunKey], &run); err != nil {
 		t.Fatal(err)
 	}
-	wantDigests, _ := parseBusDigests(validDigests())
-	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
+	wantDigests, _ := parseBusDigests(validDigests(), a2aBusMigrationStreams())
+	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(m.agent, 1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
 		t.Errorf("run Secret %+v, owners %v", run, secret.OwnerReferences)
 	}
 
@@ -658,7 +658,7 @@ func TestAFailedRestoreRollsBackNamingItsError(t *testing.T) {
 }
 
 func TestTheHashingReportIsReadStrictly(t *testing.T) {
-	good, refused := parseBusDigests(validDigests())
+	good, refused := parseBusDigests(validDigests(), a2aBusMigrationStreams())
 	if refused != "" || len(good) != len(a2aProvisionedStreams) {
 		t.Fatalf("a valid report refused: %s", refused)
 	}
@@ -690,7 +690,7 @@ func TestTheHashingReportIsReadStrictly(t *testing.T) {
 			c["TASKS"] = busmigrate.StagedDigest{Data: c["TASKS"].Data}
 		}),
 	} {
-		if _, refused := parseBusDigests(msg); refused == "" {
+		if _, refused := parseBusDigests(msg, a2aBusMigrationStreams()); refused == "" {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -872,8 +872,11 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 	shrinkBanned := []string{"SNAPSHOT", "RESTORE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE"}
 	snapshot := grant{busMigrationGrow, []string{"INFO", "SNAPSHOT"}, []string{"$JS.SNAPSHOT.ACK.%s.>"},
 		[]string{"RESTORE", "RESTORE-CHUNK", "UPDATE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
-	restore := grant{busMigrationGrow, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}, []string{"$JS.SNAPSHOT.RESTORE.%s.>"},
-		[]string{"SNAPSHOT", "ACK", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
+	// The restore reads consumers (names, info) and nothing else of theirs:
+	// CREATE, DELETE and the durable create stay out (checked below).
+	restore := grant{busMigrationGrow, []string{"INFO", "RESTORE", "UPDATE", "DELETE"},
+		[]string{"$JS.SNAPSHOT.RESTORE.%s.>", "$JS.API.CONSUMER.NAMES.%s", "$JS.API.CONSUMER.INFO.%s.*"},
+		[]string{"SNAPSHOT", "ACK", "PURGE", "CREATE", "DURABLE", "MSG.DELETE", "LEADER.STEPDOWN"}}
 	want := map[busMigrationPhase]grant{
 		busMigrationPinning:           {busMigrationShrink, []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}, nil, shrinkBanned},
 		busMigrationUnpinning:         {busMigrationShrink, []string{"INFO", "UPDATE"}, nil, shrinkBanned},
@@ -905,6 +908,20 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 			t.Errorf("%s publish:\n got %v\nwant %v", phase, id.publish, expected)
 		}
 		for _, p := range id.publish {
+			if strings.Contains(p, ".CONSUMER.") {
+				// Consumers are read only, by stream name: names and info.
+				// The consumer-name wildcard under one provisioned stream
+				// is the one wildcard allowed. Which phases hold it is
+				// pinned by the exact list above.
+				ok := false
+				for _, s := range a2aProvisionedStreams {
+					ok = ok || p == "$JS.API.CONSUMER.NAMES."+s || p == "$JS.API.CONSUMER.INFO."+s+".*"
+				}
+				if !ok {
+					t.Errorf("%s grants a consumer subject: %s", phase, p)
+				}
+				continue
+			}
 			if strings.HasSuffix(p, ".*") || strings.Contains(p, "STREAM.>") || p == "$JS.API.>" || strings.HasPrefix(p, "$JS.API.STREAM.*") ||
 				p == "$JS.SNAPSHOT.RESTORE.>" || p == "$JS.SNAPSHOT.ACK.>" || p == "$JS.SNAPSHOT.>" {
 				t.Errorf("%s: wildcard over stream names: %s", phase, p)
@@ -1046,7 +1063,7 @@ func TestAPhaseCreatesItsJobAndIdentity(t *testing.T) {
 		"--ca-file " + a2aNATSCAFile(),
 		"--user " + busMigrationPrincipal("pin", "3-1"),
 		"--token-file " + a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams " + strings.Join(a2aProvisionedStreams, ","),
+		"--streams " + strings.Join(a2aBusMigrationStreams(), ","),
 		"--target " + a2aNATSName(m.agent) + "-0",
 	} {
 		if !strings.Contains(args, want) {
@@ -1345,7 +1362,13 @@ func TestAStepsJobStopsBeforeItsCredentialExpires(t *testing.T) {
 // provision script, continuations joined, keyed by stream name, as flag maps.
 func provisionCreateLines(t *testing.T) map[string]map[string]string {
 	t.Helper()
-	script := buildA2AProvisionJob(a2aTestAgent()).Spec.Template.Spec.Containers[0].Command[2]
+	return provisionCreateLinesFor(t, a2aTestAgent())
+}
+
+// provisionCreateLinesFor is provisionCreateLines for agent's script.
+func provisionCreateLinesFor(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]map[string]string {
+	t.Helper()
+	script := buildA2AProvisionJob(agent).Spec.Template.Spec.Containers[0].Command[2]
 	script = strings.ReplaceAll(script, "\\\n", " ")
 	lines := map[string]map[string]string{}
 	for _, line := range strings.Split(script, "\n") {
@@ -1378,7 +1401,7 @@ func provisionCreateLines(t *testing.T) map[string]map[string]string {
 // same streams, and every value the script passes on a policy field.
 func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 	lines := provisionCreateLines(t)
-	policies := a2aStreamPolicies(1)
+	policies := a2aStreamPolicies(a2aTestAgent(), 1)
 	var names []string
 	for _, p := range policies {
 		names = append(names, p.Name)
@@ -1427,7 +1450,7 @@ func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 			_, direct := f["allow-direct"]
 			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: strings.Split(f["subjects"], ","), Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
 				MaxBytes: num(f["max-bytes"], -1), MaxAge: dur(f["max-age"]), Discard: nats.DiscardOld, MaxMsgsPerSubject: num(f["max-msgs-per-subject"], -1),
-				AllowDirect: direct, Replicas: 1}
+				AllowDirect: direct, Replicas: 1, MaxConsumers: int(num(f["max-consumers"], 0))}
 		case "kv":
 			bucket := strings.TrimPrefix(p.Name, "KV_")
 			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: []string{"$KV." + bucket + ".>"}, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
@@ -1440,6 +1463,34 @@ func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 	}
 }
 
+// TASKS's policy width is the CR's, not the fresh install's: with
+// maxSessions raised it is a2aTasksMaxConsumers(agent), the width the
+// provision script creates TASKS with for that CR, which is the width a
+// one to three restore widens to.
+func TestTheTasksPolicyWidthFollowsTheCR(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: ptr.To(20)}}
+	want := a2aTasksMaxConsumers(agent)
+	if want == a2aTasksMaxConsumers(a2aTestAgent()) {
+		t.Fatalf("maxSessions 20 renders the default width %d; the test can't tell them apart", want)
+	}
+	found := false
+	for _, p := range a2aStreamPolicies(agent, 1) {
+		if p.Name == "TASKS" {
+			found = true
+			if p.MaxConsumers != want {
+				t.Errorf("TASKS policy max_consumers %d, want the CR's %d", p.MaxConsumers, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no TASKS policy")
+	}
+	if got := provisionCreateLinesFor(t, agent)["TASKS"]["max-consumers"]; got != strconv.Itoa(want) {
+		t.Errorf("provision script --max-consumers %q, want %d: the policy and the script disagree", got, want)
+	}
+}
+
 // The table's KV implications, and every value the script leaves to the
 // CLI's defaults, are what a fresh install creates (busmigrate's
 // fresh_streams.json, captured with the provision image's CLI against the
@@ -1449,7 +1500,7 @@ func TestTheStreamPoliciesMatchAFreshInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(a2aTestAgent(), 1) {
 		ref, ok := fresh.Streams[p.Name]
 		if !ok {
 			t.Errorf("%s: not in the fresh-install reference; regenerate it", p.Name)
@@ -1571,7 +1622,7 @@ func TestTheSnapshotPhaseCreatesAOnePodStage(t *testing.T) {
 		t.Errorf("storage class %v owners %v", pvc.Spec.StorageClassName, pvc.OwnerReferences)
 	}
 	var caps int64
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(a2aTestAgent(), 1) {
 		caps += p.MaxBytes
 	}
 	got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
@@ -2615,7 +2666,7 @@ func TestAClearFailingPartwayIsRetriedToTheEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.pass(busMigrationRollingBack, 1)
-	if !busMigrationClearedAll(m.agent.Status.BusMigration) {
+	if !busMigrationClearedAll(m.agent.Status.BusMigration, busMigrationGrow) {
 		t.Error("the retried clear did not record every stream")
 	}
 }
@@ -2658,7 +2709,7 @@ func TestEachClearingStartsItsOwnRecord(t *testing.T) {
 	m.agent.Status.BusMigration.Cleared = a2aProvisionedStreams // the forward clear's
 	m.finishPod("restore", corev1.PodFailed, `{"error":"boom"}`, "")
 	m.pass(busMigrationClearing, 3)
-	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration) {
+	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration, busMigrationGrow) {
 		t.Errorf("the way back's Clearing starts with %v cleared", m.agent.Status.BusMigration.Cleared)
 	}
 }
@@ -2849,5 +2900,297 @@ func TestAGivenUpShrinkClaimsNoFreezeOrRecreatedStreams(t *testing.T) {
 	agent.Status.BusMigration.Leg = string(busMigrationGrow)
 	if got := busMigrationFailedActions(agent); !strings.Contains(got, "recreated empty") {
 		t.Errorf("given-up grow says %q, want the recreated streams named", got)
+	}
+}
+
+// The restore's settle wait is named in the run's status and in a Normal
+// Event, once.
+func TestTheRestoreSettleTimeIsInStatusAndAnEvent(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(8)
+	m.r.Recorder = recorder
+	m.finishPod("restore", corev1.PodSucceeded, `{"settleSeconds":1.234}`, "")
+	m.pass(busMigrationReleasing, 3)
+	if got := m.agent.Status.BusMigration.SettleTime; got != "1.234s" {
+		t.Errorf("status settleTime %q, want 1.234s", got)
+	}
+	select {
+	case e := <-recorder.Events:
+		if !strings.Contains(e, "Normal BusMigrationSettled") || !strings.Contains(e, "1.234s") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Normal Event for the settle time")
+	}
+}
+
+// A failed restore's report that carries a settle time too (from a pod that
+// reports both) sets no settle time and no Normal Event: the run is turning
+// back, not settled. A second report doesn't overwrite a settle time.
+func TestAFailedRestoreRecordsNoSettleTime(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	recorder := record.NewFakeRecorder(8)
+	m.r.Recorder = recorder
+	m.finishPod("restore", corev1.PodFailed, `{"settleSeconds":2.5,"error":"stream DIRECTORY: not at R3 with its consumers after 5m0s: a follower is not current"}`, "")
+	m.pass(busMigrationClearing, 3)
+	if got := m.agent.Status.BusMigration.SettleTime; got != "" {
+		t.Errorf("status settleTime %q on a failed restore, want none", got)
+	}
+	for len(recorder.Events) > 0 {
+		if e := <-recorder.Events; strings.Contains(e, "BusMigrationSettled") {
+			t.Errorf("settle Event on a failed restore: %q", e)
+		}
+	}
+}
+
+func TestASettleTimeIsWrittenOnce(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(8)
+	m.r.Recorder = recorder
+	m.agent.Status.BusMigration.SettleTime = "1s"
+	m.finishPod("restore", corev1.PodSucceeded, `{"settleSeconds":9}`, "")
+	m.pass(busMigrationReleasing, 3)
+	if got := m.agent.Status.BusMigration.SettleTime; got != "1s" {
+		t.Errorf("status settleTime %q, want the first one kept", got)
+	}
+	for len(recorder.Events) > 0 {
+		if e := <-recorder.Events; strings.Contains(e, "BusMigrationSettled") {
+			t.Errorf("a second settle Event: %q", e)
+		}
+	}
+}
+
+// A restore whose streams never settle fails the restore: the run turns back
+// (Clearing, abandoning), the cause names the wait, and the staging claim and
+// run Secret are kept, as on any give-up after the forward clear (#4488).
+func TestARestoreThatNeverSettlesRollsBackKeepingTheStage(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	m.finishPod("restore", corev1.PodFailed, `{"error":"stream TASKS: not at R3 with its consumers after 5m0s: consumer worker not found on its leader"}`, "")
+	m.pass(busMigrationClearing, 3)
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "not at R3 with its consumers after 5m0s") {
+		t.Errorf("abandoning %v cause %q, want the settle timeout as the cause", run.Abandoning, run.Cause)
+	}
+	ctx := context.Background()
+	pvc := buildBusStagePVC(m.agent, run)
+	if err := m.cl.Get(ctx, client.ObjectKeyFromObject(pvc), pvc); err != nil || !pvc.DeletionTimestamp.IsZero() {
+		t.Errorf("staging claim after a settle timeout: %v (deleting %v), want it kept", err, pvc.DeletionTimestamp)
+	}
+	if err := m.cl.Get(ctx, client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationRunSecret(m.agent, "3-1")}, &corev1.Secret{}); err != nil {
+		t.Errorf("run Secret after a settle timeout: %v, want it kept", err)
+	}
+}
+
+// singleServerAskedForThree is a provisioned one-server bus whose field asks
+// for three, on a fake cluster whose status subresource conflicts or prunes as
+// the test's patch hook says, as #6298's lane did.
+func singleServerAskedForThree(t *testing.T, onStatusPatch func(client.Client, context.Context, client.Object, client.Patch, ...client.SubResourcePatchOption) error) (*agentv1alpha1.PlatformAgent, client.Client, *PlatformAgentReconciler) {
+	t.Helper()
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	agent := a2aTestAgent()
+	agent.Generation = 4
+	agent.Status.BusReplicas = 1
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(3)}}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	base := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}).Build()
+	cl := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if _, ok := obj.(*agentv1alpha1.PlatformAgent); ok && sub == "status" {
+				return onStatusPatch(c, ctx, obj, patch, opts...)
+			}
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: emptyBusStreams}
+	return agent, base, r
+}
+
+// freezeID is the run ID a callout rendered from agent carries, if any.
+func freezeID(agent *agentv1alpha1.PlatformAgent) string {
+	dep := &appsv1.Deployment{}
+	busMigrationFreezeCallout(agent, dep)
+	return dep.Spec.Template.Annotations[a2aBusFreezeAnnotation]
+}
+
+// #6298: a run whose first status write conflicts renders nothing with its
+// ID. The pass fails before anything does, with the conflict, which requeues
+// it. The next pass starts the run and persists it, and every pass after,
+// reading it back, renders the callout with that one ID. Before, the record
+// lived only in memory until the pass's last write, so a conflict there lost
+// it after the callout had rolled, and each pass rolled it again with a new
+// ID.
+func TestALostFirstWriteRendersNoRunAndTheCalloutKeepsOneID(t *testing.T) {
+	ctx := context.Background()
+	conflicts := 1
+	agent, base, r := singleServerAskedForThree(t, func(c client.Client, ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+		if conflicts > 0 {
+			conflicts--
+			return apierrors.NewConflict(agentv1alpha1.GroupVersion.WithResource("platformagents").GroupResource(), obj.GetName(), fmt.Errorf("the object has been modified"))
+		}
+		return c.SubResource("status").Patch(ctx, obj, patch, opts...)
+	})
+	stored := func() *agentv1alpha1.PlatformAgent {
+		a := &agentv1alpha1.PlatformAgent{}
+		if err := base.Get(ctx, client.ObjectKeyFromObject(agent), a); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+
+	err := r.resolveA2ABusReplicas(ctx, agent)
+	if !isPlatformAgentConflict(err) {
+		t.Fatalf("the pass whose run write conflicted = %v, want the conflict, which requeues it", err)
+	}
+	if agent.Status.BusMigration != nil || freezeID(agent) != "" {
+		t.Fatalf("after a conflicted run write: run %+v in the pass, callout freeze %q; want neither", agent.Status.BusMigration, freezeID(agent))
+	}
+	if stored().Status.BusMigration != nil {
+		t.Fatal("a run is stored from a conflicted write")
+	}
+
+	ids := map[string]bool{}
+	for pass := 1; pass <= 3; pass++ {
+		a := stored() // the requeued pass reads the CR afresh
+		if err := r.resolveA2ABusReplicas(ctx, a); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		now := stored()
+		run, kept := a.Status.BusMigration, now.Status.BusMigration
+		if run == nil || kept == nil || kept.RunID != run.RunID {
+			t.Fatalf("pass %d: run %+v in the pass, %+v stored; want the pass's run stored", pass, run, kept)
+		}
+		// The pass's final status write goes against the version the run
+		// write made, or it would conflict every time a run starts.
+		if a.ResourceVersion != now.ResourceVersion {
+			t.Errorf("pass %d: the pass holds resourceVersion %s, the CR is at %s", pass, a.ResourceVersion, now.ResourceVersion)
+		}
+		ids[freezeID(a)] = true
+	}
+	if len(ids) != 1 || ids[""] {
+		t.Errorf("the callout was rendered with run IDs %v over three passes, want one", ids)
+	}
+}
+
+// A run write whose echo comes back without the record, the served CRD
+// pruning it, takes the run back out of the pass, and the next pass refuses
+// to start one with the existing Warning Event, as when the final write's
+// echo shows the prune.
+func TestAPrunedRunWriteTakesTheRunBack(t *testing.T) {
+	ctx := context.Background()
+	agent, _, r := singleServerAskedForThree(t, func(c client.Client, ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+		if err := c.SubResource("status").Patch(ctx, obj, patch, opts...); err != nil {
+			return err
+		}
+		obj.(*agentv1alpha1.PlatformAgent).Status.BusMigration = nil // the echo of a CRD without the field
+		return nil
+	})
+	recorder := record.NewFakeRecorder(16)
+	r.Recorder = recorder
+	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil || freezeID(agent) != "" || !r.busMigrationStatusPruned(agent) {
+		t.Fatalf("after a pruned run write: run %+v, freeze %q, prune recorded %v; want no run and the prune recorded", agent.Status.BusMigration, freezeID(agent), r.busMigrationStatusPruned(agent))
+	}
+	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil {
+		t.Fatalf("a run started after the prune was recorded: %+v", agent.Status.BusMigration)
+	}
+	found := false
+	for len(recorder.Events) > 0 {
+		found = found || strings.Contains(<-recorder.Events, "drops status.busMigration")
+	}
+	if !found {
+		t.Error("no Warning Event naming the pruned field")
+	}
+}
+
+// The run write is against the version the pass read: a CR changed since,
+// by anyone, refuses it, and the pass starts nothing, rather than starting a
+// second run beside one a write that seemed to fail did store.
+func TestARunWriteAgainstAChangedCRStartsNothing(t *testing.T) {
+	ctx := context.Background()
+	agent, base, r := singleServerAskedForThree(t, func(c client.Client, ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+		return c.SubResource("status").Patch(ctx, obj, patch, opts...)
+	})
+	moved := &agentv1alpha1.PlatformAgent{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(agent), moved); err != nil {
+		t.Fatal(err)
+	}
+	moved.Annotations = map[string]string{"example.test/touched": "1"}
+	if err := base.Update(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	err := r.resolveA2ABusReplicas(ctx, agent) // agent is the read from before the change
+	if !isPlatformAgentConflict(err) || agent.Status.BusMigration != nil || freezeID(agent) != "" {
+		t.Fatalf("a run write against a changed CR = %v, run %+v, freeze %q; want the conflict and no run", err, agent.Status.BusMigration, freezeID(agent))
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(agent), moved); err != nil || moved.Status.BusMigration != nil {
+		t.Fatalf("stored run after a refused write: %+v, %v", moved.Status.BusMigration, err)
+	}
+}
+
+// A new run replaces the last one's record whole: nothing of the last run
+// (its retries, its cleared streams, its cause, its confirmed freeze) carries
+// into the new run's stored record.
+func TestANewRunReplacesTheLastRunsRecord(t *testing.T) {
+	ctx := context.Background()
+	agent, base, r := singleServerAskedForThree(t, func(c client.Client, ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+		return c.SubResource("status").Patch(ctx, obj, patch, opts...)
+	})
+	// A run that turned back and ended without converting the bus, which
+	// the bus-migration-start annotation naming it asks to try again.
+	old := &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "2-1", Phase: string(busMigrationAbandoned),
+		Cause: "an earlier failure", Cleared: []string{"TASKS"}, FreezeConfirmed: true, Retries: []agentv1alpha1.BusMigrationRetry{{}},
+		StartedAt: metav1.NewTime(time.Now().Add(-5 * time.Hour)), Deadline: metav1.NewTime(time.Now().Add(-3 * time.Hour)), ObservedGeneration: 2}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Annotations = map[string]string{a2aBusMigrationStartAnnotation: "2-1"}
+	if err := base.Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Status.BusMigration = old
+	if err := base.Status().Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	run := stored.Status.BusMigration
+	if run == nil || run.RunID == "2-1" {
+		t.Fatalf("stored run %+v, want a new one", run)
+	}
+	if run.GivenUp || run.Cause != "" || len(run.Cleared) != 0 || run.FreezeConfirmed || len(run.Retries) != 0 {
+		t.Errorf("the new run's stored record carries the last run's fields: %+v", run)
+	}
+}
+
+// The migration walks every provisioned stream once, with PROFILE_SUBMITS
+// after both streams that index it: the clear deletes last to first, so a
+// partial clear never leaves the submits without their leases or stops.
+func TestTheMigrationWalksTheSubmitsAfterTheirIndexes(t *testing.T) {
+	order := a2aBusMigrationStreams()
+	if !slices.Equal(slices.Sorted(slices.Values(order)), slices.Sorted(slices.Values(a2aProvisionedStreams))) {
+		t.Fatalf("migration order %v, want exactly the provisioned streams %v", order, a2aProvisionedStreams)
+	}
+	submits := slices.Index(order, a2aProfileSubmitStream)
+	for _, index := range []string{"KV_PROFILE_LEASES", "DISPATCH_STOPS"} {
+		if i := slices.Index(order, index); i < 0 || i > submits {
+			t.Errorf("migration order %v: %s at %d, PROFILE_SUBMITS at %d; the index must come first", order, index, i, submits)
+		}
 	}
 }

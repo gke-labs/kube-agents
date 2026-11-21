@@ -313,13 +313,19 @@ const (
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
 	// homeChannelUnsetToGchat and homeChannelUnsetToSlackRoute are the
 	// meanwhile when the other armed backend has a home: the agent sends
-	// home posts only to the platforms with one, the CR's list plus a
-	// learned Slack channel (agents/platform/scripts/chat_notify.py,
+	// home posts only to the platforms with one, the CR's list and then a
+	// learned channel or space (agents/platform/scripts/chat_notify.py,
 	// routed_platforms).
 	homeChannelUnsetToGchat      = "go to Google Chat's home channel meanwhile"
 	homeChannelUnsetToSlackRoute = "go to Slack's home channel meanwhile"
 	// homeChannelUnsetJoin joins the sentences when both backends lack a home.
 	homeChannelUnsetJoin = " "
+	// What homeChannelUnsetMessageFormat takes for Google Chat: the backend,
+	// the CR field, the install.env key and what the field holds.
+	homeChannelUnsetGchatBackend = "Google Chat"
+	homeChannelUnsetGchatField   = "spec.integration.googleChat.homeChannel"
+	homeChannelUnsetGchatEnvKey  = "GOOGLE_CHAT_HOME_CHANNEL"
+	homeChannelUnsetGchatHolds   = "a Chat space name (spaces/<id>)"
 
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
@@ -537,6 +543,18 @@ type PlatformAgentReconciler struct {
 	// writers leave the field out of their unchanged checks, so the write the
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
+	// heldBusMigrationWarned records, per CR, the run and phase of an
+	// unknown-leg run whose hold Warning this process has sent, so the
+	// Warning goes once per run and phase rather than once per pass. Kept
+	// here and not in status, so nothing the run's own operator reads changes
+	// while it is held (holdUnknownBusMigrationLeg). A restart sends it once
+	// more. Keyed by ObjectKey, value "<run>/<phase>".
+	heldBusMigrationWarned sync.Map
+	// busReshapeRefused records, per CR, the bus-reshape request and the
+	// reason this process last reported for not starting it, so the Event
+	// goes once per request and kind of reason, not once per pass. Keyed by
+	// ObjectKey, value "<nonce>/<kind>".
+	busReshapeRefused sync.Map
 	// prunedBusMigrationStatus records, per CR, that a status write carrying
 	// status.busMigration came back without it: the served CRD predates the
 	// field. A run the API server drops is gone by the next pass, which would
@@ -618,6 +636,12 @@ type PlatformAgentReconciler struct {
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
 
+	// kanbanAdmissionWarningsLogged records, per CR, the spec generation whose
+	// zero-slot kanban.admission warning reconcileConfigMap last logged, so each
+	// generation logs it once. Keyed by ObjectKey, value int64; cleared when
+	// the CR is fixed or deleted.
+	kanbanAdmissionWarningsLogged sync.Map
+
 	// a2aChartPodsWarned records, per CR, the spec generation and the
 	// chart-pods Warning last reported (a2aQuotaAgent), so each generation and
 	// reason warns once. Keyed by ObjectKey, value
@@ -696,9 +720,20 @@ type PlatformAgentReconciler struct {
 	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
-	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
-	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
-	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
+	// busConfigLoadTime stands in for reading a bus server's config_load_time
+	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error)
+	// busVarz stands in for reading a bus server's /varz (a2aBusVarz), in
+	// tests; it wins over busConfigLoadTime, which answers a fixed start.
+	busVarz func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (a2aBusVarz, error)
+	// busConfigWrittenAt stands in for reading when the live bus config
+	// Secret was written (a2aBusConfigWrittenAt), in tests: the fake client
+	// keeps no managedFields.
+	busConfigWrittenAt func(live *corev1.Secret) (time.Time, bool)
+	// busTLSWrittenAt stands in for reading when the bus's TLS Secret was
+	// last written (a2aBusWatched), in tests: the fake client keeps no
+	// managedFields.
+	busTLSWrittenAt func(tls *corev1.Secret) (time.Time, bool)
 	// busStreamState stands in for reading each bus stream's state from the
 	// monitoring endpoint (a2aBusStreamState), in tests.
 	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
@@ -1473,6 +1508,26 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// The A2A stack: NATS, the auth callout, the gateway, the capability
 	// verifier, the provisioning Job and the tiers. Every install renders it.
 	a2aState, err := r.reconcileA2A(ctx, renderAgent, homeRec)
+	// The A2A stack ran on the render copy and recorded what it resolved in
+	// that copy's status: the bus's server count, a migration's run record
+	// and its phases, the conditions it sets directly. The status writers
+	// below write instance, so all of it is carried back, with the version a
+	// write made on the copy (#6298). Only the copy's universe-domain pair
+	// stays behind: it was stamped on for the renders, and the Ready writer
+	// records the resolved pair itself.
+	//
+	// Not on a failed pass: a migration step changes its record before the
+	// work it records (a give-up marked before its cleanup, a terminal phase
+	// before its teardown) and leaves the change behind when the work fails,
+	// for the next pass to redo. The deferred writers would persist it, and
+	// the work would never be redone. instance takes the stored status
+	// instead, which holds what this pass did write, such as a new run's
+	// record.
+	if err == nil {
+		adoptRenderedStatus(instance, renderAgent)
+	} else {
+		r.adoptStoredStatus(ctx, instance)
+	}
 	// For the deferred write at 2d, failed pass or not: a step after
 	// the dispatcher's failing doesn't undo what it did to Job mode.
 	dispatcherJobMode = a2aState.dispatcherJobMode
@@ -1857,6 +1912,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.kanbanAdmissionWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
@@ -1960,6 +2016,18 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 }
 
 func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) (string, error) {
+	key := client.ObjectKeyFromObject(agent)
+	if refusal := kanbanAdmissionRefusal(agent); refusal != "" {
+		if logged, ok := r.kanbanAdmissionWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
+			logf.FromContext(ctx).Info("kanban.admission sets memoryBudgetMiB below workerRssCapMiB; single worker RSS cap exceeds pod admission budget until resolved",
+				"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+			r.kanbanAdmissionWarningsLogged.Store(key, agent.Generation)
+		}
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidKanbanAdmission, refusal)
+	} else {
+		r.kanbanAdmissionWarningsLogged.Delete(key)
+	}
+
 	cm := buildConfigMap(agent, agentPlugins)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
@@ -4010,7 +4078,9 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 	log.Info("agent Pod egress is default-deny with an allowlist; the metadata server is not on it. "+
 		"This does nothing unless the cluster CNI enforces NetworkPolicy, which the operator cannot "+
 		"detect, and it is unioned with every other policy selecting this Pod — including the "+
-		"gateway policy this operator renders, which does permit the metadata server.",
+		"gateway policy this operator renders unless spec.networkPolicy.enabled is false, which "+
+		"permits TCP 443 to any address outside the private, link-local and shared ranges unless an "+
+		"FQDNNetworkPolicy is applied in its place.",
 		"policy", policy.Name, "rules", len(policy.Spec.Egress))
 	return nil
 }
@@ -4140,7 +4210,8 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicyWithFQDN(ctx context.Con
 	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
 	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
 	if skipFQDNReconcile {
-		// On a cold-start metadata timeout with no prior resolved universe, leave
+		// On a cold-start metadata timeout with no prior resolved universe, or
+		// with a prior value the validators refuse, leave
 		// any existing FQDNNetworkPolicy untouched rather than rendering default
 		// commercial domains or deleting a previously applied sovereign policy.
 		// Probe CRD presence via List (not Get, because isCRDNotInstalledError treats
@@ -4824,6 +4895,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// So does the sandbox pin: an old sandbox is a likely cause of the park.
 	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
+		profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		noChatPlatformConditionCurrent(agent, noChatMsg) &&
@@ -4842,6 +4914,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
+			profileSupervisorFormConditionCurrent(live, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
 			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
@@ -4860,6 +4933,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, gatewayMsg, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
+	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setNoChatPlatformCondition(agent, noChatMsg, now)
@@ -4879,6 +4953,34 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	return nil
+}
+
+// adoptRenderedStatus carries the render copy's status and resourceVersion
+// back into instance, keeping instance's own universe-domain pair (see
+// adoptRenderedStatus's caller).
+func adoptRenderedStatus(instance, rendered *agentv1alpha1.PlatformAgent) {
+	domain, source := instance.Status.ResolvedUniverseDomain, instance.Status.UniverseDomainSource
+	instance.Status = *rendered.Status.DeepCopy()
+	instance.Status.ResolvedUniverseDomain, instance.Status.UniverseDomainSource = domain, source
+	instance.ResourceVersion = rendered.ResourceVersion
+}
+
+// adoptStoredStatus replaces instance's status and version with the stored
+// ones, read past the cache, after a failed pass (see its caller). A read
+// that fails leaves instance as it is: a deferred write against a version
+// this pass moved then conflicts and the pass is redone.
+func (r *PlatformAgentReconciler) adoptStoredStatus(ctx context.Context, instance *agentv1alpha1.PlatformAgent) {
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(instance), live); err != nil {
+		logf.FromContext(ctx).Error(err, "could not read the stored PlatformAgent after a failed pass")
+		return
+	}
+	instance.Status = live.Status
+	instance.ResourceVersion = live.ResourceVersion
 }
 
 // busReplicasStatusCurrent reports whether status.busReplicas needs no write:
@@ -5233,8 +5335,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedReason = conditionReasonA2AGatewayWaitingForTasks
 		degradedMsg = a2aTasksWaitMsg
 	} else if reason, msg := specResourceDegraded(agent); reason != "" {
-		// The spec's resource and exec-tier refusals, last: each leaves its
-		// workload at the operator's defaults, and the reasons above report
+		// The spec's resource, exec-tier, and admission refusals, last: the
+		// resource and exec checks leave workloads at the operator's defaults,
+		// InvalidKanbanAdmission keeps rendering the resolved budget (so a low
+		// resource limit never spawns into OOM), and the reasons above report
 		// lost function and must not be masked by them (specResourceDegraded).
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = reason
@@ -5308,6 +5412,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The provisioned-once record, same shape (wantBusProvisioned).
 	busProvisionedWanted := wantBusProvisioned(agent, a2a)
 	busProvisionedUnchanged := busProvisionedConditionCurrent(agent, busProvisionedWanted)
+	// The supervisor-form latch (#5301), same shape: computed here so a
+	// settled pass that reaches the switch still writes it.
+	profileSupervisorFormUnchanged := profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy)
 	// The verifier term has to be computed here, with the others, rather than
 	// read at the write below: the early return a few lines down is what
 	// decides whether there is a write at all. Left out of the check, the
@@ -5347,18 +5454,21 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// telemetry and policy results, which take a discovery to produce.
 	newActiveInterfaces := resolveActiveInterfaces(agent)
 
-	// The install's default model, read from its LiteLLM config. A negative clears
-	// both fields; a failed read keeps the pair the status carries, so a transient
-	// error never blanks it. Gated like activeInterfaces while the served CRD
-	// prunes the block.
+	// The install's default model, read from its LiteLLM config, with the reasoning
+	// effort its entry states (empty on a found read when it states none). A negative
+	// clears every field; a failed read keeps what the status carries, so a transient
+	// error never blanks it. While the served CRD prunes the block the write is held
+	// like activeInterfaces; while it prunes the effort alone, only a write that would
+	// change nothing the CRD keeps is held (inferencePairUnchanged).
 	newInference := agent.Status.Inference
 	switch model, read := r.readInferenceModel(ctx, agent); read {
 	case inferenceReadFound:
-		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model}
+		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model, ReasoningEffort: model.ReasoningEffort}
 	case inferenceReadNegative:
 		newInference = &agentv1alpha1.InferenceStatus{}
 	}
-	inferenceUnchanged := r.inferencePruned(agent) || inferenceStatusEqual(agent.Status.Inference, newInference)
+	inferenceUnchanged := inferenceStatusEqual(agent.Status.Inference, newInference) ||
+		(r.inferencePruned(agent) && inferencePairUnchanged(agent.Status.Inference, newInference))
 
 	resolvedUniverseDomain, universeDomainSource := r.resolvedUniverseDomainPair(ctx, agent)
 	universeDomainUnchanged := r.universeDomainPruned(agent) ||
@@ -5406,7 +5516,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		execReadyUnchanged &&
 		a2aGatewayUnchanged &&
-		busProvisionedUnchanged &&
+		busProvisionedUnchanged && profileSupervisorFormUnchanged &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && a2aBusMetaUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
 		gatewayElectedUnchanged &&
@@ -5495,6 +5605,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
+	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
@@ -5509,7 +5620,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Copied before the write: decoding the response may reuse the pointer's target.
 	var wroteInference *inferenceModel
 	if newInference != nil {
-		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
+		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model, ReasoningEffort: newInference.ReasoningEffort}
 	}
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, a2aTasksWaitRequeue, err
@@ -5652,6 +5763,8 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
+	r.heldBusMigrationWarned.Delete(client.ObjectKeyFromObject(agent))
+	r.busReshapeRefused.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
 	delete(r.prunedNewerFields, usagePollKey(agent))
 	r.prunedNewerFieldsMu.Unlock()
@@ -5660,28 +5773,48 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
 // spec and the home-channel record, or "" when the condition is to be absent:
 // the A2A stack holds no chat backend, or each one it holds has a home
-// channel, from the CR or (Slack) admitted from the record. With both
+// channel, from the CR or admitted from the record. With both
 // backends lacking one, the message carries both sentences, Chat first, and
 // each says the gateway keeps the posts; with one lacking it, its sentence
 // says the posts go to the other's home channel meanwhile. A
 // malformed home channel is not this condition's: the gateway refuses it at
-// start and says so. On Slack with the CR field empty the base sentence
+// start and says so. With the CR field empty each backend's base sentence
 // carries at most one more: why the record did not stand in (manual, not an
 // id, refused), or that a mention sets it.
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	var parts []string
-	if a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" {
-		meanwhile := homeChannelUnsetKept
-		if a2aSlackHasHome(agent, rec) {
-			meanwhile = homeChannelUnsetToSlackRoute
-		}
-		parts = append(parts, fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile))
+	if msg := gchatHomeChannelUnsetMessage(agent, rec); msg != "" {
+		parts = append(parts, msg)
 	}
 	if msg := slackHomeChannelUnsetMessage(agent, rec); msg != "" {
 		parts = append(parts, msg)
 	}
 	return strings.Join(parts, homeChannelUnsetJoin)
+}
+
+// gchatHomeChannelUnsetMessage is homeChannelUnsetMessage's Google Chat
+// sentence, or "" when Chat is not armed or has a home channel.
+func gchatHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
+	if !a2aChatArmed(agent) || strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) != "" || rec.gchat.space != "" {
+		return ""
+	}
+	meanwhile := homeChannelUnsetKept
+	if a2aSlackHasHome(agent, rec) {
+		meanwhile = homeChannelUnsetToSlackRoute
+	}
+	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, homeChannelUnsetGchatBackend,
+		homeChannelUnsetGchatField, homeChannelUnsetGchatEnvKey, homeChannelUnsetGchatHolds, meanwhile)
+	switch {
+	case gchatHomeChannelPolicy(agent) == gchatHomeChannelPolicyManual:
+		return msg + homeChannelUnsetManualSuffix
+	case rec.gchat.recorded == homeChannelRecordMalformed:
+		return msg + gchatHomeChannelUnsetMalformedSuffix
+	case rec.gchat.recorded != "" && rec.gchat.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.gchat.recorded, rec.gchat.refused)
+	case rec.gchat.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.gchat.refused)
+	}
+	return msg + gchatHomeChannelUnsetLearnSuffix
 }
 
 // slackHomeChannelUnsetMessage is homeChannelUnsetMessage's Slack sentence,
@@ -5691,7 +5824,7 @@ func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 		return ""
 	}
 	meanwhile := homeChannelUnsetKept
-	if a2aGchatHasHome(agent) {
+	if a2aGchatHasEffectiveHome(agent, rec) {
 		meanwhile = homeChannelUnsetToGchat
 	}
 	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",

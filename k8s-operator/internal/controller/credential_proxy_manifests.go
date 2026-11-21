@@ -584,6 +584,10 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 			Annotations: map[string]string{credentialProxyClusterTypeAnnotation: clusterType},
 		},
 		Spec: appsv1.DeploymentSpec{
+			// One pod, rolled with Recreate: the broker keeps a process-local record
+			// of which profile task made which branch and proposal (#6400), which is
+			// only right while one process serves /v1/vcs/. Scaling this out moves
+			// that record to shared state first (TestTheStatefulBrokerIsOnePod...).
 			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
@@ -799,6 +803,8 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The token for the audit-report store and nothing else
 	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
 	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
+	_, tiersMount, _ := a2aTiersVolumeAndMount(agent)
+	mounts = append(mounts, tiersMount)
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
@@ -898,14 +904,12 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
 		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
 	}
-	// The A2A gateway pod, while its Google Chat adapter pulls the relay
-	// hosted here. The same condition as allowedBrokerCallers: a peer that
-	// is not a caller is a rule with nobody behind it.
-	if a2aChatArmed(agent) {
-		callers = append(callers, networkingv1.NetworkPolicyPeer{
-			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
-		})
-	}
+	// The A2A gateway pod, on every install: its report reader calls the
+	// store routes, and its Google Chat adapter, when armed, the relay. The
+	// same condition as allowedBrokerCallers.
+	callers = append(callers, networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
+	})
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods, under the cluster-view flag: the same selector
 		// the session fence and the bus fence name, on the credentialed port
@@ -914,12 +918,13 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		// that lets it connect.
 		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
 	}
-	// The MCP server's pod, under its flag, on the same condition as its
-	// place on allowedBrokerCallers (a2aMCPBrokerPeers).
+	// The MCP server's pod, by default unless switched off, on the same
+	// condition as its place on allowedBrokerCallers (a2aMCPBrokerPeers).
 	callers = append(callers, a2aMCPBrokerPeers(agent)...)
 	// The scope publisher's pods, while the broker confers the scope role,
 	// beside their place on allowedBrokerCallers (scopeBrokerPeers).
 	callers = append(callers, scopeBrokerPeers(agent)...)
+	callers = append(callers, a2aCuratorBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -1022,6 +1027,10 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	// The token the broker presents to the audit-report store.
 	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)
+	// The install's tier table (#6091): the operator's rendered, non-secret
+	// tiers ConfigMap, mounted read-only.
+	tiersVolume, _, _ := a2aTiersVolumeAndMount(agent)
+	volumes = append(volumes, tiersVolume)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 

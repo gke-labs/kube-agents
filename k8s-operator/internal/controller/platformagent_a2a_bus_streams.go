@@ -343,6 +343,12 @@ func busStreamsVerdictFor(replicas int, readings []busServerReading) busStreamsV
 // inside busStreamsReprovisionWindow only.
 type busReprovisionRecord struct {
 	Attempts []busReprovisionAttempt `json:"attempts"`
+	// Stopped is the names a re-run left missing: the operator re-runs the
+	// provision Job for none of them until each is seen back (dropped one by
+	// one) or the annotation is removed. On the record rather than an
+	// attempt, so a later attempt for other names keeps it, and pruning
+	// keeps it whatever the attempts' age.
+	Stopped []string `json:"stopped,omitempty"`
 }
 
 // busTasksLoss is the latest confirmed loss of TASKS, on its own annotation
@@ -367,8 +373,9 @@ type busReprovisionAttempt struct {
 	// Settled is set by the first poll that judges the bus after the re-run,
 	// and Restored says whether every stream the attempt named has been seen
 	// back since: on that poll, or on any later one that finds none of them
-	// missing, such as after a fix by hand. An unrestored settled attempt
-	// stops the re-runs for its names; seeing them back lifts the stop.
+	// missing, such as after a fix by hand. The stop itself is the record's
+	// Stopped list; an unrestored settled attempt is what an operator before
+	// it wrote, and what Stopped is seeded from.
 	Settled  bool `json:"settled,omitempty"`
 	Restored bool `json:"restored,omitempty"`
 }
@@ -422,7 +429,7 @@ func (rec busReprovisionRecord) pruned(now time.Time) busReprovisionRecord {
 			kept = append(kept, attempt)
 		}
 	}
-	return busReprovisionRecord{Attempts: kept}
+	return busReprovisionRecord{Attempts: kept, Stopped: rec.Stopped}
 }
 
 // busStreamStreak is one CR's run of polls, per process.
@@ -589,7 +596,11 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	last := record.last()
 	reRan := last != nil && !last.Settled && jobState == busJobComplete && job.UID != last.JobUID
 	if reRan {
-		last.Restored = !overlaps(last.Missing, verdict.missing)
+		// The names this re-run left missing join the stop; the rest of
+		// what it named is back, and stays free to be re-run if lost again.
+		still := intersect(last.Missing, verdict.missing)
+		record.Stopped = union(record.Stopped, still)
+		last.Restored = len(still) == 0
 		last.Settled = true
 		// The re-run recreated TASKS, so an open loss of it ends here, even
 		// if no poll saw TASKS present: a client that bound to the new
@@ -610,7 +621,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 			p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsRestoredEventReason,
 				fmt.Sprintf("Re-running the A2A provision Job restored %s.", strings.Join(last.Missing, ", ")))
 		}
-	} else if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID && len(verdict.missing) == 0 {
+	} else if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID && len(subtract(verdict.missing, record.Stopped)) == 0 {
 		// An attempt whose Job delete didn't land, and the streams are back
 		// before its retry: the Job never re-ran, so it recreated nothing.
 		// Settle it as restored, so a later re-run of that Job (its TTL, a
@@ -621,10 +632,24 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
 			return err
 		}
-	} else if last != nil && last.Settled && !last.Restored && !overlaps(last.Missing, verdict.missing) {
-		// The names a re-run did not bring back are back now (a fix by hand,
-		// say): lift the stop, so a later loss of them is re-provisioned.
-		last.Restored = true
+	}
+	// A record written before Stopped existed holds its stop as a settled,
+	// unrestored last attempt: seed Stopped from the names it named that
+	// are still missing, which is all that stop meant.
+	seeded := false
+	if record.Stopped == nil && last != nil && last.Settled && !last.Restored {
+		record.Stopped = intersect(last.Missing, verdict.missing)
+		seeded = true
+	}
+	// Each stopped name seen back is lifted on its own (a fix by hand,
+	// say), so a later loss of it is re-provisioned.
+	lifted := intersect(record.Stopped, verdict.missing)
+	if seeded || len(lifted) != len(record.Stopped) {
+		record.Stopped = lifted
+		if len(lifted) == 0 && last != nil && last.Settled {
+			// Every name the re-run left missing is back.
+			last.Restored = true
+		}
 		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
 			return err
 		}
@@ -692,15 +717,23 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	// Missing on this poll: confirm across busStreamsConfirmPolls in a row,
 	// keeping only what every poll in the run found missing. A poll that
 	// shares nothing with the run so far starts a new run from itself.
+	//
+	// A stopped name is left out: it would pin the run to itself, and a
+	// loss of anything else would never be confirmed while the stop holds.
+	candidates := subtract(verdict.missing, record.Stopped)
+	if len(candidates) == 0 {
+		streak.missing, streak.misses = nil, 0
+		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonDidNotRestore, stoppedMessage(record))
+	}
 	shared := map[string]bool{}
-	for _, name := range verdict.missing {
+	for _, name := range candidates {
 		if streak.misses == 0 || streak.missing[name] {
 			shared[name] = true
 		}
 	}
 	if len(shared) == 0 {
 		streak.misses = 0
-		for _, name := range verdict.missing {
+		for _, name := range candidates {
 			shared[name] = true
 		}
 	}
@@ -716,14 +749,6 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	slices.Sort(confirmed)
 	names := strings.Join(confirmed, ", ")
 
-	if last != nil && last.Settled && !last.Restored && overlaps(last.Missing, confirmed) {
-		// The last re-run completed without bringing these back. Stop:
-		// whatever keeps them off the bus, another delete of the Job will
-		// not fix it. A restore, or removing the annotation, clears this.
-		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonDidNotRestore,
-			fmt.Sprintf("Missing from the A2A bus: %s. The operator re-ran the provision Job at %s and they were still missing after it, so it will not re-run it again for them. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.",
-				names, last.At.UTC().Format(time.RFC3339), busStreamsReprovisionAnnotation))
-	}
 	if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID {
 		// The last attempt is recorded but its Job is still the completed
 		// one it was to delete: the delete didn't land (an API error after
@@ -740,17 +765,17 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 				return err
 			}
 		}
-		return p.deleteProvisionJob(ctx, agent, job, last.Missing, streak)
+		return p.deleteProvisionJob(ctx, agent, job, last.Missing, record.Stopped, streak)
 	}
 	if jobState != busJobComplete {
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonMissing,
-			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job %s failed, so the operator does not re-run it; see the PlatformAgent's events.",
-				names, job.Name))
+			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job %s failed, so the operator does not re-run it; see the PlatformAgent's events.%s",
+				names, job.Name, stoppedNote(record.Stopped)))
 	}
 	if ok, next := record.allows(now); !ok {
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonMissing,
-			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job's next re-run is allowed at %s.",
-				names, next.UTC().Format(time.RFC3339)))
+			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job's next re-run is allowed at %s.%s",
+				names, next.UTC().Format(time.RFC3339), stoppedNote(record.Stopped)))
 	}
 
 	record = record.pruned(now)
@@ -758,7 +783,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	if err := p.writeBusState(ctx, agent, &record, p.lossRerunConfirms(agent, streak), false); err != nil {
 		return err
 	}
-	return p.deleteProvisionJob(ctx, agent, job, confirmed, streak)
+	return p.deleteProvisionJob(ctx, agent, job, confirmed, record.Stopped, streak)
 }
 
 // restartTasksClients deletes the pods of TASKS' two clients, the A2A
@@ -974,12 +999,13 @@ func (p *BusStreamPoller) tasksClientPods(ctx context.Context, agent *agentv1alp
 // that fails doesn't hold the delete back: the next poll writes it again. A
 // delete that fails returns its error, and the next poll retries it under the
 // same attempt.
-func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job, missing []string, streak *busStreamStreak) error {
+func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job, missing, stopped []string, streak *busStreamStreak) error {
 	names := strings.Join(missing, ", ")
 	restart := ""
 	if slices.Contains(missing, a2aTasksStream) {
 		restart = " Once TASKS is back, the A2A gateway and the agent pod are restarted, so they recreate their TASKS consumers."
 	}
+	restart += stoppedNote(stopped)
 	log := logf.FromContext(ctx).WithName(busStreamsPollerLogName)
 	if err := p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
 		fmt.Sprintf("Missing from the A2A bus: %s. The provision Job is running again to recreate them.%s", names, restart)); err != nil {
@@ -998,13 +1024,53 @@ func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1
 	return nil
 }
 
-func overlaps(a, b []string) bool {
-	for _, name := range a {
-		if slices.Contains(b, name) {
-			return true
+// stoppedMessage is the condition's message while only stopped names are
+// missing.
+func stoppedMessage(record busReprovisionRecord) string {
+	return fmt.Sprintf("Missing from the A2A bus: %s. An earlier re-run of the provision Job left them missing, so the operator will not re-run it again for them; a loss of any other stream is still re-run, and that re-run retries these too. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.",
+		strings.Join(record.Stopped, ", "), busStreamsReprovisionAnnotation)
+}
+
+// stoppedNote is the sentence other messages add while a stop holds, or
+// nothing.
+func stoppedNote(stopped []string) string {
+	if len(stopped) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" Still stopped, an earlier re-run having left them missing: %s (a re-run for other streams retries them too).", strings.Join(stopped, ", "))
+}
+
+// intersect, union and subtract are set operations on name lists, in a's
+// order (union appends b's new names, sorted).
+func intersect(a, b []string) []string {
+	out := []string{}
+	for _, x := range a {
+		if slices.Contains(b, x) {
+			out = append(out, x)
 		}
 	}
-	return false
+	return out
+}
+
+func union(a, b []string) []string {
+	out := append([]string{}, a...)
+	for _, x := range b {
+		if !slices.Contains(out, x) {
+			out = append(out, x)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func subtract(a, b []string) []string {
+	out := []string{}
+	for _, x := range a {
+		if !slices.Contains(b, x) {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 type busJobState int

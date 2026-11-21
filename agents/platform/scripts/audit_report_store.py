@@ -35,6 +35,24 @@ escaped again, so `gitlab.com%2Fgroup%252Frepo`):
     PUT    /v1/audit-reports/<audit>/<key>/latest          copy a ring entry to latest
     DELETE /v1/audit-reports/<audit>/<key>/latest          drop latest (idempotent)
 
+Who wrote each run: the broker stamps every PUT of a ring entry with the
+X-Report-Writer header (REPORT_WRITER_HEADER), `shell` for the platform
+shell or `builtin-schedule:<audit>:<task>` for a profile task writing a
+builtin schedule's stream, from the caller it verified; a caller's own header
+never reaches here. The listener refuses a PUT of a ring entry whose header
+is not well formed for the path's audit (400), and keeps it beside the
+envelope as `runs/<stamp>.writer` (REPORT_WRITER_SUFFIX): a small JSON
+object holding the writer and the SHA-256 of the exact envelope bytes it
+describes. A PUT with no header at all (a broker from before this change:
+the broker and this listener roll independently) is written with no
+sidecar, any old one dropped, so it reads back unstamped. PUT latest copies the matched ring entry's sidecar to
+`latest.writer` (the bytes are identical, so is the hash). GET latest and GET
+runs/<stamp> answer the stored writer in the same header only when the
+sidecar's hash is that of the bytes being returned, so a sidecar can never
+vouch for another envelope; otherwise, or with no sidecar (an envelope written
+before this, or by the file store directly), there is no header. The
+envelope's bytes are never changed.
+
 The path is read from the raw request path, not the decoded one, because the
 key's `%2F` is what keeps it one segment. The token is never logged.
 """
@@ -46,6 +64,7 @@ import binascii
 import contextlib
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -92,6 +111,24 @@ RUN_STAMP_MAX_FUTURE_SECONDS = 300
 REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
+# Who wrote a stored envelope (the module docstring): the header the broker
+# sets, and the sidecar beside the envelope that keeps it. The broker holds a
+# copy of the header name and the pattern (credential_proxy.REPORT_WRITER_*),
+# which test_audit_report_routes.py holds equal.
+REPORT_WRITER_HEADER = "X-Report-Writer"
+REPORT_WRITER_SUFFIX = ".writer"
+# A sidecar's `sha256`: hashlib's hexdigest form, so a planted value (a JSON
+# \u escape decodes to a non-ASCII str) never reaches secrets.compare_digest.
+REPORT_WRITER_DIGEST_RE = re.compile(r"^[0-9a-f]{64}\Z")
+REPORT_WRITER_LATEST_NAME = "latest" + REPORT_WRITER_SUFFIX
+REPORT_WRITER_SHELL = "shell"
+REPORT_WRITER_BUILTIN = "builtin-schedule"
+# `shell`, or `builtin-schedule:<audit id>:<task id>`, each id a DNS-1123
+# label (a task id is task_credential's dot-free label).
+_WRITER_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+REPORT_WRITER_RE = re.compile(
+    rf"^(?:{REPORT_WRITER_SHELL}|{REPORT_WRITER_BUILTIN}:(?P<audit>{_WRITER_LABEL}):{_WRITER_LABEL})\Z"
+)
 REPORT_DIR_MODE = 0o755
 REPORT_FILE_MODE = 0o644
 REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
@@ -116,9 +153,9 @@ _SEPARATOR_RE = re.compile(re.escape(STORE_PATH_SEPARATOR), re.IGNORECASE)
 # (auditReportStoreAudience in k8s-operator).
 AUDIENCE = "kubeagents-audit-report-store"
 # The two caller checks the operator renders (auditReportStoreSidecarEnv),
-# both names reserved there in every mode so spec.deployment.env cannot set
-# them: the broker's ServiceAccount as a subject, and the name prefix of the
-# broker Deployment's pods. The broker's ServiceAccount is shared with other
+# both names reserved there so spec.deployment.env cannot set them: the
+# broker's ServiceAccount as a subject, and the name prefix of the broker
+# Deployment's pods. The broker's ServiceAccount is shared with other
 # pods (the exec tier among them), so the subject alone is not the broker.
 ALLOWED_SUBJECT_ENV = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
 ALLOWED_POD_PREFIX_ENV = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"
@@ -535,6 +572,74 @@ def _refuse_a_future_stamp(stamp: str) -> None:
         raise Refused(400, "the run is stamped in the future")
 
 
+def _validated_writer(writer: str | None, audit_id: str) -> str | None:
+    """The writer header of a PUT of a ring entry, None when absent. 400 unless well formed.
+
+    `shell`, or `builtin-schedule:<audit>:<task>` with <audit> the path's own:
+    a builtin schedule's task writes its own audit's stream and no other. No
+    header is a broker from before the stamp (the two roll independently):
+    accepted, and the run is stored unstamped.
+    """
+    if writer is None:
+        return None
+    match = REPORT_WRITER_RE.match(writer)
+    if match is None:
+        raise Refused(400, f"the {REPORT_WRITER_HEADER} header is not a writer")
+    if match.group("audit") is not None and match.group("audit") != audit_id:
+        raise Refused(400, f"the {REPORT_WRITER_HEADER} header names another audit")
+    return writer
+
+
+def _writer_sidecar(writer: str, data: bytes) -> bytes:
+    """The sidecar for `writer` over the envelope `data`: the writer and the envelope's SHA-256."""
+    return json.dumps({"writer": writer, "sha256": hashlib.sha256(data).hexdigest()}, sort_keys=True).encode("ascii")
+
+
+def _bound_writer(dir_fd: int, name: str, data: bytes) -> str | None:
+    """The writer the sidecar `name` records for exactly the envelope `data`, or None.
+
+    None when there is no sidecar, when it is not a sidecar (not the JSON
+    object _writer_sidecar writes, or a writer that is not one), and when its
+    hash is not that of `data`: a sidecar describing another envelope (a
+    concurrent write, or a listener without sidecars rewriting the envelope
+    after a rollback) is never passed on. A symlink or a non-regular file at
+    the name is never followed or read, and is no writer: the envelope's read
+    goes on, unstamped.
+    """
+    try:
+        raw = _read_at(dir_fd, name)
+    except Refused as exc:
+        if exc.status != 404:
+            LOGGER.warning("ignored a report writer sidecar that could not be read (%d): %s", exc.status, _sanitize(name))
+        return None
+    try:
+        sidecar = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        sidecar = None
+    writer = sidecar.get("writer") if isinstance(sidecar, dict) else None
+    digest = sidecar.get("sha256") if isinstance(sidecar, dict) else None
+    if (
+        not isinstance(writer, str)
+        or not REPORT_WRITER_RE.match(writer)
+        or not isinstance(digest, str)
+        or not REPORT_WRITER_DIGEST_RE.match(digest)
+    ):
+        LOGGER.warning("ignored a report writer sidecar that is not one: %s", _sanitize(name))
+        return None
+    if not secrets.compare_digest(digest, hashlib.sha256(data).hexdigest()):
+        return None
+    return writer
+
+
+def _drop_at(dir_fd: int, name: str) -> None:
+    """Unlink `name` (a symlink is unlinked, never followed); absent is fine, and costs no unlink."""
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+
+
 # Every filesystem step below is fd-relative and refuses a symlink. The tree
 # is on the agent's data volume, which the platform-agent container beside
 # this one writes as the same uid, so a path checked and then used could be a
@@ -705,8 +810,8 @@ def _all_ring_names(runs_fd: int) -> list[str]:
     return sorted(names)
 
 
-def _ring_holds(runs_fd: int, data: bytes) -> bool:
-    """Whether a ring entry is byte-identical to `data`, newest first, stopping at the first match.
+def _ring_match(runs_fd: int, data: bytes) -> str | None:
+    """The newest ring entry byte-identical to `data`, or None, stopping at the first match.
 
     An entry that cannot be read (over REPORT_MAX_BYTES, which the file
     store's writer does not cap, gone, or no longer a regular file) is a
@@ -717,10 +822,10 @@ def _ring_holds(runs_fd: int, data: bytes) -> bool:
     for entry in reversed(_ring_names(runs_fd)):
         try:
             if _read_at(runs_fd, entry) == data:
-                return True
+                return entry
         except (Refused, OSError):
             continue
-    return False
+    return None
 
 
 def _ring_of(root: str, parts: list[str]) -> list[str]:
@@ -814,16 +919,20 @@ def _locked(dir_fd: int):
         fcntl.flock(dir_fd, fcntl.LOCK_UN)
 
 
-def handle(root: str, method: str, segments: list[str], body: bytes) -> tuple[int, bytes | list | None]:
+def handle(
+    root: str, method: str, segments: list[str], body: bytes, writer: str | None = None
+) -> tuple[int, bytes | list | None, str | None]:
     """One authenticated request, after the raw path was split.
 
-    `segments` is the raw path below AUDIT_REPORTS_PREFIX. Returns the status
-    and either raw JSON bytes, a value to encode, or None for no body.
+    `segments` is the raw path below AUDIT_REPORTS_PREFIX; `writer` is the
+    request's REPORT_WRITER_HEADER, None when absent. Returns the status,
+    either raw JSON bytes, a value to encode, or None for no body, and the
+    stored writer to answer in REPORT_WRITER_HEADER (None for none).
     """
     if not segments:
         if method != "GET":
             raise Refused(405, "method not allowed")
-        return 200, list_streams(root)
+        return 200, list_streams(root), None
     if len(segments) < 3:
         raise Refused(404, "no such route")
     audit_id, key, *rest = segments
@@ -832,18 +941,21 @@ def handle(root: str, method: str, segments: list[str], body: bytes) -> tuple[in
     owner, name = store_dirs_for_key(key)
     store = [_validate_audit_id(audit_id), owner, name]
     try:
-        return _handle_store(root, method, audit_id, store, rest, body)
+        return _handle_store(root, method, audit_id, store, rest, body, writer)
     except _Missing:
         raise Refused(404, "not found") from None
 
 
 def _handle_store(
-    root: str, method: str, audit_id: str, store: list[str], rest: list[str], body: bytes
-) -> tuple[int, bytes | list | None]:
+    root: str, method: str, audit_id: str, store: list[str], rest: list[str], body: bytes, writer: str | None
+) -> tuple[int, bytes | list | None, str | None]:
     if rest == ["latest"]:
         if method == "GET":
-            with _DirChain(root, store, create=False) as chain:
-                return 200, _read_at(chain.fd, REPORT_LATEST_NAME)
+            # Under the store's lock, so a write does not land between the
+            # two reads; the hash binding is what makes a pair never mismatched.
+            with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
+                data = _read_at(chain.fd, REPORT_LATEST_NAME)
+                return 200, data, _bound_writer(chain.fd, REPORT_WRITER_LATEST_NAME, data)
         if method == "PUT":
             data = _validated_body(body)
             try:
@@ -856,44 +968,81 @@ def _handle_store(
                 except _Missing:
                     raise Refused(409, "latest must be a copy of a run in the ring") from None
                 try:
-                    if not _ring_holds(runs_fd, data):
+                    entry = _ring_match(runs_fd, data)
+                    if entry is None:
                         raise Refused(409, "latest must be a copy of a run in the ring")
+                    # Byte-identical to the entry, so the entry's sidecar binds it too.
+                    copied = _bound_writer(runs_fd, entry[: -len(".json")] + REPORT_WRITER_SUFFIX, data)
                 finally:
                     os.close(runs_fd)
+                # The old writer goes first, so a failure below leaves latest
+                # with no writer, never with another envelope's.
+                _drop_at(chain.fd, REPORT_WRITER_LATEST_NAME)
                 _write_at(chain.fd, REPORT_LATEST_NAME, data)
-            return 204, None
+                if copied is not None:
+                    _write_at(chain.fd, REPORT_WRITER_LATEST_NAME, _writer_sidecar(copied, data))
+            return 204, None, None
         if method == "DELETE":
             try:
-                with _DirChain(root, store, create=False) as chain:
+                with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
+                    _drop_at(chain.fd, REPORT_WRITER_LATEST_NAME)
                     os.unlink(REPORT_LATEST_NAME, dir_fd=chain.fd)
             except (_Missing, FileNotFoundError):
                 pass
-            return 204, None
+            return 204, None, None
         raise Refused(405, "method not allowed")
     if rest == ["runs"]:
         if method != "GET":
             raise Refused(405, "method not allowed")
-        return 200, [entry[: -len(".json")] for entry in reversed(_ring_of(root, store))]
+        return 200, [entry[: -len(".json")] for entry in reversed(_ring_of(root, store))], None
     stamp = _validate_stamp(rest[1])
     if method == "GET":
-        with _DirChain(root, store + [REPORT_RUNS_DIR], create=False) as runs:
-            return 200, _read_at(runs.fd, f"{stamp}.json")
+        with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
+            runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=False)
+            try:
+                data = _read_at(runs_fd, f"{stamp}.json")
+                return 200, data, _bound_writer(runs_fd, stamp + REPORT_WRITER_SUFFIX, data)
+            finally:
+                os.close(runs_fd)
     if method == "PUT":
         _refuse_a_future_stamp(stamp)
+        stamp_writer = _validated_writer(writer, audit_id)
         data = _validated_body(body)
+        sidecar = _writer_sidecar(stamp_writer, data) if stamp_writer is not None else None
         with _DirChain(root, store, create=True) as chain, _locked(chain.fd):
             runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=True)
             try:
+                # The old writer goes first, so a failure below leaves the
+                # entry with no writer, never with the one it replaced.
+                _drop_at(runs_fd, stamp + REPORT_WRITER_SUFFIX)
                 _write_at(runs_fd, f"{stamp}.json", data)
+                if sidecar is not None:
+                    _write_at(runs_fd, stamp + REPORT_WRITER_SUFFIX, sidecar)
                 try:
-                    for stale in _all_ring_names(runs_fd)[:-REPORT_HISTORY]:
-                        os.unlink(stale, dir_fd=runs_fd)
+                    _prune(runs_fd)
                 except Exception as exc:  # noqa: BLE001 - the entry is written; a long ring costs disk only
                     LOGGER.warning("report store prune failed for %s: %s", audit_id, exc)
             finally:
                 os.close(runs_fd)
-        return 204, None
+        return 204, None, None
     raise Refused(405, "method not allowed")
+
+
+def _prune(runs_fd: int) -> None:
+    """Drop the ring's entries past REPORT_HISTORY, each with its writer sidecar.
+
+    A sidecar whose envelope is no longer kept (one a listener that keeps no
+    sidecars pruned, after a rollback) goes too.
+    """
+    names = _all_ring_names(runs_fd)
+    for stale in names[:-REPORT_HISTORY]:
+        os.unlink(stale, dir_fd=runs_fd)
+        _drop_at(runs_fd, stale[: -len(".json")] + REPORT_WRITER_SUFFIX)
+    kept = set(names[-REPORT_HISTORY:])
+    for name in _listdir(runs_fd):
+        stem = name[: -len(REPORT_WRITER_SUFFIX)]
+        if name.endswith(REPORT_WRITER_SUFFIX) and STAMP_RE.match(stem) and f"{stem}.json" not in kept:
+            _drop_at(runs_fd, name)
 
 
 def _raw_segments(raw_path: bytes) -> list[str] | None:
@@ -963,7 +1112,12 @@ def create_app(verifier: TokenVerifier | None = None, root: str = DEFAULT_REPORT
             if request.method not in ("GET", "PUT", "DELETE"):
                 raise Refused(405, "method not allowed")
             body = await _read_body(request) if request.method == "PUT" else b""
-            status, payload = await run_in_threadpool(handle, request.app.state.root, request.method, segments, body)
+            writers = request.headers.getlist(REPORT_WRITER_HEADER)
+            if len(writers) > 1:
+                raise Refused(400, f"more than one {REPORT_WRITER_HEADER} header")
+            status, payload, stored = await run_in_threadpool(
+                handle, request.app.state.root, request.method, segments, body, writers[0] if writers else None
+            )
         except AuthRefused as exc:
             LOGGER.info("%s %s -> %d (%s) subject=%s", request.method, route, exc.status, exc.reason, subject)
             return JSONResponse({"error": exc.reason}, status_code=exc.status)
@@ -977,7 +1131,8 @@ def create_app(verifier: TokenVerifier | None = None, root: str = DEFAULT_REPORT
         if payload is None:
             return Response(status_code=status)
         if isinstance(payload, bytes):
-            return Response(content=payload, status_code=status, media_type="application/json")
+            headers = {REPORT_WRITER_HEADER: stored} if stored is not None else None
+            return Response(content=payload, status_code=status, media_type="application/json", headers=headers)
         return JSONResponse(payload, status_code=status)
 
     return application

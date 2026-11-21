@@ -10,6 +10,7 @@ never builds an argparse namespace. These tests are that caller.
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import io
 import json
@@ -272,6 +273,164 @@ class ForgeCallTest(unittest.TestCase):
                 vcs_client.call("issue-update", {})
         self.assertEqual(caught.exception.code, vcs_client.BROKER_ROUTE_UNSUPPORTED)
         self.assertIn("issue-update", str(caught.exception))
+
+    def test_a_2xx_whose_json_body_is_not_an_object_reads_as_an_answer_that_is_not_json(self):
+        """Through the real `vcs_call`: a 2xx whose body is valid JSON but not an
+        object. The caller gets the error of a 2xx body that is not JSON, and
+        no consumer meets an `AttributeError` on a list or on `None`."""
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        for body in (b"[]", b"null"):
+
+            def answer(request, *args, body=body, **kwargs):
+                return io.BytesIO(body)
+
+            with self.subTest(body=body), mock.patch.dict(os.environ, environment), mock.patch.object(
+                vcs_client.credential_proxy_client, "open_broker_request", answer
+            ):
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.call("capabilities", {"repository": "acme/infra"})
+                self.assertIsNone(caught.exception.code)
+                self.assertIn("not JSON", str(caught.exception))
+                with self.assertRaises(vcs_client.VcsError):
+                    vcs_client.base_branch("acme/infra")
+
+    def test_a_body_nested_too_deep_for_the_parser_reads_as_an_error_of_this_module_on_both_paths(self):
+        """Through the real `vcs_call`, with the parser's RecursionError given
+        directly: a 2xx reads as an answer that is too deep, a refusal as its
+        status. No consumer meets the RecursionError."""
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        client = vcs_client.credential_proxy_client
+        too_deep = mock.patch.object(client.json, "load", side_effect=RecursionError("maximum recursion depth exceeded"))
+
+        def answer(request, *args, **kwargs):
+            return io.BytesIO(b"[]")
+
+        with mock.patch.dict(os.environ, environment), mock.patch.object(client, "open_broker_request", answer), too_deep:
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("capabilities", {"repository": "acme/infra"})
+        self.assertIsNone(caught.exception.code)
+        self.assertEqual(str(caught.exception), vcs_client.ANSWER_TOO_DEEP_TEXT)
+
+        refusal = urllib.error.HTTPError("http://127.0.0.1:1/v1/vcs/capabilities", 502, "refused", {}, io.BytesIO(b"[]"))
+        self.addCleanup(refusal.close)
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            client, "open_broker_request", side_effect=refusal
+        ), too_deep:
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("capabilities", {"repository": "acme/infra"})
+        self.assertIsNone(caught.exception.code)
+        self.assertIn("HTTP 502", str(caught.exception))
+
+    DEEP_ENVIRONMENT = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+    PROPOSAL_URL = "https://forge.example/acme/infra/pull/7"
+
+    @staticmethod
+    def nested_lists(levels: int) -> bytes:
+        """The JSON text of `levels` lists, one inside the other. The compact form: 2 x `levels` bytes."""
+        return b"[" * levels + b"]" * levels
+
+    def call_with_the_proposal_title(self, title: bytes):
+        """`call("proposal-create")` through the real `vcs_call`; (the answer or the error, the stderr lines)."""
+        body = b'{"proposal": {"url": "%s", "number": 7, "title": %s}, "claim": "c-1"}' % (self.PROPOSAL_URL.encode(), title)
+        client = vcs_client.credential_proxy_client
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, self.DEEP_ENVIRONMENT), mock.patch.object(
+            client, "open_broker_request", lambda request, *args, **kwargs: io.BytesIO(body)
+        ), contextlib.redirect_stderr(stderr):
+            try:
+                result = vcs_client.call("proposal-create", {})
+            except vcs_client.VcsError as exc:
+                result = exc
+        return result, stderr.getvalue().splitlines()
+
+    def test_the_bound_of_the_broker_client_is_a_decision(self):
+        # A decision: under the limit of each encoder and of `repr` on each Python
+        # that the client runs on, and far above the depth of an answer of the broker.
+        self.assertEqual(vcs_client.credential_proxy_client.MAX_VCS_BODY_DEPTH, 500)
+
+    def test_a_proposal_answer_nested_deeper_than_the_bound_is_one_error_and_no_record(self):
+        """The answer object and its `proposal` are two levels; the title holds the rest."""
+        bound = vcs_client.credential_proxy_client.MAX_VCS_BODY_DEPTH
+        answer, lines = self.call_with_the_proposal_title(self.nested_lists(bound - 2))
+        self.assertIsInstance(answer, dict)
+        self.assertNotIn("claim", answer)
+        self.assertEqual([json.loads(line)["proposal"]["url"] for line in lines], [self.PROPOSAL_URL])
+
+        for levels in (bound - 1, bound, 4 * bound):
+            with self.subTest(levels=levels):
+                error, lines = self.call_with_the_proposal_title(self.nested_lists(levels))
+                self.assertIsInstance(error, vcs_client.VcsError)
+                self.assertEqual(error.as_json(), {"error": vcs_client.ANSWER_TOO_DEEP_TEXT})
+                self.assertIn("may have taken effect", vcs_client.ANSWER_TOO_DEEP_TEXT)
+                self.assertNotIn("retry", vcs_client.ANSWER_TOO_DEEP_TEXT.lower())
+                self.assertEqual(lines, [])
+
+    def test_a_refusal_nested_deeper_than_the_bound_keeps_its_code_and_loses_the_deep_part(self):
+        """The refusal object is one level; a value has the rest. The caller's rules read the code."""
+        client = vcs_client.credential_proxy_client
+        bound = client.MAX_VCS_BODY_DEPTH
+        sent = []
+
+        def refuse_with(status: int, body: bytes):
+            def refuse(request, *args, **kwargs):
+                sent.append(request.full_url)
+                raise urllib.error.HTTPError(request.full_url, status, "refused", {}, io.BytesIO(body))
+
+            with mock.patch.dict(os.environ, self.DEEP_ENVIRONMENT), mock.patch.object(client, "open_broker_request", refuse):
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.call("issue-update", {})
+            return caught.exception
+
+        at_the_bound = refuse_with(422, b'{"error": %s, "code": "FORGE_REJECTED"}' % self.nested_lists(bound - 1))
+        self.assertEqual(at_the_bound.code, "FORGE_REJECTED")
+        self.assertEqual(json.loads(json.dumps(at_the_bound.as_json()))["code"], "FORGE_REJECTED")
+
+        for levels in (bound, 4 * bound):
+            deep = self.nested_lists(levels)
+            with self.subTest(levels=levels):
+                sent.clear()
+                error = refuse_with(422, b'{"error": %s, "code": "FORGE_REJECTED"}' % deep)
+                self.assertEqual(error.as_json(), {"error": "HTTP 422", "code": "FORGE_REJECTED"})
+                self.assertEqual(len(sent), 1)
+                error = refuse_with(409, b'{"error": "the base branch moved", "code": "BASE_MOVED", "detail": %s}' % deep)
+                self.assertEqual(
+                    error.as_json(),
+                    {"error": "the base branch moved", "code": "BASE_MOVED", "detail": "left out: nested too deep to read"},
+                )
+                # A coded 404 is the forge's answer, and not a broker that is too old for the verb.
+                error = refuse_with(404, b'{"error": "no such repository", "code": "FORGE_NOT_FOUND", "detail": %s}' % deep)
+                self.assertEqual(error.code, "FORGE_NOT_FOUND")
+                # A 404 whose code is too deep has a code that the client does not know: not a missing route either.
+                error = refuse_with(404, b'{"error": "no such repository", "code": %s}' % deep)
+                self.assertEqual((str(error), error.code), ("no such repository", "left out: nested too deep to read"))
+                error = refuse_with(429, b'{"error": "rate limited", "code": "FORGE_RATE_LIMITED", "entries": %s}' % deep)
+                self.assertEqual((error.code, error.entries), ("FORGE_RATE_LIMITED", None))
+
+    def test_a_value_at_the_bound_is_one_that_the_verbs_can_use(self):
+        """The deepest value the bound lets pass, in the places that use a value of an answer:
+        the text of a refusal, `str` of a field, and the session record with its indent."""
+        client = vcs_client.credential_proxy_client
+        value = json.loads(self.nested_lists(client.MAX_VCS_BODY_DEPTH - 1))
+        text_length = 2 * (client.MAX_VCS_BODY_DEPTH - 1)
+        self.assertEqual(len(str(value)), text_length)
+        self.assertEqual(len(str(client.WorkspaceRequestError(422, {"error": value}))), text_length)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(vcs_client, "SESSIONS", Path(tmp) / ".sessions"):
+            vcs_client.save_session(
+                {"forge": "local", "repo": "acme/infra", "branch": "main", "revision": value, "baseBranch": value}
+            )
+            recorded = json.loads(vcs_client.session_path("local", "acme/infra", "main").read_text())
+        # assertTrue, not assertEqual: a failure report of this depth is a RecursionError of pprint.
+        self.assertTrue(recorded["revision"] == value and recorded["baseBranch"] == value)
+
+    def test_the_record_of_an_opened_proposal_is_left_out_when_the_encoder_gives_up(self):
+        """`_say_opened` never raises: a `target` of the caller that the encoder cannot take leaves the record out."""
+        stderr = io.StringIO()
+        gives_up = mock.patch.object(
+            vcs_client.json, "dumps", side_effect=RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+        )
+        with gives_up, contextlib.redirect_stderr(stderr):
+            vcs_client._say_opened({"proposal": {"url": self.PROPOSAL_URL}}, target={"finding_id": "f-1"})
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_a_coded_forge_404_is_still_the_forge_s_answer(self):
         """The other half: a bare 404 is the only one read as a missing route.
@@ -998,6 +1157,83 @@ class WorkingCopyTest(unittest.TestCase):
             vcs_client.publish("acme/infra", advance=True)
         self.assertIn("branch and target are both", str(caught.exception))
         self.assertEqual(self.published, [])
+
+    def test_publish_blocks_decision_memory_guard_and_appends_section_on_pass(self):
+        (self.origin / "knowledge" / "lessons").mkdir(parents=True)
+        (self.origin / "knowledge" / "lessons" / "LES-2026-001-checkout-memory.md").write_text(
+            "---\n"
+            "type: lesson\n"
+            "id: LES-2026-001\n"
+            "title: Keep checkout memory request >= 2Gi\n"
+            "status: active\n"
+            "date: 2026-03-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/checkout.yaml\n"
+            "guard:\n"
+            "  rule: Keep checkout memory request >= 2Gi.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/checkout.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: '>='\n"
+            "    value: 2Gi\n"
+            "evidence:\n"
+            "  pull_request: '#10'\n"
+            "---\n\n"
+            "## What happened\n\nOOMKilled below 2Gi.\n"
+        )
+        git(self.origin, "add", "-A")
+        git(self.origin, "commit", "--quiet", "-m", "seed LES-2026-001 on main")
+        self.head = git(self.origin, "rev-parse", "HEAD").stdout.strip()
+
+        cloned = vcs_client.clone("acme/infra", key="fix/mem")
+        tree = Path(cloned["path"])
+        vcs_client.branch("acme/infra", "fix/mem", key="fix/mem")
+        (tree / "clusters" / "prod").mkdir(parents=True)
+        (tree / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n"
+        )
+        vcs_client.commit(
+            "lower memory to 512Mi",
+            ["clusters/prod/checkout.yaml"],
+            spec="acme/infra",
+            key="fix/mem",
+        )
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            vcs_client.publish("acme/infra", key="fix/mem")
+        self.assertEqual(caught.exception.code, vcs_client.DECISION_MEMORY_BLOCKED)
+        self.assertIsInstance(caught.exception, PermissionError)
+        self.assertIn("LES-2026-001", str(caught.exception))
+        self.assertEqual(self.published, [])
+
+        # Fix the manifest to satisfy the guard; publish succeeds and proposal-create gets the section.
+        (tree / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n"
+        )
+        vcs_client.commit("raise memory to 4Gi", spec="acme/infra", key="fix/mem")
+        vcs_client.publish("acme/infra", key="fix/mem")
+        self.assertEqual(len(self.published), 1)
+
+        seen_forge = []
+        with mock.patch.object(
+            vcs_client,
+            "call",
+            side_effect=lambda verb, payload: seen_forge.append((verb, payload))
+            or {"proposal": {"url": "https://forge.test/pr/1", "number": 1, "title": "t"}},
+        ):
+            vcs_client.forge(
+                "proposal-create",
+                {"title": "Raise memory", "body": "Summary.", "source": "fix/mem", "target": "main"},
+                repository="acme/infra",
+            )
+        self.assertEqual(len(seen_forge), 1)
+        self.assertIn("### Prior decisions and lessons", seen_forge[0][1]["body"])
+        self.assertIn("LES-2026-001", seen_forge[0][1]["body"])
 
 
 def build_tar(*members: tuple[tarfile.TarInfo, bytes | None]) -> bytes:

@@ -255,10 +255,14 @@ not been set.
 
 **Image pins.** `images.json` is the source of truth for every image an install pulls, but a bump
 starts there and rarely ends there. Several images keep a second copy that the file is the source
-for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
+for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator, the chart's
+template default for the A2A bus's four (`kube-agents.a2aBusImageDefaults` in
+`charts/kube-agents/templates/_helpers.tpl`) — and
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
-default and a mirrored install, and what each off-by-default toggle it renders adds to each (the
-GitHub token minter, the web console, the cluster profile, Hindsight); the build-time
+default and a mirrored install, what each off-by-default toggle it renders adds to each (the
+GitHub token minter, the web console, the cluster profile, Hindsight), and the four bus env vars of
+a `helm upgrade --reuse-values` render from before `a2aBus` (no `a2aBus` key), unmirrored and
+mirrored; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
@@ -712,7 +716,9 @@ only `lgtm`, so the draw is the whole pool at equal weight; any other change sti
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files, and
 `approved` is per file, so it takes as many of them as it needs to cover every file: first one for
 the file with the fewest approvers, then one more for whatever that person cannot approve, from
-the default reviewers when nobody the glob matched can approve it. A change
+the default reviewers when nobody the glob matched can approve it. Both draws pass over a
+reviewer who is away while someone on the roster who is here can do the same job
+([who owns an open pull request](#who-owns-an-open-pull-request)). A change
 to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
 unless that member is one. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
@@ -837,9 +843,8 @@ request. The sweep puts it back once after the first such removal since the last
 one keeps it out until a push. If `Smoke gate` is pending, a `/test` or a push is how you get a
 fresh green. `/retest` is fine: it reruns only failed contexts.
 
-No verdict carries across a change to what the job grades. When the blocking job's `spec.mode`
-changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the repository
-variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
+No verdict carries across a change to what the job grades. When a change to the stack the blocking job
+grades lands in `oss-test-infra`, set the repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
 timeout (a run in flight at the change reports afterwards). `Smoke gate` then stays pending on a
 green whose build first reported before that time, until a run from after it replaces it, and its
 pending text asks for a push. Check the value before you set it: an unparsable one exits
@@ -1037,6 +1042,27 @@ triage sweep applies the wider rule and messages whoever owns each pull request,
 one they share; it runs outside this repository (`triage/` in the internal `gke-labs/kube-agents-bot`,
 with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above
 is all this page can state about it.
+
+The script passes over a reviewer who is away, on the check-run path and on `/request-review`. The
+`REVIEWERS_AWAY` repository secret holds a JSON list of who is away and until when, and those people
+leave the draw. A change that needs only `lgtm`, with everyone it routes to away, draws from the
+default reviewers who are here. Where nobody here on the roster can approve a file, or nobody on it
+is here at all, the script asks the person back soonest, at random among those back the same day,
+in place of nobody; a file someone here can approve still gets that person. A request already
+made stays with its reviewer. A maintainer sets the list, and each set replaces all of it. Keep the
+value on one line: GitHub masks a secret in the log one line at a time.
+
+```bash
+# `back` is the first day the person reviews again; `from` is optional. Dates are UTC.
+gh secret set REVIEWERS_AWAY --repo gke-labs/kube-agents \
+  --body '[{"login":"<login>","from":"2026-12-21","back":"2027-01-05"}]'
+# Nobody away: delete it. A list that is empty or does not parse also reads as nobody away.
+gh secret delete REVIEWERS_AWAY --repo gke-labs/kube-agents
+```
+
+GitHub does not show a secret back, so keep the list you set. The run log names logins
+and never a date. The hand-off comment says so when the reviewer it names was asked while away, also
+with no date.
 
 ```bash
 # Whose move is it: draft, conflicts, verdict, and who is on the hook now.

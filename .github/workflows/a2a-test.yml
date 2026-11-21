@@ -44,26 +44,37 @@ on:
       # the next a2a pull request to inherit.
       - "k8s-operator/go.mod"
       - "k8s-operator/go.sum"
+      # gateway/session_resources_test.go holds spawn.go's session-pod defaults
+      # equal to the operator's, read from this file across the module line, so
+      # an operator-only edit of a default has to run it.
+      - "k8s-operator/api/v1alpha1/session_resources.go"
       # cmd/session-persona's tests read these from outside the module: the
       # cluster skills the worker image ships a session copy of, and the
       # broker policy the session's read tables must stay a subset of. An
       # edit to either alone has to run those tests. lib/persona's tests read
       # the tse persona and the skills it copies the same way (mcp_policy.py,
-      # which bounds its servers, is listed below).
+      # which bounds its servers, is listed below), and the Hermes tse
+      # profile's SOUL.md and AGENTS.md, which the persona must stay in step
+      # with (tse_profile_drift_test.go).
       - "agents/cluster/skills/**"
       - "agents/tse/persona/**"
       - "agents/tse/skills/**"
+      - "agents/tse/SOUL.md"
+      - "agents/tse/AGENTS.md"
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
       # lib/persona/claudecode's cluster persona tests read the persona, the
-      # cluster skills its copies must match, the two scripts its skills
-      # carry byte-identical copies of, and mcp_policy.py, whose
+      # cluster skills its copies must match, the four scripts its skills
+      # carry byte-identical copies of (scriptSources in
+      # a2a/lib/persona/claudecode), and mcp_policy.py, whose
       # PROFILE_SERVER_TOOLS bounds its servers; cmd/session-persona's
       # TestSourceSkillsTeachNoWrites reads the persona's skills too. An edit
       # to any of them alone has to run those tests.
       - "agents/cluster/persona/**"
       - "agents/platform/scripts/stall_report.py"
       - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+      - "agents/platform/scripts/workload_triage.py"
+      - "agents/platform/skills/version-control/scripts/vcs.py"
       - "agents/platform/scripts/mcp_policy.py"
       # hermes-bridge's incident_test.go reads the incident_context hook to
       # keep the bridge's copy of its frame and token list in step; an edit
@@ -124,14 +135,19 @@ jobs:
               - "k8s-operator/Makefile"
               - "k8s-operator/go.mod"
               - "k8s-operator/go.sum"
+              - "k8s-operator/api/v1alpha1/session_resources.go"
               - "agents/cluster/skills/**"
               - "agents/tse/persona/**"
               - "agents/tse/skills/**"
+              - "agents/tse/SOUL.md"
+              - "agents/tse/AGENTS.md"
               - "agents/platform/scripts/command_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
               - "agents/cluster/persona/**"
               - "agents/platform/scripts/stall_report.py"
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+              - "agents/platform/scripts/workload_triage.py"
+              - "agents/platform/skills/version-control/scripts/vcs.py"
               - "agents/platform/scripts/mcp_policy.py"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"

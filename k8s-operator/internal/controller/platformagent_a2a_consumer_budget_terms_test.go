@@ -11,7 +11,6 @@ package controller
 
 import (
 	"encoding/json"
-	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -24,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -570,6 +570,14 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 	if perSession != a2aSessionConsumersPerSession {
 		t.Errorf("A2A_SESSION_CONSUMERS is %d, a2aSessionConsumersPerSession is %d", perSession, a2aSessionConsumersPerSession)
 	}
+	// A session run (EVAL_FRONT_DOOR=session, #6539) sizes its cap at the
+	// session route's per-session cost, which adds the replays.
+	if asks := read("A2A_SESSION_REPLAY_ASKS"); asks != a2aTasksReplaySessionAsks {
+		t.Errorf("A2A_SESSION_REPLAY_ASKS is %d, a2aTasksReplaySessionAsks is %d", asks, a2aTasksReplaySessionAsks)
+	}
+	if per := a2aTasksConsumersPerSession(&agentv1alpha1.PlatformAgent{Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{DefaultRoute: ptr.To(agentv1alpha1.DefaultRouteSession)}}}}); per != perSession+read("A2A_SESSION_REPLAY_ASKS") {
+		t.Errorf("the session route's per-session cost is %d, A2A_SESSION_CONSUMERS + A2A_SESSION_REPLAY_ASKS is %d", per, perSession+read("A2A_SESSION_REPLAY_ASKS"))
+	}
 	if want := a2aTasksReservedConsumersFor(0); fixed != want {
 		t.Errorf("A2A_RESERVE_FIXED is %d, the reserve at zero workers is %d", fixed, want)
 	}
@@ -592,9 +600,18 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		}
 		return n
 	}
-	format := regexp.MustCompile(`(?m)^readonly MODE_NEXT_HELM_VALUES_FORMAT='(.*)'$`).FindSubmatch(script)
-	if format == nil {
-		t.Fatalf("no `readonly MODE_NEXT_HELM_VALUES_FORMAT='...'` in %s; it is the values document that carries the mode and the cap", ciDeploySource)
+	helmPath := regexp.MustCompile(`(?m)^readonly MAX_SESSIONS_HELM_VALUE="platformAgent\.(.*)"$`).FindSubmatch(script)
+	if helmPath == nil {
+		t.Fatalf("no `readonly MAX_SESSIONS_HELM_VALUE=\"platformAgent.<spec path>\"` in %s; it is the Helm value that carries the cap", ciDeploySource)
+	}
+	// The dotted spec path as the nested JSON document the API would store.
+	specDocument := func(n int) string {
+		keys := strings.Split(string(helmPath[1]), ".")
+		doc := strconv.Itoa(n)
+		for i := len(keys) - 1; i >= 0; i-- {
+			doc = `{"` + keys[i] + `":` + doc + `}`
+		}
+		return doc
 	}
 	for _, tc := range []struct {
 		workers, want int
@@ -608,26 +625,15 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		if n != tc.want {
 			t.Errorf("at %d workers the script sizes maxSessions=%d, want %d", tc.workers, n, tc.want)
 		}
-		// The first change's values document, its platformAgent object
-		// decoded as the CR's spec with unknown fields refused: the path is
-		// spec.harness.tuning.maxSessions, and the mode rides in the same
-		// upgrade so the first render sees both.
-		var values struct {
-			PlatformAgent json.RawMessage `json:"platformAgent"`
-		}
-		vdec := json.NewDecoder(strings.NewReader(fmt.Sprintf(string(format[1]), n)))
-		vdec.DisallowUnknownFields()
-		if err := vdec.Decode(&values); err != nil || values.PlatformAgent == nil {
-			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT is not a document with platformAgent alone at its top (%v)", err)
-		}
+		// The install's Helm value, its path under platformAgent decoded as
+		// the CR's spec with unknown fields refused: the path is
+		// spec.harness.tuning.maxSessions, set at the install so the first
+		// render sees it.
 		agent := &agentv1alpha1.PlatformAgent{}
-		dec := json.NewDecoder(strings.NewReader(`{"spec":` + string(values.PlatformAgent) + `}`))
+		dec := json.NewDecoder(strings.NewReader(`{"spec":` + specDocument(n) + `}`))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(agent); err != nil {
-			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT's platformAgent does not decode into a PlatformAgent spec: %v", err)
-		}
-		if agent.Spec.Mode == nil || *agent.Spec.Mode != "next" {
-			t.Errorf("the first change does not set spec.mode: next (got %v)", agent.Spec.Mode)
+			t.Fatalf("MAX_SESSIONS_HELM_VALUE's path under platformAgent does not decode into a PlatformAgent spec: %v", err)
 		}
 		if got := resolveA2AMaxSessions(agent); got != n {
 			t.Errorf("the first change's maxSessions resolves to %d, want %d: the field path is not the one the operator reads", got, n)

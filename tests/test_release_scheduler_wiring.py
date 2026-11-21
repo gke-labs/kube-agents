@@ -24,8 +24,11 @@ _SCHEDULER = "release-scheduler.yml"
 _PIPELINE = "release-publish.yml"
 # Daily, at 06:17 UTC: after the nightly staging promotion (02:17 UTC) has had
 # time to push its staging_* tag, and off the top of the hour, where GitHub's
-# scheduler queues. test_release_publish_workflow.py asserts the daily shape
-# only; the exact value lives here.
+# scheduler queues. The tick is the fallback: staging-promotion-pipeline.yml
+# step 6b dispatches this scheduler when it tags, so a promotion that runs past
+# the tick ships the same day (test_promotion_pipeline_wiring.py pins that
+# job). test_release_publish_workflow.py asserts the daily shape only; the
+# exact value lives here.
 _RELEASE_CRON = "17 6 * * *"
 
 _DISPATCH_SCRIPT_NAME = "dispatch_release_pipeline.sh"

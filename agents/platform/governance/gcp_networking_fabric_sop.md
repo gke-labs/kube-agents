@@ -1,6 +1,6 @@
 # SOP: GCP Networking Fabric & VPC IPAM Audit (Daily Governance)
 
-**Purpose:** Sweep all managed VPC networks, subnets, Cloud NAT gateways, Private Service Connect (PSC) endpoints, Cloud Armor security policies and firewall rules across target GCP projects for subnet IP exhaustion, NAT port allocation saturation, PSC routing deadlocks, MTU fragmentation mismatches, Cloud Armor policy anomalies, and management ports open to the whole internet. The question this audit answers for a platform admin is: _which subnets are running out of secondary IP ranges for GKE Pods, where are Cloud NAT gateways dropping connections due to port exhaustion, and which VPCs have MTU mismatches causing packet fragmentation?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
+**Purpose:** Sweep all managed VPC networks, subnets, Cloud NAT gateways, Private Service Connect (PSC) endpoints, Cloud Armor security policies, firewall rules and GKE cluster add-ons across target GCP projects for subnet IP exhaustion, NAT port allocation saturation, PSC routing deadlocks, MTU fragmentation mismatches, Cloud Armor policy anomalies, management ports open to the whole internet, and Standard clusters without NodeLocal DNSCache. The question this audit answers for a platform admin is: _which subnets are running out of secondary IP ranges for GKE Pods, where are Cloud NAT gateways dropping connections due to port exhaustion, and which VPCs have MTU mismatches causing packet fragmentation?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
 
 **Cron:** id `gcp-networking-fabric-audit`, schedule `0 8 * * *` (daily 08:00 UTC).
 
@@ -21,7 +21,7 @@ The audit targets the repository with `role: gitops`. `start` and `finish` resol
 - **Do not loop over the managed repositories, and do not ask the user to choose one.** Run `start` and `finish` once, without `--repo`. If `start` cannot find the `role: gitops` repository, it says so in its `no_forge` note and the run goes on with no forge; never choose a repository yourself.
 - **Pass `--repo "<owner>/<repo>"` only when a person names a repository for this one run,** and pass the same `--repo` to `finish`.
 
-Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gcp-networking-fabric-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gcp-networking-fabric-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.
+Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gcp-networking-fabric-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gcp-networking-fabric-audit.json", "pending_remediation_requests": [<finding_id>, ...], "declared_intent_repos":[…], "declared_intent_searched":[…], "declared_intent_unsearched":[…], "declarations_path":"…"}`. Keep `findings_path`, `workspace`, `declared_intent_repos`, `declared_intent_searched` and `declared_intent_unsearched` from this call: you write into the first two and read the rest in §2a — `declared_intent_repos` is the set the search must cover, `declared_intent_searched` what `start` already read, `declared_intent_unsearched` the repositories (with their pinned `ref`) that are yours to copy and record; `declarations_path` is where `start` filed the notes it found. The obtainability SOP's Step 0 says what each holds in full.
 
 If `pending_remediation_requests` is non-empty, inspect each requested finding in the open issue and write the updated manifest or Terraform file to `workspace` at `remediation.path` before proceeding to step 3 (`finish`).
 
@@ -31,7 +31,7 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 
 The collector (§2) applies all of this itself: it sweeps the `--scope-projects` you pass from `fleet_scope`, else resolves the scope as above, leaves out a project whose own Compute Engine API is off, and hands back `project/UNENUMERATED_PROJECTS` as a `gate-failed` target carrying the reason, the unread declared projects among them. The rules above are for a target you fall back on by hand.
 
-- A target is either a subnet, named `<project>/<region>/<subnet>`, which owes `subnet-ip-exhaustion` alone, or a project, named `project/<project-id>`, which owes the other five checks. Record `{name, location, project, checks_run}` into `scope.clusters` for each.
+- A target is either a subnet, named `<project>/<region>/<subnet>`, which owes `subnet-ip-exhaustion` alone, or a project, named `project/<project-id>`, which owes the other six checks. Record `{name, location, project, checks_run}` into `scope.clusters` for each.
 - **`checks_run` is mandatory on every scope entry:** Each entry is an object `{"check": "<slug>", "command": "<literal command>"}` naming the exact inspection command executed on that target.
 - A project or target you cannot reach goes in `scope.skipped` with a reason string, **and the sweep continues** — one project's permission error never decides the outcome for the rest of the fleet. If a target is partially readable, record the refusal in its `limitations` string.
 
@@ -121,6 +121,27 @@ The cron prompt of a scheduled run names the flag to add to this command, the sa
 - **Impact:** "Any host on the internet can open a TCP connection to these ports on the instances named, so whatever authenticates on the far side of the port is the entire perimeter."
 - **Remediation:** `kind: manifest`. Declare a Config Connector `ComputeFirewall` for the rule in the reconciled GCP directory, with `spec.sourceRanges` narrowed to `35.235.240.0/20` — the IAP TCP-forwarding range — in place of the world range, and everything else copied from the live rule. Config Connector acquires an existing rule of the same name rather than failing on it, so the object adopts the rule the finding names instead of creating a second one. Narrow rather than delete: `gcloud compute ssh --tunnel-through-iap` keeps working through the IAP range, so the fix closes the internet without removing the access path, and a manifest that deletes the rule outright leaves nothing for a reviewer to compare against. **Do not propose private nodes as the fix**, however obviously it presents itself when every instance in the excerpt is a GKE node holding a public address. Taking the external IPs away is the larger correct change and the wrong one to derive from this finding: a private node reaches Artifact Registry only through Cloud NAT, so on a project whose `cloud-nat-exhaustion` scope entry recorded no NAT gateway (only the `routers list` read, no `get-status`) — §2.2's own read establishes this, at no extra cost — flipping `enablePrivateNodes` stops every image pull in the fleet. Name it in `recommendation.rationale` as the alternative considered and rejected, with the router count as the reason.
 
+#### 2.7 Standard cluster without NodeLocal DNSCache (`missing-nodelocal-dnscache`)
+
+- **Command:** `gcloud container clusters list --project=$PROJECT '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'`. The subnet sweep and this check share one `clusters list` read per project.
+- **Flag when:** a cluster that is not Autopilot does not carry `addonsConfig.dnsCacheConfig.enabled: true`. Without the add-on every Pod DNS lookup is a UDP request to the `kube-dns` ClusterIP that takes a conntrack entry on the node, and `ndots:5` search-path expansion turns one application lookup into several.
+- **A missing `dnsCacheConfig` key means off, not unknown.** The listing omits the block on a cluster that never enabled the add-on, so reading absence as unread would skip exactly the clusters this check is for.
+- **Do NOT flag:** an Autopilot cluster, where the cache is always on and cannot be turned off; a cluster that uses Cloud DNS for GKE (`networkConfig.dnsConfig.clusterDns: CLOUD_DNS`), whose Pods resolve at the metadata address and send no lookup to `kube-dns` once its nodes are re-created (a Standard cluster that moved to Cloud DNS keeps `kube-dns` for its Pods until then, and the listing does not show which DNS provider the nodes of each node pool use, so this check does not see that interval); a cluster the declared scope excludes (`--scope-exclude-clusters`), which the collector drops before it judges; a cluster whose listing carries no `addonsConfig` at all, which is unread and is named in the target's `limitations`; a project whose Kubernetes Engine API is off, which holds no cluster (the collector lists the check in that target's `checks_not_applicable`).
+- **Severity:** `minor`. The finding names a latency and dropped-lookup risk under load, not an outage in progress.
+- **Impact:** "Every Pod DNS lookup goes to the kube-dns ClusterIP and takes a conntrack entry on its node, so lookups slow down under load and are dropped when the table fills."
+- **Remediation:** `kind: manual`. `gcloud container clusters update <cluster> --location <location> --update-addons=NodeLocalDNS=ENABLED`, in a maintenance window: the change re-creates the cluster's nodes. This audit never runs it.
+
+### 2a. Check declared intent before reporting a posture
+
+One check judges a **posture** — a shape an owner may have chosen on purpose — rather than a fault: 2.4 `mtu-packet-fragmentation`. It compares two values the owner set, the MTU of each peered network, and reads nothing live. Two peered networks kept at different MTUs on purpose — a jumbo-frame storage or Interconnect network beside a 1460 network whose VMs cannot all restart to adopt a new MTU, where the traffic that crosses the peering is TCP and MSS negotiation absorbs the difference — is a choice an owner may declare. Every other check in §2 is a fault no declaration excuses: a range with under 15% free, a VM at its NAT port ceiling, a rejected PSC connection, a preview or duplicate-priority Cloud Armor rule on a production backend, a management port open to the internet on a live external address, a Standard cluster without NodeLocal DNSCache. Each of those declared in a repository is a declared bug, and it stays a finding.
+
+The step is the one the obtainability SOP's §4a describes, and the harness does its half the same way here:
+
+- **The harness searches first.** `start` reads every repository in `declared_intent_repos` (the GitOps repository plus each `context_repos` entry) for OKF notes whose frontmatter carries a `declares:` list, files what it finds at `declarations_path`, and lists each repository it read completely under `declared_intent_searched`. `finish` moves every 2.4 finding a filed declaration covers to `declared` (§4) itself. A candidate a note covers is still written to `findings`: `finish` is what moves it, and a candidate you leave out because you found the note yourself is declared by `finish` from the collector's manifest when a note covers it, without your evidence.
+- **What counts as a declaration.** An item `{check, namespace, object}`, optionally `cluster` and `expires`, with `check` the slug `mtu-packet-fragmentation`, `namespace` the empty string written out as `namespace: ""` (the finding sits on a project target with no namespace; an omitted key or a YAML null is skipped with a WARNING, not read as empty, and a namespace written on the item, or on the finding, is read as empty) and `object` as the finding names it: `NetworkPeering/<a>--<b>`, the two network names in the order the finding spells them (the collector sorts the pair), never a `Network/` or a `Project/` — the validator rejects a `declared` entry whose object is anything but a `NetworkPeering/`. `cluster`, when present, is the finding's `project/<project-id>`; omitted, the item is fleet-wide and covers every project whose pair matches. The match is case-blind on those fields, scoped `(check, cluster, namespace, object)` first and fleet-wide second. An item with any other slug, a missing field or an `object` that is not `Kind/name` is skipped with a WARNING (an item that belongs to another stream is noted, not warned about), and the rest of the note still counts. Body text is never read. `expires` is the last day the item stands (`YYYY-MM-DD`, UTC); what a lapsed item does is the obtainability SOP's §4a: the posture stays a finding, with a _Declared intent expired_ line naming the note and the date.
+- **Where the harness looks**, how it records the commit it read, what you do for a repository it could not read, and what a search you could not complete means are the obtainability SOP's §4a, word for word: a repository `start` read completely needs nothing from you; one it could not read is one you copy, grep and record yourself under `declared_intent_searched` as `owner/name@sha`, or leave as the coverage gap it is. Never write a `declared` entry for a declaration you did not read.
+- **A step you skipped is visible, not silent.** Whenever any project target's `checks_run` names 2.4, `finish` requires `declared_intent_searched` to cover every slug in `declared_intent_repos`. Anything less is no search: `finish` withholds every 2.4 finding, the other six checks publish, the ledger names each withheld posture under _Declared intent not searched_, and the run is `partial`.
+
 ### 3. Generate remediation artifacts
 
 For promoted findings requiring `kind: manifest` remediation, write the updated Terraform or manifest file to `remediation.path` resolved within the `workspace` GitOps repository:
@@ -148,7 +169,7 @@ Every finding must conform to the full findings schema:
         "checks_run": [
           {
             "check": "subnet-ip-exhaustion",
-            "command": "gcloud compute networks subnets list --project=proj-1 '--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)' && gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)' && gcloud compute instances list --project=proj-1 '--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)' && gcloud compute addresses list --project=proj-1 --filter=addressType=INTERNAL '--format=json(address,subnetwork)' && gcloud compute forwarding-rules list --project=proj-1 '--format=json(IPAddress,subnetwork)'"
+            "command": "gcloud compute networks subnets list --project=proj-1 '--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)' && gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)' && gcloud compute instances list --project=proj-1 '--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)' && gcloud compute addresses list --project=proj-1 --filter=addressType=INTERNAL '--format=json(address,subnetwork)' && gcloud compute forwarding-rules list --project=proj-1 '--format=json(IPAddress,subnetwork)'"
           }
         ]
       },
@@ -176,6 +197,10 @@ Every finding must conform to the full findings schema:
           {
             "check": "firewall-world-open-ingress",
             "command": "gcloud compute firewall-rules list --project=proj-1 --format=json && gcloud compute instances list --project=proj-1 '--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)' && gcloud compute forwarding-rules list --project=proj-1 --format=json"
+          },
+          {
+            "check": "missing-nodelocal-dnscache",
+            "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'"
           }
         ]
       }
@@ -192,7 +217,7 @@ Every finding must conform to the full findings schema:
       "object": "SecondaryRange/gke-pods",
       "impact": "GKE cannot add nodes that take their Pod block from gke-pods once it is fully allocated, so autoscaling and surge upgrades on those node pools fail.",
       "evidence": {
-        "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)'",
+        "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'",
         "excerpt": "Pod range gke-pods (10.4.0.0/18): GKE reports 93.8% allocated (cluster prod-1, node pool default-pool); about 4 more /24 node blocks fit"
       },
       "recommendation": {
@@ -208,6 +233,11 @@ Every finding must conform to the full findings schema:
   ]
 }
 ```
+
+What §2a adds:
+
+- `declared_intent_searched`: a top-level list of `owner/name@sha` strings, one per repository §2a searched. Required in effect whenever any project target's `checks_run` names 2.4: together with the list `start` printed under the same key, it must cover every slug `start` printed under `declared_intent_repos`, or `finish` withholds every 2.4 finding as a coverage gap (§2a). Omit the key only on a run where 2.4 ran nowhere.
+- `declared`, optionally: one entry per peering you moved out of `findings` yourself — `finish` adds the entries for the notes `start` filed, and declares a collector candidate you left out of the document when a note covers it, so omitting a declared peering does not hold it on the ledger — each carrying `check` (2.4 only), `cluster` (the `project/<project-id>` target), `namespace` (`""`), `object` (`NetworkPeering/<a>--<b>`), `title` and `declaration` with `repo`, `path` and `excerpt`. No severity, no remediation, no id; a declared fault exits 2 and publishes nothing.
 
 ### 5. Close the audit run
 
@@ -226,6 +256,7 @@ Every finding must conform to the full findings schema:
 - `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - `status == "STORE_LEDGER"` → the forge has no issue tracker, or no labels, so the ledger is in the report store and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim, which names the remediation pull requests (the skill's "A forge with no issue tracker" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.
+- `partial` is `true` when the run could not read the whole scope: any target in `scope.skipped`, any target kept in scope with a `limitations` note, or a §2a search that did not cover every repository in `declared_intent_repos`, which withholds every 2.4 finding and names each under _Declared intent not searched_. `coverage_gaps` names each one in a sentence.
 
 ---
 

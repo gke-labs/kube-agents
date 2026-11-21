@@ -130,6 +130,7 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("AGENTS.md", "agents/chat/AGENTS.md"),
     ("scripts", "agents/chat/scripts"),
     ("scripts", "agents/platform/scripts"),
+    ("scripts/shell_words.py", "bench/kube_agents_bench/shell_words.py"),
     ("scripts/profile_overlay.py", "deploy/shared/profile_overlay.py"),
     ("scripts/profile_plugins.py", "deploy/shared/profile_plugins.py"),
     ("scripts/otel_config.py", "deploy/shared/otel_config.py"),

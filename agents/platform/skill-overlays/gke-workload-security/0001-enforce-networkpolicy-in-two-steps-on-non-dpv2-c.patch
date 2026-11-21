@@ -2,6 +2,7 @@ Subject: Enforce NetworkPolicy in two steps on non-DPv2 clusters
 
 Why: on a cluster without Dataplane V2, GKE rejects `--enable-network-policy` until the NetworkPolicy addon is enabled, and gcloud rejects both flags in one call; the skill checks the dataplane first and enables enforcement in two steps.
 Local-Issue: #931 (fixed in #1275)
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Upstream-Issue: none filed yet
 Retire-When: upstream checks the dataplane and enables enforcement in two steps
 

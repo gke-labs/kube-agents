@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent configurations, personas, and skills for managing Kubernetes/GKE operations.
+The Kubernetes Agentic Harness (`kube-agents`): agent configurations, personas and skills for Kubernetes/GKE operations.
 
 ## Repository Layout
 
@@ -25,8 +25,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
 - `scripts/`: Repository tooling: `installer/` (shared by the front doors), `dev/`, `release/`.
 - `examples/`: LiteLLM provider configs, vLLM serving, inference replay.
 - `bench/`: Evaluation harness running [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent.
-- `images.json`: Inventory of every container image an install pulls, with its upstream reference
-  and pin; read by `make mirror-images`, the kustomize deploy targets, and the docs generator.
+- `images.json`: Every container image an install pulls, with its upstream reference and pin;
+  read by `make mirror-images`, the kustomize deploy targets and the docs generator.
 
 ## Where Tests Go
 
@@ -54,7 +54,7 @@ A new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the `Makef
 ## Agent Setup & Integration
 
 Follow [INSTALL.md](INSTALL.md) to set up and register the Platform Agent;
-[docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts, and
+[docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts and
 operational guides.
 
 ## Before Starting a Task
@@ -70,15 +70,14 @@ git fetch upstream main
 git switch -c <branch> --no-track upstream/main
 ```
 
-Already on a branch? Measure whether `main` moved underneath the files you are changing with the
-drift check in
+Already on a branch? Check whether `main` moved under your files with the drift check in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#measure-how-far-a-branch-has-drifted-from-main).
-If it lists a file, rebase onto `upstream/main` and re-read those files before writing more; if it
-lists nothing, being behind is a merge-conflict risk to settle later, not a reason to stop.
+If it lists a file, rebase onto `upstream/main` and re-read those files before writing more; if
+none, being behind is a merge-conflict risk for later, not a reason to stop.
 
 ### Check whether someone is already doing it
 
-Before writing code on a non-trivial task, scan open PRs and issues with the queries in
+Before coding a non-trivial task, scan open PRs and issues with the queries in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#check-whether-someone-is-already-doing-it)
 and report to the user (skip only when the user named the issue/PR or asked for a one-liner):
 
@@ -88,18 +87,18 @@ and report to the user (skip only when the user named the issue/PR or asked for 
 - **An open issue describes the task and is unassigned.** Give the number and title, offer to claim
   it, and say what you would comment. Assign or comment only after the user agrees (the token is a
   person's account).
-- **The issue is assigned to someone else.** Report it and ask before starting.
-- **Nothing matches.** Say so in one line and carry on.
+- **The issue is assigned to someone else.** Report it; ask before starting.
+- **Nothing matches.** Say so in a line and carry on.
 
 Record the result in the PR's **Context** section (`Closes #<number>`, or the related open PR and
-how yours differs) per [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Do
-not apply `status:` labels here; those belong to the runtime claim loop in
-[`agents/platform/skills/github-issue-resolver/SKILL.md`](agents/platform/skills/github-issue-resolver/SKILL.md).
+how yours differs) per [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
+`status:` labels belong to the runtime claim loop in
+[`agents/platform/skills/github-issue-resolver/SKILL.md`](agents/platform/skills/github-issue-resolver/SKILL.md), not here.
 
 ## Skills Guidelines
 
 - Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md`.
-- Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
+- Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent. A profile persona may publish its task's requested change as a proposal through the broker; the broker's permit gate, not the persona, enforces when that's allowed.
 - `agents/platform/skills/gke-*` (a reserved prefix) are copies of `google/skills`, generated from `third_party/google-skills/<skill>/` and the overlay in `agents/platform/skill-overlays/<skill>/`. Edit one in place and record it with `make skills-refresh` (see `edit-mirrored-skill`).
 
 ## Engineering Rules
@@ -116,7 +115,7 @@ Read the matching file in [`.agents/rules/`](.agents/rules/) before writing:
 
 ## Documentation Guidelines
 
-Every fact has one home; check whether the topic has an owner before adding prose:
+Every fact has one home; check for the topic's owner before adding prose:
 
 | Content                                        | Canonical home                       |
 | ---------------------------------------------- | ------------------------------------ |
@@ -153,7 +152,7 @@ Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.m
   lists (`SKILL.md` excepted per `.agents/skills/skill-review/SKILL.md`).
 
 Run `make docs-check` before pushing: generated regions, links/anchors/reachability, terminology,
-site audience, site prose, the context budget, the PR template's sections, and upgrade-table labels.
+site audience and prose, the context budget, PR template sections, upgrade-table labels.
 
 ## Contributing as an agent
 
@@ -222,13 +221,12 @@ user" clauses here. Agents with a user in the loop follow this file.
 
 ### The behavioural presubmit gate
 
-`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
-install (3 repetitions per active case, 1.5–3.5 hours). Non-inert
+`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` through the A2A
+gateway's inject door (3 repetitions per active case, 1.5–3.5 hours). Non-inert
 pushes restart it, so open the PR early and batch changes; a green on the head stays valid when
 `main` moves. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
 or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
-inconsistent liveness signals; a run-less record is infrastructure unless every case is one). Today
-mode and rollback: optional `pull-kube-agents-smoke-test-today` (round-trip PRs or `/test`).
+inconsistent liveness signals; a run-less record is infrastructure unless every case is one).
 Roster, inject-lane exclusions: `docs/eval-gate-roster.md`; verdict ladder:
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2. On a red, read the
 health bot comment and <https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>:
@@ -306,5 +304,5 @@ another round. Two traps:
   the base branch, and any unresolved review thread means work is still outstanding.
 - **Unanswered Self-Review:** "no findings" counts only alongside what was looked for.
 
-Mechanics, queries, and verdicts live in
+Mechanics, queries and verdicts:
 [`.claude/commands/pr-review-batch.md`](.claude/commands/pr-review-batch.md).

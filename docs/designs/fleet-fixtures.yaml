@@ -10,13 +10,12 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`
-# and `declared-mtu-peering` are project-scoped, so they have no cluster slot).
-# fixtures.json carries `startup-fail-vm`, `world-open-ingress` and
-# `declared-mtu-peering` as project-scoped roles (`cluster_slot: null`), which
-# the runner probes in the project with gcloud; `orphan-disks` is in this file
-# alone. A project-scoped role in fixtures.json must appear here with
-# `slot: null`.
+# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`,
+# `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot` are
+# project-scoped, so they have no cluster slot). fixtures.json carries all but
+# `orphan-disks` as project-scoped roles (`cluster_slot: null`), which the runner
+# probes in the project with gcloud; `orphan-disks` is in this file alone. A
+# project-scoped role in fixtures.json must appear here with `slot: null`.
 #
 # A case names a fixture by role and never by a cluster name or a project id.
 # Each eval project carries its own set of clusters (`bench/tf/fleet/`,
@@ -42,7 +41,7 @@
 slots:
   - slot: a
     suffix: a
-    carries: The seeded namespaces and the two defect node pools
+    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the pool that names a missing reservation
   - slot: b
     suffix: b
     carries: The held-back control plane, and the upgrade-readiness drain defects
@@ -114,7 +113,25 @@ fixtures:
       overrequest posture, which the same knowledge/ note declares on
       purpose. The one declarable cost check with no multi-day age gate, so
       the posture is observable on apply day; its case still needs a ledger,
-      which the idle pool supplies from day 7.
+      which the generated-name family's findings supply from their first
+      hour, before the idle pool's day 7.
+
+  - role: generated-name-family
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6
+      - deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b
+      - deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132
+    namespace: seeded-family
+    defect: >-
+      Three Deployments named calibration-<uuid>, the shape a spawner leaves,
+      with one common app.kubernetes.io/part-of label and no owner reference.
+      Each is two pause replicas requesting 10m / 128Mi and using almost none
+      of the memory, behind a budget and a default-deny policy: the waste
+      audit's overrequest posture on objects whose names no repository file
+      declares. The names are literals in the stack, the same on every
+      project. No multi-day age gate.
 
   - role: guaranteed-qos-workload
     slot: a
@@ -181,6 +198,20 @@ fixtures:
       pinned-inference-pool cannot play this part, since its backlog is the
       defect stockout-pinned-pool grades.
 
+  - role: missing-reservation-pool
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/missing-reservation-pool
+    namespace: null
+    defect: >-
+      A pool with no autoscaling, held at zero nodes behind the taint
+      seeded-role=missing-reservation, that consumes one named reservation
+      (SPECIFIC_RESERVATION) while no reservation of that name exists in any
+      zone of the project. GKE reports the pool RUNNING and refuses the first
+      node it would add, so the pool can never grow. The stack plants no
+      reservation: the missing one is the defect. Zero nodes cost nothing.
+
   - role: deprecated-api-caller
     slot: a
     available_from_day: 0
@@ -245,11 +276,9 @@ fixtures:
     defect: >-
       A custom-mode VPC at MTU 8896 with no subnet, peered both ways with
       `default` (MTU 1460), so the networking SOP's 2.4 reads the ACTIVE
-      peering as an MTU mismatch. Not a defect: the one check of that stream
-      proposed as declarable on purpose. Inert for the audit until the
-      stream's declared-intent slice lands and the pool project's GitOps
-      knowledge/ note declares the peering; until then the finding publishes
-      and no case grades it.
+      peering as an MTU mismatch. Not a defect: the pool project's GitOps
+      knowledge/ note declares the peering on purpose, and the networking
+      audit lists it under Declared intent rather than as a finding.
 
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
@@ -260,6 +289,32 @@ fixtures:
     defect: >-
       Two unattached 10 GB persistent disks. The cost SOP's unattached-disk
       collector filters server-side on creationTimestamp<-P30D.
+
+  - role: declared-orphan-snapshot
+    slot: null # Project-scoped, a global object; not attached to any cluster.
+    available_from_day: 91
+    objects:
+      - snapshot/declared-orphan-snap-<prefix>
+    defect: >-
+      A Persistent Disk snapshot whose source disk is gone: the stack's
+      planter (orphan_snapshot.py) snapshots a 10 GB throwaway disk and
+      deletes it, and no snapshot schedule took the snapshot. The GCE compute
+      audit's orphaned-snapshots check flags it once
+      (now - creationTimestamp).days > 90, so the role is not ready, rather
+      than drifted, until day 91. The pool project's GitOps knowledge/ note
+      declares the snapshot on purpose, so the compute audit lists it under
+      Declared intent rather than as a finding.
+
+  - role: orphan-snapshot
+    slot: null # Project-scoped, a global object; not attached to any cluster.
+    available_from_day: 91
+    objects:
+      - snapshot/orphan-snap-<prefix>
+    defect: >-
+      The second snapshot of the same throwaway disk, the same
+      orphaned-snapshots shape, which no note declares: the control the
+      compute audit keeps filing as a finding beside the declared one.
+      Not ready, rather than drifted, until day 91, as its sibling.
 
   - role: version-laggard
     slot: b
@@ -332,8 +387,9 @@ fixtures:
     namespace: seeded-compute-class
     defect: >-
       A Deployment naming ComputeClass general-ccc only in a required
-      nodeAffinity term and never in nodeSelector, which is the one field the
-      pre-filter reads.
+      nodeAffinity term and never in nodeSelector. A required nodeAffinity on
+      the class key also requests the class, so this is the targeted control
+      beside the untargeted workload and no check flags it.
 
   - role: compute-class-toleration-workload
     slot: c
@@ -345,8 +401,24 @@ fixtures:
     defect: >-
       A Deployment targeted through the nodeSelector with a hand-written
       toleration for the class taint that names key, value and effect and no
-      operator. The pool it targets carries no taint, so the pod runs; the
-      toleration's shape is the fixture.
+      operator. GKE adds its own toleration with operator Equal to a Pod
+      that selects a class, and a live test ran this shape on a tainted class
+      pool, hand-made and GKE-created (Standard 1.35.8, Autopilot 1.36.4;
+      older versions not tested): no defect, and no case reads the role. The
+      pool it targets carries no taint, so the pod runs.
+
+  - role: no-ephemeral-limit-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/batch-worker-a
+    namespace: seeded-compute-class
+    defect: >-
+      The same batch-worker-a Deployment, read for its defect: its
+      container sets no ephemeral-storage request or limit, so its writable
+      layer and logs can fill the node's boot disk until the kubelet evicts
+      pods under DiskPressure. GKE Standard admission adds none, where
+      Autopilot writes a 1Gi request and limit onto every container.
 
   - role: untainted-compute-class-pool
     slot: c
@@ -639,8 +711,10 @@ fixtures:
       - statefulset/zone-bound-store
     namespace: seeded-topology
     defect: >-
-      One replica on a zonal standard-rwo claim, so the pod cannot change zone
-      without leaving its data. The fix is a migration, not an edit.
+      Two replicas whose claims use seeded-zonal-pd, a class whose
+      allowedTopologies names only the first zone, so both bind there and
+      neither pod can change zone without leaving its data. The fix is a
+      migration, not an edit.
 
   - role: zonal-skew-capacity
     slot: d
@@ -650,6 +724,8 @@ fixtures:
       - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
-      Four replicas at 120m CPU against two e2-small nodes, so those that do
-      not fit stay Pending on insufficient CPU. Its distribution looks like
+      Four replicas at 500m CPU against the first zone's e2-small, which
+      first-zone-sponge keeps below one replica's worth of free CPU, and the
+      second zone's e2-standard-2, so every replica that runs is in the second
+      zone and the rest stay Pending on insufficient CPU. Its distribution looks like
       the scheduling case; only the Pending pods' events say otherwise.

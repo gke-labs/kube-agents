@@ -1,22 +1,22 @@
 # Google Chat DMs: one conversation per ask, answered in its thread
 
 Design for [#3108](https://github.com/gke-labs/kube-agents/issues/3108), step four of the
-Google Chat next-mode parity work (after the line forms and the cardsV2 renderer of #4319, the
-card emitters of #4369 and the keyed home threads of #4390). It changes the A2A gateway under
-`spec.mode: next`: the Google Chat adapter's classification of DM messages, and the gateway
+Google Chat gateway parity work (after the line forms and the cardsV2 renderer of #4319, the
+card emitters of #4369 and the keyed home threads of #4390). It changes the A2A gateway: the
+Google Chat adapter's classification of DM messages, and the gateway
 paths that already key on a top-level DM for Slack.
 
 ## Intent
 
 In a Google Chat DM the gateway today keys every top-level message to the space,
 `gchat:dm/spaces/AAA`, and answers at the top level. A message typed inside a thread is a side
-conversation of its own. That is the main-flow rule of the Hermes adapter that `today` runs, and
+conversation of its own. That is the main-flow rule of the Hermes Google Chat adapter, and
 [#2765](https://github.com/gke-labs/kube-agents/pull/2765) made the gateway match it. The cost
 shows in #3108: a long answer and the completion of a card the ask delegated land flat in the DM
 stream, and an operator who opens the ask's thread to follow up finds neither there and starts a
 second session besides.
 
-Slack under `next` already does the other thing: each DM question is its own conversation,
+Slack on the gateway already does the other thing: each DM question is its own conversation,
 answered in its own thread, and a reply typed in that thread continues it. The decision for this
 change is to match Slack as closely as possible. Google Chat makes that cheap: Chat attaches a
 thread to every top-level DM message, so the gateway has a thread name to reply into without
@@ -41,7 +41,7 @@ creating one.
 
 ## Non-goals
 
-- The Hermes Google Chat adapter that `today` runs, and its inbound-count heuristic described in
+- The Hermes Google Chat adapter, and its inbound-count heuristic described in
   `cron-report-relay.md` ("The first reply into a report's thread"). Untouched.
 - Group spaces and spaces whose threading state has no replies. Their rule is unchanged: a
   threaded space keys each thread, `UNTHREADED_MESSAGES` and `GROUP_CHAT` bind the space.

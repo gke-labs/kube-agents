@@ -59,8 +59,7 @@ def run_hook(
     timeout_s: str = "",
     rc_commit_sha: str = "",
     path_prepend: str = "",
-    mode_next: str = "",
-    rollback_lane: str = "",
+    front_door: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -76,13 +75,12 @@ def run_hook(
         f'export JOB_TYPE="{job_type}"',
         f'export PULL_NUMBER="{pull_number}"',
         f'export RC_COMMIT_SHA="{rc_commit_sha}"',
-        f'export EVAL_MODE_NEXT="{mode_next}"',
-        f'export EVAL_ROLLBACK_LANE="{rollback_lane}"',
         # Always pinned: the suite itself runs under Prow, where a real
         # $ARTIFACTS is set, and the hook copies its log there.
         f'export ARTIFACTS="{artifacts}"',
         f'export EVAL_DASHBOARD_TIMEOUT="{timeout_s}"',
         f'export EVAL_DASHBOARD_TARGET="{target}"',
+        f'export EVAL_FRONT_DOOR="{front_door}"',
     ]
     if path_prepend:
         lines.append(f'export PATH="{path_prepend}:$PATH"')
@@ -162,6 +160,17 @@ class PublishHookFailSafeTest(unittest.TestCase):
         self.assertIn(reason_fragment, skip_line)
         self.assertIn(f"called dumper with {exit_code}", result.stdout)
 
+    def test_a_session_front_door_run_never_publishes(self):
+        """A front-door A/B run (EVAL_FRONT_DOOR=session, #6539) is compared
+        with a platform run, not filed as main's nightly history: the hook
+        skips with the target set and nothing in scripts/eval_dashboard/ runs."""
+        marker = "import pathlib, sys\npathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), marker)
+            result = run_hook(0, fake_hack, target="gs://bucket/evals", front_door="session")
+            self.assert_skipped_once(result, 0, "EVAL_FRONT_DOOR=session")
+            self.assertFalse((fake_hack.parent / "scripts" / "eval_dashboard" / "collect.py.ran").exists())
+
     def test_unset_target_skips_and_preserves_the_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             for code in (0, 7):
@@ -238,34 +247,9 @@ class PublishHookFailSafeTest(unittest.TestCase):
             dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
             self.assertEqual(list(dash.glob("*.ran")), [])
 
-    def test_a_today_lane_run_never_publishes(self):
-        """A today-lane run on main, if one ran, would be a periodic with no
-        PULL_NUMBER and no RC_COMMIT_SHA, flagged EVAL_MODE_NEXT=1 for its
-        deploy. It would grade an install rolled back from next, which is not
-        main's history. Mirrors the baseline recorder's fourth condition."""
-        marker = (
-            "import pathlib, sys\n"
-            "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            fake_hack = dashboard_stubs(pathlib.Path(tmp), marker)
-            for code in (0, 7):
-                result = run_hook(
-                    code,
-                    fake_hack,
-                    target="gs://kube-agents-dashboards/evals/",
-                    job_type="periodic",
-                    mode_next="1",
-                    rollback_lane="1",
-                )
-                self.assert_skipped_once(result, code, "EVAL_ROLLBACK_LANE=1")
-            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
-            self.assertEqual(list(dash.glob("*.ran")), [])
-
-    def test_a_next_mode_periodic_publishes(self):
-        """A next-mode run on main records under the version key's next mode,
-        so it is main's history and the publisher lets it through, mirroring
-        the recorder."""
+    def test_a_periodic_on_main_publishes(self):
+        """A run on main records under the version key's next mode, so it is
+        main's history and the publisher lets it through, mirroring the recorder."""
         with tempfile.TemporaryDirectory() as tmp:
             fake_hack = dashboard_stubs(
                 pathlib.Path(tmp),
@@ -277,7 +261,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             )
             result = run_hook(
                 0, fake_hack, target="gs://kube-agents-dashboards/evals/",
-                job_type="periodic", mode_next="1",
+                job_type="periodic",
                 path_prepend=failing_gcloud(pathlib.Path(tmp)),
             )
             self.assertEqual(result.returncode, 0, result.stderr)

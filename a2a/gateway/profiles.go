@@ -86,6 +86,9 @@ const (
 	// conversation has a task running, which would otherwise be steered
 	// into that task with the profile dropped.
 	noticeProfileWhileRunning = "a task is still running here; stop it or wait for it before asking an agent profile"
+	// noticeConfirmWhileRunning refuses a confirm (IntentConfirm) while
+	// the conversation has a task running, which a steer can't grant.
+	noticeConfirmWhileRunning = "a task is still running here; stop it or wait for it before confirming a change"
 	// noticeProfileNoCapability refuses a profile task whose grant couldn't
 	// be minted: its grant carries the tier and target the dispatcher checks.
 	noticeProfileNoCapability = "⚠️ not started: could not mint this task's capability"
@@ -137,18 +140,40 @@ func (g *Gateway) mintTaskCapability(ctx context.Context, taskID, addressee stri
 }
 
 // submissionPayload is the submission's message: the text, for a profile
-// route with parameters the taskParameters part beside it, and any extra
-// parts after (a session turn's delegateTargets).
-func submissionPayload(text, taskID, contextID string, route *profileRoute, extra ...lib.Part) ([]byte, error) {
+// route with parameters or a change requested the taskParameters part
+// beside it, and any extra parts after (a session turn's delegateTargets).
+// A task addressed to platform or a session carries no taskParameters part:
+// the dispatcher is its only reader, and the entry keeps changeRequested for
+// the profile children such a task delegates.
+func submissionPayload(text, taskID, contextID string, route *profileRoute, changeRequested bool, extra ...lib.Part) ([]byte, error) {
 	parts := []lib.Part{{Kind: "text", Text: text}}
-	if route != nil && len(route.Params) > 0 {
-		params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params})
+	if route != nil && (len(route.Params) > 0 || changeRequested) {
+		params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params, ChangeRequested: changeRequested})
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, params)
 	}
 	return messagePayloadParts(append(parts, extra...), taskID, contextID)
+}
+
+// topProfile is the profile a top-level profile task was routed to, for its
+// status line (OutMessage.Profile), and "" for any other task.
+func topProfile(route *profileRoute) string {
+	if route == nil || route.Kind != lib.SubmitKindTop {
+		return ""
+	}
+	return route.Profile
+}
+
+// topInReplyTo is the message id of the turn that started a top-level
+// profile task, for its status line (OutMessage.InReplyTo), and "" for any
+// other task.
+func topInReplyTo(ts taskStart) string {
+	if topProfile(ts.Route) == "" {
+		return ""
+	}
+	return ts.MessageID
 }
 
 // submissionSubject is where a new task is published: a profile's submission
@@ -546,18 +571,6 @@ func fnmatchRegexp(pattern string) string {
 	}
 	b.WriteString(")$")
 	return b.String()
-}
-
-// requesterTier is the tier a profile task runs at for this requester, until
-// the PlatformAgent's membership mapping exists (the contract on #3655,
-// addendum 1): read for a person at any door, and a refusal for a requester
-// with no attested identity. Unattended is a named trigger's tier, and no
-// trigger submits through the gateway yet.
-func requesterTier(r TaskRequester) (capability.Tier, error) {
-	if strings.TrimSpace(r.Subject) == "" {
-		return "", refused(noticeProfileNoIdentity)
-	}
-	return capability.TierRead, nil
 }
 
 // profileRouteFor resolves addressee and params to the route a task takes:

@@ -21,7 +21,8 @@ Your system prompt says what this turn can reach. Go by it, not by this file.
   `delegate` tool, say plainly that you can't reach the cluster.
 - Either way, never search this pod's files, environment or binaries for tools or
   credentials. There are none you can use.
-- Nothing else here reaches a cluster or the web: no git, no scripts, no browser.
+- Nothing else here reaches a cluster or the web. `git` is present for local work only;
+  this session has no version-control route, and no scripts or browser.
 
 ## When to delegate
 
