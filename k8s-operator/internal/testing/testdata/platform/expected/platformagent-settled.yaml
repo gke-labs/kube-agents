@@ -5768,7 +5768,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-647cdd83
+  name: platformagent-a2a-provision-a8600b61
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6259,8 +6259,13 @@ spec:
               the bridge sidecar with fewer workers where\n  # it declared more than the
               default, or recreates the stream, and\n  # provisioning does none of those.
               Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              which is\n  # usually not 2, so an unexpected failure stays on the retry
+              budget. The\n  # bus reshape treats a Job failed on this exit as provisioned
+              for a\n  # reshape, which fixes exactly this (busProvisionRefusedOnlyForWidth),
+              and\n  # checks the bus holds every stream besides, since a shell error
+              can exit\n  # 2 too. TestTheProvisionScriptExitsTwoOnlyAtTheConsumerGate
+              keeps this the\n  # script's only explicit exit 2.\n  exit 2\nfi\n\necho
+              \"a2a provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp

@@ -151,7 +151,11 @@ func newScheduleFixtureWith(t *testing.T, mutate func(*agentv1alpha1.AgentSchedu
 		WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.AgentSchedule{}).Build()
 	f := &scheduleFixture{c: c, gw: &fakeScheduleGateway{}, tracker: &fakeScheduleTracker{state: ScheduleTaskState{Found: true}},
 		stopper: &fakeScheduleStopper{result: triggerStopStopped}, key: client.ObjectKeyFromObject(sched)}
-	f.r = &AgentScheduleReconciler{Client: c, Scheme: c.Scheme(), Submitter: f.gw, Tracker: f.tracker, Stopper: f.stopper, Now: func() time.Time { return f.clock }}
+	// The fixture's schedule is one the PlatformAgent renders, so a labelled,
+	// controlled one runs as built-in.
+	builtin := sched.Name
+	f.r = &AgentScheduleReconciler{Client: c, Scheme: c.Scheme(), Submitter: f.gw, Tracker: f.tracker, Stopper: f.stopper, Now: func() time.Time { return f.clock },
+		BuiltinNames: func(*agentv1alpha1.PlatformAgent) []string { return []string{builtin} }}
 	return f
 }
 
@@ -683,12 +687,15 @@ func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 		name       string
 		controlled bool
 		label      string
+		rendered   bool
 		builtin    bool
+		reason     string
 	}{
-		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, false},
-		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, false},
-		{"controlled, unlabelled", true, "", false},
-		{"controlled by the install, labelled builtin", true, agentv1alpha1.AgentScheduleOriginBuiltin, true},
+		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, true, false, agentScheduleReasonBuiltinNotFromOperator},
+		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, true, false, agentScheduleReasonUserDeferred},
+		{"controlled, unlabelled", true, "", true, false, agentScheduleReasonUserDeferred},
+		{"controlled and labelled builtin, not a schedule the install renders", true, agentv1alpha1.AgentScheduleOriginBuiltin, false, false, agentScheduleReasonBuiltinNotFromOperator},
+		{"controlled by the install, labelled builtin, rendered", true, agentv1alpha1.AgentScheduleOriginBuiltin, true, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
@@ -701,6 +708,9 @@ func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 					s.OwnerReferences = nil
 				}
 			})
+			if !tc.rendered {
+				f.r.BuiltinNames = func(*agentv1alpha1.PlatformAgent) []string { return nil }
+			}
 			f.at(t, hourAt(0, 45))
 			f.at(t, hourAt(1, 0))
 			if tc.builtin {
@@ -714,10 +724,24 @@ func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 			}
 			got := f.get(t)
 			cond := meta.FindStatusCondition(got.Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
-			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != agentScheduleReasonUserDeferred {
-				t.Fatalf("Accepted = %+v, want False/%s", cond, agentScheduleReasonUserDeferred)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != tc.reason {
+				t.Fatalf("Accepted = %+v, want False/%s", cond, tc.reason)
 			}
 		})
+	}
+}
+
+// The operator renders no built-in schedules yet, so with the rendered set
+// every builtin-labelled schedule reads BuiltinNotFromOperator and fires
+// nothing, however it was written.
+func TestAgentScheduleNoScheduleIsBuiltinUntilTheOperatorRendersOne(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.r.BuiltinNames = nil
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	cond := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if len(f.gw.sends) != 0 || cond == nil || cond.Reason != agentScheduleReasonBuiltinNotFromOperator {
+		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
 	}
 }
 
@@ -1112,5 +1136,22 @@ func TestAgentScheduleARefusedStopClearsTheRunItStops(t *testing.T) {
 	f.at(t, hourAt(1, 1))
 	if s := f.get(t); s.Status.StoppedTaskID != "" || s.Status.LastHandledStop != "s1" {
 		t.Fatalf("after a refused stop: stoppedTaskID = %q, lastHandledStop = %q", s.Status.StoppedTaskID, s.Status.LastHandledStop)
+	}
+}
+
+// A controller reference of another kind that carries the PlatformAgent's uid
+// doesn't make a schedule built-in: metav1.IsControlledBy matches uids alone,
+// so the reconciler checks the kind too.
+func TestAgentScheduleAControllerOfAnotherKindIsNotThePlatformAgent(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+		s.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "v1", Kind: "ConfigMap", Name: "not-an-agent", UID: "agent-uid", Controller: ptr.To(true),
+		}}
+	})
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	cond := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if len(f.gw.sends) != 0 || cond == nil || cond.Reason != agentScheduleReasonBuiltinNotFromOperator {
+		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
 	}
 }

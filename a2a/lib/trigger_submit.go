@@ -45,6 +45,11 @@ func ValidTriggerReplySubject(source, reply string) bool {
 // published by the operator's reconciler.
 const TriggerSourceSchedule = triggerScheduleSource
 
+// TriggerRunNowKeyPrefix opens a schedule's run-now idempotency key
+// (run-now/<ns>/<name>/<token>). No event source may take it as its name,
+// or its keys could spell a schedule's.
+const TriggerRunNowKeyPrefix = "run-now"
+
 // TriggerSubmitSubject is where source submits.
 func TriggerSubmitSubject(source string) string {
 	return TriggerSubmitSubjectPrefix + source + TriggerSubmitSubjectSuffix
@@ -104,14 +109,18 @@ type ScheduleRef struct {
 
 // TriggerSubmit is a trigger's request for one task.
 type TriggerSubmit struct {
-	// Trigger is the trigger the task's grant binds: name schedule/<stream>,
-	// origin builtin, stream the schedule's report stream, and script the
-	// profile script a script run executes, absent on a prompt run.
+	// Trigger is the trigger the task's grant binds. A schedule's: name
+	// schedule/<stream>, origin builtin, stream the schedule's report
+	// stream, and script the profile script a script run executes, absent on
+	// a prompt run. An event source's (#6572): name <source>/<kind>, origin
+	// builtin, no stream or script.
 	Trigger TriggerClaim `json:"trigger"`
 	// IdempotencyKey names the run: schedule/<ns>/<name>/<slot-unix> or
-	// run-now/<ns>/<name>/<token>. A repeat answers with the same task.
+	// run-now/<ns>/<name>/<token> for a schedule, <source>/<kind>/<token>
+	// for an event source. A repeat answers with the same task.
 	IdempotencyKey string `json:"idempotencyKey"`
-	// Schedule is the AgentSchedule the run is for.
+	// Schedule is the AgentSchedule the run is for; empty for an event
+	// source.
 	Schedule ScheduleRef `json:"schedule"`
 	// Profile is the AgentProfile that runs the task, at the unattended tier.
 	Profile string `json:"profile"`
@@ -155,30 +164,23 @@ const (
 )
 
 // ValidateTriggerSubmit reports the first way s is malformed for source, or
-// nil. It checks the shape and the trigger's binding to the source and the
-// schedule; whether the profile exists and admits the unattended tier is
-// the gateway's to answer from its directory.
+// nil. It checks the shape and the trigger's binding to the source: for the
+// schedule source, to its schedule (validateScheduleSubmit); for any other
+// source, an event source, to an event kind (validateEventSubmit). Whether
+// the gateway admits the source at all, and whether the profile exists and
+// admits the unattended tier, is the gateway's to answer.
 func ValidateTriggerSubmit(source string, s TriggerSubmit) error {
-	if source != TriggerSourceSchedule {
-		return fmt.Errorf("trigger source %q is not %q, the one source that submits", source, TriggerSourceSchedule)
+	if !ValidSubjectToken(source) {
+		return fmt.Errorf("trigger source %q is not a dot-free DNS-1123 label", source)
 	}
 	if err := ValidateTrigger(s.Trigger.Name, s.Trigger.Origin, s.Trigger.Stream, s.Trigger.Script); err != nil {
 		return err
 	}
-	src, name, _ := strings.Cut(s.Trigger.Name, "/")
-	if src != source || name == "" {
-		return fmt.Errorf("trigger name %q is not %s/<schedule> for source %q", s.Trigger.Name, source, source)
+	bind := validateEventSubmit
+	if source == TriggerSourceSchedule {
+		bind = validateScheduleSubmit
 	}
-	if s.Trigger.Stream != name {
-		return fmt.Errorf("trigger stream %q is not the schedule's own name %q", s.Trigger.Stream, name)
-	}
-	if !validDNS1123Label(s.Schedule.Namespace) || s.Schedule.Name == "" || len(s.Schedule.Name) > 253 {
-		return fmt.Errorf("schedule %s/%s is not a namespace and a name", s.Schedule.Namespace, s.Schedule.Name)
-	}
-	if s.Schedule.Name != name {
-		return fmt.Errorf("trigger %q does not name schedule %q", s.Trigger.Name, s.Schedule.Name)
-	}
-	if err := validateIdempotencyKey(s.IdempotencyKey, s.Schedule); err != nil {
+	if err := bind(source, s); err != nil {
 		return err
 	}
 	if !ValidSubjectToken(s.Profile) {
@@ -210,6 +212,55 @@ func ValidateTriggerSubmit(source string, s TriggerSubmit) error {
 	return ValidateScheduleDelivery(s.Delivery)
 }
 
+// validateScheduleSubmit checks a schedule source's binding: a trigger named
+// schedule/<name> whose stream is its own name, the schedule it names, and a
+// key for a run of that schedule.
+func validateScheduleSubmit(source string, s TriggerSubmit) error {
+	src, name, _ := strings.Cut(s.Trigger.Name, "/")
+	if src != source || name == "" {
+		return fmt.Errorf("trigger name %q is not %s/<schedule> for source %q", s.Trigger.Name, source, source)
+	}
+	if s.Trigger.Stream != name {
+		return fmt.Errorf("trigger stream %q is not the schedule's own name %q", s.Trigger.Stream, name)
+	}
+	if !validDNS1123Label(s.Schedule.Namespace) || s.Schedule.Name == "" || len(s.Schedule.Name) > 253 {
+		return fmt.Errorf("schedule %s/%s is not a namespace and a name", s.Schedule.Namespace, s.Schedule.Name)
+	}
+	if s.Schedule.Name != name {
+		return fmt.Errorf("trigger %q does not name schedule %q", s.Trigger.Name, s.Schedule.Name)
+	}
+	return validateIdempotencyKey(s.IdempotencyKey, s.Schedule)
+}
+
+// validateEventSubmit checks an event source's binding (#6572): a trigger
+// named <source>/<kind>, the kind of event it reports; no schedule, and so
+// no stream or script, which only a schedule's trigger binds
+// (ValidateTrigger); and a key <source>/<kind>/<token>, the token the
+// source's own dedupe already names the event by, one segment.
+func validateEventSubmit(source string, s TriggerSubmit) error {
+	src, kind, _ := strings.Cut(s.Trigger.Name, "/")
+	if src != source || kind == "" {
+		return fmt.Errorf("trigger name %q is not %s/<kind> for source %q", s.Trigger.Name, source, source)
+	}
+	if s.Schedule != (ScheduleRef{}) {
+		return fmt.Errorf("an event source's submission names no schedule")
+	}
+	prefix := s.Trigger.Name + "/"
+	token, ok := strings.CutPrefix(s.IdempotencyKey, prefix)
+	if !ok || token == "" {
+		return fmt.Errorf("idempotency key %q is not %s<token>", s.IdempotencyKey, prefix)
+	}
+	// The token is one segment of letters, digits, '.', '_' and '-': the
+	// key names one run's own record (the gateway's trigger:<key>), so it
+	// can't reach into another key's shape.
+	for i := 0; i < len(token); i++ {
+		if c := token[i]; !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return fmt.Errorf("idempotency key %q has a token that is not letters, digits, '.', '_' and '-'", s.IdempotencyKey)
+		}
+	}
+	return validateIdempotencyToken(s.IdempotencyKey)
+}
+
 // validateIdempotencyKey checks key names a run of sched:
 // schedule/<ns>/<name>/<slot-unix> or run-now/<ns>/<name>/<token>.
 func validateIdempotencyKey(key string, sched ScheduleRef) error {
@@ -217,7 +268,7 @@ func validateIdempotencyKey(key string, sched ScheduleRef) error {
 		return fmt.Errorf("idempotency key longer than %d bytes", triggerSubmitIdempotencyMaxLn)
 	}
 	parts := strings.Split(key, "/")
-	if len(parts) != 4 || (parts[0] != "schedule" && parts[0] != "run-now") {
+	if len(parts) != 4 || (parts[0] != TriggerSourceSchedule && parts[0] != TriggerRunNowKeyPrefix) {
 		return fmt.Errorf("idempotency key %q is not schedule/<ns>/<name>/<slot> or run-now/<ns>/<name>/<token>", key)
 	}
 	if parts[1] != sched.Namespace || parts[2] != sched.Name {
@@ -225,6 +276,15 @@ func validateIdempotencyKey(key string, sched ScheduleRef) error {
 	}
 	if parts[3] == "" {
 		return fmt.Errorf("idempotency key %q has no run token", key)
+	}
+	return validateIdempotencyToken(key)
+}
+
+// validateIdempotencyToken checks key's length and that it holds no space or
+// control character.
+func validateIdempotencyToken(key string) error {
+	if len(key) > triggerSubmitIdempotencyMaxLn {
+		return fmt.Errorf("idempotency key longer than %d bytes", triggerSubmitIdempotencyMaxLn)
 	}
 	for i := 0; i < len(key); i++ {
 		if c := key[i]; c <= ' ' || c == 0x7f {

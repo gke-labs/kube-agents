@@ -69,6 +69,11 @@ const (
 	// #5635): which identity the gateway resolves a creator's tier from is
 	// open, so none fires, and the gateway refuses origin user anyway.
 	agentScheduleReasonUserDeferred = "UserSchedulesDeferred"
+	// agentScheduleReasonBuiltinNotFromOperator: labelled builtin, but not
+	// one of the built-in schedules the install's PlatformAgent renders (a
+	// schedule someone else labelled, say, before the admission policy
+	// refused that), so it isn't read as built-in.
+	agentScheduleReasonBuiltinNotFromOperator = "BuiltinNotFromOperator"
 	// agentScheduleReasonInvalidName: a name the run's trigger can't carry.
 	// The trigger name is schedule/<name>, and the gateway holds <name> to a
 	// dot-free DNS-1123 label, so any other name would be refused at every
@@ -203,6 +208,9 @@ type AgentScheduleReconciler struct {
 	Stopper   ScheduleTaskStopper
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// BuiltinNames, when set, replaces the built-in set the PlatformAgent
+	// renders (agentScheduleBuiltinNames). Tests set it.
+	BuiltinNames func(*agentv1alpha1.PlatformAgent) []string
 }
 
 func (r *AgentScheduleReconciler) now() time.Time {
@@ -234,21 +242,51 @@ func AgentScheduleTriggerName(sched *agentv1alpha1.AgentSchedule) string {
 	return "schedule/" + sched.Name
 }
 
+// agentScheduleBuiltinNames is the set of built-in schedules the install's
+// PlatformAgent renders. The operator renders none yet: the change that
+// renders them fills this from the list it renders from, so a schedule is
+// read as built-in only when the operator would have written it.
+//
+// That renderer must own the whole object it renders: a schedule someone
+// created under a built-in's name before the admission policy existed has to
+// be overwritten in full (labels, references and spec) or deleted and
+// created again, never adopted by name with its content kept.
+func agentScheduleBuiltinNames(*agentv1alpha1.PlatformAgent) []string { return nil }
+
+// builtinNames is the reconciler's built-in set: BuiltinNames when a test
+// sets it, the rendered set otherwise.
+func (r *AgentScheduleReconciler) builtinNames(agent *agentv1alpha1.PlatformAgent) []string {
+	if r.BuiltinNames != nil {
+		return r.BuiltinNames(agent)
+	}
+	return agentScheduleBuiltinNames(agent)
+}
+
 // agentScheduleOrigin is builtin only for a schedule the operator rendered:
-// its controller is the install's PlatformAgent and its origin label reads
-// builtin. Neither alone is enough. Whoever creates a schedule sets both its
-// labels and its owner references, but the admission policy keeps the broker
-// to origin: user (design section 6), so the label is the half a compromised
-// broker can't forge, and the controller reference is the half a person
-// writing a schedule by hand won't have. A builtin origin unlocks a built-in
-// audit's report stream (design section 1); the gateway checks the stream
-// against the trigger again.
-func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha1.PlatformAgent) string {
-	if agent != nil && metav1.IsControlledBy(sched, agent) &&
-		sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin {
+// its controller is the install's PlatformAgent, its origin label reads
+// builtin, and its name is one of the built-in schedules that PlatformAgent
+// renders. The admission policy (config/admission/agentschedule-builtin-
+// policy.yaml) keeps anyone but the operator from setting the label or the
+// controller reference, and the name check covers a schedule written before
+// the policy existed: whoever created it set both, and nothing it carries
+// (its managed fields name a client-chosen manager) proves who. A builtin
+// origin unlocks a built-in audit's report stream (design section 1); the
+// gateway checks the stream against the trigger again.
+func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha1.PlatformAgent, builtins []string) string {
+	if agent != nil && metav1.IsControlledBy(sched, agent) && controlledByAPlatformAgent(sched) &&
+		sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin &&
+		slices.Contains(builtins, sched.Name) {
 		return agentv1alpha1.AgentScheduleOriginBuiltin
 	}
 	return agentv1alpha1.AgentScheduleOriginUser
+}
+
+// controlledByAPlatformAgent reports whether the schedule's controller
+// reference names a PlatformAgent, not only its uid: metav1.IsControlledBy
+// compares uids alone.
+func controlledByAPlatformAgent(sched *agentv1alpha1.AgentSchedule) bool {
+	ref := metav1.GetControllerOf(sched)
+	return ref != nil && ref.Kind == "PlatformAgent" && ref.APIVersion == agentv1alpha1.GroupVersion.String()
 }
 
 func slotKey(sched *agentv1alpha1.AgentSchedule, slot time.Time) string {
@@ -356,9 +394,13 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		return nil, nil, false, nil
 	}
 	agent := &agents.Items[0]
-	if agentScheduleOrigin(sched, agent) != agentv1alpha1.AgentScheduleOriginBuiltin {
+	if agentScheduleOrigin(sched, agent, r.builtinNames(agent)) != agentv1alpha1.AgentScheduleOriginBuiltin {
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonUserDeferred
 		cond.Message = "only schedules the PlatformAgent renders run for now; user schedules wait on Track 7 (#5624)"
+		if sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin {
+			cond.Reason = agentScheduleReasonBuiltinNotFromOperator
+			cond.Message = "labelled builtin, but not a built-in schedule this install's PlatformAgent renders, so it runs as nothing"
+		}
 		meta.SetStatusCondition(&sched.Status.Conditions, cond)
 		return nil, nil, false, nil
 	}
@@ -690,7 +732,7 @@ func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agen
 	taskID, err := r.Submitter.Submit(ctx, ScheduleSubmission{
 		IdempotencyKey: p.IdempotencyKey,
 		TriggerName:    AgentScheduleTriggerName(sched),
-		Origin:         agentScheduleOrigin(sched, agent),
+		Origin:         agentScheduleOrigin(sched, agent, r.builtinNames(agent)),
 		SlotTime:       p.SlotTime.UTC(),
 		Schedule:       sched,
 	})

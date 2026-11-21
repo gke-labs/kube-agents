@@ -888,3 +888,28 @@ func TestServeExplainsABusLostExit(t *testing.T) {
 		t.Fatalf("another failure wrote a termination message: %v", err)
 	}
 }
+
+// TestA2ADoorOptionsCarryEverySignInClass: the door is armed from what the
+// config read, class by class. A class the config reads but the options do
+// not carry is a door that refuses every one of that class's tokens on a
+// real install while every test, which builds the options directly, passes.
+func TestA2ADoorOptionsCarryEverySignInClass(t *testing.T) {
+	cfg := &gateway.Config{
+		A2ADoorPublicURL: "https://x/a2a", DefaultAddressee: "platform", TaskDeadline: time.Minute,
+		A2ADoorGoogleClientID: "client", A2ADoorAllowedUsers: []string{"dev@example.com"},
+		A2ADoorEntraTenantID: "tenant", A2ADoorEntraClientID: "app", A2ADoorEntraAllowedUsers: []string{"oid"},
+	}
+	o := a2aDoorOptions(cfg, slog.Default())
+	if o.PublicURL != cfg.A2ADoorPublicURL || o.DefaultAddressee != cfg.DefaultAddressee || o.TaskDeadline != cfg.TaskDeadline {
+		t.Errorf("door options = %+v", o)
+	}
+	if o.GoogleClientID != cfg.A2ADoorGoogleClientID || len(o.GoogleAllowedUsers) != 1 {
+		t.Errorf("the Google class is not carried: %+v", o)
+	}
+	if o.EntraTenantID != cfg.A2ADoorEntraTenantID || o.EntraClientID != cfg.A2ADoorEntraClientID || len(o.EntraAllowedUsers) != 1 {
+		t.Errorf("the Entra class is not carried: %+v", o)
+	}
+	if o.Logger == nil {
+		t.Error("no logger")
+	}
+}
