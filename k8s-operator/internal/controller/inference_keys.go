@@ -148,7 +148,7 @@ const (
 
 	// callerKeysSecretName and callerKeysFileKey are the map the gateway
 	// mounts (the chart's litellm.yaml); callerKeysComponent labels it.
-	callerKeysSecretName = "litellm-caller-keys"
+	callerKeysSecretName = "litellm-caller-keys" // #nosec G101 -- Secret name, not a credential
 	callerKeysFileKey    = "keys.json"
 	callerKeysComponent  = "caller-keys"
 
