@@ -76,6 +76,18 @@ Two environment variables are its per-install configuration, set through the cha
 
 The form URL is not configurable. `enabled: false` on the roster entry is the fleet-wide switch, as for every other job.
 
+`leeway-watch` posts topology and ComputeClass rank findings from its daily sweep. Five environment variables set which findings it posts and how often it posts an open one again. Set them through the chart value `platformAgent.deployment.env`, the same way as the feedback prompt's two above.
+
+| Variable                             | Default | Meaning                                                                                                                                   |
+| ------------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `LEEWAY_WATCH_MIN_SEVERITY`          | `info`  | the lowest severity posted: `info`, `warning` or `critical`                                                                               |
+| `LEEWAY_WATCH_MIN_DRIFT`             | `0`     | the lowest drift score (0–1) a topology finding needs                                                                                     |
+| `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`  | `0`     | the lowest share of a workload's pods in its fullest zone (0–1) a topology finding needs                                                  |
+| `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR` | `1`     | how many replicas (0–10000) past the most even spread possible a skew with no identified cause needs; `0` posts even the most even spread |
+| `LEEWAY_WATCH_REFRESH_DAYS`          | `7`     | days before a finding still open is posted again (1–365)                                                                                  |
+
+A zone that takes no pods is posted whatever the drift, share and floor thresholds say, though `LEEWAY_WATCH_MIN_SEVERITY` still applies to it. A workload confined to one zone by its node selector skips `LEEWAY_WATCH_MIN_DRIFT` only. A value that does not parse or is out of range is ignored and the default applies. A finding a threshold holds back is not reported as cleared.
+
 ## The shipping jobs
 
 Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) and [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json). Retired ids are omitted. An id on its way out ships switched off for a release before it is deleted. A disabled entry on the Platform Agent's roster is left out of this table rather than listed as a job an operator could reach. See [The retired jobs](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs).
@@ -110,6 +122,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `feedback-prompt` | Platform Agent | `0 13 * * *` | Daily 13:00 | yes | `feedback_prompt.py` |
 | `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 | `stall-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `stall_watch.py` |
+| `post-merge-check` | Platform Agent | `*/5 * * * *` | Every 5 minutes | yes | `post_merge_check.py` |
 | `upgrade-readiness-watch` | Platform Agent | `10 10 * * *` | Daily 10:10 | yes | `upgrade_readiness_watch.py` |
 | `upgrade-readiness-weekly-review` | Platform Agent | `0 6 * * 6` | Weekly, Saturday 06:00 | yes | `upgrade_readiness_review.py` |
 | `upgrade-readiness-weekly-brief` | Platform Agent | `0 7 * * 6` | Weekly, Saturday 07:00 | yes | Write this week's upgrade readiness brief. Read the SOP at '/opt/data/profiles/platform/governance/upgrade_... |
@@ -137,7 +150,7 @@ Both rosters use one schema. A governance watchdog:
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
-  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at '/opt/data/profiles/platform/governance/compliance_audit_sop.md' — all 482 lines of it, before you run anything. Its eighteen checks are section 2, lines 90-410, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit`) in the foreground with the terminal tool's timeout: 600 (the foreground maximum), --workspace set to the workspace start returned and --out /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, run precheck on it, read the manifest the way section 2 says, and pass the same file to precheck and then to finish as --manifest-file (if the collector wrote none, section 2 says what to pass instead). This is a scheduled run, so pass --scheduled to precheck and finish (and to no other command): only a scheduled run can get silent_ok true, and only a scheduled run is closed by precheck when the collector finds the fleet unchanged since the last one. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at '/opt/data/profiles/platform/governance/compliance_audit_sop.md' — all 515 lines of it, before you run anything. Its twenty checks are section 2, lines 90-443, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit`) in the foreground with the terminal tool's timeout: 600 (the foreground maximum), --workspace set to the workspace start returned and --out /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, run precheck on it, read the manifest the way section 2 says, and pass the same file to precheck and then to finish as --manifest-file (if the collector wrote none, section 2 says what to pass instead). This is a scheduled run, so pass --scheduled to precheck and finish (and to no other command): only a scheduled run can get silent_ok true, and only a scheduled run is closed by precheck when the collector finds the fleet unchanged since the last one. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
   "skills": [
     "fleet-audit"
   ],

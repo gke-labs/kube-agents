@@ -1,0 +1,5 @@
+name: eval_run_tag
+version: 0.1.0
+kind: standalone
+description: While KUBEAGENTS_EVAL_RUN_TAGS is on, add the eval run, case and repetition to every model request's headers for the replay proxy's log; off, register nothing.
+provides_middleware: [llm_request]

@@ -3,30 +3,30 @@
 # `cloud.google.com/compute-class=general-ccc` and no matching
 # `cloud.google.com/compute-class=general-ccc:NoSchedule` taint, under a
 # ComputeClass whose auto-creation is off, with autoscaling held at one node.
-# The scheduler places untargeted pods on such a pool until it is full; the
-# Cluster Autoscaler's ComputeClass pre-filter then drops them from its
-# scale-up simulation, so they stay Pending while the pool reads healthy. No
-# stockout check names the pool: the collector's 3.12(c) fires only when a
-# referenced pool lacks the class LABEL (fleet_stockout.py,
-# check_dangling_compute_class), it reads no pool taint against its label,
-# and it reads no class status. GKE marks the class `NodepoolMisconfigured`
-# for the missing taint, which the SOP's 3.12(b) by-hand step may file as
-# `dangling-compute-class` on `ComputeClass/general-ccc`; this case does not
-# accept that pair and grades the automatic pool check alone, so a by-hand
-# filing never flips its marker. A declared gap: expected_fail until the
-# check lands (gke-labs/kube-agents#5600). What the fixture carries versus
-# the customer failure: the fixture carries the labelled, untainted pool; the
-# customer failure is untargeted pods filling it and then dropping out of the
-# scale-up simulation. The fixture cannot fill the pool (one node, three
-# small workloads), so the check reads the label against the taint, never a
+# The scheduler places untargeted pods on such a pool until it is full; on an
+# affected GKE version the Cluster Autoscaler then does not grow the pool for
+# them, so they stay Pending while the pool reads healthy. GKE itself reports
+# the pool: the class status carries `NodepoolMisconfigured`, reason
+# `TaintMissing`, with the pool's name in its message. The stockout
+# collector reads that status (the SOP's 3.12(b), fleet_stockout.py,
+# check_compute_class_status) and files `dangling-compute-class` on
+# `ComputeClass/general-ccc`, with the condition as its evidence. No check
+# files on the pool: the class finding names the pool and the fix, and a
+# second finding on `NodePool/default-pool` would report one defect twice.
+# The second objective holds the finding to the collector: its phrase is the
+# collector's own excerpt, which a finding written by hand from the same
+# status does not carry. What the fixture carries versus the customer
+# failure: the fixture carries the labelled, untainted pool; the customer
+# failure is untargeted pods filling it and then staying Pending. The fixture
+# cannot fill the pool (one node, three small workloads), so the check reads
+# GKE's verdict on the class, never a
 # Pending pod. Nothing is planted by the run: the case observes the fleet
 # (role untainted-compute-class-pool in bench/tf/fleet/fixtures.json).
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: ccc-untainted-node-pool-absorption
-name: "Untainted ComputeClass Node Pool Absorbing Untargeted Pods Until Exhausted (untainted-compute-class-pool)"
+name: "Untainted ComputeClass Node Pool Absorbing Untargeted Pods Until Exhausted (dangling-compute-class)"
 domain: capacity
 suite: validated-capabilities
-expected_fail: true
 audit_streams:
   - stockout-prevention
 fixtures:
@@ -35,43 +35,53 @@ prompt: >-
   Run the fleet stockout prevention and capacity audit, following the
   stockout-prevention SOP.
 expected_output: >-
-  The ledger issue carries an untainted-pool finding on NodePool
-  `default-pool` of the ComputeClass cluster: the pool carries the
+  The ledger issue carries a `dangling-compute-class` finding on
+  ComputeClass `general-ccc`: GKE reports the class misconfigured because
+  node pool `default-pool` carries the
   `cloud.google.com/compute-class=general-ccc` label and no matching
   NoSchedule taint, so the scheduler fills it with pods that never selected
-  the class, and once it is full the autoscaler's ComputeClass pre-filter
-  drops those pods from its scale-up simulation; the fix is the taint on the
-  pool (a new pool, since taints are immutable) or the label removed. The
-  closing response is the SOP's one line with the ledger URL.
+  the class, and once it is full those pods can stay Pending; the fix is
+  the taint on the pool or the label removed. The closing response is the
+  SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
 validated: false
 
 verification_spec:
-  # One finding must carry both the check and the planted pool: a body
-  # phrase alone matches every finding on the pool, and a slug among the ids
-  # alone matches the check on any pool. Under scope: finding the phrase is
-  # read on the Where: line of a finding whose id starts with one of the
-  # accepted slugs; `NodePool/<name>` is the collector's pool object form. A
-  # bare `default-pool` among the ids would match any cluster's pool. The
-  # object phrase cannot carry the cluster (the Where: line's cluster is not
-  # read), so the binding rests on the check: it fires only on a pool
-  # labelled for a class, and in a pool project that is slot c's default-pool
-  # alone; the gap issue names that pool.
-  - name: ledger-files-the-untainted-pool-check-on-the-planted-pool
+  # One finding must carry both the check and the planted class: a body
+  # phrase alone matches every finding on the class, and a slug among the ids
+  # alone matches the check on any object. Under scope: finding the phrase is
+  # read on the Where: line of a finding whose id starts with the slug;
+  # `ComputeClass/<name>` is the collector's class object form. The object
+  # phrase cannot carry the cluster (the Where: line's cluster is not read),
+  # so the binding rests on the class's name, which the fleet gives to slot
+  # c's class alone.
+  - name: ledger-files-the-misconfigured-class
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: stockout-prevention
       scope: finding
-      finding_check:
-        [
-          "untainted-compute-class-pool",
-          "ccc-untainted-pool",
-          "ccc-prefilter-untainted-pool",
-        ]
-      required_phrases: ["NodePool/default-pool"]
+      finding_check: "dangling-compute-class"
+      required_phrases: ["ComputeClass/general-ccc"]
+  # The finding must come from the collector, not from a step a worker may
+  # skip. `finish` takes a collector candidate's evidence from the manifest,
+  # so the ledger body carries the collector's excerpt word for word while
+  # the finding renders in full (a row under "Listed without detail", on a
+  # ledger over its size budget, carries no evidence); a
+  # finding a worker writes by hand from the same status quotes the YAML and
+  # does not carry this sentence. A body phrase, because the finding scope
+  # reads the object alone.
+  - name: the-finding-carries-the-collectors-evidence
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: body
+      required_phrases:
+        ["status condition NodepoolMisconfigured is True (TaintMissing)"]
   # The writes this case tempts are the two fixes it describes: the class
   # taint on the pool's nodes, and auto-creation turned on so GKE creates
   # tainted pools of its own. The fleet is read-only for evaluations (the

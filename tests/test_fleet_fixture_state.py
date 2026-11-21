@@ -2,7 +2,7 @@
 
 The runner (hack/fleet-kubeconfigs.sh) confirms a fixture's objects are PRESENT;
 this script confirms they are in the state the cases depend on (#1544). What
-these tests pin, with ``kubectl`` and ``gcloud`` stubbed on ``PATH``:
+these tests pin, with ``kubectl``, ``gcloud`` and ``gh`` stubbed:
 
 * the real catalog loads, and every role declares at least one assertion;
 * each operator and path form does what the catalog's ``state_syntax`` says;
@@ -20,12 +20,20 @@ these tests pin, with ``kubectl`` and ``gcloud`` stubbed on ``PATH``:
   outlier (slot c) is past the drift SOP's 24-hour age gate, which never
   holds a ``--wait``;
 * a re-run that finds a role converged removes a stale ``.drift`` file;
-* a malformed catalog or a directory the runner did not write is exit 1.
+* a malformed catalog or a directory the runner did not write is exit 1;
+* a tool that is not installed comes back as exit status 127, a tool that
+  cannot be run as 126 and a tool that runs past its timeout as 124, and a
+  read that got one of them is "not checked".
 
 The stubs answer from a JSON "world" file so each test names only its own
 defect; a key whose value is a list (a kubectl subject or a describe) is
 answered in order, once per call, which is how a fixture that converges between
 passes is expressed.
+
+Most tests run the script in the test process (``run_script``): its ``main()``
+is called there, and each ``subprocess.run`` of a stubbed tool runs the stub's
+code there. A few run it as a new process with the stubs as programs on its
+``PATH`` (``run_script_process``); ``PassTest`` names them and what they hold.
 """
 
 from __future__ import annotations
@@ -41,6 +49,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -65,7 +74,7 @@ ffs = _load_module()
 verifier = _load_module(_VERIFIER, "verify_ci_pool_project")
 
 # The declared-intent note as the fixture gate reads it: its path in the pool
-# repository, the blob sha of the six-item content provisioning seeds, and
+# repository, the blob sha of the content provisioning seeds, and
 # the blob the forty registered projects carried after the sixth declaration
 # landed (#5827), which the gate must read as drift.
 _NOTE_PATH = verifier.GITOPS_INTENT_NOTE_PATH
@@ -74,7 +83,7 @@ _SEEDED_NOTE_SHA = verifier.gitops_seeded_blob_sha(_NOTE_PATH)
 _FIVE_ITEM_NOTE_SHA = "3c5790d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
 _POOL_REPO = "gke-agentic/kube-agents-evals-infra"
 # The catalog roles that carry the note assertion: every declared-* role.
-_NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
+_NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering", "declared-orphan-snapshot"}
 
 
 class _SteppedClock:
@@ -111,7 +120,8 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as fh:
     fh.write("kubectl " + " ".join(args) + "\n")
-world = json.load(open(os.environ["STUB_WORLD"]))
+with open(os.environ["STUB_WORLD"]) as fh:
+    world = json.load(fh)
 i = args.index("get")
 kind = args[i + 1]
 # Real kubectl refuses a resource type it does not serve; a subject split on
@@ -145,10 +155,14 @@ if key not in answers:
 value = answers[key]
 if isinstance(value, list):
     counter = os.environ["STUB_LOG"] + ".counts"
-    counts = json.load(open(counter)) if os.path.exists(counter) else {}
+    counts = {}
+    if os.path.exists(counter):
+        with open(counter) as fh:
+            counts = json.load(fh)
     n = counts.get(key, 0)
     counts[key] = n + 1
-    json.dump(counts, open(counter, "w"))
+    with open(counter, "w") as fh:
+        json.dump(counts, fh)
     value = value[min(n, len(value) - 1)]
 if value == "UNREACHABLE":
     print("Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout", file=sys.stderr)
@@ -176,15 +190,20 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as fh:
     fh.write("gcloud " + " ".join(args) + "\n")
-world = json.load(open(os.environ["STUB_WORLD"]))
+with open(os.environ["STUB_WORLD"]) as fh:
+    world = json.load(fh)
 if args[:3] == ["container", "clusters", "describe"]:
     doc = world.get("describe", {}).get(args[3])
     if isinstance(doc, list):
         counter = os.environ["STUB_LOG"] + ".describes"
-        counts = json.load(open(counter)) if os.path.exists(counter) else {}
+        counts = {}
+        if os.path.exists(counter):
+            with open(counter) as fh:
+                counts = json.load(fh)
         n = counts.get(args[3], 0)
         counts[args[3]] = n + 1
-        json.dump(counts, open(counter, "w"))
+        with open(counter, "w") as fh:
+            json.dump(counts, fh)
         doc = doc[min(n, len(doc) - 1)]
     if doc is None:
         print(f"ERROR: (gcloud.container.clusters.describe) Not found: {args[3]}", file=sys.stderr)
@@ -206,6 +225,14 @@ elif args[0] == "compute" and args[2] == "list":
     if answer == "UNREACHABLE":
         print(f"ERROR: (gcloud.compute.{args[1]}.list) Some requests did not succeed: Required 'compute.{args[1]}.list' permission", file=sys.stderr)
         sys.exit(1)
+    if answer == "PARTIAL":
+        # gcloud's default for a list that failed in part: a warning, what it
+        # could read (here nothing), and exit 0. After an empty answer its last
+        # line is the warning about the filter's key.
+        print("WARNING: Some requests did not succeed.\n - Internal error in zone us-central1-a\n - Internal error in zone us-central1-b\n", file=sys.stderr)
+        print("WARNING: The following filter keys were not present in any resource : name", file=sys.stderr)
+        print("[]")
+        sys.exit(0)
     # `name ~ ^<prefix>` is a prefix read; `name ~ ^<name>$` (the disk read
     # behind source_disk_gone) is an exact one.
     pattern = next(a for a in args if a.startswith("--filter=name ~ ^"))[len("--filter=name ~ ^"):]
@@ -234,7 +261,8 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as fh:
     fh.write("gh " + " ".join(args) + "\n")
-world = json.load(open(os.environ["STUB_WORLD"]))
+with open(os.environ["STUB_WORLD"]) as fh:
+    world = json.load(fh)
 github = world.get("github")
 if github is None:
     print("To get started with GitHub CLI, please run:  gh auth login", file=sys.stderr)
@@ -367,15 +395,29 @@ _DECLARED_ZONAL_POOL = {
     "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "declared-zonal", "effect": "NO_SCHEDULE"}]},
 }
 
+# seeded-a's missing-reservation-pool as `clusters describe` reports it
+# (main.tf): no autoscaling, tainted, no node, bound to one reservation name.
+_MISSING_RESERVATION_POOL = {
+    "name": "missing-reservation-pool",
+    "status": "RUNNING",
+    "locations": ["us-central1-a"],
+    "config": {
+        "machineType": "n2-standard-2",
+        "taints": [{"key": "seeded-role", "value": "missing-reservation", "effect": "NO_SCHEDULE"}],
+        "reservationAffinity": {"consumeReservationType": "SPECIFIC_RESERVATION", "key": "compute.googleapis.com/reservation-name", "values": ["seeded-absent-reservation"]},
+    },
+}
+
 
 def _peer(*, block: dict | None = _OPEN_BLOCK, created: str | None = None) -> dict:
     """A drift-cohort peer's cluster document (slot a or d).
 
-    Carries seeded-a's declared pool so a peer document a test rewrites for
-    its authorized-networks block still converges the pool's role; slot d's
-    document carries it too, which no role on slot d reads.
+    Carries seeded-a's declared pool and its reservation pool so a peer
+    document a test rewrites for its authorized-networks block still converges
+    the two pools' roles; slot d's document carries them too, which no role on
+    slot d reads.
     """
-    doc = {"currentMasterVersion": "1.34.1-gke.1", "createTime": created or _created(), "nodePools": [_DECLARED_ZONAL_POOL]}
+    doc = {"currentMasterVersion": "1.34.1-gke.1", "createTime": created or _created(), "nodePools": [_DECLARED_ZONAL_POOL, _MISSING_RESERVATION_POOL]}
     if block is not None:
         doc["masterAuthorizedNetworksConfig"] = block
     return doc
@@ -449,6 +491,9 @@ def _healthy_world() -> dict:
             "deployment/token-sidecar": {"status": {"readyReplicas": 1, "replicas": 1}},
             "serviceaccount/default": {"automountServiceAccountToken": True},
             "deployment/burst-ingest": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
             "deployment/ledger-writer": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "10m", "memory": "32Mi"}}}]}}}},
             "poddisruptionbudget?": {"items": []},
             "networkpolicy?": {"items": []},
@@ -658,8 +703,51 @@ def _healthy_world() -> dict:
     }
 
 
+def _exit_code(code, stderr) -> int:
+    """What a process ends with when its main returns `code` or exits with it: the
+    int, 0 for None, and 1 with the text on stderr for anything else."""
+    if code is None or isinstance(code, int):
+        return code or 0
+    print(code, file=stderr)
+    return 1
+
+
+def _print_error(error: BaseException, stderr) -> None:
+    """The traceback a process prints for an error it does not catch: the frames
+    from the called code on, without the frame of the caller here."""
+    traceback.print_exception(error.with_traceback(error.__traceback__.tb_next), file=stderr)
+
+
+def _run_in_process(main, argv: list[str], env: dict) -> subprocess.CompletedProcess:
+    """Call a script's `main(argv)` in this process and give back what a new process
+    would: its exit code, its stdout and its stderr. The call gets `env` as its whole
+    environment, the script's path and `argv` in sys.argv, and its own sys.stdout
+    and sys.stderr; what it returns, a SystemExit, or an error it does not catch
+    becomes the exit code. The environment, sys.argv, the two streams and the
+    working directory are put back after the call."""
+    out, err = io.StringIO(), io.StringIO()
+    cwd = os.getcwd()
+    try:
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(sys, "argv", [str(_SCRIPT), *argv]),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                code = _exit_code(main(argv), err)
+            except SystemExit as exit:
+                code = _exit_code(exit.code, err)
+            except Exception as error:
+                _print_error(error, err)
+                code = 1
+    finally:
+        os.chdir(cwd)
+    return subprocess.CompletedProcess([str(_SCRIPT), *argv], code, out.getvalue(), err.getvalue())
+
+
 class _Harness(unittest.TestCase):
-    """A fleet directory the runner would have written, and the two stubs."""
+    """A fleet directory the runner would have written, and the three stubs."""
 
     def setUp(self):
         import tempfile
@@ -669,10 +757,15 @@ class _Harness(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
+        # Each stub's code for a run in the test process, compiled from the text of
+        # its program on PATH, and as python3 compiles a program: without this
+        # module's `from __future__` import.
+        self.stub_code = {}
         for name, body in (("kubectl", _STUB_KUBECTL), ("gcloud", _STUB_GCLOUD), ("gh", _STUB_GH)):
             stub = self.bin / name
             stub.write_text(body, encoding="utf-8")
             stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+            self.stub_code[name] = compile(stub.read_text(encoding="utf-8"), str(stub), "exec", dont_inherit=True)
         self.log = self.tmp / "calls.log"
         self.log.write_text("")
         self.world = self.tmp / "world.json"
@@ -701,8 +794,9 @@ class _Harness(unittest.TestCase):
             else:
                 (self.fleet / f"{role}.kubeconfig").write_text("apiVersion: v1\nkind: Config\n")
 
-    def run_script(self, world: dict, *args: str, catalog: pathlib.Path = _CATALOG) -> subprocess.CompletedProcess:
-        self.world.write_text(json.dumps(world))
+    def script_env(self) -> dict:
+        """The environment of one run of the script: the stubs first on PATH, their
+        log and their world."""
         env = {
             **os.environ,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
@@ -710,16 +804,143 @@ class _Harness(unittest.TestCase):
             "STUB_WORLD": str(self.world),
         }
         env.pop("BENCH_FLEET_KUBECONFIG_DIR", None)
+        return env
+
+    def run_stub(self, cmd: list[str], env: dict | None = None) -> tuple[int, str, str]:
+        """Run the stub for `cmd[0]` in this process as its program on PATH runs: the
+        command in sys.argv, `env` as its environment when one is given, its output
+        taken, its exit code given back. An error the stub does not catch ends it
+        with the traceback and 1, as a process ends."""
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with (
+            mock.patch.dict(os.environ, dict(os.environ) if env is None else env, clear=True),
+            mock.patch.object(sys, "argv", [str(self.bin / cmd[0]), *cmd[1:]]),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                exec(self.stub_code[cmd[0]], {"__name__": "__main__"})
+            except SystemExit as exit:
+                code = _exit_code(exit.code, err)
+            except Exception as error:
+                _print_error(error, err)
+                code = 1
+        return code, out.getvalue(), err.getvalue()
+
+    def run_script(self, world: dict, *args: str, catalog: pathlib.Path = _CATALOG) -> subprocess.CompletedProcess:
+        """One run of the script in the test process. A new process for each run,
+        and one more for each command the script sends, cost this file most of its
+        time; run_script_process is the same run across the real boundary.
+
+        The script module is loaded anew for the run. Each `subprocess.run` of
+        `kubectl`, `gcloud` or `gh`, by the script or by the pool verifier, runs
+        that stub's code; the timeout is not used. Any other command is run."""
+        self.world.write_text(json.dumps(world))
+        real_run = subprocess.run
+
+        def run(cmd, **kwargs):
+            if cmd[0] not in self.stub_code:
+                return real_run(cmd, **kwargs)
+            return subprocess.CompletedProcess(cmd, *self.run_stub(cmd, kwargs.get("env")))
+
+        with mock.patch.object(subprocess, "run", run):
+            return _run_in_process(_load_module().main, ["--dir", str(self.fleet), "--catalog", str(catalog), *args], self.script_env())
+
+    def run_script_process(self, world: dict, *args: str, catalog: pathlib.Path = _CATALOG) -> subprocess.CompletedProcess:
+        """One run of the script as a new process, with the stubs as programs on its
+        PATH: the boundary run_script leaves out."""
+        self.world.write_text(json.dumps(world))
         return subprocess.run(
             [sys.executable, str(_SCRIPT), "--dir", str(self.fleet), "--catalog", str(catalog), *args],
             capture_output=True,
             text=True,
-            env=env,
+            env=self.script_env(),
             check=False,
         )
 
     def drift_files(self) -> dict[str, str]:
         return {p.stem: p.read_text() for p in sorted(self.fleet.glob("*.drift"))}
+
+
+class RunInTheTestProcessTest(_Harness):
+    """run_script calls the script in the test process. These hold that such a run
+    is kept apart from the next one, that it ends with what a process would, and
+    that each stub answers there as its program on PATH answers."""
+
+    def test_a_run_leaves_nothing_for_the_next_run(self):
+        seen = []
+
+        def main(argv):
+            seen.append({name: os.environ.get(name) for name in ("OUTSIDE", "MINE", "LEFT_BY_A_RUN")} | {"cwd": os.getcwd(), "argv": list(sys.argv)})
+            os.environ["LEFT_BY_A_RUN"] = "1"
+            os.chdir(self.tmp)
+            sys.argv.append("left")
+            print("on stdout")
+            print("on stderr", file=sys.stderr)
+            sys.exit(3)
+
+        with mock.patch.dict(os.environ, {"OUTSIDE": "the test's own"}):
+            before = (dict(os.environ), os.getcwd(), list(sys.argv), sys.stdout, sys.stderr)
+            first = _run_in_process(main, ["a"], {"MINE": "first"})
+            second = _run_in_process(main, ["b"], {})
+            assert (dict(os.environ), os.getcwd(), list(sys.argv), sys.stdout, sys.stderr) == before
+        assert (first.returncode, first.stdout, first.stderr) == (3, "on stdout\n", "on stderr\n")
+        # Each run saw its own environment alone: not the test's, not the other run's.
+        assert seen[0] == {"OUTSIDE": None, "MINE": "first", "LEFT_BY_A_RUN": None, "cwd": before[1], "argv": [str(_SCRIPT), "a"]}
+        assert seen[1] == {"OUTSIDE": None, "MINE": None, "LEFT_BY_A_RUN": None, "cwd": before[1], "argv": [str(_SCRIPT), "b"]}
+
+    def test_a_run_ends_with_what_a_process_would(self):
+        # Each `main` here and as the body of a program: the same exit code, and
+        # the same last line on stderr.
+        bodies = {
+            "pass": 0,
+            "return 1": 1,
+            "return 'a message'": 1,
+            "sys.exit()": 0,
+            "sys.exit(2)": 2,
+            "sys.exit('a message')": 1,
+            "raise ValueError('not caught')": 1,
+        }
+        for body, code in bodies.items():
+            with self.subTest(body=body):
+                scope = {"sys": sys}
+                exec(f"def main(argv):\n    {body}\n", scope)
+                here = _run_in_process(scope["main"], [], {})
+                program = self.tmp / "program.py"
+                program.write_text(f"import sys\ndef main(argv):\n    {body}\nsys.exit(main(sys.argv[1:]))\n", encoding="utf-8")
+                there = subprocess.run([sys.executable, str(program)], capture_output=True, text=True, check=False)
+                assert here.returncode == there.returncode == code
+                assert here.stderr.splitlines()[-1:] == there.stderr.splitlines()[-1:]
+
+    def test_a_stub_in_the_test_process_answers_as_its_program_on_path(self):
+        for name, code in self.stub_code.items():
+            program = self.bin / name
+            assert code == compile(program.read_text(encoding="utf-8"), str(program), "exec", dont_inherit=True), name
+        # Each command of one pass, with a subject that cannot be read and a
+        # repository that is not there among them, sent again to the program.
+        world = _healthy_world()
+        world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
+        world["github"] = {}
+        answers = []
+        run_stub = self.run_stub
+
+        def recorded(cmd, env=None):
+            answers.append((list(cmd), run_stub(cmd, env)))
+            return answers[-1][1]
+
+        self.run_stub = recorded
+        self.run_script(world)
+        assert {cmd[0] for cmd, _ in answers} == set(self.stub_code)
+        assert any(answer[0] != 0 for _, answer in answers), "no command of the pass failed"
+        # And a command that the stub does not expect, which ends it with an error.
+        with mock.patch.dict(os.environ, self.script_env(), clear=True):
+            recorded(["kubectl", "version"])
+        assert "ValueError" in answers[-1][1][2]
+        for cmd, answer in answers:
+            with self.subTest(cmd=cmd):
+                program = subprocess.run([str(self.bin / cmd[0]), *cmd[1:]], capture_output=True, text=True, env=self.script_env(), check=False)
+                assert answer == (program.returncode, program.stdout, program.stderr)
 
 
 class CatalogTest(unittest.TestCase):
@@ -793,6 +1014,65 @@ class CatalogTest(unittest.TestCase):
             for entry in cases:
                 with self.subTest(entry=entry), self.assertRaises(ffs.CatalogError):
                     ffs.load_assertions(self._catalog_with(pathlib.Path(tmp), entry))
+
+
+class RunCommandTest(unittest.TestCase):
+    """`_run` turns a tool that is not installed, a tool that cannot be run and
+    a tool that runs too long into exit statuses.
+
+    The statuses are the shell's: 127 for a command that is not found, 126 for
+    one that is there and cannot be started, 124 for one that `timeout` stopped.
+    Each real process here is this interpreter, a path that does not exist or
+    a file that is not executable, so no test starts `kubectl`, `gcloud` or
+    `gh`.
+    """
+
+    #: Short enough to keep the test fast, and a child that sleeps far longer.
+    TIMEOUT_SECONDS = 0.2
+    CHILD_SLEEP_SECONDS = 30
+
+    def test_a_tool_that_is_not_installed_is_status_127(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(pathlib.Path(tmp) / "no-such-tool")
+            rc, out, err = ffs._run([missing, "get", "pods"], self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (127, ""))
+        self.assertIn(missing, err)
+
+    def test_a_tool_that_cannot_be_run_is_status_126(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_executable = pathlib.Path(tmp) / "kubectl"
+            not_executable.write_text("#!/bin/sh\n")
+            not_executable.chmod(0o644)
+            rc, out, err = ffs._run([str(not_executable), "get", "pods"], self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (126, ""))
+        self.assertIn(str(not_executable), err)
+
+    def test_a_tool_that_runs_past_its_timeout_is_status_124(self):
+        cmd = [sys.executable, "-c", f"import time; time.sleep({self.CHILD_SLEEP_SECONDS})"]
+        rc, out, err = ffs._run(cmd, self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (124, ""))
+        self.assertEqual(err, f"timed out after {self.TIMEOUT_SECONDS:g}s: {' '.join(cmd)}")
+
+    def test_a_tool_that_answers_keeps_its_status_and_both_streams(self):
+        cmd = [sys.executable, "-c", "import sys; print('to stdout'); print('to stderr', file=sys.stderr); sys.exit(3)"]
+        self.assertEqual(ffs._run(cmd, 30), (3, "to stdout\n", "to stderr\n"))
+
+    def test_a_read_that_got_such_a_status_is_unreadable_and_names_it(self):
+        """A caller reports the status, so "not installed", "cannot be run" and
+        "too slow" read apart in the "not checked" line, and none is taken for
+        drift."""
+        failures = (
+            (FileNotFoundError(2, "No such file or directory", "kubectl"), 127, "No such file or directory"),
+            (PermissionError(13, "Permission denied", "kubectl"), 126, "Permission denied"),
+            (OSError(8, "Exec format error", "kubectl"), 126, "Exec format error"),
+            (subprocess.TimeoutExpired(["kubectl"], ffs.KUBECTL_TIMEOUT_SECONDS), 124, "timed out after"),
+        )
+        for failure, status, text in failures:
+            with self.subTest(status=status), mock.patch.object(subprocess, "run", side_effect=failure):
+                with self.assertRaises(ffs.Unreadable) as caught:
+                    ffs.read_kubectl(pathlib.Path("kubeconfig"), None, "deployment/x")
+                self.assertIn(f"({status})", str(caught.exception))
+                self.assertIn(text, str(caught.exception))
 
 
 class EvaluateTest(unittest.TestCase):
@@ -999,10 +1279,18 @@ class EvaluateTest(unittest.TestCase):
 
 
 class PassTest(_Harness):
+    # These tests run the script as a new process with the stubs as programs on
+    # its PATH: the healthy pass, the pending crashloop, the unreadable subject and
+    # the directory that is not the runner's (run_script_process), and
+    # test_the_environment_supplies_the_defaults. They hold what a run in the test
+    # process leaves out: the script started as a program, its exit code through
+    # `sys.exit(main())`, zero and not zero, and the real `subprocess.run` of the
+    # tools on PATH.
+
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
-        done = self.run_script(_healthy_world())
+        done = self.run_script_process(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 53 role(s) in their designed state, 0 drifted, 0 not checked, 0 not yet ready (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 55 role(s) in their designed state, 0 drifted, 0 not checked, 0 not yet ready (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -1011,7 +1299,7 @@ class PassTest(_Harness):
     def test_a_pending_crashloop_is_drift_that_names_the_evidence(self):
         world = _healthy_world()
         world["kubectl"]["pod?app=payments-api"] = _pods(_pod(restarts=0, last_reason=None, phase="Pending"))
-        done = self.run_script(world)
+        done = self.run_script_process(world)
         assert done.returncode == 0, done.stderr
         assert "1 drifted" in done.stderr
         files = self.drift_files()
@@ -1032,7 +1320,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "53 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "55 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -1062,9 +1350,9 @@ class PassTest(_Harness):
     def test_an_unreadable_subject_is_not_checked_and_leaves_no_drift_file(self):
         world = _healthy_world()
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
-        done = self.run_script(world)
+        done = self.run_script_process(world)
         assert done.returncode == 0, done.stderr
-        assert "52 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -1090,7 +1378,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "53 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "55 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -1114,7 +1402,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "53 role(s) in their designed state" in done.stderr, done.stderr
+        assert "55 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -1128,7 +1416,7 @@ class PassTest(_Harness):
     def test_the_default_pool_needs_room_for_the_next_fixture(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "53 role(s) in their designed state" in done.stderr, done.stderr
+        assert "55 role(s) in their designed state" in done.stderr, done.stderr
         # The pods are read once, across every namespace, not once per node.
         assert self.log.read_text().count("get pod -A") == 1, self.log.read_text()
         # 2026-10-20's shape on kube-agents-evals-11: 940m nodes, the busier one 4m from full.
@@ -1144,7 +1432,7 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["kubectl"]["pod?"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "52 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
         assert "default-pool-headroom" in done.stderr and "kubectl get pod -A failed" in done.stderr, done.stderr
         assert "default-pool-headroom" not in self.drift_files()
 
@@ -1157,7 +1445,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "53 role(s) in their designed state" in done.stderr, done.stderr
+        assert "55 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -1189,7 +1477,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "53 role(s) in their designed state" in done.stderr, done.stderr
+        assert "55 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -1396,7 +1684,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "53 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "55 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
@@ -1601,7 +1889,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "42 role(s) in their designed state, 0 drifted, 11 not checked" in done.stderr
+        assert "43 role(s) in their designed state, 0 drifted, 12 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -1620,7 +1908,7 @@ class PassTest(_Harness):
 
     def test_the_directory_must_be_the_runners(self):
         (self.fleet / ".kube-agents-fleet-kubeconfigs").unlink()
-        done = self.run_script(_healthy_world())
+        done = self.run_script_process(_healthy_world())
         assert done.returncode == 1
         assert "not a directory hack/fleet-kubeconfigs.sh wrote" in done.stderr
 
@@ -1646,7 +1934,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "53 role(s) in their designed state" in done.stderr
+        assert "55 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -1838,7 +2126,7 @@ class ProjectScopedRoleTest(_Harness):
         world["compute"]["instances"] = "UNREACHABLE"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "51 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
+        assert "53 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
         assert "fixture role 'startup-fail-vm' could not be checked" in done.stderr
 
     def test_the_peered_networks_are_read_in_the_project(self):
@@ -1899,6 +2187,81 @@ class ProjectScopedRoleTest(_Harness):
         path.write_text(json.dumps(catalog))
         with self.assertRaises(ffs.CatalogError):
             ffs.load_assertions(path)
+
+
+class ReservationSubjectTest(_Harness):
+    """`reservation/<name-prefix>*` is the project's reservations, read with
+    `gcloud compute reservations list`. It is the one project subject that a
+    cluster role carries: the pool that names a reservation is a cluster's, and
+    the reservation is not (#6367)."""
+
+    _LIST = "gcloud compute reservations list --project kube-agents-evals --filter=name ~ ^seeded-absent-reservation --format json"
+
+    def test_the_reservations_are_listed_in_the_project_for_the_pool_role(self):
+        done = self.run_script(_healthy_world())
+        assert done.returncode == 0, done.stderr
+        assert self.drift_files() == {}, done.stderr
+        assert self._LIST in self.log.read_text()
+
+    def test_a_reservation_with_the_fixtures_name_is_drift_that_names_it(self):
+        """Someone created the reservation: the pool can grow now, and nothing
+        on the cluster shows it until the first node."""
+        world = _healthy_world()
+        world["compute"]["reservations"] = [{"name": "seeded-absent-reservation", "zone": "https://www.googleapis.com/compute/v1/projects/kube-agents-evals/zones/us-central1-a"}]
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"missing-reservation-pool"}, done.stderr
+        body = self.drift_files()["missing-reservation-pool"]
+        assert 'reservation/seeded-absent-reservation* name none_eq "seeded-absent-reservation": observed "seeded-absent-reservation"' in body, body
+
+    def test_a_reservation_of_another_name_is_not_drift(self):
+        """The pool consumes one exact name. A reservation whose name only
+        starts with it gives the pool nothing."""
+        world = _healthy_world()
+        world["compute"]["reservations"] = [{"name": "team-batch-reservation"}, {"name": "seeded-absent-reservation-2"}]
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+
+    def test_a_list_that_gcloud_read_in_part_is_not_checked(self):
+        """gcloud exits 0 on a list that failed in part. An empty answer then
+        is not "no reservation": the role is not checked, never healthy."""
+        world = _healthy_world()
+        world["compute"]["reservations"] = "PARTIAL"
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "fixture role 'missing-reservation-pool' could not be checked" in done.stderr
+        # The reason is each item under gcloud's first warning, not its last line.
+        assert "compute reservations list was partial: Internal error in zone us-central1-a; Internal error in zone us-central1-b" in done.stderr
+        assert "filter keys" not in done.stderr
+
+    def test_a_refused_reservation_list_is_not_checked_and_leaves_no_drift_file(self):
+        world = _healthy_world()
+        world["compute"]["reservations"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "fixture role 'missing-reservation-pool' could not be checked" in done.stderr
+
+    def test_no_other_project_subject_is_for_a_cluster_role(self):
+        catalog = json.loads(_CATALOG.read_text())
+        reservation = {"subject": "reservation/seeded-absent-reservation*", "path": "name", "op": "none_eq", "value": "seeded-absent-reservation", "why": "w"}
+        path = self.tmp / "catalog.json"
+        for subject, refused in (
+            ("reservation/seeded-absent-reservation*", False),
+            ("firewall/world-open-2379-*", True),
+            ("reservation/Seeded*", True),
+            ("reservation/seeded-absent-reservation", True),
+            ("reservation?", True),
+            ("reservation?name=seeded-absent-reservation", True),
+        ):
+            with self.subTest(subject=subject):
+                catalog["roles"]["missing-reservation-pool"]["state"] = [{**reservation, "subject": subject}]
+                path.write_text(json.dumps(catalog))
+                if refused:
+                    with self.assertRaises(ffs.CatalogError):
+                        ffs.load_assertions(path)
+                else:
+                    assert ffs.load_assertions(path)["missing-reservation-pool"]["state"][0]["subject"] == subject
 
 
 class RepositorySubjectTest(_Harness):
@@ -2090,7 +2453,7 @@ class OrphanSnapshotRoleTest(_Harness):
         done = self.run_script(world, "--report", str(report))
         assert done.returncode == 0, done.stderr
         assert self.drift_files() == {}, done.stderr
-        assert "52 role(s) in their designed state, 0 drifted, 0 not checked, 1 not yet ready" in done.stderr, done.stderr
+        assert "54 role(s) in their designed state, 0 drifted, 0 not checked, 1 not yet ready" in done.stderr, done.stderr
         assert "NOTE: fixture role 'declared-orphan-snapshot' is planted in kube-agents-evals but not yet ready" in done.stderr, done.stderr
         assert "WARNING" not in done.stderr
         doc = json.loads(report.read_text())
@@ -2100,7 +2463,7 @@ class OrphanSnapshotRoleTest(_Harness):
         assert len(entry["detail"]) == 1 and entry["detail"][0].startswith("snapshot/declared-orphan-snap-* creationTimestamp ready_after_hours 2184: observed"), entry
         assert f"ready at {ready_at}" in entry["detail"][0], entry
         assert doc["roles"]["orphan-snapshot"]["state"] == "converged"
-        assert doc["summary"] == {"converged": 52, "drifted": 0, "unchecked": 0, "not_ready": 1}
+        assert doc["summary"] == {"converged": 54, "drifted": 0, "unchecked": 0, "not_ready": 1}
 
     def test_the_gate_does_not_hold_the_wait(self):
         # One read of the prefix under a 60-second wait at a 1-second interval
@@ -2211,7 +2574,7 @@ class OrphanSnapshotRoleTest(_Harness):
         world["compute"]["disks"] = "UNREACHABLE"
         done = self.run_script(world)
         assert self.drift_files() == {}, done.stderr
-        assert "51 role(s) in their designed state, 0 drifted, 2 not checked, 0 not yet ready" in done.stderr, done.stderr
+        assert "53 role(s) in their designed state, 0 drifted, 2 not checked, 0 not yet ready" in done.stderr, done.stderr
         assert "fixture role 'declared-orphan-snapshot' could not be checked" in done.stderr
         assert "compute.disks.list" in done.stderr
 
@@ -2270,6 +2633,7 @@ class ReportTest(_Harness):
                 "compute-class-toleration-workload": "converged",
                 "declared-single-zone-pool": "converged",
                 "manual-pools-compute-class": "converged",
+                "missing-reservation-pool": "converged",
                 "no-ephemeral-limit-workload": "converged",
                 "no-nodelocal-dnscache": "unchecked",
                 "untainted-compute-class-pool": "unchecked",
@@ -2280,6 +2644,7 @@ class ReportTest(_Harness):
                 "cuda-pinned-gpu-job": "converged",
                 "declared-no-pdb-workload": "converged",
                 "declared-overrequest-workload": "converged",
+                "generated-name-family": "converged",
                 "guaranteed-qos-workload": "converged",
                 "declared-token-workload": "converged",
                 "default-pool-headroom": "converged",
@@ -2326,7 +2691,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 47, "drifted": 1, "unchecked": 4, "not_ready": 0})
+        self.assertEqual(doc["summary"], {"converged": 49, "drifted": 1, "unchecked": 4, "not_ready": 0})
         self.assertEqual(doc["roles"]["startup-fail-vm"]["cluster_slot"], None)
         self.assertIn("1 drifted, 4 not checked", done.stderr)
 

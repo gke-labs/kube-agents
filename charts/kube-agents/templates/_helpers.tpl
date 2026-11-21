@@ -235,25 +235,31 @@ true
 
 {{/*
 The operator flags the chart sets from first-class values, as a YAML env list (empty when
-none is on). operator-deployment.yaml renders it ahead of operator.extraEnv, and the quota
-preflight reads it ahead of extraEnv, so the two agree on which flagged pods run. A flag
+every default stands). operator-deployment.yaml renders it ahead of operator.extraEnv, and the
+quota preflight reads it ahead of extraEnv, so the two agree on which flags are set. A flag
 operator.extraEnv already names is left out: extraEnv wins either way, and leaving it out
 keeps the container's env free of a duplicate name. `| default dict` because
-`helm upgrade --reuse-values` renders against a release that predates operator.mcpServer.
+`helm upgrade --reuse-values` renders against a release that predates operator.mcpServer or
+operator.profileDispatcher.
 */}}
 {{- define "kube-agents.operatorFlagEnv" -}}
 {{- $named := dict -}}
 {{- range $e := (.Values.operator.extraEnv | default list) -}}
 {{- $_ := set $named (toString (index ($e | default dict) "name")) true -}}
 {{- end -}}
-{{- if and (.Values.operator.mcpServer | default dict).enabled (not (hasKey $named "A2A_MCP_DOOR")) -}}
+{{- $mcp := (.Values.operator.mcpServer | default dict) -}}
+{{- if and (hasKey $mcp "enabled") (eq (toString $mcp.enabled) "false") (not (hasKey $named "A2A_MCP_DOOR")) }}
 - name: A2A_MCP_DOOR
-  value: "true"
+  value: "false"
 {{- end -}}
 {{- $dispatcher := (.Values.operator.profileDispatcher | default dict) -}}
 {{- if and (hasKey $dispatcher "enabled") (eq (toString $dispatcher.enabled) "false") (not (hasKey $named "A2A_PROFILE_DISPATCHER")) }}
 - name: A2A_PROFILE_DISPATCHER
   value: "false"
+{{- end -}}
+{{- if and (.Values.operator.cardStop | default dict).enabled (not (hasKey $named "A2A_CARD_STOP")) }}
+- name: A2A_CARD_STOP
+  value: "true"
 {{- end -}}
 {{- with (.Values.operator.slackTestUsers | default list) }}
 {{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
@@ -1029,8 +1035,9 @@ in-place updates, so the running pod would have kept the old file indefinitely.
 
 Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
-no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
-neither key), which only openai_compatible passes, and the optional
+no reasoning_effort), plus apiBase (optional; passed by openai_compatible and,
+when platformAgent.harness.universeDomain is non-default, vertex_ai) and
+sslVerify (optional; passed only by openai_compatible), and the optional
 dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds,
 numRetries and retryAfterSeconds. Every optional input renders nothing when
 unset, so the default render is unchanged.
@@ -2526,6 +2533,32 @@ these have passed.
 ^(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$
 {{- end }}
 
+{{- /* kube-agents.quantityExponentCheck refuses a quantity whose exponent is below -18
+       (#6196). The CRD's quantity pattern admits any integer exponent, and
+       resource.ParseQuantity reads it into an int32 and then rounds through a big.Int of
+       that many digits: past int32 it refuses the PlatformAgent outright, and a large
+       negative one (1e-30000000 took 3.9s, growing faster than the exponent) stalls every
+       decode of it. Below -18 a quantity is smaller than the n suffix and rounds to 1n, so
+       nothing a pod requests needs one. A positive exponent past 18 is past int64 in bytes
+       or millicores, which the callers' overflow checks already refuse, by name, except
+       for a zero, which no overflow check catches: a zero with an exponent past 18 is
+       refused here.
+       Args: raw (the value without a leading sign), key (the values path, for the message), and
+       optionally shown (the value as written, for the message; raw when unset). */ -}}
+{{- define "kube-agents.quantityExponentCheck" -}}
+{{- $shown := .shown | default .raw -}}
+{{- $exp := regexFind "[eE][-+]?[0-9]+$" .raw -}}
+{{- if $exp -}}
+{{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
+{{- if and (contains "-" $exp) (or (gt (len $digits) 2) (and $digits (gt (int $digits) 18))) -}}
+{{- fail (printf "%s is %s, whose exponent is below -18: the operator decodes a quantity like this slowly or not at all, and no pod resource needs one. Write it with a unit suffix (m, n) instead" .key $shown) -}}
+{{- end -}}
+{{- if and (not (contains "-" $exp)) (not (regexMatch "[1-9]" (trimSuffix $exp .raw))) (or (gt (len $digits) 2) (and $digits (gt (int $digits) 18))) -}}
+{{- fail (printf "%s is %s, a zero whose exponent is past 18: the operator decodes a quantity like this slowly or not at all. Write it as 0 instead" .key $shown) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- /* kube-agents.sessionResourcesCheck refuses a session-pod resources value the operator
        cannot read (#2371). The CRD's quantity pattern also admits a decimal exponent (1e.5),
        which the API server stores and resource.ParseQuantity then refuses on every decode of
@@ -2548,16 +2581,7 @@ these have passed.
        without its sign (the resolver reads a negative as unset, but the operator must
        still decode it): 15 significant digits, and nothing past int64 in bytes or in
        millicores, which a large exponent reaches and the CRD's pattern admits. */ -}}
-{{- /* resource.ParseQuantity reads an exponent into an int32 (strconv.ParseInt, then
-       int32()): past int64 it refuses the quantity, and between int32 and int64 it
-       truncates it to another value. So no exponent past int32, either sign. */ -}}
-{{- $exp := regexFind "[eE][-+]?[0-9]+$" $abs -}}
-{{- if $exp -}}
-{{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
-{{- if or (gt (len $digits) 10) (and (eq (len $digits) 10) (gt (int64 $digits) 2147483647)) -}}
-{{- fail (printf "%s.%s.%s is %s, whose exponent is past the int32 the operator reads it into: past int64 the operator cannot decode the PlatformAgent, and below that it truncates the exponent to another value" $prefix $side $name $raw) -}}
-{{- end -}}
-{{- end -}}
+{{- include "kube-agents.quantityExponentCheck" (dict "raw" $abs "shown" $raw "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
 {{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" $abs "") "" -}}
 {{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
 {{- if gt (len $significand) 15 -}}
@@ -2614,6 +2638,7 @@ these have passed.
 {{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
 {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
+{{- include "kube-agents.quantityExponentCheck" (dict "raw" (trimPrefix "+" $raw) "shown" $raw "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
 {{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
        within one part in 10^16 of each other, or of a bound, read as equal, and the
        render would pass what the operator's exact comparison refuses. Counted on the
@@ -3632,11 +3657,12 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.clampInt64" $session.requestsEphemeral | int64)) | int64 -}}
     {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.clampInt64" $session.limitsEphemeral | int64)) | int64 -}}
   {{- end -}}
-  {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
-         #3869). The profile dispatcher, on by default, is in footprint.yaml; switched off
-         (operator.profileDispatcher.enabled false) it is still counted, which over-counts
-         by its one pod in the safe direction. The operator renders each only while
-         its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
+  {{- /* Standing pods behind an opt-in operator flag (files/flagged-pods.yaml: the OKF
+         memory curator, #5566). The MCP server and the profile dispatcher, both on by
+         default, are in footprint.yaml; switched off (operator.mcpServer.enabled or
+         operator.profileDispatcher.enabled false) each is still counted, which over-counts
+         by its one pod in the safe direction. The operator renders each flagged pod only while
+         its flag is set in operator.extraEnv, so no golden
          renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.
          A setting the chart cannot read -- a valueFrom, a non-string value, a string holding
@@ -3655,7 +3681,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
   {{- end -}}
   {{- $flagged := index $flaggedFile "pods" -}}
-  {{- /* The flags first-class values set (operator.mcpServer.enabled), then extraEnv: the
+  {{- /* The flags first-class values set, then extraEnv: the
          order operator-deployment.yaml renders them in, so the last setting wins here too. */ -}}
   {{- $flagEnv := list -}}
   {{- with (include "kube-agents.operatorFlagEnv" .) -}}

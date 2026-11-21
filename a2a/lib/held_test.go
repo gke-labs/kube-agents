@@ -1365,3 +1365,29 @@ func TestHeldStopIntakeLetsAGiveBackReachTheNextHolderAtOnce(t *testing.T) {
 		}
 	}
 }
+
+// A durable its caller says existed isn't re-created on one "not found":
+// EnsureHeldConsumer returns ErrHeldConsumerNotReCreated and makes nothing,
+// and the same call with Existed false creates it (#6283).
+func TestAHeldConsumerThatExistedIsNotReCreatedOnOneMiss(t *testing.T) {
+	h, _ := newHeldHarness(t, "existed")
+	c := h.cfg()
+	cfg := HeldConsumerConfig{Stream: c.Stream, Durable: c.Durable, FilterSubject: c.Subject, MaxAckPending: 1, Existed: true}
+	err := h.req.EnsureHeldConsumer(h.ctx, cfg)
+	if !errors.Is(err, ErrHeldConsumerNotReCreated) {
+		t.Fatalf("EnsureHeldConsumer = %v, want ErrHeldConsumerNotReCreated", err)
+	}
+	_, js := h.req.conn()
+	if _, err := js.Consumer(h.ctx, c.Stream, c.Durable); !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		t.Fatalf("the durable was made anyway: %v", err)
+	}
+	cfg.Existed = false
+	if err := h.req.EnsureHeldConsumer(h.ctx, cfg); err != nil {
+		t.Fatalf("with Existed false: %v", err)
+	}
+	// Existed doesn't change anything for a durable that is there.
+	cfg.Existed = true
+	if err := h.req.EnsureHeldConsumer(h.ctx, cfg); err != nil {
+		t.Fatalf("an existing durable with Existed: %v", err)
+	}
+}

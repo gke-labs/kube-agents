@@ -4743,6 +4743,51 @@ def test_finding_objects_mirrors_the_renderers_reader():
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", excerpt=where)),
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{row}"), finding_ids=named),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n", finding_ids=named),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "no-memory-limit",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "default-sa-automount",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                        "remediation": {
+                            "note": (
+                                f"{renderer.SHARED_ACCOUNT_SHIELD_PREFIX}"
+                                " `Deployment/other` (org/repo:notes/sa.md) — "
+                                "kept `kind: manual` so the namespace-wide ServiceAccount patch is not proposed."
+                            )
+                        },
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"),
         _ledger_body(
             findings="#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
@@ -8788,6 +8833,48 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
         with pytest.raises(ValueError):
             WorkerRun(**bad)
+
+
+def test_shell_argvs_reads_a_substitution_mark_text_on_a_line_with_no_substitution():
+    """The reader marks a substitution inside the line with NUL, ``S``, an index, NUL. A line
+    that holds that text and no substitution raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00S0\x00") == [["echo", "\x00S0\x00"]]
+    # the same text in quotes, inside a word, behind an escape, and with an index that fits no list
+    assert _shell_argvs("echo '\x00S0\x00' \"\x00S1\x00\" a\x00S2\x00b") == [["echo", "\x00S0\x00", "\x00S1\x00", "a\x00S2\x00b"]]
+    assert _shell_argvs("echo \\\x00S0\x00") == [["echo", "\x00S0\x00"]]
+    assert _shell_argvs("echo \x00S9999999999999999999999\x00") == [["echo", "\x00S9999999999999999999999\x00"]]
+    # in a span that the line leaves open, and in the command line that a substitution or a shell runs
+    assert _shell_argvs("echo $(date \x00S0\x00") == [["echo", "$(date", "\x00S0\x00"]]
+    assert _shell_argvs("echo $(echo \x00S0\x00)") == [["echo", "$(echo \x00S0\x00)"], ["echo", "\x00S0\x00"]]
+    assert _shell_argvs("bash -c 'echo \x00S0\x00'")[-1] == ["echo", "\x00S0\x00"]
+
+
+def test_shell_argvs_reads_an_operator_mark_text_on_a_line_with_no_operator():
+    """The operator mark is NUL, ``O``, an index, NUL, as a word of its own. A line that holds
+    that word and no operator raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00O0\x00 x") == [["echo", "\x00O0\x00", "x"]]
+    assert _shell_argvs("eval echo \x00O0\x00 x")[-1] == ["echo", "\x00O0\x00", "x"]
+    # a NUL character alone, and the text of the reader's own literal mark, stay as they are
+    assert _shell_argvs("echo \x00 \x00N\x00") == [["echo", "\x00", "\x00N\x00"]]
+
+
+def test_shell_argvs_reads_a_mark_text_with_a_valid_index_as_text():
+    """With a substitution or an operator on the line, the same text has an index that exists.
+    It read as that substitution or that operator, so the words were not the words of the line."""
+    from kube_agents_bench.shell_words import _ShellOperator, _shell_argvs, _shell_words_and_spans
+
+    # was: the second `$(date)` in the place of the text
+    assert _shell_argvs("echo $(date) \x00S0\x00") == [["echo", "$(date)", "\x00S0\x00"], ["date"]]
+    # was: a `;` in the place of the text, so `echo` and `x` were two commands
+    assert _shell_argvs("echo a; echo \x00O0\x00 x") == [["echo", "a"], ["echo", "\x00O0\x00", "x"]]
+    # was: a second `>` with no target, which is a line that the reader refuses
+    words, _ = _shell_words_and_spans("ls > out \x00O0\x00")
+    assert words == ["ls", ">", "out", "\x00O0\x00"]
+    assert [isinstance(word, _ShellOperator) for word in words] == [False, True, False, False]
 
 
 def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():

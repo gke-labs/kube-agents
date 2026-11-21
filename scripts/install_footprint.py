@@ -119,10 +119,10 @@ A2A_WORKLOADS = (
     ("a2aGateway", "A2A gateway", "Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false`"),
     ("a2aConsole", "Console", "Standing"),
     ("a2aDispatcher", "Profile dispatcher", "Standing, unless `operator.profileDispatcher.enabled` is `false`, when the quota check still counts it"),
+    ("a2aMcp", "MCP server", "Standing, unless `operator.mcpServer.enabled` is `false`, when the quota check still counts it"),
     ("a2aProvision", "Bus provisioning Job", "At install, again whenever its spec changes, and about daily"),
 )
 FLAGGED_LABELS = {
-    "mcp": "MCP server",
     "curator": "OKF memory curator",
 }
 FLAGGED_WHEN = {
@@ -408,7 +408,7 @@ def render_tables() -> str:
         " plus the pods the operator runs for the agent, the chart's pods in the namespace with"
         f" their rollout surges ({constants['defaultChartPods']} when the operator cannot read the"
         f" chart's count), and a margin of {constants['margin']} for the operator's rollout surges,"
-        " its Jobs and the gateway's count-then-create overshoot.",
+        " its Jobs and the gateway's transient overshoot at the cap.",
         "",
         "The A2A stack, per pod:",
         "",

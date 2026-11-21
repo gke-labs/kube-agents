@@ -34,6 +34,16 @@ type StreamPolicy struct {
 	DenyPurge         bool                 `json:"deny_purge"`
 	AllowDirect       bool                 `json:"allow_direct"`
 	Replicas          int                  `json:"num_replicas"`
+	// MaxConsumers is the max_consumers the render creates the stream with
+	// (the provision script's --max-consumers); zero is a stream the script
+	// leaves at the server's default, on which Check does not compare it.
+	// JetStream never changes a stream's max_consumers after it is created,
+	// so a restore is the one moment a stream can take a new one. The
+	// forward restore raises a narrower snapshot to it and keeps a wider
+	// one (widenedMaxConsumers); the way back keeps the snapshot's own. An
+	// older restore pod ignores the field and keeps the snapshot's own,
+	// which is today's behaviour.
+	MaxConsumers int `json:"max_consumers,omitempty"`
 }
 
 // Check lists every field on which cfg differs from the policy, and names a
@@ -76,6 +86,9 @@ func (p StreamPolicy) Check(cfg nats.StreamConfig) []string {
 	field("deny_purge", p.DenyPurge, cfg.DenyPurge)
 	field("allow_direct", p.AllowDirect, cfg.AllowDirect)
 	field("num_replicas", p.Replicas, cfg.Replicas)
+	if p.MaxConsumers != 0 {
+		field("max_consumers", p.MaxConsumers, cfg.MaxConsumers)
+	}
 	if len(cfg.Sources) > 0 {
 		diffs = append(diffs, fmt.Sprintf("sources: want none, got %d", len(cfg.Sources)))
 	}

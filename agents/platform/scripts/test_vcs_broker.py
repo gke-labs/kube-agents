@@ -60,12 +60,25 @@ GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "test@example.com",
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_SYSTEM": "/dev/null",
+    # The default from Git 3.0, on every git of this file, the broker's
+    # included: a call that takes a bare repository from its working directory
+    # fails here before a git with that default runs it.
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.bareRepository",
+    "GIT_CONFIG_VALUE_0": "explicit",
 }
 
 
+def is_bare(path: Path | str) -> bool:
+    """Whether `path` is a bare repository: git's own files are at its top."""
+    return (Path(path) / "HEAD").is_file() and (Path(path) / "refs").is_dir()
+
+
 def git(cwd: Path | str, *args: str, check: bool = True):
+    # A bare repository is named, as `safe.bareRepository=explicit` asks.
+    named = [vcs_broker.GIT_DIR_IS_CWD] if is_bare(cwd) else []
     return subprocess.run(
-        ["git", *args],
+        ["git", *named, *args],
         cwd=str(cwd),
         capture_output=True,
         text=True,
@@ -3176,6 +3189,15 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(answer["commits"][0]["sha"], "a" * 40)
         self.assertEqual(answer["commits"][0]["committed"], "2026-01-01T00:00:00Z")
 
+    def test_proposal_reviews_lists_every_submitted_review_with_its_state(self):
+        broker, recorder = self.broker([
+            {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": "alice", "type": "User"}, "body": ""},
+            {"id": 2, "state": "PENDING", "user": {"login": "bob", "type": "User"}},
+        ])
+        answer = broker.proposal_reviews({"repository": "acme/infra", "number": 9})
+        self.assertEqual(recorder.calls[-1][4].split("?")[0], "repos/acme/infra/pulls/9/reviews")
+        self.assertEqual([(r["state"], r["author"]) for r in answer["reviews"]], [("changes_requested", "alice")])
+
     def test_acknowledge_reacts_on_comments_and_declines_reviews(self):
         broker, recorder = self.broker({"id": 1, "content": "eyes"})
         answer = broker.proposal_acknowledge(
@@ -4016,7 +4038,7 @@ class SnapshotTest(unittest.TestCase):
         self.broker.snapshot({"repository": self.REPOSITORY})
         (argv,) = [argv for argv, _ in self.calls if "archive" in argv]
         self.assertTrue(any(arg.startswith("--output=") for arg in argv), argv)
-        self.assertEqual("--literal-pathspecs", argv[1])
+        self.assertLess(argv.index("--literal-pathspecs"), argv.index("archive"))
 
     # -- ref ---------------------------------------------------------------
 

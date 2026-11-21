@@ -118,8 +118,10 @@ const (
 	// The scratch emptyDir is the harness's working directory (the worker
 	// adapter's defaultWorkdir), so files the model writes land there, as
 	// do the delegate socket and, with SessionClusterView, HERMES_HOME's
-	// kubeconfig files. No clone can: the image carries no git, and the
-	// agent SDK keeps its transcripts under $HOME, in the writable layer.
+	// kubeconfig files. No clone lands here: the image carries git, for a
+	// profile persona's version-control skill, but a session pod's broker
+	// role reaches no /v1/vcs/ route, so it has nothing to clone from; and
+	// the agent SDK keeps its transcripts under $HOME, in the writable layer.
 	// Sessions measured on dev lanes over seven days (2026-10-22, 30-40
 	// minutes each) left it at 4 KiB. 1Gi is the floor for a workspace an
 	// agent writes into, and Autopilot's default ephemeral-storage request
@@ -228,18 +230,14 @@ type spawner interface {
 	// TerminalOrphans lists pods in a terminal phase, with the task identity
 	// their annotations carry (sweep's scan).
 	TerminalOrphans(ctx context.Context) ([]orphanPod, error)
-	// LiveSessions counts session pods not yet in a terminal phase and not
-	// being deleted - the session cap's denominator, over the same pods
-	// SessionPods offers the cap's eviction.
-	LiveSessions(ctx context.Context) (int, error)
 	// Reusable reports whether a pod can take its conversation's next task:
 	// spawned for reuse, running, not being deleted, its worker not exited,
 	// and with room left in its lifetime for a whole task. A pod that is
 	// gone is not reusable and not an error.
 	Reusable(ctx context.Context, podName string) (bool, error)
 	// SessionPods lists the session pods that are live and not being
-	// deleted, with the conversation each belongs to: the cap eviction's
-	// candidates.
+	// deleted, with the conversation each belongs to: the session cap's
+	// count, and its eviction's candidates.
 	SessionPods(ctx context.Context) ([]sessionPod, error)
 	// PodStarted is the pod's status.startTime, when the kubelet took it
 	// (before the image pull), which is where activeDeadlineSeconds counts
@@ -655,35 +653,6 @@ func (s *podSpawner) Delete(ctx context.Context, podName string) error {
 	return err
 }
 
-// LiveSessions counts through the k8s API rather than the gateway's own
-// registry: the API is authoritative, survives a gateway restart, and sees
-// orphans the registry has forgotten. Terminal pods are sweep's inventory,
-// not load, so they don't count - matching what a `pods` ResourceQuota
-// counts, which is the layer that backstops this number.
-//
-// A pod being deleted does not count either, though the quota still does
-// until it is gone: its slot is already freeing, and the cap's eviction
-// cannot choose it (SessionPods skips it too), so counting it would evict
-// some other conversation's live pod for a slot nobody needs. The count and
-// the candidates agree, and the overlap while it terminates is the same one
-// a successful eviction already leaves, which the quota headroom absorbs.
-func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
-	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
-	})
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, p := range pods.Items {
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
-			continue
-		}
-		n++
-	}
-	return n, nil
-}
-
 // reusePod reports whether a pod spawned for rec serves every turn of its
 // conversation: reuse is on and the conversation is on the session route.
 // A one-shot Delegate from a fixed-route conversation is not: the next plain
@@ -796,6 +765,17 @@ func podReusable(p *corev1.Pod, transport string, taskDeadline time.Duration, no
 	return true
 }
 
+// SessionPods reads the k8s API rather than the gateway's own registry: the
+// API is authoritative, survives a gateway restart, and sees orphans the
+// registry has forgotten. Terminal pods are sweep's inventory, not load, so
+// they're not listed, which matches what a `pods` ResourceQuota counts, the
+// layer that backstops the cap.
+//
+// A pod being deleted isn't listed either, though the quota still counts it
+// until it's gone: its slot is already freeing, and the cap's eviction
+// can't choose it, so counting it would evict some other conversation's
+// live pod for a slot nobody needs. The overlap while it terminates is the
+// one a successful eviction already leaves, which the quota headroom absorbs.
 func (s *podSpawner) SessionPods(ctx context.Context) ([]sessionPod, error) {
 	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
@@ -838,23 +818,26 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 }
 
 // refuseAtSessionCap is the usability half of the session-pod bound, checked
-// before any route mutation that will need a fresh pod. At the cap the pod
-// that has been idle longest makes room (evictIdleSession), and its
-// conversation is told; with no idle pod the turn is refused with a reply
-// naming the numbers - never silently queued, never dropped. replacing marks a turn that retires its previous incarnation in
+// before any route mutation that will need a fresh pod. At the cap the pods
+// idle longest make room (evictIdleSessions): one, or over the cap the idle
+// surplus too, and each conversation is told. With too few idle pods to get
+// under the cap, the turn is refused with a reply naming the count left -
+// never silently queued, never dropped. replacing marks a turn that retires its previous incarnation in
 // the same breath: the doomed pod is usually still live at count time, so
 // it hands its slot to its successor rather than double-counting - and if
-// it already went terminal or is already being deleted (LiveSessions counts
+// it already went terminal or is already being deleted (SessionPods lists
 // neither), the extra slot is a transient overshoot the quota headroom
 // absorbs.
 //
-// The count-then-create race is real, and wider than one: conversations run
-// on distinct queue workers, so every delegation in flight inside the
-// count-to-create window can pass this check together - the true bound on
-// the overshoot is the namespace ResourceQuota the operator renders above
-// this number, not cap+1 and not a lock here. A lock would only serialize
-// this process, while the quota also holds against a gateway that has
-// stopped honoring its own cap.
+// The count-then-create race: conversations run on distinct queue workers,
+// so every turn in flight inside the count-to-create window used to pass this
+// check together. A burst of 10 on top of 9 live pods left 19 against a cap
+// of 10 (#6033, measured for #2371), well past the quota's few pods of
+// margin. So the check is serialized (capCheck), and a slot granted here counts
+// as live until ensureSessionPod's spawn returns (capHolds), or for at most
+// sessionCapHoldTTL. Only the leader replica takes turns, so one process's
+// check is enough. The namespace ResourceQuota stays the hard bound against a
+// gateway that has stopped honoring its own cap.
 func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, replacing bool) bool {
 	// SessionRouted persists in the KV record; the spawner is a setting. A
 	// W4 rollback leaves session-routed records this check still reaches -
@@ -863,39 +846,152 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	if g.spawner == nil {
 		return false
 	}
-	live, err := g.spawner.LiveSessions(ctx)
+	// One check at a time (#6033): concurrent conversations at the cap each
+	// counted the same live pods and all passed, leaving the gateway well
+	// over its cap. The count includes slots granted but not yet created.
+	// The wait for the check honours ctx, so a turn that waited out its
+	// budget is told so rather than failing later, and the chat posts the
+	// check makes (eviction notices, the refusal) go out after it ends, so a
+	// slow chat backend doesn't hold up every other conversation.
+	var notices []capNotice
+	defer func() {
+		for _, n := range notices {
+			g.post(n.key, n.text)
+		}
+	}()
+	if !g.acquireCapCheck(ctx) {
+		notices = append(notices, capNotice{rec.Key, "⚠️ not started: other conversations were starting session workers and this one waited too long — try again in a moment"})
+		return true
+	}
+	defer g.releaseCapCheck()
+	// The held slots before the pods: a slot is released only after its
+	// pod exists, so a slot missing from this snapshot means its pod is in
+	// the list read after it. The other order could miss a pod created and
+	// released between the two reads; this one can only count a pod twice
+	// for a moment, which errs on the safe side. One list serves the count,
+	// the replaced pods and the eviction candidates.
+	holds := g.capHoldSnapshot(rec.Key, time.Now())
+	pods, err := g.spawner.SessionPods(ctx)
 	if err != nil {
 		// Proceeding blind would make the cap advisory exactly when the API
 		// is misbehaving; say so instead of dropping the turn silently.
 		g.log.Error("session cap: live count failed", "conversation", rec.Key, "err", err)
-		g.post(rec.Key, "⚠️ not started: can't count the running session workers right now — try again in a moment")
+		notices = append(notices, capNotice{rec.Key, "⚠️ not started: can't count the running session workers right now — try again in a moment"})
 		return true
 	}
+	running := make(map[string]bool, len(pods))
+	for _, p := range pods {
+		running[p.PodName] = true
+	}
+	live := len(pods)
+	for _, h := range holds {
+		if h.replaces == "" || !running[h.replaces] {
+			live++
+		}
+	}
 	limit := g.cfg.MaxSessions
+	replaces := ""
 	if replacing {
 		limit++
+		replaces = rec.PodName
 	}
 	if live < limit {
+		g.holdCapSlot(rec.Key, replaces)
 		return false
 	}
 	// Full, but a pod at the cap may only be holding a conversation nobody
-	// is in right now. Evicting the longest-idle one makes room for one that
-	// is; its conversation is told, and resumes cold with the primer. A
-	// successful eviction is the slot; the count is not read again. A pod
-	// already being deleted is not counted above (LiveSessions), so its
-	// freeing slot never costs another conversation its pod.
-	if g.evictIdleSession(ctx, rec) {
+	// is in right now. Evicting the longest-idle ones makes room for one
+	// that is; each conversation is told, and resumes cold with the primer.
+	// Over the cap (after the cap is lowered, say), the idle surplus goes
+	// too, so the count comes back to the cap rather than staying over it
+	// one-for-one. A pod already being deleted is not listed
+	// (SessionPods), so its freeing slot never costs another conversation
+	// its pod.
+	evicted := g.evictIdleSessions(ctx, rec, pods, live-limit+1, func(key, text string) {
+		notices = append(notices, capNotice{key, text})
+	})
+	if live-evicted < limit {
+		g.holdCapSlot(rec.Key, replaces)
 		return false
 	}
+	live -= evicted
 	workers := fmt.Sprintf("%d session workers are", live)
 	if live == 1 {
 		workers = "1 session worker is"
 	}
 	g.log.Warn("session cap: delegation refused", "conversation", rec.Key, "live", live, "cap", g.cfg.MaxSessions)
-	g.post(rec.Key, fmt.Sprintf(
+	notices = append(notices, capNotice{rec.Key, fmt.Sprintf(
 		"🚦 not started: %s already running (cap %d). Wait for one to finish or `stop` one you started; an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
-		workers, g.cfg.MaxSessions))
+		workers, g.cfg.MaxSessions)})
 	return true
+}
+
+// sessionCapHoldTTL is how long a slot refuseAtSessionCap granted counts
+// against the cap before its pod exists. The slot is released as soon as the
+// spawn returns, and again when the conversation's locked turn ends whatever
+// happened in between (releaseCapHold); this bounds only what neither
+// reaches, a panic.
+const sessionCapHoldTTL = 2 * time.Minute
+
+// capNotice is a chat post the cap check makes, sent after the check ends.
+type capNotice struct{ key, text string }
+
+// capHold is a slot granted to a conversation whose pod isn't created yet:
+// when it was granted, and the pod it replaces, if the turn retires one.
+type capHold struct {
+	at       time.Time
+	replaces string
+}
+
+// acquireCapCheck takes the one cap check at a time, or reports false when
+// ctx ends first.
+func (g *Gateway) acquireCapCheck(ctx context.Context) bool {
+	g.capOnce.Do(func() { g.capCheck = make(chan struct{}, 1) })
+	select {
+	case g.capCheck <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (g *Gateway) releaseCapCheck() { <-g.capCheck }
+
+// capHoldSnapshot is the unexpired slots granted to conversations other
+// than key (key's own is replaced by this check), pruning the expired. A
+// replacing turn's slot isn't counted while the pod it replaces is still
+// running: that pod is already in the count, and the slot is its
+// successor's.
+func (g *Gateway) capHoldSnapshot(key string, now time.Time) []capHold {
+	g.capMu.Lock()
+	defer g.capMu.Unlock()
+	var out []capHold
+	for k, h := range g.capHolds {
+		switch {
+		case now.Sub(h.at) > sessionCapHoldTTL:
+			delete(g.capHolds, k)
+		case k != key:
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// holdCapSlot records key's granted slot.
+func (g *Gateway) holdCapSlot(key, replaces string) {
+	g.capMu.Lock()
+	defer g.capMu.Unlock()
+	if g.capHolds == nil {
+		g.capHolds = map[string]capHold{}
+	}
+	g.capHolds[key] = capHold{at: time.Now(), replaces: replaces}
+}
+
+// releaseCapHold ends key's granted slot, if it has one.
+func (g *Gateway) releaseCapHold(key string) {
+	g.capMu.Lock()
+	delete(g.capHolds, key)
+	g.capMu.Unlock()
 }
 
 // workerResources is the session pod's requests and limits: CPU and memory
@@ -911,6 +1007,10 @@ func (s *podSpawner) workerResources() corev1.ResourceRequirements {
 // ensureSessionPod spawns (or rehydrates) the session's incarnation for a
 // new task. Only called on session-addressed routes.
 func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, taskID string, originSeq uint64) {
+	// The cap's slot for this turn ends here whichever way it goes: a pod
+	// created is listed by SessionPods (a direct list), one that failed
+	// never will be.
+	defer g.releaseCapHold(rec.Key)
 	if rec.PodName != "" {
 		return
 	}

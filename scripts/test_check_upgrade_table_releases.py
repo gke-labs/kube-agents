@@ -10,13 +10,18 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().with_name("check_upgrade_table_releases.py")
 PAGE = "docs/site/src/content/docs/install/upgrade.md"
 TRACES = "scripts/upgrade_table_traces.txt"
 HEADING = "### Breaking changes in recent releases\n\n"
+# A tag time inside and outside the check's 48-hour grace window for a freshly shipped `pending` row.
+FRESH_TAG_AGE = 3600
+STALE_TAG_AGE = 72 * 3600
 HEADER = "| Release | Change | What an existing install meets |\n| --- | --- | --- |\n"
 
 
@@ -128,6 +133,77 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         other = "## Versions\n\n| Version | Supported |\n| --- | --- |\n| 0.40.0 | yes |\n\n"
         self.assertEqual(check.order_problems(page(row("0.10.0", "a"), row("0.9.0", "c"), other=other)), [])
         self.assertEqual([r.change for r in check.table_rows(page(row("0.9.0", "c"), other=other))], ["c"])
+
+    def test_pending_rows_run_in_order_of_their_change_text_and_a_misplaced_one_is_told_where(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        def page(*rows_: str) -> str:
+            return "# Upgrade\n\n" + HEADING + HEADER + "".join(rows_) + "\n"
+        # Case, backticks and a `#<number>: ` prefix don't count, so these run in order.
+        ordered = page(row("pending", "a change"), row("pending", "`B` change"), row("pending", "#12: c change"),
+                       row("pending", "D change"), row("0.10.0", "z"))
+        self.assertEqual(check.order_problems(ordered), [])
+        # One row added on top: it is named, with the row it belongs below.
+        problems = check.order_problems(page(row("pending", "m change"), row("pending", "a change"),
+                                             row("pending", "z change")))
+        self.assertEqual(len(problems), 1)
+        self.assertIn('the `pending` row "a change" is out of order', problems[0])
+        self.assertIn('move it to the top of the `pending` rows', problems[0])
+        problems = check.order_problems(page(row("pending", "a change"), row("pending", "z change"),
+                                             row("pending", "m change")))
+        self.assertEqual(len(problems), 1)
+        self.assertIn('move it below the row "a change"', problems[0])
+        # Released rows are placed by release alone, not by their change text.
+        self.assertEqual(check.order_problems(page(row("0.10.0", "z"), row("0.10.0", "a"))), [])
+
+    def test_the_misplaced_row_is_the_one_named_even_with_duplicates_and_a_row_on_top(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        def page(*changes: str) -> str:
+            return "# Upgrade\n\n" + HEADING + HEADER + "".join(row("pending", c) for c in changes) + "\n"
+        def where(*changes: str) -> list[str]:
+            return [p.split("so move it ")[1] for p in check.order_problems(page(*changes))]
+        # A row added on top of three: that row is named once, not each row it pushed down.
+        self.assertEqual(where("x", "a", "b", "c"), ['below the row "c"'])
+        # It belongs below the last row that sorts before it, not the first.
+        self.assertEqual(where("a", "b", "x", "c", "d"), ['below the row "d"'])
+        # Equal keys are in order, and the row named is never the flagged row's own twin.
+        self.assertEqual(where("b", "a", "a"), ['below the row "a"'])
+        self.assertEqual(where("a", "c", "b", "b"), ['below the row "b"'])
+        self.assertEqual(where("a", "a", "b"), [])
+
+    def test_the_pending_key_drops_a_number_prefix_backticks_and_case(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        self.assertEqual(check.pending_key("#123: The `Foo` change"), "the foo change")
+
+    def test_a_row_the_check_cannot_read_is_reported(self):
+        # The table is out of Prettier, so a row without the usual spacing would skip every check.
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + "|pending|zz|y|\n").split("\n")
+        with mock.patch.object(check, "working_file_lines", return_value=lines):
+            problems = check.release_cell_problems()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("so the check cannot read it", problems[0])
+
+    def test_a_row_indented_before_its_bar_is_reported(self):
+        # #6429: an indented row ends the table, so it and every row below it would skip every check.
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + " " + row("pending", "b")
+                 + row("pending", "c")).split("\n")
+        with mock.patch.object(check, "working_file_lines", return_value=lines):
+            problems = check.release_cell_problems()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("starts with a space before its", problems[0])
+        self.assertIn(f":{lines.index(' ' + row('pending', 'b').rstrip()) + 1}:", problems[0])
+        # Prose after the table, or a blank line, ends it without a report.
+        for tail in ("\nSome prose.\n", "Some prose.\n", "  indented prose\n"):
+            with self.subTest(tail=tail):
+                lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + tail).split("\n")
+                with mock.patch.object(check, "working_file_lines", return_value=lines):
+                    self.assertEqual(check.release_cell_problems(), [])
 
     def test_a_disorder_already_on_main_warns_a_pull_request_that_leaves_the_page_alone(self):
         self.repo.commit("feat: a", row=row("pending", "change a"))
@@ -683,6 +759,70 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
         self.assertIn("labelled pending, but 1.0.0 contains", err)
 
+    def _pending_row_tagged(self, age: int) -> str:
+        """A `pending` row "change p" that 1.0.0, tagged `age` seconds ago, contains; returns its commit."""
+        added = self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.git("tag", "-a", "1.0.0", "-m", "1.0.0", at=int(time.time()) - age)
+        return added
+
+    def test_a_pending_row_a_fresh_release_contains_warns_a_push(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 0)
+        self.assertIn(f'warning: {PAGE}', err)
+        self.assertIn(f"labelled pending, but 1.0.0 contains {added[:12]}", err)
+        self.assertIn("the release job's relabel pull request is expected to relabel them", err)
+
+    def test_a_pending_row_a_release_tagged_past_the_grace_window_contains_fails_a_push(self):
+        self._pending_row_tagged(STALE_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn("Relabel it as 1.0.0.", err)
+
+    def test_a_pull_request_that_touches_a_freshly_shipped_pending_row_fails(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        self.repo.trace(f"{added} change p")  # the pull request edits the row's trace entry
+        self.repo.commit("docs: trace p", code=False)
+        event = Path(self.tmp.name) / "event.json"
+        event.write_text(json.dumps({"pull_request": {"base": {"sha": added}}}), encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request", GITHUB_EVENT_PATH=str(event))
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn("labelled pending, but 1.0.0 contains", err)
+
+    def test_a_merge_group_that_touches_a_freshly_shipped_pending_row_fails(self):
+        added = self._pending_row_tagged(FRESH_TAG_AGE)
+        self.repo.trace(f"{added} change p")
+        self.repo.commit("docs: trace p", code=False)
+        event = Path(self.tmp.name) / "event.json"
+        event.write_text(json.dumps({"merge_group": {"base_sha": added}}), encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="merge_group", GITHUB_EVENT_PATH=str(event))
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+
+    def test_a_graced_row_does_not_hide_a_wrong_label_on_another_row(self):
+        self.repo.mislabel()  # "change b", labelled 1.0.0, which 1.0.0 does not contain
+        added = self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.git("tag", "-a", "1.1.0", "-m", "1.1.0", at=int(time.time()) - FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f'warning: {PAGE}:', err)
+        self.assertIn(f"labelled pending, but 1.1.0 contains {added[:12]}", err)
+        failures = [line for line in err.splitlines() if not line.startswith("warning:")]
+        self.assertTrue(any('the row "change b" is labelled 1.0.0, but 1.0.0 does not contain' in line
+                            for line in failures))
+        self.assertFalse(any("change p" in line for line in failures))
+
+    def test_a_wrong_release_label_gets_no_grace(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("fix: b", row=row("1.0.0", "change b"))
+        self.repo.git("tag", "-a", "1.0.0", "-m", "1.0.0", base, at=int(time.time()) - FRESH_TAG_AGE)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        self.assertIn('the row "change b" is labelled 1.0.0, but 1.0.0 does not contain', err)
+
     def test_a_relabelled_row_passes(self):
         base = self.repo.commit("feat: before the branch point")
         self.repo.commit("fix: b", row=row("1.0.0", "change b"))
@@ -870,7 +1010,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
         self.assertEqual(code, 0)
         self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
-        self.assertIn("main's push run fails until a pull request relabels them", err)
+        self.assertIn("main's push run fails until a pull request relabels them (pending rows once their release is 48 hours old)", err)
 
     def test_a_push_to_main_fails_on_a_wrong_label(self):
         head = self.repo.mislabel()

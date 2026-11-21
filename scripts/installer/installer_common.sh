@@ -131,6 +131,7 @@ readonly GATEWAY_HOME_CHANNEL_SLACK_PLATFORM="Slack"
 # `helm get notes` is the command that does.
 readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
 readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_SCHEMA_FILE="values.schema.json"
 readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
 readonly FOOTPRINT_PROBE_KEY="summary"
 readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
@@ -336,6 +337,11 @@ readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
 # slack_home_channel_policy validation holds the same three values.
 readonly SLACK_HOME_CHANNEL_POLICY_AUTO="auto"
 readonly SLACK_HOME_CHANNEL_POLICY_MANUAL="manual"
+# spec.integration.googleChat.homeChannelPolicy takes the same two values on
+# the same terms; Terraform's google_chat_home_channel_policy validation holds
+# the same three.
+readonly GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO="$SLACK_HOME_CHANNEL_POLICY_AUTO"
+readonly GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL="$SLACK_HOME_CHANNEL_POLICY_MANUAL"
 # The prefix of a Google Chat space's resource name, the only home channel
 # form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
 # The gateway and the operator hold the same rule; keep the three in step
@@ -982,7 +988,8 @@ tfvars_scalar() {
 # Renders the chart's footprint summary for the install terraform.tfvars
 # describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
 # $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
-# the chart is not in the checkout, or the render refuses; the caller decides
+# the chart is not in the checkout, a step of the probe chart's build fails
+# (the probe directory is removed), or the render refuses; the caller decides
 # whether that is worth more than a warning.
 render_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
@@ -1000,14 +1007,15 @@ render_footprint_summary() {
   # only template beside the probe. values.schema.json comes too, so a value
   # the chart would refuse is refused here as well.
   cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
-  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  [ ! -f "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" ] || cp "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
   cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
-  mkdir -p "$probe_dir/templates"
-  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  mkdir -p "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE%/*}" || { rm -rf "$probe_dir"; return 1; }
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}" || { rm -rf "$probe_dir"; return 1; }
   # A ConfigMap, so the output is one YAML document helm's manifest sorter
   # reads; the block scalar keeps the summary's lines as they are.
   printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
-    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}" \
+    || { rm -rf "$probe_dir"; return 1; }
   local -a set_args=()
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue
@@ -1386,11 +1394,11 @@ gateway_home_channel_unset_key() {
 # four arguments. Google Chat first, as the agent picks where home posts go
 # (chat_notify.routed_platforms). A Chat home counts only as a space name, and
 # a Slack home only as a channel id: the gateway arms no route for anything
-# else (the operator's slackChannelID). It cannot see a Slack channel
-# the gateway learned from a mention, which only the cluster records: with
-# that channel learned, the warning for Google Chat still says the gateway
-# keeps its posts, while the agent sends them to Slack. Called when a key is
-# unset, so the platform it prints is the other one.
+# else (the operator's slackChannelID). It cannot see a Slack channel or a
+# Chat space the gateway learned from a mention, which only the cluster
+# records: with one learned, the warning for the other platform still says the
+# gateway keeps its posts, while the agent sends them to the learned home.
+# Called when a key is unset, so the platform it prints is the other one.
 gateway_home_channel_set_platform() {
   local home
   if google_chat_moves_to_a2a_gateway "${2:-}"; then
@@ -1432,7 +1440,7 @@ gateway_home_channel_unset_remedy() {
       ;;
     GOOGLE_CHAT_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
-      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space."
+      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space; or, under homeChannelPolicy auto (the default), mention the agent once, top-level, in the named space you want."
       ;;
   esac
 }
@@ -2373,6 +2381,20 @@ require_slack_home_channel_policy() {
   esac
   [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel-policy"
   print_error "SLACK_HOME_CHANNEL_POLICY is '${value}', which is not ${SLACK_HOME_CHANNEL_POLICY_AUTO} or ${SLACK_HOME_CHANNEL_POLICY_MANUAL} (empty means ${SLACK_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.slack.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
+  return 1
+}
+
+# GOOGLE_CHAT_HOME_CHANNEL_POLICY, on require_slack_home_channel_policy's
+# terms: it renders spec.integration.googleChat.homeChannelPolicy, whose CRD
+# enum accepts the same two spellings. $1 the value; $2 is "flags" when
+# install.sh's flag can set it too, so the remedy names it.
+require_google_chat_home_channel_policy() {
+  local value="${1:-}" via="install.env"
+  case "$value" in
+    "" | "$GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO" | "$GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL") return 0 ;;
+  esac
+  [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel-policy"
+  print_error "GOOGLE_CHAT_HOME_CHANNEL_POLICY is '${value}', which is not ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO} or ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL} (empty means ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.googleChat.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
   return 1
 }
 
@@ -5406,6 +5428,7 @@ write_tfvars_from_state() {
   # would name the variable after the interview, or after the Day-2 menu has
   # rewritten install.env. Every route to Terraform passes here.
   require_slack_home_channel_policy "${SLACK_HOME_CHANNEL_POLICY:-}" || return 1
+  require_google_chat_home_channel_policy "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: the chart refuses to render
   # openai_compatible without these, and upgrade.sh regenerates without
   # install.sh's interview.
@@ -5675,6 +5698,7 @@ write_tfvars_from_state() {
     echo "chat_subscription_name    = $(hcl_str "$chat_sub")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"
     echo "google_chat_home_channel  = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+    echo "google_chat_home_channel_policy = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}")"
     echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}")"
     echo ""
     echo "enable_slack            = $(hcl_bool "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}")"
@@ -5749,6 +5773,10 @@ write_tfvars_from_state() {
     # Read from install.env (or the environment) only: no flag or interview
     # question sets it, so install.sh exports nothing over it. See the variable.
     echo "helm_upgrade_install = $(hcl_bool "$helm_upgrade_install")"
+    echo ""
+    # The same: install.env (or the environment) only. Unset, or any spelling
+    # is_truthy does not take, renders false, the stop's default.
+    echo "card_stop_enabled = $(hcl_bool "${CARD_STOP_ENABLED:-}")"
     echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."

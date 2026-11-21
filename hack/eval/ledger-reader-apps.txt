@@ -1,0 +1,35 @@
+# The ledger-reader GitHub Apps the eval runner grades with, one per line:
+# row k is reader App k, counting from 1, which is how the Apps are named
+# (the first is kube-agents-evals-ledger-reader, the second
+# kube-agents-evals-ledger-reader-2) and how the scripts' messages count.
+# Each is a copy of the first with the same grants (docs/ci-pool-projects.md
+# 5.4: contents, issues and pull_requests write, metadata read; grading
+# mints only the four reads), installed on the infrastructure organisation
+# with `selected` repositories: its share of the pool's
+# kube-agents-evals-*-infra repositories, ten projects per App in number
+# order (LEDGER_READER_SHARD_SIZE in hack/ci-eval-pr.sh): row 1 holds
+# kube-agents-evals (number 1) through kube-agents-evals-10, row 2 holds
+# -11 through -20, and so on, so no table maps projects to Apps:
+# hack/ci-eval-pr.sh mints from the shard of the project it leased,
+# scripts/verify_ci_pool_project.py checks a project against its shard, and
+# scripts/provision_ci_pool_project.sh names the shard a new project's
+# repository goes to. Splitting the pool this way gives concurrent runs on
+# different projects different hourly budgets (gke-labs/kube-agents#6240).
+#
+# Append only, and append before the first project of a new ten is
+# registered: scripts/test_verify_ci_pool_project.py fails a pull request
+# whose project mapping has a project with no row here, and until the row
+# exists the eval reads such a project through reader App 1 with a warning.
+# Inserting or reordering a line moves every project to another App, and
+# every onboarding check and lease would fail.
+# Prow is to mount one key per line, in the same order (EVAL_LEDGER_APP_KEY_FILES
+# in the kube-agents job configs of oss-test-infra; a line whose key is not
+# mounted yet is read through reader App 1 with a warning); the third column
+# is the build-cluster Secret that holds it, which the verifier reads.
+#
+# <App id> <installation id> <Secret on the build cluster holding its key>
+4739812 157029058 kube-agents-evals-ledger-app-key
+5837324 183792790 kube-agents-evals-ledger-app-key-2
+5837337 183793190 kube-agents-evals-ledger-app-key-3
+5837352 183793636 kube-agents-evals-ledger-app-key-4
+5837495 183793852 kube-agents-evals-ledger-app-key-5

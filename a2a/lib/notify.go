@@ -1,6 +1,9 @@
 package lib
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // The chat.notify wire contract, shared by the gateway that answers it
 // (a2a/gateway/notify.go) and the `a2a notify` command that sends it from the
@@ -94,8 +97,18 @@ type NotifyRequest struct {
 	// ReplyTo, on a request aimed at a conversation, is the id of the
 	// gateway task whose turn filed the work this reports on, when the
 	// sender knows it. Only the console passes it on (its frame's replyTo),
-	// so a console client can join a report to the turn it answers.
+	// so a console client can join a post to the turn it reports on, and
+	// the gateway keeps the post under its root for the reply that names
+	// it (a2a/gateway/reports.go).
 	ReplyTo string `json:"reply_to,omitempty"`
+	// Report marks a conversation post as a card's report: the kanban
+	// notifier sets it on the settled card's report post alone (never on a
+	// progress note, heartbeat, queued or plan line), and the gateway keeps
+	// a post for the reply under it only when it is set: under its task for
+	// a console post, under the thread for a post into a chat thread; the
+	// console frame carries it (report), so a console client offers a
+	// reply under that post alone.
+	Report bool `json:"report,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it
@@ -115,4 +128,57 @@ type NotifyReply struct {
 	// digest it posts once a home channel is set: nothing was posted now, and
 	// a sender that would retry or re-send should treat the post as handled.
 	Kept bool `json:"kept,omitempty"`
+}
+
+// The conversation keys every top-level message of a conversation shares: a
+// Google Chat space with no thread (gchat:space/...), a Google Chat DM with
+// no thread (gchat:dm/... without /threads/), and a Slack DM with no thread
+// (slack:dm/<id>). A report posted under such a key belongs to no one later
+// message, so neither the hermes-bridge's lookup nor the gateway's relay
+// puts it ahead of one.
+const (
+	wholeConversationGchatSpace = "gchat:space/"
+	// GchatDMKeyPrefix begins a Google Chat DM conversation key, and
+	// GchatThreadsSep sits between a space and its thread in one;
+	// SlackDMKeyPrefix begins a Slack DM key. The hermes-bridge's lookup
+	// reads the same shapes (incidentThread).
+	GchatDMKeyPrefix = "gchat:dm/"
+	GchatThreadsSep  = "/threads/"
+	SlackDMKeyPrefix = "slack:dm/"
+)
+
+// WholeConversationKey reports whether key names a conversation every
+// top-level message shares rather than one thread.
+func WholeConversationKey(key string) bool {
+	switch {
+	case strings.HasPrefix(key, wholeConversationGchatSpace):
+		return true
+	case strings.HasPrefix(key, GchatDMKeyPrefix):
+		return !strings.Contains(key[len(GchatDMKeyPrefix):], GchatThreadsSep)
+	case strings.HasPrefix(key, SlackDMKeyPrefix):
+		return !strings.Contains(key[len(SlackDMKeyPrefix):], "/")
+	}
+	return false
+}
+
+// The conversation key prefixes of the chat backends whose key names the
+// thread a message is typed in, so the key alone says which posts a reply
+// is under. A backend whose keys are threads (Teams, when it lands)
+// registers its prefix here; a console or door key is one long conversation
+// and names a report by task instead.
+var threadKeyedPrefixes = []string{"slack:", "gchat:"}
+
+// ThreadKeyedConversation reports whether key names one thread of a chat
+// backend: a thread-keyed prefix, and not a key every top-level message
+// shares (WholeConversationKey).
+func ThreadKeyedConversation(key string) bool {
+	if WholeConversationKey(key) {
+		return false
+	}
+	for _, prefix := range threadKeyedPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }

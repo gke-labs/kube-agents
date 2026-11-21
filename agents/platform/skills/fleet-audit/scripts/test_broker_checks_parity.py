@@ -1,7 +1,9 @@
-"""The credential broker re-checks a no-pdb fix with `automerge_checks` (stdlib
-only, no fleet-audit import); its verdicts and its copies of the audit's scope
-rules must stay the sandbox's own (`pdb_safety.judge`, `collect`)."""
+"""The no-pdb recipe's `checks.py` (stdlib only, no fleet-audit import) is what
+both the credential broker and the sandbox's pre-flight (`fix_preflight`) run.
+Its copies of the audit's scope rules must stay the audit's own (`collect`),
+and the pre-flight, on its own read, must reach the verdicts the broker does."""
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -9,14 +11,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit_report  # puts the shared scripts directory on the path
-import automerge_checks
-import pdb_safety
-from test_pdb_safety import BUDGET_TEXT, finding, ready
+from fix_recipes import registry
+import fix_preflight
+from test_fix_preflight import BUDGET_TEXT, finding, ready
 from test_recheck import CTX, LABELS, NS, FakeRun, deployment, hpa, pdb
 
 
 class BrokerChecksParityTest(unittest.TestCase):
-    ac = automerge_checks
+    ac = registry.checks_module("no-pdb")
 
     def test_the_brokers_copies_of_the_audits_rules_are_the_audits(self):
         import collect
@@ -26,11 +28,57 @@ class BrokerChecksParityTest(unittest.TestCase):
         self.assertEqual(self.ac.BUILTIN_OWNER_GROUPS, collect.BUILTIN_OWNER_GROUPS)
         self.assertEqual(self.ac.BUILTIN_OWNER_KINDS, collect.BUILTIN_OWNER_KINDS)
         self.assertEqual(self.ac.DEFAULT_HPA_MIN_REPLICAS, collect.DEFAULT_HPA_MIN_REPLICAS)
-        self.assertEqual(set(self.ac.READ_KINDS.split(",")), set(pdb_safety.READ.kinds.split(",")))
+        import recheck
+
+        # The re-check's read is a subset of the recipe's, which adds Jobs and CronJobs.
+        self.assertLessEqual(set(recheck.RECHECKS["no-pdb"].kinds.split(",")), set(self.ac.READ_KINDS.split(",")))
         for ns in ("gke-x", "config-management-y", "shop", "asm-x", "istio-x", "anthos-x", "gmp-x", "cnrm-x"):
             self.assertEqual(ns.startswith(self.ac.SYSTEM_NAMESPACE_PREFIXES), collect._is_system_namespace(ns) and ns not in collect.SYSTEM_NAMESPACES)
 
     def test_the_broker_reaches_the_sandboxs_verdicts(self):
+        self.check_cases(self.verdicts_agree)
+
+    def test_the_recipes_copied_rules_reach_the_audits_answers(self):
+        # The independent oracle: `collect`, which the audit itself reads with.
+        self.check_cases(self.rules_agree)
+
+    def verdicts_agree(self, items):
+        sandbox = fix_preflight.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun(items), kube_context=CTX)
+        broker = self.ac.judge({"items": items}, "Deployment/checkout", NS, "checkout-pdb", {"matchLabels": LABELS})
+        self.assertEqual(
+            {c["name"]: c["passed"] for c in broker},
+            {c["name"]: c["passed"] for c in sandbox["checks"]},
+            (broker, sandbox["checks"]),
+        )
+
+    def rules_agree(self, items):
+        import collect
+
+        dump = {"items": items}
+        kept = {(w["kind"], w["name"]) for w in collect.normalize_workloads(dump)}
+        for item in items:
+            if item.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
+                key = (item["kind"], item["metadata"]["name"])
+                self.assertEqual(self.ac.in_scope(item), key in kept, key)
+        recipe_templates = sorted(
+            (i["kind"], i["metadata"]["name"], json.dumps(labels, sort_keys=True))
+            for i in items
+            if (labels := self.ac._pod_template_labels(i)) is not None
+        )
+        audit_templates = sorted(
+            (t["kind"], t["name"], json.dumps(t["labels"], sort_keys=True))
+            for t in collect.pod_templates_by_namespace(dump).get(NS, [])
+        )
+        self.assertEqual(recipe_templates, audit_templates)
+        context = {"hpas": {NS: [i for i in items if i.get("kind") == "HorizontalPodAutoscaler"]}}
+        for workload in collect.normalize_workloads(dump):
+            self.assertIs(
+                self.ac._autoscaler(items, workload["kind"], workload["name"]),
+                collect._hpa_targeting(workload, context),
+                workload["name"],
+            )
+
+    def check_cases(self, check):
         job = {"kind": "Job", "metadata": {"name": "migrate", "namespace": NS},
                "spec": {"template": {"metadata": {"labels": LABELS}}}}
         cron = {"kind": "CronJob", "metadata": {"name": "nightly", "namespace": NS},
@@ -99,21 +147,17 @@ class BrokerChecksParityTest(unittest.TestCase):
         }
         for case, items in cases.items():
             with self.subTest(case=case):
-                sandbox = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun(items), kube_context=CTX)
-                broker = self.ac.judge({"items": items}, "Deployment/checkout", NS, "checkout-pdb", {"matchLabels": LABELS})
-                self.assertEqual(
-                    {c["name"]: c["passed"] for c in broker},
-                    {c["name"]: c["passed"] for c in sandbox["checks"]},
-                    (broker, sandbox["checks"]),
-                )
+                check(items)
 
-    def test_an_unreadable_live_selector_is_stricter_here_on_purpose(self):
+    def test_an_unreadable_live_selector_counts_as_overlapping_for_both(self):
         odd = pdb("odd", labels={"app": "other"})
         odd["spec"]["selector"]["matchExpressions"] = [{"key": "a", "operator": "Bogus"}]
         items = [ready(deployment()), odd]
-        sandbox = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun(items), kube_context=CTX)
+        sandbox = fix_preflight.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun(items), kube_context=CTX)
         broker = self.ac.judge({"items": items}, "Deployment/checkout", NS, "checkout-pdb", {"matchLabels": LABELS})
-        self.assertTrue({c["name"]: c["passed"] for c in sandbox["checks"]}[self.ac.NO_OVERLAPPING_BUDGET])
+        # Stricter than `collect.selector_matches`, which skips the unknown
+        # term: since the pre-flight runs the recipe, the sandbox is too.
+        self.assertFalse({c["name"]: c["passed"] for c in sandbox["checks"]}[self.ac.NO_OVERLAPPING_BUDGET])
         self.assertFalse({c["name"]: c["passed"] for c in broker}[self.ac.NO_OVERLAPPING_BUDGET])
 
 

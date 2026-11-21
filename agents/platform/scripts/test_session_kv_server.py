@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
@@ -1329,6 +1329,46 @@ class TestAlertGoesToTheFirstHomePostPlatform(unittest.TestCase):
         session_kv_server._register_session_routing.assert_called_once()
         self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], "slack")
 
+    # (A2A_NOTIFY_PLATFORM, slack_home, gchat_home, the platform picked): a
+    # configured home before a learned one, Chat before Slack when alike.
+    PICKS = (
+        ("slack", "", "spaces/AAA\n", "slack"),
+        ("google_chat", "C1\n", "", "google_chat"),
+        ("", "C1\n", "spaces/AAA\n", "google_chat"),
+        ("google_chat,slack", "", "", "google_chat"),
+    )
+
+    def _homes(self, listed, slack_file, gchat_file):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = listed
+        self._write_home_file(slack_file)
+        with open(os.path.join(self.dir, chat_notify.GCHAT_HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(gchat_file)
+
+    def test_the_alert_takes_a_configured_home_ahead_of_a_learned_one(self):
+        for listed, slack_file, gchat_file, picked in self.PICKS:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._homes(listed, slack_file, gchat_file)
+                session_kv_server._register_session_routing.reset_mock()
+                thread = "spaces/AAA/threads/T1" if picked == "google_chat" else "1712345678.000100"
+                legs = self._run(lambda argv: session_kv_server.subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": thread}), stderr=""))
+                self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", picked]])
+                self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], picked)
+
+    def test_every_single_destination_reader_takes_the_same_platform(self):
+        # The pick the alert and the drift digest make, and the first platform
+        # the data-volume warning and send_notification try.
+        import chat_platforms
+        for listed, slack_file, gchat_file, picked in self.PICKS:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._homes(listed, slack_file, gchat_file)
+                platforms = session_kv_server.enabled_chat_platforms()
+                self.assertEqual(platforms, chat_notify.routed_platforms())
+                self.assertEqual(session_kv_server.get_active_platform(platforms), picked)
+                with patch.object(chat_platforms, "MANAGED_CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+                     patch.object(chat_platforms, "CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"):
+                    self.assertEqual(chat_platforms.enabled_chat_platforms()[0], picked)
+
     def test_with_no_home_the_alert_goes_to_chat_and_is_kept(self):
         self._write_home_file("")
 
@@ -1456,6 +1496,8 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/tasks/t-1", None),
         ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
         ("GET", "/v1/sessions/sess-1/origin", None),
+        ("PUT", "/v1/sessions/sess-1/eval-run", {"eval_run": "devops-bench-abc/case-a/1"}),
+        ("GET", "/v1/sessions/sess-1/eval-run", None),
         ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
@@ -8829,6 +8871,78 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         )
         self.assertEqual(polled["next_since_id"], polled["events"][-1]["id"])
 
+    def _ledger_row_aged(self, session_id, hours_ago):
+        """One suppressed row, dated `hours_ago` back in the ledger's own clock."""
+        row_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1", namespace="prod", workload=session_id, object_uid=session_id,
+            object_kind="Pod", reason="BackOff", message="m", severity="Warning",
+            occurrences=1, notified=False, session_id=session_id,
+        )
+        with closing_db() as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE id = ?",
+                (f"-{hours_ago} hours", row_id),
+            )
+            conn.commit()
+        return row_id
+
+    def test_intercepted_events_since_filters_the_newest_first_page(self):
+        for session_id, hours_ago in (("old-a", 72), ("old-b", 48), ("new-c", 1), ("new-d", 0)):
+            self._ledger_row_aged(session_id, hours_ago)
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+        page = self.client.get(f"/v1/intercepted-events?since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in page["events"]], ["new-d"])
+        # `truncated` counts the window's rows only: one more inside it, two outside.
+        self.assertTrue(page["truncated"])
+        full = self.client.get(f"/v1/intercepted-events?since={since}&limit=10").json()
+        self.assertEqual([e["session_id"] for e in full["events"]], ["new-d", "new-c"])
+        self.assertFalse(full["truncated"])
+        self.assertEqual(full["next_since_id"], full["events"][0]["id"])
+        # Without `since` the page is what it always was.
+        self.assertEqual(len(self.client.get("/v1/intercepted-events?limit=10").json()["events"]), 4)
+
+    def test_intercepted_events_since_filters_the_cursor_page(self):
+        ids = {}
+        for session_id, hours_ago in (("old-a", 72), ("old-b", 48), ("new-c", 1), ("new-d", 0)):
+            ids[session_id] = self._ledger_row_aged(session_id, hours_ago)
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+        first = self.client.get(f"/v1/intercepted-events?since_id=0&since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in first["events"]], ["new-c"])
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["next_since_id"], ids["new-c"])
+        rest = self.client.get(f"/v1/intercepted-events?since_id={first['next_since_id']}&since={since}&limit=1").json()
+        self.assertEqual([e["session_id"] for e in rest["events"]], ["new-d"])
+        self.assertFalse(rest["truncated"])
+        # An empty filtered page keeps the cursor where it was.
+        none = self.client.get(f"/v1/intercepted-events?since_id={ids['new-d']}&since={since}").json()
+        self.assertEqual(none, {"events": [], "truncated": False, "next_since_id": ids["new-d"]})
+        # Without `since` the cursor walk starts at the oldest row, as before.
+        self.assertEqual(
+            self.client.get("/v1/intercepted-events?since_id=0&limit=1").json()["events"][0]["session_id"], "old-a"
+        )
+
+    def test_intercepted_events_unpadded_since_is_normalised_before_the_compare(self):
+        """`strptime` takes `9:00:00`; the string compare against zero-padded `created_at`
+        would not (`'12' < '9:'`), so the route re-renders `since` before binding it."""
+        row_id = self._ledger_row_aged("noon", 0)
+        with closing_db() as conn:
+            conn.execute("UPDATE intercepted_events SET created_at = '2026-01-01 12:00:00' WHERE id = ?", (row_id,))
+            conn.commit()
+        for since in ("2026-01-01 9:00:00", "2026-01-01 09:00:00"):
+            with self.subTest(since=since):
+                page = self.client.get("/v1/intercepted-events", params={"since": since}).json()
+                self.assertEqual([e["session_id"] for e in page["events"]], ["noon"])
+
+    def test_intercepted_events_bad_since_is_a_400(self):
+        for bad in ("yesterday", "2026-11-16T00:00:00Z", "2026-11-16", "2026-13-01 00:00:00"):
+            with self.subTest(bad=bad):
+                response = self.client.get(f"/v1/intercepted-events?since={bad}")
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("YYYY-MM-DD HH:MM:SS", response.json()["detail"])
+        self.assertEqual(self.client.get("/v1/intercepted-events?since=2026-11-16 00:00:00").status_code, 200)
+
     def test_kanban_task_feeds_and_detail(self):
         # Before kanban.db exists: empty list feed with board=False, 404 on detail
         empty_sess = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
@@ -8879,6 +8993,19 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         self.assertEqual(len(detail["events"]), 1)
         self.assertEqual(len(detail["comments"]), 1)
         self.assertEqual(self.client.get("/v1/tasks/no-such-task").status_code, 404)
+
+    def test_init_db_adds_changed_paths_to_an_existing_post_merge_records(self):
+        import sqlite3
+
+        legacy_db = self.root / "legacy_post_merge.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute("CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, repo TEXT, number INTEGER)")
+            conn.execute("INSERT INTO post_merge_records VALUES ('u', 'r', 1)")
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(legacy_db)):
+            session_kv_server.init_db()
+            session_kv_server.init_db()
+        with sqlite3.connect(legacy_db) as conn:
+            self.assertEqual(conn.execute("SELECT url, changed_paths FROM post_merge_records").fetchall(), [("u", None)])
 
     def test_init_db_adds_session_id_column_idempotently_to_legacy_ledger(self):
         import sqlite3
@@ -9930,6 +10057,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             # another tool's token printer, and another language's print of its environment (#5803)
             "gh auth token",
             "kubectl create token builder",
+            # forms that the rule's second read withholds
+            "find . -exec true \\; -exec env \\;",
+            "env$(true)",
             "python3 -c 'import os; print(os.environ)'",
         ]
         served = [
@@ -12810,6 +12940,26 @@ class TestDriftBacklog(unittest.TestCase):
         self.addCleanup(enabled.stop)
         self.addCleanup(off.stop)
 
+    def test_the_digest_takes_a_configured_home_ahead_of_a_learned_one(self):
+        # Slack's home on the CR, Chat's only learned: the digest goes to Slack.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        with open(os.path.join(directory, chat_notify.GCHAT_HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write("spaces/AAA\n")
+        with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write("")
+        self._burst()
+        sent = []
+        with patch.object(chat_notify, "HOME_FILE_DIR", directory), \
+             patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "slack",
+                                     chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack"}), \
+             patch.object(session_kv_server, "MANAGED_CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+             patch.object(session_kv_server, "CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"), \
+             patch.object(session_kv_server, "_send_drift_backlog_digest",
+                          side_effect=lambda platform, _message: sent.append(platform) or True):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual(sent, ["slack"])
+
     def test_one_digest_names_the_count_and_the_principals(self):
         self._chat()
         for i in range(7):
@@ -14312,6 +14462,62 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
             self.assertIsNone(os.environ.get(self.LIMIT))
 
 
+class TestSessionEvalRun(unittest.TestCase):
+    """The session's eval run tag (deploy/docker/patches/eval_run_tag.py): first write wins, read through compression."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS session_eval_runs")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_no_table_reads_as_no_tag(self):
+        self.assertEqual(self.client.get("/v1/sessions/ev-none/eval-run").status_code, 404)
+
+    def test_the_first_write_wins(self):
+        first = self.client.put("/v1/sessions/ev-1/eval-run", json={"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put("/v1/sessions/ev-1/eval-run", json={"eval_run": "devops-bench-bb/case-b/2"})
+        self.assertEqual(second.json(), {"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(self.client.get("/v1/sessions/ev-1/eval-run").json(), {"eval_run": "devops-bench-aa/case-a/1"})
+
+    def test_a_malformed_tag_is_refused(self):
+        for bad in ("", "no-slashes", "a/b/c", "a/b/1\nX: y", 7, None):
+            response = self.client.put("/v1/sessions/ev-bad/eval-run", json={"eval_run": bad})
+            self.assertEqual(response.status_code, 400, bad)
+        self.assertEqual(self.client.get("/v1/sessions/ev-bad/eval-run").status_code, 404)
+
+    def test_the_session_metadata_row_is_not_touched(self):
+        self.client.put("/v1/sessions/ev-meta/eval-run", json={"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(session_kv_server._session_metadata("ev-meta"), {})
+
+    def test_a_compressed_child_reads_its_parents_tag(self):
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('ev-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('ev-child', 'ev-root', NULL);
+                INSERT INTO sessions VALUES ('ev-other', 'ev-lone', NULL);
+                INSERT INTO sessions VALUES ('ev-lone', NULL, 'user_exit');
+                """
+            )
+        self.client.put("/v1/sessions/ev-root/eval-run", json={"eval_run": "devops-bench-aa/case-a/3"})
+        self.client.put("/v1/sessions/ev-lone/eval-run", json={"eval_run": "devops-bench-aa/case-b/1"})
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            child = self.client.get("/v1/sessions/ev-child/eval-run")
+            self.assertEqual(child.json(), {"eval_run": "devops-bench-aa/case-a/3"})
+            # A parent that did not end in compression is another conversation.
+            self.assertEqual(self.client.get("/v1/sessions/ev-other/eval-run").status_code, 404)
+
+
 class TestProposalOrigin(unittest.TestCase):
     """The origin record, the per-job origin table and the proposals ledger: docs/designs/proposal-origin.md §2.1-§2.2."""
 
@@ -14549,6 +14755,7 @@ class TestProposalOrigin(unittest.TestCase):
                        "followup_state", "followup_attempts", "followup_detail"):
             self.assertIn(column, row)
         self.assertIsNone(row["outcome"])
+        self.assertIsNone(row["environment"])
 
     def test_post_merge_record_leaves_project_empty_for_an_unknown_or_ambiguous_cluster(self):
         import sqlite3
@@ -14624,7 +14831,8 @@ class TestProposalOrigin(unittest.TestCase):
         )
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
-        self.assertEqual(set(plugin.POST_MERGE_KINDS), set(session_kv_server.POST_MERGE_KINDS))
+        self.assertEqual(plugin.post_merge_kinds(), frozenset(session_kv_server.POST_MERGE_KINDS))
+        self.assertIn("no-pdb", session_kv_server.POST_MERGE_KINDS)
         self.assertEqual(plugin.POST_MERGE_PATH, "/v1/post-merge/records")
 
     def test_post_merge_record_refuses_what_is_not_a_known_fix_pull_request(self):
