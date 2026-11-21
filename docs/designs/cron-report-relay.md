@@ -217,6 +217,16 @@ it unblocks or archives the row's cards through session-kv's `POST /v1/board/act
 edits the row
 ([the job's section](../../agents/platform/cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)).
 
+`findings-morning-nudge`'s report gets a card the same way: `findings_nudge.py` leaves the card
+beside its record, and `_load_findings_nudge_card` reads it (`findings_nudge_card.load`) only when
+its text is the report being relayed and the report was not truncated. With the flag on and a
+channel known (or the leg routed through the gateway), `_post_findings_nudge_card` posts it as
+Block Kit through the relay or as a chat message through the gateway, and the report goes out as
+text where the card does not post. What is stored against the thread is the card's
+`thread_context`, the report's text followed by the ids of the findings it names, which the
+message itself does not print, on every leg that lands, card or text; a truncated report, or one
+whose card file is missing, unreadable or for another report, stores the text alone.
+
 ## Why no agent turn runs over the report
 
 The relay first ran one Chat Agent turn over each report, told to reproduce it

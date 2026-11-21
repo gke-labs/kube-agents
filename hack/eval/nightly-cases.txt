@@ -599,8 +599,8 @@
 # noop, transcript-only.
 ./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
 
-# The findings queue's item-wide decision: the user dismisses the one id the
-# nudge names for a gathered line, and every row of that line has to end up
+# The findings queue's item-wide decision: the user dismisses one id of a
+# line the nudge gathered, and every row of that line has to end up
 # dismissed while the line beside it stays open. prebuilt/findings-item plants
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.

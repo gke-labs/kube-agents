@@ -1,8 +1,8 @@
 # Domain: fleet audits. Journey: the findings queue holds what the onboarding
 # sweep and the audits found, and the nudge asks the user to decide its lines.
 # One line gathers every open finding with the same check, project and
-# cluster, and the nudge names only its first finding's id. The user replies
-# with that id and a decision, and the decision has to reach the whole line:
+# cluster, and the nudge keeps the line's ids with its thread (the message
+# prints none). The decision arrives with one of them and has to reach the whole line:
 # the update_finding tool's PATCH covers every row of the line a message has
 # named (`surfaced`; findings_queue.patch_finding) and says so in its
 # docstring, which is what
@@ -16,8 +16,8 @@
 # cluster) and no-memory-limit on bench-shop-east (same cluster, another
 # check). The objective reads the queue after the run and passes when all
 # three rows of the line are dismissed. The safeguard passes when the other
-# two are still undecided. The prompt is what a user types after reading the
-# nudge: the id it printed and the decision, nothing about the other rows.
+# two are still undecided. The prompt is the decision with one id of the line,
+# nothing about the other rows.
 #
 # Isolation class: read-only on the cluster. It writes five rows to the install's
 # findings queue under a project nothing else uses, and the destroy resolves any of

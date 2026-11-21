@@ -41,6 +41,7 @@ import clean_merges
 import dial_state
 from fix_recipes import registry as fix_recipes_registry
 import cron_schedule
+import findings_nudge_card
 import findings_queue
 import gitops_workspace
 import kanban_board_health
@@ -5614,7 +5615,8 @@ def _ensure_session_row(session_id: str, profile: str, job_id: str, title: str =
 
 
 def _store_incident_report(chat_id: str, thread_id: str, report: str) -> None:
-    """Persist the delivered text so a reply in this thread carries it back.
+    """Persist the delivered text so a reply in this thread carries it back
+    (for the findings nudge, the text and the finding ids it does not print).
 
     This is the half of the mechanism that makes the Chat Agent context-aware
     about something it did not investigate. `incident_context`
@@ -6118,6 +6120,24 @@ def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) ->
         return None
 
 
+def _post_sidecar_card(
+    platform: str,
+    profile: str,
+    job_id: str,
+    card: dict,
+    card_module: Any,
+    chat_id: str,
+    thread_id: str,
+    deadline: float,
+) -> AuditPost | None:
+    """Post a sidecar cron card through the gateway or Slack relay; None to fall back to text."""
+    routed = chat_notify.routes(platform)
+    if not (routed or slack_blocks_post.configured()):
+        return None
+    built = card_module.chat_from_card(card) if routed else card_module.blocks_from_card(card)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
 def _post_board_health_card(
     platform: str, profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
@@ -6126,11 +6146,25 @@ def _post_board_health_card(
     Block Kit through the Slack relay, or a chat message through the gateway
     where it holds Slack, with the outcomes of :func:`_post_audit_card`.
     """
-    routed = chat_notify.routes(platform)
-    if not (routed or slack_blocks_post.configured()):
+    return _post_sidecar_card(platform, profile, job_id, card, board_health_card, chat_id, thread_id, deadline)
+
+
+def _load_findings_nudge_card(report: str, job_id: str) -> dict | None:
+    """Load the findings-nudge sidecar matching ``report``, or None when absent or stale."""
+    if job_id != findings_nudge_card.JOB_ID:
         return None
-    built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
-    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
+    try:
+        return findings_nudge_card.load(gitops_workspace.agent_home(), report)
+    except Exception as exc:  # noqa: BLE001 - the report still posts, as text
+        logger.warning(f"Relay for {job_id}: findings-nudge card unreadable, posting text: {exc!r}")
+        return None
+
+
+def _post_findings_nudge_card(
+    platform: str, profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Post the findings-nudge card; where it landed, or None to post the report as text."""
+    return _post_sidecar_card(platform, profile, job_id, card, findings_nudge_card, chat_id, thread_id, deadline)
 
 
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
@@ -6618,6 +6652,7 @@ def relay_cron_report(
     # Legs whose Block Kit post landed with no ts to thread under: delivered,
     # with nothing to register.
     unthreaded: list[str] = []
+    nudge = None if truncation_notice else _load_findings_nudge_card(report, job_id)
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
         try:
@@ -6638,6 +6673,10 @@ def relay_cron_report(
             # where it does not post, the report goes out as written.
             posted = _post_board_health_card(
                 platform, profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
+            )
+        elif nudge is not None and _card_platform(platform, leg_chat_id):
+            posted = _post_findings_nudge_card(
+                platform, profile, job_id, nudge, leg_chat_id, leg_thread_id, blocks_deadline
             )
         elif headline and not truncation_notice:
             posted = _post_audit_blocks(
@@ -6739,10 +6778,11 @@ def relay_cron_report(
     # so writing those rows would overwrite each channel's stored context with a
     # report it never received and drop the one still on its screen.
     registered = _lookup_platform_threads(session_id)
+    stored_report = findings_nudge_card.thread_context(nudge, message) if nudge is not None else message
     for platform in threads:
         entry = registered.get(platform)
         if entry:
-            _store_incident_report(entry[0], entry[1], message)
+            _store_incident_report(entry[0], entry[1], stored_report)
 
     logger.info(
         f"Relayed {profile}/{job_id} report to {', '.join(threads)} "

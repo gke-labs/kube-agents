@@ -6649,6 +6649,149 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(self.posts, [])
         self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+
+
+class TestFindingsNudgeCardRelay(unittest.TestCase):
+    """The findings-morning-nudge cron relay posts its cards and stores hidden thread metadata."""
+
+    SLACK_THREAD = "1712345678.000100"
+    HOME = "C0123456789"
+    BLOCKS_TS = "1712345999.000200"
+    REPORT = (
+        "2 critical issues will block cluster upgrades · 4 open across 2 clusters\n\n"
+        "- critical · kube-system/istiod on prod-central — PodDisruptionBudget blocks drain. "
+        "Allow at least 1 disruption.\n"
+        "- critical · gke-pool-1 on prod-central — Orphan Node has no backing VM. "
+        "Delete the orphan Node object.\n\n"
+        "2 more issues are queued (1 critical, 1 lower priority)."
+    )
+    HIDDEN_CONTEXT = (
+        REPORT
+        + "\n\n[Queued item metadata for thread replies]\n"
+        + "1. [reminder] id=urr-pdb.1 members=urr-pdb.1 location=proj/prod-central/kube-system/istiod covers=1 unreported=0"
+    )
+    CARD = {
+        "version": 1,
+        "text": REPORT,
+        "thread_context": HIDDEN_CONTEXT,
+        "headline": "2 critical issues will block cluster upgrades",
+        "note": "· 4 open across 2 clusters",
+        "tone": "critical",
+        "rows": [
+            {
+                "severity": "critical",
+                "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain",
+                "detail": "Allow at least 1 disruption.",
+            },
+            {
+                "severity": "critical",
+                "text": "**gke-pool-1** on `prod-central` — Orphan Node has no backing VM",
+                "detail": "Delete the orphan Node object.",
+            },
+        ],
+        "after": ["2 more issues are queued (1 critical, 1 lower priority)."],
+        "fold": {
+            "title": "Queue breakdown (2 more queued)",
+            "table": {
+                "columns": ["Cluster", "Critical", "Major", "Lower", "Next queued issue"],
+                "rows": [
+                    ["prod-central", "1", "0", "0", "billing/worker: mounts static key"],
+                    ["staging-east", "0", "1", "0", "ledger: missing ResourceQuota"],
+                ],
+            },
+        },
+        "choices": ["Fix first issue", "See all 4 items"],
+        "replies": {"Fix first issue": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain"},
+        "links": [["Open backlog", "https://github.com/acme/ops/issues/9"]],
+    }
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + (
+            "KAGE_SLACK_UX",
+            "SLACK_RELAY_URL",
+            "A2A_NOTIFY_PLATFORM",
+            "FINDINGS_NUDGE_HOME",
+        ):
+            os.environ.pop(key, None)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        os.environ["SLACK_HOME_CHANNEL"] = self.HOME
+        os.environ["KAGE_SLACK_UX"] = "1"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        profile = Path(tmp.name, "profiles", "platform")
+        profile.mkdir(parents=True)
+        os.environ["PLATFORM_AGENT_HOME"] = tmp.name
+        session_kv_server.findings_nudge_card.save(
+            session_kv_server.findings_nudge_card.card_path(profile),
+            self.CARD,
+        )
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+
+    def _post(self, report=REPORT, platforms=("slack",), job_id="findings-morning-nudge", blocks_post=None):
+        answers = {"slack": self.SLACK_THREAD, "google_chat": "spaces/AAA/threads/T1"}
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            return answers[platform]
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post("/v1/cron-reports", json={"job_id": job_id, "report": report})
+        self.posts = poster.call_args_list
+        return response, sender.call_args_list
+
+    def _stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
+
+    def test_slack_relay_posts_blocks_with_collapsible_table_and_stores_hidden_context(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        (args, _kwargs), = [(c.args, c.kwargs) for c in self.posts]
+        channel, text, blocks, _thread = args
+        self.assertEqual((channel, text), (self.HOME, self.REPORT))
+        self.assertNotIn("urr-pdb.1", json.dumps(blocks))
+        self.assertIn("container", [b["type"] for b in blocks])
+        # Hidden finding IDs are stored in incidents for thread replies, never in visible chat.
+        self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.HIDDEN_CONTEXT)])
+
+    def test_gateway_route_posts_v1_chat_message_on_slack_and_google_chat(self):
+        for platform, thread in (("slack", "7.7"), ("google_chat", "spaces/H/threads/T")):
+            with self.subTest(platform=platform):
+                os.environ["A2A_NOTIFY_PLATFORM"] = platform
+                with patch.object(
+                    session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost(thread)
+                ) as via:
+                    response, calls = self._post(platforms=(platform,))
+                self.assertEqual(response.json()["status"], "delivered")
+                self.assertEqual(calls, [])
+                chat, text = via.call_args.args[3:5]
+                self.assertEqual(chat["schema"], "kube-agents.chat/v1")
+                self.assertEqual(chat["tone"], "critical")
+                self.assertEqual(chat["fold"]["title"], "Queue breakdown (2 more queued)")
+                self.assertEqual([c["text"] for c in chat["choices"]], ["Fix first issue", "See all 4 items"])
+                self.assertEqual(text, self.REPORT)
+                self.assertNotIn("urr-pdb.1", json.dumps(chat))
+
+    def test_text_fallback_still_stores_hidden_thread_context_when_ux_flag_is_off(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
+        _, calls = self._post()
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.HIDDEN_CONTEXT)])
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 

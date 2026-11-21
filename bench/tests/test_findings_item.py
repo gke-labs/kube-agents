@@ -212,7 +212,7 @@ def _verify(name: str, timeout: float = 0.0, task: Path = TASK):
 
 
 def _named_id() -> str:
-    """The id in the prompt: the one the nudge prints for the gathered line."""
+    """The id in the prompt: one id of the line the nudge gathers."""
     return _check("line-dismissed")["finding_ids"][0]
 
 

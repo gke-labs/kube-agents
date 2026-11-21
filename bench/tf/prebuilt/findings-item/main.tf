@@ -19,7 +19,7 @@
 # resolve them again on destroy.
 #
 # In findings.json, three rows share check, project and cluster, so they are one
-# gathered line of the nudge's message, which names only the first of them by id.
+# gathered line of the nudge's message; the prompt names the id of only one of them.
 # The other two share the project and differ in cluster or in check, so they are
 # lines of their own, and a decision on the first line must leave them alone.
 # findings-unnamed.json has the same shape under its own project, with a fourth

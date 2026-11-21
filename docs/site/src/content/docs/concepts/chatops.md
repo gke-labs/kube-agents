@@ -139,7 +139,7 @@ A scheduled brief posts flat in that channel, never inside a thread. A job that 
 
 ### Reactions
 
-The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report and fleet-audit reports into cards, and changes how the harness's own messages read on Slack (below).
+The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report, fleet-audit reports and the findings nudge into cards, and changes how the harness's own messages read on Slack (below).
 
 To turn the flag off, set `KAGE_SLACK_UX=false` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`); an install that never set it has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
 
@@ -359,7 +359,7 @@ A task that fails posts `❌ failed — <why>`, in plain words, or `❌ failed: 
 
 On Google Chat, the agent's answer is one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask, and each alert or report the agent posts on its own, ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)).
 
-A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
+A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report, the findings nudge and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
 
 A first sentence longer than 150 characters is cut at a clause, as on Slack, or at a word when no clause fits. The bold line then ends in "…" and the detail opens on one, so no word of it is lost. The same cut holds on Slack.
 
