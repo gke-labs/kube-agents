@@ -170,7 +170,7 @@ func TestAHealFindsATerminalAStragglerHides(t *testing.T) {
 		}
 		drainRelayDurable(t, r.url)
 	})
-	if p, err := r2.g.probeTask(ctx, targetPlatform, f.kids[0].ID); err != nil || p.final {
+	if p, err := probeOf(t, r2, targetPlatform, f.kids[0].ID); err != nil || p.final {
 		t.Fatalf("probe of the straggled child = %+v, %v; the test needs it to read as running", p, err)
 	}
 	healed := func() bool {
@@ -261,7 +261,7 @@ func TestTheProbeAgreesWithTheReplay(t *testing.T) {
 		for _, step := range c.steps {
 			step(id)
 		}
-		p, err := r.g.probeTask(ctx, addr, id)
+		p, err := probeOf(t, r, addr, id)
 		if err != nil {
 			t.Fatalf("%s: probe: %v", c.name, err)
 		}
@@ -273,7 +273,108 @@ func TestTheProbeAgreesWithTheReplay(t *testing.T) {
 			t.Errorf("%s: probe = %+v, replay = state %s final %v", c.name, p, task.State, task.Final)
 		}
 	}
-	if p, err := r.g.probeTask(ctx, addr, "task-probe-none"); err != nil || !p.empty || p.final {
+	if p, err := probeOf(t, r, addr, "task-probe-none"); err != nil || !p.empty || p.final {
 		t.Errorf("a task with nothing on its stream: probe = %+v, %v; want empty", p, err)
+	}
+}
+
+// probeOf probes a task on its own stream handle.
+func probeOf(t *testing.T, r *rig, addressee, taskID string) (taskProbe, error) {
+	t.Helper()
+	stream, err := r.g.tasksStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r.g.probeTask(context.Background(), stream, addressee, taskID)
+}
+
+// rawPublish publishes env on subject past the client's own subject check, as
+// a misbehaving writer could.
+func rawPublish(t *testing.T, r *rig, subject string, env *lib.Envelope) {
+	t.Helper()
+	nc, err := connectTest(r.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	data, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.Publish(subject, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The probe screens each envelope as the replay does: a terminal the fold
+// drops (here, a supervisor-subject terminal written by the executor) is no
+// terminal to the probe either, and a status that leaves the payload's
+// taskId out still counts, as the fold counts it.
+func TestTheProbeScreensAsTheReplayDoes(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	const addr = "tse"
+	forged := "task-probe-forged"
+	probeStatus(t, r, lib.TaskEventsSubject(addr, forged), addr, forged, lib.StateWorking, false)
+	payload, _ := json.Marshal(lib.StatusUpdate{TaskID: forged, Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: addr, AgentType: "test-executor"}, forged, "ctx-probe", "corr-probe", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawPublish(t, r, lib.TaskSupervisorSubject(addr, forged), env)
+	p, err := probeOf(t, r, addr, forged)
+	task, _, _, rerr := r.bus.TasksGetTerminal(ctx, addr, forged)
+	if err != nil || rerr != nil || p.final != task.Final || p.state != task.State {
+		t.Fatalf("a terminal the fold drops: probe = %+v (%v), replay = %s final %v (%v)", p, err, task.State, task.Final, rerr)
+	}
+	bare := "task-probe-bare"
+	payload, _ = json.Marshal(lib.StatusUpdate{Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true})
+	env, err = lib.NewStatusUpdateEnvelope(lib.Party{Session: addr, AgentType: "test-executor"}, bare, "ctx-probe", "corr-probe", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskEventsSubject(addr, bare), env); err != nil {
+		t.Fatal(err)
+	}
+	p, err = probeOf(t, r, addr, bare)
+	task, _, _, rerr = r.bus.TasksGetTerminal(ctx, addr, bare)
+	if err != nil || rerr != nil || !p.final || p.state != task.State || !task.Final {
+		t.Fatalf("a terminal with no payload taskId: probe = %+v (%v), replay = %s final %v (%v)", p, err, task.State, task.Final, rerr)
+	}
+}
+
+// The spot check reaches each running child in turn even as the running set
+// shrinks between passes, and forgets the parent once none runs.
+func TestTheSpotCheckReachesEachRunningChildInTurn(t *testing.T) {
+	t.Parallel()
+	g := &Gateway{}
+	kids := func(ids ...string) []TaskRef {
+		var out []TaskRef
+		for _, id := range ids {
+			out = append(out, TaskRef{ID: id})
+		}
+		return out
+	}
+	var got []string
+	for _, running := range [][]TaskRef{kids("a", "b", "c", "d"), kids("b", "c", "d"), kids("b", "d"), kids("b", "d")} {
+		k, ok := g.nextFanOutSpotCheck("p", running)
+		if !ok {
+			t.Fatal("no child chosen from a running set")
+		}
+		got = append(got, k.ID)
+	}
+	if want := []string{"a", "b", "d", "b"}; !slices.Equal(got, want) {
+		t.Fatalf("spot checks = %v, want %v (each running child reached in turn)", got, want)
+	}
+	if _, ok := g.nextFanOutSpotCheck("p", nil); ok {
+		t.Fatal("a child chosen with none running")
+	}
+	if _, kept := g.fanOutSpotChecks["p"]; kept {
+		t.Fatal("the parent's place was kept with no child running")
 	}
 }

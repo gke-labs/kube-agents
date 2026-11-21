@@ -560,56 +560,51 @@ type taskProbe struct {
 // per child (#6646). Only a terminal needs the full replay, for its folded
 // final message, and the caller makes that read for those children alone.
 // An error is the read failing, not the subjects being empty.
-func (g *Gateway) probeTask(ctx context.Context, addressee, taskID string) (taskProbe, error) {
-	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
-	if err != nil {
-		return taskProbe{}, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
-	}
+func (g *Gateway) probeTask(ctx context.Context, stream jetstream.Stream, addressee, taskID string) (taskProbe, error) {
 	p := taskProbe{empty: true, state: lib.StateWorking}
 	var newest, finalSeq uint64
 	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
-		msg, err := stream.GetLastMsgForSubject(ctx, subject)
-		if errors.Is(err, jetstream.ErrMsgNotFound) {
-			continue
-		}
+		// Screened as the replay screens each envelope (LastEnvelopeOn), so
+		// an envelope the fold drops is dropped here too.
+		env, seq, err := g.client.LastEnvelopeOn(ctx, stream, subject)
 		if err != nil {
-			return taskProbe{}, fmt.Errorf("newest message on %s: %w", subject, err)
+			return taskProbe{}, err
+		}
+		if seq == 0 {
+			continue // nothing on this subject
 		}
 		p.empty = false
-		status, ok := statusOf(msg.Data)
-		if !ok {
+		if env == nil || env.Kind != lib.KindStatusUpdate {
 			continue
 		}
-		if status.TaskID != taskID {
-			continue // not this task's status, whatever subject it was published on
+		var status lib.StatusUpdate
+		if json.Unmarshal(env.Payload, &status) != nil {
+			continue
 		}
 		if status.Final {
 			// Two terminals (an executor's and a supervisor's that raced
 			// it): the first in stream order is the task's, as the fold has
 			// it, and the later one its post-final drop.
-			if !p.final || msg.Sequence < finalSeq {
-				p.final, p.state, finalSeq = true, status.Status.State, msg.Sequence
+			if !p.final || seq < finalSeq {
+				p.final, p.state, finalSeq = true, status.Status.State, seq
 			}
 			continue
 		}
-		if !p.final && msg.Sequence > newest {
-			newest, p.state = msg.Sequence, status.Status.State
+		if !p.final && seq > newest {
+			newest, p.state = seq, status.Status.State
 		}
 	}
 	return p, nil
 }
 
-// statusOf is the status update data carries, when it is one.
-func statusOf(data []byte) (lib.StatusUpdate, bool) {
-	env, err := lib.ParseEnvelope(data)
-	if err != nil || env.Kind != lib.KindStatusUpdate {
-		return lib.StatusUpdate{}, false
+// tasksStream is the TASKS stream handle a pass of probes shares, so one
+// pass makes one STREAM.INFO round trip, not one per task.
+func (g *Gateway) tasksStream(ctx context.Context) (jetstream.Stream, error) {
+	stream, err := g.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		return nil, fmt.Errorf("stream %s: %w", lib.TasksStream, err)
 	}
-	var s lib.StatusUpdate
-	if err := json.Unmarshal(env.Payload, &s); err != nil {
-		return lib.StatusUpdate{}, false
-	}
-	return s, true
+	return stream, nil
 }
 
 // noticeCeilingGraces bounds the no-first-event notice from above, in
