@@ -76,7 +76,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NamedTuple
 
-# The shared scripts dir holds github_token_refresh and gitops_workspace (see
+# The shared scripts dir holds github_token_refresh, gitops_workspace and the
+# fix_recipes package (the no-pdb generator) (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
 # copied per-profile). The import itself is lazy so `--dry-run` works on a dev
 # machine with no sandbox. The third entry is the same directory in a source
@@ -2222,11 +2223,9 @@ RUN_RECORD_STARTED_KEY = "started_at"
 # cleared finding of it `manual`: a PodDisruptionBudget is fully determined by
 # the workload's selector (obtainability SOP §3.3), which the collector reads.
 GENERATED_FIX_CHECK = "no-pdb"
-# The new file `finish` writes beside the workload's declaration.
-GENERATED_PDB_SUFFIX = "-pdb"
+# The extension of the new file `finish` writes beside the workload's
+# declaration; its name is the recipe's (`fix_recipes/no-pdb/fix.py`).
 GENERATED_PDB_EXTENSION = ".yaml"
-# A DNS-1123 subdomain, what Kubernetes requires of a PDB's name and namespace.
-KUBERNETES_NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 # A clone's own directory, which no search of the repository's files enters.
 GIT_DIR_NAME = ".git"
 # What marks a directory as a Kustomize root, as the collector reads it: a
@@ -2300,8 +2299,6 @@ HTTP_TOO_MANY_REQUESTS = 429
 MANUAL_NOTE_MANIFEST_LINES = 60
 # The last line of a copied file that went past either cap.
 MANUAL_NOTE_TRUNCATED = "# (truncated)"
-# The selector keys `policy/v1` takes, and nothing else.
-LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
 GENERATED_FIX_NOTE = (
     "_(The audit wrote this PodDisruptionBudget from the workload's own selector, "
@@ -18947,53 +18944,27 @@ def unwritten_refusal_message(
     return " ".join(parts)
 
 
+def _no_pdb_fix():
+    """The `no-pdb` recipe's generator (`fix_recipes/no-pdb/fix.py`).
+
+    Lazy, as `gitops_workspace` is (the module comment on `sys.path`)."""
+    from fix_recipes import registry
+
+    return registry.generator(GENERATED_FIX_CHECK)
+
+
 def _pdb_unbuildable_reason(candidate: dict) -> str:
     """Why `_pdb_manifest` builds nothing for `candidate`, in the refusal's words,
-    or "" where it builds one. The one place those refusals are decided, so the
-    note the worker reads names the refusal `_pdb_manifest` made."""
-    selector = candidate.get("pod_selector")
-    if not isinstance(selector, dict) or not selector:
-        return "the collector attached no selector to write it from"
-    if set(selector) - LABEL_SELECTOR_KEYS:
-        return "the collector's selector has keys `policy/v1` does not take"
-    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
-        return "the collector's selector is empty, and would select every pod in the namespace"
-    workload = str(candidate.get("object") or "").partition("/")[2]
-    if not KUBERNETES_NAME_PATTERN.match(f"{workload}{GENERATED_PDB_SUFFIX}"):
-        return "its name would not be a valid Kubernetes name"
-    if not KUBERNETES_NAME_PATTERN.match(str(candidate.get("namespace") or "")):
-        return "the collector named no valid namespace for it"
-    return ""
+    or "" where it builds one: the recipe's `unbuildable_reason`, so the note the
+    worker reads names the refusal `_pdb_manifest` made."""
+    return _no_pdb_fix().unbuildable_reason(candidate)
 
 
 def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
-    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None.
-
-    `maxUnavailable: 1` and the workload's `spec.selector` verbatim, which the
-    collector carries as `pod_selector`. None where that cannot be written
-    safely (`_pdb_unbuildable_reason`): no selector, an empty one (which would
-    select every pod in the namespace), keys `policy/v1` does not take, or a
-    name or namespace Kubernetes refuses.
-    """
-    if _pdb_unbuildable_reason(candidate):
-        return None
-    selector = candidate["pod_selector"]
-    name = f"{str(candidate.get('object') or '').partition('/')[2]}{GENERATED_PDB_SUFFIX}"
-    namespace = str(candidate.get("namespace") or "")
-    # JSON is YAML, so the selector is written exactly as it was read.
-    text = (
-        f"# {candidate.get('cluster', '')}: {GENERATED_FIX_CHECK} on {candidate.get('object')} "
-        f"({finding_id})\n"
-        "apiVersion: policy/v1\n"
-        "kind: PodDisruptionBudget\n"
-        "metadata:\n"
-        f"  name: {name}\n"
-        f"  namespace: {namespace}\n"
-        "spec:\n"
-        "  maxUnavailable: 1\n"
-        f"  selector: {json.dumps(selector, sort_keys=True)}\n"
-    )
-    return name, text
+    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None: the
+    `no-pdb` recipe's `generate` (`fix_recipes/no-pdb/fix.py`), which says when
+    it refuses and pins the text byte for byte."""
+    return _no_pdb_fix().generate(candidate, finding_id)
 
 
 def _broker_outage(exc: BaseException) -> bool:

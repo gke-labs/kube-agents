@@ -47,6 +47,9 @@ The verification fields, all optional:
 - `health`: `restart_flat` (the default) holds the health window on the
   workload the record names; `none` passes the window on the run after the fix
   is applied, for a fix whose object is not a workload.
+
+A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
+`generator(kind)`; `no-pdb` has one, which `audit_report._pdb_manifest` calls.
 """
 
 from __future__ import annotations
@@ -55,12 +58,14 @@ import functools
 import importlib.util
 import json
 import re
-from types import ModuleType
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 RECIPE_FILE = "recipe.yaml"
+# A recipe's fix generator, beside its recipe.yaml (optional until every kind has one).
+FIX_FILE = "fix.py"
 #: A recipe's safety checks: `read_kinds` (one namespace read) and
 #: `checks(change, live)`, each result named and `pass`, `fail` or `unknown`.
 CHECKS_FILE = "checks.py"
@@ -218,6 +223,30 @@ def kinds() -> frozenset[str]:
 def recipe(kind: str) -> Recipe | None:
     """The recipe for `kind`, or None for a kind the registry does not list."""
     return next((found for found in recipes() if found.kind == kind), None)
+
+def generator(kind: str, root: Path = HERE) -> ModuleType:
+    """The `fix.py` of `kind`'s recipe, loaded once per file.
+
+    Loaded from its path: a kind is a check id such as `no-pdb`, and a hyphen
+    is not an importable package name. RecipeError for a kind with no valid
+    recipe or no `fix.py`.
+    """
+    if not KIND_RE.fullmatch(kind) or not (root / kind / RECIPE_FILE).is_file():
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    if kind not in {found.kind for found in (recipes() if root == HERE else load(root))}:
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    path = root / kind / FIX_FILE
+    if not path.is_file():
+        raise RecipeError(f"{kind}/{FIX_FILE}: missing")
+    return _load_fix(path.resolve(), kind)
+
+
+@functools.cache
+def _load_fix(path: Path, kind: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(f"fix_recipes.{kind.replace('-', '_')}_fix", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @functools.lru_cache(maxsize=None)
