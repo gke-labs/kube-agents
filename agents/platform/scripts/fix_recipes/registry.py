@@ -55,10 +55,9 @@ How the broker proves a pull request is the fix: `verify` is `add-manifest`
 kind of the one document it edits, and `edit_paths`, the dotted scalar paths
 it may change (a segment of digits is a list index), never an identity,
 label, selector, ownership or status field (`EDIT_FORBIDDEN_SEGMENTS`).
-`automerge_edit` holds a pull request to exactly those edits, and `fix.py`'s
-`allowed_edit(path, old, new)` must return True for each: it sees values as
-`yaml_edit.read_scalar` reads them, so it must check both values' types (a
-head may turn `1` into `"2"` or `true`).
+`automerge_edit` holds a pull request to exactly those edits, refuses any
+that changes a field's YAML type (a bool is not an int), and then asks
+`fix.py`'s `allowed_edit(path, old, new)`, which must return True for each.
 
 A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
 `generator(kind)`, and stdlib only for the same reason. `no-pdb` has one:

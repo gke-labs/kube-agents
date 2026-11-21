@@ -21,8 +21,10 @@ writes at the recipe's `edit_paths` on that base, and nothing else:
   `set_scalar` itself refuses anchors, aliases, tags, flow style and
   templates on the path, and `apiVersion`, `kind`, `metadata.name` and
   `metadata.namespace`;
-- the recipe's `fix.py` `allowed_edit(path, old, new)` accepts every change;
-  a recipe without one accepts none.
+- every changed field keeps its YAML type (int, bool or string; a bool is not
+  an int), and the recipe's `fix.py` `allowed_edit(path, old, new)` returns
+  True for every change; a recipe without one accepts none, and one that
+  raises is a refusal.
 
 Stdlib only: the credential proxy runs it.
 """
@@ -211,6 +213,13 @@ def _verify(recipe: Recipe, fix_module: Any, path: str, cluster: str, base: str,
             changes.append((field, old, new))
     if not changes:
         raise EditRefused("no declared field changed")
+    # The framework, not each recipe, holds a field to its YAML type: a head
+    # may write `"2"` or `true` where the base had `1`, and a bool is not an
+    # int. A recipe whose field legitimately changes type cannot use this verb.
+    retyped = [f"{'.'.join(map(str, f))} ({type(old).__name__} to {type(new).__name__})"
+               for f, old, new in changes if type(new) is not type(old)]
+    if retyped:
+        raise EditRefused(f"the edit changes the type of {', '.join(retyped)}")
     expected = base
     for field, _, new in changes:
         expected = yaml_edit.set_scalar(expected, doc, list(field), new)
