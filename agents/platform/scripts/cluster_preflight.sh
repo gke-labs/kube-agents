@@ -133,9 +133,18 @@ readonly SCOPE_EXCLUDE_REFUSAL_RE='scope\.excluded-cluster'
 # The unreadable forms are not an operator's decision: the proxy or the broker
 # can't read the file it was given and refuses every cluster (fail-closed).
 readonly SCOPE_UNREADABLE_REFUSAL_RE='scope\.hold-unreadable|scope\.exclude-unreadable'
-# The operator's reason in a hold refusal: "... on hold (spec.hold): <reason>.
-# An operator paused ...", the `.all` form included.
-readonly SCOPE_HOLD_REASON_SED='s/.*on hold (spec\.hold[.a-z]*): \(.*\)\. An operator paused.*/\1/p'
+# The hold's reason sits between the first "on hold (spec.hold...): " and the last
+# ". An operator paused agent access to it;" of kube-proxy's or the broker's refusal,
+# so a reason that repeats either phrase is kept whole. Read by python3, which caps it
+# by characters (not bytes) and replaces bytes that are not UTF-8.
+readonly SCOPE_HOLD_REASON_READER='
+import re, sys
+text = " ".join(sys.stdin.buffer.read().decode("utf-8", "replace").split())
+start = re.search(r"on hold \(spec\.hold[.a-z]*\): ", text)
+end = text.rfind(". An operator paused agent access to it;")
+if start and end > start.end():
+    print(text[start.end():end][:int(sys.argv[1])])
+'
 readonly SCOPE_HOLD_REASON_MAX_CHARS=256
 readonly SCOPE_HOLD_REMEDIATION="Report the hold to the user and stop; do not retry, re-scaffold, or work around it. An operator lifts it by removing the cluster from spec.hold."
 readonly SCOPE_UNREADABLE_REASON="The credential broker or Kubernetes API proxy cannot read its scope/hold file, so it refuses every cluster (fail-closed). This is a platform fault, not a hold."
@@ -500,7 +509,7 @@ if [ "$STATUS" = "ok" ]; then
             REASON_5="The target cluster is on hold by the platform's operators (spec.hold): kube-proxy and the credential broker refuse its API to every agent."
             # From the whole message, not ERR_ONE: its 500-character cut can fall
             # inside a long reason, past which the pattern's anchor is lost.
-            HOLD_REASON="$(printf '%s' "$ERR" | tr '\n' ' ' | sed 's/  */ /g' | sed -n "$SCOPE_HOLD_REASON_SED" | head -n 1 | cut -c1-"$SCOPE_HOLD_REASON_MAX_CHARS")"
+            HOLD_REASON="$(printf '%s' "$ERR" | python3 -I -c "$SCOPE_HOLD_REASON_READER" "$SCOPE_HOLD_REASON_MAX_CHARS" 2>/dev/null)"
             [ -n "$HOLD_REASON" ] && REASON_5="$REASON_5 Reason given: $HOLD_REASON."
             REMEDIATION_5="$SCOPE_HOLD_REMEDIATION"
         elif grep -Eq "$SCOPE_EXCLUDE_REFUSAL_RE" <<<"$ERR"; then

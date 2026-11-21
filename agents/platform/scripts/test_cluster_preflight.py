@@ -459,6 +459,16 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertEqual("5", result["check"])
         self.assertIn("Reason given: " + reason + ".", result["reason"])
 
+    def test_check_5_keeps_a_reason_that_repeats_the_hold_phrase(self):
+        reason = "rollback; see the earlier refusal: on hold (spec.hold): INC-41"
+        result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=self.HOLD_ERR.replace("INC-42 rollback in progress", reason))
+        self.assertIn("Reason given: " + reason + ".", result["reason"])
+
+    def test_check_5_caps_a_non_ascii_reason_by_characters(self):
+        reason = "停机维护" * 64  # 256 characters, 768 UTF-8 bytes
+        result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=self.HOLD_ERR.replace("INC-42 rollback in progress", reason))
+        self.assertIn("Reason given: " + reason + ".", result["reason"])
+
     def test_check_5_names_a_hold_on_every_cluster(self):
         all_err = self.HOLD_ERR.replace(
             "cluster prod-1 (payments-prod, us-central1) is on hold (spec.hold): INC-42 rollback in progress",
