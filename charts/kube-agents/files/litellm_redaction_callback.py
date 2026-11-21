@@ -49,6 +49,7 @@ import base64
 import binascii
 import copy
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -142,6 +143,13 @@ MEDIA_MAGIC = {
     "application/pdf": (b"%PDF-",),
 }
 ASSISTANT_ROLES = frozenset({"assistant", "model"})
+# A string holding a JSON object or array (a tool call's arguments, a tool's
+# JSON output) is decoded and walked as a document, so key names count and a
+# value after an escaped newline is matched, then re-encoded only if a rule
+# changed it. The wrapper marks where it came from while the walk runs.
+JSON_OPENERS = ("{", "[")
+JSON_WRAPPER_KEY = "__kube_agents_json_string__"
+JSON_DOCUMENT_KEY = "__kube_agents_json_document__"
 DATA_KEY = "data"
 
 
@@ -326,6 +334,45 @@ class KubeAgentsRedactionCallback(CustomLogger):
         except (KeyError, IndexError, TypeError):
             return
 
+    @classmethod
+    def _expand_json(cls, node: Any, sources: List[str]) -> Any:
+        """node with each string that holds a JSON object or array replaced by
+        its decoded document, wrapped with the index of the original string in
+        sources, so _collapse_json can re-encode it. Only the document is
+        walked."""
+        if isinstance(node, str):
+            text = node.strip()
+            if text[:1] in JSON_OPENERS:
+                try:
+                    decoded = json.loads(text)
+                except ValueError:
+                    return node
+                if isinstance(decoded, (dict, list)):
+                    sources.append(node)
+                    return {JSON_WRAPPER_KEY: len(sources) - 1, JSON_DOCUMENT_KEY: cls._expand_json(decoded, sources)}
+            return node
+        if isinstance(node, list):
+            return [cls._expand_json(item, sources) for item in node]
+        if isinstance(node, dict):
+            return {key: cls._expand_json(value, sources) for key, value in node.items()}
+        return node
+
+    @classmethod
+    def _collapse_json(cls, node: Any, sources: List[str]) -> Any:
+        """Undo _expand_json on a walked tree: a decoded document goes back to
+        its original string, re-encoded only if a rule changed it."""
+        if isinstance(node, dict) and set(node) == {JSON_WRAPPER_KEY, JSON_DOCUMENT_KEY} and isinstance(node[JSON_WRAPPER_KEY], int):
+            source = sources[node[JSON_WRAPPER_KEY]]
+            document = cls._collapse_json(node[JSON_DOCUMENT_KEY], sources)
+            if document == json.loads(source.strip()):
+                return source
+            return json.dumps(document, ensure_ascii=False)
+        if isinstance(node, list):
+            return [cls._collapse_json(item, sources) for item in node]
+        if isinstance(node, dict):
+            return {key: cls._collapse_json(value, sources) for key, value in node.items()}
+        return node
+
     def _redact_field(self, value: Any, kept: List[tuple], counts: Dict[str, int]) -> Any:
         """One top-level field: every string redacted, key names counted, the
         kept fields put back as they came. The original is left unchanged
@@ -336,7 +383,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 self._put(placeholder, path, None)
         else:
             placeholder = value
-        redacted, made = AuditRedactor.redact_counted(placeholder, self._rules)
+        sources: List[str] = []
+        expanded = self._expand_json(placeholder, sources)
+        walked, made = AuditRedactor.redact_counted(expanded, self._rules)
+        redacted = self._collapse_json(walked, sources)
         for name, count in made.items():
             counts[name] = counts.get(name, 0) + count
         for path, original in kept:

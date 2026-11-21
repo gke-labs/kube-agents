@@ -587,6 +587,27 @@ class TestCallback(unittest.TestCase):
             with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
 
+    def test_json_held_in_a_string_is_decoded_wherever_it_sits(self) -> None:
+        # A value right after an escaped newline sits after the letter `n` in
+        # the encoded string, where a word-boundary rule cannot see it; the
+        # decoded document has a real newline there.
+        args = json.dumps({"command": "kubectl get pods\n10.0.0.5", "cluster": "prod-eu-1"})
+        output = json.dumps({"items": [{"status": {"podIP": "10.0.0.6"}}], "note": "on\nprod-eu-1"})
+        data = {
+            "messages": [
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "a", "type": "function", "function": {"name": "t", "arguments": args}}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "u", "name": "Bash", "input": args}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "u", "content": output}]},
+            ]
+        }
+        result = self._run(data, "anthropic_messages")["messages"]
+        for sent in (result[0]["tool_calls"][0]["function"]["arguments"], result[1]["content"][0]["input"], result[2]["content"][0]["content"]):
+            self.assertIsInstance(sent, str)
+            decoded = json.loads(sent)
+            text = json.dumps(decoded)
+            for value in ("10.0.0.5", "10.0.0.6", "prod-eu-1"):
+                self.assertNotIn(value, text)
+
     # Fail closed.
 
     def test_a_request_in_a_shape_the_hook_cannot_walk_is_refused(self) -> None:
