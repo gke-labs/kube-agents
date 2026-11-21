@@ -374,20 +374,41 @@ class KubeAgentsRedactionCallback(CustomLogger):
             return {key: cls._expand_json(value, sources) for key, value in node.items()}
         return node
 
-    @classmethod
-    def _collapse_json(cls, node: Any, sources: List[str]) -> Any:
-        """Undo _expand_json on a walked tree: a decoded document goes back to
-        its original string, re-encoded only if a rule changed it."""
+    @staticmethod
+    def _has_duplicate_keys(source: str) -> bool:
+        """Whether an object in source repeats a key: the decoder keeps one
+        value and drops the others, which the walk then never sees."""
+        found = False
+
+        def pairs(items: List[tuple]) -> Dict[str, Any]:
+            nonlocal found
+            keys = [key for key, _ in items]
+            found = found or len(keys) != len(set(keys))
+            return dict(items)
+
+        json.loads(source.strip(), object_pairs_hook=pairs)
+        return found
+
+    def _collapse_json(self, node: Any, sources: List[str], counts: Dict[str, int]) -> Any:
+        """Undo _expand_json on a walked tree. A decoded document goes back to
+        its original string only if the walk changed nothing, the string has
+        no repeated key, and the text rules over the raw string change nothing
+        either; otherwise it is re-encoded and the text rules run over the
+        result too, which also reaches key names and numbers."""
         if isinstance(node, dict) and set(node) == {JSON_WRAPPER_KEY, JSON_DOCUMENT_KEY} and isinstance(node[JSON_WRAPPER_KEY], int):
             source = sources[node[JSON_WRAPPER_KEY]]
-            document = cls._collapse_json(node[JSON_DOCUMENT_KEY], sources)
-            if document == json.loads(source.strip()):
+            document = self._collapse_json(node[JSON_DOCUMENT_KEY], sources, counts)
+            raw, _ = AuditRedactor.redact_text_counted(source, self._rules)
+            if raw == source and document == json.loads(source.strip()) and not self._has_duplicate_keys(source):
                 return source
-            return json.dumps(document, ensure_ascii=False)
+            encoded, made = AuditRedactor.redact_text_counted(json.dumps(document, ensure_ascii=False), self._rules)
+            for name, count in made.items():
+                counts[name] = counts.get(name, 0) + count
+            return encoded
         if isinstance(node, list):
-            return [cls._collapse_json(item, sources) for item in node]
+            return [self._collapse_json(item, sources, counts) for item in node]
         if isinstance(node, dict):
-            return {key: cls._collapse_json(value, sources) for key, value in node.items()}
+            return {key: self._collapse_json(value, sources, counts) for key, value in node.items()}
         return node
 
     def _redact_field(self, value: Any, kept: List[tuple], counts: Dict[str, int]) -> Any:
@@ -403,9 +424,9 @@ class KubeAgentsRedactionCallback(CustomLogger):
         sources: List[str] = []
         expanded = self._expand_json(placeholder, sources)
         walked, made = AuditRedactor.redact_counted(expanded, self._rules)
-        redacted = self._collapse_json(walked, sources)
         for name, count in made.items():
             counts[name] = counts.get(name, 0) + count
+        redacted = self._collapse_json(walked, sources, counts)
         for path, original in kept:
             self._put(redacted, path, original)
         return redacted

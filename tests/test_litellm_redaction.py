@@ -608,6 +608,22 @@ class TestCallback(unittest.TestCase):
             for value in ("10.0.0.5", "10.0.0.6", "prod-eu-1"):
                 self.assertNotIn(value, text)
 
+    def test_json_whose_decoded_view_hides_a_value_is_re_encoded_redacted(self) -> None:
+        # A repeated key: the decoder keeps the last value, so the first one
+        # never reaches the walk. A key name: the walk reads values. Either
+        # way the original string is not sent as it was.
+        repeated = '{"note": "on prod-eu-1", "note": "safe"}'
+        keyed = json.dumps({"10.0.0.5": "pod", "ok": 1})
+        data = {"messages": [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "t", "arguments": repeated}},
+            {"id": "b", "type": "function", "function": {"name": "t", "arguments": keyed}},
+        ]}]}
+        first, second = (call["function"]["arguments"] for call in self._run(data)["messages"][0]["tool_calls"])
+        self.assertNotIn("prod-eu-1", first)
+        self.assertNotIn("10.0.0.5", second)
+        json.loads(first)
+        json.loads(second)
+
     # Fail closed.
 
     def test_a_request_in_a_shape_the_hook_cannot_walk_is_refused(self) -> None:
