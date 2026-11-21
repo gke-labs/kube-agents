@@ -227,6 +227,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 		`kubeagents_kube_proxy_secrets_redacted_total{action="accept_header_rewritten"} 1`,
 		`kubeagents_kube_proxy_secrets_redacted_total{action="payload_scrubbed"} 1`,
 		`kubeagents_kube_proxy_in_flight_requests 0`,
+		`kubeagents_kube_proxy_certificate_reload_failures_total 0`,
 		`# TYPE process_start_time_seconds gauge`,
 	}
 
@@ -479,4 +480,15 @@ func TestSetupOTelDisabledOrUnset(t *testing.T) {
 		t.Fatal("expected non-nil TracerProvider")
 	}
 	_ = shutdown2(context.Background())
+}
+
+func TestRecordCertificateReloadFailure(t *testing.T) {
+	metrics := NewMetrics()
+	metrics.RecordCertificateReloadFailure()
+	metrics.RecordCertificateReloadFailure()
+	if want := `kubeagents_kube_proxy_certificate_reload_failures_total 2`; !strings.Contains(scrapeMetricsText(t, metrics), want) {
+		t.Errorf("metrics exposition missing %q", want)
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordCertificateReloadFailure()
 }
