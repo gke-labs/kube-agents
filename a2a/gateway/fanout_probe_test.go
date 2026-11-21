@@ -181,9 +181,21 @@ func TestAHealFindsATerminalAStragglerHides(t *testing.T) {
 		kid, ok := rec.TaskRefFor(f.kids[0].ID)
 		return ok && kid.BatchEnd != nil
 	}
+	// Each status turn is one heal pass. Its answer is counted, not matched
+	// on a digit: the answer names a count that depends on which child the
+	// pass checked, and that order follows the random task ids.
+	answers := func() int {
+		n := 0
+		for _, p := range r2.adapter.postTexts() {
+			if strings.Contains(p, "delegated task") {
+				n++
+			}
+		}
+		return n
+	}
 	for i := 0; i < 2 && !healed(); i++ {
 		sessionRigTurn(r2, conv, fmt.Sprintf("h-straggler-%d", i), "status")
-		waitFor(t, "the status answer", postedContaining(r2, fmt.Sprintf("%d", i+1)))
+		waitFor(t, "the status answer", func() bool { return answers() >= i+1 })
 	}
 	waitFor(t, "the straggled child healed by a spot check", healed)
 }
@@ -376,5 +388,54 @@ func TestTheSpotCheckReachesEachRunningChildInTurn(t *testing.T) {
 	}
 	if _, kept := g.fanOutSpotChecks["p"]; kept {
 		t.Fatal("the parent's place was kept with no child running")
+	}
+}
+
+// A fan-out that ends with no heal pass after it (its last child's terminal
+// relayed, so the wake runs) leaves no spot-check place behind for its
+// parent: the place goes when the batch ends, not only when a heal finds
+// nothing running.
+func TestAFanOutsSpotCheckPlaceGoesWhenItEnds(t *testing.T) {
+	t.Parallel()
+	r, spawn, _ := startFanOutRig(t, 2)
+	conv := "discord:g1/t-fanout-spot-forget"
+	f := fanOut(t, r, spawn, conv, clusterTask("web-1", "a"), clusterTask("web-2", "b"))
+	r.g.mu.Lock()
+	if r.g.fanOutSpotChecks == nil {
+		r.g.fanOutSpotChecks = map[string]string{}
+	}
+	r.g.fanOutSpotChecks[f.origin.TaskID] = f.kids[0].ID
+	r.g.mu.Unlock()
+	completeTask(t, r.execFor(t, f.envs[0], "cluster"), "web-1 is green")
+	completeTask(t, r.execFor(t, f.envs[1], "cluster"), "web-2 is green")
+	childEndedLogged(t, r, f.kids[1].ID)
+	waitFor(t, "the parent's spot-check place forgotten", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		_, kept := r.g.fanOutSpotChecks[f.origin.TaskID]
+		return !kept
+	})
+}
+
+// A status whose payload names another task, on this task's subject, is
+// skipped by the probe: it is no state of this task's.
+func TestTheProbeSkipsAStatusNamingAnotherTask(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	const addr = "tse"
+	id := "task-probe-mine"
+	probeStatus(t, r, lib.TaskEventsSubject(addr, id), addr, id, lib.StateWorking, false)
+	mine, _ := json.Marshal(lib.StatusUpdate{TaskID: id, Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: addr, AgentType: "test-executor"}, id, "ctx-probe", "corr-probe", mine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The payload swapped after the build and published raw: the library
+	// refuses to build or write it.
+	env.Payload, _ = json.Marshal(lib.StatusUpdate{TaskID: "task-probe-other", Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
+	rawPublish(t, r, lib.TaskSupervisorSubject(addr, id), env)
+	p, err := probeOf(t, r, addr, id)
+	if err != nil || p.final || p.state != lib.StateWorking {
+		t.Fatalf("probe = %+v (%v), want working and not final", p, err)
 	}
 }

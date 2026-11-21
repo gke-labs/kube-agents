@@ -205,6 +205,9 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 	if left > 0 {
 		return
 	}
+	// The batch is over however it ended (the relay, the heal or a stop),
+	// so the heal's place in it goes too (nextFanOutSpotCheck).
+	g.forgetFanOutSpotCheck(child.ParentTaskID)
 	child.BatchEnd = &end
 	woken, why, stopped := g.wakeBatch(ctx, rec, parent, child, log)
 	if !woken {
@@ -483,6 +486,13 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 		return true
 	}
 	return false
+}
+
+// forgetFanOutSpotCheck drops a fan-out parent's spot-check place.
+func (g *Gateway) forgetFanOutSpotCheck(parent string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.fanOutSpotChecks, parent)
 }
 
 // nextFanOutSpotCheck is the running child the heal replays in full this

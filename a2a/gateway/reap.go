@@ -565,7 +565,9 @@ func (g *Gateway) probeTask(ctx context.Context, stream jetstream.Stream, addres
 	var newest, finalSeq uint64
 	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
 		// Screened as the replay screens each envelope (LastEnvelopeOn), so
-		// an envelope the fold drops is dropped here too.
+		// an envelope the fold drops is dropped here too. That includes a
+		// status whose payload names another task: ParseEnvelope refuses
+		// it, and LastEnvelopeOn skips it.
 		env, seq, err := g.client.LastEnvelopeOn(ctx, stream, subject)
 		if err != nil {
 			return taskProbe{}, err
