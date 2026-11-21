@@ -359,3 +359,98 @@ func TestAnActivityTitleSkipsAssignmentsAndNonWords(t *testing.T) {
 		}
 	}
 }
+
+// An activity title is scrubbed with the task's seen values too: a value
+// seen in a tool result that looks like a bare word can't pass as a
+// subcommand.
+func TestAnActivityTitleIsScrubbedWithSeenValues(t *testing.T) {
+	const word = "SyntheticSeenWord0003"
+	task, _, res := runLines(t, "chat-heron-s9c9", "task-scrub-title",
+		toolResultLine(t, secretManifest(t, word)),
+		assistantBlockLine(t, map[string]any{"type": "tool_use", "id": "toolu_3", "name": "Bash", "input": map[string]any{"command": "mycli " + word}}),
+		resultLine(t, "done"),
+	)
+	if res.State != lib.StateCompleted {
+		t.Fatalf("state %q", res.State)
+	}
+	art := task.Artifact(lib.ArtifactActivity)
+	if art == nil || len(art.Parts) != 1 {
+		t.Fatalf("activity artifact = %+v, want one entry", art)
+	}
+	if strings.Contains(string(art.Parts[0].Data), word) {
+		t.Fatalf("activity entry = %s, want the seen value redacted from its title", art.Parts[0].Data)
+	}
+}
+
+// An answer that opens with unstructured reasoning is withheld whole: the
+// harness's result is its last text block, which isn't published as
+// progress either.
+func TestAWithheldReasoningAnswerIsNotPublishedAsProgress(t *testing.T) {
+	const marker = "synthetic-reasoning-marker-0004"
+	task, _, res := runLines(t, "chat-heron-r1c1", "task-reasoning-progress",
+		assistantTextLine(t, "thought:\n"+marker),
+		resultLine(t, "thought:\n"+marker),
+	)
+	if res.State != lib.StateFailed {
+		t.Fatalf("state %q, want failed", res.State)
+	}
+	if got := artifactText(task, lib.ArtifactProgress); strings.Contains(got, marker) {
+		t.Fatalf("progress = %q, want the withheld answer absent", got)
+	}
+}
+
+// A failed run's partial output that opens with unstructured reasoning isn't
+// attached to the failure.
+func TestReasoningIsNotAttachedAsPartialOutput(t *testing.T) {
+	const marker = "synthetic-reasoning-marker-0005"
+	_, final, res := runLines(t, "chat-heron-r2c2", "task-reasoning-evidence",
+		eventLine(t, map[string]any{"type": "result", "subtype": "error_max_turns", "is_error": true, "result": "thought:\n" + marker}),
+	)
+	if res.State != lib.StateFailed {
+		t.Fatalf("state %q, want failed", res.State)
+	}
+	if reason := final.Status.Message.Parts[0].Text; strings.Contains(reason, marker) || strings.Contains(reason, "partial output") {
+		t.Fatalf("reason = %q, want no partial output", reason)
+	}
+}
+
+// A shell title names no argument: an assignment whose quoted value spans
+// several words leaves no program, and a word after a program that takes no
+// verbs isn't kept.
+func TestAnActivityTitleNamesNoArgumentForQuotedValuesOrUnknownPrograms(t *testing.T) {
+	for cmd, want := range map[string]string{
+		"TOKEN='" + synthShapeValue + " b c' curl -s x": "Bash",
+		`TOKEN="a b ` + synthShapeValue + `" curl`:      "Bash",
+		"echo SyntheticToken0006":                       "Bash echo",
+		"mycli SyntheticToken0006 --flag":               "Bash mycli",
+		"kubectl SyntheticToken0006":                    "Bash kubectl",
+		"kubectl get pods":                              "Bash kubectl get",
+	} {
+		input, err := json.Marshal(map[string]any{"command": cmd})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := activityTitle("Bash", input); got != want {
+			t.Errorf("activityTitle(%q) = %q, want %q", cmd, got, want)
+		}
+	}
+}
+
+// A delegation's texts are scrubbed with the task's seen values before the
+// delegate artifact goes out; parameters go as written.
+func TestADelegationsTextsAreScrubbed(t *testing.T) {
+	a := &adapter{}
+	a.seen.Add(synthSeenValue)
+	got := a.scrubDelegate(lib.DelegateRequest{
+		Addressee:  "platform",
+		Text:       "check the value " + synthSeenValue,
+		Parameters: map[string]string{"cluster": "prod"},
+		Tasks:      []lib.DelegateTask{{Addressee: "cluster", Text: "and " + synthSeenValue}},
+	})
+	if strings.Contains(got.Text, synthSeenValue) || strings.Contains(got.Tasks[0].Text, synthSeenValue) {
+		t.Fatalf("delegation = %+v, want the seen value redacted", got)
+	}
+	if got.Parameters["cluster"] != "prod" {
+		t.Fatalf("parameters = %v, want them as written", got.Parameters)
+	}
+}

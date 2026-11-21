@@ -1265,7 +1265,13 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 				a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: text}, false)
 			}
 		case "text":
-			// The model's prose is scrubbed as the answer is (scrub).
+			// The model's prose is scrubbed as the answer is (scrub). A block
+			// that opens with unstructured reasoning isn't published at all:
+			// the harness's result is its last text block, and an answer
+			// withheld at the end must not already be on TASKS as progress.
+			if answerscrub.OpensWithUnstructuredReasoning(block.Text) {
+				continue
+			}
 			if text := a.scrub(block.Text); text != "" {
 				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: text}, false)
 			}
@@ -1274,7 +1280,7 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 			// arguments (activityTitle).
 			entry, err := json.Marshal(map[string]any{
 				"tool":  block.Name,
-				"title": activityTitle(block.Name, block.Input),
+				"title": a.scrub(activityTitle(block.Name, block.Input)),
 			})
 			if err != nil {
 				continue
@@ -1330,13 +1336,29 @@ func (a *adapter) publishArtifactPart(ctx context.Context, name string, part lib
 // "delegated" for a request the gateway never saw waits for a wake that
 // never comes.
 func (a *adapter) publishDelegate(ctx context.Context, req lib.DelegateRequest) error {
-	data, err := json.Marshal(req)
+	data, err := json.Marshal(a.scrubDelegate(req))
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, delegatePublishTimeout)
 	defer cancel()
 	return a.publishArtifactPart(ctx, lib.ArtifactDelegate, lib.Part{Kind: "data", Data: data}, false, true)
+}
+
+// scrubDelegate is a delegation with its texts scrubbed as the answer is:
+// the child's request is the model's text. Parameters are the card's checked
+// fields and go as written.
+func (a *adapter) scrubDelegate(req lib.DelegateRequest) lib.DelegateRequest {
+	req.Text = a.scrub(req.Text)
+	if len(req.Tasks) > 0 {
+		tasks := make([]lib.DelegateTask, len(req.Tasks))
+		for i, t := range req.Tasks {
+			t.Text = a.scrub(t.Text)
+			tasks[i] = t
+		}
+		req.Tasks = tasks
+	}
+	return req
 }
 
 // publishResult publishes the deliverable as the result artifact, scrubbed
@@ -1445,6 +1467,10 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 		err = a.exec.PublishStatus(ctx, state, true)
 	} else {
 		text := reason
+		if answerscrub.OpensWithUnstructuredReasoning(evidence) {
+			// The same rule as the result: withheld, not attached.
+			evidence = ""
+		}
 		if evidence = a.scrub(evidence); evidence != "" {
 			text += "\npartial output:\n" + truncate(evidence, failureEvidenceCap)
 		}
@@ -2149,7 +2175,8 @@ func chunkString(s string, size int) []string {
 // activityTitle is a tool call's title for the activity artifact, with none
 // of its arguments: a shell command's program and subcommand, a file tool's
 // file name, otherwise the tool's name. It goes through the scrub's shape
-// rules all the same.
+// rules here, and the caller scrubs it again with the task's seen values, so
+// a seen value that looks like a bare word is redacted too.
 func activityTitle(tool string, input json.RawMessage) string {
 	var args map[string]any
 	_ = json.Unmarshal(input, &args)
@@ -2179,7 +2206,13 @@ func leadingCommand(cmd string) (bin, sub string) {
 	fields := strings.Fields(cmd)
 	i := 0
 	for i < len(fields) && strings.Contains(fields[i], "=") && !strings.HasPrefix(fields[i], "-") {
-		i++ // leading VAR=value assignments are dropped
+		// Leading VAR=value assignments are dropped. One whose quote
+		// doesn't close in the same word was split on its spaces: what
+		// follows is still its value, so there's no program to name.
+		if strings.Count(fields[i], "'")%2 == 1 || strings.Count(fields[i], "\"")%2 == 1 {
+			return "", ""
+		}
+		i++
 	}
 	if i >= len(fields) {
 		return "", ""
@@ -2190,10 +2223,28 @@ func leadingCommand(cmd string) (bin, sub string) {
 		// no program at all rather than a guess.
 		return "", ""
 	}
-	if i+1 < len(fields) && bareWord(fields[i+1]) {
+	if verbCLIs[bin] && i+1 < len(fields) && lowerVerb(fields[i+1]) {
 		sub = fields[i+1]
 	}
 	return bin, sub
+}
+
+// verbCLIs are the programs whose first argument is a verb worth a title
+// (kubectl get, git status). Any other program's next word could be data, so
+// its title is the program alone.
+var verbCLIs = map[string]bool{"kubectl": true, "gcloud": true, "git": true, "helm": true, "gh": true, "terraform": true, "docker": true, "kustomize": true}
+
+// lowerVerb reports whether w is a lowercase verb: a-z and '-', 2 to 20 bytes.
+func lowerVerb(w string) bool {
+	if len(w) < 2 || len(w) > 20 {
+		return false
+	}
+	for _, r := range w {
+		if !(r >= 'a' && r <= 'z' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // bareWord reports whether w looks like a command or subcommand name:
