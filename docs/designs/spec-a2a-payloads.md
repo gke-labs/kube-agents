@@ -790,14 +790,25 @@ credential-proxy token.
 - A reader that finds the part and it breaks these bounds, or carries no parameters object, refuses
   the task rather than running it without parameters (`lib.TaskParametersOf`). The dispatcher also
   checks that every parameter the persona declares is present before it builds the resource.
-- A child result that is malformed (no task id, a non-terminal state, text past the cap) is
-  skipped: it is no event, where a malformed parameter set would change what runs.
+- A child result that is malformed (a non-terminal state, text past the cap, or no task id
+  outside a not-started batch entry) is skipped: it is no event, where a malformed parameter set
+  would change what runs.
 
 **Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
-carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?}}`. The parent's per-task
+carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?}}`. The parent's per-task
 reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
 when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
 `result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
+
+A profile parent's batch gets one end per entry. `entry` is the entry's 1-based index in the
+batch, on every end of a batch, and absent for a single delegation. Each end is delivered at least
+once, since a gateway restart between the send and the record write sends it again. So a parent
+waiting on a batch dedupes its ends on `entry` and counts them to the batch's size, and a single
+delegation's on `childTaskId`. A batch child that reaches `input-required` is cancelled and ends
+`canceled`, with its question as `text`. A batch withdrawn whole (cut short, or a child that
+couldn't reach the bus) ends every entry `failed`, with the reason as `text` and no
+`childTaskId`. A withdrawn child's own later end sends nothing more, and a stopped parent gets
+nothing.
 
 This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A
 profile parent that has already ended gets no child result; the gateway drops it and logs it. A

@@ -1,0 +1,324 @@
+package gateway
+
+import (
+	"context"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+// profileBatchParent starts a top-level profile task on "chat" in a console
+// conversation and has it delegate a batch of the given clusters to the
+// cluster profile. It returns the parent's execution, its submission, and
+// the children's submissions in batch order.
+func profileBatchParent(t *testing.T, r *rig, conv string, clusters ...string) (*lib.TaskExecution, *lib.Envelope, []*lib.Envelope) {
+	t.Helper()
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	ctx := context.Background()
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	var tasks []lib.DelegateTask
+	for _, c := range clusters {
+		tasks = append(tasks, lib.DelegateTask{Addressee: "cluster", Text: "look at " + c, Parameters: targetParams("p1", "us-east1", c)})
+	}
+	if err := parent.PublishArtifact(ctx, delegateBatchArtifact(t, tasks...)); err != nil {
+		t.Fatal(err)
+	}
+	var kids []*lib.Envelope
+	waitFor(t, "every child submitted", func() bool {
+		kids = nil
+		for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>") {
+			kids = append(kids, e.env)
+		}
+		return len(kids) == len(clusters)
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	index := map[string]int{}
+	for _, k := range childrenOf(rec, origin.TaskID) {
+		index[k.ID] = k.BatchIndex
+	}
+	sort.Slice(kids, func(i, j int) bool { return index[kids[i].TaskID] < index[kids[j].TaskID] })
+	return parent, origin, kids
+}
+
+// childResultsOn reads every childResult on a parent's .in.
+func childResultsOn(t *testing.T, r *rig, addressee, taskID string) []lib.ChildResult {
+	t.Helper()
+	var out []lib.ChildResult
+	for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject(addressee, taskID)) {
+		if c, ok := lib.ChildResultOf(messageParts(t, e.env)); ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func completeChild(t *testing.T, r *rig, env *lib.Envelope, text string) {
+	t.Helper()
+	ctx := context.Background()
+	child := r.execFor(t, env, "cluster")
+	if err := child.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-" + env.TaskID, Name: lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: text}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAProfileParentsBatchSendsEachChildsEndAsItEnds: a profile task's batch
+// mints a child per entry at the parent's tier, and each child's end reaches
+// the parent's .in as its own childResult, naming its entry, as that child
+// ends. The parent holds the conversation the whole time, since it waits
+// open: no wake runs.
+func TestAProfileParentsBatchSendsEachChildsEndAsItEnds(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch"
+	_, origin, kids := profileBatchParent(t, r, conv, "a", "b", "c")
+
+	for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>") {
+		if _, tier, kind, _, ok := lib.ParseSubmitSubject(e.subject); !ok || tier != "read" || kind != lib.SubmitKindChild {
+			t.Fatalf("child subject = %q, want a read child submission", e.subject)
+		}
+	}
+	waitForRecord(t, r, conv, "the parent holding the conversation", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+	// Each child carries the parent on its chain, so its own children are
+	// held to the cycle rule as a single child's are.
+	rec0, _ := r.g.reg.Get(ctx, conv)
+	for _, k := range childrenOf(rec0, origin.TaskID) {
+		if strings.Join(k.ProfileChain, ",") != "chat" {
+			t.Fatalf("child %s chain = %v, want [chat]", k.ID, k.ProfileChain)
+		}
+	}
+
+	completeChild(t, r, kids[1], "b is fine")
+	waitFor(t, "b's result on the parent's .in", func() bool {
+		got := childResultsOn(t, r, "chat", origin.TaskID)
+		return len(got) == 1 && got[0].ChildTaskID == kids[1].TaskID && got[0].Entry == 2 &&
+			got[0].State == lib.StateCompleted && got[0].Text == "b is fine"
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if rec.ActiveTask == nil || rec.ActiveTask.TaskID != origin.TaskID {
+		t.Fatalf("active = %+v, want the parent while its other children run", rec.ActiveTask)
+	}
+
+	completeChild(t, r, kids[0], "a is fine")
+	completeChild(t, r, kids[2], "c is fine")
+	waitFor(t, "all three results", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 3 })
+	entries := map[int]string{}
+	for _, c := range childResultsOn(t, r, "chat", origin.TaskID) {
+		entries[c.Entry] = c.ChildTaskID
+	}
+	for i, k := range kids {
+		if entries[i+1] != k.TaskID {
+			t.Fatalf("entry %d's result names %q, want %q", i+1, entries[i+1], k.TaskID)
+		}
+	}
+	waitForRecord(t, r, conv, "the parent still holding the conversation", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID && rec.Addressee == "chat"
+	})
+	if n := platformSubmissions(t, r); n != 0 {
+		t.Fatalf("%d platform submission(s): a profile parent's batch woke something", n)
+	}
+	// The results are delivered once each, not again at the last end.
+	time.Sleep(200 * time.Millisecond)
+	if got := childResultsOn(t, r, "chat", origin.TaskID); len(got) != 3 {
+		t.Fatalf("%d childResults, want 3", len(got))
+	}
+}
+
+// TestAProfileParentsBatchChildStoppedMidBatchStillSendsOneEnd: a child that
+// is stopped while its siblings run sends the parent one end, canceled, so a
+// parent counting to the batch size isn't left waiting for it.
+func TestAProfileParentsBatchChildStoppedMidBatchStillSendsOneEnd(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-cancel"
+	_, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+
+	// The dispatcher ends one child canceled (its queue timeout, say).
+	child := r.execFor(t, kids[0], "cluster")
+	if err := child.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	completeChild(t, r, kids[1], "b is fine")
+	waitFor(t, "both ends", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 2 })
+	for _, c := range childResultsOn(t, r, "chat", origin.TaskID) {
+		switch c.ChildTaskID {
+		case kids[0].TaskID:
+			if c.State != lib.StateCanceled || c.Entry != 1 {
+				t.Fatalf("a's end = %+v, want canceled, entry 1", c)
+			}
+		case kids[1].TaskID:
+			if c.State != lib.StateCompleted || c.Entry != 2 {
+				t.Fatalf("b's end = %+v, want completed, entry 2", c)
+			}
+		default:
+			t.Fatalf("a result for %q", c.ChildTaskID)
+		}
+	}
+}
+
+// TestAStopDuringAProfileParentsBatchCancelsTheTree: a stop while a profile
+// parent's batch runs cancels the parent and every live child, and writes a
+// dispatch stop record for each.
+func TestAStopDuringAProfileParentsBatchCancelsTheTree(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	conv := "console:tab-profile-batch-stop"
+	_, origin, kids := profileBatchParent(t, r, conv, "a", "b", "c")
+	completeChild(t, r, kids[0], "a is fine")
+	waitFor(t, "a's result", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 1 })
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Backend: consoleBackend, Kind: "dm", AuthorID: consoleAuthor,
+		MessageID: "stop-pb", Text: "stop"}
+	cancelled := func(addressee, taskID string) bool {
+		for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject(addressee, taskID)) {
+			if e.env.Kind == lib.KindCancel {
+				return true
+			}
+		}
+		return false
+	}
+	waitFor(t, "the parent and the live children cancelled", func() bool {
+		return cancelled("chat", origin.TaskID) && cancelled("cluster", kids[1].TaskID) && cancelled("cluster", kids[2].TaskID)
+	})
+	waitFor(t, "a stop record for each live profile task", func() bool {
+		_, p := dispatchStopFor(t, r.url, "chat", origin.TaskID)
+		_, b := dispatchStopFor(t, r.url, "cluster", kids[1].TaskID)
+		_, c := dispatchStopFor(t, r.url, "cluster", kids[2].TaskID)
+		return p && b && c
+	})
+}
+
+// TestAProfileParentsBatchWithAnOutOfScopeEntryMintsNothing: the parent's
+// chain and scope rules apply to every entry, and one refused entry refuses
+// the whole batch.
+func TestAProfileParentsBatchWithAnOutOfScopeEntryMintsNothing(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-scope"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "x", Parameters: targetParams("p9", "us-east1", "x")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the batch recorded as refused", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && ref.DelegationEnd != ""
+	})
+	time.Sleep(200 * time.Millisecond)
+	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>"); len(envs) != 0 {
+		t.Fatalf("a refused batch left %d child submission(s)", len(envs))
+	}
+	if got := childResultsOn(t, r, "chat", origin.TaskID); len(got) != 0 {
+		t.Fatalf("a refused batch sent %d childResult(s): %+v", len(got), got)
+	}
+}
+
+// TestARedeliveredProfileBatchMintsNothingMore: the batch artifact arriving
+// twice mints its children once.
+func TestARedeliveredProfileBatchMintsNothingMore(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-redeliver"
+	parent, _, kids := profileBatchParent(t, r, conv, "a", "b")
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "look at a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "look at b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>"); len(envs) != len(kids) {
+		t.Fatalf("%d child submissions after a redelivery, want %d", len(envs), len(kids))
+	}
+}
+
+// TestAWithdrawnProfileBatchEndsEveryEntry: a profile parent's batch cut
+// short, whose request then fails its checks when it comes back, is
+// withdrawn whole, and the parent gets one failed end per entry, naming the
+// entry and no child, so it isn't left waiting for children that never ran.
+func TestAWithdrawnProfileBatchEndsEveryEntry(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-withdrawn"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	first := submissionOn(t, r, "cluster")
+	waitForRecord(t, r, conv, "the cut-short mint", func(rec *SessionRecord) bool {
+		ref, _ := rec.TaskRefFor(origin.TaskID)
+		return ref.BatchSize == 2 && len(ref.Children) == 1
+	})
+	// The profile goes away before the request comes back, so its checks
+	// now refuse it and the batch is withdrawn.
+	r.g.profiles.put("cluster", nil)
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "an end for each entry", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 2 })
+	seen := map[int]bool{}
+	for _, c := range childResultsOn(t, r, "chat", origin.TaskID) {
+		if c.ChildTaskID != "" || c.State != lib.StateFailed || c.Text != whyBatchCutShort {
+			t.Fatalf("end = %+v, want failed, no child, the cut-short reason", c)
+		}
+		seen[c.Entry] = true
+	}
+	if !seen[1] || !seen[2] {
+		t.Fatalf("entries ended = %v, want 1 and 2", seen)
+	}
+	// The withdrawn child's own end, when it comes, adds nothing.
+	child := r.execFor(t, first, "cluster")
+	if err := child.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := childResultsOn(t, r, "chat", origin.TaskID); len(got) != 2 {
+		t.Fatalf("%d ends after the withdrawn child's terminal, want 2: %+v", len(got), got)
+	}
+}

@@ -709,25 +709,13 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 	if !ok || parent.Tier == "" {
 		return false
 	}
-	if !parent.Canceled && !parent.TerminalObserved && g.parentEnded(ctx, parent.ID) {
-		// The relay retires a task's index entry on its terminal and sets
-		// no flag on the history entry.
-		parent.TerminalObserved = true
-	}
-	if parent.Canceled || parent.TerminalObserved {
-		// A stop cancelled the parent with its child, or the parent has
-		// ended: nothing reads its .in, and restoring it would hand the
-		// conversation a task the user already saw end, or steer the next
-		// message into one they stopped. Handled, so no session is woken.
-		g.log.Info("child result not delivered: the parent is cancelled or has ended",
-			"child", child.ID, "parent", parent.ID, "canceled", parent.Canceled, "ended", parent.TerminalObserved)
+	if !g.profileParentListens(ctx, &parent, child.ID) {
+		// Restoring it would hand the conversation a task the user already
+		// saw end, or steer the next message into one they stopped.
+		// Handled, so no session is woken.
 		return true
 	}
-	if err := g.publishChildResult(ctx, rec, parent, child, state, result, reason); err != nil {
-		g.log.Error("child result not delivered", "child", child.ID, "parent", parent.ID, "err", err)
-	} else {
-		g.log.Info("child result delivered", "child", child.ID, "parent", parent.ID, "state", state)
-	}
+	g.sendChildResult(ctx, rec, parent, child, state, result, reason)
 	// The parent is running again: it holds the conversation, so a stop
 	// reaches it, a steer goes to it, and a new ask waits behind it. Its
 	// rolling line comes back from the entry that kept it while the child ran.
@@ -739,6 +727,68 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 		rec.Addressee = parent.Addressee
 	}
 	return true
+}
+
+// profileParentListens reports whether a profile parent still reads its .in:
+// not when a stop cancelled it with its child, or it has ended. It logs a
+// result it won't deliver.
+func (g *Gateway) profileParentListens(ctx context.Context, parent *TaskRef, child string) bool {
+	if !parent.Canceled && !parent.TerminalObserved && g.parentEnded(ctx, parent.ID) {
+		// The relay retires a task's index entry on its terminal and sets
+		// no flag on the history entry.
+		parent.TerminalObserved = true
+	}
+	if parent.Canceled || parent.TerminalObserved {
+		g.log.Info("child result not delivered: the parent is cancelled or has ended",
+			"child", child, "parent", parent.ID, "canceled", parent.Canceled, "ended", parent.TerminalObserved)
+		return false
+	}
+	return true
+}
+
+// sendChildResult publishes a child's end to its profile parent and logs
+// how that went. A failed publish is logged and not retried here: the
+// parent's own deadline bounds its wait.
+func (g *Gateway) sendChildResult(ctx context.Context, rec *SessionRecord, parent, child TaskRef, state lib.TaskState, result, reason string) {
+	if err := g.publishChildResult(ctx, rec, parent, child, state, result, reason); err != nil {
+		g.log.Error("child result not delivered", "child", child.ID, "entry", child.BatchIndex, "parent", parent.ID, "err", err)
+	} else {
+		g.log.Info("child result delivered", "child", child.ID, "entry", child.BatchIndex, "parent", parent.ID, "state", state)
+	}
+}
+
+// profileBatchChildEnded sends a profile parent one batch child's end as it
+// ends, with its entry, since the parent waits open and counts its batch's
+// ends (lib.ChildResult). Nothing is sent once the batch was withdrawn,
+// whose entries were each ended then (endWithdrawnProfileBatch).
+func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord, parent, child TaskRef, end BatchEnd, reason string) {
+	if parent.DelegationEnd != "" || !g.profileParentListens(ctx, &parent, child.ID) {
+		return
+	}
+	state, text := end.State, end.Text
+	if state == lib.StateInputRequired {
+		// A batch child that asks is cancelled (batchChildAsks), and its
+		// question is its result: the parent decides whether to ask.
+		state = lib.StateCanceled
+	}
+	g.sendChildResult(ctx, rec, parent, child, state, text, text)
+}
+
+// endWithdrawnProfileBatch ends every entry of a profile parent's batch that
+// was withdrawn (it was cut short, or a child couldn't reach the bus), so a
+// parent counting its batch's ends isn't left waiting for children that
+// never ran. Each end is failed with why, and names the entry and no child:
+// a withdrawn child was cancelled before it could deliver anything. A
+// parent that isn't a profile task is left alone; a session parent is woken
+// by nothing for a batch that minted nothing.
+func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionRecord, taskID string, size int, why string) {
+	parent, ok := rec.TaskRefFor(taskID)
+	if !ok || parent.Tier == "" || !g.profileParentListens(ctx, &parent, "") {
+		return
+	}
+	for i := 1; i <= size; i++ {
+		g.sendChildResult(ctx, rec, parent, TaskRef{BatchIndex: i}, lib.StateFailed, "", why)
+	}
 }
 
 // parentEnded reports whether a task's index entry is gone, which the relay
@@ -762,7 +812,8 @@ func (g *Gateway) publishChildResult(ctx context.Context, rec *SessionRecord, pa
 	if len(text) > lib.ChildResultTextCap {
 		text = truncateBytes(text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
 	}
-	part, err := lib.ChildResultPart(lib.ChildResult{ChildTaskID: child.ID, Addressee: child.Addressee, State: state, Text: text})
+	part, err := lib.ChildResultPart(lib.ChildResult{ChildTaskID: child.ID, Addressee: child.Addressee, State: state, Text: text,
+		Entry: child.BatchIndex})
 	if err != nil {
 		return fmt.Errorf("build: %w", err)
 	}
