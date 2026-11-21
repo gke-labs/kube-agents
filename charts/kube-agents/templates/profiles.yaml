@@ -109,3 +109,47 @@ spec:
   resources:
     {{- toYaml $cluster.resources | nindent 4 }}
 {{- end }}
+{{- /*
+The fleet-audit profile (#5623, #5620): the parent of the install's fleet-wide
+scheduled audits and of onboarding's first inventory. Its persona is
+agents/fleet-audit/persona, published as the persona-fleet-audit image; its
+report scripts are in the worker image (/opt/fleet-audit/scripts). It takes no
+task parameters: it runs fleet-wide, and each cluster's checks run as a
+delegated cluster task. Off by default: no schedule runs on it until the
+onboarding PR renders one. Delegation from a profile task will need the
+profile's opt-in (spec.delegates, #6789), set by whichever of #6789 and the
+onboarding PR lands second.
+*/}}
+{{- if and .Values.platformAgent.enabled .Values.profiles .Values.profiles.fleetAudit .Values.profiles.fleetAudit.enabled }}
+{{- $fa := .Values.profiles.fleetAudit -}}
+{{- $defaultTag := (.Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | toString -}}
+{{- $personaRepo := include "kube-agents.imageRepository" (dict "repository" $fa.persona.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
+{{- $personaTag := ($fa.persona.image.tag | default $defaultTag) | toString -}}
+{{- $harnessRepo := include "kube-agents.imageRepository" (dict "repository" $fa.harness.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
+{{- $harnessTag := ($fa.harness.image.tag | default $defaultTag) | toString }}
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentProfile
+metadata:
+  name: {{ "fleet-audit" | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  description: {{ $fa.description | quote }}
+  persona:
+    image: {{ printf "%s:%s" $personaRepo $personaTag | quote }}
+  harness:
+    image: {{ printf "%s:%s" $harnessRepo $harnessTag | quote }}
+    model: {{ $fa.harness.model | quote }}
+    maxTurns: {{ $fa.harness.maxTurns }}
+  identity: {}
+  allowedTiers:
+    {{- toYaml $fa.allowedTiers | nindent 4 }}
+  lifecycle:
+    activeDeadlineSeconds: {{ $fa.lifecycle.activeDeadlineSeconds }}
+    ttlSecondsAfterFinished: {{ $fa.lifecycle.ttlSecondsAfterFinished }}
+  concurrency: {{ $fa.concurrency }}
+  resources:
+    {{- toYaml $fa.resources | nindent 4 }}
+{{- end }}

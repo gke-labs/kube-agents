@@ -514,3 +514,50 @@ class AgentProfileFieldGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_FLEET_AUDIT_PERSONA = _REPO_ROOT / "agents" / "fleet-audit" / "persona" / "persona.yaml"
+
+
+class HelmFleetAuditProfileTest(unittest.TestCase):
+    """The fleet-audit AgentProfile (#5623): the fleet-wide audits' parent."""
+
+    def _render(self, *extra: str) -> subprocess.CompletedProcess:
+        cmd = ["helm", "template", "test-release", str(_CHART), *_CHART_CLUSTER_SETS, *extra]
+        return subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    def _profile(self, stdout: str) -> dict:
+        found = [
+            doc
+            for doc in yaml.safe_load_all(stdout)
+            if doc and doc.get("kind") == "AgentProfile" and doc["metadata"]["name"] == "fleet-audit"
+        ]
+        self.assertEqual(len(found), 1, "expected exactly one AgentProfile/fleet-audit")
+        return found[0]
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_not_rendered_by_default(self):
+        self.assertNotIn('name: "fleet-audit"', self._render().stdout)
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_enabled_renders_the_persona_mirrored_at_read_and_unattended(self):
+        proc = self._render(
+            "--set", "profiles.fleetAudit.enabled=true",
+            "--set", "global.imageRegistry=us-docker.pkg.dev/my-proj/my-mirror",
+            "--set", "platformAgent.deployment.image.tag=v2026.11.02",
+        )
+        spec = self._profile(proc.stdout)["spec"]
+        self.assertEqual(spec["persona"]["image"], "us-docker.pkg.dev/my-proj/my-mirror/persona-fleet-audit:v2026.11.02")
+        self.assertEqual(spec["harness"]["image"], "us-docker.pkg.dev/my-proj/my-mirror/a2a-worker:v2026.11.02")
+        self.assertEqual(spec["allowedTiers"], ["read", "unattended"])
+        # The broker's report-store allowlist names this profile, so its name is fixed.
+        self.assertEqual(self._profile(proc.stdout)["metadata"]["name"], "fleet-audit")
+        self.assertNotIn("yieldToPinned", spec)
+        self.assertNotIn("clusterRef", spec)
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_it_takes_no_parameters_like_its_persona(self):
+        persona = yaml.safe_load(_FLEET_AUDIT_PERSONA.read_text(encoding="utf-8"))
+        self.assertFalse(persona.get("parameters"), "the fleet-audit persona declares parameters")
+        spec = self._profile(self._render("--set", "profiles.fleetAudit.enabled=true").stdout)["spec"]
+        self.assertFalse(spec.get("parameters"))
