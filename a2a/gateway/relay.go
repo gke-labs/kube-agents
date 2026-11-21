@@ -452,9 +452,11 @@ func taskAddressee(rec *SessionRecord, taskID string) string {
 }
 
 // relayBatch renders a session's queued events in order. Rolling-line edits
-// are coalesced: only the last event of the batch renders the line, so a
-// backlog of progress artifacts becomes one edit instead of a rate-limited
-// stampede. Posts (results, failures, input asks) always render.
+// are coalesced per task: only a task's last event in the batch renders its
+// line, so a backlog of progress artifacts becomes one edit per line instead
+// of a rate-limited stampede, and a batch carrying several tasks' events (a
+// fan-out's children share the conversation) moves each task's line. Posts
+// (results, failures, input asks) always render.
 func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
@@ -569,6 +571,10 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		}
 		fresh = append(fresh, item)
 	}
+	lastOfTask := map[string]int{}
+	for i, item := range fresh {
+		lastOfTask[item.env.TaskID] = i
+	}
 	for i, item := range fresh {
 		if g.relayInFlight.abandoned() {
 			// The stop's wait ran out on this batch: its deliveries have been
@@ -579,7 +585,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", i, "events", len(fresh))
 			return
 		}
-		g.applyEvent(ctx, rec, item, i == len(fresh)-1)
+		g.applyEvent(ctx, rec, item, i == lastOfTask[item.env.TaskID])
 		rec.markRelayed(item.env.TaskID, item.sequence())
 	}
 	if g.relayInFlight.abandoned() {
@@ -1507,8 +1513,8 @@ func isReasonTokenByte(c byte) bool {
 // turn-by-turn narration — the existing Chat integration's default-vs-debug
 // split, honoured here rather than reinvented.
 func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relayState) {
-	active := rec.ActiveTask
-	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" || active.LineClosed {
+	messageID, note, stop := liveLineOf(rec, taskID)
+	if messageID == "" {
 		return
 	}
 	if rs.busyShown && lineStillSubmitted(rs) {
@@ -1518,7 +1524,7 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	if g.cfg.DisplayMode == displayModeDefault {
 		progress = ""
 	}
-	line := withLineNote(statusLine(rs.state, progress), active.LineNote)
+	line := withLineNote(statusLine(rs.state, progress), note)
 	// The progress chat message is laid out under every display mode: it is
 	// the executor's statement of where the work is (a plan), not narration.
 	shown := lineKey(line, rs)
@@ -1529,16 +1535,39 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	// artifact renders this same line, so a failed edit recorded as sent
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
-	// A detached task (a typed stop, its terminal pending) keeps its line
-	// moving, with no Stop control: the stop is sent. One whose stop closed
-	// the line (LineClosed) returned above and keeps it.
-	stop := taskID
-	if active.Detached {
-		stop = ""
-	}
-	if g.renderLine(rec.Key, active.StatusMsgID, line, rs, stop) {
+	if g.renderLine(rec.Key, messageID, line, rs, stop) {
 		rs.lastLine = lineKey(line, rs) // after the render, which may have found the backend text-only
 	}
+}
+
+// liveLineOf is the rolling line a running task's events move: its message,
+// its note and the Stop control it keeps, or no message when the task has
+// no open line. That is the active task's line, or a fan-out child's, which
+// never holds the active task and keeps its line on its own entry
+// (taskStart.KeepActive). A delegating turn's line kept on its entry
+// (setParentLine) is not one: it waits there for the turn's terminal.
+func liveLineOf(rec *SessionRecord, taskID string) (messageID, note, stop string) {
+	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
+		// A detached task (a typed stop, its terminal pending) keeps its
+		// line moving, with no Stop control: the stop is sent. One whose
+		// stop closed the line (LineClosed) keeps it.
+		if active.StatusMsgID == "" || active.LineClosed {
+			return "", "", ""
+		}
+		if active.Detached {
+			return active.StatusMsgID, active.LineNote, ""
+		}
+		return active.StatusMsgID, active.LineNote, taskID
+	}
+	// A child the stop canceled had its line closed at "🛑 stopped" and its
+	// message taken off the entry (cancelTreeNode), as one that asked or
+	// ended has (batchChildAsks, the heal); the checks on Canceled and
+	// BatchEnd keep any of them closed should the message stay.
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok || ref.StatusMsgID == "" || ref.Canceled || ref.BatchEnd != nil || !rec.fanOutChild(ref) {
+		return "", "", ""
+	}
+	return ref.StatusMsgID, ref.LineNote, taskID
 }
 
 // editLine edits one status message and reports whether the edit landed.

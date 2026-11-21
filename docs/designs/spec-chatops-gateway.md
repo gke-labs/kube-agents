@@ -530,7 +530,11 @@ turn that already got one does not. A batch of two or more checks every entry as
 checked (target, parameters, the lists, depth) before it mints any, so one entry that fails refuses
 the whole batch with nothing minted. Its children don't take the conversation's active task or
 its addressee: the delegating turn keeps both, and each child records its parent, which lists them
-all. A child that can't be submitted partway through withdraws the batch: the children already
+all. Each child keeps its own rolling line on its history entry, on a backend that keeps lines (none on
+Slack, a `StatusShower`: the single profile child's exception does not extend to a batch), and the relay moves it with
+that child's own working and progress events, under the display mode any line follows, until its terminal or a stop closes it;
+the relay coalesces line edits per task within a batch of queued events, so one batch carrying several children's events
+moves each child's line. A child that can't be submitted partway through withdraws the batch: the children already
 submitted are canceled and dropped from the record, except one whose cancel couldn't be published, which stays on it, marked canceled with its cancel unsent, so it still counts as live and the next turn's heal sends its cancel again. A batch of one is a
 single child, which takes the active task as before. Width bounds what one conversation asks for,
 not what runs at once: children queue at the dispatcher, held to each profile's concurrency. At the
