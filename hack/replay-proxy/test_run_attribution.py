@@ -205,18 +205,25 @@ class DecisionTest(unittest.TestCase):
         saved = self._first_writer("t_99999999", ["B"], ["pass"])
         self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
 
-    def test_the_same_answer_given_to_a_failing_run_too_is_not_published(self):
+    def test_the_same_answer_given_to_a_failing_run_too_is_proven_by_both(self):
         saved = self._first_writer("t_99999999", ["A", "A"], ["pass", "fail"])
-        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).__dict__,
+                         {"decision": "fail", "runs": ("case-a#1", "case-a#2")})
+
+    def test_an_answer_saved_by_background_traffic_is_proven_by_a_failing_run_that_gave_it(self):
+        saved = self._first_writer("t_99999999", ["A"], ["fail"])
+        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).__dict__,
+                         {"decision": "fail", "runs": ("case-a#1",)})
 
     def test_a_failing_runs_saved_answer_stays_a_fail_when_a_passing_run_gave_it_too(self):
         saved = self._first_writer("t_00000002", ["A"], ["pass"])
         self.world.run("case-a", 2, "fail", ["t_00000002"])
         self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "fail")
 
-    def test_a_failing_runs_saving_line_beside_an_unworked_card_is_not_published(self):
+    def test_a_saving_line_beside_an_unworked_card_takes_another_lines_evidence(self):
         # The saving line is a failing run's worker that also created a card no
-        # run worked (a run cut short), so it decides unattributed with that run.
+        # run worked (a run cut short), so it decides unattributed with that run;
+        # the passing run's line that got the same answer proves it.
         self.world.run("case-a", 1, "pass", ["t_00000001"])
         self.world.request(worker("t_00000001"), "opening", answer="A")
         self.world.run("case-a", 2, "fail", ["t_00000002"])
@@ -224,15 +231,14 @@ class DecisionTest(unittest.TestCase):
         attribution = self.world.attribution()
         line = RA.Line.from_entry(saved)
         self.assertEqual(attribution.decide(line).__dict__, {"decision": "unattributed", "runs": ("case-a#2",)})
-        self.assertEqual(attribution.decide_answer(line).decision, "unattributed")
+        self.assertEqual(attribution.decide_answer(line).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
 
-    def test_a_failing_run_beside_an_unworked_card_that_got_the_answer_blocks_it(self):
+    def test_a_disagreeing_line_that_got_the_answer_blocks_it(self):
         saved = self._first_writer("t_99999999", ["A"], ["pass"])
-        self.world.run("case-a", 2, "fail", ["t_00000002"])
-        self.world.request(worker("t_00000002", *created("t_88888888")), "opening", answer="A")
+        self.world.request(worker("t_00000001"), "opening", answer="A", tag=World.tag("case-b", 1))
         self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
 
-    def test_a_tagged_card_less_line_proves_a_saved_answer_and_a_failing_ones_blocks_it(self):
+    def test_tagged_card_less_lines_prove_a_saved_answer_passing_or_failing(self):
         saved = self.world.request(worker("t_99999999"), "r1", recorded=True, answer="A")
         self.world.run("case-a", 1, "pass", ["t_00000001"])
         self.world.request(front(), "r1", answer="A", tag=World.tag("case-a", 1))
@@ -240,7 +246,8 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(self.world.attribution().decide_answer(line).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
         self.world.run("case-a", 2, "fail", ["t_00000002"])
         self.world.request(front(), "r1", answer="A", tag=World.tag("case-a", 2))
-        self.assertEqual(self.world.attribution().decide_answer(line).decision, "unattributed")
+        self.assertEqual(self.world.attribution().decide_answer(line).__dict__,
+                         {"decision": "fail", "runs": ("case-a#1", "case-a#2")})
 
     def test_a_passing_run_in_another_build_is_no_evidence(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])

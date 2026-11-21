@@ -97,13 +97,16 @@ class LaneReportTest(unittest.TestCase):
                 self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
                 self.assertEqual(report["unknown_reasons"], {"no_verdict": 1})
 
-    def test_a_conversation_whose_recording_night_is_in_no_record_is_unknown_and_says_why(self):
+    def test_a_conversation_whose_recording_night_is_in_no_record_is_still_graded_by_its_own_run(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.run("case-a", 2, "fail", ["t_00000002"])
         self.conversation("t_00000001", (True, True), recorded_from="1790000000000000999")
+        self.conversation("t_00000002", (True, True), recorded_from="1790000000000000999")
         report, summary = self.report({NIGHT: []})
-        self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
-        self.assertEqual(report["unknown_reasons"], {"recording_build_unrecorded": 1})
-        self.assertIn("recording_build_unrecorded", summary)
+        self.assertEqual(report["served_conversations"], {"match": 1, "mismatch": 1, "unknown": 0})
+        self.assertEqual(report["unknown_reasons"], {})
+        self.assertEqual(report["mismatched_conversations"][0]["recorded_build"], "1790000000000000999")
+        self.assertIn("served conversations by the replayed run's verdict", summary)
 
     def test_an_answer_first_written_by_an_older_night_still_gets_a_verdict(self):
         # The fetch reads runs back to the lifecycle (fetch_cache.py), so a night
