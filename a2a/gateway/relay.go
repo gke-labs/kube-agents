@@ -150,9 +150,6 @@ var reasonDetailShown = map[string]bool{
 	"parameters-invalid":     true,
 	"queue-timeout":          true,
 	"delegation-not-started": true,
-	// A profile task the worker stopped at a write refusal: the detail
-	// names the policy rule and the refused verb.
-	"write-refused": true,
 }
 
 // KV access rides withRetry with these shapes: enough to ride out a
