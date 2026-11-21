@@ -925,7 +925,7 @@ func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
 // a wake used to loop to the depth bound with nothing answered.
 const (
 	wakeReplyGuide     = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
-	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the whole answer to their question from it, briefly: the finding first, then only the evidence it rests on, in the format their question asked for if it gave one. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it, in the format their question asked for if it gave one. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
 )
 
 // wakeReplyGuideMax is the longer of the two guides, which the result
