@@ -32,6 +32,8 @@ escaped again, so `gitlab.com%2Fgroup%252Frepo`):
     GET    /v1/audit-reports/<audit>/<key>/runs            run names, newest first
     GET    /v1/audit-reports/<audit>/<key>/runs/<stamp>    one ring entry
     PUT    /v1/audit-reports/<audit>/<key>/runs/<stamp>    write a ring entry, prune
+    GET    /v1/audit-reports/<audit>/<key>/runs/started-<run>  one run-start record
+    PUT    /v1/audit-reports/<audit>/<key>/runs/started-<run>  write a run-start record, prune
     PUT    /v1/audit-reports/<audit>/<key>/latest          copy a ring entry to latest
     DELETE /v1/audit-reports/<audit>/<key>/latest          drop latest (idempotent)
 
@@ -52,6 +54,27 @@ sidecar's hash is that of the bytes being returned, so a sidecar can never
 vouch for another envelope; otherwise, or with no sidecar (an envelope written
 before this, or by the file store directly), there is no header. The
 envelope's bytes are never changed.
+
+A run-start record (#6812) is the one name on the run routes that is not a
+stamp: `started-<run>`, with <run> the run's id (a DNS-1123 label: a profile
+task's id, or the id `start` made for a run in the shell). `start` writes it
+and `finish` rewrites it with `done_at`, so a reader can tell a stream whose
+newest run started and never finished. It is kept in a sibling directory,
+`run-starts/<run>.json`, never in `runs/`: the file store's readers list
+`runs/*.json` as the ring, and an older one would read a record there as the
+newest run. So it is never a ring entry: not listed by GET runs, not pruned
+with the ring, never matched by PUT latest, and GET or DELETE latest cannot
+name it. A record is a small JSON object (RUN_START_MAX_BYTES) whose `run_id`
+is the name's and whose `started_at` is a time with a zone, no further ahead of
+this clock than a run stamp may be, so a done mark with no start is refused
+and a far-future start cannot stand as the newest for good. The stream keeps
+the newest RUN_START_HISTORY by `started_at`. The writer header is checked as
+on a ring entry's PUT and not kept: the record is no report, and the A2A relay
+that trusts a stamp cannot read it. The stream list carries the newest record
+of each stream as `last_run_start`, when there is one. A record never creates
+the stream's store: a PUT for a store that does not exist yet is answered 404,
+because a store that exists is one a run has published to, so a stream's first
+run for a repository is not tracked.
 
 The path is read from the raw request path, not the decoded one, because the
 key's `%2F` is what keeps it one segment. The token is never logged.
@@ -141,6 +164,21 @@ STORE_DIR_NAME_MAX_BYTES = 255
 # unbounded there; here a single envelope is capped at 1 MiB, and anything
 # larger is answered 413 rather than written.
 REPORT_MAX_BYTES = 1 << 20
+
+# The run-start record (the module docstring). report_status.py holds copies of
+# the names and the bounds, which test_audit_report_store.py holds equal.
+RUN_START_PREFIX = "started-"
+RUN_STARTS_DIR = "run-starts"
+_RUN_ID = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+RUN_ID_RE = re.compile(rf"^{_RUN_ID}\Z")
+RUN_START_NAME_RE = re.compile(rf"^{RUN_START_PREFIX}(?P<run>{_RUN_ID})\Z")
+RUN_START_HISTORY = 8
+RUN_START_MAX_BYTES = 4096
+# The keys a stream listing passes on from the newest record, each only with
+# its own type: `run_id`, `started_at`, `done_at` and `outcome` strings,
+# `scheduled` a boolean.
+RUN_START_LISTED_KEYS = ("run_id", "started_at", "scheduled", "done_at", "outcome")
+RUN_START_OUTCOME_MAX_CHARS = 64
 
 AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
 AUDIT_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -896,15 +934,130 @@ def list_streams(root: str) -> list[dict]:
                         finished = latest["finished_at"]
                 except (_Missing, Refused, OSError, ValueError, RecursionError):
                     pass
-                streams.append(
-                    {
-                        "audit_id": audit,
-                        "key": key,
-                        "newest_run": ring[-1][: -len(".json")] if ring else None,
-                        "latest_finished_at": finished,
-                    }
-                )
+                row = {
+                    "audit_id": audit,
+                    "key": key,
+                    "newest_run": ring[-1][: -len(".json")] if ring else None,
+                    "latest_finished_at": finished,
+                }
+                newest = _newest_run_start_of(root, [audit, owner, name])
+                if newest is not None:
+                    row["last_run_start"] = newest
+                streams.append(row)
     return streams
+
+
+def _newest_run_start_of(root: str, parts: list[str]) -> dict | None:
+    """The stream's newest run-start record as a listing carries it, or None.
+
+    None too when the records cannot be read: the listing is of reports, and a
+    record it could not read costs only the note a reader would add.
+    """
+    try:
+        with _DirChain(root, parts + [RUN_STARTS_DIR], create=False) as starts:
+            records, _ = _run_start_records(starts.fd)
+    except (_Missing, Refused, OSError):
+        return None
+    if not records:
+        return None
+    record = records[-1][3]
+    listed: dict = {}
+    for name in RUN_START_LISTED_KEYS:
+        value = record.get(name)
+        if name == "scheduled":
+            if isinstance(value, bool):
+                listed[name] = value
+        elif isinstance(value, str) and len(value) <= RUN_START_OUTCOME_MAX_CHARS:
+            listed[name] = value
+    return listed
+
+
+def _record_time(value: object) -> float | None:
+    """An ISO 8601 time with a zone as an epoch, or None for anything else."""
+    if not isinstance(value, str) or len(value) > RUN_START_OUTCOME_MAX_CHARS:
+        return None
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None
+    try:
+        return when.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _validated_run_start(body: bytes, run_id: str) -> bytes:
+    """A run-start record's body, unchanged, once it is one (the module docstring)."""
+    if len(body) > RUN_START_MAX_BYTES:
+        raise Refused(413, f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
+    try:
+        record = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise Refused(400, "the body is not JSON") from None
+    if not isinstance(record, dict):
+        raise Refused(400, "the body is not a JSON object")
+    if record.get("run_id") != run_id:
+        raise Refused(400, "the run-start record names another run")
+    started = _record_time(record.get("started_at"))
+    if started is None:
+        # A done mark with no start of its own is no record of a run.
+        raise Refused(400, "the run-start record has no started_at")
+    if started > _now() + RUN_STAMP_MAX_FUTURE_SECONDS:
+        raise Refused(400, "the run-start record is stamped in the future")
+    if "scheduled" in record and not isinstance(record["scheduled"], bool):
+        raise Refused(400, "the run-start record's scheduled is not a boolean")
+    if record.get("done_at") is not None and _record_time(record.get("done_at")) is None:
+        raise Refused(400, "the run-start record's done_at is not a time")
+    outcome = record.get("outcome")
+    if outcome is not None and (not isinstance(outcome, str) or len(outcome) > RUN_START_OUTCOME_MAX_CHARS):
+        raise Refused(400, "the run-start record's outcome is not a short string")
+    return body
+
+
+def _run_start_records(starts_fd: int) -> tuple[list[tuple[float, str, str, dict]], list[str]]:
+    """The readable records, oldest first by `started_at` then run id, and the names that are not.
+
+    Each record as (started, run id, file name, record). A file named for a run
+    that does not read back as that run's record (another run's id inside, no
+    `started_at`, over RUN_START_MAX_BYTES, not a regular file) is in the
+    second list, for the prune; anything not named `<run id>.json` (a temp
+    file mid-write) is in neither.
+    """
+    records = []
+    invalid = []
+    for name in _listdir(starts_fd):
+        run_id = name[: -len(".json")] if name.endswith(".json") else ""
+        if not RUN_ID_RE.match(run_id):
+            continue
+        try:
+            data = _read_at(starts_fd, name)
+            record = json.loads(data.decode("utf-8")) if len(data) <= RUN_START_MAX_BYTES else None
+        except Refused as exc:
+            if exc.status == 404:
+                continue
+            record = None
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            record = None
+        started = (
+            _record_time(record.get("started_at"))
+            if isinstance(record, dict) and record.get("run_id") == run_id
+            else None
+        )
+        if started is None:
+            invalid.append(name)
+            continue
+        records.append((started, run_id, name, record))
+    records.sort(key=lambda entry: (entry[0], entry[1]))
+    return records, invalid
+
+
+def _prune_run_starts(starts_fd: int) -> None:
+    """Keep the newest RUN_START_HISTORY records; drop every file named for a run that is not one."""
+    records, invalid = _run_start_records(starts_fd)
+    for name in invalid + [entry[2] for entry in records[:-RUN_START_HISTORY]]:
+        _drop_at(starts_fd, name)
 
 
 @contextlib.contextmanager
@@ -995,6 +1148,9 @@ def _handle_store(
         if method != "GET":
             raise Refused(405, "method not allowed")
         return 200, [entry[: -len(".json")] for entry in reversed(_ring_of(root, store))], None
+    run_id = _run_start_id(rest[1])
+    if run_id is not None:
+        return _handle_run_start(root, method, audit_id, store, run_id, body, writer)
     stamp = _validate_stamp(rest[1])
     if method == "GET":
         with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
@@ -1024,6 +1180,47 @@ def _handle_store(
                     LOGGER.warning("report store prune failed for %s: %s", audit_id, exc)
             finally:
                 os.close(runs_fd)
+        return 204, None, None
+    raise Refused(405, "method not allowed")
+
+
+def _run_start_id(name: str) -> str | None:
+    """The run id a `started-<run>` name carries, or None for any other name."""
+    match = RUN_START_NAME_RE.match(name)
+    return match.group("run") if match else None
+
+
+def _handle_run_start(
+    root: str, method: str, audit_id: str, store: list[str], run_id: str, body: bytes, writer: str | None
+) -> tuple[int, bytes | list | None, str | None]:
+    """GET or PUT one run-start record, `run-starts/<run>.json` (the module docstring)."""
+    name = f"{run_id}.json"
+    if method == "GET":
+        with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
+            starts_fd = _open_child_dir(chain.fd, RUN_STARTS_DIR, create=False)
+            try:
+                return 200, _read_at(starts_fd, name), None
+            finally:
+                os.close(starts_fd)
+    if method == "PUT":
+        # Checked as on a ring entry's PUT, so a malformed stamp is refused
+        # alike; not kept, since the record is no report.
+        _validated_writer(writer, audit_id)
+        data = _validated_run_start(body, run_id)
+        # The stream's store must exist already: a record never makes one. A
+        # store that exists is one a run published to, and a first run's
+        # record would make the next run read a lost memory. So a stream's
+        # first run is answered 404, as GET is for a missing store, untracked.
+        with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
+            starts_fd = _open_child_dir(chain.fd, RUN_STARTS_DIR, create=True)
+            try:
+                _write_at(starts_fd, name, data)
+                try:
+                    _prune_run_starts(starts_fd)
+                except Exception as exc:  # noqa: BLE001 - the record is written; extra records cost disk only
+                    LOGGER.warning("run-start prune failed for %s: %s", audit_id, exc)
+            finally:
+                os.close(starts_fd)
         return 204, None, None
     raise Refused(405, "method not allowed")
 

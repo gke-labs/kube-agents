@@ -10,6 +10,7 @@ commands that do touch the network are driven through a single recorded seam
 (audit_report.run_cmd) plus stubs for credential minting.
 """
 
+import base64
 import contextlib
 import copy
 import fnmatch
@@ -49,6 +50,7 @@ import gitops_workspace  # noqa: E402
 import no_live_google_auth  # noqa: E402
 import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
+import report_status  # noqa: E402
 import vcs_broker  # noqa: E402
 import vcs_client  # noqa: E402
 import workspace_paths  # noqa: E402
@@ -3364,10 +3366,11 @@ class TestAuditCatalogue(unittest.TestCase):
         for audit_id, spec in sorted(audit_report.AUDITS.items()):
             with self.subTest(audit=audit_id):
                 self.assertIn(audit_id, jobs, f"{audit_id} has no cron job")
+                # `start` records it on the run-start record (#6812).
                 phrase = (
-                    "pass --scheduled to precheck and finish"
+                    "pass --scheduled to start, precheck and finish"
                     if audit_id in PRECHECK_STREAMS
-                    else "pass --scheduled to finish"
+                    else "pass --scheduled to start and finish"
                 )
                 self.assertIn(
                     phrase,
@@ -6058,7 +6061,10 @@ class TestStart(HarnessTestCase):
         note = Path(audit_report.inflight_path_for(AUDIT))
         self.assertNotIn(str(note.parent), self.err)
         self.assertIn("a lease on the stream, not a process", self.err)
-        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at"})
+        # The run id (#6812) names the run for its run-start record, not a
+        # process, and the refusal never prints it.
+        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at", "run_id"})
+        self.assertNotIn(json.loads(note.read_text())["run_id"], self.err)
         # Refused means refused: the other run's note is still there.
         self.assertTrue(note.is_file())
         # There is no flag past the guard. The CLI had `--takeover` until
@@ -6591,6 +6597,114 @@ class TestStart(HarnessTestCase):
 # --------------------------------------------------------------------------- #
 # --dry-run
 # --------------------------------------------------------------------------- #
+
+
+class TestRunStartRecord(HarnessTestCase):
+    """`start` writes a run-start record and `finish` marks its own run's done (#6812)."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("findings_path_for", lambda audit_id: str(self.tmp_path / f"findings_{audit_id}.json"))
+        self.patch_attr("run_record_path_for", lambda audit_id: str(self.tmp_path / f"run_{audit_id}.json"))
+        self.patch_attr("declarations_path_for", lambda audit_id: str(self.tmp_path / f"declarations_{audit_id}.json"))
+        audit_report._RUN_START_LOGGED.clear()
+        self.addCleanup(audit_report._RUN_START_LOGGED.clear)
+        self.harness.replies = {"issue-list": self.issue_list()}
+
+    def records(self, repo="acme/fleet"):
+        directory = self.store_dir(repo=repo) / report_status.RUN_STARTS_DIR
+        if not directory.is_dir():
+            return {}
+        return {path.stem: json.loads(path.read_text()) for path in directory.glob("*.json")}
+
+    def unfinished(self):
+        return report_status.unfinished_run_of(str(self.reports_dir), AUDIT, "acme/fleet")
+
+    def as_task(self, task_id):
+        """This process holds a task credential naming `task_id`, as a profile worker does."""
+        token = self.tmp_path / "task-token"
+        claims = base64.urlsafe_b64encode(json.dumps({"nats": {"task": task_id}}).encode()).decode().rstrip("=")
+        token.write_text(f"e30.{claims}.sig")
+        env = patch.dict(os.environ, {report_status.TASK_TOKEN_FILE_ENV: str(token)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_start_records_the_run_and_finish_marks_it_done(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        note = json.loads(Path(audit_report.inflight_path_for(AUDIT)).read_text())
+        records = self.records()
+        self.assertEqual([note["run_id"]], list(records))
+        record = records[note["run_id"]]
+        self.assertTrue(note["run_id"].startswith(audit_report.RUN_ID_LOCAL_PREFIX))
+        self.assertIs(record["scheduled"], True)
+        self.assertNotIn("done_at", record)
+        # Running: readers say the last run did not finish, beside the report.
+        self.assertEqual(note["run_id"], self.unfinished()["run_id"])
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        record = self.records()[note["run_id"]]
+        self.assertEqual(note["run_id"], record["run_id"])
+        self.assertIsInstance(record["done_at"], str)
+        self.assertTrue(record["outcome"])
+        self.assertIsNone(self.unfinished())
+
+    def test_a_run_without_scheduled_is_recorded_as_on_demand(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        (record,) = self.records().values()
+        self.assertIs(record["scheduled"], False)
+
+    def test_a_run_that_never_finished_reads_as_unfinished(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        # Its finish died on the forge: nothing was published, and the record
+        # keeps no done mark.
+        self.harness.failures = {"issue-update": 1, "issue-create": 1}
+        self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 1, self.err)
+        unfinished = self.unfinished()
+        self.assertEqual("the last run did not finish", unfinished["note"])
+        self.assertTrue(unfinished["scheduled"])
+
+    def test_a_dry_run_marks_nothing(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual(self.run_finish(make_doc(findings=[]), argv_extra=("--dry-run",)), 0, self.err)
+        (record,) = self.records().values()
+        self.assertNotIn("done_at", record)
+
+    def test_a_profile_task_is_its_own_run_and_a_late_finish_marks_only_its_own(self):
+        self.as_task("task-old")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.as_task("task-new")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.assertEqual({"task-old", "task-new"}, set(self.records()))
+        # The older task's finish lands after the newer one started.
+        self.as_task("task-old")
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        records = self.records()
+        self.assertIn("done_at", records["task-old"])
+        self.assertNotIn("done_at", records["task-new"])
+        self.assertEqual("task-new", self.unfinished()["run_id"])
+
+    def test_a_first_run_makes_no_store_for_its_record(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertFalse(self.store_dir().exists())
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertFalse(self.store_dir().exists())
+        self.assertNotIn("run-start", self.err)
+
+    def test_a_store_that_refuses_the_record_never_stops_the_run(self):
+        # An older broker or listener refuses the name (404 or 400): `start`
+        # says so once and goes on, and `finish` marks nothing and says nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        refusal = report_status.ReportStoreUnavailable("the report store is unavailable: HTTP 404 (not_found)", 404)
+        with patch.object(report_status, "write_run_start", side_effect=refusal), patch.object(
+            report_status, "read_run_start", side_effect=refusal
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+            self.assertEqual(1, self.err.count("does not take run-start records yet"))
+            self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assertNotIn("not marked done", self.err)
 
 
 class TestDryRun(BaseTestCase):

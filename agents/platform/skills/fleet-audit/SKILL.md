@@ -89,7 +89,7 @@ Run every script by its full path. A kanban worker starts in its card's workspac
 1. **`start`, before anything else.**
 
    ```bash
-   /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit <audit-id> [--repo "<owner>/<repo>"]
+   /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit <audit-id> [--repo "<owner>/<repo>"] [--scheduled]
    ```
 
    It prints one JSON line: `sop`, the stream's SOP by full path; `checks`, the roster to run;
@@ -129,7 +129,7 @@ Run every script by its full path. A kanban worker starts in its card's workspac
      [--decline-fix <finding-id> "<why>" ...] [--no-promote] [--scheduled]
    ```
 
-   Pass `--scheduled` to `precheck` and to `finish` only when the cron prompt tells you to; never on
+   Pass `--scheduled` to `start`, `precheck` and `finish` only when the cron prompt tells you to; never on
    a run a person asked for (`references/finish.md`). Pass `--no-promote` when the card says not to open a pull request: the
    ledger still publishes, no automatic remediation pull request opens on that run.
 

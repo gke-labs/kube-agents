@@ -70,6 +70,22 @@ RUNS_DIR = "runs"
 # `finished_at` in UTC, in this form, so the two compare as strings.
 RUN_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 
+# The run-start record (#6812): `start` writes one per run beside the store,
+# `run-starts/<run id>.json`, and `finish` rewrites its own run's with
+# `done_at`. A sibling of `runs/`, never in it, so a reader that lists the ring
+# never takes one for a run. The broker store names it `runs/started-<run id>`
+# on the wire. Restated from audit_report_store.RUN_START_* (a test holds them
+# equal), as this file imports nothing (the module docstring).
+RUN_STARTS_DIR = "run-starts"
+RUN_START_PREFIX = "started-"
+RUN_ID_RE = re.compile(r"\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+RUN_START_HISTORY = 8
+RUN_START_MAX_BYTES = 4096
+# What a reader says beside the report when the newest record never got its
+# done mark: the run that started last did not reach `finish` (or is still
+# running), so the report is the run before it.
+UNFINISHED_RUN_NOTE = "the last run did not finish"
+
 # Always present on a projected `latest`, null when the envelope lacks them, so
 # a reader never has to tell an absent key from a null one. Everything else the
 # envelope carries except the keys below rides along untouched
@@ -619,8 +635,189 @@ def _project_repo(root: str, audit_id: str, repo: str) -> dict:
         # newer than this.
         "latest_missing": latest_missing,
         "runs": runs,
+        # Beside the report, never in it: the newest run-start record when it
+        # has no done mark, else null.
+        "unfinished_run": unfinished_run_of(root, audit_id, repo),
         "error": error,
     }
+
+
+def _record_epoch(value: object) -> float | None:
+    """An ISO 8601 time with a zone, as a run-start record holds one, as an epoch; else None."""
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None
+    try:
+        return when.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _run_start_of(value: object, run_id: str | None = None) -> dict | None:
+    """`value` when it is a run-start record (for `run_id`, when given), else None.
+
+    A record names its run and when it started. One without a readable
+    `started_at` -- a done mark that no `start` wrote -- is no record, so it
+    can never stand as the newest and hide a later start.
+    """
+    if not isinstance(value, dict):
+        return None
+    named = value.get("run_id")
+    if not isinstance(named, str) or not RUN_ID_RE.match(named) or (run_id is not None and named != run_id):
+        return None
+    if _record_epoch(value.get("started_at")) is None:
+        return None
+    return value
+
+
+def newest_run_start(records: list) -> dict | None:
+    """The record that started last, by `started_at` then run id; None when none is one."""
+    valid = [record for record in (_run_start_of(value) for value in records) if record is not None]
+    if not valid:
+        return None
+    return max(valid, key=lambda record: (_record_epoch(record["started_at"]), record["run_id"]))
+
+
+def run_start_record(
+    run_id: str, started_at: str, scheduled: bool, done_at: str | None = None, outcome: str | None = None
+) -> dict:
+    """A run-start record as `start` writes it, and `finish` with its done mark."""
+    record: dict = {"run_id": run_id, "started_at": started_at, "scheduled": bool(scheduled)}
+    if done_at is not None:
+        record["done_at"] = done_at
+        record["outcome"] = outcome
+    return record
+
+
+def write_run_start(root: str, audit_id: str, repo: str, record: dict) -> None:
+    """Write one run-start record, replacing its run's. Raises OSError or ValueError.
+
+    FileNotFoundError when the stream has no store for `repo` yet: a record
+    never creates one (a store that exists is one a run published to), so a
+    stream's first run is not tracked. The broker store's listener and this
+    file store keep the newest RUN_START_HISTORY by `started_at`.
+    """
+    run_id = record.get("run_id")
+    if _run_start_of(record) is None:
+        raise ValueError("not a run-start record: it needs a run id and a started_at")
+    data = json.dumps(record, sort_keys=True).encode("utf-8")
+    if len(data) > RUN_START_MAX_BYTES:
+        raise ValueError(f"a run-start record is over {RUN_START_MAX_BYTES} bytes")
+    if isinstance(root, BrokerReportStore):
+        root.write_run_start(audit_id, repo, run_id, data)
+        return
+    store = store_path(root, audit_id, repo)
+    if not os.path.isdir(store):
+        # As the listener: a record never creates the store, since a store
+        # that exists is one a run published to.
+        raise FileNotFoundError(f"no report store for {audit_id} in {repo} yet")
+    directory = os.path.join(store, RUN_STARTS_DIR)
+    os.makedirs(directory, exist_ok=True)
+    target = os.path.join(directory, f"{run_id}.json")
+    staged = f"{target}.{os.getpid()}.tmp"
+    try:
+        with open(staged, "wb") as handle:
+            handle.write(data)
+        os.replace(staged, target)
+    except BaseException:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
+    _prune_run_starts(directory)
+
+
+def _file_run_starts(directory: str) -> list[tuple[str, dict | None]]:
+    """Every `<run id>.json` in a file store's record directory, read: (name, record or None)."""
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    records = []
+    for name in names:
+        run_id = name[: -len(".json")] if name.endswith(".json") else ""
+        if not RUN_ID_RE.match(run_id):
+            continue
+        try:
+            with open(os.path.join(directory, name), "rb") as handle:
+                data = handle.read(RUN_START_MAX_BYTES + 1)
+            value = json.loads(data.decode("utf-8")) if len(data) <= RUN_START_MAX_BYTES else None
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            value = None
+        records.append((name, _run_start_of(value, run_id)))
+    return records
+
+
+def _prune_run_starts(directory: str) -> None:
+    """Keep the newest RUN_START_HISTORY records, as the listener does. Best-effort."""
+    try:
+        records = _file_run_starts(directory)
+        valid = sorted(
+            ((name, record) for name, record in records if record is not None),
+            key=lambda entry: (_record_epoch(entry[1]["started_at"]), entry[1]["run_id"]),
+        )
+        stale = [name for name, record in records if record is None] + [name for name, _ in valid[:-RUN_START_HISTORY]]
+        for name in stale:
+            os.unlink(os.path.join(directory, name))
+    except OSError:
+        pass
+
+
+def read_run_start(root: str, audit_id: str, repo: str, run_id: str) -> dict | None:
+    """One run's record; None when there is none, or what is there is not that run's."""
+    if not RUN_ID_RE.match(str(run_id)):
+        raise ValueError(f"run id {run_id!r} is not a DNS-1123 label")
+    if isinstance(root, BrokerReportStore):
+        data = root.read_run_start(audit_id, repo, run_id)
+        value = None if data is None else json.loads(data.decode("utf-8"))
+    else:
+        try:
+            value = read_json(os.path.join(store_path(root, audit_id, repo), RUN_STARTS_DIR, f"{run_id}.json"))
+        except FileNotFoundError:
+            return None
+    return _run_start_of(value, run_id)
+
+
+def last_run_start(root: str, audit_id: str, repo: str) -> dict | None:
+    """The stream's newest run-start record for `repo`, or None when it has none.
+
+    Through the broker store, the listener's stream list carries it; a
+    listener that predates the records carries none, and this is None.
+    """
+    if isinstance(root, BrokerReportStore):
+        return root.last_run_start(audit_id, repo)
+    directory = os.path.join(store_path(root, audit_id, repo), RUN_STARTS_DIR)
+    return newest_run_start([record for _, record in _file_run_starts(directory)])
+
+
+def unfinished_run(record: dict | None) -> dict | None:
+    """What a reader shows for the newest record: a note when it has no done mark, else None."""
+    record = _run_start_of(record)
+    if record is None or isinstance(record.get("done_at"), str):
+        return None
+    return {
+        "note": UNFINISHED_RUN_NOTE,
+        "run_id": record["run_id"],
+        "started_at": record["started_at"],
+        "scheduled": record.get("scheduled") is True,
+    }
+
+
+def unfinished_run_of(root: str, audit_id: str, repo: str) -> dict | None:
+    """`unfinished_run` of the stream's newest record. None when it cannot be read:
+    the note is beside the report, and a record that cannot be read costs only the note."""
+    try:
+        return unfinished_run(last_run_start(root, audit_id, repo))
+    except (OSError, ValueError):
+        return None
 
 
 def _project_started(started: float | None, now_epoch: float) -> dict | None:
@@ -819,6 +1016,36 @@ def _is_report_credential(token: str) -> bool:
     return isinstance(nats, dict) and "target" not in nats
 
 
+def task_id_from_credential() -> str | None:
+    """The task id (`nats.task`) of this pod's task credential, read unverified, or None.
+
+    A profile worker's run id for its run-start record (#6812): its own task,
+    which no other run shares. Read, not trusted: the broker verifies the
+    credential on every request, and the id only names the record. None when
+    there is no task credential, it cannot be read, or the claim is not a
+    DNS-1123 label.
+    """
+    token_file = os.environ.get(TASK_TOKEN_FILE_ENV, "").strip()
+    if not token_file:
+        return None
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read(MAX_TASK_CREDENTIAL_BYTES + 1).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    parts = token.split(".")
+    if len(token) > MAX_TASK_CREDENTIAL_BYTES or len(parts) != 3:
+        return None
+    segment = parts[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, RecursionError):
+        return None
+    nats = claims.get("nats") if isinstance(claims, dict) else None
+    task = nats.get("task") if isinstance(nats, dict) else None
+    return task if isinstance(task, str) and RUN_ID_RE.match(task) else None
+
+
 def _audit_reports_path(path: str) -> bool:
     path = urllib.parse.urlsplit(path).path
     return path == AUDIT_REPORTS_ROUTE or path.startswith(AUDIT_REPORTS_ROUTE + "/")
@@ -1003,6 +1230,33 @@ class BrokerReportStore(str):
         self._maybe_seed(audit_id, repo)
         self._request("PUT", self._stream_path(audit_id, repo, "runs", self._stamp(name)), data)
         self._streams = None
+
+    def write_run_start(self, audit_id: str, repo: str, run_id: str, data: bytes) -> None:
+        """PUT one run-start record (`runs/started-<run id>`). Not seeded first:
+        the seed copies the ring and latest, and a record is neither."""
+        self._request("PUT", self._stream_path(audit_id, repo, "runs", self._run_start_name(run_id)), data)
+        self._streams = None
+
+    def read_run_start(self, audit_id: str, repo: str, run_id: str) -> bytes | None:
+        """One run-start record's bytes; None when the store holds none for that run."""
+        try:
+            return self._request("GET", self._stream_path(audit_id, repo, "runs", self._run_start_name(run_id)))
+        except FileNotFoundError:
+            return None
+
+    def last_run_start(self, audit_id: str, repo: str) -> dict | None:
+        """The newest record the stream list carries for this stream (`last_run_start`)."""
+        key = broker_store_key(repo)
+        for row in self.streams():
+            if row.get("audit_id") == audit_id and row.get("key") == key:
+                return _run_start_of(row.get("last_run_start"))
+        return None
+
+    @staticmethod
+    def _run_start_name(run_id: str) -> str:
+        if not RUN_ID_RE.match(str(run_id)):
+            raise ValueError(f"run id {run_id!r} is not a DNS-1123 label")
+        return RUN_START_PREFIX + run_id
 
     def write_latest(self, audit_id: str, repo: str, data: bytes) -> None:
         self._maybe_seed(audit_id, repo)

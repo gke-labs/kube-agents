@@ -78,6 +78,12 @@ this directory. `streams` and `runs` report it as `liveness`: `never` (no run st
 problem (a sibling repository's unreadable store, a bad lease note) comes back under `error` with
 exit 2 even when the listing is complete; report it, do not drop it.
 
+`streams` rows, and `show` for the newest run, carry `unfinished_run`: null, or `note` ("the last
+run did not finish"), `run_id`, `started_at` and `scheduled` when the newest run of that stream
+started and never reached `finish` (stopped, out of memory, past its deadline, or its pod lost). The
+report is then the run before it. Say so beside the answer, with its `started_at`; a finished run
+has null, and nothing extra to say.
+
 ## Query it; do not read it
 
 **Never open a store file** — not `latest.json`, not a ring entry, not with a file tool and not
