@@ -373,7 +373,7 @@ FIXTURE_NOT_READY = {
     # starts before a per-node agent's pod is Ready. That order is evidence
     # only on a node made after the agent's DaemonSet, and a workload's restart
     # resets it. The fleet's pools make a node only at an upgrade or a repair,
-    # and its one zero-node pool is read by other cases as empty; the cost,
+    # and its two zero-node pools are read by other cases as empty; the cost,
     # not tried, is a pool of its own with one standing small node. The first
     # plan's signal, a label only a fixture writes, is not a fixture (fixture
     # rule 9). #5411 owns the gap and proposes the first plan's check.

@@ -27,7 +27,7 @@
 # `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: control-plane-konnectivity-agent-exhaustion
-name: "Konnectivity agent count below GKE's size table (declared gap; nothing planted; a fixture waits for the fleet owner's decision)"
+name: "Konnectivity agent count below GKE's size table (declared gap; nothing planted; a fixture is possible, the fleet's owner not yet asked)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2
@@ -41,11 +41,11 @@ prompt: >-
 expected_output: >-
   Nothing planted. Customer failure, as live tests showed it: with 1
   konnectivity-agent where GKE's size table gives more, control-plane-to-node
-  calls failed on CPU-full nodes under heavy use and for the time of a node
-  restart. Validated needs a fixture and a check that names a cluster whose
-  agent count is below the table; the ledger issue would then carry a finding on
-  Deployment `konnectivity-agent` in namespace `kube-system`. The closing
-  response is the SOP's one line with the ledger URL.
+  calls failed on CPU-full nodes under heavy use (one cluster, cause not known)
+  and for the time of a node restart. Validated needs a fixture and a check that
+  names a cluster whose agent count is below the table; the ledger issue would
+  then carry a finding on Deployment `konnectivity-agent` in namespace
+  `kube-system`. The closing response is the SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
 validated: false

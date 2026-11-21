@@ -8,10 +8,11 @@
 # six thread-making processes in one container reached 96195, then memory ran
 # out, with no PIDPressure. Seven leaking containers on a 256 GB node used
 # 4194238 of 4194304 within about 30 seconds: the node reported PIDPressure,
-# got the taint `node.kubernetes.io/pid-pressure`, and read NotReady for a
-# time. PIDPressure can be made on purpose (a privileged pod that lowers
-# `kernel.pid_max` on one node); the kubelet then evicted a pod and the
-# condition cleared after five minutes, so a standing plant of it is not shown.
+# got the taint `node.kubernetes.io/pid-pressure`, the kubelet evicted one of
+# the seven, and the node read NotReady for a time. PIDPressure can be made on
+# purpose (a privileged pod that lowers `kernel.pid_max` on one node); the
+# kubelet then evicted a pod and the condition cleared after five minutes, so a
+# standing plant of it is not shown.
 # The shape that this case reads exists on the fleet and nothing new is
 # planted: role `multi-process-container`, Deployment multi-process-worker in
 # seeded-shapes on slot a, a shell supervisor forking two workers under a 32Mi
@@ -21,9 +22,9 @@
 # also the platform's default, which fixture rule 9 does not take as a fixture;
 # the case stays on the lane only until the decision on a fixture for the
 # node's own PIDPressure. Until then the flip condition is the first plan's: a
-# check that names that workload on its pool. The readiness rule group-oom-kill
-# and the case upgrades-fleet-readiness-multi-process-container assert it is
-# the fleet's only forking container, so no second forking plant may land. The
+# check that names that workload. The readiness rule group-oom-kill and the
+# case upgrades-fleet-readiness-multi-process-container assert it is the
+# fleet's only forking container, so no second forking plant may land. The
 # objective below keeps the form of the first plan, a finding on that workload;
 # a check keyed on the PIDPressure condition or on pid_used reads nothing here.
 # Domain `fleet-audits` as the other GCE compute cases.
@@ -46,9 +47,8 @@ expected_output: >-
   limit. Customer failure, as live tests showed it: several leaking containers
   used all process IDs of a large node, and the kubelet set PIDPressure and
   evicted; one container did not. Validated needs a fixture for that state; the
-  present objective accepts a finding that names Deployment
-  `multi-process-worker` in namespace `seeded-shapes` on pool `default-pool`.
-  The closing response is the SOP's one line with the ledger URL.
+  present objective accepts a finding that names `multi-process-worker`. The
+  closing response is the SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
 validated: false

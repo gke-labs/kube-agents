@@ -24,7 +24,7 @@
 # cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-nf-conntrack-table-saturation
-name: "Node conntrack table full (declared gap; nothing planted; a fixture waits for the fleet owner's decision)"
+name: "Node conntrack table full (declared gap; nothing planted; a fixture is possible, the fleet's owner not yet asked)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2

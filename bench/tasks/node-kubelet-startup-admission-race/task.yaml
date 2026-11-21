@@ -19,7 +19,7 @@
 # agent by days, which is a late DaemonSet and not a race, so a correct check
 # uses only nodes made after the DaemonSet, and a workload's restart resets the
 # times. The fleet's present pools make a node only at an upgrade or a repair;
-# its one zero-node pool is read by other cases as empty. The cost of a
+# its two zero-node pools are read by other cases as empty. The cost of a
 # fixture, not tried: a pool of its own that makes a node after the agent's
 # DaemonSet (one standing small node) with a pinned workload, and the times
 # must then stay readable. The first plan's signal, a label `init-critical`, is
@@ -28,13 +28,14 @@
 # needs the right to change nodes. #5411 proposes the first plan's check; no
 # open issue plans a check on the order of the two times. The objective below
 # keeps the form of the first plan; the pull request that brings a fixture
-# rewrites it, and the un-park pull request restores the suite line. `fixtures:
-# []`: the run plants nothing and reads no fixture, so no fixture's drift may
-# excuse it; no safeguard reads a fixture because none exists. Domain
-# `fleet-audits` as the other GCE compute cases.
+# rewrites it, and the un-park pull request restores the `suite:` and
+# `suite_part:` lines. `expected_fail` stays: the marker waits for a check on
+# that order. `fixtures: []`: the run plants nothing and reads no fixture, so
+# no fixture's drift may excuse it; no safeguard reads a fixture because none
+# exists. Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-kubelet-startup-admission-race
-name: "Kubelet startup admission race (parked: no fixture that a correct check finds can stand today)"
+name: "Kubelet startup admission race (parked: no fixture stands on the fleet today; one is possible at a cost that is not tried)"
 domain: fleet-audits
 expected_fail: true
 audit_streams:

@@ -29,7 +29,7 @@
 # because none exists. Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-mount-table-leak-exhaustion
-name: "Node mounts held by an agent (declared gap; nothing planted; a fixture waits for the fleet owner's decision)"
+name: "Node mounts held by an agent (declared gap; nothing planted; a fixture is possible, the fleet's owner not yet asked)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2
