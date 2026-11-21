@@ -105,6 +105,15 @@ class PlumbingTest(unittest.TestCase):
     def test_a_recipe_change_that_edits_shared_plumbing_is_flagged(self):
         changed = [self.RECIPE_FILE, "agents/platform/scripts/dial_state.py", "README.md"]
         self.assertEqual(check_recipes.plumbing_flags(changed), ["agents/platform/scripts/dial_state.py"])
+        # The post-merge loop's driver holds per-kind tables a new recipe is tempted to edit.
+        for module in ("post_merge_outcome.py", "post_merge_scope.py", "reconciler_sync.py"):
+            path = f"agents/platform/scripts/{module}"
+            with self.subTest(module=module):
+                self.assertEqual(check_recipes.plumbing_flags([self.RECIPE_FILE, path]), [path])
+
+    def test_every_post_merge_module_is_plumbing(self):
+        shipped = {f"agents/platform/scripts/{p.name}" for p in check_recipes.SCRIPTS.glob("post_merge_*.py")}
+        self.assertLessEqual(shipped, set(check_recipes.SHARED_PLUMBING))
 
     def test_plumbing_alone_or_a_recipe_alone_is_not_flagged(self):
         self.assertEqual(check_recipes.plumbing_flags(["agents/platform/scripts/dial_state.py"]), [])

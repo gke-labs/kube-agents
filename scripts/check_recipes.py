@@ -49,6 +49,9 @@ SHARED_PLUMBING = tuple(
         "post_merge_offer.py",
         "post_merge_stepdown.py",
         "post_merge_followups.py",
+        "post_merge_outcome.py",
+        "post_merge_scope.py",
+        "reconciler_sync.py",
         "clean_merges.py",
         "fix_recipes/__init__.py",
         "fix_recipes/registry.py",
@@ -137,7 +140,8 @@ def plumbing_flags(changed: list[str]) -> list[str]:
 
 
 def changed_files(base: str) -> list[str]:
-    out = subprocess.run(["git", "diff", "--name-only", base, "HEAD"], cwd=REPO, check=True,
+    # From the merge-base, so a base branch that moved on is not counted as this change.
+    out = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], cwd=REPO, check=True,
                          capture_output=True, text=True).stdout
     return [line for line in out.splitlines() if line]
 

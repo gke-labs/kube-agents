@@ -25,8 +25,9 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(recipe.kind, HERE.name)
 
     def test_the_fix(self):
-        # RECIPE-TEMPLATE: the same finding and base give the same bytes, and a
-        # finding the fix cannot write exactly raises ValueError.
+        # RECIPE-TEMPLATE: the same candidate and finding_id give the same bytes,
+        # read_inputs reads back what generate wrote, and a candidate the fix
+        # cannot write returns None.
         self.assertTrue(callable(fix.generate) and callable(fix.read_inputs))
 
     def test_the_checks(self):

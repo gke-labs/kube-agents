@@ -542,6 +542,11 @@ jobs:
         with:
           python-version-file: ".python-version"
 
+      - name: Install bench and its test runner
+        run: |
+          python3 -m pip install --upgrade pip
+          make test-bench-deps
+
       # The fix recipes: each loads, names an eval case that names it back, and
       # carries no scaffold line. On a pull request it also flags a change that
       # edits a recipe and the shared plumbing beside it (a warning, for a
@@ -559,11 +564,6 @@ jobs:
             base="HEAD^1"
           fi
           make recipe-check RECIPE_CHECK_BASE="$base"
-
-      - name: Install bench and its test runner
-        run: |
-          python3 -m pip install --upgrade pip
-          make test-bench-deps
 
       - name: Run the bench harness tests
         run: make test-bench
