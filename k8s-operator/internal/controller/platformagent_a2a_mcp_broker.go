@@ -34,13 +34,13 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// The MCP server as a credential-broker caller. Under its flag the MCP pod
-// runs as a ServiceAccount of its own and presents a projected token minted
-// for an audience of its own, and the broker confers the `mcp` role by that
-// audience. Every piece here hangs off a2aMCPBrokerEnabled, so an install
-// without the MCP server renders none of it: no audience on the broker, no
-// extra caller, no extra ingress peer, and an mcp-audience token from anywhere
-// is "another audience", 401.
+// The MCP server as a credential-broker caller. Unless A2A_MCP_DOOR=false, the
+// MCP pod runs as a ServiceAccount of its own and presents a projected token
+// minted for an audience of its own, and the broker confers the `mcp` role by
+// that audience. Every piece here hangs off a2aMCPBrokerEnabled, so an install
+// with the MCP server switched off renders none of it: no audience on the
+// broker, no extra caller, no extra ingress peer, and an mcp-audience token
+// from anywhere is "another audience", 401.
 //
 // The pattern is the session pod's (credentialProxySessionAudience) and the
 // A2A gateway's (credentialProxyA2AChatAudience): a projected token, an

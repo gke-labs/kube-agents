@@ -104,8 +104,9 @@ type NotifyRequest struct {
 	// Report marks a conversation post as a card's report: the kanban
 	// notifier sets it on the settled card's report post alone (never on a
 	// progress note, heartbeat, queued or plan line), and the gateway keeps
-	// a post for the reply under it only when it is set and names its task;
-	// the console frame carries it (report), so a console client offers a
+	// a post for the reply under it only when it is set: under its task for
+	// a console post, under the thread for a post into a chat thread; the
+	// console frame carries it (report), so a console client offers a
 	// reply under that post alone.
 	Report bool `json:"report,omitempty"`
 }

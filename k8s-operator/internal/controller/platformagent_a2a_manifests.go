@@ -5223,17 +5223,21 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	} {
 		n += int64(ptr.Deref(sts.Spec.Replicas, 1))
 	}
-	// The workloads rendered on a condition, which the next-mode golden (the
-	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
-	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
-	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
-	// workloads behind an operator flag (the MCP door) come from
+	// The workloads rendered on a condition, which the settled golden (the
+	// example CR, no operator flags) cannot show when off or behind a flag;
+	// TestA2AStandingPodsCountTheConditionalWorkloads names each. The credential
+	// proxy's exec tier is a CR field (spec.deployment.credentialProxy.exec.replicas,
+	// unset as 0); the workloads behind an opt-in operator flag come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
-	// The profile dispatcher, on unless A2A_PROFILE_DISPATCHER is "false"
-	// (operator.profileDispatcher.enabled in the chart).
+	// The profile dispatcher and the MCP server, each on unless its flag is
+	// "false" (operator.profileDispatcher.enabled and operator.mcpServer.enabled
+	// in the chart).
 	if a2aDispatcherEnabled() {
 		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
+	}
+	if a2aMCPDoorEnabled() {
+		n += int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
 	}
 	n += a2aFlaggedStandingPods(agent)
 	// The gateway's standbys and its rollout's surge pod, under the election
