@@ -109,6 +109,21 @@ archive was built for; the `kube-proxy` image prints the commit it was built fro
 prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
 it carry none.
 
+For standalone sidecar or loopback bridge deployments outside a host cluster, `cmd/k8s-api-proxy`
+provides three opt-in flags. `--auth-mode=none` (`KUBE_PROXY_AUTH_MODE`; default `token-review`)
+skips `TokenReview` setup, records `caller_username` as `unauthenticated`, logs a startup warning,
+and rejects `--allowed-callers`, `CREDENTIAL_PROXY_SESSION_AUDIENCE`, and
+`CREDENTIAL_PROXY_SESSION_CALLERS`. Bind `--listen-addr` (default `:8443`) to `127.0.0.1` for a host
+loopback bridge. `--upstream-url=<url>` (`KUBE_PROXY_UPSTREAM_URL`) forwards
+`in-cluster` requests to one static `http://` or `https://` endpoint through `upstream.NewStatic`
+(`StaticConfig`, `StaticTransport`) without cloud credentials. It rejects `--host-cluster-id`,
+`--container-api-url`, `--scope-file`, `--exclude-host-cluster-id`, and
+`CREDENTIAL_PROXY_SCOPED_SA_POOL`, and sets `Config.DefaultClusterID` to `in-cluster` so bare
+`/api/...` and `/clusters/in-cluster/...` paths both work (`SplitClusterPathWithDefault`).
+`--deny-streaming` (`KUBE_PROXY_DENY_STREAMING`, `Policy.DenyStreaming`) refuses `watch` requests,
+`log` `follow` streams (`ReasonStreamingBlocked`), and protocol upgrades with `403 Forbidden`, and
+rejects `--allow-upgrade-subresources`.
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash

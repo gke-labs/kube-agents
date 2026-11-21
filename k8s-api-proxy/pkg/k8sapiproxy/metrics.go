@@ -175,6 +175,7 @@ var (
 		ReasonSubresourceBlocked:       {},
 		ReasonDryRunRequired:           {},
 		ReasonVerbBlocked:              {},
+		ReasonStreamingBlocked:         {},
 		ReasonExcludedCluster:          {},
 		ReasonExcludeUnreadable:        {},
 	}

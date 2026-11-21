@@ -70,22 +70,26 @@ type Config struct {
 	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
 	// bounds its memory. Watches and long-running subresources do not count. Zero is no cap.
 	MaxInFlight int
+	// DefaultClusterID routes requests without a /clusters/<id> prefix to that cluster ID
+	// in single-upstream deployments. Empty requires a /clusters/<id> prefix on every path.
+	DefaultClusterID string
 }
 
 // auditEventKey carries the request's *AuditEvent to the transport and the error handler.
 type auditEventKey struct{}
 
 type handler struct {
-	authenticator  CallerAuthenticator
-	exclusions     *Exclusions
-	policy         Policy
-	audit          AuditSink
-	metrics        *Metrics
-	tracerProvider trace.TracerProvider
-	cache          *responseCache
-	partition      func(*CallerIdentity) string
-	factory        *request.RequestInfoFactory
-	proxy          *httputil.ReverseProxy
+	authenticator    CallerAuthenticator
+	exclusions       *Exclusions
+	policy           Policy
+	defaultClusterID string
+	audit            AuditSink
+	metrics          *Metrics
+	tracerProvider   trace.TracerProvider
+	cache            *responseCache
+	partition        func(*CallerIdentity) string
+	factory          *request.RequestInfoFactory
+	proxy            *httputil.ReverseProxy
 	// slots holds one token per counted request in flight; nil when there is no cap.
 	slots chan struct{}
 }
@@ -106,6 +110,9 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	}
 	if cfg.MaxInFlight < 0 {
 		return nil, fmt.Errorf("k8sapiproxy: Config.MaxInFlight %d is negative", cfg.MaxInFlight)
+	}
+	if cfg.DefaultClusterID != "" && !validClusterID.MatchString(cfg.DefaultClusterID) {
+		return nil, fmt.Errorf("k8sapiproxy: invalid Config.DefaultClusterID %q", cfg.DefaultClusterID)
 	}
 	var slots chan struct{}
 	if cfg.MaxInFlight > 0 {
@@ -140,16 +147,17 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		return resp, err
 	}
 	return &handler{
-		authenticator:  cfg.Authenticator,
-		exclusions:     cfg.Exclusions,
-		policy:         cfg.Policy,
-		audit:          audit,
-		metrics:        metrics,
-		tracerProvider: tp,
-		cache:          cache,
-		partition:      cfg.CallerPartition,
-		factory:        NewRequestInfoFactory(),
-		slots:          slots,
+		authenticator:    cfg.Authenticator,
+		exclusions:       cfg.Exclusions,
+		policy:           cfg.Policy,
+		defaultClusterID: cfg.DefaultClusterID,
+		audit:            audit,
+		metrics:          metrics,
+		tracerProvider:   tp,
+		cache:            cache,
+		partition:        cfg.CallerPartition,
+		factory:          NewRequestInfoFactory(),
+		slots:            slots,
 		proxy: &httputil.ReverseProxy{
 			// Rewrite rather than Director: the reverse proxy then also drops the caller's
 			// Forwarded, X-Forwarded-For, X-Forwarded-Host and X-Forwarded-Proto headers. The
@@ -283,7 +291,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		partition = h.partition(caller)
 	}
 
-	clusterID, apiPath, perr := SplitClusterPath(r.URL)
+	clusterID, apiPath, perr := SplitClusterPathWithDefault(r.URL, h.defaultClusterID)
 	if perr != nil {
 		refuse(w, ev, perr)
 		return
