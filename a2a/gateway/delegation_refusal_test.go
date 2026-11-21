@@ -142,3 +142,42 @@ func TestARefusedProfileParentsRequestAgainIsIgnored(t *testing.T) {
 		t.Fatalf("%d submission(s) for a request already answered", after-before)
 	}
 }
+
+// TestACutShortBatchWhoseProfileLostDelegatesIsWithdrawn: a batch a restart
+// cut short is finished by its request seen again, every check applying. A
+// profile that lost spec.delegates in between is refused, and the batch is
+// withdrawn whole (each entry ended), never left with a child running and
+// the rest unminted.
+func TestACutShortBatchWhoseProfileLostDelegatesIsWithdrawn(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	ctx := context.Background()
+	conv := "console:tab-batch-lost-delegates"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	submissionOn(t, r, "cluster")
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "an end for each entry", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 2 })
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if ref, ok := rec.TaskRefFor(origin.TaskID); !ok || ref.DelegationEnd == "" {
+		t.Fatalf("the parent's entry = %+v, want the batch withdrawn", ref)
+	}
+}

@@ -205,15 +205,6 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			ignore(ruleDelegationStale, "delegationEnd", "already answered")
 			return
 		}
-		// Only a profile whose card says it delegates (spec.delegates):
-		// the worker's tool is the profile admin's opt-in, and this is
-		// where it holds, not the tool's absence on the worker (#6789).
-		// Checked first, so a profile that may not delegate learns
-		// nothing else from the checks below (another task's id).
-		if card, ok := g.profiles.lookup(parent.Addressee); !ok || !card.Delegates {
-			refuse(ruleDelegationProfileNotDelegating, noticeDelegationRefusedFor+fmt.Sprintf(noticeProfileDoesNotDelegate, parent.Addressee))
-			return
-		}
 	}
 	// A request is accepted once per task, whether it asked for one child
 	// or a batch: a parent with any child has had its request. Checked
@@ -240,6 +231,18 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			}
 		}()
 		log.Info("finishing a batch cut short", "minted", len(parent.Children), "tasks", parent.BatchSize)
+	}
+	// Only a profile whose card says it delegates (spec.delegates): the
+	// worker's tool is the profile admin's opt-in, and this is where it
+	// holds, not the tool's absence on the worker (#6789). After the resume
+	// block, so a batch cut short whose profile has since lost it is still
+	// withdrawn (the deferred withdrawCutShortBatch); before every check
+	// whose notice could name another task.
+	if profileParent {
+		if card, ok := g.profiles.lookup(parent.Addressee); !ok || !card.Delegates {
+			refuse(ruleDelegationProfileNotDelegating, noticeDelegationRefusedFor+fmt.Sprintf(noticeProfileDoesNotDelegate, parent.Addressee))
+			return
+		}
 	}
 	if active := rec.ActiveTask; active == nil || active.TaskID != taskID {
 		ignore(ruleDelegationStale)
