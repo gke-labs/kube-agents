@@ -14120,16 +14120,25 @@ class RequiredRoleTest(unittest.TestCase):
             credential_proxy._teams_route_roles(True),
         )
         for armed in (False, True):
+            consumer = credential_proxy._teams_route_roles(armed)
+            # The intake's exact entry carries the consumer roles plus the
+            # inbound receiver's; the prefix entry carries the consumer roles.
             table = tuple(
-                (prefix, credential_proxy._teams_route_roles(armed)) if prefix == "/v1/chat/teams/" else (prefix, roles)
+                (prefix, consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,))
+                if prefix == credential_proxy.TEAMS_INBOUND_ROUTE
+                else (prefix, consumer) if prefix == "/v1/chat/teams/" else (prefix, roles)
                 for prefix, roles in credential_proxy.ROUTE_ROLES
             )
             credential_proxy._validate_route_roles(table)
             with mock.patch.object(credential_proxy, "ROUTE_ROLES", table):
                 for path in teams_paths:
-                    self.assertEqual(
-                        credential_proxy._teams_route_roles(armed), credential_proxy.required_roles(path), (armed, path)
-                    )
+                    # The intake entry is a prefix like the rest of the table, so
+                    # the pull and its receipts resolve to it too; _role_permits,
+                    # not this table, holds the receiver to POST on the exact path.
+                    want = consumer
+                    if path.startswith(credential_proxy.TEAMS_INBOUND_ROUTE):
+                        want = consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,)
+                    self.assertEqual(want, credential_proxy.required_roles(path), (armed, path))
                 self.assertEqual(
                     (credential_proxy.CALLER_ROLE_CHAT,),
                     credential_proxy.required_roles("/v1/chat/slack/events"),
