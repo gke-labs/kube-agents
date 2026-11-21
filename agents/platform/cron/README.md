@@ -1144,8 +1144,8 @@ rule outlives the memory of why:
   in-flight note per stream on the sandbox pod's own volume, at
   `/opt/data/scratch/inflight_<audit>.json` in that pod (the script runs in
   the sandbox shell, whose `/opt/data` is its own PVC, not the gateway volume
-  this README otherwise calls "the volume"), holding the stream id and a start
-  time, honoured for two hours and removed by a `finish` that published or
+  this README otherwise calls "the volume"), holding the stream id, a start
+  time and the run id, honoured for two hours and removed by a `finish` that published or
   died (exit 0 or 1); `finish --dry-run` and a `finish` that exited 2 keep it,
   so a note beside a rejected document is a live run, not a stale one. The note spans one
   `start`-`finish` pair, so a multi-repository loop reclaims it at each

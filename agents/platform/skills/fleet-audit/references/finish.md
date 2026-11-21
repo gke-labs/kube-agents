@@ -23,7 +23,7 @@ the reason. The install's own switch (`KUBEAGENTS_AUDIT_AUTO_PROMOTE`) is not ch
 Pass `--scheduled` only when the cron prompt tells you to: it says that the run is a scheduled run,
 and only a scheduled run can get `silent_ok: true` (see [The clean run](clean-run.md#the-clean-run)). Do not
 pass it on a run that a person asked for. A fleet-audit cron job that you create on request must
-carry the same sentence as the shipped jobs in its prompt. The same flag goes to `precheck`, which
+carry the same sentence as the shipped jobs in its prompt. The same flag goes to `start`, and to `precheck`, which
 runs this `finish` itself on a scheduled run whose collector manifest digests the same as the last
 scheduled run's ([`draft` and `precheck`](lifecycle.md#between-the-collector-and-finish-draft-and-precheck)): the
 document is that run's stored one, the manifest is this run's, and every rule below applies as it

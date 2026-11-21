@@ -23,6 +23,8 @@ to uses `no_forge/local`:
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
   run-over-run history that exists anywhere: the ledger issue rewrites itself in place.
+- `run-starts/<run id>.json` — one run-start record per run, newest 8 kept: `start` writes it and
+  `finish` marks it done. It is no report; `unfinished_run` (below) is read from it.
 
 An envelope carries `audit_id`, `repo`, `started_at`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
