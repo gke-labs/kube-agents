@@ -3654,6 +3654,121 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertEqual("4", error.headers.get("Retry-After"))
 
 
+class ExecRefusalNestedTooDeepTest(unittest.TestCase):
+    """A `/v1/exec` refusal with a top-level value that puts it over MAX_VCS_BODY_DEPTH: the key
+    stays and a text takes the value's place, so no reader of the refusal prints the value. The
+    parser takes a deeper body than `str` and `print` do."""
+
+    LEFT_OUT = "left out: nested too deep to read"
+    BLOCKED = sorted(credential_proxy_client.POLICY_BLOCKED_CODES)[0]
+    BOUND = credential_proxy_client.MAX_VCS_BODY_DEPTH
+
+    @staticmethod
+    def _nested_lists(levels):
+        """The JSON text of `levels` lists, one inside the other."""
+        return "[" * levels + "]" * levels
+
+    def _payload(self, status, body):
+        """The refusal as the shim holds it, and the error it came from."""
+        stream = io.BytesIO(body.encode("utf-8"))
+        error = urllib.error.HTTPError("http://broker.invalid/v1/exec", status, "refused", {}, stream)
+        self.addCleanup(error.close)
+        payload = credential_proxy_client._refusal_payload(error)
+        self.assertTrue(stream.closed, "the shim left the refusal open")
+        return payload, error
+
+    def _printed(self, status, body):
+        """The exit code and the stderr text of the shim's refusal lines."""
+        payload, error = self._payload(status, body)
+        err = io.StringIO()
+        with patch("sys.stderr", new=err):
+            code = credential_proxy_client._exec_refused(error, payload)
+        return code, err.getvalue()
+
+    def test_a_value_at_the_bound_stays_and_one_level_more_gets_the_text(self):
+        """The refusal object is one level; a value has the rest."""
+        at_the_bound, too_deep = self._nested_lists(self.BOUND - 1), self._nested_lists(self.BOUND)
+        kept, _ = self._payload(400, '{"error": "argv is required", "detail": %s}' % at_the_bound)
+        self.assertEqual(json.loads(at_the_bound), kept["detail"])
+        trimmed, _ = self._payload(400, '{"error": "argv is required", "detail": %s}' % too_deep)
+        self.assertEqual({"error": "argv is required", "detail": self.LEFT_OUT}, trimmed)
+
+    def test_an_error_that_is_too_deep_is_printed_as_the_status(self):
+        body = '{"error": %s}' % self._nested_lists(self.BOUND)
+        code, err = self._printed(403, body)
+        self.assertEqual(1, code)
+        self.assertEqual("HTTP 403\n", err)
+        payload, _ = self._payload(403, body)
+        self.assertEqual("HTTP 403", credential_proxy_client.refusal_text(payload))
+
+    def test_a_policy_refusal_keeps_its_code_and_a_text_takes_each_part_that_is_too_deep(self):
+        too_deep = self._nested_lists(self.BOUND)
+        code, err = self._printed(
+            403, '{"code": "%s", "message": %s, "rule": %s}' % (self.BLOCKED, too_deep, too_deep)
+        )
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.assertEqual([self.LEFT_OUT, f"policy rule: {self.LEFT_OUT}"], err.splitlines())
+
+    def test_a_busy_refusal_keeps_the_key_of_a_bound_that_is_too_deep(self):
+        """A busy refusal with no `bound` is sent again. One with a `bound` that the shim cannot
+        read is not that refusal, so the key stays."""
+        payload, _ = self._payload(
+            503, '{"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "bound": %s}' % self._nested_lists(self.BOUND)
+        )
+        self.assertEqual(self.LEFT_OUT, payload[credential_proxy_client.BUSY_BOUND_KEY])
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", payload["code"])
+
+    def test_the_verb_line_is_printed_for_a_list_of_words_only(self):
+        policy = '{"code": "%s", "message": "blocked", "rule": "r1", "verb": %%s}' % self.BLOCKED
+        shown = {
+            '["get", "pods"]': ["blocked", "policy rule: r1", "policy verb: get pods"],
+            # Too deep: a text took the list's place. A text has no words.
+            '["get", %s]' % self._nested_lists(self.BOUND): ["blocked", "policy rule: r1"],
+            '"get pods"': ["blocked", "policy rule: r1"],
+            '{"get": "pods"}': ["blocked", "policy rule: r1"],
+            "[]": ["blocked", "policy rule: r1"],
+            "7": ["blocked", "policy rule: r1"],
+            "true": ["blocked", "policy rule: r1"],
+        }
+        for verb, lines in shown.items():
+            with self.subTest(verb=verb[:24]):
+                code, err = self._printed(403, policy % verb)
+                self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+                self.assertEqual(lines, err.splitlines())
+
+    def test_a_body_at_the_depth_where_print_gives_up_ends_in_a_line_not_a_traceback(self):
+        """At about 100,000 levels `str` of the value raises RecursionError on Python 3.14, the
+        Python of the sandbox image. The parser of Python 3.13 and older refuses that body, and
+        the refusal then reads as one with no JSON body; there this test holds that line only."""
+        deep = self._nested_lists(100_000)
+        try:
+            json.loads(deep)
+            parsed = True
+        except RecursionError:
+            parsed = False
+        no_json = [f"credential proxy error (HTTP 403): {credential_proxy_client.NON_JSON_RESPONSE_TEXT}"]
+        for body, lines in (
+            ('{"error": %s}' % deep, ["HTTP 403"]),
+            ('{"code": "%s", "message": %s}' % (self.BLOCKED, deep), [self.LEFT_OUT, "policy rule: unknown"]),
+        ):
+            with self.subTest(body=body[:24]):
+                _, err = self._printed(403, body)
+                self.assertEqual(lines if parsed else no_json, err.splitlines())
+
+    def test_the_shim_prints_the_status_for_a_refusal_with_an_error_that_is_too_deep(self):
+        """Through `execute`, over a real socket."""
+        broker = ScriptedBroker([(403, {"Content-Type": "application/json"}, '{"error": %s}' % self._nested_lists(self.BOUND))])
+        self.addCleanup(broker.close)
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict("os.environ", {"CREDENTIAL_PROXY_TOKEN_FILE": "", "KUBECONFIG": ""}), \
+                patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                broker.endpoint, ["kubectl", "get", "ns"], sleep_fn=lambda _: None, rng=random.Random(7)
+            )
+        self.assertEqual((1, "", "HTTP 403\n"), (code, out.getvalue(), err.getvalue()))
+        self.assertEqual(1, len(broker.requests))
+
+
 class RetryScheduleTest(unittest.TestCase):
     """The delay and the refusal filter, without a server."""
 
@@ -3807,6 +3922,20 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         return http_, credential_proxy_client.ApiSession(
             http=http_, sleep_fn=self.sleeps.append, rng=random.Random(3)
         )
+
+    def test_the_retry_line_has_the_status_for_a_busy_reply_with_an_error_that_is_too_deep(self):
+        """The line prints the refusal's text. A value that puts the refusal over
+        MAX_VCS_BODY_DEPTH gets a text in its place, as for a `/v1/exec` refusal."""
+        bound = credential_proxy_client.MAX_VCS_BODY_DEPTH
+        too_deep = json.loads("[" * bound + "]" * bound)
+        ok = self.Response(200, {"timeSeries": []})
+        http_, session = self.session([self.Response(503, {**BUSY_SLOT, "error": too_deep}), ok])
+        with patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertIs(ok, session.get(self.URL, timeout=30))
+        self.assertEqual(2, len(http_.calls))
+        (line,) = err.getvalue().strip().splitlines()
+        self.assertTrue(line.startswith("credential proxy busy (HTTP 503): HTTP 503; retrying in "), line)
+        self.assertNotIn("[", line)
 
     def test_a_broker_busy_then_a_200_is_one_answer(self):
         ok = self.Response(200, {"timeSeries": []})
@@ -4102,6 +4231,73 @@ class KubeconfigLockOwnerTest(unittest.TestCase):
         self.root.chmod(0o500)
         self.addCleanup(self.root.chmod, 0o700)
         self.assertIn(f"{self.lock}: Permission denied; context {self.TARGET_CTX} was not checked or registered", self.merge())
+
+
+class KubeconfigScalarThatYamlCannotBuildTest(unittest.TestCase):
+    """For a scalar that it cannot build, PyYAML raises a plain exception and not a
+    `yaml.YAMLError`. The merge leaves such a kubeconfig as it is, as it leaves one with a syntax
+    error, and does not end in a traceback."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+    # The text, and the plain exception that PyYAML raises for it.
+    SCALARS = (
+        ("note: 2026-02-30", ValueError),
+        ("note: !!int text", ValueError),
+        ("note: !!bool text", KeyError),
+        ("note: !!int", IndexError),
+        ("note: !!timestamp text", AttributeError),
+    )
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.kubeconfig = self.root / ".kubeconfig"
+        self.good = credential_proxy_client.build_kube_proxy_kubeconfig(
+            self.HOST_CTX, proxy_url=self.PROXY_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+        )
+
+    def merge(self):
+        """One merge of TARGET_CTX; returns what it wrote to stderr."""
+        stderr = io.StringIO()
+        with patch.object(credential_proxy_client.sys, "stderr", stderr):
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                self.kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        return stderr.getvalue()
+
+    def test_a_kubeconfig_with_such_a_scalar_stays_as_it_is(self):
+        import yaml
+
+        for line, raised in self.SCALARS:
+            with self.subTest(line=line):
+                text = f"{self.good.rstrip()}\n{line}\n"
+                with self.assertRaises(raised) as caught:
+                    yaml.safe_load(text)
+                self.assertNotIsInstance(caught.exception, yaml.YAMLError)
+                self.kubeconfig.write_text(text, encoding="utf-8")
+                self.assertEqual("", self.merge())
+                self.assertEqual(text, self.kubeconfig.read_text(encoding="utf-8"))
+
+    def test_the_same_kubeconfig_without_the_scalar_gets_the_context(self):
+        """The control: the merge of this fixture works, so the test above shows the catch."""
+        self.kubeconfig.write_text(self.good, encoding="utf-8")
+        self.assertEqual("", self.merge())
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", self.kubeconfig.read_text(encoding="utf-8"))
+
+    def test_an_error_of_the_loader_of_another_type_gets_out(self):
+        """The catch has the types that PyYAML raises for a document, and no more: a
+        programming fault is not a kubeconfig that the merge cannot read."""
+        self.kubeconfig.write_text(self.good, encoding="utf-8")
+        for fault in (TypeError("a fault of the loader"), RuntimeError("the parent type of RecursionError")):
+            with self.subTest(fault=type(fault).__name__), patch("yaml.safe_load", side_effect=fault):
+                with self.assertRaises(type(fault)) as caught:
+                    self.merge()
+                self.assertIs(fault, caught.exception)
+        self.assertEqual(self.good, self.kubeconfig.read_text(encoding="utf-8"))
 
 
 class DefaultKubeconfigFolderOwnerTest(unittest.TestCase):
