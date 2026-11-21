@@ -97,7 +97,8 @@ type harnessEvent struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype"`
 	// type:"assistant" carries an API Message; content blocks are inspected
-	// for text / thinking / tool_use.
+	// for text / thinking / tool_use. type:"user" carries the tool_result
+	// blocks the harness fed back to the model.
 	Message *harnessMessage `json:"message,omitempty"`
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
@@ -206,7 +207,27 @@ func (ev harnessEvent) telemetry(model string) resultTelemetry {
 }
 
 type harnessMessage struct {
-	Content []harnessBlock `json:"content"`
+	Content harnessContent `json:"content"`
+}
+
+// harnessContent is a message's content blocks. A user message's content may
+// be a plain string (a prompt the harness echoes) rather than a list; it
+// carries no block the adapter reads, so it decodes as none rather than
+// failing the whole line.
+type harnessContent []harnessBlock
+
+func (c *harnessContent) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		*c = nil
+		return nil
+	}
+	var blocks []harnessBlock
+	if err := json.Unmarshal(b, &blocks); err != nil {
+		return err
+	}
+	*c = blocks
+	return nil
 }
 
 type harnessBlock struct {
@@ -215,6 +236,10 @@ type harnessBlock struct {
 	Thinking string          `json:"thinking,omitempty"`
 	Name     string          `json:"name,omitempty"`  // tool_use
 	Input    json.RawMessage `json:"input,omitempty"` // tool_use
+	// Content is a tool_result block's result, as the harness reported it
+	// on a user message: a JSON string, or a list of content blocks (text,
+	// image). Read only for the answer's scrub (adapter.collectToolResults).
+	Content json.RawMessage `json:"content,omitempty"`
 }
 
 // userMessage is the stream-json stdin shape for both the opening prompt and

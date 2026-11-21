@@ -18,6 +18,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 )
 
 // Config is the adapter's contract with its pod: everything here arrives as
@@ -398,6 +399,13 @@ type adapter struct {
 	// and finalize sees it first, they all see it after.
 	abandonSeen   bool
 	abandonReason string
+
+	// seen is this task's set of secret values its tool results carried
+	// (answerscrub.Seen), fed from the harness's tool_result blocks
+	// (collectToolResults) and redacted out of every model-written text the
+	// task publishes (scrub). The adapter is per task, so the set is too,
+	// and finalize clears and closes it.
+	seen answerscrub.Seen
 }
 
 // errAbandoned is finalize's answer for an abandoned task: no terminal went
@@ -989,6 +997,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
+			case "user":
+				a.collectToolResults(ev)
 			case "result":
 				// What the turn cost goes out first, whatever the turn
 				// decided: a delegating turn, a steered one and an errored
@@ -1159,6 +1169,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	switch {
 	case a.abandoned():
 		return Result{Abandoned: true}, nil
+	case sawResult && resultErr == "" && !delegated && answerscrub.OpensWithUnstructuredReasoning(resultText):
+		// The model's reasoning, not an answer (#3206): withheld, as the
+		// bridge withholds it, with the harness session if one is known.
+		a.log.Warn("answer withheld: it opens with a thought line (unstructured model reasoning)",
+			"task", a.taskID, "harnessSession", a.harnessSession, "bytes", len(resultText),
+			"reason", answerscrub.UnstructuredReasoningToken)
+		state := lib.StateFailed
+		return Result{State: state}, a.finalize(state, unstructuredReasoningReason(a.harnessSession), "")
 	case sawResult && resultErr == "":
 		return a.completeWith(resultText)
 	case sawResult:
@@ -1175,15 +1193,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		state := lib.StateFailed
 		reason := "reason: stream-ended-without-result" +
 			reapEvidence(waitErr, reapTook, proc.cmd.WaitDelay) +
-			scanEvidence(proc.scanErr()) +
-			proc.stderrEvidence()
+			a.scrub(scanEvidence(proc.scanErr())+proc.stderrEvidence())
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
 }
 
 // completeWith publishes the deliverable and the completed terminal: the
-// harness's clean result, or a delegating turn's one-line result. A result
-// that cannot be published fails the task with the publish error.
+// harness's clean result, a delegating turn's one-line result, or a script
+// run's output. The deliverable is scrubbed (publishResult). A result that
+// cannot be published fails the task with the publish error.
 func (a *adapter) completeWith(resultText string) (Result, error) {
 	if err := a.publishResult(resultText); err != nil {
 		state := lib.StateFailed
@@ -1244,8 +1262,9 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 				a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: block.Thinking}, false)
 			}
 		case "text":
-			if block.Text != "" {
-				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: block.Text}, false)
+			// The model's prose is scrubbed as the answer is (scrub).
+			if text := a.scrub(block.Text); text != "" {
+				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: text}, false)
 			}
 		case "tool_use":
 			entry, err := json.Marshal(map[string]any{
@@ -1315,13 +1334,13 @@ func (a *adapter) publishDelegate(ctx context.Context, req lib.DelegateRequest) 
 	return a.publishArtifactPart(ctx, lib.ArtifactDelegate, lib.Part{Kind: "data", Data: data}, false, true)
 }
 
-// publishResult publishes the deliverable as the result artifact, chunked.
-// Empty output still yields one empty chunk: completed must carry a result
-// artifact (assertion 18).
+// publishResult publishes the deliverable as the result artifact, scrubbed
+// (scrub) and then chunked. Empty output still yields one empty chunk:
+// completed must carry a result artifact (assertion 18).
 func (a *adapter) publishResult(text string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), terminalPublishTimeout)
 	defer cancel()
-	chunks := chunkString(text, resultChunkSize)
+	chunks := chunkString(a.scrub(text), resultChunkSize)
 	for i, chunk := range chunks {
 		if err := a.publishArtifactPart(ctx, lib.ArtifactResult, lib.Part{Kind: "text", Text: chunk},
 			i > 0, i == len(chunks)-1); err != nil {
@@ -1400,7 +1419,7 @@ func truncateRunes(s string, n int) string {
 // finalize publishes the one terminal event, exactly once per process, on a
 // fresh context (the caller's may already be dead - eviction). A reason
 // travels as the status message; evidence (partial output) rides along when
-// present.
+// present, scrubbed (scrub). The task's seen-values set is cleared after.
 func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	if a.abandoned() {
 		return errAbandoned
@@ -1421,7 +1440,7 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 		err = a.exec.PublishStatus(ctx, state, true)
 	} else {
 		text := reason
-		if evidence != "" {
+		if evidence = a.scrub(evidence); evidence != "" {
 			text += "\npartial output:\n" + truncate(evidence, failureEvidenceCap)
 		}
 		update := lib.StatusUpdate{
@@ -1459,7 +1478,80 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	a.mu.Lock()
 	a.finalErr = err
 	a.mu.Unlock()
+	a.clearSeen()
 	return err
+}
+
+// collectToolResults hands each tool_result block on one user message to the
+// task's seen-values set (answerscrub.Seen.CollectToolResult), one call per
+// result. The harness reports a result's content as a JSON string, which
+// goes in as it is, or as a list of content blocks, whose text blocks go in
+// as one JSON list of strings (an image's data is not read).
+func (a *adapter) collectToolResults(ev harnessEvent) {
+	if ev.Message == nil {
+		return
+	}
+	for _, block := range ev.Message.Content {
+		if block.Type != "tool_result" || len(block.Content) == 0 {
+			continue
+		}
+		a.seen.CollectToolResult(toolResultRaw(block.Content))
+	}
+}
+
+// toolResultRaw is the raw JSON CollectToolResult reads for one tool_result
+// block's content: a string as it is; a list of blocks as the list of its
+// text blocks' texts; anything else as it is.
+func toolResultRaw(content json.RawMessage) json.RawMessage {
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return content
+	}
+	texts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			texts = append(texts, b.Text)
+		}
+	}
+	raw, err := json.Marshal(texts)
+	if err != nil {
+		return content
+	}
+	return raw
+}
+
+// scrub is what of a model-written text this task publishes: the task's seen
+// values exact-matched out, then the shape rules (answerscrub.Scrub), one
+// shared implementation for the bridge and session paths.
+func (a *adapter) scrub(text string) string {
+	if text == "" {
+		return ""
+	}
+	return answerscrub.Scrub(text, &a.seen)
+}
+
+// clearSeen empties and closes the task's seen-values set, and says at debug
+// how many values the set refused because a pool was full: a count only,
+// never a value.
+func (a *adapter) clearSeen() {
+	if n := a.seen.Clear(); n > 0 {
+		a.log.Debug(fmt.Sprintf("seen-set refused %d values", n), "task", a.taskID, "refused", n)
+	}
+}
+
+// unstructuredReasoningReason is the terminal message for an answer withheld
+// because it opens with unstructured reasoning: the bridge's token and
+// notice, and the harness session when one is known. The answer's text stays
+// out.
+func unstructuredReasoningReason(harnessSession string) string {
+	reason := fmt.Sprintf("reason: %s - %s", answerscrub.UnstructuredReasoningToken, answerscrub.UnstructuredReasoningNotice)
+	if harnessSession != "" {
+		reason += "; session: " + harnessSession
+	}
+	return reason
 }
 
 // sessionConsumer creates one of the adapter's three consumers, by name.
