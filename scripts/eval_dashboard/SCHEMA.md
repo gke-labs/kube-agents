@@ -527,7 +527,7 @@ Additive, optional, and safe to omit — consumers must default them.
   "result": "SUCCESS|FAILURE|ABORTED",
   "started": "<iso8601>",
   "finished": "<iso8601>",
-  "duration_s": 15006,
+  "duration_s": 10554,
   "project": "kube-agents-evals-10",
   "artifacts_url": "https://oss.gprow.dev/view/gs/... | https://console.cloud.google.com/storage/browser/...",
   "pass_rate": 0.88,

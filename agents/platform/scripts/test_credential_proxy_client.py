@@ -1233,6 +1233,130 @@ class VcsCallErrorTest(unittest.TestCase):
                 self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
                 self.assertTrue(stream.closed, "vcs_call left the refusal open")
 
+    @staticmethod
+    def _nested_lists(levels):
+        """The JSON text of `levels` lists, one inside the other."""
+        return b"[" * levels + b"]" * levels
+
+    def test_a_2xx_answer_nested_deeper_than_the_bound_is_the_too_deep_error(self):
+        bound = credential_proxy_client.MAX_VCS_BODY_DEPTH
+        # The answer object is one level; its `entries` hold the rest.
+        with self._no_token_file, self._answer(b'{"entries": %s}' % self._nested_lists(bound - 1)):
+            answer = credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+        self.assertFalse(credential_proxy_client.nests_deeper_than(answer, bound))
+        self.assertTrue(credential_proxy_client.nests_deeper_than(answer, bound - 1))
+        for levels in (bound, 4 * bound):
+            body = b'{"entries": %s}' % self._nested_lists(levels)
+            with self.subTest(levels=levels), self._no_token_file, self._answer(body):
+                with self.assertRaises(credential_proxy_client.VcsAnswerTooDeep) as caught:
+                    credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                # A ValueError, as for a body that is not JSON, and nothing of the body.
+                self.assertIsInstance(caught.exception, ValueError)
+                self.assertNotIn("[", str(caught.exception))
+
+    def _refused_with(self, status, body):
+        stream = io.BytesIO(body)
+        error = self._held_refusal(status, stream)
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+        self.assertTrue(stream.closed, "vcs_call left the refusal open")
+        return caught.exception
+
+    LEFT_OUT = "left out: nested too deep to read"
+
+    def test_a_refusal_nested_deeper_than_the_bound_keeps_its_keys_and_a_text_takes_each_part_that_is_too_deep(self):
+        """The refusal object is one level; a value has the rest. The caller still reads the code."""
+        bound = credential_proxy_client.MAX_VCS_BODY_DEPTH
+        at_the_bound, too_deep = self._nested_lists(bound - 1), self._nested_lists(bound)
+
+        kept = self._refused_with(409, b'{"error": "the base branch moved", "code": "BASE_MOVED", "detail": %s}' % at_the_bound)
+        self.assertTrue(kept.payload["detail"] == json.loads(at_the_bound))
+
+        # The deepest value that passes stays beside one that is too deep.
+        mixed = self._refused_with(409, b'{"error": "moved", "detail": %s, "more": %s}' % (at_the_bound, too_deep))
+        self.assertTrue(mixed.payload["detail"] == json.loads(at_the_bound))
+        self.assertEqual((mixed.payload["error"], mixed.payload["more"]), ("moved", self.LEFT_OUT))
+        self.assertFalse(credential_proxy_client.nests_deeper_than(mixed.payload, bound))
+
+        for status, code, part in ((409, "BASE_MOVED", "detail"), (404, "FORGE_NOT_FOUND", "detail"), (429, "FORGE_RATE_LIMITED", "entries")):
+            with self.subTest(code=code):
+                body = b'{"error": "the forge refused", "code": "%s", "%s": %s}' % (code.encode(), part.encode(), too_deep)
+                refused = self._refused_with(status, body)
+                self.assertEqual(refused.payload, {"error": "the forge refused", "code": code, part: self.LEFT_OUT})
+                self.assertEqual(refused.json_body, refused.payload)
+                self.assertEqual(str(refused), "the forge refused")
+
+        # A list that is within the bound stays beside a part that is too deep.
+        refused = self._refused_with(
+            413,
+            b'{"error": "too large", "code": "SNAPSHOT_TOO_LARGE", "entries": [{"path": "a", "bytes": 9}], "ceiling": 5, "detail": %s}'
+            % too_deep,
+        )
+        self.assertEqual(
+            refused.payload,
+            {
+                "error": "too large", "code": "SNAPSHOT_TOO_LARGE", "entries": [{"path": "a", "bytes": 9}], "ceiling": 5,
+                "detail": self.LEFT_OUT,
+            },
+        )
+
+        # An `error` that is too deep becomes the status; a refusal with no `error` gets none.
+        refused = self._refused_with(422, b'{"error": %s, "code": "FORGE_REJECTED", "detail": "a title is needed"}' % too_deep)
+        self.assertEqual(refused.payload, {"error": "HTTP 422", "code": "FORGE_REJECTED", "detail": "a title is needed"})
+        refused = self._refused_with(403, b'{"message": "blocked", "rule": %s}' % too_deep)
+        self.assertEqual(refused.payload, {"message": "blocked", "rule": self.LEFT_OUT})
+
+        # No version control on the broker is still read from the code.
+        stream = io.BytesIO(b'{"error": "not available", "code": "VCS_UNAVAILABLE", "detail": %s}' % too_deep)
+        error = self._held_refusal(404, stream)
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+            with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
+                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+
+    def test_a_busy_refusal_with_a_part_that_is_too_deep_is_sent_again_and_its_text_is_kept(self):
+        """A refusal that says it came before admission ran nothing; a `detail` that is too deep does not change that."""
+        bound = credential_proxy_client.MAX_VCS_BODY_DEPTH
+        for levels in (bound - 1, bound, 4 * bound):
+            # The refusal object is one level; its `detail` holds the rest.
+            busy = self._busy("profile")[:-1] + b', "detail": ' + self._nested_lists(levels) + b"}"
+            calls, opener = self._replies((503, busy, {}), {"proposal": {"number": 3}})
+            with self.subTest(levels=levels), opener, patch("sys.stderr", new_callable=io.StringIO) as err:
+                result, _ = self._call()
+                self.assertEqual({"proposal": {"number": 3}}, result)
+                self.assertEqual(2, len(calls))
+                # The broker's own text is in the line, and nothing of the deep part.
+                self.assertIn("(HTTP 503): busy;", err.getvalue())
+                self.assertNotIn("[[", err.getvalue())
+
+        # The refusal that is raised when the retries are spent has the text in place of the part.
+        busy = self._busy("profile")[:-1] + b', "detail": ' + self._nested_lists(bound) + b"}"
+        calls, opener = self._replies(*([(503, busy, {})] * 10))
+        with opener, patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                self._call()
+        self.assertGreater(len(calls), 1)
+        self.assertEqual((caught.exception.payload["bound"], caught.exception.payload["detail"]), ("profile", self.LEFT_OUT))
+
+    def test_a_busy_refusal_whose_retry_mark_is_too_deep_is_sent_one_time(self):
+        """A mark that is too deep is a mark that the client does not know, and not one that is absent:
+        a busy refusal with no `bound` is sent again, and one with a `bound` that it cannot read is not."""
+        too_deep = self._nested_lists(credential_proxy_client.MAX_VCS_BODY_DEPTH)
+        code = credential_proxy_client.BUSY_CODE.encode()
+        bodies = {
+            "bound": b'{"error": "busy", "code": "%s", "before_admission": true, "bound": %s}' % (code, too_deep),
+            "before_admission": b'{"error": "busy", "code": "%s", "bound": "profile", "before_admission": %s}' % (code, too_deep),
+            "code": b'{"error": "busy", "bound": "profile", "before_admission": true, "code": %s}' % too_deep,
+        }
+        for mark, body in bodies.items():
+            calls, opener = self._replies((503, body, {}), {"proposal": {"number": 3}})
+            with self.subTest(mark=mark), opener, patch("sys.stderr", new_callable=io.StringIO) as err:
+                with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                    self._call()
+                self.assertEqual(1, len(calls))
+                self.assertEqual(caught.exception.payload[mark], self.LEFT_OUT)
+                self.assertEqual("", err.getvalue())
+
     def test_a_2xx_answer_that_is_an_object_comes_back_as_it_is(self):
         for answer in ({}, {"baseBranch": "main", "entries": [1, 2]}):
             with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):

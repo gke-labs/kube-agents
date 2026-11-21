@@ -41,6 +41,7 @@ _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
 from _run_make import run_make  # noqa: E402
+from testing import no_live_gcloud  # noqa: E402
 
 REPO_ROOT = _HERE.parent
 
@@ -718,6 +719,227 @@ class WorkerEnvironmentTest(unittest.TestCase):
             paths += re.findall(r"^kubeconfig=(.+)$", block, re.MULTILINE)
         self.assertEqual(len(set(paths)), 2, paths)
         self.assertNotIn(inherited.name, paths)
+
+
+#: What the fixtures below pass to `gcloud`. Not a gcloud command: a call that
+#: gets past every stand-in still does nothing.
+GCLOUD_FIXTURE_COMMAND = "sweep-fixture"
+#: The stand-in's line in a file's block, before the calls it recorded.
+GCLOUD_RECORD_HEADER = "gcloud ran with no stub of its own in this file"
+#: The names of the fixtures, one test file each.
+UNSTUBBED_FILE = "test_gcloud_unstubbed.py"
+TOLERANT_FILE = "test_gcloud_tolerant.py"
+OWN_STUB_FILE = "test_gcloud_own_stub.py"
+MOCKED_FILE = "test_gcloud_mocked.py"
+MANY_CALLS_FILE = "test_gcloud_many_calls.py"
+SIBLING_FILE = "test_gcloud_sibling.py"
+SLOW_TOLERANT_FILE = "test_gcloud_slow_tolerant.py"
+#: How long the slow fixture waits before its gcloud call: long against the
+#: time that a second worker needs to fail on the folder of the first.
+SLOW_FIXTURE_SECONDS = 2
+#: How many calls MANY_CALLS_FILE makes: more than the block shows.
+MANY_CALLS = 7
+
+UNSTUBBED_SOURCE = f"""\
+import subprocess
+import unittest
+
+
+class UnstubbedTest(unittest.TestCase):
+    def test_runs_gcloud_and_needs_it_to_succeed(self):
+        done = subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", "needs-success"])
+        self.assertEqual(0, done.returncode)
+"""
+TOLERANT_SOURCE = f"""\
+import subprocess
+import unittest
+
+
+class TolerantTest(unittest.TestCase):
+    def test_runs_gcloud_and_tolerates_its_failure(self):
+        done = subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", "tolerated", "--project", "example-project"])
+        print(f"returncode={{done.returncode}}")
+"""
+OWN_STUB_SOURCE = f"""\
+import os
+import pathlib
+import subprocess
+import tempfile
+import unittest
+
+
+class OwnStubTest(unittest.TestCase):
+    def test_runs_a_gcloud_of_its_own_ahead_on_path(self):
+        with tempfile.TemporaryDirectory() as out:
+            stub = pathlib.Path(out, "gcloud")
+            stub.write_text("#!/bin/sh\\nexit 0\\n")
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=out + os.pathsep + os.environ["PATH"])
+            done = subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", "own-stub"], env=env)
+        self.assertEqual(0, done.returncode)
+"""
+MOCKED_SOURCE = f"""\
+import subprocess
+import unittest
+from unittest import mock
+
+
+class MockedTest(unittest.TestCase):
+    def test_runs_gcloud_through_a_mock(self):
+        with mock.patch("subprocess.run") as run:
+            subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", "mocked"])
+        run.assert_called_once()
+"""
+MANY_CALLS_SOURCE = f"""\
+import subprocess
+import unittest
+
+
+class ManyCallsTest(unittest.TestCase):
+    def test_runs_gcloud_many_times(self):
+        for number in range(1, {MANY_CALLS} + 1):
+            subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", f"call-{{number}}"])
+"""
+SIBLING_SOURCE = f"""\
+import os
+import unittest
+
+
+class SiblingTest(unittest.TestCase):
+    def test_no_other_files_stand_in_folder_is_left(self):
+        own = os.environ["PATH"].split(os.pathsep)[0]
+        self.assertTrue(own.endswith(".gcloud"), own)
+        work = os.path.dirname(own)
+        others = sorted(name for name in os.listdir(work) if name.endswith(".gcloud") and os.path.join(work, name) != own)
+        self.assertEqual([], others)
+
+    def test_only_a_files_log_holds_the_calls_of_an_earlier_file(self):
+        # The record of an earlier file is gone; the lines that its block shows are in its log.
+        own = os.environ["PATH"].split(os.pathsep)[0]
+        self.assertTrue(own.endswith(".gcloud"), own)
+        work = os.path.dirname(own)
+        holders = []
+        for folder, _, names in os.walk(work):
+            for name in names:
+                with open(os.path.join(folder, name), "rb") as handle:
+                    if b"{GCLOUD_FIXTURE_COMMAND}" in handle.read():
+                        holders.append(name)
+        self.assertEqual([], [name for name in holders if not name.endswith(".log")])
+"""
+SLOW_TOLERANT_SOURCE = f"""\
+import subprocess
+import time
+import unittest
+
+
+class SlowTolerantTest(unittest.TestCase):
+    def test_runs_gcloud_after_a_wait_and_tolerates_its_failure(self):
+        time.sleep({SLOW_FIXTURE_SECONDS})
+        subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", "slow"])
+"""
+GCLOUD_FIXTURES = {
+    UNSTUBBED_FILE: UNSTUBBED_SOURCE,
+    TOLERANT_FILE: TOLERANT_SOURCE,
+    OWN_STUB_FILE: OWN_STUB_SOURCE,
+    MOCKED_FILE: MOCKED_SOURCE,
+    MANY_CALLS_FILE: MANY_CALLS_SOURCE,
+    SIBLING_FILE: SIBLING_SOURCE,
+    SLOW_TOLERANT_FILE: SLOW_TOLERANT_SOURCE,
+}
+
+
+@contextlib.contextmanager
+def gcloud_fixture_files():
+    """Write the gcloud fixtures outside the repository, as `fixture_files` does; yield {name: path}."""
+    with tempfile.TemporaryDirectory() as out:
+        paths = {}
+        for name, source in GCLOUD_FIXTURES.items():
+            paths[name] = os.path.join(out, name)
+            pathlib.Path(paths[name]).write_text(source)
+        yield paths
+
+
+class GcloudStandInTest(unittest.TestCase):
+    """A test that runs `gcloud` with no stub of its own fails its file in the sweep.
+
+    Each file runs with a stand-in `gcloud` first on PATH, in a folder of its
+    own. The stand-in records the call and fails; a record that is not empty
+    fails the file, also when its tests passed.
+    """
+
+    def _sweep(self, names, jobs=max(JOB_COUNTS)):
+        with gcloud_fixture_files() as paths:
+            files = [paths[name] for name in names]
+            done, failed = sweep(files, jobs, DISCOVER_MAKEFILE)
+            blocks = {}
+            for name, file in zip(names, files):
+                self.assertIn(f"==> {file}", done.stdout, done.stdout + done.stderr)
+                blocks[name] = _block(done.stdout, file)
+            return (failed or "").split(), dict(zip(names, files)), blocks
+
+    def test_a_file_whose_test_needs_gcloud_fails_and_its_block_names_the_call(self):
+        failed, files, blocks = self._sweep([UNSTUBBED_FILE])
+        self.assertEqual([files[UNSTUBBED_FILE]], failed)
+        self.assertIn(GCLOUD_RECORD_HEADER, blocks[UNSTUBBED_FILE])
+        self.assertIn(f"gcloud {GCLOUD_FIXTURE_COMMAND} needs-success", blocks[UNSTUBBED_FILE])
+
+    def test_a_file_whose_test_tolerates_the_failure_fails_too(self):
+        failed, files, blocks = self._sweep([TOLERANT_FILE])
+        block = blocks[TOLERANT_FILE]
+        # The file's own test passed: only the record fails it.
+        self.assertIn("Ran 1 test", block)
+        self.assertIn("\nOK", block)
+        self.assertEqual([files[TOLERANT_FILE]], failed)
+        self.assertIn(GCLOUD_RECORD_HEADER, block)
+        self.assertIn(f"gcloud {GCLOUD_FIXTURE_COMMAND} tolerated --project example-project", block)
+
+    def test_the_stand_in_exits_with_the_code_of_the_module_guard(self):
+        _, _, blocks = self._sweep([TOLERANT_FILE])
+        self.assertIn(f"returncode={no_live_gcloud.STAND_IN_EXIT_CODE}", blocks[TOLERANT_FILE])
+
+    def test_a_gcloud_of_the_tests_own_and_a_mock_are_not_affected(self):
+        failed, _, blocks = self._sweep([OWN_STUB_FILE, MOCKED_FILE])
+        self.assertEqual([], failed, blocks)
+        for block in blocks.values():
+            self.assertIn("\nOK", block)
+            self.assertNotIn(GCLOUD_RECORD_HEADER, block)
+
+    def test_a_block_shows_the_first_five_calls_and_the_count(self):
+        failed, files, blocks = self._sweep([MANY_CALLS_FILE])
+        block = blocks[MANY_CALLS_FILE]
+        self.assertEqual([files[MANY_CALLS_FILE]], failed)
+        self.assertIn(f"{GCLOUD_RECORD_HEADER}: {MANY_CALLS} call(s).", block)
+        shown = re.findall(rf"^\s*gcloud {GCLOUD_FIXTURE_COMMAND} (call-\d+)$", block, re.MULTILINE)
+        self.assertEqual([f"call-{number}" for number in range(1, no_live_gcloud.REPORTED_CALLS + 1)], shown)
+
+    def test_each_file_has_a_record_of_its_own(self):
+        for jobs in JOB_COUNTS:
+            with self.subTest(jobs=jobs):
+                failed, files, blocks = self._sweep([UNSTUBBED_FILE, TOLERANT_FILE, MOCKED_FILE], jobs)
+                self.assertEqual(sorted([files[UNSTUBBED_FILE], files[TOLERANT_FILE]]), sorted(failed))
+                self.assertIn("needs-success", blocks[UNSTUBBED_FILE])
+                self.assertNotIn("tolerated", blocks[UNSTUBBED_FILE])
+                self.assertIn("tolerated", blocks[TOLERANT_FILE])
+                self.assertNotIn("needs-success", blocks[TOLERANT_FILE])
+                self.assertNotIn(GCLOUD_RECORD_HEADER, blocks[MOCKED_FILE])
+
+    def test_a_files_folder_and_record_are_gone_when_the_next_file_runs(self):
+        # One worker, so the files run one after the other, in list order. The
+        # last file looks in the sweep's work folder for another file's folder.
+        for first in (TOLERANT_FILE, UNSTUBBED_FILE, MOCKED_FILE):
+            with self.subTest(first=first):
+                failed, files, blocks = self._sweep([first, SIBLING_FILE], jobs=1)
+                self.assertIn("\nOK", blocks[SIBLING_FILE])
+                self.assertNotIn(files[SIBLING_FILE], failed)
+
+    def test_a_second_entry_of_a_file_does_not_remove_the_stand_in_of_the_first(self):
+        # The same file two times and two workers: one worker makes the folder,
+        # the other cannot and stops at once. The first one's test runs gcloud
+        # after that, and must still get the stand-in.
+        failed, files, blocks = self._sweep([SLOW_TOLERANT_FILE, SLOW_TOLERANT_FILE], jobs=2)
+        self.assertIn(files[SLOW_TOLERANT_FILE], failed)
+        self.assertIn(GCLOUD_RECORD_HEADER, blocks[SLOW_TOLERANT_FILE])
+        self.assertIn(f"gcloud {GCLOUD_FIXTURE_COMMAND} slow", blocks[SLOW_TOLERANT_FILE])
 
 
 if __name__ == "__main__":

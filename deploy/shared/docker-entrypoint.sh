@@ -570,10 +570,16 @@ fi
 # module mid-copy must find the old file whole, never a truncated one that stops the plugin
 # loading. A copy that fails part-way leaves the old file whole for the same reason.
 #
-# Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a volume where the kubelet
-# created it as the parent of a plugin mounted beneath it, and `set -e` would otherwise end
-# the container on the mkdir. The scripts block above guards only its `cp`: step 2's bulk
-# copy has already created `scripts/`, so its bare `mkdir -p` meets an existing directory.
+# Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a new volume where the
+# container runtime created it as the parent of a plugin mounted beneath it (an operator
+# that does not make the folder first), and `set -e` would otherwise end the container on
+# the mkdir. The scripts block above guards only its `cp`: step 2's bulk copy has already
+# created `scripts/`, so its bare `mkdir -p` meets an existing directory.
+#
+# The warning says what the volume is left with. A plugin folder that held a file before
+# the copy keeps the previous image's copy of each file not yet replaced. A folder that
+# held none, as on that new volume, has no copy to keep: the plugin is missing or
+# incomplete, and the agent runs without it.
 if [ -d "$DEFAULTS_PLUGINS_DIR" ]; then
     # shellcheck disable=SC3028 # falls back to $$ where HOSTNAME is unset
     _plugin_refresh_tag="${HOSTNAME:-$$}"
@@ -583,12 +589,22 @@ if [ -d "$DEFAULTS_PLUGINS_DIR" ]; then
         case " $PINNED_EXTERNAL_PLUGINS " in *" $_image_plugin "*) continue ;; esac
         _plugin_dst="$TARGET_DIR/plugins/$_image_plugin"
         [ -L "$_plugin_dst" ] && continue
+        # Before the copy, and a folder only: a file in the folder's place is no copy, and
+        # neither is a temporary file that an earlier failed copy left.
+        _plugin_had_copy=false
+        if [ -d "$_plugin_dst" ] && [ -n "$(find "$_plugin_dst" -type f ! -name '*.refresh.*' 2>/dev/null | head -n 1)" ]; then
+            _plugin_had_copy=true
+        fi
         if ! (cd "$_image_plugin_dir" && find . -type f) | while IFS= read -r _file; do
             _tmp="$_plugin_dst/$_file.refresh.$_plugin_refresh_tag"
             { mkdir -p "$(dirname "$_plugin_dst/$_file")" && cp -p "$_image_plugin_dir$_file" "$_tmp" && mv -f "$_tmp" "$_plugin_dst/$_file"; } 2>/dev/null \
                 || { rm -f "$_tmp" 2>/dev/null; exit 1; }
         done; then
-            echo "WARN: could not refresh $_plugin_dst from the image; each file not yet replaced keeps the previous image's copy" >&2
+            if [ "$_plugin_had_copy" = true ]; then
+                echo "WARN: could not refresh $_plugin_dst from the image; each file not yet replaced keeps the previous image's copy" >&2
+            else
+                echo "WARN: could not refresh $_plugin_dst from the image; the volume had no earlier copy, so the $_image_plugin plugin is missing or incomplete and the agent runs without it" >&2
+            fi
         fi
     done
 fi

@@ -93,8 +93,11 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 #   workload and waits for that repetition's own card
 #   (autoops-warning-event-triage, autoops-crashloop-config-triage,
 #   autoops-warning-event-no-action-triage, whose plant also fails on any
-#   answer but `injected`). A window longer than the gap folds repetition 2's
-#   incident into repetition 1's and no card comes. The fan-out in
+#   answer but `injected`; the workload-image-pull-refused-* cases also
+#   re-plant one workload, where the turn and not the plant waits for the
+#   card, and their shortest measured repetition is 5.5 minutes). A window
+#   longer than the gap folds repetition 2's incident into repetition 1's
+#   and no card comes. The fan-out in
 #   hack/ci-eval-pr.sh queues case by case and can launch a case's next
 #   repetition as soon as its last ends (#3939), so the gap can be as short
 #   as one repetition: at least 4.5 minutes (the third's shortest). Under
@@ -393,6 +396,14 @@ readonly KUBECTL_EMPTY_COLUMN='<none>'
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
+# 5c's guard for a profile namespace still Terminating from a release
+# uninstall (#6602). The chart names the namespace as the release namespace
+# plus this suffix (charts/kube-agents/templates/profiles-namespace.yaml); the
+# guard reads its deletionTimestamp and waits this long for it to go. The limit
+# is the CR delete's: both wait for the objects of one failed install.
+readonly PROFILES_NAMESPACE_SUFFIX="-profiles"
+readonly NAMESPACE_DELETION_JSONPATH='{.metadata.deletionTimestamp}'
+readonly PROFILES_NAMESPACE_DELETE_TIMEOUT="120s"
 # The NATS StatefulSet the operator renders, and the claims its
 # volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
 # (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
@@ -2394,6 +2405,27 @@ echo "Credential-proxy memory limit for this install: ${EVAL_CREDENTIAL_PROXY_ME
 HELM_INSTALL_OUT="$(mktemp)"
 HELM_EXIT=0
 for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
+  # A release uninstall with no wait (the heal of a poisoned record, at lease
+  # time in 5a or before a retry below) starts the delete of the chart's
+  # profile namespace and returns. An install that starts while the namespace
+  # is Terminating fails on it, with `namespaces "<name>" not found` when the
+  # delete completes under it, and that is not a retried error (#6602). So
+  # before each attempt, a namespace that carries a deletionTimestamp is waited
+  # out. A live or absent namespace costs this one read. A read that fails
+  # is named and leaves the decision to the install.
+  PROFILES_NAMESPACE_DELETING="$(kubectl get namespace "${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --ignore-not-found \
+    -o jsonpath="${NAMESPACE_DELETION_JSONPATH}")" || {
+    echo "WARNING: could not read the profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} to check for one still Terminating; install attempt ${attempt} decides."
+    PROFILES_NAMESPACE_DELETING=""
+  }
+  if [ -n "${PROFILES_NAMESPACE_DELETING}" ]; then
+    echo "The profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} is Terminating (since ${PROFILES_NAMESPACE_DELETING}); waiting up to ${PROFILES_NAMESPACE_DELETE_TIMEOUT} for it to go before install attempt ${attempt}."
+    if ! kubectl wait --for=delete "namespace/${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX}" --timeout="${PROFILES_NAMESPACE_DELETE_TIMEOUT}"; then
+      echo "ERROR: the wait for the profile namespace ${NAMESPACE}${PROFILES_NAMESPACE_SUFFIX} to go failed (limit ${PROFILES_NAMESPACE_DELETE_TIMEOUT}; kubectl's line is above); install attempt ${attempt} would fail on it (#6602)." >&2
+      rm -f "${HELM_INSTALL_OUT}"
+      exit 1
+    fi
+  fi
   set +e
   helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
     --namespace "${NAMESPACE}" --create-namespace \
