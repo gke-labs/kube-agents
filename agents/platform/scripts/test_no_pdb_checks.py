@@ -1,7 +1,7 @@
 """Tests for fix_recipes/no-pdb/checks.py: the no-pdb recipe's safety checks on a generated budget.
 
-`fleet-audit/scripts/test_broker_checks_parity.py` holds the verdicts to the
-sandbox's own `pdb_safety.judge`.
+`fleet-audit/scripts/test_broker_checks_parity.py` holds the sandbox's
+pre-flight (`fix_preflight`), which runs this same recipe, to the same verdicts.
 """
 
 import sys

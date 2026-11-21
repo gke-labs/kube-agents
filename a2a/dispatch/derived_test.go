@@ -2,6 +2,8 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,7 +34,6 @@ func TestAProfileWithNoListedDurablesDispatches(t *testing.T) {
 	b.ensure("tse", 2, 0, "read")
 	b.worker("tse", "read", "tse-1", answerAccept, time.Second)
 	prof := testProfile("tse", 2)
-	prof.Durables = nil
 	ti := &testInstall{src: NewStaticSource(testDispatchConfig(6, prof)), pool: NewStaticPool()}
 	ti.pool.Set("tse", "read", "tse-1")
 	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
@@ -43,38 +44,62 @@ func TestAProfileWithNoListedDurablesDispatches(t *testing.T) {
 	}
 }
 
-// The roll window this change opens (#5479): the operator applies the
-// ConfigMap before the dispatcher Deployment, so a dispatcher from before
-// #5479 reads a config it refuses (it requires listed durables). A refusing
-// reader keeps serving its last good config rather than stopping, and the
-// dispatcher reads nothing but that store. Here the store holds a config an
-// operator of either shape could write, then is handed one it refuses (a
-// listed durable set that isn't the derived one, the refusal this change
-// adds): it keeps the last good config, stays ready, and says why.
+// A refused config leaves the last good one serving: the store keeps it,
+// stays ready, and says why.
 func TestARefusedConfigKeepsTheLastGoodServing(t *testing.T) {
 	s := NewConfigStore(quietLog())
-	good := testDispatchConfig(6, testProfile("tse", 2)) // lists its durables, as an older operator does
-	good.Version = "old-operator"
+	good := testDispatchConfig(6, testProfile("tse", 2))
+	good.Version = "good"
 	if err := s.Update(rawConfig(t, good)); err != nil {
 		t.Fatal(err)
 	}
-	refused := testDispatchConfig(6, testProfile("tse", 2, "read", "unattended"))
+	refused := testDispatchConfig(6, testProfile("tse", 2))
 	refused.Version = "refused"
-	refused.Profiles[0].Durables = refused.Profiles[0].Durables[:1]
+	refused.Profiles[0].Concurrency = 0
 	if err := s.Update(rawConfig(t, refused)); err == nil {
-		t.Fatal("a listed durable set that isn't the derived one was accepted")
+		t.Fatal("a profile with no concurrency was accepted")
 	}
-	if !s.Ready() || s.Config().Version != "old-operator" || s.LastError() == "" {
+	if !s.Ready() || s.Config().Version != "good" || s.LastError() == "" {
 		t.Fatalf("ready %v, serving %q, last error %q: want the last good config still serving", s.Ready(), s.Config().Version, s.LastError())
 	}
-	if got := s.Config().Profiles[0].DerivedDurables(); len(got) != 2 {
-		t.Errorf("the config still serving derives %d durables; want 2", len(got))
+}
+
+// The fields the dispatcher no longer reads (#5639), which no operator from
+// #5649 on writes, are ignored if a config still carries them: a listed
+// durable set, even one that isn't the derived one; an inline jobTemplate;
+// and a jobTemplateRef name, even another profile's param. The durables come
+// from the tiers, and the template from the profile's own param.
+func TestAConfigsDroppedFieldsAreIgnored(t *testing.T) {
+	s := NewConfigStore(quietLog())
+	var doc map[string]any
+	if err := json.Unmarshal(rawConfig(t, testDispatchConfig(6, testProfile("tse", 2, "read", "unattended"))), &doc); err != nil {
+		t.Fatal(err)
 	}
-	// A config with no listed durables (this operator's shape) loads.
-	current := testDispatchConfig(6, testProfile("tse", 2))
-	current.Version = "new-operator"
-	current.Profiles[0].Durables = nil
-	if err := s.Update(rawConfig(t, current)); err != nil || s.Config().Version != "new-operator" {
-		t.Fatalf("the new shape: err %v, serving %q", err, s.Config().Version)
+	p := doc["profiles"].([]any)[0].(map[string]any)
+	p["durables"] = []any{map[string]any{"tier": "read", "kind": "top", "name": lib.ProfileDurableName("tse", "read", "top")}}
+	p["jobTemplate"] = map[string]any{"spec": map[string]any{"containers": []any{map[string]any{"name": "inline"}}}}
+	p["jobTemplateRef"] = map[string]any{"name": lib.DispatchJobTemplateName("other"), "hash": "aaaa"}
+	raw, merr := json.Marshal(doc)
+	if merr != nil {
+		t.Fatal(merr)
+	}
+	if err := s.Update(raw); err != nil {
+		t.Fatalf("a config carrying the dropped fields was refused: %v", err)
+	}
+	prof := s.Config().Profiles[0]
+	if got := prof.DerivedDurables(); len(got) != 4 {
+		t.Errorf("derived %d durables; want 4, one per tier and kind", len(got))
+	}
+	var asked string
+	k := &KubeJobs{getTemplate: func(_ context.Context, _ string, name string) ([]byte, error) {
+		asked = name
+		return []byte(`{"metadata":{"annotations":{"` + lib.DispatchJobTemplateHashAnnotation + `":"aaaa"}},"spec":{"template":{"spec":{"containers":[{"name":"w"}]}}}}`), nil
+	}}
+	tmpl, err := k.jobTemplate(context.Background(), "ns", &prof, "unattended")
+	if err != nil || strings.Contains(string(tmpl), "inline") {
+		t.Fatalf("template %s, err %v: want the param's, not the inline copy", tmpl, err)
+	}
+	if asked != lib.DispatchJobTemplateName("tse") {
+		t.Errorf("read %q; want the profile's own param %q", asked, lib.DispatchJobTemplateName("tse"))
 	}
 }
