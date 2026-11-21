@@ -373,7 +373,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             resp.read.return_value = b'{"response": {"id": "1"}}'
             return resp
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             await adapter._process_activity(
                 {
                     "type": "message",
@@ -454,6 +454,99 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         # A pipe inside a code block is code, not a table.
         code_body = markdown_to_adaptive_card("```\n| a | b |\n```")["body"]
         self.assertEqual([b["type"] for b in code_body], ["TextBlock"])
+
+    def test_a_table_opens_only_on_a_delimiter_row(self):
+        # GitHub's rule: a header followed by a delimiter row. A lone line with
+        # pipes is prose, and a delimiter row needs one dash per cell, not three.
+        lone = markdown_to_adaptive_card("|x| + |y| = 1")["body"]
+        self.assertEqual([b["type"] for b in lone], ["TextBlock"])
+        self.assertEqual(lone[0]["text"], "|x| + |y| = 1")
+        short = markdown_to_adaptive_card("| a | b |\n| - | :-: |\n| 1 | 2 |")["body"]
+        self.assertEqual([b["type"] for b in short], ["Table"])
+        rows = short[0]["rows"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["cells"][1]["items"][0]["text"], "2")
+        # A header whose delimiter row has another cell count is not a table.
+        off = markdown_to_adaptive_card("| a | b | c |\n|---|---|\n| 1 | 2 |")["body"]
+        self.assertEqual([b["type"] for b in off], ["TextBlock"] * 3)
+
+    def test_a_continuation_piece_of_a_split_table_is_still_a_table(self):
+        # Hermes splits a long reply into pieces; pieces after the first open
+        # on body rows with no header or delimiter row.
+        body = markdown_to_adaptive_card("| 3 | 4 |\n| 5 | 6 | (2/3)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(len(body[0]["rows"]), 2)
+        self.assertEqual(body[1]["text"], "(2/3)")
+        body = markdown_to_adaptive_card("| c | Running |\n| d | Pending |\n\nTwo pods are pending.")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+
+    def test_a_list_item_or_heading_with_a_pipe_ends_the_table(self):
+        body = markdown_to_adaptive_card("| a | b |\n|---|---|\n| 1 | 2 |\n- see `x | y`\n# Next | part")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock", "TextBlock"])
+        self.assertEqual(len(body[0]["columns"]), 2)
+        self.assertEqual(body[1]["text"], "• see `x | y`")
+        self.assertEqual(body[2]["text"], "Next | part")
+
+    def test_split_marker_after_a_borderless_table_row_is_not_a_cell(self):
+        body = markdown_to_adaptive_card("a | b\n---|---\n1 | 2 (2/3)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(body[0]["rows"][1]["cells"][1]["items"][0]["text"], "2")
+        self.assertEqual(body[1]["text"], "(2/3)")
+
+    def test_a_body_row_of_dashes_is_data(self):
+        # GitHub's rule: only the line under the header is the delimiter; a
+        # later all-dash row is an empty entry and stays.
+        body = markdown_to_adaptive_card("| pod | restarts |\n|---|---|\n| a | 3 |\n| - | - |\n| --- | --- |")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table"])
+        rows = body[0]["rows"]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[2]["cells"][0]["items"][0]["text"], "-")
+        self.assertEqual(rows[3]["cells"][1]["items"][0]["text"], "---")
+
+    def test_an_issue_number_row_and_a_heading_are_told_apart(self):
+        # "#1040 | open" is a row (no space after the #); "# Section | x" is a
+        # heading and neither continues nor opens a table.
+        body = markdown_to_adaptive_card("Issue | Status\n---|---\n#1040 | open\n#3055 | closed")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table"])
+        self.assertEqual(len(body[0]["rows"]), 3)
+        self.assertEqual(body[0]["rows"][1]["cells"][0]["items"][0]["text"], "#1040")
+        body = markdown_to_adaptive_card("# Section | Overview\n---|---\n- item | a\n---|---\n| 1 | 2 |")["body"]
+        self.assertEqual(body[0]["type"], "TextBlock")
+        self.assertEqual(body[0]["size"], "Large")
+        self.assertEqual([b["type"] for b in body].count("Table"), 0)
+        self.assertEqual(body[2]["text"], "• item | a")
+
+    def test_split_marker_after_a_delimiter_row_is_detached(self):
+        # A cut right after the delimiter row: the marker comes off it, so
+        # the delimiter is still one and the table keeps its width.
+        body = markdown_to_adaptive_card("| a | b |\n|---|---| (1/2)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(len(body[0]["columns"]), 2)
+        self.assertEqual(body[1]["text"], "(1/2)")
+        body = markdown_to_adaptive_card("a | b\n---|--- (1/2)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(len(body[0]["rows"]), 1)
+
+    def test_split_marker_stays_on_a_prose_line_with_pipes(self):
+        for text in (
+            "|x| + |y| = 1 (1/2)",
+            "| Pod | Status | (1/2)",
+            "Run: kubectl get pods | grep api\nOr: kubectl get pods | grep web (1/2)",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n- see `x | y` (1/2)",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(teams_relay_patch._detach_part_marker(text), text)
+                body = markdown_to_adaptive_card(text)["body"]
+                self.assertTrue(body[-1]["text"].endswith("(1/2)"), body)
+
+    def test_an_escaped_pipe_stays_in_its_cell(self):
+        split = teams_relay_patch._split_table_row
+        self.assertEqual(split("| a \\| b | c |"), ["a | b", "c"])
+        self.assertEqual(split("a | b \\|"), ["a", "b |"])
+        body = markdown_to_adaptive_card("| cmd | out |\n|---|---|\n| a \\| b | c |")["body"]
+        table = body[0]
+        self.assertEqual(len(table["columns"]), 2)
+        self.assertEqual(table["rows"][1]["cells"][0]["items"][0]["text"], "a | b")
 
     def test_split_marker_after_a_table_row_is_not_a_cell(self):
         # Hermes appends " (i/n)" to each piece of a split reply; when the piece
@@ -542,6 +635,36 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         # tenant got no proactive reports while it was missing (2026-11-12).
         self.assertEqual(registered[0]["cron_deliver_env_var"], "TEAMS_HOME_CHANNEL")
 
+    def test_the_build_time_contract_pins_this_senders_shape(self):
+        # deploy/docker/patches/verify_slack_relay_registry_contract.py checks
+        # the sender's shape against the image's Hermes at build time; the pin
+        # it holds is this function's shape, so the two cannot drift apart.
+        import importlib
+        import inspect
+
+        patches_dir = str(Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches")
+        sys.path.insert(0, patches_dir)
+        try:
+            contract = importlib.import_module("verify_slack_relay_registry_contract")
+        finally:
+            sys.path.remove(patches_dir)
+        from gateway.platform_registry import platform_registry
+
+        teams_relay_patch.install()
+        entry = platform_registry.get("teams")
+        self.assertEqual(contract.shape(entry.standalone_sender_fn), contract.UPSTREAM_SIGNATURES["teams._standalone_send"])
+        # And the adapter's overrides take every parameter the fake base's
+        # methods declare, the way the contract check asks of the real base.
+        adapter = entry.adapter_factory({"extra": {}})
+        for name in ("connect", "disconnect", "send", "send_typing", "get_chat_info"):
+            base_method = getattr(type(adapter).__mro__[1], name, None)
+            if base_method is None:  # the fake base declares fewer methods than Hermes'
+                continue
+            base_params = inspect.signature(base_method).parameters
+            over = inspect.signature(getattr(type(adapter), name)).parameters
+            catch_all = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in over.values())
+            self.assertEqual([n for n in base_params if n not in over and not catch_all], [], name)
+
     async def test_teams_relay_adapter_lifecycle_and_message_processing(self):
         from gateway.platform_registry import PlatformRegistry, platform_registry
 
@@ -580,7 +703,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "from": {"id": "29:user-456", "aadObjectId": "aad-user-456", "name": "Admin"},
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -628,7 +751,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "channelData": {"tenant": {"id": "tenant-1"}},
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -653,7 +776,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         ):
             received_events.clear()
             typed = dict(activity, conversation={"id": "conv-777", "conversationType": conversation_type})
-            with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
                 mock_resp = mock.MagicMock()
                 mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
                 mock_resp.__enter__.return_value = mock_resp
@@ -671,7 +794,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         registry = PlatformRegistry()
         adapter = registry.create_adapter("teams")
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps(
                 {"response": {"id": "msg-1"}}
@@ -735,7 +858,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "http://relay/v1/chat/teams/api", 400, "Bad Request", {}, None
         )
         for error in (rejected, urllib.error.URLError("connection refused")):
-            with mock.patch("urllib.request.urlopen", side_effect=error):
+            with mock.patch("urllib.request.OpenerDirector.open", side_effect=error):
                 res = await adapter.send(chat_id="conv-123", content="hello")
             self.assertIsInstance(res, SendResult)
             self.assertFalse(res.success)
@@ -782,7 +905,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         adapter._running = True
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen_ack):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen_ack):
             await adapter._relay_loop()
 
         self.assertEqual(len(handled), 1)
@@ -816,7 +939,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         adapter._running = True
         with (
-            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen_nack),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen_nack),
             mock.patch.object(
                 adapter, "_process_activity", side_effect=RuntimeError("boom")
             ),
@@ -853,7 +976,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "from": {"id": "user-1"},
             "conversation": {"id": "conv-1"},
         }
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             await adapter._process_activity(unauthorized_activity)
             self.assertEqual(handled, [])
             mock_urlopen.assert_not_called()
@@ -896,7 +1019,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             mock_resp = mock.MagicMock()
             mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
@@ -941,7 +1064,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "from": {"id": "u1"},
         }
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             for bad_override in (
                 {"channelData": "bad"},
                 {"from": "bad"},
@@ -999,7 +1122,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         with (
-            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen),
             mock.patch("asyncio.sleep", new=mock.AsyncMock()),
         ):
             self.assertTrue(await adapter.connect())
@@ -1020,7 +1143,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             io.BytesIO(b'{"settled": false}'),
         )
         with (
-            mock.patch("urllib.request.urlopen", side_effect=ready) as probe,
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=ready) as probe,
             mock.patch("asyncio.sleep", new=mock.AsyncMock()) as slept,
         ):
             self.assertTrue(await adapter.connect())
@@ -1039,12 +1162,12 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         body = json.dumps({"error": "Teams operation failed", "detail": "HTTP 403: BotNotInConversationRoster",
                            "teams": {"status": 403, "code": "BotNotInConversationRoster", "message": "not in roster"}}).encode()
         err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 502, "Bad Gateway", {}, io.BytesIO(body))
-        with mock.patch("urllib.request.urlopen", side_effect=err):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=err):
             res = await sender(None, "conv-1", "hello")
         self.assertIn("BotNotInConversationRoster", res["error"])
         self.assertNotIn("success", res)
 
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+        with mock.patch("urllib.request.OpenerDirector.open") as mock_urlopen:
             self.assertEqual(await sender(None, "conv-1", "   "), {"success": True, "platform": "teams", "skipped": "empty_text"})
             self.assertEqual(
                 await sender(None, "conv-1", "", media_files=["/tmp/a.png"]),
@@ -1064,7 +1187,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             resp.__enter__.return_value = resp
             return resp
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             res = await sender(None, "conv-1", "report", media_files=["/tmp/a.png"])
         self.assertEqual(res, {"success": True, "message_id": "m-9", "media_omitted": 1})
         self.assertEqual(len(posted), 1)
@@ -1098,7 +1221,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             resp.__enter__.return_value = resp
             return resp
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             await adapter.send("conv-1", "# short\n- one line")
         self.assertIn("attachments", sent[0]["payload"])
 
@@ -1148,7 +1271,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         report = "\n".join(["finding %05d: cgroup pressure on node pool a" % i for i in range(700)])
         self.assertGreater(len(report), 2 * teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
         adapter.adaptive_cards = False
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             res = await adapter.send("conv-1", report, reply_to="1697000000000")
         self.assertTrue(res.success)
         self.assertEqual(res.message_id, "m-%d" % len(sent))
@@ -1183,7 +1306,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         adapter.adaptive_cards = False
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             res = await adapter.send("conv-1", "ok \ud83d done")
         self.assertTrue(res.success)
         self.assertEqual(sent[0]["text"], "ok ? done")
@@ -1213,7 +1336,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
-        with mock.patch("urllib.request.urlopen", side_effect=slow_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=slow_urlopen):
             with self.assertRaises(asyncio.TimeoutError):
                 await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.05)
             self.assertIn("conv-1", adapter._typing_in_flight)
@@ -1258,7 +1381,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
         loop.run_in_executor(None, busy.wait, 5)  # the only worker is taken
         with (
-            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen),
             mock.patch.object(teams_relay_patch, "TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS", 0.05),
         ):
             with self.assertRaises(asyncio.TimeoutError):
@@ -1280,6 +1403,26 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(converted.status, 400)
         self.assertEqual(str(converted), "HTTP 400: Teams relay refuses endpoint: v3/conversations/x/members")
 
+    def test_relayed_teams_error_keeps_the_reason_when_microsoft_sent_no_words(self):
+        import io
+
+        def relayed(answer):
+            body = json.dumps(answer).encode()
+            err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 502, "Bad Gateway", {}, io.BytesIO(body))
+            return str(teams_relay_patch.relayed_teams_error(err))
+
+        # A Microsoft fault with a non-JSON body: the broker's ``teams`` object
+        # holds the status alone, and the reason is in its ``detail``.
+        self.assertEqual(
+            relayed({"error": "Teams operation failed", "detail": "HTTP 503: Service Unavailable", "teams": {"status": 503}}),
+            "HTTP 502: Teams operation failed HTTP 503: Service Unavailable",
+        )
+        # Microsoft's own words win when it gave any.
+        self.assertEqual(
+            relayed({"error": "Teams operation failed", "detail": "x", "teams": {"status": 403, "code": "BotNotInConversationRoster", "message": "not in roster"}}),
+            "HTTP 502: 403 BotNotInConversationRoster not in roster",
+        )
+
     async def test_a_full_chunk_of_four_byte_characters_is_posted_whole(self):
         """The chunkers count characters and the cap counts bytes: a chunk of
         ``MAX_MESSAGE_LENGTH`` four-byte characters, with a reply id, must fit
@@ -1300,7 +1443,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         chunk = "\U0001F600" * adapter.MAX_MESSAGE_LENGTH
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             await adapter.send("conv-1", chunk, reply_to="1697000000000")
         payload = sent[0]["payload"]
         wire = json.dumps(payload, ensure_ascii=False)
@@ -1335,7 +1478,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
         with (
-            mock.patch("urllib.request.urlopen", side_effect=slow_urlopen),
+            mock.patch("urllib.request.OpenerDirector.open", side_effect=slow_urlopen),
             mock.patch.object(teams_relay_patch, "TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS", 0.05),
         ):
             with self.assertRaises(asyncio.TimeoutError):
@@ -1375,7 +1518,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             return resp
 
         report = "\n".join(["line %05d" % i for i in range(2000)])  # three chunks
-        with mock.patch("urllib.request.urlopen", side_effect=flaky_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=flaky_urlopen):
             res = await adapter.send("conv-1", report)
         self.assertFalse(res.success)
         self.assertIn("connection refused", res.error)

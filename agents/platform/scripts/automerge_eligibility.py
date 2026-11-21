@@ -68,6 +68,19 @@ class AddedManifest(NamedTuple):
     finding_id: str
     text: str
 
+    # What a recipe's `checks(change, live)` reads (`fix_recipes/<kind>/checks.py`).
+    @property
+    def object(self) -> str:
+        return str(self.candidate.get("object") or "")
+
+    @property
+    def namespace(self) -> str:
+        return str(self.candidate.get("namespace") or "")
+
+    @property
+    def selector(self) -> dict:
+        return self.candidate.get("pod_selector") or {}
+
 
 def reserved_label_refusal(verb: str, payload: Any) -> str | None:
     """Why a caller's `verb` with `payload` may not run, or None.

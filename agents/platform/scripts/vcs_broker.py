@@ -62,6 +62,7 @@ forge shares and Gerrit's unit of review is a single revision.
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import json
 import logging
@@ -78,9 +79,9 @@ from typing import Any, Callable, Mapping
 import yaml
 
 import automation_rules
-import automerge_checks
 import automerge_eligibility
 import okf_guard
+from fix_recipes import registry as fix_recipes_registry
 from providers import (
     CliTransport,
     HttpTransport,
@@ -218,6 +219,14 @@ ROLE_UNREGISTERED = "unregistered"
 # `snapshot` puts it on every clone that must not ride the ambient write
 # credential: a context repository's, and an unregistered one's.
 HELPER_CLEARED = (CREDENTIAL_HELPER_KEY, "")
+
+# What a git call carries when its working directory is a bare repository of
+# the broker's own (the snapshot clone, the `contains` scratch repository). It
+# names the repository: under `safe.bareRepository=explicit`, the default from
+# Git 3.0, git does not take a bare repository from the working directory. A
+# named repository also gets no ownership check (`safe.directory`) from git;
+# the broker makes each of these directories itself, in the same request.
+GIT_DIR_IS_CWD = "--git-dir=."
 
 # Where `snapshot` puts its two files inside its scratch directory: the bare
 # clone, and the tar `git archive` writes. The tar goes to a file and not to
@@ -1024,9 +1033,11 @@ class VcsBroker:
             lambda: tuple(forge.credential.git_config(repo)), forge.scheme == "http"
         )
 
-        def run(cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None):
+        def run(
+            cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None, bare: bool = False
+        ):
             try:
-                return runner(cwd, *args, check=check, stop=stop)
+                return runner(cwd, *args, check=check, stop=stop, bare=bare)
             except subprocess.CalledProcessError as exc:
                 # A forge whose git refusal means more than "the token is not
                 # valid" says what it means. Only the forge's own text goes
@@ -1042,15 +1053,22 @@ class VcsBroker:
     def _git_with(
         self, config: Callable[[], tuple[tuple[str, str], ...]], allow_http: bool
     ) -> Callable[..., Any]:
-        """A git runner that puts `config()` on each invocation's config layer."""
+        """A git runner that puts `config()` on each invocation's config layer.
 
-        def run(cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None):
+        `bare` says that `cwd` is a bare repository; the call then names it
+        (`GIT_DIR_IS_CWD`).
+        """
+
+        def run(
+            cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None, bare: bool = False
+        ):
             extra: dict[str, Any] = {}
             if allow_http:
                 extra["allow_http"] = True
             if stop is not None:
                 extra["stop"] = stop
-            return self._git_runner(["git", *args], cwd, check, config(), **extra)
+            named = (GIT_DIR_IS_CWD,) if bare else ()
+            return self._git_runner(["git", *named, *args], cwd, check, config(), **extra)
 
         return run
 
@@ -1422,13 +1440,14 @@ class VcsBroker:
             if cloned.returncode != 0:
                 raise subprocess.CalledProcessError(cloned.returncode, argv, cloned.stdout, cloned.stderr)
             self._enforce_ceiling(clone_dir, repo, remedy=remedy)
+            in_clone = functools.partial(git, bare=True)
             if target is None:
-                target = self._default_branch(git, clone_dir)
-            revision = self._snapshot_revision(git, clone_dir, target)
+                target = self._default_branch(in_clone, clone_dir)
+            revision = self._snapshot_revision(in_clone, clone_dir, target)
             attributes = clone_dir / SNAPSHOT_ATTRIBUTES_FILE
             attributes.parent.mkdir(parents=True, exist_ok=True)
             attributes.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
-            self._measure_snapshot(git, clone_dir, revision, paths, repo, max_unpacked)
+            self._measure_snapshot(in_clone, clone_dir, revision, paths, repo, max_unpacked)
             # `--literal-pathspecs` is GIT_LITERAL_PATHSPECS as a flag: each
             # path is a name, never a glob or pathspec magic.
             argv = [
@@ -1437,7 +1456,7 @@ class VcsBroker:
             ]
             if paths:
                 argv += ["--", *paths]
-            written = git(clone_dir, *argv, check=False)
+            written = in_clone(clone_dir, *argv, check=False)
             if written.returncode != 0:
                 if paths and PATHSPEC_NO_MATCH in (written.stderr or ""):
                     # The revision goes with the refusal: a caller that asked
@@ -2225,6 +2244,7 @@ class VcsBroker:
         root = self._scratch("contains")
         try:
             git(root, "init", "--quiet", "--bare")
+            in_repo = functools.partial(git, bare=True)
             last, stopped = [0.0], [False]
 
             def over_ceiling() -> bool:
@@ -2235,7 +2255,7 @@ class VcsBroker:
                 stopped[0] = _tree_bytes(root, self.max_clone_bytes) > self.max_clone_bytes
                 return stopped[0]
 
-            fetched = git(
+            fetched = in_repo(
                 root, "fetch", "--quiet", "--no-tags", "--filter=tree:0", bound.forge.clone_url(bound.repo), revision,
                 check=False, stop=over_ceiling,
             )
@@ -2259,9 +2279,9 @@ class VcsBroker:
                     code="FORGE_CALL_FAILED",
                 )
             self._enforce_ceiling(root, bound.repo, remedy=remedy)
-            present = git(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
+            present = in_repo(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
             full = (present.stdout or "").strip()
-            contains = present.returncode == 0 and bool(full) and self._is_ancestor(git, root, full, revision)
+            contains = present.returncode == 0 and bool(full) and self._is_ancestor(in_repo, root, full, revision)
         finally:
             self._discard_scratch(root)
         return bound.stamp({"contains": contains})
@@ -3134,7 +3154,8 @@ class VcsBroker:
           fix in the environment the cluster's own labels declare
           (`automation_rules`);
         - the three safety checks pass on the broker's own read of the
-          workload's namespace (`automerge_checks.judge`).
+          workload's namespace (the `no-pdb` recipe's `checks.py`, through
+          `fix_recipes.registry.checks_module`).
 
         Off, it reads nothing and answers so. A failed read is a reason not to
         label, never an error, except a forge read of the proposal itself.
@@ -3247,6 +3268,9 @@ class VcsBroker:
             return f"the budget names no cluster or namespace this broker reads ({cluster!r}, {namespace!r})"
         if self._cluster_read is None:
             return "this broker has no cluster reader"
+        recipe_checks = fix_recipes_registry.checks_module(automerge_eligibility.FIX_TYPE)
+        if recipe_checks is None:
+            return f"the {automerge_eligibility.FIX_TYPE} recipe has no safety checks"
         # The rules on the repository's own base, never on a target branch a
         # caller could have published with a rules file of its own.
         base = self._practice_base(bound)
@@ -3276,7 +3300,7 @@ class VcsBroker:
             LOGGER.info("practice label: rules refuse cluster=%s: %s", cluster, decision.reason)
             return f"{automation_rules.RULES_FILE} does not allow this fix in this cluster's environment"
         code, out, err = self._cluster_read(
-            ["kubectl", "get", automerge_checks.READ_KINDS, "-n", namespace, "-o", "json"],
+            ["kubectl", "get", recipe_checks.read_kinds, "-n", namespace, "-o", "json"],
             f"gke_{project}_{location}_{name}",
         )
         try:
@@ -3303,7 +3327,7 @@ class VcsBroker:
             fix, {"pod_selector": (workload.get("spec") or {}).get("selector")}
         ):
             return "the added file is not, byte for byte, what the recipe generates from the workload's live selector"
-        checks += automerge_checks.judge(dump, fix.candidate["object"], namespace, fix.name, fix.candidate["pod_selector"])
+        checks += recipe_checks.checks(fix, dump)
         failed = [check["name"] for check in checks if not check["passed"]]
         return f"safety checks failed: {', '.join(failed)}" if failed else None
 

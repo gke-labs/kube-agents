@@ -86,7 +86,7 @@
       "tagPolicy": "release",
       "override": "A2A_WORKER_IMAGE",
       "pulledBy": "The session pods the A2A gateway spawns; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `<name>-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`.",
-      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), stock kubectl wired to kube-proxy for session pods (falling back to the credential broker shim for AgentProfile workers), the credential broker's shim as gcloud, and jq, which the cluster agent's persona requires when the image runs its profile workers."
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), stock kubectl wired to kube-proxy for session pods (falling back to the credential broker shim for AgentProfile workers), the credential broker's shim as gcloud, jq, and a local-only git with no credential helper and the version-control client beside the shim, which the cluster agent's persona requires when the image runs its profile workers."
     },
     {
       "name": "persona-cluster",

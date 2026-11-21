@@ -266,10 +266,6 @@ func validDispatchConfig() DispatchConfig {
 		Profiles: []DispatchProfile{{
 			Name: "tse", Tiers: []string{"read"}, Concurrency: 2, QueueTimeoutSeconds: 3600, ActiveDeadlineSeconds: 1800,
 			Parameters: []ProfileParameter{{Name: "cluster", Required: true}},
-			Durables: []DispatchDurable{
-				{Tier: "read", Kind: SubmitKindTop, Name: ProfileDurableName("tse", "read", SubmitKindTop)},
-				{Tier: "read", Kind: SubmitKindChild, Name: ProfileDurableName("tse", "read", SubmitKindChild)},
-			},
 		}},
 	}
 }
@@ -282,7 +278,7 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 	}
 	jobs := validDispatchConfig()
 	jobs.Profiles = append([]DispatchProfile(nil), jobs.Profiles...)
-	jobs.Profiles[0].JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"w"}]}}`)
+	jobs.Profiles[0].JobTemplateRef = &DispatchJobTemplateRef{Hash: "06ecfba171668118"}
 	jobs.JobLabels = map[string]string{"app.kubernetes.io/part-of": "kube-agents", DispatchJobLabel: "true", "plain": ""}
 	if err := jobs.Validate(); err != nil {
 		t.Errorf("a config with a Job template and labels: %v", err)
@@ -296,31 +292,26 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 		edit func(*DispatchConfig)
 		want string
 	}{
-		"no namespace":              {func(c *DispatchConfig) { c.Namespace = "" }, "namespace"},
-		"no ceiling":                {func(c *DispatchConfig) { c.Ceiling = 0 }, "ceiling"},
-		"reserve at ceiling":        {func(c *DispatchConfig) { c.ChildReserve = 6 }, "childReserve"},
-		"reserve of a 1 ceiling":    {func(c *DispatchConfig) { c.Ceiling, c.ChildReserve, c.InteractiveReserve = 1, 0, 1 }, "interactiveReserve"},
-		"reserves fill the ceiling": {func(c *DispatchConfig) { c.Ceiling, c.ChildReserve, c.InteractiveReserve = 4, 2, 2 }, "reserved for neither"},
-		"short lease":               {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
-		"short grace":               {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
-		"no accept timeout":         {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
-		"overflowing job start":     {func(c *DispatchConfig) { c.JobStartSeconds = 10_000_000_000 }, "over"},
-		"null job template":         {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`null`) }, "jobTemplate"},
-		"empty job template":        {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`{}`) }, "jobTemplate"},
-		"scalar job template":       {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`"x"`) }, "jobTemplate"},
-		"no containers":             {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`{"spec":{"containers":[]}}`) }, "jobTemplate"},
-		"bad job label key":         {func(c *DispatchConfig) { c.JobLabels = map[string]string{"-bad": "x"} }, "jobLabels"},
-		"bad job label value":       {func(c *DispatchConfig) { c.JobLabels = map[string]string{"app": "has space"} }, "jobLabels"},
-		"overflowing stop grace":    {func(c *DispatchConfig) { c.StopGraceSeconds = MaxDispatchSeconds + 1 }, "over"},
-		"overflowing cooldown":      {func(c *DispatchConfig) { c.BreakerCooldownSeconds = MaxDispatchSeconds + 1 }, "over"},
-		"overflowing deadline":      {func(c *DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = MaxDispatchSeconds + 1 }, "over"},
-		"duplicate profile":         {func(c *DispatchConfig) { c.Profiles = append(c.Profiles, c.Profiles[0]) }, "twice"},
-		"no concurrency":            {func(c *DispatchConfig) { c.Profiles[0].Concurrency = 0 }, "concurrency"},
-		"misnamed durable":          {func(c *DispatchConfig) { c.Profiles[0].Durables[0].Name = "other" }, "durable"},
+		"no namespace":                  {func(c *DispatchConfig) { c.Namespace = "" }, "namespace"},
+		"no ceiling":                    {func(c *DispatchConfig) { c.Ceiling = 0 }, "ceiling"},
+		"reserve at ceiling":            {func(c *DispatchConfig) { c.ChildReserve = 6 }, "childReserve"},
+		"reserve of a 1 ceiling":        {func(c *DispatchConfig) { c.Ceiling, c.ChildReserve, c.InteractiveReserve = 1, 0, 1 }, "interactiveReserve"},
+		"reserves fill the ceiling":     {func(c *DispatchConfig) { c.Ceiling, c.ChildReserve, c.InteractiveReserve = 4, 2, 2 }, "reserved for neither"},
+		"short lease":                   {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
+		"short grace":                   {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
+		"no accept timeout":             {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
+		"overflowing job start":         {func(c *DispatchConfig) { c.JobStartSeconds = 10_000_000_000 }, "over"},
+		"bad job label key":             {func(c *DispatchConfig) { c.JobLabels = map[string]string{"-bad": "x"} }, "jobLabels"},
+		"bad job label value":           {func(c *DispatchConfig) { c.JobLabels = map[string]string{"app": "has space"} }, "jobLabels"},
+		"overflowing stop grace":        {func(c *DispatchConfig) { c.StopGraceSeconds = MaxDispatchSeconds + 1 }, "over"},
+		"overflowing cooldown":          {func(c *DispatchConfig) { c.BreakerCooldownSeconds = MaxDispatchSeconds + 1 }, "over"},
+		"overflowing deadline":          {func(c *DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = MaxDispatchSeconds + 1 }, "over"},
+		"duplicate profile":             {func(c *DispatchConfig) { c.Profiles = append(c.Profiles, c.Profiles[0]) }, "twice"},
+		"no concurrency":                {func(c *DispatchConfig) { c.Profiles[0].Concurrency = 0 }, "concurrency"},
+		"job template ref with no hash": {func(c *DispatchConfig) { c.Profiles[0].JobTemplateRef = &DispatchJobTemplateRef{} }, "jobTemplateRef"},
 	} {
 		c := validDispatchConfig()
 		c.Profiles = append([]DispatchProfile(nil), c.Profiles...)
-		c.Profiles[0].Durables = append([]DispatchDurable(nil), c.Profiles[0].Durables...)
 		tc.edit(&c)
 		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: Validate = %v, want an error saying %q", name, err, tc.want)
@@ -453,36 +444,28 @@ func TestDispatchConfigRefusesARetentionOutOfRange(t *testing.T) {
 	}
 }
 
-// A draining profile (#5074) has left the install: it is listed with no
-// durables, so nothing new is dispatched for it, until DrainingUntil. A live
-// profile needs a durable; a draining one has none.
+// A draining profile (#5074) has left the install: it derives no durables,
+// so nothing new is dispatched for it, until DrainingUntil. A live profile
+// derives one per (tier, kind).
 func TestADrainingProfileHasNoDurablesAndALiveOneDoes(t *testing.T) {
-	durable := DispatchDurable{Tier: "read", Kind: SubmitKindTop, Name: ProfileDurableName("tse", "read", SubmitKindTop)}
-	child := DispatchDurable{Tier: "read", Kind: SubmitKindChild, Name: ProfileDurableName("tse", "read", SubmitKindChild)}
-	profile := DispatchProfile{Name: "tse", Tiers: []string{"read"}, Concurrency: 2, Durables: []DispatchDurable{durable, child}}
+	profile := DispatchProfile{Name: "tse", Tiers: []string{"read"}, Concurrency: 2}
 	until := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	for name, tc := range map[string]struct {
-		durables []DispatchDurable
 		until    time.Time
-		ok       bool
+		durables int
 	}{
-		// From #5479 a live profile lists none (the dispatcher derives them),
-		// or, for one release, exactly the derived set.
-		"live listing the derived set": {[]DispatchDurable{durable, child}, time.Time{}, true},
-		"live listing none":            {nil, time.Time{}, true},
-		"live listing a partial set":   {[]DispatchDurable{durable}, time.Time{}, false},
-		"draining with none":           {nil, until, true},
-		"draining with a durable":      {[]DispatchDurable{durable}, until, false},
+		"live":     {time.Time{}, 2},
+		"draining": {until, 0},
 	} {
 		p := profile
-		p.Durables, p.DrainingUntil = tc.durables, tc.until
+		p.DrainingUntil = tc.until
 		cfg := DispatchConfig{Namespace: "ns", ProfileNamespace: "ns-profiles", Ceiling: 6, LeaseSeconds: 90, RenewSeconds: 20,
 			RestartGraceSeconds: 60, AcceptTimeoutSeconds: 10, Profiles: []DispatchProfile{p}}
-		if err := cfg.Validate(); (err == nil) != tc.ok {
-			t.Errorf("%s: Validate = %v, want ok=%v", name, err, tc.ok)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("%s: Validate = %v", name, err)
 		}
-		if p.Draining() != !tc.until.IsZero() {
-			t.Errorf("%s: Draining() = %v", name, p.Draining())
+		if p.Draining() != !tc.until.IsZero() || len(p.DerivedDurables()) != tc.durables {
+			t.Errorf("%s: Draining() = %v, %d durables", name, p.Draining(), len(p.DerivedDurables()))
 		}
 	}
 }
@@ -508,8 +491,8 @@ func TestTheOperatorsDrainingDispatchConfigDecodesAndValidates(t *testing.T) {
 	for _, p := range cfg.Profiles {
 		if p.Draining() {
 			draining++
-			if len(p.Durables) != 0 {
-				t.Errorf("draining profile %s has durables %v", p.Name, p.Durables)
+			if len(p.DerivedDurables()) != 0 {
+				t.Errorf("draining profile %s derives durables %v", p.Name, p.DerivedDurables())
 			}
 		} else {
 			live++
@@ -588,55 +571,80 @@ func TestScriptPathIsTheCRDs(t *testing.T) {
 	}
 }
 
-// A profile names its Job template by reference or carries it inline, never
-// both, and a reference needs an object name and a hash.
-// A hash-only ref is valid from #5479 (TestAJobTemplateRefMayCarryOnlyItsHash).
-func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
-	base := func() DispatchConfig {
-		cfg := validDispatchConfig()
-		return cfg
+// A script rides on a confirm only, and only one that could run: a name
+// that's a subject token, a path under the script root, and a timeout
+// (#5622). The worker checks the message before it reads the script.
+func TestADispatchMessagesScriptIsChecked(t *testing.T) {
+	good := &DispatchScript{Name: "stall-watch", Path: ScriptRoot + "stall_watch.py", TimeoutSeconds: 60}
+	if err := (DispatchMessage{Type: DispatchConfirm, TaskID: "t1", Script: good}).Validate(); err != nil {
+		t.Fatalf("a confirm with a good script: %v", err)
 	}
-	ref := &DispatchJobTemplateRef{Name: "kube-agents-dispatch-job-profile-tse", Hash: "06ecfba171668118"}
-	ok := base()
-	ok.Profiles[0].JobTemplateRef = ref
+	for name, m := range map[string]DispatchMessage{
+		"on an offer": {Type: DispatchOffer, TaskID: "t1", Kind: SubmitKindTop, Envelope: json.RawMessage(`{}`),
+			Deadline: time.Now(), LeaseSeconds: 90, RenewSeconds: 20, AcceptSeconds: 10, Script: good},
+		"on an abandon":      {Type: DispatchAbandon, TaskID: "t1", Reason: "x", Script: good},
+		"a path outside":     {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: "/bin/sh", TimeoutSeconds: 60}},
+		"a dot-dot path":     {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: ScriptRoot + "../x", TimeoutSeconds: 60}},
+		"a dotted name":      {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s.x", Path: ScriptRoot + "a.py", TimeoutSeconds: 60}},
+		"no timeout":         {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: ScriptRoot + "a.py"}},
+		"an endless timeout": {Type: DispatchConfirm, TaskID: "t1", Script: &DispatchScript{Name: "s", Path: ScriptRoot + "a.py", TimeoutSeconds: MaxDispatchSeconds + 1}},
+	} {
+		if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "script") {
+			t.Errorf("%s: Validate = %v, want a script error", name, err)
+		}
+	}
+}
+
+// A Job template reference needs a hash; with one, the profile runs as Jobs.
+func TestAJobTemplateRefNeedsAHash(t *testing.T) {
+	ok := validDispatchConfig()
+	ok.Profiles[0].JobTemplateRef = &DispatchJobTemplateRef{Hash: "06ecfba171668118"}
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("a well-formed reference was refused: %v", err)
 	}
 	if !ok.Profiles[0].HasJobTemplate("unattended") {
 		t.Error("a profile naming a template doesn't run as Jobs")
 	}
-	for name, mutate := range map[string]func(*DispatchProfile){
-		"no hash": func(p *DispatchProfile) { p.JobTemplateRef = &DispatchJobTemplateRef{Name: ref.Name} },
-		"bad name": func(p *DispatchProfile) {
-			p.JobTemplateRef = &DispatchJobTemplateRef{Name: "Not_A_Name", Hash: ref.Hash}
-		},
-		"inline too": func(p *DispatchProfile) {
-			p.JobTemplateRef = ref
-			p.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			cfg := base()
-			mutate(&cfg.Profiles[0])
-			if err := cfg.Validate(); err == nil {
-				t.Error("refused nothing")
-			}
-		})
+	for name, ref := range map[string]*DispatchJobTemplateRef{"no hash": {}, "bad hash": {Hash: "has space"}} {
+		cfg := validDispatchConfig()
+		cfg.Profiles[0].JobTemplateRef = ref
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("%s: refused nothing", name)
+		}
 	}
 	if (DispatchProfile{}).HasJobTemplate("unattended") {
 		t.Error("a profile with no template runs as Jobs")
 	}
 }
 
+// profileSupervisorForm is empty or "profile" (#5301), and the subject a
+// config gives a profile's terminal follows it.
+func TestTheSupervisorFormIsEmptyOrProfile(t *testing.T) {
+	c := validDispatchConfig()
+	if got := c.SupervisorSubjectFor("tse", "t1"); got != TaskSupervisorSubject("tse", "t1") {
+		t.Errorf("unset form: %q", got)
+	}
+	c.ProfileSupervisorForm = ProfileSupervisorFormProfile
+	if err := c.Validate(); err != nil {
+		t.Errorf("the profile form was refused: %v", err)
+	}
+	if got := c.SupervisorSubjectFor("tse", "t1"); got != ProfileSupervisorSubject("tse", "t1") {
+		t.Errorf("profile form: %q", got)
+	}
+	c.ProfileSupervisorForm = "six"
+	if err := c.Validate(); err == nil {
+		t.Error("an unknown profileSupervisorForm validated")
+	}
+}
+
 // A per-tier reference covers each live tier and no draining one; one that
-// isn't per tier, or an inline template, is the unattended-mode tier's alone,
+// isn't per tier is the unattended-mode tier's alone,
 // which the caller holds the tier to (#5646).
 func TestHasJobTemplateIsPerTierOnlyUnderAPerTierReference(t *testing.T) {
 	perTier := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"},
 		DrainingTiers:  []DrainingTier{{Tier: "triage", Until: time.Now().Add(time.Hour)}},
 		JobTemplateRef: &DispatchJobTemplateRef{Hash: "h", PerTier: true}}
 	legacy := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"}, JobTemplateRef: &DispatchJobTemplateRef{Hash: "h"}}
-	inline := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"}, JobTemplate: json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)}
 	for _, c := range []struct {
 		name    string
 		p       DispatchProfile
@@ -652,7 +660,6 @@ func TestHasJobTemplateIsPerTierOnlyUnderAPerTierReference(t *testing.T) {
 		// Not held to the profile's tiers: the caller holds the tier to the
 		// unattended side, as before per-tier templates.
 		{"unattended only, a tier the profile doesn't list", legacy, "batch", true, false},
-		{"inline", inline, "unattended", true, false},
 		{"none", DispatchProfile{Name: "tse", Tiers: []string{"read"}}, "read", false, false},
 	} {
 		if got := c.p.HasJobTemplate(c.tier); got != c.has {

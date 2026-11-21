@@ -712,6 +712,7 @@ def test_a_level_that_keeps_the_fleet_skips_the_settle(monkeypatch, tmp_path):
     for name in ("preflight", "ensure_clusters", "ensure_nodes", "ensure_fixtures"):
         monkeypatch.setattr(run, name, lambda *a: None)
     monkeypatch.setattr(runner.fixtures.Churner, "start", lambda self: None)
+    monkeypatch.setattr(runner.fixtures.Churner, "stop", lambda self: None)
     # The runner's clock only: a library polling a subprocess in another thread sleeps too.
     monkeypatch.setattr(runner, "time", types.SimpleNamespace(sleep=sleeps.append, monotonic=time.monotonic,
                                                               time=time.time))
@@ -841,6 +842,7 @@ def test_a_level_that_failed_half_way_is_settled_next_time(monkeypatch, tmp_path
     for name in ("preflight", "ensure_clusters", "ensure_nodes"):
         monkeypatch.setattr(run, name, lambda *a: None)
     monkeypatch.setattr(runner.fixtures.Churner, "start", lambda self: None)
+    monkeypatch.setattr(runner.fixtures.Churner, "stop", lambda self: None)
     monkeypatch.setattr(runner, "time", types.SimpleNamespace(sleep=sleeps.append, monotonic=time.monotonic,
                                                               time=time.time))
     monkeypatch.setattr(run, "ensure_fixtures", lambda *a: None)

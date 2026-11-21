@@ -1296,6 +1296,19 @@ func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheEvalRunTagSwitchAsALiteralOnly(t *testing.T) {
+	// The chart renders KUBEAGENTS_EVAL_RUN_TAGS from
+	// platformAgent.deployment.evalRunTags on eval installs; the agent's API
+	// server, board and plugin read it only through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "KUBEAGENTS_EVAL_RUN_TAGS", Value: "1"},
+		{Name: "KUBEAGENTS_EVAL_RUN_TAGS", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	})
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_EVAL_RUN_TAGS" || got[0].Value != "1" {
+		t.Fatalf("expected only the literal KUBEAGENTS_EVAL_RUN_TAGS to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesThePostMergeReadCap(t *testing.T) {
 	// POST_MERGE_READS_PER_TICK bounds how many records one post-merge check
 	// step reads; it reaches the agent only through this allowlist, and only
@@ -1519,6 +1532,56 @@ func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	// it would re-arm the prompt on a volume that has already sent it.
 	if _, ok := values["HERMES_HOME"]; ok {
 		t.Errorf("HERMES_HOME must stay operator-owned, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesLeewayWatchThresholds(t *testing.T) {
+	// leeway-watch reads its alert thresholds from the environment on every
+	// daily sweep. Off the allowlist, a threshold set on the CR renders and
+	// never reaches the script. The neighbours that choose what the sweep
+	// reads, or where it keeps its state, must not pass.
+	custom := []corev1.EnvVar{
+		{Name: "LEEWAY_WATCH_MIN_SEVERITY", Value: "critical"},
+		{Name: "LEEWAY_WATCH_MIN_DRIFT", Value: "0.3"},
+		{Name: "LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE", Value: "0.8"},
+		{Name: "LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR", Value: "0"},
+		{Name: "LEEWAY_WATCH_REFRESH_DAYS", Value: "3"},
+		{Name: "LEEWAY_WATCH_CLUSTERS", Value: "p/l/c"},
+		{Name: "LEEWAY_WATCH_PROJECTS", Value: "other-project"},
+		{Name: "LEEWAY_WATCH_HOME", Value: "/tmp/elsewhere"},
+		{
+			Name: "LEEWAY_WATCH_MIN_DRIFT",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	for name, want := range map[string]string{
+		"LEEWAY_WATCH_MIN_SEVERITY":          "critical",
+		"LEEWAY_WATCH_MIN_DRIFT":             "0.3",
+		"LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE":  "0.8",
+		"LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR": "0",
+		"LEEWAY_WATCH_REFRESH_DAYS":          "3",
+	} {
+		if v, ok := values[name]; !ok || v != want {
+			t.Errorf("expected %s=%q to pass, got %q (present=%v)", name, want, v, ok)
+		}
+	}
+	for _, name := range []string{"LEEWAY_WATCH_CLUSTERS", "LEEWAY_WATCH_PROJECTS", "LEEWAY_WATCH_HOME"} {
+		if _, ok := values[name]; ok {
+			t.Errorf("%s must not pass, got %#v", name, got)
+		}
 	}
 }
 
@@ -7005,7 +7068,7 @@ func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
 	// the platform on the auto-generated `hermes-google_chat` composite and unions in every
 	// enabled MCP server, which is broader than the worker surface this pins, not narrower.
 	toolsets, _ := overlay["platform_toolsets"].(map[string]any)
-	for _, platform := range []string{"google_chat", "slack"} {
+	for _, platform := range []string{"google_chat", "slack", "teams"} {
 		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
 		want := slices.Sorted(slices.Values(frontDoorToolsets))
 		if !slices.Equal(got, want) {
@@ -8277,5 +8340,94 @@ func TestAgentAPIProbesTimeOutUnderKubeletAndKeepTheStartupBudget(t *testing.T) 
 	}
 	if window := readiness.PeriodSeconds * readiness.FailureThreshold; window >= budget {
 		t.Errorf("readiness withdraws after %ds, which is not quicker than the %ds startup budget", window, budget)
+	}
+}
+
+// A plugin mounted inside the data PVC (a default-profile plugin, at
+// <home>/plugins/<name>) has its parent folder made by an earlier init container
+// that mounts the PVC and runs as the pod's user, the agent's. Without it the container
+// runtime makes <home>/plugins as root when it creates the agent container, and
+// on a new volume the entrypoint cannot copy the image's plugins into it.
+func TestAPluginMountedUnderTheHomeHasItsParentMadeFirst(t *testing.T) {
+	const dataVolume = "platform-agent-data-vol"
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "plugin-agent", Namespace: "test-ns"}}
+	untargeted := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "myplugin"},
+		Spec:       agentv1alpha1.AgentPluginSpec{Image: "gcr.io/my-plugin:v1"},
+	}
+	targeted := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "profileplugin"},
+		Spec:       agentv1alpha1.AgentPluginSpec{Image: "gcr.io/profile-plugin:v1", TargetProfile: "platform"},
+	}
+	// dataMount is where a container mounts the PVC's root, or "".
+	dataMount := func(c corev1.Container) string {
+		for _, m := range c.VolumeMounts {
+			if m.Name == dataVolume && m.SubPath == "" {
+				return m.MountPath
+			}
+		}
+		return ""
+	}
+	// makesDir reports whether an init container makes dir, a path on the PVC:
+	// a line of its script is `mkdir -p <path>`, alone or before `||`. It must
+	// run as the pod's user, with no user of its own.
+	makesDir := func(c corev1.Container, dir string) bool {
+		root := dataMount(c)
+		if root == "" || len(c.Args) != 1 || (c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil) {
+			return false
+		}
+		want := "mkdir -p " + path.Join(root, dir)
+		for _, line := range strings.Split(c.Args[0], "\n") {
+			if line == want || strings.HasPrefix(line, want+" ||") {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, imageVolumes := range []bool{true, false} {
+		dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4",
+			[]*agentv1alpha1.AgentPlugin{untargeted, targeted}, renderOptions{imageVolumeSupported: imageVolumes})
+		spec := dep.Spec.Template.Spec
+		if spec.SecurityContext == nil || spec.SecurityContext.RunAsUser == nil || *spec.SecurityContext.RunAsUser != sandboxUID {
+			t.Fatalf("imageVolumeSupported=%v: the pod does not run as the agent's user: %+v", imageVolumes, spec.SecurityContext)
+		}
+		// Every container in start order: the init containers, then the rest.
+		inOrder := append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+		checked := 0
+		for i, c := range inOrder {
+			root := dataMount(c)
+			if root == "" {
+				continue
+			}
+			for _, m := range c.VolumeMounts {
+				if !strings.HasPrefix(m.Name, "plugin-") || !strings.HasPrefix(m.MountPath, root+"/") {
+					continue
+				}
+				checked++
+				parent := strings.TrimPrefix(path.Dir(m.MountPath), root+"/")
+				made := false
+				for _, earlier := range spec.InitContainers[:min(i, len(spec.InitContainers))] {
+					made = made || makesDir(earlier, parent)
+				}
+				if !made {
+					t.Errorf("imageVolumeSupported=%v: %s mounts %s inside the data PVC, and no earlier init container makes %s on it",
+						imageVolumes, c.Name, m.MountPath, parent)
+				}
+			}
+		}
+		if checked == 0 {
+			t.Errorf("imageVolumeSupported=%v: no plugin mount inside the data PVC was found, so nothing was checked", imageVolumes)
+		}
+	}
+
+	// With no plugin under the home, the cleanup container is as it was: an
+	// install without a default-profile plugin keeps its pod template.
+	for name, plugins := range map[string][]*agentv1alpha1.AgentPlugin{"no plugin": nil, "a targeted plugin only": {targeted}} {
+		dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", plugins, renderOptions{imageVolumeSupported: true})
+		cleanup := containerByName(t, dep.Spec.Template.Spec.InitContainers, "sandbox-credential-cleanup")
+		if len(cleanup.Args) != 1 || strings.Contains(cleanup.Args[0], "mkdir") {
+			t.Errorf("%s: the cleanup container makes a folder: %q", name, cleanup.Args)
+		}
 	}
 }

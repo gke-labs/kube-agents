@@ -384,8 +384,8 @@ cases do; the apply step is covered by the unit test above.
   saved with a session that never got the record, and the watch waits the day it gives any session
   that files no card. The window is the inject call itself, at most its 30-second timeout.
 - **An undelivered stall alert is reported nowhere.** The daemon marks the ledger row's
-  `delivery_error`, and the only reader of that column, the event watcher's daily recap, excludes
-  stall rows as it excludes drift rows. The old path's "stall noticed" line went through cron
+  `delivery_error`; the event watcher's daily recap excludes stall rows as it excludes drift rows,
+  and `get_alert_history` lists the row as `undelivered`, but only when asked. The old path's "stall noticed" line went through cron
   delivery, which `chat-delivery-watch` monitors; the alert does not.
 - **The event watcher and the stall watch can report the same defect.** A Deployment whose Pods fail
   with a reason on the watcher's list is triaged by the watcher on the Pod and, ten minutes later,

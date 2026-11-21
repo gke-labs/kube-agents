@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -195,6 +196,22 @@ RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
 # What an answer with no JSON body is reported as, a refusal or a 2xx; the
 # broker's own text is used when a refusal sent one.
 NON_JSON_RESPONSE_TEXT = "non-JSON response"
+# How deep a `/v1/vcs/*` body can nest lists and objects. `vcs_call` refuses a
+# 2xx answer over the bound and takes the parts that are too deep out of a
+# refusal. A broker answer is a few levels deep. Python 3.14 parses a body of
+# 100,000 levels, and `json.dumps` and `repr` then raise RecursionError on the
+# result, in whatever caller uses it. The bound is under the limit of each of
+# them, and it is the bound of the version-control skill's print step.
+MAX_VCS_BODY_DEPTH = 500
+# The message of the error for a 2xx body over that bound. It names no value:
+# `vcs_client` gives the caller a text of its own.
+_VCS_ANSWER_TOO_DEEP_TEXT = "the broker's answer is JSON nested too deep to read"
+# A refusal over the bound keeps its keys, and each value that is too deep
+# becomes this text. Its `error`, when that is one of them, becomes the status,
+# as for a body that is no refusal document.
+_REFUSAL_PART_TOO_DEEP_TEXT = "left out: nested too deep to read"
+_REFUSAL_ERROR_FIELD = "error"
+_REFUSAL_STATUS_TEXT = "HTTP {status}"
 CLASS_INTERACTIVE = "interactive"
 CLASS_BACKGROUND = "background"
 CLASS_LABEL = "class"
@@ -250,6 +267,24 @@ _DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the com
 # a command's output and is never printed.
 _UNREADABLE_ANSWER_LINE = "credential proxy error (HTTP {status}): {what}; the command may have run"
 _NOT_AN_OBJECT_TEXT = "the response is JSON of type {type}, not an object"
+# The fields of that answer that `execute` writes or returns. A field of another
+# type makes the whole answer unreadable: the line names the field and the
+# type, never a value, and nothing of the answer is printed.
+_EXEC_OUTPUT_FIELDS = ("stdout", "stderr")
+_EXEC_KUBECONFIG_FIELD = "kubeconfig"
+_EXEC_EXIT_CODE_FIELD = "exitCode"
+_FIELD_NOT_A_STRING_TEXT = "the response's {field} is of type {type}, not a string"
+_EXIT_CODE_NOT_AN_INTEGER_TEXT = "the response's exitCode is of type {type}, not an integer"
+_NO_EXIT_CODE_TEXT = "the response has no exitCode"
+# The broker sends the command's return code as `exitCode`. A process status is
+# 0 to 255. A command that a signal ended has the signal's negative number
+# there, and a shell reports that death as 128 plus the number, so the least
+# value with a status is 128 - 255. A value outside the two bounds is no
+# command's result, and `sys.exit` would wrap it: 256 would read as success.
+_MAX_EXIT_STATUS = 255
+_SIGNAL_EXIT_BASE = 128
+_MIN_EXIT_CODE = _SIGNAL_EXIT_BASE - _MAX_EXIT_STATUS
+_EXIT_CODE_OUT_OF_RANGE_TEXT = f"the response's exitCode is outside {_MIN_EXIT_CODE} to {_MAX_EXIT_STATUS}"
 # The least read time a relay fallback is worth sending with; less, and the
 # caller's budget is already spent, so the error is raised instead.
 RELAY_FALLBACK_MIN_SECONDS = 1.0
@@ -608,11 +643,11 @@ def authorization_headers() -> dict[str, str]:
 
 # A profile worker's task credential (#3889): the dispatcher's proxyToken, which
 # the worker adapter writes to a tmpfs file on the task's confirm and removes at
-# the task's end. Sent in this header on every exec and version-control call,
-# re-read on every call, so a warm pod's next task presents its own. The broker
-# confines an exec to the cluster the credential names, and admits a
-# version-control write only under its permit
-# (credential_proxy.TASK_CREDENTIAL_HEADER).
+# the task's end. Sent in this header on every exec and version-control call
+# (a report credential only on the audit-report routes), re-read on every call,
+# so a warm pod's next task presents its own. The broker confines an exec to the
+# cluster the credential names, and admits a version-control write only under
+# its permit (credential_proxy.TASK_CREDENTIAL_HEADER).
 TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
 TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
 # The broker's own ceiling on the value (task_credential.MAX_TOKEN_BYTES).
@@ -647,8 +682,43 @@ def task_mode() -> bool:
     return bool(os.environ.get(TASK_TOKEN_FILE_ENV, "").strip())
 
 
-def task_credential_headers() -> dict[str, str]:
-    """The task credential header, or nothing when there is no task.
+# The broker routes a report credential (one naming no target cluster:
+# task_credential.REPORT_TIER) is admitted on, and refused on every other,
+# /v1/exec included (credential_proxy.REPORT_CREDENTIAL_ROUTES).
+AUDIT_REPORTS_ROUTE = "/v1/audit-reports"
+
+
+def _is_report_credential(token: str) -> bool:
+    """Whether a task credential names no target cluster, read unverified.
+
+    This only decides whether to send it; the broker verifies whatever is
+    sent. A token whose claims can't be read is not called a report
+    credential, so it is sent as before and the broker refuses it loudly.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    segment = parts[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, RecursionError):
+        return False
+    nats = claims.get("nats") if isinstance(claims, dict) else None
+    return isinstance(nats, dict) and "target" not in nats
+
+
+def _audit_reports_path(path: str) -> bool:
+    path = urllib.parse.urlsplit(path).path
+    return path == AUDIT_REPORTS_ROUTE or path.startswith(AUDIT_REPORTS_ROUTE + "/")
+
+
+def task_credential_headers(path: str) -> dict[str, str]:
+    """The task credential header for a broker request to `path`, or nothing.
+
+    A report credential is sent only on the audit-report routes, the only
+    ones the broker admits it on: on any other call the task goes without
+    it and keeps the local-only commands a task with no credential gets.
+    A credential that names a target is sent on every call.
 
     Read per call. A missing file is no task, not an error: the adapter
     removes it when the task ends, and the broker then runs local-only
@@ -670,6 +740,8 @@ def task_credential_headers() -> dict[str, str]:
         return {}
     if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
         raise TokenUnavailable(f"{token_file} does not hold a task credential")
+    if _is_report_credential(token) and not _audit_reports_path(path):
+        return {}
     return {TASK_CREDENTIAL_HEADER: token}
 
 
@@ -819,13 +891,17 @@ def read_current_context(text: str) -> str | None:
 
     Anything else — a syntax error, several documents, a top level that is not a
     mapping, a non-string `current-context` — reads as absent, and the caller
-    turns that into a rejection.
+    turns that into a rejection. So does a scalar that PyYAML cannot build. For
+    that it raises a plain exception, not a `yaml.YAMLError`: a `ValueError`
+    for a date that does not exist or an `!!int` tag on text, a `KeyError` for
+    an `!!bool` tag on text, an `IndexError` for an `!!int` tag on nothing, an
+    `AttributeError` for an `!!timestamp` tag on text.
     """
     import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
 
     try:
         document = yaml.safe_load(text)
-    except (yaml.YAMLError, RecursionError):
+    except (yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError):
         return None
     if not isinstance(document, dict):
         return None
@@ -1810,7 +1886,8 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
     exc.shim_payload = None
     try:
         payload = json.load(exc)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: a body nested deeper than the parser goes.
         return None
     except (http.client.HTTPException, OSError):
         # The connection closed while the refusal's body was read.
@@ -1820,6 +1897,41 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
         exc.close()
     exc.shim_payload = payload if isinstance(payload, dict) else None
     return exc.shim_payload
+
+
+def _unusable_exec_answer(payload: dict) -> str | None:
+    """What is wrong with the fields of a 2xx answer from `/v1/exec`, or None.
+
+    `stdout` and `stderr` are strings when present, and `kubeconfig` is a string
+    or null. `exitCode` is an integer and is not optional: without it the
+    command's result is not known. A boolean is not an integer here, and a
+    number in a string is not one either. An integer that is no command's
+    result, above the greatest status or below the least signal's number, is
+    not usable either.
+    """
+    for field in _EXEC_OUTPUT_FIELDS:
+        if field in payload and not isinstance(payload[field], str):
+            return _FIELD_NOT_A_STRING_TEXT.format(field=field, type=type(payload[field]).__name__)
+    kubeconfig = payload.get(_EXEC_KUBECONFIG_FIELD)
+    if kubeconfig is not None and not isinstance(kubeconfig, str):
+        return _FIELD_NOT_A_STRING_TEXT.format(field=_EXEC_KUBECONFIG_FIELD, type=type(kubeconfig).__name__)
+    if _EXEC_EXIT_CODE_FIELD not in payload:
+        return _NO_EXIT_CODE_TEXT
+    exit_code = payload[_EXEC_EXIT_CODE_FIELD]
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return _EXIT_CODE_NOT_AN_INTEGER_TEXT.format(type=type(exit_code).__name__)
+    if not _MIN_EXIT_CODE <= exit_code <= _MAX_EXIT_STATUS:
+        return _EXIT_CODE_OUT_OF_RANGE_TEXT
+    return None
+
+
+def _exit_status(exit_code: int) -> int:
+    """The status to exit with for a command's return code from the broker.
+
+    A negative code is the number of the signal that ended the command; the
+    status is 128 plus that number, as a shell reports it.
+    """
+    return _SIGNAL_EXIT_BASE - exit_code if exit_code < 0 else exit_code
 
 
 def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
@@ -2116,7 +2228,7 @@ def execute(
     headers = {"Content-Type": "application/json"}
     try:
         headers.update(authorization_headers())
-        headers.update(task_credential_headers())
+        headers.update(task_credential_headers(EXEC_ROUTE))
     except TokenUnavailable as exc:
         # Sending the request anyway would earn an undifferentiated 401 and
         # hide the real fault, which is a broken token projection.
@@ -2151,11 +2263,12 @@ def execute(
             return 1
         try:
             with open_broker_request(request) as response:
-                # Only the parse is guarded: a read that breaks is a dropped
-                # connection, below.
+                # Only the parse and the answer's shape are guarded: a read
+                # that breaks is a dropped connection, below. RecursionError:
+                # a body nested deeper than the parser goes.
                 try:
                     payload = json.load(response)
-                except ValueError:
+                except (ValueError, RecursionError):
                     print(
                         _UNREADABLE_ANSWER_LINE.format(status=response.status, what=NON_JSON_RESPONSE_TEXT),
                         file=sys.stderr,
@@ -2164,6 +2277,11 @@ def execute(
                 if not isinstance(payload, dict):
                     shape = _NOT_AN_OBJECT_TEXT.format(type=type(payload).__name__)
                     print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=shape), file=sys.stderr)
+                    return 1
+                # Before anything of the answer is written.
+                unusable = _unusable_exec_answer(payload)
+                if unusable is not None:
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=unusable), file=sys.stderr)
                     return 1
             break
         except urllib.error.HTTPError as exc:
@@ -2245,7 +2363,7 @@ def execute(
         # Whatever the command itself exited: a cut payload is not the
         # command's answer, and exit 0 on one is what a caller reads as success.
         return EXIT_OUTPUT_TRUNCATED
-    return int(payload.get("exitCode", 1))
+    return _exit_status(payload[_EXEC_EXIT_CODE_FIELD])
 
 
 def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
@@ -2282,6 +2400,30 @@ class BrokerDisconnected(RuntimeError):
     changed nothing; a connection that broke mid-answer may have been acted on
     at the far end, and a retry has to be written knowing that.
     """
+
+
+class VcsAnswerTooDeep(ValueError):
+    """A 2xx `/v1/vcs/*` body that nests deeper than MAX_VCS_BODY_DEPTH, or deeper than the parser goes.
+
+    The request reached the broker, so the verb can have taken effect. A
+    ValueError, as for a body that is not JSON, so a caller with an arm for
+    that one still takes this one.
+    """
+
+
+def nests_deeper_than(document: object, bound: int) -> bool:
+    """Whether `document` nests lists and objects more than `bound` levels. A loop, with no recursion."""
+    layer = [document]
+    for _ in range(bound):
+        layer = [
+            child
+            for node in layer
+            if isinstance(node, (dict, list))
+            for child in (node.values() if isinstance(node, dict) else node)
+        ]
+        if not layer:
+            return False
+    return any(isinstance(node, (dict, list)) for node in layer)
 
 
 class WorkspaceRequestError(RuntimeError):
@@ -2383,9 +2525,10 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
     # A profile worker's task credential, as `execute` sends it: the broker
     # refuses a profile caller's version-control verbs without one, and its
     # permit is what admits the writes (#3993). Nothing outside task mode.
-    headers.update(task_credential_headers())
+    route = f"/v1/vcs/{verb}"
+    headers.update(task_credential_headers(route))
     request = urllib.request.Request(
-        endpoint.rstrip("/") + f"/v1/vcs/{verb}",
+        endpoint.rstrip("/") + route,
         data=body,
         headers=headers,
         method="POST",
@@ -2396,9 +2539,11 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
                 answer = json.load(response)
             except RecursionError as exc:
                 # A body nested deeper than the parser goes. A RuntimeError by
-                # type, so no clause for a body that is not JSON sees it. A
-                # ValueError, as for the answer below that is not an object.
-                raise ValueError("the broker's answer is JSON nested too deep to read") from exc
+                # type, so no clause for a body that is not JSON sees it.
+                raise VcsAnswerTooDeep(_VCS_ANSWER_TOO_DEEP_TEXT) from exc
+            if nests_deeper_than(answer, MAX_VCS_BODY_DEPTH):
+                # The parser took it; an encoder or `repr` of a caller may not.
+                raise VcsAnswerTooDeep(_VCS_ANSWER_TOO_DEEP_TEXT)
             if not isinstance(answer, dict):
                 # Valid JSON, but not an object, and every consumer reads the
                 # answer as one. A ValueError, as for a body that is not JSON:
@@ -2431,6 +2576,8 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
             # Valid JSON, but not an object, so no refusal document either.
             # The status is the whole answer, as above.
             raise _vcs_refusal(exc, {"error": f"HTTP {exc.code}"}, None) from exc
+        if nests_deeper_than(answer, MAX_VCS_BODY_DEPTH):
+            answer = _refusal_without_deep_parts(answer, exc.code)
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
@@ -2445,6 +2592,27 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
         raise
     except (http.client.HTTPException, OSError) as exc:
         raise BrokerDisconnected(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _refusal_without_deep_parts(refusal: dict, status: int) -> dict:
+    """`refusal` with a text in place of each top-level value that puts it over MAX_VCS_BODY_DEPTH.
+
+    The other values stay, so a caller still reads the refusal's `code` and its
+    text. The key of a value that is too deep stays too: a reader then sees a
+    mark that it does not know, and not a mark that is absent, which can have a
+    meaning of its own (a busy refusal with no `bound` is sent again). An
+    `error` that is too deep becomes the status.
+    """
+    trimmed = {}
+    for name, value in refusal.items():
+        # The refusal object is one level; a value has the rest of the bound.
+        if not nests_deeper_than(value, MAX_VCS_BODY_DEPTH - 1):
+            trimmed[name] = value
+        elif name == _REFUSAL_ERROR_FIELD:
+            trimmed[name] = _REFUSAL_STATUS_TEXT.format(status=status)
+        else:
+            trimmed[name] = _REFUSAL_PART_TOO_DEEP_TEXT
+    return trimmed
 
 
 def _vcs_refusal(exc: urllib.error.HTTPError, payload: dict, json_body: object) -> WorkspaceRequestError:
@@ -2468,11 +2636,13 @@ class ApiSession:
     arrives as a 403 whose JSON body carries `rule` and `message`, the same
     shape `/v1/exec` uses.
 
-    The URL a caller writes stays the real endpoint, so a collector's evidence
-    label still names it, and `.get(url, params=, timeout=)` is what a
+    The URL a caller writes stays as written, so a collector's evidence label
+    still names the Google endpoint it reads, in its commercial form: when the
+    caller's environment names a custom universe domain, `relay_url` puts the
+    host in that domain. `.get(url, params=, timeout=)` is what a
     `requests.Session` offers, so code written against one runs against this
-    unchanged. `requests` is imported here and not at module scope: it is in the
-    sandbox image, where this class runs, and nowhere else this module is
+    unchanged. `requests` is imported here and not at module scope: it is in
+    the sandbox image, where this class runs, and nowhere else this module is
     imported needs it. `http` is injectable for tests and for a caller that
     already holds a configured session.
     """
@@ -2572,7 +2742,8 @@ class ApiSession:
     def _json_body(response):
         try:
             return response.json()
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, RecursionError):
+            # RecursionError: a body nested deeper than the parser goes.
             return None
 
     def _refused_admission(self, response) -> bool:

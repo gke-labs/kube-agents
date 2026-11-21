@@ -18,6 +18,10 @@ from credential_proxy_client import authorization_headers
 from slack_relay_patch import is_silent_text
 
 LOGGER = logging.getLogger("teams-relay-patch")
+# The relay is the credential broker, an in-cluster Service: a proxy from the
+# environment must not get this request and its bearer token, and urllib does
+# not leave out a cluster host by itself.
+_RELAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULT_RELAY_READY_TIMEOUT = 120.0
 # The activity budget is modelled on Hermes' bundled Teams adapter's 28,000-
 # character limit; Microsoft's own figure is about 100 KB of UTF-16 with 80 KB
@@ -59,6 +63,17 @@ TEAMS_CONVERSATION_TYPE_TO_CHAT_TYPE = {
     "channel": "channel",
 }
 TEAMS_DEFAULT_CHAT_TYPE = "channel"
+# Pipe-table rendering: the cell border, the escaped pipe GFM keeps as content,
+# and the stand-in it is held as while a row is split.
+_TABLE_PIPE = "|"
+_TABLE_ESCAPED_PIPE = "\\|"
+_TABLE_PIPE_PLACEHOLDER = "\x00"
+# A line opening one of these is a block of its own, not a table row, even
+# when it carries a pipe: a list item or a fence; a heading is one too
+# (_TABLE_HEADING_RE, the renderer's own rule: a run of # then a space, so
+# "#1040 | open" stays a row).
+_TABLE_BLOCK_STARTS = ("- ", "* ", "```")
+_TABLE_HEADING_RE = re.compile(r"^#{1,6} ")
 
 
 def default_service_url() -> str:
@@ -170,7 +185,9 @@ def is_tenant_allowed(
     return activity_tenant_id.strip().lower() == configured_tenant_id.strip().lower()
 
 
-_TABLE_SEPARATOR_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$")
+# A GitHub-Markdown delimiter row: one or more dashes per cell, optional
+# alignment colons (``| - | :-: |`` is one; three dashes are not required).
+_TABLE_SEPARATOR_RE = re.compile(r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$")
 
 
 def _is_table_row(stripped: str) -> bool:
@@ -182,11 +199,96 @@ def _is_table_separator(stripped: str) -> bool:
     return bool(_TABLE_SEPARATOR_RE.match(stripped))
 
 
+def _table_starts(header: str, next_line: str) -> bool:
+    """GitHub's rule for where a pipe table opens.
+
+    The line after the header is a delimiter row carrying a pipe, with the
+    header's cell count. A lone ``|x| + |y| = 1`` line, or a line followed
+    by a bare thematic break, is text whatever pipes it carries.
+    """
+    next_line = next_line.strip()
+    if _TABLE_PIPE not in next_line or not _is_table_separator(next_line):
+        return False
+    return len(_split_table_row(next_line)) == len(_split_table_row(header))
+
+
+def _starts_block(stripped: str) -> bool:
+    """A list item, a fence or a heading: never a table row, whatever pipes it has."""
+    return stripped.startswith(_TABLE_BLOCK_STARTS) or bool(_TABLE_HEADING_RE.match(stripped))
+
+
+def _opens_table(stripped: str, next_line: str) -> bool:
+    """Whether ``stripped`` is the first row of a table.
+
+    GitHub's rule first (a delimiter row follows). A bordered row followed by
+    another bordered row opens one too: a continuation piece of a reply split
+    mid-table carries body rows and no header, and two bordered rows in a row
+    are not prose, where a lone ``|x| + |y| = 1`` line is. A block start
+    (heading, list item, fence) opens nothing.
+    """
+    if _starts_block(stripped):
+        return False
+    next_line = next_line.strip()
+    if _TABLE_PIPE in next_line and _is_table_separator(next_line):
+        # A delimiter row follows: GitHub's rule decides, so a header whose
+        # delimiter row has another cell count stays text.
+        return _table_starts(stripped, next_line)
+    return (
+        _is_table_row(stripped)
+        and not _is_table_separator(stripped)
+        and _is_table_row(next_line)
+    )
+
+
+def _table_line_kinds(lines: list[str]) -> list[str]:
+    """Classify each line as the renderer's table scan will: ``"row"`` (a
+    table row, the header included), ``"delimiter"`` (the row under a header,
+    dropped), or ``""`` (anything else, fenced code included). The one scan
+    both ``markdown_to_adaptive_card`` and ``_detach_part_marker`` read, so
+    the two cannot disagree about which line is in a table."""
+    kinds = [""] * len(lines)
+    in_table = False
+    in_code = False
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            in_table = False
+            index += 1
+            continue
+        if in_code or _TABLE_PIPE not in stripped:
+            in_table = False
+            index += 1
+            continue
+        if in_table and not _starts_block(stripped):
+            kinds[index] = "row"
+            index += 1
+            continue
+        in_table = False
+        if index + 1 < len(lines) and _opens_table(stripped, lines[index + 1]):
+            kinds[index] = "row"
+            in_table = True
+            if _table_starts(stripped, lines[index + 1]):
+                kinds[index + 1] = "delimiter"
+                index += 1
+        index += 1
+    return kinds
+
+
 def _split_table_row(stripped: str) -> list[str]:
     # One border pipe off each end, not every pipe: ``|| a |`` has an empty
-    # first cell, and stripping both pipes would shift the row's columns.
-    inner = stripped.removeprefix("|").removesuffix("|")
-    return [cell.strip() for cell in inner.split("|")]
+    # first cell, and stripping both pipes would shift the row's columns. An
+    # escaped pipe is content and stays in its cell; a row that ends in one
+    # with no border keeps it rather than losing it as the border.
+    if stripped.endswith(_TABLE_ESCAPED_PIPE):
+        stripped += _TABLE_PIPE
+    inner = stripped.removeprefix(_TABLE_PIPE).removesuffix(_TABLE_PIPE)
+    inner = inner.replace(_TABLE_ESCAPED_PIPE, _TABLE_PIPE_PLACEHOLDER)
+    return [
+        cell.replace(_TABLE_PIPE_PLACEHOLDER, _TABLE_PIPE).strip()
+        for cell in inner.split(_TABLE_PIPE)
+    ]
 
 
 def strip_bot_mentions(text: str, activity: dict[str, Any]) -> str:
@@ -227,8 +329,12 @@ def _detach_part_marker(text: str) -> str:
     if not match:
         return text
     body = text[: match.start()]
-    last_line = body.rstrip("\n").rsplit("\n", 1)[-1].strip()
-    if not _is_table_row(last_line):
+    body_lines = body.rstrip("\n").split("\n")
+    # The last line is a table line by the renderer's own scan (a row, or
+    # the delimiter row a cut can land right after), not by a pipe
+    # heuristic: a lone pipe line, a shell pipeline or a bullet under a
+    # table render as prose and keep their marker where Hermes put it.
+    if not _table_line_kinds(body_lines)[-1]:
         return text
     return f"{body.rstrip()}\n\n({match.group(1)}/{match.group(2)})"
 
@@ -290,11 +396,16 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
         )
         table_rows.clear()
 
-    for line in lines:
+    # Which lines are table rows and which is a header's delimiter row, by
+    # the one scan _detach_part_marker also reads. Every row after the
+    # delimiter is data, GitHub's rule, so a body row of dashes ("| - | - |",
+    # an empty entry) is kept.
+    kinds = _table_line_kinds(lines)
+    for index, line in enumerate(lines):
         stripped = line.strip()
-        if not in_code_block and _is_table_row(stripped):
-            if _is_table_separator(stripped):
-                continue
+        if kinds[index] == "delimiter":
+            continue
+        if kinds[index] == "row":
             table_rows.append(_split_table_row(stripped))
             continue
         flush_table()
@@ -407,7 +518,10 @@ def relayed_teams_error(exc: urllib.error.HTTPError) -> TeamsRelayError:
         body = {}
     body = body if isinstance(body, dict) else {}
     fields = body.get("teams") if isinstance(body.get("teams"), dict) else {}
-    if not fields:
+    # Microsoft's words when it gave any; a fault with a non-JSON body leaves
+    # the ``teams`` object holding only the status, and the reason is then in
+    # the broker's ``detail``, so that is read rather than the bare number.
+    if not any(fields.get(k) for k in ("code", "message")):
         fields = {k: body[k] for k in ("error", "detail") if body.get(k)}
     detail = " ".join(str(v) for v in fields.values() if v) or str(exc.reason)
     return TeamsRelayError(f"HTTP {exc.code}: {detail}", exc.code)
@@ -559,7 +673,7 @@ def _build_teams_adapter_and_sender(
             method="GET" if body is None else "POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with _RELAY_OPENER.open(req, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             raise relayed_teams_error(exc) from exc
@@ -997,9 +1111,11 @@ def _build_teams_adapter_and_sender(
     ) -> dict[str, Any]:
         """The registry's standalone sender: a ``success`` or ``error`` dict, never a raise.
 
-        ``hermes send`` and the send tool call this out of process; the cron
-        lane would too, but only for an entry that names a cron home-channel
-        variable, which neither Teams registration does. Same contract as the
+        ``hermes send`` and the send tool call this out of process, and so
+        does the cron lane for a job whose ``deliver`` names ``teams``: both
+        Teams registrations name ``TEAMS_HOME_CHANNEL`` as their cron
+        home-channel variable, which the operator renders from
+        ``spec.integration.teams.homeChannel``. Same contract as the
         Slack sender: a silent tick (the dressed ``[SILENT]`` marker upstream
         lets through) is a logged success with nothing posted; a failure
         returns the cause. A file cannot ride the relay: the send tool already

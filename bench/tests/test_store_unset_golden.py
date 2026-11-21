@@ -55,7 +55,7 @@ GOLDEN = Path(__file__).parent / "fixtures" / "golden" / "store-unset"
 #: The version pins the golden was captured under. Written into an empty
 #: directory per test rather than read from the live ``bench/baselines/``.
 SHIPPED_VERSIONS = {"fleet": 1, "verifiers": 1}
-JUDGE = "gemini-3.1-pro-preview"
+JUDGE = "model-x"
 PATH_TOKEN = "<FIXTURE_RUNS>"
 #: Additive since the golden was captured; popped before comparing. The last
 #: two are the suite verdict's: ``outcome`` restates ``green`` as one of three

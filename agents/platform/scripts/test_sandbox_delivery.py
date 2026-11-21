@@ -305,9 +305,10 @@ def local_imports(path: Path, universe: set[str]) -> set[str]:
     `import gitops_workspace` are different nodes.
     """
     if path.is_dir():
-        # A package: what its modules import, down to each recipe's
-        # `<kind>/fix.py`, so a sibling import anywhere inside it is held to the
-        # allowlist like a top-level script's. Tests are stripped from the image.
+        # A package: what its modules import, down to each recipe's own
+        # modules (`fix_recipes/<kind>/fix.py`, `checks.py`), so a sibling
+        # import anywhere inside it is held to the allowlist like a top-level
+        # script's. Tests are stripped from the image.
         modules = sorted(p for p in path.rglob("*.py") if not p.name.startswith("test_"))
         return set().union(*(local_imports(p, universe) for p in modules))
     if path.suffix != ".py":

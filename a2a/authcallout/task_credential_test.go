@@ -127,7 +127,10 @@ func TestATaskCredentialMustBeThisConnections(t *testing.T) {
 		{"another tier", taskToken(t, kp, func(c *taskcred.Claims) { c.Tier = "unattended" }), "tier"},
 		{"past the max lifetime", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(DefaultTaskCredentialMaxLifetime + time.Hour) }), "ceiling"},
 		{"an untrusted key", taskToken(t, other, nil), "not a trusted task-signing key"},
-		{"the proxy audience", taskToken(t, kp, func(c *taskcred.Claims) { c.Audience = taskcred.AudienceCredentialProxy }), "credential-proxy"},
+		{"the proxy audience", taskToken(t, kp, func(c *taskcred.Claims) {
+			c.Audience = taskcred.AudienceCredentialProxy
+			c.Target = &taskcred.Target{Project: "p", Location: "l", Cluster: "c"}
+		}), "credential-proxy"},
 		{"not a credential", "not-a-jwt", "not a JWT"},
 	}
 	for _, tc := range cases {
