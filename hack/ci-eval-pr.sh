@@ -259,6 +259,7 @@ readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 # long enough for a slow API server, short against the 5m grace period.
 readonly EVAL_CANCEL_CUTS_MODEL_JOB_TYPES="presubmit batch"
 readonly EVAL_CANCEL_SCALE_REQUEST_TIMEOUT="30s"
+readonly EVAL_CANCEL_MARKER="cancelled"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -1039,6 +1040,9 @@ stop_model_calls_on_cancel() {
   done
   [ -n "${cuts}" ] || return 0
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cancelled (JOB_TYPE=${JOB_TYPE}): stopping the fan-out and the model gateway before collecting artifacts ==="
+  if [ -n "${STATE_DIR:-}" ] && [ -d "${STATE_DIR}" ]; then
+    : > "${STATE_DIR}/${EVAL_CANCEL_MARKER}"
+  fi
   # Only the units still in this shell's job table: a finished unit's PID may
   # since belong to some other process.
   local pid frozen="" running
@@ -5201,6 +5205,7 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # verification wholesale (evalharness/default.py, "skipped_no_infra") and
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
+export STATE_DIR
 
 # The units the card fence could not run before (fence_live_cards): one reason
 # file each under EVAL_FENCE_UNFENCED_DIR, read by run_one_unit beside the
