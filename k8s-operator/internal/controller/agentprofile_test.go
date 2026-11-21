@@ -175,6 +175,7 @@ func agentProfileSpecPaths() []string {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "cluster", Required: true}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Delegates = true
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage
