@@ -262,6 +262,7 @@ func TestTheDriftWarningIsOfTheRestoredWidth(t *testing.T) {
 					t.Fatal(err)
 				}
 				nc = conn
+				t.Cleanup(nc.Close)
 				js, _ := nc.JetStream()
 				for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
 					if _, err := js.AccountInfo(); err == nil {
@@ -278,9 +279,9 @@ func TestTheDriftWarningIsOfTheRestoredWidth(t *testing.T) {
 					t.Fatal(err)
 				}
 				nc = conn
+				t.Cleanup(nc.Close)
 			}
 			warnings, _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, c.replicas)
-			nc.Close()
 			if err != nil {
 				t.Fatalf("snapshot %d, render %d, into %d: %v", c.snapshot, c.rendered, c.replicas, err)
 			}
