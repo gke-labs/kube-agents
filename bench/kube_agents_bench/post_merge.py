@@ -266,7 +266,9 @@ def writable_kubeconfig(role: str) -> str:
             env={**os.environ, "KUBECONFIG": path}, capture_output=True, text=True,
             timeout=APPLY_TIMEOUT_SEC, check=False,
         )
-        why = "" if done.returncode == 0 else (done.stderr or "").strip()[-300:]
+        why = "" if done.returncode == 0 else (
+            (done.stderr or done.stdout or "").strip()[-300:] or f"gcloud exited {done.returncode}"
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         why = str(exc)
     if why:

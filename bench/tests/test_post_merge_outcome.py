@@ -365,3 +365,8 @@ def test_a_refused_credential_or_missing_record_is_unresolved(monkeypatch):
     with pytest.raises(fleet.FleetRoleUnresolved, match="denied"):
         post_merge.writable_kubeconfig("no-pdb-workload")
     assert written and not os.path.exists(written[0])
+    # A non-zero exit with nothing on stderr is still a refusal, not an empty credential.
+    monkeypatch.setattr(subprocess, "run", lambda argv, *a, **k: subprocess.CompletedProcess(argv, -9, "", ""))
+    with pytest.raises(fleet.FleetRoleUnresolved, match="exited -9"):
+        post_merge.writable_kubeconfig("no-pdb-workload")
+    assert not os.path.exists(written[-1])
