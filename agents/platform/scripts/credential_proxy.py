@@ -680,6 +680,19 @@ GCE_METADATA_FLAVOR_HEADER = "Metadata-Flavor"
 GCE_METADATA_FLAVOR_VALUE = "Google"
 GCE_METADATA_TIMEOUT_SECONDS = 0.5
 GCE_METADATA_MAX_BYTES = 512
+# The start check of a universe domain that the environment names, against the
+# metadata server's answer. No answer (a timeout, a connection error, a status
+# other than 200 and 404) is tried up to this many times in total, with this
+# pause between tries: at most about 15 seconds, which is longer than a
+# metadata server takes to answer a pod that has just started.
+UNIVERSE_CHECK_ATTEMPTS = 10
+UNIVERSE_CHECK_PAUSE_SECONDS = 1.0
+# What the broker does when the metadata server gives no answer in every try:
+# True starts with the value unchecked and says so in one WARNING record, False
+# does not start. A host with no metadata server, such as a harness on kind,
+# never gets an answer, so False stops it. The decision is here and nowhere
+# else.
+UNIVERSE_CHECK_UNANSWERED_STARTS = True
 _METADATA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _CACHED_METADATA_UNIVERSE_DOMAIN: str | None = None
 _METADATA_UNIVERSE_LOCK = threading.Lock()
@@ -1540,6 +1553,41 @@ LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 LOG_MSEC_FORMAT = "%s.%03dZ"
 
 
+def probe_gce_universe_domain_answer(
+    metadata_url: str = GCE_UNIVERSE_METADATA_URL,
+    timeout: float = GCE_METADATA_TIMEOUT_SECONDS,
+    opener: Any = None,
+) -> tuple[str | None, bool]:
+    """Ask the GCE/GKE metadata server for the universe domain: `(domain, answered)`.
+
+    `(domain, True)` for an HTTP 200 with a valid universe domain. `(None, True)`
+    for an HTTP 404: the host has no universe route (not GCE, or an older
+    emulator), which is an answer with nothing in it. `(None, False)` for no
+    answer: a timeout, a connection error, any other status, or a body that
+    is not a valid universe domain.
+    """
+    request = urllib.request.Request(
+        metadata_url,
+        headers={GCE_METADATA_FLAVOR_HEADER: GCE_METADATA_FLAVOR_VALUE},
+        method="GET",
+    )
+    active_opener = _METADATA_OPENER if opener is None else opener
+    try:
+        with active_opener.open(request, timeout=timeout) as response:
+            if response.status == HTTPStatus.NOT_FOUND:
+                return None, True
+            if response.status != HTTPStatus.OK:
+                return None, False
+            raw = response.read(GCE_METADATA_MAX_BYTES).decode("utf-8", "replace").strip()
+            if not raw:
+                return None, False
+            return credential_proxy_client.normalize_universe_domain(raw), True
+    except urllib.error.HTTPError as exc:
+        return None, exc.code == HTTPStatus.NOT_FOUND
+    except (OSError, ValueError, http.client.HTTPException):
+        return None, False
+
+
 def probe_gce_universe_domain_status(
     metadata_url: str = GCE_UNIVERSE_METADATA_URL,
     timeout: float = GCE_METADATA_TIMEOUT_SECONDS,
@@ -1552,28 +1600,57 @@ def probe_gce_universe_domain_status(
     and 5xx responses return `(googleapis.com, False)` so callers never cache a
     transient metadata blip as commercial Google Cloud.
     """
-    request = urllib.request.Request(
-        metadata_url,
-        headers={GCE_METADATA_FLAVOR_HEADER: GCE_METADATA_FLAVOR_VALUE},
-        method="GET",
+    domain, answered = probe_gce_universe_domain_answer(metadata_url, timeout, opener)
+    return domain or credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, answered
+
+
+def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time.sleep) -> None:
+    """Refuse a universe domain from the environment that the metadata server contradicts.
+
+    The environment's value otherwise goes unchecked: a value that names hosts
+    of another universe, or of the commercial one under other names, would send
+    this host's credential there. The metadata server says which universe the
+    host is in, so an answer that differs raises and the broker does not start.
+    An answer that agrees passes. A host with no universe route has nothing to
+    contradict the value: it passes, with a WARNING record that the value was
+    not checked. No answer in UNIVERSE_CHECK_ATTEMPTS tries is
+    UNIVERSE_CHECK_UNANSWERED_STARTS's case, with the same record.
+    """
+    reported, answered = None, False
+    for attempt in range(UNIVERSE_CHECK_ATTEMPTS):
+        if attempt:
+            sleep(UNIVERSE_CHECK_PAUSE_SECONDS)
+        reported, answered = probe_gce_universe_domain_answer()
+        if answered:
+            break
+    variables = (
+        f"{credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV} or "
+        f"{credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV}"
     )
-    active_opener = _METADATA_OPENER if opener is None else opener
-    try:
-        with active_opener.open(request, timeout=timeout) as response:
-            if response.status == HTTPStatus.NOT_FOUND:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
-            if response.status != HTTPStatus.OK:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-            raw = response.read(GCE_METADATA_MAX_BYTES).decode("utf-8", "replace").strip()
-            if not raw:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-            return credential_proxy_client.normalize_universe_domain(raw), True
-    except urllib.error.HTTPError as exc:
-        if exc.code == HTTPStatus.NOT_FOUND:
-            return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
-        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-    except (OSError, ValueError, http.client.HTTPException):
-        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
+    if not answered:
+        if not UNIVERSE_CHECK_UNANSWERED_STARTS:
+            raise RuntimeError(
+                f"the environment ({variables}) names universe domain {configured!r}, and the "
+                f"metadata server gave no answer in {UNIVERSE_CHECK_ATTEMPTS} tries to check it against"
+            )
+        LOGGER.warning(
+            "universe domain %s from the environment was not checked: the metadata server gave no answer in %d tries",
+            configured,
+            UNIVERSE_CHECK_ATTEMPTS,
+        )
+        return
+    if reported is None:
+        LOGGER.warning(
+            "universe domain %s from the environment was not checked: the metadata server has no universe route",
+            configured,
+        )
+        return
+    if reported != configured:
+        raise RuntimeError(
+            f"the environment ({variables}) names universe domain {configured!r}, and the metadata "
+            f"server reports {reported!r}. One credential proxy serves one universe domain and sends "
+            f"no credential to another. Set the variable to {reported!r} or remove it."
+        )
 
 
 def _cached_metadata_universe_domain() -> tuple[str, bool]:
@@ -1591,12 +1668,8 @@ def _cached_metadata_universe_domain() -> tuple[str, bool]:
         return domain, determined
 
 
-def resolve_universe_domain(
-    *,
-    environ: Any = os.environ,
-    probe_metadata: bool = False,
-) -> str:
-    """Resolve the active Google Cloud universe domain (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` -> `CLOUDSDK_CORE_UNIVERSE_DOMAIN` -> optional GCE metadata -> `googleapis.com`)."""
+def configured_universe_domain(environ: Any = os.environ) -> str | None:
+    """The universe domain the environment names, normalised, or None when it names none."""
     for name in (
         credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV,
         credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV,
@@ -1604,6 +1677,18 @@ def resolve_universe_domain(
         raw = environ.get(name, "").strip()
         if raw:
             return credential_proxy_client.normalize_universe_domain(raw)
+    return None
+
+
+def resolve_universe_domain(
+    *,
+    environ: Any = os.environ,
+    probe_metadata: bool = False,
+) -> str:
+    """Resolve the active Google Cloud universe domain (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` -> `CLOUDSDK_CORE_UNIVERSE_DOMAIN` -> optional GCE metadata -> `googleapis.com`)."""
+    configured = configured_universe_domain(environ)
+    if configured is not None:
+        return configured
     if probe_metadata:
         domain, _ = _cached_metadata_universe_domain()
         return domain
@@ -18923,6 +19008,11 @@ def serve(args: argparse.Namespace) -> None:
 
     CredentialProxyHandler.policy = Policy.load(args.policy)
     CredentialProxyHandler.probe_metadata_universe = True
+    # Read before the resolve below, which can put a metadata answer into the
+    # environment: only a value the environment came with is checked.
+    configured_universe = configured_universe_domain()
+    if configured_universe is not None:
+        check_universe_domain_against_metadata(configured_universe)
     universe_domain = resolve_universe_domain(probe_metadata=True)
     if universe_domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
         os.environ.setdefault(
@@ -19396,7 +19486,8 @@ def main(stream: TextIO = sys.stdout) -> int:
 
     Every refusal `serve` makes before it opens a listener -- an unsupported
     role or authentication mode, a listener reachable off the Pod with no
-    authenticator, a failed bootstrap command -- would otherwise leave the
+    authenticator, a failed bootstrap command, a universe domain the metadata
+    server contradicts -- would otherwise leave the
     process through the interpreter's default hook as a plain-text traceback
     on the same container log the JSON records go to, on every restart of a
     crash-looping broker. Caught here, it is one ERROR record with the

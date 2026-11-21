@@ -96,14 +96,16 @@ type PlatformAgentTiersSpec struct {
 // TierMember maps one person on one chat backend to a tier.
 type TierMember struct {
 	// Backend is the surface the person writes from: one whose requester is
-	// one verified person. The a2a door isn't one: its callers name
-	// themselves under a shared token.
-	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a-google
+	// one verified person. The a2a door's eval class isn't one: its callers
+	// name themselves under a shared token; its Google and Entra sign-in
+	// classes are.
+	// +kubebuilder:validation:Enum=gchat;slack;discord;a2a-google;a2a-entra
 	// +required
 	Backend string `json:"backend"`
 
 	// User is the person's id on that backend: their email on Google Chat
 	// (compared without case) and on a2a-google (as their Google token
+	// carries it), their Entra object id on a2a-entra (as their Entra token
 	// carries it), their user id on Slack or Discord.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=128

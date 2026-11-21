@@ -564,7 +564,8 @@ listener off, as before: nothing on that path scrapes it.
 
 A fourth family, `kubeagents_platformagent_model`, serves `status.inference` from the same
 reconcile, at the same site as the other three: an info gauge at `1`, one sample per agent, with the two
-agent labels and two string labels, `provider` and `model`, the pair as the status holds it. It
+agent labels and three string labels, `provider`, `model` and `reasoning_effort`, the pair and the
+effort as the status holds them (`reasoning_effort` empty while it holds none). It
 lives in `k8s-operator/internal/controller/inference_status.go` beside the reader that fills the
 block, not in `usage_gauges.go`, because its label values are not a closed set. When the pair
 changes the agent's old sample is deleted before the new one is set, there is no sample while
@@ -735,7 +736,7 @@ alternatives section refuses, a workload describing its own activity: it is a re
 the workload can withhold or nudge, never write.
 
 `status.inference`, beside `status.usage` and outside its "static enums and integer counts"
-contract, holds two short strings, the provider slug and the model name, which the operator reads
+contract, holds three short strings, the provider slug, the model name and the reasoning effort, which the operator reads
 from the install's own LiteLLM config ConfigMap; the status, the model gauge's labels and the
 summary carry them as read. The one transformation is the resource-reference rule: a Vertex AI
 endpoint path (`projects/…`) or a Bedrock ARN keeps its resource id only, so a project id, a

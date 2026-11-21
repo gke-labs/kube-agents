@@ -773,9 +773,10 @@ func (g *Gateway) sessionTurn(ref TaskRef) bool {
 // held to the same rule: its callers are verified people, but they reach the
 // door through a program, and bnaylor decided (2026-10-07) that a door
 // caller delegates only under a list of its own, whichever class verified
-// them.
+// them. The Entra class (a2aEntraBackend, a2adoor_entra.go) is the same
+// case.
 func (g *Gateway) doorUnlisted(target, backend string) bool {
-	return (backend == a2aBackend || backend == a2aGoogleBackend) && g.targetAllowed[target][backend] == nil
+	return (backend == a2aBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend) && g.targetAllowed[target][backend] == nil
 }
 
 // authorRefusal is the rule a steer author or incarnation-set member refuses
@@ -1332,7 +1333,7 @@ func wakeToDoor(parent *TaskRef) bool {
 		return false
 	}
 	switch parent.Requester.Backend {
-	case injectBackend, a2aBackend, a2aGoogleBackend:
+	case injectBackend, a2aBackend, a2aGoogleBackend, a2aEntraBackend:
 		return true
 	}
 	return false
