@@ -141,8 +141,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    homeChannelUnsetConditionType,
-		Written: "While the A2A gateway holds a chat backend whose `homeChannel` is empty (Google Chat, Slack, or both) and no learned channel is admitted for it",
-		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When the other platform has a home channel, proactive posts go there meanwhile. When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or under `homeChannelPolicy` `auto` mention the agent in a channel or a space, or on Slack pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
+		Written: "While the A2A gateway holds a chat backend whose `homeChannel` is empty (Google Chat, Slack, or Microsoft Teams with the operator's `A2A_TEAMS_BACKEND` switch on, any of them) and no learned channel or space is admitted for it",
+		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When another platform has a home channel, proactive posts go there meanwhile (Chat's first, then Slack's, then Teams'). When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform; the `install.env` key beside the field only for the platforms the installer configures. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or under `homeChannelPolicy` `auto` mention the agent in a channel or a space, or on Slack pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
 	},
 	{
 		Type:    a2aBusMigratingConditionType,
@@ -151,8 +151,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    noChatPlatformConditionType,
-		Written: "While neither Google Chat nor Slack is enabled",
-		Meaning: "`status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`) to clear it.",
+		Written: "While neither Google Chat nor Slack is enabled, and the gateway's Microsoft Teams backend is not armed",
+		Meaning: "`status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`, or `spec.integration.teams` on an operator running with `A2A_TEAMS_BACKEND=true`) to clear it.",
 	},
 	{
 		Type:    shellSandboxImagePinnedConditionType,

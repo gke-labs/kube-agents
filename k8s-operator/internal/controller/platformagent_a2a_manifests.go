@@ -52,6 +52,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -361,6 +362,7 @@ const (
 	// same in a2a/gateway/allowlist.go; the conformance suite pins it.
 	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
 	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
+	a2aTargetAllowedUsersTeamsEnvVar = "A2A_TARGET_ALLOWED_USERS_TEAMS"
 
 	// a2aTierMembershipEnvVar carries spec.tiers.membership to the gateway
 	// as backend:user=tier, comma-separated, plaintext like the allowlists:
@@ -697,6 +699,42 @@ const (
 	a2aGchatRelayURLEnvVar      = "A2A_GCHAT_RELAY_URL"
 	a2aGchatAllowedUsersEnvVar  = "A2A_GCHAT_ALLOWED_USERS"
 	a2aGchatAllowAllUsersEnvVar = "A2A_GCHAT_ALLOW_ALL_USERS"
+	// The Microsoft Teams backend the operator renders under mode: next when
+	// spec.integration.teams is enabled (a2aTeamsArmed). Names are the
+	// gateway's (a2a/gateway/config.go, FromEnv); the relay is the broker's
+	// Teams queue and passthrough (credential_proxy.py, TeamsRelay), which
+	// the Hermes consumer reads as TEAMS_RELAY_URL when Teams stays on Hermes.
+	// a2aTeamsBackendEnvVar is the operator's own switch for the gateway's
+	// Teams backend (a2aTeamsArmed): "true" on the controller-manager
+	// Deployment arms it for every PlatformAgent with Teams enabled; unset,
+	// Teams stays on the Hermes consumer. A switch rather than a CR field
+	// while the backend is new: the Hermes path is what Teams customers
+	// run, and an upgrade must not move them without an operator's hand.
+	a2aTeamsBackendEnvVar = "A2A_TEAMS_BACKEND"
+	// a2aNotifyPlatformTeams is Teams' name in A2A_NOTIFY_PLATFORM and
+	// A2A_NOTIFY_CONVERSATIONS, as Hermes spells it (`hermes send --to teams`).
+	a2aNotifyPlatformTeams = "teams"
+
+	a2aTeamsRelayURLEnvVar      = "A2A_TEAMS_RELAY_URL"
+	a2aTeamsAllowedUsersEnvVar  = "A2A_TEAMS_ALLOWED_USERS"
+	a2aTeamsAllowAllUsersEnvVar = "A2A_TEAMS_ALLOW_ALL_USERS"
+	a2aTeamsHomeChannelEnvVar   = "A2A_TEAMS_HOME_CHANNEL"
+	a2aTeamsTenantIDEnvVar      = "A2A_TEAMS_TENANT_ID"
+	a2aTeamsAdaptiveCardsEnvVar = "A2A_TEAMS_ADAPTIVE_CARDS"
+	// The gateway's rule for a Teams home conversation id
+	// (a2a/gateway/teams.go, teamsIsHomeConversationID): one of the two shapes
+	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
+	// personal chat), with something after the prefix, no whitespace of any
+	// script inside, and none of the characters the broker's activity path
+	// refuses (a decoded channel link carries "/General?groupId=…"); a Chat
+	// space name, a Slack channel id or a URL is none of these.
+	a2aTeamsHomeGroupPrefix    = "19:"
+	a2aTeamsHomePersonalPrefix = "a:"
+	a2aTeamsHomeRefused        = "/?#%\\"
+	// A thread's own id carries this; a home must be a channel, group or
+	// personal chat, since every message in a thread shares one key.
+	a2aTeamsHomeThreadToken = ";messageid="
+	a2aTeamsTokenPathEnvVar = "A2A_TEAMS_TOKEN_PATH" // #nosec G101 -- an environment variable name, not a credential
 	// The home space the gateway's chat.notify route posts to
 	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
 	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
@@ -758,6 +796,9 @@ const (
 	// gateway's ServiceAccount in the broker (#6090), rendered beside the
 	// audience above and only with it.
 	credentialProxyA2AChatCallersEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS" // #nosec G101 -- Environment variable name, not a credential
+	// The broker admits the a2a-chat role on its Teams routes only while
+	// this reads "true": the gateway's teams backend is the queue's consumer.
+	credentialProxyTeamsA2ACallerEnvVar = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER" // #nosec G101 -- Environment variable name, not a credential
 
 	// The A2AGateway condition. Older operators published it while a next
 	// install's gateway ran nothing for want of a chat backend: withheld
@@ -1552,9 +1593,10 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
-// a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
-// gateway. An absent list, or the allow-all spelling allowAllUsers accepts,
-// renders nothing: the gateway reads no var as "all authenticated users",
+// a2aTargetAllowlistEnv renders the CR's Chat, Slack and, with the gateway's
+// Teams backend armed, Teams allowlists for the gateway. An absent list, or
+// the allow-all spelling allowAllUsers accepts (for Teams, the CRD's explicit
+// allowAllUsers switch), renders nothing: the gateway reads no var as "all authenticated users",
 // which is what the CR field promises. Any other list renders, even one that
 // is blank after trimming: the gateway reads a set-but-empty var as a list
 // with no members, so a list of blanks admits nobody, the rule #2207 set for
@@ -1583,6 +1625,12 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	}
 	if integ.Slack != nil && !allowAllUsers(integ.Slack.AllowedUsers) {
 		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
+	}
+	// Teams: the same list the ingress gate reads (lowercased, as the
+	// gateway compares it), unless the CR's explicit allow-all switch is on;
+	// an empty list with the switch off renders empty and admits nobody.
+	if a2aTeamsArmed(agent) && !(integ.Teams.AllowAllUsers != nil && *integ.Teams.AllowAllUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersTeamsEnvVar, Value: join(integ.Teams.AllowedUsers, true)})
 	}
 	return env
 }
@@ -1672,6 +1720,9 @@ func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	if a2aSlackNotifyArmed(agent) {
 		platforms = append(platforms, a2aNotifyPlatformSlack)
 	}
+	if a2aTeamsNotifyArmed(agent) {
+		platforms = append(platforms, a2aNotifyPlatformTeams)
+	}
 	return platforms
 }
 
@@ -1688,6 +1739,9 @@ func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	}
 	if a2aSlackNotifyArmed(agent) && a2aSlackHomeChannel(agent) != "" {
 		platforms = append(platforms, a2aNotifyPlatformSlack)
+	}
+	if a2aTeamsHasHome(agent) {
+		platforms = append(platforms, a2aNotifyPlatformTeams)
 	}
 	return platforms
 }
@@ -1709,6 +1763,42 @@ func a2aGchatHasEffectiveHome(agent *agentv1alpha1.PlatformAgent, rec homeChanne
 // reads it; the pod template never reads the record (a2aNotifyHomePlatforms).
 func a2aSlackHasHome(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) bool {
 	return a2aSlackNotifyArmed(agent) && a2aSlackHomeEffective(agent, rec) != ""
+}
+
+// a2aTeamsNotifyArmed is whether the gateway arms Teams' chat.notify route:
+// whenever it holds Teams, unless teams.homeChannel is set but is not a
+// conversation id, which the gateway refuses at start (NewTeamsNotifier),
+// dropping the whole route. The agent is then not told to report to it.
+func a2aTeamsNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aTeamsArmed(agent) {
+		return false
+	}
+	return strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel) == "" || a2aTeamsHomeConversation(agent) != ""
+}
+
+// a2aTeamsHomeConversation is teams.homeChannel trimmed, when it is a Teams
+// conversation id by the gateway's rule (one token, no whitespace inside, in
+// one of the two shapes Teams issues), and "" otherwise.
+func a2aTeamsHomeConversation(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Integration == nil || agent.Spec.Integration.Teams == nil {
+		return ""
+	}
+	home := strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel)
+	if home == "" || strings.ContainsAny(home, a2aTeamsHomeRefused) || strings.Contains(strings.ToLower(home), a2aTeamsHomeThreadToken) || strings.IndexFunc(home, unicode.IsSpace) >= 0 {
+		return ""
+	}
+	for _, prefix := range []string{a2aTeamsHomeGroupPrefix, a2aTeamsHomePersonalPrefix} {
+		if body, ok := strings.CutPrefix(home, prefix); ok && body != "" {
+			return home
+		}
+	}
+	return ""
+}
+
+// a2aTeamsHasHome is whether Teams' chat.notify route is armed with a home
+// conversation to post to.
+func a2aTeamsHasHome(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aTeamsNotifyArmed(agent) && a2aTeamsHomeConversation(agent) != ""
 }
 
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
@@ -1772,8 +1862,7 @@ func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return slackEnabled(agent)
 }
 
-// teamsEnabled is the enabled test for Teams, which only Hermes serves: the
-// A2A gateway has no Teams backend, so an enabled Teams is always on Hermes.
+// teamsEnabled is the enabled test for Teams, in one place.
 func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Integration == nil {
 		return false
@@ -1782,14 +1871,53 @@ func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return teams != nil && teams.Enabled != nil && *teams.Enabled
 }
 
+// a2aTeamsArmed reports whether this install's Teams is consumed by the A2A
+// stack: the gateway's teams backend, on the broker's Teams relay, when the
+// operator runs with A2A_TEAMS_BACKEND=true and the CR enables Teams. Unlike
+// Chat and Slack, the arm is not the CR alone: spec.mode is "next" on every
+// stored object (the webhook rewrites the rest), so a mode test would move
+// every Teams install off the Hermes consumer on the upgrade that brings the
+// backend. One consumer per install either way: the broker's queue is one,
+// and two pullers would split its activities, so the Hermes env
+// (TEAMS_RELAY_URL) renders only while this is false (teamsOnHermes).
+func a2aTeamsArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	return teamsEnabled(agent) && os.Getenv(a2aTeamsBackendEnvVar) == "true"
+}
+
+// teamsOnHermes reports a Teams integration served by the Hermes consumer:
+// enabled, and not armed on the A2A gateway.
+func teamsOnHermes(agent *agentv1alpha1.PlatformAgent) bool {
+	return teamsEnabled(agent) && !a2aTeamsArmed(agent)
+}
+
 // peopleReadingEnabled reports whether the usage poller reads the A2A
 // gateway's people reading for the install: only while no chat platform it
 // enables is served through Hermes, since the gateway counts only the
 // people who write through it, and a count beside a Hermes-served platform
 // would say nobody wrote while that platform's users were writing. Google
-// Chat and Slack are always on the A2A gateway, so only Teams counts.
+// Chat and Slack are always on the A2A gateway, so only a Teams on Hermes
+// counts.
 func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return !teamsEnabled(agent)
+	return !teamsOnHermes(agent)
+}
+
+// a2aChatRelayToken is the projected ServiceAccount token the gateway
+// presents to the broker's chat relays (the a2a-chat audience), mounted for
+// the Google Chat backend, the Teams backend, or both: one volume, one path.
+func a2aChatRelayToken() ([]corev1.VolumeMount, []corev1.Volume) {
+	mounts := []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
+	volumes := []corev1.Volume{{
+		Name: a2aGchatTokenVolume,
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr.To(int32(0400)),
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience:          credentialProxyA2AChatAudience,
+				ExpirationSeconds: ptr.To(int64(a2aGchatTokenTTLSeconds)),
+				Path:              a2aGchatTokenKey,
+			}}},
+		}},
+	}}
+	return mounts, volumes
 }
 
 // slackEnabled is the enabled test the Slack render sites make, in one place.
@@ -2720,6 +2848,7 @@ accounts {
       { stream: { account: APP, subject: "a2a.cap.verify.*" } }
       { stream: { account: APP, subject: "chat.notify.gchat" } }
       { stream: { account: APP, subject: "chat.notify.slack" } }
+      { stream: { account: APP, subject: "chat.notify.teams" } }
       { stream: { account: APP, subject: "chat.notify.console" } }
       { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
     ]
@@ -2757,6 +2886,7 @@ accounts {
       { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
       { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
       { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
       { stream: "chat.notify.console", accounts: [ TRUSTED ] }
       { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
     ]
@@ -7169,7 +7299,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// when it is not armed, so every other render is byte-identical to what
 	// it was.
 	var backendEnv []corev1.EnvVar
-	if !a2aSlackArmed(agent) && !a2aChatArmed(agent) {
+	if !a2aSlackArmed(agent) && !a2aChatArmed(agent) && !a2aTeamsArmed(agent) {
 		backendEnv = []corev1.EnvVar{
 			// Created by hand at install time (the bot token is operator
 			// input, never repo content); the reference is optional so the
@@ -7288,18 +7418,38 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if gchat.AnswerFeedback != nil && !*gchat.AnswerFeedback {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
-		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
-		chatVolumes = []corev1.Volume{{
-			Name: a2aGchatTokenVolume,
-			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-				DefaultMode: ptr.To(int32(0400)),
-				Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-					Audience:          credentialProxyA2AChatAudience,
-					ExpirationSeconds: ptr.To(int64(a2aGchatTokenTTLSeconds)),
-					Path:              a2aGchatTokenKey,
-				}}},
-			}},
-		}}
+		chatMounts, chatVolumes = a2aChatRelayToken()
+	}
+	// The Teams backend, beside Chat's or alone: the same relay token, the
+	// Teams relay URL, the CR's allowlist on Chat's terms (a2aAllowlist) and
+	// its allow-all switch as the CRD defines it (an empty list with the
+	// switch off admits nobody). The tenant and home channel render only when set; the
+	// card switch only when off, so a default CR renders nothing extra.
+	if a2aTeamsArmed(agent) {
+		teams := agent.Spec.Integration.Teams
+		chatEnv = append(chatEnv,
+			corev1.EnvVar{Name: a2aTeamsRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
+			// The same projected token as Chat's, named so the path and the
+			// mount are one fact here rather than two defaults agreeing.
+			corev1.EnvVar{Name: a2aTeamsTokenPathEnvVar, Value: a2aGchatTokenPath},
+			corev1.EnvVar{Name: a2aTeamsAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(teams.AllowedUsers), ",")},
+			// The explicit switch, as the Hermes render reads it: an empty
+			// list with the switch off (the default) admits nobody, which is
+			// the CRD's documented meaning, unlike Chat's raw-list rule.
+			corev1.EnvVar{Name: a2aTeamsAllowAllUsersEnvVar, Value: strconv.FormatBool(teams.AllowAllUsers != nil && *teams.AllowAllUsers)},
+		)
+		if teams.TenantId != "" {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsTenantIDEnvVar, Value: teams.TenantId})
+		}
+		if home := strings.TrimSpace(teams.HomeChannel); home != "" {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsHomeChannelEnvVar, Value: home})
+		}
+		if teams.AdaptiveCards != nil && !*teams.AdaptiveCards {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAdaptiveCardsEnvVar, Value: strconv.FormatBool(false)})
+		}
+		if len(chatVolumes) == 0 {
+			chatMounts, chatVolumes = a2aChatRelayToken()
+		}
 	}
 
 	// The container env, in the order it has always had: the bus, the

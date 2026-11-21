@@ -3524,7 +3524,8 @@ type AgentUsageStatus struct {
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
 	// chat platform the install enables is served through Hermes (Microsoft
-	// Teams), and while the served CRD
+	// Teams, unless the operator arms the gateway's Teams backend), and
+	// while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional

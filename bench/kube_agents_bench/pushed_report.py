@@ -31,6 +31,10 @@ What it grades is the hermes-bridge's read of that row before the turn
 a report the relay or the notifier pushed reaches the bridge with no link to
 the report, and the bridge attaches the stored report ahead of the user's
 words, as the Hermes gateway's ``incident_context`` hook did before the bus.
+On a live install the gateway relays a card's report it posted into the
+thread ahead of the row (``a2a/docs/hermes-bridge.md``); the row is the
+fallback, and the one reached here, since nothing posts into an inject
+conversation.
 A case asks about a detail only the report carries; an agent that has the
 report answers it, and one that does not cannot.
 

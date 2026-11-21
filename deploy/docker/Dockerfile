@@ -925,6 +925,7 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
+     deploy/docker/patches/apply_api_platform_hint.py \
      deploy/docker/patches/apply_slack_reactions_scope.py \
      deploy/docker/patches/verify_slack_reactions_scope.py \
      deploy/docker/patches/apply_slack_ux_reactions.py \
@@ -978,6 +979,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_chan
     grep -qF "kube-agents patch: attachment-fallback notice" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -qF "_credential_proxy_relay_patched" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_api_platform_hint.py /opt/hermes && \
+    grep -qF "kube-agents chat gateway" /opt/hermes/agent/prompt_builder.py && \
+    ! grep -qF "assume plain text" /opt/hermes/agent/prompt_builder.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_reactions_scope.py /opt/hermes && \
     grep -qF '"reactions:write"' /opt/hermes/hermes_cli/slack_cli.py && \
     install -m 0644 /tmp/message-surface/slack_ux_reactions.py /opt/hermes/gateway/slack_ux_reactions.py && \
