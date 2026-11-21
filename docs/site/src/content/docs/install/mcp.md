@@ -114,10 +114,15 @@ gh release download "$VERSION" --repo gke-labs/kube-agents \
   -p "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz" -p checksums.txt
 grep "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz" checksums.txt | shasum -a 256 -c -
 tar -xzf "kube-agents-mcp_${VERSION}_${OS}_${ARCH}.tar.gz"
+mkdir -p ~/.local/bin
 install -m 0755 "kube-agents-mcp_${VERSION}_${OS}_${ARCH}/kube-agents-mcp" ~/.local/bin/
 ```
 
-Any directory on your `PATH` works in place of `~/.local/bin`. Without `gh`, download the same two files from the release's page. On Linux, `sha256sum -c -` takes the place of `shasum -a 256 -c -`.
+`~/.local/bin` must be on your `PATH`; macOS doesn't put it there, so add it in your shell's profile, or install into another directory on your `PATH`. On Linux, `sha256sum -c -` takes the place of `shasum -a 256 -c -`.
+
+Without `gh`, download the same two files from the release's page. On macOS a browser download is quarantined, and Gatekeeper can then refuse to run the bridge. Clear the flag with `xattr -d com.apple.quarantine` on the installed binary.
+
+0.35.0 also attached bridge archives, but its binary predates the version output and the step-streaming setting described below. Use 0.36.0 or later.
 
 ### Build from source
 
@@ -203,7 +208,7 @@ agy --print "Call the kube-agents connection_status tool." \
 ```
 
 :::caution
-A bridge built before the `KUBE_AGENTS_MCP_STREAM_STEPS` setting existed ignores it. Check with `kube-agents-mcp --help`. If its usage lists no `stream-steps` flag, replace it with a release from 0.36.0 on or a build from source. Or have the agent pass `stream_steps: false` to `send_message` instead, for example "Use the kube-agents send_message tool with stream_steps false to ask: …".
+A bridge built before the `KUBE_AGENTS_MCP_STREAM_STEPS` setting existed ignores it. Check with `kube-agents-mcp --help`, which ends with a `flag: help requested` line after the usage. If the usage lists no `stream-steps` flag, replace it with a release from 0.36.0 on or a build from source. Or have the agent pass `stream_steps: false` to `send_message` instead, for example "Use the kube-agents send_message tool with stream_steps false to ask: …".
 :::
 
 ### Antigravity editor
