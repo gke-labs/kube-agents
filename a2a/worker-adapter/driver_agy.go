@@ -29,7 +29,8 @@ import (
 //   - it streams no thinking text (only a thinking token count), so it
 //     produces no EventThinking;
 //   - it reports no cost, so its telemetry carries no running total and the
-//     adapter publishes none (cost is absent for agy, by design here);
+//     adapter publishes none, until #6808 takes the per-turn cost from
+//     LiteLLM through the loopback proxy (#6714);
 //   - result.usage is cumulative over the process, so the decoder reports
 //     each result's difference from the last.
 //
@@ -232,7 +233,7 @@ func (d *agyDecoder) result(r agyResult) Event {
 }
 
 // telemetry is this result's turn: the difference between its cumulative
-// usage and duration and the last result's. agy reports no cost, so there
+// usage and duration and the last result's. agy reports no cost (until #6808), so there
 // is no running total. duration_seconds is wall time since the process
 // started (the probe's second turn read 47.3s after a first of 18.0s and a
 // 25s pause before its message), so the difference includes any wait between
