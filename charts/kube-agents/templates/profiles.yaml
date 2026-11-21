@@ -120,8 +120,43 @@ onboarding PR renders one. Delegation from a profile task will need the
 profile's opt-in (spec.delegates, #6789), set by whichever of #6789 and the
 onboarding PR lands second.
 */}}
+{{- define "kube-agents.fleetAuditProfileDefaults" -}}
+description: >-
+  Fleet-wide audit runner: hands each in-scope cluster's read-only checks
+  to the cluster profile as one delegated task per cluster, collects their
+  results, and composes the audit's findings and report. Never reads or
+  changes a cluster itself.
+persona:
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/persona-fleet-audit
+    tag: ""
+harness:
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+    tag: ""
+  model: model-default
+  maxTurns: 120
+allowedTiers:
+  - read
+  - unattended
+lifecycle:
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 600
+concurrency: 1
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+{{- end }}
 {{- if and .Values.platformAgent.enabled .Values.profiles .Values.profiles.fleetAudit .Values.profiles.fleetAudit.enabled }}
-{{- $fa := .Values.profiles.fleetAudit -}}
+{{- /* values.yaml's profiles.fleetAudit block, under what the install sets: a
+`helm upgrade --reuse-values` from a release before this key carries only the
+keys someone set (enabled, say), never the chart's defaults.
+tests/test_optional_profiles.py holds the defaults here equal to values.yaml's. */}}
+{{- $fa := mergeOverwrite (include "kube-agents.fleetAuditProfileDefaults" . | fromYaml) (deepCopy .Values.profiles.fleetAudit) -}}
 {{- $defaultTag := (.Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | toString -}}
 {{- $personaRepo := include "kube-agents.imageRepository" (dict "repository" $fa.persona.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
 {{- $personaTag := ($fa.persona.image.tag | default $defaultTag) | toString -}}

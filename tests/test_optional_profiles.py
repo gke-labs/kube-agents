@@ -561,3 +561,27 @@ class HelmFleetAuditProfileTest(unittest.TestCase):
         self.assertFalse(persona.get("parameters"), "the fleet-audit persona declares parameters")
         spec = self._profile(self._render("--set", "profiles.fleetAudit.enabled=true").stdout)["spec"]
         self.assertFalse(spec.get("parameters"))
+
+
+class HelmFleetAuditProfileReuseValuesTest(unittest.TestCase):
+    """`helm upgrade --reuse-values` from a release before profiles.fleetAudit
+    carries only what the install sets, so the template falls back to its own
+    copy of the defaults, which must equal values.yaml's."""
+
+    def _render(self, *extra: str) -> dict:
+        cmd = ["helm", "template", "test-release", str(_CHART), *_CHART_CLUSTER_SETS, *extra]
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        found = [d for d in yaml.safe_load_all(out) if d and d.get("kind") == "AgentProfile" and d["metadata"]["name"] == "fleet-audit"]
+        self.assertEqual(len(found), 1)
+        return found[0]["spec"]
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_only_enabled_set_renders_the_same_spec_as_the_defaults(self):
+        values = yaml.safe_load((_CHART / "values.yaml").read_text(encoding="utf-8"))
+        nulls = []
+        for key in values["profiles"]["fleetAudit"]:
+            if key != "enabled":
+                nulls += ["--set", f"profiles.fleetAudit.{key}=null"]
+        stripped = self._render("--set", "profiles.fleetAudit.enabled=true", *nulls)
+        defaults = self._render("--set", "profiles.fleetAudit.enabled=true")
+        self.assertEqual(stripped, defaults)
