@@ -62,8 +62,10 @@ import (
 //
 // The question is asked with a probe key of its own, in the reserved class
 // gateway-probe, which the hook admits on GET /v1/models alone and no
-// caller is ever given. Its digest is written in the same map update as the
-// callers', so a pod that admits it has loaded the whole map. A caller's key
+// caller is ever given. A fresh probe key goes with every map the operator
+// writes, its digest in the same update as the callers' and the previous
+// probe digest dropped, so a pod that admits it has loaded that map, and a
+// pod still on an older one refuses it. A caller's key
 // is never sent in a probe: which pods the probe reaches is chosen from pod
 // objects anyone who can create a pod in the namespace can imitate
 // (gatewayOwnsPod).
@@ -611,6 +613,17 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	// A map at the name that isn't the recorded one is replaced when the new
 	// map is written, not before, and nothing is read from it.
 	mapRecorded := mapFound && recorded[callerKeysSecretName] != "" && existingMap.UID == recorded[callerKeysSecretName]
+	if mapFound && !mapRecorded {
+		// The pass's copy of the agent can lag the record: take the record
+		// from the API server before treating the map, or anything, as not
+		// the operator's.
+		fresh, err := r.freshRecordedSecretUIDs(ctx, agent)
+		if err != nil {
+			return r.notWrittenFor("Secret "+mapKey.String(), err)
+		}
+		recorded = fresh
+		mapRecorded = recorded[callerKeysSecretName] != "" && existingMap.UID == recorded[callerKeysSecretName]
+	}
 	var previousTiers []string
 	if mapRecorded {
 		previousTiers = tierClassesInMap(existingMap.Data[callerKeysFileKey])
@@ -688,13 +701,34 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	}
 	slices.Sort(removed)
 
-	digests := make(map[string]string, len(keys))
+	callerDigests := make(map[string]string, len(keys))
 	for class, apiKey := range keys {
-		digests[inferenceKeyDigest(apiKey)] = class
+		if class != inferenceKeyClassProbe {
+			callerDigests[inferenceKeyDigest(apiKey)] = class
+		}
 	}
-	doc, err := callerKeysDocument(digests)
+	// Every map the operator writes carries a probe key of its own: a pod
+	// still on an older map then refuses the probe, so Served can't be read
+	// off a map no pod has loaded. When this pass's map differs from the
+	// stored one, the probe key is replaced in its Secret first and the map
+	// written after, carrying the new digest alone. A map write that fails
+	// leaves a map that differs again on the next pass, which rotates once
+	// more and writes it. A probe key minted this pass is already new.
+	doc, err := mapWithProbe(callerDigests, keys[inferenceKeyClassProbe])
 	if err != nil {
 		return notWritten("the caller-key map could not be encoded", false)
+	}
+	if !slices.Contains(minted, inferenceKeyClassProbe) && (!mapRecorded || string(existingMap.Data[callerKeysFileKey]) != string(doc)) {
+		probe := installInferenceKeyClass(agent, inferenceKeyClassProbe)
+		fresh, err := r.rotateProbeKey(ctx, agent, probe, recorded[probe.secret.Name])
+		if err != nil {
+			log.Info("could not replace the probe key; the map is left as it is", "failure", apiFailure(err))
+			return r.notWrittenFor("the "+inferenceKeyClassProbe+" key's Secret", err)
+		}
+		keys[inferenceKeyClassProbe] = fresh
+		if doc, err = mapWithProbe(callerDigests, fresh); err != nil {
+			return notWritten("the caller-key map could not be encoded", false)
+		}
 	}
 	mapWritten, err := r.writeCallerKeysMap(ctx, agent, existingMap, mapFound, mapRecorded, doc)
 	if err != nil {
@@ -819,6 +853,40 @@ func inferenceKeySecretIsOurs(s *corev1.Secret, agent *agentv1alpha1.PlatformAge
 		return false
 	}
 	return !c.inProfileNamespace || renderedByAgent(s, agent, inferenceKeyComponent)
+}
+
+// mapWithProbe is keys.json for the caller digests and the probe key.
+func mapWithProbe(callerDigests map[string]string, probeAPIKey string) ([]byte, error) {
+	entries := make(map[string]string, len(callerDigests)+1)
+	for digest, class := range callerDigests {
+		entries[digest] = class
+	}
+	entries[inferenceKeyDigest(probeAPIKey)] = inferenceKeyClassProbe
+	return callerKeysDocument(entries)
+}
+
+// rotateProbeKey writes a fresh key into the recorded probe key Secret, in
+// place, and returns it. Only the operator's own recorded Secret is written.
+func (r *PlatformAgentReconciler) rotateProbeKey(ctx context.Context, agent *agentv1alpha1.PlatformAgent, c inferenceKeyClass, recordedUID types.UID) (string, error) {
+	existing := &corev1.Secret{}
+	if err := r.a2aReader().Get(ctx, c.secret, existing); err != nil {
+		return "", err
+	}
+	if !inferenceKeySecretIsOurs(existing, agent, c, recordedUID) {
+		return "", fmt.Errorf("secret %s changed under the pass", c.secret.String())
+	}
+	fresh, err := newInferenceKey()
+	if err != nil {
+		return "", err
+	}
+	if existing.Data == nil {
+		existing.Data = map[string][]byte{}
+	}
+	existing.Data[inferenceKeyDataKey] = []byte(fresh)
+	if err := r.Update(ctx, existing); err != nil {
+		return "", err
+	}
+	return fresh, nil
 }
 
 // recordedTiers is the tiers whose key Secret names the record holds.
@@ -961,8 +1029,8 @@ func (r *PlatformAgentReconciler) gatewayOwnsPod(ctx context.Context, gateway *a
 // answers to the key probeKey picks, side by side under one deadline. Pods
 // are filtered by gatewayOwnsPod first. classes are the caller classes the
 // map carries beside the probe key, for the message. Every pod answering
-// 200 is Served: the probe key is in the same map update as every caller
-// key, so a pod that admits it has loaded them all. A pod answering
+// 200 is Served: the probe key is new with the map this pass wrote or
+// found, so a pod that admits it has loaded that map. A pod answering
 // anything else is NotServed, which names the pod and the status; a pod
 // that doesn't answer is ProbeIncomplete. A gateway without the caller-auth
 // hook admits any key, so it answers 200, which is right: it would serve a

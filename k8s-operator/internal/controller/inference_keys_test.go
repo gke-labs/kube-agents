@@ -1285,3 +1285,132 @@ func TestTheCRDSchemaIsReadOncePerResourceVersion(t *testing.T) {
 		t.Errorf("%d schema reads and %d metadata reads over three passes, want 1 and 3", full.Load(), head.Load())
 	}
 }
+
+// mapServingGateway is a fake gateway whose pods each serve a loaded map:
+// a pod admits a key only when its digest is in the map that pod loaded.
+type mapServingGateway struct {
+	mu     sync.Mutex
+	loaded map[string]map[string]string
+}
+
+func (g *mapServingGateway) load(host string, doc []byte) {
+	var entries map[string]string
+	_ = json.Unmarshal(doc, &entries)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.loaded[host] = entries
+}
+
+func (g *mapServingGateway) Probe(_ context.Context, addr, apiKey string) (int, error) {
+	host, _, _ := net.SplitHostPort(addr)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.loaded[host][inferenceKeyDigest(apiKey)]; ok {
+		return http.StatusOK, nil
+	}
+	return http.StatusUnauthorized, nil
+}
+
+// A new map carries a new probe key: from Served, adding a tier rewrites the
+// map, and a pod still serving the old map refuses the new probe key, so the
+// condition reads NotServed until that pod loads the new map. The old probe
+// digest is gone from the new map.
+func TestANewMapIsServedOnlyOnceThePodsLoadIt(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	profile := &agentv1alpha1.AgentProfile{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	gw := &mapServingGateway{loaded: map[string]map[string]string{}}
+	r.inferenceKeyProbe = gw
+	loadEverywhere := func() {
+		_, doc := readCallerKeysMap(t, cl, agent)
+		gw.load("10.1.0.1", doc)
+		gw.load("10.1.0.2", doc)
+	}
+
+	r.reconcileInferenceKeys(ctx, agent)
+	loadEverywhere()
+	if out := r.reconcileInferenceKeys(ctx, agent); out.condition.Status != metav1.ConditionTrue {
+		t.Fatalf("with the map loaded: %+v", out.condition)
+	}
+	oldProbe := allInferenceKeys(t, cl, agent)[inferenceKeyClassProbe]
+
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	out := r.reconcileInferenceKeys(ctx, agent)
+	if out.condition.Status != metav1.ConditionFalse || out.condition.Reason != inferenceKeysReasonNotServed {
+		t.Fatalf("pods on the old map read as %+v, want NotServed", out.condition)
+	}
+	newProbe := allInferenceKeys(t, cl, agent)[inferenceKeyClassProbe]
+	if newProbe == oldProbe {
+		t.Fatal("the probe key didn't change with the map")
+	}
+	entries, _ := readCallerKeysMap(t, cl, agent)
+	if _, ok := entries[inferenceKeyDigest(oldProbe)]; ok {
+		t.Error("the new map still holds the old probe digest")
+	}
+	if entries[inferenceKeyDigest(newProbe)] != inferenceKeyClassProbe {
+		t.Error("the new map lacks the new probe digest")
+	}
+
+	loadEverywhere()
+	if out := r.reconcileInferenceKeys(ctx, agent); out.condition.Status != metav1.ConditionTrue {
+		t.Errorf("with the new map loaded: %+v", out.condition)
+	}
+	if again := allInferenceKeys(t, cl, agent)[inferenceKeyClassProbe]; again != newProbe {
+		t.Error("an unchanged map rotated the probe key again")
+	}
+}
+
+// A map write that fails after the probe key was replaced converges on the
+// next pass: the map is rewritten with the current probe digest.
+func TestAFailedMapWriteAfterARotationConverges(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	profile := &agentv1alpha1.AgentProfile{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	failMap := true
+	inner := cl.(client.WithWatch)
+	r.Client = interceptor.NewClient(inner, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if obj.GetName() == callerKeysSecretName && failMap {
+				return apierrors.NewServiceUnavailable("unavailable")
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+	if out := r.reconcileInferenceKeys(ctx, agent); out.condition.Reason != inferenceKeysReasonNotWritten {
+		t.Fatalf("a failed map write read as %+v", out.condition)
+	}
+	failMap = false
+	r.reconcileInferenceKeys(ctx, agent)
+	probeKey := allInferenceKeys(t, cl, agent)[inferenceKeyClassProbe]
+	entries, _ := readCallerKeysMap(t, cl, agent)
+	if entries[inferenceKeyDigest(probeKey)] != inferenceKeyClassProbe {
+		t.Error("the map doesn't carry the current probe digest after the retry")
+	}
+	probes := 0
+	for _, class := range entries {
+		if class == inferenceKeyClassProbe {
+			probes++
+		}
+	}
+	if probes != 1 {
+		t.Errorf("%d probe digests in the map, want 1", probes)
+	}
+}
