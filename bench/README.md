@@ -78,7 +78,7 @@ The operator runs the gateway as one replica whatever `spec.deployment.availabil
 
 To run the agent unsandboxed: `ENABLE_GVISOR=false` at install time, or in `install.env` before a full `upgrade.sh`, which re-renders the runtime class from it; on a Standard install that runs the gVisor pool, that upgrade also needs `--allow-node-pool-destroy` — read [`scripts/installer/README.md`](../scripts/installer/README.md) on what else that apply rewrites before you run it on an install you care about. CI reaches the same place by overriding the chart value directly, which a throwaway cluster can afford: `hack/ci-deploy.sh` pins `runtimeClassName` empty before `hack/ci-eval-pr.sh` runs, and says why.
 
-The fold window is the other value `hack/ci-deploy.sh` pins for the eval install. `INCIDENT_WORKLOAD_DEDUP_SECONDS` defaults to an hour, and on a dev install that keeps the default, a case that re-plants one workload and waits for that repetition's own card (`autoops-warning-event-triage`, `autoops-crashloop-config-triage`, `autoops-warning-event-no-action-triage`) folds its second and third repetition into the first's incident, so no card comes and the plant times out. Before running one of those three times back to back, set the window to 150 s as CI does, with the chart key `platformAgent.deployment.incidentWorkloadDedupSeconds: 150` (an `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry in `platformAgent.deployment.env` wins over it); `hack/ci-deploy.sh` says how the number was chosen.
+The fold window is the other value `hack/ci-deploy.sh` pins for the eval install. `INCIDENT_WORKLOAD_DEDUP_SECONDS` defaults to an hour, and on a dev install that keeps the default, a case that re-plants one workload and waits for that repetition's own card (`autoops-warning-event-triage`, `autoops-crashloop-config-triage`, `autoops-warning-event-no-action-triage`) folds its second and third repetition into the first's incident, so no card comes and the plant times out. The `workload-image-pull-refused-*` cases also re-plant one workload and read that repetition's own card; their plant does not wait for it, so the fold check fails such a repetition instead. Before running one of these cases three times back to back, set the window to 150 s as CI does, with the chart key `platformAgent.deployment.incidentWorkloadDedupSeconds: 150` (an `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry in `platformAgent.deployment.env` wins over it); `hack/ci-deploy.sh` says how the number was chosen.
 
 ## Running evals
 
@@ -221,6 +221,8 @@ validator check lands with the first stack that needs it:
    card, a server-side dry run of the manifest on the host type (`kubectl create --dry-run=server
 -o yaml`) lists what admission adds or changes; a safeguard reads its value from there.
 6. A namespace-scoped plant calls `bench/tf/modules/namespaced-plant` and holds only its manifest.
+   A case that grades the alert its plant raises passes the module's `settle_seconds`, so the apply
+   returns once the alert had time to open.
    A cluster-scoped plant copies the module's guards: one ownership read with `--ignore-not-found`
    and a name/label jsonpath (no stderr grammar; a read error is a stop), a pre-clear that deletes
    this stack's leftover first and stops on a foreign owner, `kubectl create` rather than `apply`,
