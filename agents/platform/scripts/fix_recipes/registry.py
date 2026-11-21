@@ -51,11 +51,12 @@ The verification fields, all optional:
 
 How the broker proves a pull request is the fix: `verify` is `add-manifest`
 (the default: one new file, byte for byte what `fix.py` generates) or
-`edit-manifest`. An `edit-manifest` recipe names `edit_kind`, the Kubernetes
-kind of the one document it edits, and `edit_paths`, the dotted scalar paths
+`edit-manifest`. An `edit-manifest` recipe names `edit_api_version` and `edit_kind`, the
+apiVersion and Kubernetes kind of the one document it edits, and `edit_paths`, the dotted scalar paths
 it may change (a segment of digits is a list index), never an identity,
-label, selector (including any `...Selector`), placement, service account,
-ownership, server-bookkeeping or status field (`EDIT_FORBIDDEN_SEGMENTS`).
+label, selector (including any `...Selector`), placement, privilege, service
+account, ownership, server-bookkeeping or status field
+(`EDIT_FORBIDDEN_SEGMENTS`).
 `automerge_edit` holds a pull request to exactly those edits, refuses any
 that changes a field's YAML type (a bool is not an int), and then asks
 `fix.py`'s `allowed_edit(path, old, new)`, which must return True for each.
@@ -88,7 +89,7 @@ CHECKS_FILE = "checks.py"
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
 OPTIONAL = ("owner", "eval_case", "recheck_kinds", "recheck_siblings", "applied", "applied_resource", "applied_noun",
-            "applied_field", "applied_value", "health", "verify", "edit_kind", "edit_paths")
+            "applied_field", "applied_value", "health", "verify", "edit_api_version", "edit_kind", "edit_paths")
 #: The stock probes `fix_recipes/probes.py` runs, and the health windows the post-merge check holds.
 APPLIED_PROBES = ("object_present", "field_equals")
 HEALTH_PROBES = ("restart_flat", "none")
@@ -106,7 +107,12 @@ EDIT_FORBIDDEN_SEGMENTS = frozenset({
     "labels", "annotations", "selector", "matchLabels", "matchExpressions", "status",
     "nodeName", "serviceAccountName", "serviceAccount", "resourceVersion", "generation", "managedFields",
     "creationTimestamp", "deletionTimestamp", "selfLink",
+    # Placement and privilege.
+    "tolerations", "affinity", "topologySpreadConstraints", "priorityClassName", "schedulerName",
+    "runtimeClassName", "hostNetwork", "hostPID", "hostIPC", "hostPath", "securityContext", "privileged",
+    "automountServiceAccountToken",
 })
+_API_VERSION_RE = re.compile(r"(?:[a-z0-9]+(?:[.-][a-z0-9]+)*/)?v[0-9]+(?:(?:alpha|beta)[0-9]+)?")
 #: One `edit_paths` entry: dotted mapping keys, a segment of digits being a list index.
 EDIT_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*))*")
 _K8S_KIND_RE = re.compile(r"[A-Z][A-Za-z0-9]*")
@@ -147,6 +153,7 @@ class Recipe(NamedTuple):
     applied_value: str = ""
     health: str = "restart_flat"
     verify: str = "add-manifest"
+    edit_api_version: str = ""
     edit_kind: str = ""
     edit_paths: str = ""
 
@@ -243,9 +250,11 @@ def _check_verification(fields: dict[str, str], where: str) -> None:
     if verify not in VERIFY_VERBS:
         raise RecipeError(f"{where}: `verify` must be one of {', '.join(VERIFY_VERBS)}")
     if verify != "edit-manifest":
-        if "edit_kind" in fields or "edit_paths" in fields:
-            raise RecipeError(f"{where}: `edit_kind` and `edit_paths` mean nothing without `verify: edit-manifest`")
+        if {"edit_api_version", "edit_kind", "edit_paths"} & set(fields):
+            raise RecipeError(f"{where}: `edit_api_version`, `edit_kind` and `edit_paths` mean nothing without `verify: edit-manifest`")
         return
+    if not _API_VERSION_RE.fullmatch(fields.get("edit_api_version", "")):
+        raise RecipeError(f"{where}: `verify: edit-manifest` needs `edit_api_version`, such as `policy/v1`")
     if not _K8S_KIND_RE.fullmatch(fields.get("edit_kind", "")):
         raise RecipeError(f"{where}: `verify: edit-manifest` needs `edit_kind`, a Kubernetes kind such as `PodDisruptionBudget`")
     paths = fields.get("edit_paths", "").split()

@@ -45,7 +45,7 @@ spec:
 """
 RECIPE = registry.parse(
     "kind: raise-pdb\nname: budget raises\ntitle: Budget raises\ndial_environment: dev\n"
-    "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable spec.maxUnavailable\n"
+    "verify: edit-manifest\nedit_api_version: policy/v1\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable spec.maxUnavailable\n"
 )
 
 
@@ -195,7 +195,7 @@ class RefusedContent(unittest.TestCase):
                 self.assertRefused(head)
 
     def test_the_wrong_document_or_a_document_swap(self):
-        self.assertIn("not a PodDisruptionBudget", self.assertRefused(BASE.replace("replicas: 3", "replicas: 9").replace("kind: Deployment", "kind: Deployment")))
+        self.assertIn("not a policy/v1 PodDisruptionBudget", self.assertRefused(BASE.replace("replicas: 3", "replicas: 9").replace("kind: Deployment", "kind: Deployment")))
         first, second = BASE.split("---\n")
         self.assertRefused(second + "---\n" + first, base=BASE)
 
@@ -273,10 +273,20 @@ class PlainStringsInTheBase(unittest.TestCase):
     def test_plain_forms_yaml_reads_as_other_types_stay_unreadable(self):
         from fix_recipes import yaml_edit
 
-        for raw in ("yes", "0x10", "1_000", "2.5", "~", "2024-01-01", "1:20"):
+        # The second row: go-yaml reads these as numbers where PyYAML reads text.
+        for raw in ("yes", "0x10", "1_000", "2.5", "~", "2024-01-01", "1:20",
+                    "08", "09", "0_9", "-09", "+08", "+_1", "-_0", "007"):
             with self.subTest(raw=raw), self.assertRaises(yaml_edit.RefusedEdit):
                 yaml_edit.read_scalar(f"a: {raw}\n", 0, ["a"])
         self.assertEqual(yaml_edit.read_scalar("a: 128Mi\n", 0, ["a"]), "128Mi")
+
+
+class ApiVersion(unittest.TestCase):
+    def test_a_lookalike_kind_in_another_group_is_refused(self):
+        base = BASE.replace("apiVersion: policy/v1", "apiVersion: evil.example.com/v1")
+        with self.assertRaises(ae.EditRefused) as cm:
+            verify(base.replace("minAvailable: 1  #", "minAvailable: 2  #"), base=base)
+        self.assertIn("evil.example.com/v1 PodDisruptionBudget, not a policy/v1 PodDisruptionBudget", str(cm.exception))
 
 
 class Hardening(unittest.TestCase):
@@ -310,7 +320,7 @@ class Hardening(unittest.TestCase):
         )
         recipe = registry.parse(
             "kind: raise-pdb\nname: n\ntitle: t\ndial_environment: dev\n"
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable\n"
+            "verify: edit-manifest\nedit_api_version: policy/v1\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable\n"
         )
         self.assertTrue(ae.git_blob_id(merge_base).startswith("6296333"))
         head = merge_base.replace("minAvailable: 1", "minAvailable: 2")
@@ -356,34 +366,43 @@ class Registry(unittest.TestCase):
             "verify: patch-manifest\n",
             "edit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable\n",
             "verify: edit-manifest\nedit_paths: spec.minAvailable\n",
-            "verify: edit-manifest\nedit_kind: pdb\nedit_paths: spec.minAvailable\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: metadata.name\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: kind\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec spec.minAvailable\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec..x\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.01\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.a spec.a\n",
-            "verify: edit-manifest\nedit_kind: List\nedit_paths: items.0.kind\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.metadata.namespace\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.ownerReferences.0.uid\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.labels.app\n",
-            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.selector.matchLabels.app\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: status.replicas\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.spec.nodeSelector.pool\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.spec.nodeName\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.spec.serviceAccountName\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.resourceVersion\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.generation\n",
-            "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: metadata.managedFields.0.manager\n",
-            "verify: edit-manifest\nedit_kind: Service\nedit_paths: spec.topologySelector\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: pdb\nedit_paths: spec.minAvailable\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\nedit_paths: metadata.name\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\nedit_paths: kind\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\nedit_paths: spec spec.minAvailable\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\nedit_paths: spec..x\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\nedit_paths: spec.01\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\nedit_paths: spec.a spec.a\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: List\nedit_paths: items.0.kind\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: spec.template.metadata.namespace\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: metadata.ownerReferences.0.uid\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: metadata.labels.app\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: PodDisruptionBudget\nedit_paths: spec.selector.matchLabels.app\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: status.replicas\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: spec.template.spec.nodeSelector.pool\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: spec.template.spec.nodeName\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: spec.template.spec.serviceAccountName\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: metadata.resourceVersion\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: metadata.generation\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: metadata.managedFields.0.manager\n",
+            "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Service\nedit_paths: spec.topologySelector\n",
+            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable\n",
+            "verify: edit-manifest\nedit_api_version: policy\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable\n",
+            "edit_api_version: policy/v1\n",
+        ) + tuple(
+            f"verify: edit-manifest\nedit_api_version: apps/v1\nedit_kind: Deployment\nedit_paths: spec.template.spec.{path}\n"
+            for path in ("tolerations.0.key", "affinity.nodeAffinity.x", "priorityClassName", "schedulerName",
+                         "runtimeClassName", "topologySpreadConstraints.0.topologyKey", "hostNetwork",
+                         "containers.0.securityContext.privileged", "automountServiceAccountToken")
+        ) + (
         ):
             with self.subTest(extra=extra), self.assertRaises(registry.RecipeError):
                 registry.parse(self.HEAD + extra)
 
     def test_paths_with_indexes(self):
         recipe = registry.parse(
-            self.HEAD + "verify: edit-manifest\nedit_kind: Deployment\nedit_paths: spec.template.spec.containers.0.image\n"
+            self.HEAD + "verify: edit-manifest\nedit_api_version: v1\nedit_kind: Deployment\nedit_paths: spec.template.spec.containers.0.image\n"
         )
         self.assertEqual(recipe.edit_path_list(), (("spec", "template", "spec", "containers", 0, "image"),))
 

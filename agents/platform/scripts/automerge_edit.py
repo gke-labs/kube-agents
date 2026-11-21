@@ -17,7 +17,8 @@ writes at the recipe's `edit_paths` on that base, and nothing else:
   moved since the diff was taken (where a hunk applied by line number could
   land on another object) is refused by content, not by an abbreviated id;
 - both files are at most `MAX_FILE_BYTES`, and every changed line lies in one
-  document, whose `kind` is the recipe's `edit_kind`;
+  document, whose `apiVersion` and `kind` are the recipe's `edit_api_version`
+  and `edit_kind`;
 - the new values are read from the head only in the forms `set_scalar` writes
   (`yaml_edit.read_scalar`), `set_scalar` is re-run on the base with them, and
   the result must equal the head. So a comment, whitespace, key order, another
@@ -222,8 +223,11 @@ def _verify(recipe: Recipe, fix_module: Any, path: str, cluster: str, base: str,
         raise EditRefused("the changed lines do not lie in exactly one document")
     doc = docs.pop()
     object_kind = yaml_edit.read_scalar(base, doc, ["kind"])
-    if object_kind != recipe.edit_kind:
-        raise EditRefused(f"the edited document is a {object_kind}, not a {recipe.edit_kind}")
+    api_version = yaml_edit.read_scalar(base, doc, ["apiVersion"])
+    if (api_version, object_kind) != (recipe.edit_api_version, recipe.edit_kind):
+        raise EditRefused(
+            f"the edited document is a {api_version} {object_kind}, not a {recipe.edit_api_version} {recipe.edit_kind}"
+        )
     changes = []
     for field in recipe.edit_path_list():
         try:
