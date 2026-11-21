@@ -241,15 +241,9 @@ Both the chart and the kustomize base still load a pre-call hook that drops repl
 
 Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs.
 
-`litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`. Before LiteLLM calls the provider, the hook rewrites every request shape the gateway serves:
+`litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`. Before LiteLLM calls the provider, the hook rewrites every top-level field of the request that is not a generation setting or the gateway's own bookkeeping: the conversation in any shape the gateway serves (chat and Anthropic `messages`, Gemini `contents` under `/v1beta/models/...`), the system text, tool definitions, embeddings `input`, a completion `prompt`, and any newer field. Each field is walked whole, so a value is redacted wherever it sits, including a tool's input, what a tool returned and an assistant message's other fields; a tool call's arguments are parsed, so a key name such as `password` counts as it does in a mapping, and JSON held in a string stays valid JSON.
 
-- chat completions: `messages[].content` and each assistant message's `tool_calls[].function.arguments`, parsed, so a key name such as `password` counts as it does in a mapping;
-- Anthropic messages: the same `messages`, where content blocks include a tool's input, what a tool returned and the model's thinking, plus the top-level `system` text;
-- Gemini (`/v1beta/models/...`): every part of `contents`, including function calls and function responses, and `systemInstruction`;
-- embeddings `input` and completion `prompt`;
-- any other top-level field that is not a generation setting or the gateway's own bookkeeping, such as tool definitions, by the text rules.
-
-Only a part's binary payload (base64 image or document data, an inline `data:` URL, Gemini inline data) and the provider's opaque blocks (redacted thinking, a thought signature) are left as they are. A request the hook cannot walk is refused: one that carries none of these shapes, a `messages` or `contents` that is not a list, or Gemini inline data of a text type.
+Left as they came: a thinking block's text and signature, which the provider checks against each other and which the model wrote from input the hook had already redacted; opaque blocks (redacted thinking, a thought signature, encrypted content); and binary payloads (base64 image or document data, Gemini inline data, input audio, a `data:` URL). A request the hook cannot walk is refused: one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or a payload whose media type is text. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 
 The rendered default config does not change while the value is off.
 

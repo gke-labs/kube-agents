@@ -344,7 +344,7 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(block["text"], "project [REDACTED_PROJECT]")
         self.assertEqual(block["cache_control"], {"type": "ephemeral"})
 
-    def test_anthropic_tool_results_tool_inputs_and_thinking_are_redacted(self) -> None:
+    def test_anthropic_tool_results_and_tool_inputs_are_redacted_and_thinking_kept(self) -> None:
         image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
         opaque = {"type": "redacted_thinking", "data": "opaque-blob"}
         data = {
@@ -377,7 +377,10 @@ class TestCallback(unittest.TestCase):
         }
         result = self._run(data, "anthropic_messages")
         thinking, kept, tool_use = result["messages"][0]["content"]
-        self.assertRegex(thinking["thinking"], r"^the node is \[ip:[0-9a-f]{12}\]$")
+        # Signed thinking is left as the provider issued it: the provider
+        # checks the text against the signature, and the model wrote it from
+        # input the hook had already redacted.
+        self.assertEqual(thinking["thinking"], "the node is 10.0.0.9")
         self.assertEqual(thinking["signature"], "sig")
         self.assertEqual(kept, opaque)
         self.assertNotIn(_OAUTH_TOKEN, json.dumps(tool_use["input"]))
@@ -512,7 +515,8 @@ class TestCallback(unittest.TestCase):
             {"model": "m"},
             {"model": "m", "messages": {"role": "user", "content": "prod-eu-1"}},
             {"model": "m", "contents": "on prod-eu-1"},
-            {"model": "m", "contents": [{"role": "user", "parts": "on prod-eu-1"}]},
+            {"model": "m", "messages": ["prod-eu-1"]},
+            {"model": "m", "contents": ["on prod-eu-1"]},
         ):
             with self.assertRaises(self.module.UnwalkableRequestError) as raised:
                 self._run(dict(data), "arerank")
@@ -524,13 +528,60 @@ class TestCallback(unittest.TestCase):
 
     def test_every_shape_the_gateway_serves_is_walked_not_refused(self) -> None:
         for call_type, data in (
-            ("acompletion", {"messages": [{"role": "user", "content": "hi"}]}),
-            ("anthropic_messages", {"system": "s", "messages": [{"role": "user", "content": "hi"}]}),
-            ("agenerate_content", {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}),
-            ("aembedding", {"input": "hi"}),
-            ("atext_completion", {"prompt": "hi"}),
+            ("acompletion", {"messages": [{"role": "user", "content": "on prod-eu-1"}]}),
+            ("anthropic_messages", {"system": "on prod-eu-1", "messages": [{"role": "user", "content": "hi"}]}),
+            ("agenerate_content", {"contents": [{"role": "user", "parts": [{"text": "on prod-eu-1"}]}]}),
+            ("aembedding", {"input": "on prod-eu-1"}),
+            ("atext_completion", {"prompt": "on prod-eu-1"}),
         ):
-            self.assertIsNotNone(self._run(data, call_type), call_type)
+            result = self._run(data, call_type)
+            self.assertNotIn("prod-eu-1", json.dumps(result), call_type)
+
+    def test_every_field_of_a_message_is_walked_not_just_its_content(self) -> None:
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "the pod is 10.0.0.5",
+                    "function_call": {"name": "f", "arguments": json.dumps({"password": "hunter2-example-pw"})},
+                    "refusal": "not on prod-eu-1",
+                    "tool_calls": [{"type": "custom", "custom": {"name": "c", "input": "project my-proj-8"}}],
+                    "thinking_blocks": [{"type": "thinking", "thinking": "signed", "signature": "sig"}],
+                }
+            ]
+        }
+        message = self._run(data)["messages"][0]
+        sent = json.dumps(message)
+        for value in ("10.0.0.5", "hunter2-example-pw", "prod-eu-1", "my-proj-8"):
+            self.assertNotIn(value, sent)
+        self.assertEqual(message["thinking_blocks"], [{"type": "thinking", "thinking": "signed", "signature": "sig"}])
+
+    def test_a_binary_payload_is_kept_wherever_it_sits_and_a_text_one_is_refused(self) -> None:
+        payload = "prod-eu-1AAAA"  # a text rule would rewrite it if it were walked
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": payload}}]},
+                        {"type": "input_audio", "input_audio": {"format": "wav", "data": payload}},
+                        {"type": "file", "file": {"filename": "r.pdf", "file_data": "data:application/pdf;base64," + payload}},
+                    ],
+                }
+            ]
+        }
+        result, audio, filed = self._run(data)["messages"][0]["content"]
+        self.assertEqual(result["content"][0]["source"]["data"], payload)
+        self.assertEqual(audio["input_audio"]["data"], payload)
+        self.assertEqual(filed["file"]["file_data"], "data:application/pdf;base64," + payload)
+        for part in (
+            {"type": "image_url", "image_url": {"url": "data:text/plain;base64,b24gcHJvZC1ldS0x"}},
+            {"type": "file", "file": {"file_data": "data:application/json;base64,e30="}},
+            {"type": "image", "source": {"type": "base64", "media_type": "text/plain", "data": "b24="}},
+        ):
+            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+                self._run({"messages": [{"role": "user", "content": [part]}]})
 
     def test_a_bad_rule_file_fails_the_import_rather_than_the_request(self) -> None:
         for config in (

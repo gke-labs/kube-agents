@@ -8,28 +8,25 @@ config's directory, so the three files have to share one; `proxy_handler_instanc
 is the attribute it reads.
 
 What runs: `AuditRedactor`'s credential patterns, then the operator's rules
-from the file `KUBE_AGENTS_REDACTION_CONFIG` names, over every request shape
-the gateway serves:
+from the file `KUBE_AGENTS_REDACTION_CONFIG` names, over every top-level
+field of the request that is not a control: the conversation under any
+shape the gateway serves (chat and Anthropic `messages`, Gemini `contents`),
+the system text under any spelling, tool definitions, embeddings `input`, a
+completion `prompt`, and any field newer than this file. Each field is
+walked whole with the key-aware walk the audit hooks use, so a value is
+redacted wherever it sits -- a tool's input, what a tool returned, a
+per-message field -- and JSON held in a string stays valid JSON.
 
-- chat completions: `messages[].content`, as a string or as content parts,
-  and each assistant message's `tool_calls[].function.arguments` (parsed and
-  walked with its key names);
-- Anthropic messages: the same `messages`, where content blocks include a
-  tool's input (`tool_use.input`), what a tool returned (`tool_result`) and
-  the model's thinking, plus the top-level `system` text;
-- Gemini (`/v1beta/models/...`): `contents[].parts[]` (text, a function
-  call's `args`, a function response's `response`) and `systemInstruction`;
-- the `input` of an embeddings request and the `prompt` of a text completion.
-
-Only a part's binary payload (base64 image or document data, an inline
-`data:` URL, Gemini inline data) and opaque blocks (redacted thinking, a
-thought signature) are left as they are; the rest of every part is walked
-whole. Every top-level key that is not a known control (tool definitions,
-`instructions`, anything newer) is walked for text too. A request that
-carries none of these shapes, a `messages` or `contents` that is not a list,
-or Gemini inline data of a text type is refused: the hook cannot say what in
-it is text, so it does not forward it. Responses are not touched; the
-limitation is documented on the site's inference-gateway page.
+Left exactly as they came: a thinking block's text and signature (the
+provider checks the text against the signature, and the model wrote it from
+input this hook had already redacted); opaque blocks (redacted thinking, a
+thought signature, encrypted content); and binary payloads (base64 image or
+document data, Gemini inline data, input audio, a `data:` URL). Generation
+settings and the gateway's own bookkeeping are not walked. A request the hook
+cannot walk is refused: one that carries no conversation, input or prompt, a
+`messages` or `contents` that is not a list of objects, or a payload whose
+media type is text. Responses are not touched; the limitation is documented
+on the site's inference-gateway page.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
 which stops the gateway pod at startup rather than letting it forward
@@ -44,10 +41,11 @@ never the payload.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
-import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -69,56 +67,19 @@ REDACTOR_MODULE_NAME = "kube_agents_litellm_redactor"
 # pod log. The line is the one operator-visible signal that a rule fired.
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
-# Request fields the redactor walks. `messages` is the chat shape the agents
-# send; `input` is embeddings; `prompt` is the legacy text-completion shape.
+# A request has to carry at least one of these for the hook to know it is a
+# model call it can read. One that carries none is refused rather than
+# forwarded. `messages` is the chat and Anthropic shape, `contents` Gemini's,
+# `input` embeddings and `prompt` the legacy text completion.
 MESSAGES_KEY = "messages"
-CONTENT_KEY = "content"
-TEXT_PART_TYPE = "text"
-TEXT_KEY = "text"
-PART_TYPE_KEY = "type"
-SCALAR_INPUT_KEYS = ("input", "prompt")
-# An assistant message's tool calls. `arguments` is a JSON document held in a
-# string, and the model builds it from what it read, so a value it copied out
-# of a tool result goes back up here on every later turn.
-TOOL_CALLS_KEY = "tool_calls"
-FUNCTION_KEY = "function"
-ARGUMENTS_KEY = "arguments"
-# Anthropic messages: the top-level system text, and the thinking block,
-# whose signature the provider checks and the walk must not touch.
-SYSTEM_KEY = "system"
-THINKING_TYPE = "thinking"
-THINKING_KEY = "thinking"
-# Gemini: the conversation, its parts, and the system instruction under
-# either spelling the API takes. Within a part, binary data and the
-# thought signature are left alone; everything else is walked.
 CONTENTS_KEY = "contents"
-PARTS_KEY = "parts"
-GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
-# Opaque blocks the provider checks, left as they are.
-OPAQUE_PART_TYPES = frozenset({"redacted_thinking"})
-# Base64 payloads inside a part: no text rule applies to them, and a
-# substitution would corrupt them. Only the payload is skipped; the rest of
-# the part (a title, a context, a URL, a text source) is walked.
-SOURCE_KEY = "source"
-SOURCE_TYPE_KEY = "type"
-BASE64_SOURCE_TYPE = "base64"
-DATA_KEY = "data"
-IMAGE_URL_KEY = "image_url"
-URL_KEY = "url"
-DATA_URL_PREFIX = "data:"
-# Gemini binary parts, and the thought signature the provider checks.
-GEMINI_INLINE_KEYS = ("inlineData", "inline_data")
-GEMINI_MIME_KEYS = ("mimeType", "mime_type")
-GEMINI_OPAQUE_PART_KEYS = frozenset({"thoughtSignature", "thought_signature"})
-# Inline data whose MIME type is text is refused: it would carry text the
-# walk cannot reach without decoding it, and refusing is the safe answer.
-TEXT_MIME_PREFIXES = ("text/", "application/json", "application/xml", "application/yaml", "application/x-yaml")
-# Top-level request keys that are controls, never text: generation settings,
-# routing, and LiteLLM's own bookkeeping (its metadata carries the caller's
-# key hash, which the gateway reads after this hook, so it must not be
-# touched). Every other top-level key -- tool definitions, `instructions`,
-# a legacy `function_call`, a field newer than this file -- is walked for
-# text, so text the hook was not told about is still redacted.
+WALKED_REQUEST_KEYS = (MESSAGES_KEY, CONTENTS_KEY, "input", "prompt")
+# Top-level request keys that are controls, never text sent as content:
+# generation settings, routing, and the gateway's own bookkeeping (its
+# metadata carries the caller's key hash, read after this hook, and must not
+# be touched). Every other top-level key is walked whole -- the conversation,
+# the system text under any spelling, tool definitions, `instructions`,
+# a field newer than this file.
 CONTROL_KEYS = frozenset(
     {
         "model", "stream", "stream_options", "temperature", "top_p", "top_k", "n", "seed",
@@ -131,17 +92,41 @@ CONTROL_KEYS = frozenset(
         "metadata", "litellm_metadata", "proxy_server_request", "secret_fields",
         "mock_response", "timeout", "num_retries", "api_base", "api_version", "drop_params",
         "api_key", "organization", "headers", "extra_headers", "custom_llm_provider",
-        "fallbacks", "tags", "guardrails",
+        "fallbacks", "tags", "guardrails", "mcp_servers",
     }
 )
-CONTROL_KEY_PREFIXES = ("litellm_", "_")
-# A request has to carry at least one of these for the hook to know where its
-# text is. One that carries none is refused rather than forwarded.
-WALKED_REQUEST_KEYS = (MESSAGES_KEY, CONTENTS_KEY) + SCALAR_INPUT_KEYS
+CONTROL_KEY_PREFIXES = ("litellm_", "langfuse_", "_")
+# Fields left exactly as they came, because the provider checks them or
+# because they are binary:
+# - a thinking block's text and signature: the provider verifies the text
+#   against the signature, and the model wrote that text from input this hook
+#   had already redacted;
+# - redacted thinking, Gemini's thought signature and encrypted blobs: opaque;
+# - base64 payloads (an image or document source, Gemini inline data, input
+#   audio) and `data:` URLs: no text rule applies, and a substitution would
+#   corrupt them. A payload whose media type is text is refused instead,
+#   since it carries text the walk cannot reach without decoding it.
+TYPE_KEY = "type"
+THINKING_TYPE = "thinking"
+THINKING_KEPT_KEYS = frozenset({"thinking", "signature"})
+REDACTED_THINKING_TYPE = "redacted_thinking"
+OPAQUE_KEYS = frozenset({"thoughtSignature", "thought_signature", "encrypted_content", "encrypted_index"})
+DATA_KEY = "data"
+BASE64_SOURCE_TYPE = "base64"
+# An Anthropic document whose source is plain text: its data is text, walked.
+TEXT_SOURCE_TYPE = "text"
+MEDIA_TYPE_KEYS = ("media_type", "mimeType", "mime_type")
+INPUT_AUDIO_KEY = "input_audio"
+DATA_URL_PATTERN = re.compile(r"^data:([^;,]*)(?:;[^,]*)?;base64,", re.IGNORECASE)
+TEXT_MEDIA_PREFIXES = ("text/", "application/json", "application/xml", "application/yaml", "application/x-yaml", "application/javascript")
 
 
 class UnwalkableRequestError(ValueError):
     """A request in a shape the redaction hook does not know how to walk."""
+
+
+def _is_text_media(media_type: Any) -> bool:
+    return isinstance(media_type, str) and media_type.strip().lower().startswith(TEXT_MEDIA_PREFIXES)
 
 
 def _load_redactor():
@@ -203,198 +188,112 @@ class KubeAgentsRedactionCallback(CustomLogger):
     def rules(self) -> List[RedactionRule]:
         return list(self._rules)
 
-    def _redact_text(self, text: str, counts: Dict[str, int]) -> str:
-        redacted, made = AuditRedactor.redact_text_counted(text, self._rules)
-        for name, count in made.items():
-            counts[name] = counts.get(name, 0) + count
-        return redacted
-
-    def _redact_value(self, value: Any, counts: Dict[str, int]) -> Any:
-        """Strings in place; lists element-wise; content parts by what they carry."""
+    def _keep(self, value: Any, path: tuple, kept: List[tuple], where: str) -> None:
+        """Record a field to leave as it is; refuse a text payload."""
         if isinstance(value, str):
-            return self._redact_text(value, counts)
-        if isinstance(value, list):
-            return [self._redact_value(item, counts) for item in value]
-        if isinstance(value, dict):
-            return self._redact_part(value, counts)
-        return value
+            match = DATA_URL_PATTERN.match(value)
+            if match and _is_text_media(match.group(1)):
+                raise UnwalkableRequestError(
+                    f"the gateway redaction hook refuses a request it cannot walk: a {match.group(1)} data URL at {where}"
+                )
+        kept.append((path, value))
 
-    def _redact_part(self, part: Dict[str, Any], counts: Dict[str, int]) -> Dict[str, Any]:
-        """One content part or block, in place.
-
-        Binary and opaque parts are left alone. A thinking block has its text
-        redacted and its signature left as the provider issued it. Every other
-        part -- text, a tool's input, what a tool returned, a part type this
-        file has never seen -- is walked whole, with the key-aware walk the
-        audit hooks use, so a value is redacted wherever in the part it sits
-        and JSON held in a string stays valid JSON.
-        """
-        kind = part.get(PART_TYPE_KEY)
-        if kind in OPAQUE_PART_TYPES:
-            return part
-        source = part.get(SOURCE_KEY)
-        if isinstance(source, dict) and source.get(SOURCE_TYPE_KEY) == BASE64_SOURCE_TYPE and DATA_KEY in source:
-            # An image or document sent as base64: walk all but the payload.
-            payload = source.pop(DATA_KEY)
-            try:
-                redacted = self._redact_structure(part, counts)
-            finally:
-                source[DATA_KEY] = payload
-            # The walk returns a copy: the payload goes back on it as well.
-            redacted[SOURCE_KEY][DATA_KEY] = payload
-            return redacted
-        image_url = part.get(IMAGE_URL_KEY)
-        url = image_url.get(URL_KEY) if isinstance(image_url, dict) else image_url
-        if isinstance(url, str) and url.startswith(DATA_URL_PREFIX):
-            # An image inlined as a data: URL is a payload, not text.
-            return part
-        if kind == THINKING_TYPE:
-            if isinstance(part.get(THINKING_KEY), str):
-                part[THINKING_KEY] = self._redact_text(part[THINKING_KEY], counts)
-            return part
-        return self._redact_structure(part, counts)
-
-    def _redact_gemini_parts(self, parts: Any, counts: Dict[str, int]) -> Any:
-        """Gemini parts, in place: binary and opaque fields left alone, every
-        other field (text, a function call, a function response, anything
-        newer) walked whole."""
-        if not isinstance(parts, list):
-            raise UnwalkableRequestError(
-                f"the gateway redaction hook refuses a request it cannot walk: Gemini parts as {type(parts).__name__}"
-            )
-        for i, part in enumerate(parts):
-            if not isinstance(part, dict):
-                parts[i] = self._redact_value(part, counts)
-                continue
-            for key in list(part):
-                if key in GEMINI_OPAQUE_PART_KEYS:
-                    continue
-                if key in GEMINI_INLINE_KEYS and isinstance(part[key], dict):
-                    inline = part[key]
-                    mime = next((inline[k] for k in GEMINI_MIME_KEYS if isinstance(inline.get(k), str)), "")
-                    if mime.lower().startswith(TEXT_MIME_PREFIXES):
-                        raise UnwalkableRequestError(
-                            f"the gateway redaction hook refuses a request it cannot walk: inline data of type {mime}"
-                        )
-                    # A binary payload: walk all but the data.
-                    payload = inline.pop(DATA_KEY, None)
-                    try:
-                        part[key] = self._redact_structure(inline, counts)
-                    finally:
-                        if payload is not None:
-                            part[key][DATA_KEY] = payload
-                    continue
-                part[key] = self._redact_structure(part[key], counts)
-        return parts
-
-    def _redact_gemini_content(self, content: Any, counts: Dict[str, int]) -> Any:
-        """A Gemini content (`{role, parts}`), or a bare string or parts list."""
-        if isinstance(content, str):
-            return self._redact_text(content, counts)
-        if isinstance(content, list):
-            return self._redact_gemini_parts(content, counts)
-        if isinstance(content, dict) and PARTS_KEY in content:
-            content[PARTS_KEY] = self._redact_gemini_parts(content[PARTS_KEY], counts)
-            return content
-        return self._redact_structure(content, counts)
-
-    def _redact_strings(self, value: Any, counts: Dict[str, int]) -> Any:
-        """Every string in value, by the text rules only: no key-name
-        replacement, so a schema's `password` property stays a schema."""
-        if isinstance(value, str):
-            return self._redact_text(value, counts)
-        if isinstance(value, list):
-            return [self._redact_strings(item, counts) for item in value]
-        if isinstance(value, dict):
-            for key in list(value):
-                value[key] = self._redact_strings(value[key], counts)
-            return value
-        return value
-
-    def _redact_structure(self, value: Any, counts: Dict[str, int]) -> Any:
-        """A parsed document, with the key-aware walk the audit hooks use."""
-        redacted, made = AuditRedactor.redact_counted(value, self._rules)
-        for name, count in made.items():
-            counts[name] = counts.get(name, 0) + count
-        return redacted
-
-    def _redact_arguments(self, arguments: Any, counts: Dict[str, int]) -> Any:
-        """Redact a tool call's arguments, re-serialising only when something changed.
-
-        The parsed document is walked rather than the raw string: key names
-        count (`{"password": …}`, an env `name`/`value` pair, a Secret's
-        `data`), the result is still valid JSON -- a provider rejects
-        tool-call arguments that do not parse -- and the line-based patterns
-        see real newlines rather than `\\n` escapes. Arguments that are not
-        JSON are redacted as text; arguments already sent as an object are
-        walked as they are.
-        """
-        if not isinstance(arguments, str):
-            return self._redact_structure(arguments, counts)
-        try:
-            parsed = json.loads(arguments)
-        except ValueError:
-            return self._redact_text(arguments, counts)
-        redacted = self._redact_structure(parsed, counts)
-        # Compared, not counted: a substitution that swaps one marker for
-        # another nets zero on the counts but still changed the payload.
-        if redacted == parsed:
-            return arguments
-        return json.dumps(redacted, ensure_ascii=False)
-
-    def _redact_tool_calls(self, tool_calls: Any, counts: Dict[str, int]) -> None:
-        if not isinstance(tool_calls, list):
+    def _carve(self, node: Any, path: tuple, kept: List[tuple]) -> None:
+        """Find the fields to leave as they are, anywhere in node."""
+        if isinstance(node, list):
+            for i, item in enumerate(node):
+                if isinstance(item, str) and DATA_URL_PATTERN.match(item):
+                    self._keep(item, path + (i,), kept, "a list item")
+                else:
+                    self._carve(item, path + (i,), kept)
             return
-        for call in tool_calls:
-            function = call.get(FUNCTION_KEY) if isinstance(call, dict) else None
-            if isinstance(function, dict) and function.get(ARGUMENTS_KEY) is not None:
-                function[ARGUMENTS_KEY] = self._redact_arguments(function[ARGUMENTS_KEY], counts)
+        if not isinstance(node, dict):
+            return
+        kind = node.get(TYPE_KEY)
+        media = next((node[k] for k in MEDIA_TYPE_KEYS if k in node), None)
+        for key, value in node.items():
+            here = path + (key,)
+            if (kind == THINKING_TYPE and key in THINKING_KEPT_KEYS) or kind == REDACTED_THINKING_TYPE or key in OPAQUE_KEYS:
+                kept.append((here, value))
+            elif key == DATA_KEY and kind != TEXT_SOURCE_TYPE and (
+                kind == BASE64_SOURCE_TYPE or media is not None or (path and path[-1] == INPUT_AUDIO_KEY)
+            ):
+                if _is_text_media(media):
+                    raise UnwalkableRequestError(
+                        f"the gateway redaction hook refuses a request it cannot walk: an inline {media} payload"
+                    )
+                kept.append((here, value))
+            elif isinstance(value, str) and DATA_URL_PATTERN.match(value):
+                self._keep(value, here, kept, key)
+            else:
+                self._carve(value, here, kept)
+
+    @staticmethod
+    def _put(root: Any, path: tuple, value: Any) -> None:
+        """Set value at path in root; a path the walk reshaped is left as the walk left it."""
+        node = root
+        for step in path[:-1]:
+            try:
+                node = node[step]
+            except (KeyError, IndexError, TypeError):
+                return
+        try:
+            node[path[-1]] = value
+        except (KeyError, IndexError, TypeError):
+            return
+
+    def _redact_field(self, value: Any, counts: Dict[str, int]) -> Any:
+        """One top-level field: every string redacted, key names counted, the
+        kept fields put back as they came. The original is left unchanged
+        (the walk returns a copy)."""
+        kept: List[tuple] = []
+        self._carve(value, (), kept)
+        if isinstance(value, (dict, list)):
+            placeholder = copy.deepcopy(value)
+            for path, _ in kept:
+                self._put(placeholder, path, None)
+        else:
+            placeholder = value
+        redacted, made = AuditRedactor.redact_counted(placeholder, self._rules)
+        for name, count in made.items():
+            counts[name] = counts.get(name, 0) + count
+        for path, original in kept:
+            self._put(redacted, path, original)
+        return redacted
+
+    @staticmethod
+    def _check_shape(data: Dict[str, Any]) -> None:
+        refuse = "the gateway redaction hook refuses a request it cannot walk: "
+        if not any(key in data for key in WALKED_REQUEST_KEYS):
+            raise UnwalkableRequestError(
+                refuse + f"it carries none of {', '.join(WALKED_REQUEST_KEYS)} "
+                f"(keys: {', '.join(sorted(str(k) for k in data))})"
+            )
+        for key in (MESSAGES_KEY, CONTENTS_KEY):
+            if key not in data:
+                continue
+            if not isinstance(data[key], list):
+                raise UnwalkableRequestError(refuse + f"{key} as {type(data[key]).__name__}")
+            for item in data[key]:
+                if not isinstance(item, dict):
+                    raise UnwalkableRequestError(refuse + f"an item of {key} as {type(item).__name__}")
 
     def redact_request(self, data: Dict[str, Any]) -> Dict[str, int]:
         """Redact `data` in place and return the substitution counts by rule name.
 
-        Raises UnwalkableRequestError for a request that carries none of the
-        shapes above, naming its top-level keys and never its values.
+        Every top-level field that is not a control is walked whole, so a
+        field this file has never heard of is still redacted. Raises
+        UnwalkableRequestError for a request it cannot walk, naming its keys
+        and never their values.
         """
-        if not any(key in data for key in WALKED_REQUEST_KEYS):
-            raise UnwalkableRequestError(
-                "the gateway redaction hook refuses a request it cannot walk: it carries none of "
-                f"{', '.join(WALKED_REQUEST_KEYS)} (keys: {', '.join(sorted(str(k) for k in data))})"
-            )
-        for key in (MESSAGES_KEY, CONTENTS_KEY):
-            if key in data and not isinstance(data[key], list):
-                raise UnwalkableRequestError(
-                    f"the gateway redaction hook refuses a request it cannot walk: {key} as {type(data[key]).__name__}"
-                )
+        self._check_shape(data)
         counts: Dict[str, int] = {}
-        if SYSTEM_KEY in data:
-            data[SYSTEM_KEY] = self._redact_value(data[SYSTEM_KEY], counts)
-        for key in GEMINI_SYSTEM_KEYS:
-            if key in data:
-                data[key] = self._redact_gemini_content(data[key], counts)
-        contents = data.get(CONTENTS_KEY)
-        if isinstance(contents, list):
-            for i, content in enumerate(contents):
-                contents[i] = self._redact_gemini_content(content, counts)
-        elif contents is not None:
-            data[CONTENTS_KEY] = self._redact_gemini_content(contents, counts)
-        messages = data.get(MESSAGES_KEY)
-        if isinstance(messages, list):
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                if CONTENT_KEY in message:
-                    message[CONTENT_KEY] = self._redact_value(message[CONTENT_KEY], counts)
-                self._redact_tool_calls(message.get(TOOL_CALLS_KEY), counts)
-        for key in SCALAR_INPUT_KEYS:
-            if key in data:
-                data[key] = self._redact_value(data[key], counts)
-        handled = {MESSAGES_KEY, CONTENTS_KEY, SYSTEM_KEY, *GEMINI_SYSTEM_KEYS, *SCALAR_INPUT_KEYS}
         for key in list(data):
-            if key in handled or key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
+            if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
                 continue
-            data[key] = self._redact_strings(data[key], counts)
+            data[key] = self._redact_field(data[key], counts)
         return counts
+
 
     async def async_pre_call_hook(
         self,
