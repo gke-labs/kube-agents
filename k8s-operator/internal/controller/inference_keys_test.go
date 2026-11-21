@@ -1605,3 +1605,40 @@ func TestAnUnusedTierCostsNoRead(t *testing.T) {
 		t.Errorf("%d reads of an unused tier's Secret on a steady pass", n)
 	}
 }
+
+// Step 12a's record write moves the stored version on the render copy only.
+// When the pass then fails before the instance takes that version, the
+// condition is still written, against the PlatformAgent read past the
+// cache, with no conflict returned, the record kept, and the instance's
+// version left as it was.
+func TestTheConditionIsWrittenAfterTheRecordMovedTheVersion(t *testing.T) {
+	r, cl, _ := inferenceKeysFixture(t)
+	ctx := context.Background()
+	instance := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "test-agent"}, instance); err != nil {
+		t.Fatal(err)
+	}
+	staleVersion := instance.ResourceVersion
+	render := instance.DeepCopy()
+	out := r.reconcileInferenceKeys(ctx, render)
+	if render.ResourceVersion == staleVersion {
+		t.Fatal("the record write didn't move the version; the test sets up nothing")
+	}
+	if err := r.syncInferenceKeysServed(ctx, instance, out.condition); err != nil {
+		t.Fatalf("the condition write returned %v", err)
+	}
+	if instance.ResourceVersion != staleVersion {
+		t.Error("the instance's version was moved")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(instance), stored); err != nil {
+		t.Fatal(err)
+	}
+	c := meta.FindStatusCondition(stored.Status.Conditions, inferenceKeysServedCondition)
+	if c == nil || c.Reason != out.condition.Reason {
+		t.Errorf("stored condition %+v, want %s", c, out.condition.Reason)
+	}
+	if len(recordedSecretUIDs(stored)) == 0 {
+		t.Error("the record was lost")
+	}
+}

@@ -43,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -1198,21 +1199,44 @@ func inferenceKeysFingerprint(doc []byte, pods []*corev1.Pod) string {
 // syncInferenceKeysServed writes the InferenceKeysServed condition on the
 // way out of Reconcile, as syncDispatcherCeiling does: nil leaves it as it
 // was, inferenceKeysRemoved takes it away, anything else is its new value.
+//
+// Step 12a's record write moves the stored PlatformAgent's version on the
+// render copy, and agent (the pass's instance) takes that version only when
+// the A2A step succeeds. A pass that fails between them would see its own
+// write as a conflict here. On a conflict the change alone is applied to the
+// PlatformAgent as read past the cache, with a bounded retry; agent's
+// version is left as it is, so the writers after this one behave as before.
 func (r *PlatformAgentReconciler) syncInferenceKeysServed(ctx context.Context, agent *agentv1alpha1.PlatformAgent, verdict *metav1.Condition) error {
-	switch verdict {
-	case nil:
+	if verdict == nil {
 		return nil
-	case inferenceKeysRemoved:
-		if meta.RemoveStatusCondition(&agent.Status.Conditions, inferenceKeysServedCondition) {
-			return r.Status().Update(ctx, agent)
+	}
+	var condition metav1.Condition
+	if verdict != inferenceKeysRemoved {
+		condition = *verdict
+		condition.ObservedGeneration = agent.Generation
+		condition.LastTransitionTime = metav1.Now()
+	}
+	apply := func(a *agentv1alpha1.PlatformAgent) bool {
+		if verdict == inferenceKeysRemoved {
+			return meta.RemoveStatusCondition(&a.Status.Conditions, inferenceKeysServedCondition)
 		}
+		return meta.SetStatusCondition(&a.Status.Conditions, condition)
+	}
+	if !apply(agent) {
 		return nil
 	}
-	condition := *verdict
-	condition.ObservedGeneration = agent.Generation
-	condition.LastTransitionTime = metav1.Now()
-	if !meta.SetStatusCondition(&agent.Status.Conditions, condition) {
-		return nil
+	err := r.Status().Update(ctx, agent)
+	if !apierrors.IsConflict(err) {
+		return err
 	}
-	return r.Status().Update(ctx, agent)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		live := &agentv1alpha1.PlatformAgent{}
+		if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+			return err
+		}
+		if !apply(live) {
+			return nil
+		}
+		return r.Status().Update(ctx, live)
+	})
 }
