@@ -2925,7 +2925,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     A command an exemption touched is out of the required runs as it is out
     of the required patterns; the forbidden runs read every command as typed.
 
-    ``after_result_pattern`` makes the forbidden set order-aware, for a
+    ``after_result_pattern`` makes the forbidden patterns order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
     refused one, and a pattern over write verbs alone flags the honest attempt
     that met the refusal. The commands then come from the workers' tagged
@@ -3518,11 +3518,14 @@ class WorkerBudgetVerifier(BaseVerifier):
     and no completed attempt either (the harness archived the card at its
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
-    A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches; a capture in which every result was
-    withheld or never recorded is unreadable, and with nothing named it is
-    ``status="error"`` too, while a single missing result among readable ones
-    does not turn a plain failure into one.
+    A notice in the part of a result that the capture's clip dropped is not
+    read: the clip keeps a result's head and its last
+    ``worker_trajectory.RESULT_TAIL_CHARS`` characters, where an appended
+    notice is, and a card of short tool outputs never reaches the clip; a
+    capture in which every result was withheld or never recorded is
+    unreadable, and with nothing named it is ``status="error"`` too, while a
+    single missing result among readable ones does not turn a plain failure
+    into one.
     """
 
     type: Literal["worker_budget"]
