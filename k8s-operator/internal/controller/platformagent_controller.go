@@ -795,6 +795,9 @@ type PlatformAgentReconciler struct {
 	// new sends no probe.
 	inferenceKeyProbe      inferenceKeyProber
 	inferenceKeysServedFor sync.Map
+	// inferenceKeysCRD caches whether the served PlatformAgent CRD has
+	// status.inferenceKeys, per CRD resourceVersion.
+	inferenceKeysCRD inferenceKeysCRDCache
 
 	// UniverseDomainDetector probes the GKE metadata server for the host
 	// cluster's Google Cloud API universe domain; nil in offline unit and
@@ -974,7 +977,9 @@ type PlatformAgentReconciler struct {
 // `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
 // confers none of its permissions on the operator itself.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
-// Escalation prevention: buildMinimalPlatformRole grants CRD reads to the agent.
+// Escalation prevention: buildMinimalPlatformRole grants CRD reads to the agent. The operator
+// also reads the PlatformAgent CRD itself, by name and uncached, to check its schema has
+// status.inferenceKeys before writing any inference gateway key (servedCRDHasInferenceKeys).
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // The GitOps reconcilers' objects, read-only, for the same escalation-prevention reason
 // as `nodes` above: buildMinimalPlatformRole grants them to the agent, so the operator

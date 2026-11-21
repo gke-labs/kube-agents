@@ -38,6 +38,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -108,6 +109,26 @@ func litellmGatewayPod(agent *agentv1alpha1.PlatformAgent, name, ip string) *cor
 	}
 }
 
+// platformAgentCRDObject is the served PlatformAgent CRD as the operator
+// reads it, its v1alpha1 schema with or without status.inferenceKeys.
+func platformAgentCRDObject(withField bool) *unstructured.Unstructured {
+	statusProps := map[string]any{"phase": map[string]any{"type": "string"}}
+	if withField {
+		statusProps["inferenceKeys"] = map[string]any{"type": "object"}
+	}
+	crd := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"versions": []any{map[string]any{
+			"name": agentv1alpha1.GroupVersion.Version,
+			"schema": map[string]any{"openAPIV3Schema": map[string]any{"properties": map[string]any{
+				"status": map[string]any{"properties": statusProps},
+			}}},
+		}}},
+	}}
+	crd.SetGroupVersionKind(crdGVK)
+	crd.SetName(servedPlatformAgentCRDName)
+	return crd
+}
+
 // inferenceKeysFixture is a reconciler over an agent whose namespace runs
 // the gateway with two Ready pods, a profile namespace, and a profile at
 // the read and unattended tiers.
@@ -118,6 +139,7 @@ func inferenceKeysFixture(t *testing.T, extra ...client.Object) (*PlatformAgentR
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 	})
 	objs := append([]client.Object{
+		platformAgentCRDObject(true),
 		litellmGatewayDeployment(agent),
 		litellmGatewayReplicaSet(agent),
 		litellmGatewayPod(agent, "litellm-a", "10.1.0.1"),
@@ -481,7 +503,7 @@ func TestTheProbeGateNeedsEveryPodToAdmitTheProbeKey(t *testing.T) {
 		shadow := litellmGatewayPod(agent, "replay-shadow", "10.1.0.9")
 		shadow.Spec.Containers[0].Name = "replay-proxy"
 		shadow.Status.ContainerStatuses[0].Name = "replay-proxy"
-		r, _, _ := a2aGateTestReconciler(t, agent, litellmGatewayDeployment(agent), litellmGatewayReplicaSet(agent), notReady, shadow)
+		r, _, _ := a2aGateTestReconciler(t, agent, platformAgentCRDObject(true), litellmGatewayDeployment(agent), litellmGatewayReplicaSet(agent), notReady, shadow)
 		prober := admitEverything()
 		r.inferenceKeyProbe = prober
 		out := r.reconcileInferenceKeys(ctx, agent)
@@ -597,7 +619,7 @@ func TestNoKeyReachesTheLogsEventsOrConditions(t *testing.T) {
 	agent := inferenceKeysTestAgent()
 	profile := testAgentProfile(agent.Namespace, "auditor")
 	r, cl, req := a2aGateTestReconciler(t, agent,
-		litellmGatewayDeployment(agent), litellmGatewayReplicaSet(agent), litellmGatewayPod(agent, "litellm-a", "10.1.0.1"), profileNamespaceObject(agent), &profile)
+		platformAgentCRDObject(true), litellmGatewayDeployment(agent), litellmGatewayReplicaSet(agent), litellmGatewayPod(agent, "litellm-a", "10.1.0.1"), profileNamespaceObject(agent), &profile)
 	rec := record.NewFakeRecorder(256)
 	r.Recorder = rec
 	r.inferenceKeyProbe = &fakeInferenceKeyProber{answer: func(string, string) (int, error) { return http.StatusUnauthorized, nil }}
@@ -1139,5 +1161,127 @@ func TestAFailedUncachedReadReplacesNothing(t *testing.T) {
 	}
 	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: callerKeysSecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Errorf("a map was written on a pass that confirmed nothing: %v", err)
+	}
+}
+
+// writeCounter counts every write a client makes.
+func writeCounter(inner client.WithWatch, writes *atomic.Int32) client.WithWatch {
+	return interceptor.NewClient(inner, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			writes.Add(1)
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			writes.Add(1)
+			return c.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			writes.Add(1)
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			writes.Add(1)
+			return c.Delete(ctx, obj, opts...)
+		},
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			writes.Add(1)
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	})
+}
+
+// An older served CRD, the normal state after a Helm upgrade that doesn't
+// move CRDs: nothing is created, replaced, deleted or written, a foreign
+// Secret at a reserved name survives, and the condition is CRDOutdated with
+// no early requeue.
+func TestAnOlderCRDWritesNothing(t *testing.T) {
+	agent := inferenceKeysTestAgent()
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: inferenceKeySecretName(agent, inferenceKeyClassAgent), Namespace: agent.Namespace, UID: "uid-foreign-agent"}}
+	r, cl, agent := inferenceKeysFixture(t, foreign)
+	ctx := context.Background()
+	older := &unstructured.Unstructured{}
+	older.SetGroupVersionKind(crdGVK)
+	if err := cl.Get(ctx, types.NamespacedName{Name: servedPlatformAgentCRDName}, older); err != nil {
+		t.Fatal(err)
+	}
+	older.Object["spec"] = platformAgentCRDObject(false).Object["spec"]
+	if err := cl.Update(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	var writes atomic.Int32
+	r.Client = writeCounter(cl.(client.WithWatch), &writes)
+	for range 2 {
+		out := r.reconcileInferenceKeys(ctx, agent)
+		if out.condition.Status != metav1.ConditionFalse || out.condition.Reason != inferenceKeysReasonCRDOutdated || out.requeue != 0 {
+			t.Errorf("outcome %+v", out)
+		}
+	}
+	if n := writes.Load(); n != 0 {
+		t.Errorf("%d writes with an older CRD", n)
+	}
+	if got := readInferenceKey(t, cl, client.ObjectKeyFromObject(foreign)); got.UID != foreign.UID {
+		t.Error("a Secret at a reserved name was replaced under an older CRD")
+	}
+	assertNoInferenceKeysBut(t, cl, agent, inferenceKeyClassAgent)
+}
+
+// assertNoInferenceKeysBut is assertNoInferenceKeys with one class's Secret
+// allowed, for a pre-existing one the test planted.
+func assertNoInferenceKeysBut(t *testing.T, cl client.Client, agent *agentv1alpha1.PlatformAgent, planted string) {
+	t.Helper()
+	names := []types.NamespacedName{{Namespace: agent.Namespace, Name: callerKeysSecretName}}
+	for _, class := range append(append([]string(nil), installInferenceKeyClasses...), inferenceKeyClassProbe) {
+		if class != planted {
+			names = append(names, installInferenceKeyClass(agent, class).secret)
+		}
+	}
+	for _, name := range names {
+		if err := cl.Get(context.Background(), name, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Errorf("Secret %s: %v, want absent", name, err)
+		}
+	}
+}
+
+// A CRD read that fails writes nothing on that pass and looks again.
+func TestAFailedCRDReadWritesNothing(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	var writes atomic.Int32
+	r.Client = writeCounter(cl.(client.WithWatch), &writes)
+	r.APIReader = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == crdGVK.Kind {
+				return apierrors.NewServiceUnavailable("unavailable")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	out := r.reconcileInferenceKeys(context.Background(), agent)
+	if out.condition.Reason != inferenceKeysReasonNotWritten || out.requeue == 0 || writes.Load() != 0 {
+		t.Errorf("outcome %+v after %d writes", out, writes.Load())
+	}
+}
+
+// A steady install reads the CRD's metadata each pass and its schema only
+// when the resourceVersion moved.
+func TestTheCRDSchemaIsReadOncePerResourceVersion(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	var full, head atomic.Int32
+	r.APIReader = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			switch obj.(type) {
+			case *unstructured.Unstructured:
+				full.Add(1)
+			case *metav1.PartialObjectMetadata:
+				head.Add(1)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	ctx := context.Background()
+	for range 3 {
+		r.reconcileInferenceKeys(ctx, agent)
+	}
+	if full.Load() != 1 || head.Load() != 3 {
+		t.Errorf("%d schema reads and %d metadata reads over three passes, want 1 and 3", full.Load(), head.Load())
 	}
 }

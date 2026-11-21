@@ -40,6 +40,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -90,8 +92,9 @@ import (
 // the map. This is also how an install recovers when the record is lost (a
 // rollback to an operator that drops the field, or a crash between a create
 // and its record): every key is replaced once, and the condition comes back
-// on a later pass. A Secret at any other name is never deleted. When the
-// served CRD predates the status field, the operator creates no Secret.
+// on a later pass. A Secret at any other name is never deleted. Before any
+// write the operator checks the served CRD's schema has the status field
+// (servedCRDHasInferenceKeys); without it, it writes nothing at all.
 //
 // A key Secret is created once and never regenerated while it holds a
 // well-formed key: rotation is a separate, staged step. One that holds no
@@ -109,6 +112,7 @@ const (
 	inferenceKeysReasonProbeFailed    = "ProbeIncomplete"
 	inferenceKeysReasonNoReadyGateway = "NoReadyGatewayPod"
 	inferenceKeysReasonNotWritten     = "NotWritten"
+	inferenceKeysReasonCRDOutdated    = "CRDOutdated"
 
 	// The caller classes with one key for the whole install.
 	inferenceKeyClassAgent   = "agent"
@@ -173,6 +177,10 @@ const (
 	// namespace, whose gateway admits its own namespace alone) may never
 	// answer, and should not hold the agent at four passes a minute.
 	inferenceKeysUnreachableRecheck = time.Minute
+
+	// servedPlatformAgentCRDName is the PlatformAgent CRD, read for whether its
+	// schema has status.inferenceKeys before any write here.
+	servedPlatformAgentCRDName = "platformagents.kubeagents.x-k8s.io"
 
 	// reasonInferenceKeyMinted is the Normal Event a new key writes.
 	reasonInferenceKeyMinted = "InferenceKeyMinted"
@@ -351,6 +359,71 @@ func tierClassesInMap(doc []byte) []string {
 	return out
 }
 
+// crdGVK is the kind of a CustomResourceDefinition. The operator's scheme
+// doesn't register apiextensions, so the CRD is read as metadata and as
+// unstructured, through the uncached reader (no informer starts for it).
+var crdGVK = schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
+
+// inferenceKeysCRDCache is the last answer to whether the served PlatformAgent
+// CRD's schema has status.inferenceKeys, for the CRD resourceVersion it was
+// read at.
+type inferenceKeysCRDCache struct {
+	mu              sync.Mutex
+	resourceVersion string
+	hasField        bool
+}
+
+// servedCRDHasInferenceKeys reports whether the served PlatformAgent CRD's
+// schema, at the version this operator reads and writes, has
+// status.inferenceKeys. Helm doesn't upgrade CRDs from crds/ on an upgrade,
+// so an older CRD is a normal state after one, and every write in this step
+// waits on this answer. Each call reads the CRD's metadata alone; the schema
+// is read again only when the resourceVersion moved since the cached answer.
+func (r *PlatformAgentReconciler) servedCRDHasInferenceKeys(ctx context.Context) (bool, error) {
+	key := types.NamespacedName{Name: servedPlatformAgentCRDName}
+	head := &metav1.PartialObjectMetadata{}
+	head.SetGroupVersionKind(crdGVK)
+	if err := r.a2aReader().Get(ctx, key, head); err != nil {
+		return false, err
+	}
+	cache := &r.inferenceKeysCRD
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.resourceVersion != "" && cache.resourceVersion == head.GetResourceVersion() {
+		return cache.hasField, nil
+	}
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(crdGVK)
+	if err := r.a2aReader().Get(ctx, key, crd); err != nil {
+		return false, err
+	}
+	cache.resourceVersion, cache.hasField = crd.GetResourceVersion(), crdSchemaHasInferenceKeys(crd, agentv1alpha1.GroupVersion.Version)
+	return cache.hasField, nil
+}
+
+// forgetServedCRDAnswer drops the cached answer, for the backstop: a record
+// write the served CRD dropped although the cache said it had the field.
+func (r *PlatformAgentReconciler) forgetServedCRDAnswer() {
+	r.inferenceKeysCRD.mu.Lock()
+	defer r.inferenceKeysCRD.mu.Unlock()
+	r.inferenceKeysCRD.resourceVersion = ""
+}
+
+// crdSchemaHasInferenceKeys reports whether crd's schema for version has
+// status.inferenceKeys.
+func crdSchemaHasInferenceKeys(crd *unstructured.Unstructured, version string) bool {
+	versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
+	for _, v := range versions {
+		entry, ok := v.(map[string]any)
+		if !ok || entry["name"] != version {
+			continue
+		}
+		_, found, _ := unstructured.NestedMap(entry, "schema", "openAPIV3Schema", "properties", "status", "properties", "inferenceKeys")
+		return found
+	}
+	return false
+}
+
 // errInferenceKeysStatusPruned is a record write the served CRD dropped.
 var errInferenceKeysStatusPruned = errors.New("the served PlatformAgent CRD has no status.inferenceKeys")
 
@@ -419,8 +492,9 @@ func (r *PlatformAgentReconciler) createRecorded(ctx context.Context, agent *age
 
 // notWrittenFor is the outcome of a failed key or map write: the pruned CRD
 // says so and waits for the steady requeue; anything else looks again soon.
-func notWrittenFor(what string, err error) inferenceKeysOutcome {
+func (r *PlatformAgentReconciler) notWrittenFor(what string, err error) inferenceKeysOutcome {
 	if errors.Is(err, errInferenceKeysStatusPruned) {
+		r.forgetServedCRDAnswer()
 		return notWritten("the served PlatformAgent CRD has no status.inferenceKeys, so the operator can't record the Secrets it creates and creates none; apply the current CRD", false)
 	}
 	if errors.Is(err, errFreshRecordUnreadable) {
@@ -514,6 +588,16 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		return notWritten(fmt.Sprintf("%d PlatformAgents share namespace %s; the operator writes caller keys only for the one PlatformAgent in a namespace", len(agents.Items), agent.Namespace), false)
 	}
 
+	// No write of any kind until the served CRD can hold the record: with an
+	// older one, nothing is created, replaced or written.
+	switch has, err := r.servedCRDHasInferenceKeys(ctx); {
+	case err != nil:
+		return notWritten("the PlatformAgent CRD could not be read to check it has status.inferenceKeys ("+apiFailure(err)+"); nothing is written on this pass", true)
+	case !has:
+		return inferenceKeysOutcome{condition: inferenceKeysCondition(metav1.ConditionFalse, inferenceKeysReasonCRDOutdated,
+			"the served PlatformAgent CRD has no status.inferenceKeys, so the operator creates no inference gateway key until the current PlatformAgent CRD is applied")}
+	}
+
 	recorded := recordedSecretUIDs(agent)
 	mapKey := types.NamespacedName{Namespace: agent.Namespace, Name: callerKeysSecretName}
 	existingMap := &corev1.Secret{}
@@ -575,7 +659,7 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		apiKey, wasMinted, err := r.ensureInferenceKey(ctx, agent, c, recorded[c.secret.Name])
 		if err != nil {
 			log.Info("could not read or write an inference gateway key Secret; the map is left as it is", "class", c.name, "secret", c.secret.String(), "failure", apiFailure(err))
-			return notWrittenFor("the "+c.name+" key's Secret "+c.secret.String(), err)
+			return r.notWrittenFor("the "+c.name+" key's Secret "+c.secret.String(), err)
 		}
 		if wasMinted {
 			minted = append(minted, c.name)
@@ -615,7 +699,7 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	mapWritten, err := r.writeCallerKeysMap(ctx, agent, existingMap, mapFound, mapRecorded, doc)
 	if err != nil {
 		log.Info("could not write the caller-key map", "secret", mapKey.String(), "failure", apiFailure(err))
-		return notWrittenFor("Secret "+mapKey.String(), err)
+		return r.notWrittenFor("Secret "+mapKey.String(), err)
 	}
 
 	if len(minted) > 0 || mapWritten || len(removed) > 0 {
