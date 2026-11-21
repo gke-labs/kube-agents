@@ -1,6 +1,7 @@
 """Tests for the reserved auto-merge labels and the broker's proposal-practice-label verb."""
 
 import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -559,6 +560,9 @@ class BaseFileTest(unittest.TestCase):
             broker = vcs_broker.VcsBroker(Path(tmp) / "scratch", git_runner=mock.Mock())
             with mock.patch.object(broker, "snapshot", side_effect=WorkspaceError("PATH_NOT_FOUND")):
                 self.assertEqual(broker._base_file({}, "main", self.PATH), (None, "not read (WorkspaceError)", ""))
+            failed = subprocess.CalledProcessError(128, ["git", "clone"])
+            with mock.patch.object(broker, "snapshot", side_effect=failed):
+                self.assertEqual(broker._base_file({}, "x", self.PATH), (None, "not read (CalledProcessError)", ""))
 
 if __name__ == "__main__":
     unittest.main()

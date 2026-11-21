@@ -3397,7 +3397,8 @@ class VcsBroker:
                 if members[0].mode & 0o111:
                     return None, "executable", ""
                 raw = tar.extractfile(members[0]).read(automerge_edit.MAX_FILE_BYTES + 1)
-        except (WorkspaceError, tarfile.TarError, KeyError, ValueError) as exc:
+        except (WorkspaceError, subprocess.CalledProcessError, OSError, tarfile.TarError, KeyError, ValueError) as exc:
+            # A clone that failed (a deleted branch, a fork's head) is a refusal too.
             return None, f"not read ({type(exc).__name__})", ""
         if len(raw) > automerge_edit.MAX_FILE_BYTES:
             return None, f"larger than {automerge_edit.MAX_FILE_BYTES} bytes", ""
