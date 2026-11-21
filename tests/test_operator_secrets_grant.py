@@ -32,7 +32,8 @@ two documents of `role.yaml` by what they do:
   `litellm-caller-keys` digest map, in the install namespace and
   owner-referenced; a profile tier's key Secret is in the
   profile namespace, carries the agent's labels instead, and is deleted when no
-  bound profile lists the tier.
+  bound profile lists the tier. Those names are reserved: a Secret found at one
+  that the operator didn't create is deleted, by its UID, and replaced.
 
 The three read verbs are the ClusterRole document: they are held cluster-wide
 because the agent's audit ClusterRole grants them and the API server refuses a

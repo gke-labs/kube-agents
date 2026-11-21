@@ -241,41 +241,69 @@ func mapsEqual(a, b map[string]string) bool {
 	return true
 }
 
-// A key Secret this agent made that holds no well-formed key is repaired;
-// a Secret at a key's name this agent didn't make is left as it is and its
-// class gets no key, which the condition names.
-func TestAMalformedKeyIsRepairedAndAForeignOneIsLeftAlone(t *testing.T) {
+// A key Secret this agent made that holds no well-formed key is repaired
+// in place; a Secret at a key's name this agent didn't make is replaced.
+func TestAMalformedKeyIsRepairedAndAForeignOneIsReplaced(t *testing.T) {
 	agent := inferenceKeysTestAgent()
 	foreign := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: inferenceKeySecretName(agent, inferenceKeyClassCurator), Namespace: agent.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: inferenceKeySecretName(agent, inferenceKeyClassCurator), Namespace: agent.Namespace, UID: "uid-foreign"},
 		Data:       map[string][]byte{inferenceKeyDataKey: []byte("someone-elses-value")},
 	}
 	r, cl, agent := inferenceKeysFixture(t, foreign)
+	rec := record.NewFakeRecorder(64)
+	r.Recorder = rec
 	ctx := context.Background()
 	r.reconcileInferenceKeys(ctx, agent)
+	assertReplaced(t, cl, rec, agent, foreign, "someone-elses-value")
 
 	agentKey := installInferenceKeyClass(agent, inferenceKeyClassAgent).secret
 	s := readInferenceKey(t, cl, agentKey)
+	uid := s.UID
 	s.Data[inferenceKeyDataKey] = []byte("sk-short")
 	if err := cl.Update(ctx, s); err != nil {
 		t.Fatal(err)
 	}
-	out := r.reconcileInferenceKeys(ctx, agent)
-	if got := string(readInferenceKey(t, cl, agentKey).Data[inferenceKeyDataKey]); !wellFormedInferenceKey(got) {
-		t.Error("a malformed key was not repaired")
+	r.reconcileInferenceKeys(ctx, agent)
+	got := readInferenceKey(t, cl, agentKey)
+	if !wellFormedInferenceKey(string(got.Data[inferenceKeyDataKey])) || got.UID != uid {
+		t.Error("a malformed key of the operator's own was not repaired in place")
 	}
-	if got := readInferenceKey(t, cl, client.ObjectKeyFromObject(foreign)); string(got.Data[inferenceKeyDataKey]) != "someone-elses-value" {
-		t.Error("a foreign Secret was overwritten")
+}
+
+// assertReplaced checks that planted, a Secret at a reserved name, was
+// replaced: the Secret there now has another UID, the one the status
+// records; plantedValue's digest is not in the map; and a Warning Event
+// names the Secret without carrying the value.
+func assertReplaced(t *testing.T, cl client.Client, rec *record.FakeRecorder, agent *agentv1alpha1.PlatformAgent, planted *corev1.Secret, plantedValue string) {
+	t.Helper()
+	ctx := context.Background()
+	now := readInferenceKey(t, cl, client.ObjectKeyFromObject(planted))
+	if now.UID == planted.UID {
+		t.Errorf("Secret %s/%s was adopted, not replaced", planted.Namespace, planted.Name)
 	}
-	if out.condition == nil || out.condition.Status != metav1.ConditionFalse || out.condition.Reason != inferenceKeysReasonNotWritten ||
-		!strings.Contains(out.condition.Message, inferenceKeyClassCurator) {
-		t.Errorf("condition %+v, want NotWritten naming %s", out.condition, inferenceKeyClassCurator)
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
 	}
-	entries, _ := readCallerKeysMap(t, cl, agent)
-	for _, class := range entries {
-		if class == inferenceKeyClassCurator {
-			t.Error("the map names a class whose Secret isn't this agent's")
+	if recordedSecretUIDs(stored)[planted.Name] != now.UID {
+		t.Errorf("the record for %s isn't the replacement's UID", planted.Name)
+	}
+	entries, doc := readCallerKeysMap(t, cl, agent)
+	if _, ok := entries[inferenceKeyDigest(plantedValue)]; ok || strings.Contains(string(doc), plantedValue) {
+		t.Errorf("the planted value of %s reached the map", planted.Name)
+	}
+	want := planted.Namespace + "/" + planted.Name
+	warned := false
+	for _, e := range drainEvents(rec) {
+		if strings.Contains(e, plantedValue) {
+			t.Errorf("an Event carries the planted value: %s", e)
 		}
+		if strings.HasPrefix(e, corev1.EventTypeWarning) && strings.Contains(e, reasonInferenceKeySecretReplaced) && strings.Contains(e, want) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no %s Warning Event names %s", reasonInferenceKeySecretReplaced, want)
 	}
 }
 
@@ -343,17 +371,16 @@ func TestNoKeysWithoutTheirOnlyGatewayAndAgent(t *testing.T) {
 	t.Run("a foreign map", func(t *testing.T) {
 		agent := inferenceKeysTestAgent()
 		handMade := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: callerKeysSecretName, Namespace: agent.Namespace},
-			Data:       map[string][]byte{callerKeysFileKey: []byte(`{}`)},
+			ObjectMeta: metav1.ObjectMeta{Name: callerKeysSecretName, Namespace: agent.Namespace, UID: "uid-hand-made"},
+			Data:       map[string][]byte{callerKeysFileKey: []byte(`{"` + strings.Repeat("1", 64) + `":"agent"}`)},
 		}
-		r, cl, _ := inferenceKeysFixture(t, handMade)
-		out := r.reconcileInferenceKeys(ctx, agent)
-		if out.condition == nil || out.condition.Reason != inferenceKeysReasonNotWritten {
+		r, cl, agent := inferenceKeysFixture(t, handMade)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		if out := r.reconcileInferenceKeys(ctx, agent); out.condition.Status != metav1.ConditionTrue {
 			t.Errorf("condition %+v", out.condition)
 		}
-		if got := readInferenceKey(t, cl, client.ObjectKeyFromObject(handMade)); string(got.Data[callerKeysFileKey]) != `{}` {
-			t.Error("a hand-made map was overwritten")
-		}
+		assertReplaced(t, cl, rec, agent, handMade, strings.Repeat("1", 64))
 	})
 }
 
@@ -752,40 +779,41 @@ func TestAPodThatOnlyLooksLikeTheGatewayGetsNoKey(t *testing.T) {
 }
 
 // A Secret planted in the profile namespace at a tier key's name, with this
-// agent's labels, is not adopted: its key stays out of the map, the
-// condition names the class, and it isn't deleted. A tier Secret the
-// operator created survives later passes, recorded by UID.
-func TestAPlantedTierSecretIsNotAdopted(t *testing.T) {
+// agent's labels, is replaced, not adopted: its key never reaches the map,
+// and a Warning Event names it. A tier Secret the operator created survives
+// later passes. A labelled Secret at a tier's name that the record doesn't
+// hold is not deleted by the tier cleanup or the PlatformAgent's deletion.
+func TestAPlantedTierSecretIsReplacedNotAdopted(t *testing.T) {
 	agent := inferenceKeysTestAgent()
+	labelled := func(class string) map[string]string {
+		l := a2aLabels(agent, inferenceKeyComponent)
+		l[inferenceKeyClassLabel] = class
+		return l
+	}
+	plantedKey := "sk-" + strings.Repeat("A", 43)
 	planted := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: inferenceKeySecretName(agent, "tier-unattended"), Namespace: profileNamespaceName(agent), UID: "uid-planted",
-			Labels: func() map[string]string {
-				l := a2aLabels(agent, inferenceKeyComponent)
-				l[inferenceKeyClassLabel] = "tier-unattended"
-				return l
-			}(),
+			Labels: labelled("tier-unattended"),
 		},
-		Data: map[string][]byte{inferenceKeyDataKey: []byte("sk-" + strings.Repeat("A", 43))},
+		Data: map[string][]byte{inferenceKeyDataKey: []byte(plantedKey)},
 	}
-	r, cl, agent := inferenceKeysFixture(t, planted)
+	// A tier no profile lists: outside the cleanup's reach, since the record
+	// doesn't hold it.
+	idle := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: inferenceKeySecretName(agent, "tier-idle"), Namespace: profileNamespaceName(agent), UID: "uid-idle",
+			Labels: labelled("tier-idle"),
+		},
+	}
+	r, cl, agent := inferenceKeysFixture(t, planted, idle)
+	rec := record.NewFakeRecorder(64)
+	r.Recorder = rec
 	ctx := context.Background()
-	out := r.reconcileInferenceKeys(ctx, agent)
-	if out.condition.Status != metav1.ConditionFalse || out.condition.Reason != inferenceKeysReasonNotWritten || !strings.Contains(out.condition.Message, "tier-unattended") {
-		t.Fatalf("condition %+v, want NotWritten naming tier-unattended", out.condition)
+	if out := r.reconcileInferenceKeys(ctx, agent); out.condition.Status != metav1.ConditionTrue {
+		t.Fatalf("condition %+v", out.condition)
 	}
-	if strings.Contains(out.condition.Message, strings.Repeat("A", 43)) {
-		t.Error("the message carries the planted key")
-	}
-	entries, _ := readCallerKeysMap(t, cl, agent)
-	if _, ok := entries[inferenceKeyDigest(string(planted.Data[inferenceKeyDataKey]))]; ok {
-		t.Error("the planted key's digest is in the map")
-	}
-	for _, class := range entries {
-		if class == "tier-unattended" {
-			t.Error("the map names the planted class")
-		}
-	}
+	assertReplaced(t, cl, rec, agent, planted, plantedKey)
 
 	readTier := tierInferenceKeyClass(agent, "read").secret
 	before := readInferenceKey(t, cl, readTier)
@@ -795,24 +823,15 @@ func TestAPlantedTierSecretIsNotAdopted(t *testing.T) {
 	if after.UID != before.UID || string(after.Data[inferenceKeyDataKey]) != string(before.Data[inferenceKeyDataKey]) {
 		t.Error("the operator's own tier key didn't survive later passes")
 	}
-	entries, _ = readCallerKeysMap(t, cl, agent)
-	if entries[inferenceKeyDigest(string(after.Data[inferenceKeyDataKey]))] != "tier-read" {
-		t.Error("the operator's own tier key left the map")
+	for _, e := range drainEvents(rec) {
+		if strings.Contains(e, reasonInferenceKeySecretReplaced) {
+			t.Errorf("a later pass replaced something: %s", e)
+		}
 	}
 
-	// Dropping the tier, and deleting the agent, leave the planted one.
-	profile := &agentv1alpha1.AgentProfile{}
-	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
-		t.Fatal(err)
-	}
-	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
-	if err := cl.Update(ctx, profile); err != nil {
-		t.Fatal(err)
-	}
-	r.reconcileInferenceKeys(ctx, agent)
 	r.removeInferenceKeysOnDeletion(ctx, agent)
-	if err := cl.Get(ctx, client.ObjectKeyFromObject(planted), &corev1.Secret{}); err != nil {
-		t.Errorf("the planted Secret was deleted: %v", err)
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(idle), &corev1.Secret{}); err != nil {
+		t.Errorf("an unrecorded Secret was deleted by the cleanup: %v", err)
 	}
 	if err := cl.Get(ctx, readTier, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the operator's own tier key survived the deletion: %v", err)
@@ -822,9 +841,8 @@ func TestAPlantedTierSecretIsNotAdopted(t *testing.T) {
 // A Secret that names the PlatformAgent as its controller is still not the
 // operator's: whoever creates a Secret writes its owner references. A
 // pre-created map or class key Secret with a forged controller reference is
-// not adopted, overwritten or put in the map; only a Secret whose UID the
-// status records is used.
-func TestAForgedControllerReferenceIsNotTrusted(t *testing.T) {
+// replaced, and its contents never reach the map.
+func TestAForgedControllerReferenceIsReplaced(t *testing.T) {
 	ctx := context.Background()
 	forge := func(agent *agentv1alpha1.PlatformAgent, name string, data map[string][]byte) *corev1.Secret {
 		return &corev1.Secret{
@@ -840,16 +858,13 @@ func TestAForgedControllerReferenceIsNotTrusted(t *testing.T) {
 	}
 	t.Run("the map", func(t *testing.T) {
 		agent := inferenceKeysTestAgent()
-		forged := forge(agent, callerKeysSecretName, map[string][]byte{callerKeysFileKey: []byte(`{"` + strings.Repeat("0", 64) + `":"agent"}`)})
+		forgedDigest := strings.Repeat("0", 64)
+		forged := forge(agent, callerKeysSecretName, map[string][]byte{callerKeysFileKey: []byte(`{"` + forgedDigest + `":"agent"}`)})
 		r, cl, agent := inferenceKeysFixture(t, forged)
-		out := r.reconcileInferenceKeys(ctx, agent)
-		if out.condition.Reason != inferenceKeysReasonNotWritten || !strings.Contains(out.condition.Message, callerKeysSecretName) {
-			t.Errorf("condition %+v, want NotWritten naming the map", out.condition)
-		}
-		got := readInferenceKey(t, cl, client.ObjectKeyFromObject(forged))
-		if string(got.Data[callerKeysFileKey]) != string(forged.Data[callerKeysFileKey]) {
-			t.Error("a forged map was overwritten")
-		}
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		r.reconcileInferenceKeys(ctx, agent)
+		assertReplaced(t, cl, rec, agent, forged, forgedDigest)
 	})
 	t.Run("a class key", func(t *testing.T) {
 		agent := inferenceKeysTestAgent()
@@ -857,18 +872,113 @@ func TestAForgedControllerReferenceIsNotTrusted(t *testing.T) {
 		forged := forge(agent, inferenceKeySecretName(agent, inferenceKeyClassAgent), map[string][]byte{inferenceKeyDataKey: []byte(plantedKey)})
 		forged.Labels[inferenceKeyClassLabel] = inferenceKeyClassAgent
 		r, cl, agent := inferenceKeysFixture(t, forged)
-		out := r.reconcileInferenceKeys(ctx, agent)
-		if out.condition.Reason != inferenceKeysReasonNotWritten || !strings.Contains(out.condition.Message, forged.Name) || strings.Contains(out.condition.Message, plantedKey) {
-			t.Errorf("condition %+v, want NotWritten naming the Secret and not its key", out.condition)
-		}
-		entries, _ := readCallerKeysMap(t, cl, agent)
-		if _, ok := entries[inferenceKeyDigest(plantedKey)]; ok {
-			t.Error("the forged key's digest is in the map")
-		}
-		if got := readInferenceKey(t, cl, client.ObjectKeyFromObject(forged)); string(got.Data[inferenceKeyDataKey]) != plantedKey {
-			t.Error("a forged key Secret was changed")
-		}
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		r.reconcileInferenceKeys(ctx, agent)
+		assertReplaced(t, cl, rec, agent, forged, plantedKey)
 	})
+}
+
+// A rollback round-trip drops the record: every Secret is then replaced
+// once, the record is rebuilt with the new UIDs, the map holds only the new
+// digests, the condition is Served again, and the pass after replaces
+// nothing.
+func TestALostRecordReplacesEveryKeyOnce(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	oldKeys := allInferenceKeys(t, cl, agent, "read", "unattended")
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	oldUIDs := stored.Status.InferenceKeys.SecretUIDs
+	stored.Status.InferenceKeys = nil
+	if err := cl.Status().Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := record.NewFakeRecorder(64)
+	restarted := &PlatformAgentReconciler{Client: cl, Scheme: r.Scheme, Recorder: rec, inferenceKeyProbe: admitEverything()}
+	if out := restarted.reconcileInferenceKeys(ctx, stored); out.condition.Status != metav1.ConditionTrue {
+		t.Fatalf("after the round-trip: %+v", out.condition)
+	}
+	replaced := 0
+	for _, e := range drainEvents(rec) {
+		if strings.Contains(e, reasonInferenceKeySecretReplaced) {
+			replaced++
+		}
+	}
+	if replaced != len(oldUIDs) {
+		t.Errorf("%d Secrets replaced, want every one (%d)", replaced, len(oldUIDs))
+	}
+	newKeys := allInferenceKeys(t, cl, agent, "read", "unattended")
+	for class, k := range newKeys {
+		if k == oldKeys[class] {
+			t.Errorf("the %s key didn't rotate", class)
+		}
+	}
+	rebuilt := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), rebuilt); err != nil {
+		t.Fatal(err)
+	}
+	newUIDs := rebuilt.Status.InferenceKeys.SecretUIDs
+	if len(newUIDs) != len(oldUIDs) {
+		t.Errorf("%d records rebuilt, want %d", len(newUIDs), len(oldUIDs))
+	}
+	for name, uid := range newUIDs {
+		if oldUIDs[name] == uid {
+			t.Errorf("%s kept its old UID", name)
+		}
+	}
+	entries, _ := readCallerKeysMap(t, cl, agent)
+	if len(entries) != len(newKeys) {
+		t.Errorf("map has %d entries for %d keys", len(entries), len(newKeys))
+	}
+	for class, k := range newKeys {
+		if entries[inferenceKeyDigest(k)] != class {
+			t.Errorf("the map lacks the new %s digest", class)
+		}
+		if _, ok := entries[inferenceKeyDigest(oldKeys[class])]; ok {
+			t.Errorf("the map still holds the old %s digest", class)
+		}
+	}
+
+	restarted.reconcileInferenceKeys(ctx, rebuilt)
+	for _, e := range drainEvents(rec) {
+		if strings.Contains(e, reasonInferenceKeySecretReplaced) {
+			t.Errorf("the pass after the recovery replaced something: %s", e)
+		}
+	}
+}
+
+// The replacement deletes exactly the object it read: the delete carries
+// that Secret's UID as a precondition.
+func TestTheReplacementDeleteCarriesTheUIDPrecondition(t *testing.T) {
+	agent := inferenceKeysTestAgent()
+	planted := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: inferenceKeySecretName(agent, inferenceKeyClassSession), Namespace: agent.Namespace, UID: "uid-planted-session"}}
+	r, cl, agent := inferenceKeysFixture(t, planted)
+	var mu sync.Mutex
+	preconditions := map[string]*types.UID{}
+	r.Client = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			do := &client.DeleteOptions{}
+			do.ApplyOptions(opts)
+			mu.Lock()
+			if do.Preconditions != nil {
+				preconditions[obj.GetName()] = do.Preconditions.UID
+			} else {
+				preconditions[obj.GetName()] = nil
+			}
+			mu.Unlock()
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	r.reconcileInferenceKeys(context.Background(), agent)
+	got, deleted := preconditions[planted.Name]
+	if !deleted || got == nil || *got != planted.UID {
+		t.Errorf("the replacement delete's UID precondition: deleted %v, uid %v, want %s", deleted, got, planted.UID)
+	}
 }
 
 // The record lives in the PlatformAgent's status: every Secret the operator

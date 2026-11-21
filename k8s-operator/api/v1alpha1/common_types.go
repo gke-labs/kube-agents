@@ -3034,8 +3034,10 @@ type AgentStatus struct {
 
 // InferenceKeysStatus records the inference gateway caller-key Secrets, the
 // probe key Secret and the litellm-caller-keys map Secret the operator
-// created, by name and UID. The operator uses a Secret at one of those names
-// only when its UID is the one recorded here; it holds no key and no digest.
+// created, by name and UID. Those names are reserved for the operator: it
+// uses a Secret at one of them only when its UID is the one recorded here,
+// and replaces any other Secret it finds there. It holds no key and no
+// digest.
 type InferenceKeysStatus struct {
 	// SecretUIDs maps each such Secret's name to the UID it was created with.
 	// A tier key's Secret is in the profile namespace; every other one is in

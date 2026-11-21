@@ -83,14 +83,19 @@ import (
 // Secret it creates here (each key Secret and the map Secret) on the
 // PlatformAgent's status, which only it writes (status.inferenceKeys), and
 // uses a Secret at one of those names only when its UID is the recorded one.
-// Any other Secret at such a name is not adopted, not put in the map, not
-// overwritten and not deleted; the condition names it. When the served CRD
-// predates the status field, the operator creates no Secret at all.
+// The names are reserved for the operator: any other Secret found at one is
+// replaced, never adopted. It is deleted with its UID as a precondition, so
+// exactly the object read goes, a Warning Event names it, and the operator
+// creates its own and records that; the replaced Secret's key never reaches
+// the map. This is also how an install recovers when the record is lost (a
+// rollback to an operator that drops the field, or a crash between a create
+// and its record): every key is replaced once, and the condition comes back
+// on a later pass. A Secret at any other name is never deleted. When the
+// served CRD predates the status field, the operator creates no Secret.
 //
 // A key Secret is created once and never regenerated while it holds a
 // well-formed key: rotation is a separate, staged step. One that holds no
-// key, or a malformed one, is repaired. A Secret at a key's name that this
-// agent didn't create is left alone and its class gets no key.
+// key, or a malformed one, is repaired.
 //
 // Secrets are read by name through the uncached reader: the operator never
 // lists or watches a Secret (tests/test_operator_secrets_grant.py). Nothing
@@ -171,6 +176,9 @@ const (
 
 	// reasonInferenceKeyMinted is the Normal Event a new key writes.
 	reasonInferenceKeyMinted = "InferenceKeyMinted"
+	// reasonInferenceKeySecretReplaced is the Warning Event a replaced
+	// Secret at a reserved name writes.
+	reasonInferenceKeySecretReplaced = "InferenceKeySecretReplaced"
 )
 
 // callerClassPattern and reservedCallerClasses are the hook's
@@ -513,11 +521,11 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		}
 		mapFound = false
 	}
-	if mapFound && (recorded[callerKeysSecretName] == "" || existingMap.UID != recorded[callerKeysSecretName]) {
-		return notWritten("Secret "+mapKey.String()+" exists and is not the one this PlatformAgent created; the operator leaves it as it is and writes no caller keys. Deleting or replacing it is for a person to decide", false)
-	}
+	// A map at the name that isn't the recorded one is replaced when the new
+	// map is written, not before, and nothing is read from it.
+	mapRecorded := mapFound && recorded[callerKeysSecretName] != "" && existingMap.UID == recorded[callerKeysSecretName]
 	var previousTiers []string
-	if mapFound {
+	if mapRecorded {
 		previousTiers = tierClassesInMap(existingMap.Data[callerKeysFileKey])
 	}
 
@@ -559,16 +567,12 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	classes = append(classes, installInferenceKeyClass(agent, inferenceKeyClassProbe))
 	keys := make(map[string]string, len(classes))
 	var served []inferenceKeyClass
-	var refused, minted []string
+	var minted []string
 	for _, c := range classes {
-		apiKey, wasMinted, ours, err := r.ensureInferenceKey(ctx, agent, c, recorded[c.secret.Name])
+		apiKey, wasMinted, err := r.ensureInferenceKey(ctx, agent, c, recorded[c.secret.Name])
 		if err != nil {
 			log.Info("could not read or write an inference gateway key Secret; the map is left as it is", "class", c.name, "secret", c.secret.String(), "failure", apiFailure(err))
 			return notWrittenFor("the "+c.name+" key's Secret "+c.secret.String(), err)
-		}
-		if !ours {
-			refused = append(refused, c.secret.String())
-			continue
 		}
 		if wasMinted {
 			minted = append(minted, c.name)
@@ -605,7 +609,7 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	if err != nil {
 		return notWritten("the caller-key map could not be encoded", false)
 	}
-	mapWritten, err := r.writeCallerKeysMap(ctx, agent, existingMap, mapFound, doc)
+	mapWritten, err := r.writeCallerKeysMap(ctx, agent, existingMap, mapFound, mapRecorded, doc)
 	if err != nil {
 		log.Info("could not write the caller-key map", "secret", mapKey.String(), "failure", apiFailure(err))
 		return notWrittenFor("Secret "+mapKey.String(), err)
@@ -615,47 +619,46 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		log.Info("inference gateway caller keys reconciled", "callerClasses", len(served), "minted", minted, "mapWritten", mapWritten, "removedTiers", removed)
 	}
 
-	if len(refused) > 0 {
-		return notWritten(fmt.Sprintf("Secret %s exists and is not the one this PlatformAgent created; the operator leaves it as it is and its class gets no key. Delete it and the operator mints a fresh one",
-			strings.Join(refused, ", ")), false)
-	}
 	return r.probeInferenceKeys(ctx, agent, &gateway, served, keys, doc)
 }
 
 // ensureInferenceKey returns c's key, creating its Secret when absent and
 // recording it, and repairing the recorded one when it holds no well-formed
-// key. ours is false for a Secret at that name whose UID isn't recordedUID,
-// which is left alone.
-func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent *agentv1alpha1.PlatformAgent, c inferenceKeyClass, recordedUID types.UID) (apiKey string, minted, ours bool, err error) {
+// key. A Secret at that name whose UID isn't recordedUID is replaced
+// (replaceUnrecorded) and its key never read.
+func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent *agentv1alpha1.PlatformAgent, c inferenceKeyClass, recordedUID types.UID) (apiKey string, minted bool, err error) {
 	existing := &corev1.Secret{}
 	err = r.a2aReader().Get(ctx, c.secret, existing)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return "", false, false, err
+		return "", false, err
 	}
 	if err == nil {
 		if !inferenceKeySecretIsOurs(existing, agent, c, recordedUID) {
-			return "", false, false, nil
+			if err := r.replaceUnrecorded(ctx, agent, existing); err != nil {
+				return "", false, err
+			}
+		} else {
+			if current := string(existing.Data[inferenceKeyDataKey]); wellFormedInferenceKey(current) {
+				return current, false, nil
+			}
+			fresh, gerr := newInferenceKey()
+			if gerr != nil {
+				return "", false, gerr
+			}
+			if existing.Data == nil {
+				existing.Data = map[string][]byte{}
+			}
+			existing.Data[inferenceKeyDataKey] = []byte(fresh)
+			if err := r.Update(ctx, existing); err != nil {
+				return "", false, err
+			}
+			return fresh, true, nil
 		}
-		if current := string(existing.Data[inferenceKeyDataKey]); wellFormedInferenceKey(current) {
-			return current, false, true, nil
-		}
-		fresh, gerr := newInferenceKey()
-		if gerr != nil {
-			return "", false, true, gerr
-		}
-		if existing.Data == nil {
-			existing.Data = map[string][]byte{}
-		}
-		existing.Data[inferenceKeyDataKey] = []byte(fresh)
-		if err := r.Update(ctx, existing); err != nil {
-			return "", false, true, err
-		}
-		return fresh, true, true, nil
 	}
 
 	fresh, err := newInferenceKey()
 	if err != nil {
-		return "", false, true, err
+		return "", false, err
 	}
 	labels := a2aLabels(agent, inferenceKeyComponent)
 	labels[inferenceKeyClassLabel] = c.name
@@ -667,13 +670,31 @@ func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent 
 	}
 	if !c.inProfileNamespace {
 		if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
-			return "", false, true, err
+			return "", false, err
 		}
 	}
 	if err := r.createRecorded(ctx, agent, secret); err != nil {
-		return "", false, true, err
+		return "", false, err
 	}
-	return fresh, true, true, nil
+	return fresh, true, nil
+}
+
+// replaceUnrecorded deletes existing, a Secret at a name reserved for the
+// operator whose UID isn't the recorded one, with that UID as a
+// precondition so exactly the object read goes, and writes a Warning Event
+// naming it. The caller then creates the operator's own. A Secret gone
+// already is not an error; one replaced since the read is, and the next
+// pass looks again.
+func (r *PlatformAgentReconciler) replaceUnrecorded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.Secret) error {
+	uid := existing.UID
+	if err := r.Delete(ctx, existing, client.Preconditions{UID: &uid}); client.IgnoreNotFound(err) != nil {
+		return err
+	}
+	name := existing.Namespace + "/" + existing.Name
+	logf.FromContext(ctx).Info("replaced a Secret at a name reserved for the operator's inference gateway keys", "secret", name)
+	r.recordEvent(agent, corev1.EventTypeWarning, reasonInferenceKeySecretReplaced,
+		fmt.Sprintf("replaced Secret %s: the name is reserved for the operator's inference gateway keys, and this Secret was not one the operator recorded creating", name))
+	return nil
 }
 
 // inferenceKeySecretIsOurs reports whether s is the key Secret for c this
@@ -700,8 +721,15 @@ func recordedTiers(agent *agentv1alpha1.PlatformAgent, recorded map[string]types
 }
 
 // writeCallerKeysMap writes doc as the map: an update of the recorded map
-// Secret when found, else a recorded create. It reports whether it wrote.
-func (r *PlatformAgentReconciler) writeCallerKeysMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.Secret, found bool, doc []byte) (bool, error) {
+// Secret, else a recorded create, replacing first a map Secret at the name
+// that isn't the recorded one. It reports whether it wrote.
+func (r *PlatformAgentReconciler) writeCallerKeysMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.Secret, found, recorded bool, doc []byte) (bool, error) {
+	if found && !recorded {
+		if err := r.replaceUnrecorded(ctx, agent, existing); err != nil {
+			return false, err
+		}
+		found = false
+	}
 	if found {
 		if string(existing.Data[callerKeysFileKey]) == string(doc) {
 			return false, nil
