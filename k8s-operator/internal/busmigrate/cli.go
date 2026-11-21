@@ -325,7 +325,17 @@ func restoreAllDirected(ctx context.Context, nc *nats.Conn, streams []string, di
 			return warnings, 0, fmt.Errorf("stream %s: %w", name, err)
 		}
 		warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
-		warnings = append(warnings, fresh.OutsidePolicyDrift(meta.Config)...)
+		// Going forward, a policy that renders max_consumers decides it, as
+		// it does max_bytes: the restore sends at least the CR's width
+		// (withRenderedLimits) and the read-back holds the stream to what it
+		// sent, so a width other than the fresh install's (the default CR's)
+		// is the CR's, not drift, and is left out of it. The way back
+		// restores the snapshot as it was and reports it as it was.
+		compared := meta.Config
+		if ref, ok := fresh.Streams[name]; ok && replicas > 1 && policy.MaxConsumers != 0 {
+			compared.MaxConsumers = ref.MaxConsumers
+		}
+		warnings = append(warnings, fresh.OutsidePolicyDrift(compared)...)
 		open := func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) } // #nosec G304 -- under the Job's own --snapshot-dir
 		// What a restored stream is held to: the render's limits going
 		// forward, the snapshot's own on the way back (RestoreAsItWas).

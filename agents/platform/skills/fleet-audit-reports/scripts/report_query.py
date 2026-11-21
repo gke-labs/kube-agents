@@ -101,7 +101,14 @@ def _oneline(exc: Exception) -> str:
 
 
 def _root_of(args: argparse.Namespace) -> str:
-    return report_status.reports_root(getattr(args, "root", None))
+    """The store this run reads, its choice logged on stderr: the file store
+    at `--root` or the default root, or the broker store when
+    FLEET_AUDIT_REPORT_STORE is `broker` (report_status.select_report_store)."""
+    return report_status.report_store(getattr(args, "root", None))
+
+
+def _is_broker(root: str) -> bool:
+    return isinstance(root, report_status.BrokerReportStore)
 
 
 def _stream_ids(root: str) -> list[str]:
@@ -161,7 +168,7 @@ def _require_stream(root: str, audit_id: str) -> None:
     `streams` reports it, not absent."""
     _inside_store(audit_id, "stream")
     reason = report_status.store_root_error(root)
-    if reason or not os.path.isdir(root):
+    if reason or not (_is_broker(root) or os.path.isdir(root)):
         raise QueryError(
             _store_error(root, reason),
             root=root,
@@ -172,7 +179,10 @@ def _require_stream(root: str, audit_id: str) -> None:
             **_liveness(root, audit_id),
         )
     try:
-        is_stream = stat.S_ISDIR(os.stat(os.path.join(root, audit_id)).st_mode)
+        if _is_broker(root):
+            is_stream = audit_id in report_status.stream_ids(root)
+        else:
+            is_stream = stat.S_ISDIR(os.stat(os.path.join(root, audit_id)).st_mode)
     except FileNotFoundError:
         is_stream = False
     except OSError as exc:
@@ -221,7 +231,7 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
     repos, unreadable = _repos(root, audit_id)
     if repo is not None:
         try:
-            path = report_status.store_path(root, audit_id, repo)
+            path = None if _is_broker(root) else report_status.store_path(root, audit_id, repo)
             # The listing's spelling of that store: `github.com/owner/name`
             # and `owner/name` open one directory and must answer alike.
             repo = report_status.store_key(root, audit_id, repo)
@@ -230,8 +240,9 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
         if repo not in repos:
             # Its owner may not have listed: whether the directory is there is
             # the stat's to say, and a stat that fails is unread, not absent.
+            # The broker's listing has no unlisted owner to hide behind.
             try:
-                is_repo = stat.S_ISDIR(os.stat(path).st_mode)
+                is_repo = path is not None and stat.S_ISDIR(os.stat(path).st_mode)
             except FileNotFoundError:
                 is_repo = False
             except OSError as exc:
