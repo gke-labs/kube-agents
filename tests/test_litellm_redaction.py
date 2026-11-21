@@ -424,7 +424,7 @@ class TestCallback(unittest.TestCase):
                     "role": "model",
                     "parts": [
                         {"text": "checking 10.0.0.9", "thought": True},
-                        {"functionCall": {"name": "run_command", "args": {"command": f"export TOKEN={_OAUTH_TOKEN}"}}, "thoughtSignature": "sig"},
+                        {"functionCall": {"name": "run_command", "args": {"command": f"export TOKEN={_OAUTH_TOKEN}"}}, "thoughtSignature": _RULE_MATCHING_BASE64},
                     ],
                 },
                 {"role": "user", "parts": [{"functionResponse": {"name": "run_command", "response": {"output": "project my-proj-12 at 10.0.0.5"}}}]},
@@ -439,7 +439,7 @@ class TestCallback(unittest.TestCase):
         self.assertTrue(model["parts"][0]["thought"])
         call = model["parts"][1]
         self.assertNotIn(_OAUTH_TOKEN, json.dumps(call["functionCall"]["args"]))
-        self.assertEqual(call["thoughtSignature"], "sig")
+        self.assertEqual(call["thoughtSignature"], _RULE_MATCHING_BASE64)
         output = json.dumps(response["parts"][0]["functionResponse"]["response"])
         self.assertNotIn("my-proj-12", output)
         self.assertNotIn("10.0.0.5", output)
@@ -527,6 +527,8 @@ class TestCallback(unittest.TestCase):
                     "content": [
                         {"type": "tool_result", "tool_use_id": "t", "content": f"data:image/png;base64,{secret}"},
                         {"type": "tool_result", "tool_use_id": "u", "content": [{"type": "text", "text": "x", "nested": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": secret}}]}]},
+                        # Two levels down is the tool's own output, not a part.
+                        {"type": "tool_result", "tool_use_id": "v", "content": [{"type": "document", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": secret}}]}]},
                     ],
                 },
             ]
