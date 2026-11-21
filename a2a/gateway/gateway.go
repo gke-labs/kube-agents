@@ -3531,6 +3531,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Depth:        ts.Depth,
 		RootTaskID:   ts.RootTaskID,
 		Request:      ts.Request,
+		LineNote:     ts.LineNote,
 		// What a child of this task inherits (handleDelegateRequest).
 		ChangeRequested: ts.ChangeRequested,
 	}
@@ -3538,7 +3539,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.RootTaskID = taskID
 	}
 	if ts.KeepActive {
-		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
+		ref.StatusMsgID = statusMsgID
 	}
 	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
 	ref.Lineless = lineless

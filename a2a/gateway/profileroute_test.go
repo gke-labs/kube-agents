@@ -684,6 +684,7 @@ func TestARestoredProfileParentGetsItsRollingLineBack(t *testing.T) {
 	r := startProfileRig(t)
 	rec := &SessionRecord{Key: "discord:15/15", ContextID: "ctx-15", Tasks: []TaskRef{
 		{ID: "task-parent", Addressee: "cluster", Tier: "read", CorrelationID: "corr-p", StatusMsgID: "line-1",
+			LineNote: "(delegated to cluster)",
 			Attribution: json.RawMessage(`{"requester":{"backend":"discord","subject":"hmac:00"}}`)},
 		{ID: "task-child", Addressee: "prod-east", Role: taskRoleChild, ParentTaskID: "task-parent"},
 	}}
@@ -697,8 +698,36 @@ func TestARestoredProfileParentGetsItsRollingLineBack(t *testing.T) {
 	if rec.ActiveTask == nil || rec.ActiveTask.StatusMsgID != "line-1" {
 		t.Fatalf("active task = %+v, want the parent's line line-1", rec.ActiveTask)
 	}
+	if rec.ActiveTask.LineNote != "(delegated to cluster)" {
+		t.Fatalf("active task line note = %q, want (delegated to cluster)", rec.ActiveTask.LineNote)
+	}
+	r.g.updateRollingLine(rec, "task-parent", &relayState{state: lib.StateWorking})
+	if edits := r.adapter.editsOf("line-1"); len(edits) != 1 || !strings.HasSuffix(edits[0], "(delegated to cluster)") {
+		t.Fatalf("edits of restored line = %v, want suffix (delegated to cluster)", edits)
+	}
 	if parent, _ := rec.TaskRefFor("task-parent"); parent.StatusMsgID != "" {
 		t.Fatalf("the entry still holds line %q, so two copies would close it", parent.StatusMsgID)
+	}
+}
+
+func TestSetParentLineBackfillsLineNoteFromActiveTask(t *testing.T) {
+	rec := &SessionRecord{Key: "discord:15/16", Tasks: []TaskRef{
+		{ID: "task-parent", StatusMsgID: ""},
+		{ID: "task-other", StatusMsgID: ""},
+	}, ActiveTask: &ActiveTask{TaskID: "task-parent", LineNote: "(delegated to cluster)"}}
+
+	// Identity mismatch: does not backfill from an unrelated active task.
+	setParentLine(rec, "task-other", "line-other")
+	other, _ := rec.TaskRefFor("task-other")
+	if other.LineNote != "" {
+		t.Fatalf("other.LineNote = %q, want empty when active task ID differs", other.LineNote)
+	}
+
+	// Identity match: backfills missing line note on parent.
+	setParentLine(rec, "task-parent", "line-parent")
+	parent, _ := rec.TaskRefFor("task-parent")
+	if parent.LineNote != "(delegated to cluster)" {
+		t.Fatalf("parent.LineNote = %q, want (delegated to cluster)", parent.LineNote)
 	}
 }
 

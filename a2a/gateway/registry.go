@@ -448,17 +448,19 @@ type TaskRef struct {
 	// existed.
 	// StatusMsgID is the rolling-line message of a turn that delegated:
 	// the child takes ActiveTask, and with it the only other copy, so the
-	// parent's line is kept here to close on the parent's terminal. A batch
-	// child, which never takes ActiveTask, keeps its own line here too.
+	// parent's line is kept here to close on the parent's terminal
+	// (relayTerminal) or return to the active task (deliverChildResult).
+	// A batch child, which never takes ActiveTask, keeps its own line here too.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
 	// Lineless marks a task started with no rolling line at all: its
 	// backend shows task status itself (startTaskWith). A canceled one has
 	// no line to close at 🛑, so its terminal posts its one "🛑 canceled"
 	// (relayTerminal). Entries written before it read false, as before.
 	Lineless bool `json:"lineless,omitempty"`
-	// LineNote is a batch child's "(delegated to <addressee>)" note, kept
-	// with its line because the child never holds the active task, whose
-	// LineNote the single-child path reads.
+	// LineNote is the task's "(delegated to <addressee>)" note, kept on
+	// the entry so a batch child, an ending parent (relayTerminal), or a
+	// profile parent restored after its child ends (deliverChildResult)
+	// keeps its line note.
 	LineNote     string   `json:"lineNote,omitempty"`
 	Role         string   `json:"role,omitempty"`
 	ParentTaskID string   `json:"parentTaskId,omitempty"`

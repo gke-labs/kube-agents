@@ -734,7 +734,7 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 	if rec.ActiveTask == nil || rec.ActiveTask.TaskID == child.ID {
 		rec.ActiveTask = &ActiveTask{TaskID: parent.ID, CorrelationID: parent.CorrelationID,
 			Capability: parent.Capability, SubmittedAt: parent.StartedAt, Ask: truncateRunes(parent.Request, askCap),
-			StatusMsgID: parent.StatusMsgID}
+			StatusMsgID: parent.StatusMsgID, LineNote: parent.LineNote}
 		setParentLine(rec, parent.ID, "")
 		rec.Addressee = parent.Addressee
 	}
