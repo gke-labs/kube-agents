@@ -207,9 +207,19 @@ class RefusedContent(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertRefused(BASE.replace("minAvailable: 1  #", f"minAvailable: {value}  #"))
 
-    def test_a_type_change_reaches_allowed_edit_and_is_refused(self):
-        why = self.assertRefused(BASE.replace("minAvailable: 1  #", 'minAvailable: "2"  #'))
-        self.assertIn("does not accept the new value of spec.minAvailable", why)
+    def test_a_type_change_is_refused_before_allowed_edit(self):
+        def accepts_anything(path, old, new):
+            return True
+
+        anything = types.SimpleNamespace(allowed_edit=accepts_anything)
+        for old, new, said in (
+            ("minAvailable: 1  #", 'minAvailable: "2"  #', "spec.minAvailable (int to str)"),
+            ("minAvailable: 1  #", "minAvailable: true  #", "spec.minAvailable (int to bool)"),
+            ('"25%"', "3", "spec.maxUnavailable (str to int)"),
+        ):
+            with self.subTest(new=new):
+                why = self.assertRefused(BASE.replace(old, new), fix=anything)
+                self.assertIn(f"changes the type of {said}", why)
 
     def test_a_value_the_recipe_does_not_allow(self):
         for value in ("0", "11", "-1"):
@@ -251,12 +261,48 @@ class RefusedContent(unittest.TestCase):
 class Hardening(unittest.TestCase):
     def test_a_failing_allowed_edit_is_a_refusal(self):
         def broken(path, old, new):
-            return old < new  # an int compared with a str raises TypeError
+            return {}[path]  # a recipe bug: raises KeyError
 
-        head = BASE.replace("minAvailable: 1  #", 'minAvailable: "2"  #')
+        head = BASE.replace("minAvailable: 1  #", "minAvailable: 2  #")
         with self.assertRaises(ae.EditRefused) as cm:
             verify(head, fix=types.SimpleNamespace(allowed_edit=broken))
-        self.assertIn("allowed_edit failed (TypeError)", str(cm.exception))
+        self.assertIn("allowed_edit failed (KeyError)", str(cm.exception))
+
+    def test_base_drift_repro(self):
+        # The reviewer's repro: the PR edits `checkout`'s budget; main then put a
+        # same-shaped budget, `payments-db`, on top of the file. By line number
+        # the hunk applies to `payments-db`, which git would not edit. The diff
+        # is git's own, so its blob id 6296333 is the real hash of the merge base.
+        budget = (
+            "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: {name}\n  namespace: shop\n"
+            "  labels:\n    team: payments\nspec:\n  minAvailable: 1\n  selector:\n    matchLabels:\n"
+            "      tier: web\n      app: {app}\n"
+        )
+        merge_base = budget.format(name="checkout", app="checkout")
+        base_tip = budget.format(name="payments-db", app="db") + "---\n" + merge_base
+        diff = (
+            "diff --git a/clusters/fleet-1/b.yaml b/clusters/fleet-1/b.yaml\n"
+            "index 6296333..d6adbb7 100644\n"
+            "--- a/clusters/fleet-1/b.yaml\n+++ b/clusters/fleet-1/b.yaml\n"
+            "@@ -6,7 +6,7 @@ metadata:\n   labels:\n     team: payments\n spec:\n-  minAvailable: 1\n+  minAvailable: 2\n"
+            "   selector:\n     matchLabels:\n       tier: web\n"
+        )
+        recipe = registry.parse(
+            "kind: raise-pdb\nname: n\ntitle: t\ndial_environment: dev\n"
+            "verify: edit-manifest\nedit_kind: PodDisruptionBudget\nedit_paths: spec.minAvailable\n"
+        )
+        self.assertTrue(ae.git_blob_id(merge_base).startswith("6296333"))
+        edit = ae.verify_edited_manifest(recipe, FIX, diff, "clusters/fleet-1/b.yaml", merge_base)
+        self.assertEqual(edit.name, "checkout")
+        with self.assertRaises(ae.EditRefused) as cm:
+            ae.verify_edited_manifest(recipe, FIX, diff, "clusters/fleet-1/b.yaml", base_tip)
+        self.assertIn("the base branch moved", str(cm.exception))
+
+    def test_a_raising_allowed_edit_is_one_recipe_refusal(self):
+        # The broker catches EditRefused per recipe, so a recipe bug cannot end the judgement early.
+        with self.assertRaises(ae.EditRefused):
+            verify(BASE.replace("minAvailable: 1  #", "minAvailable: 2  #"),
+                   fix=types.SimpleNamespace(allowed_edit=lambda *a: 1 / 0))
 
     def test_blob_id_is_gits(self):
         # `git hash-object` of "a: 1\n".
