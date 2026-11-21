@@ -23,8 +23,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 )
 
 // DefaultHarnessPath is where the worker image carries the harness: the
@@ -42,6 +44,11 @@ const (
 	// failure message. A tail rather than the whole stream: the useful part
 	// of a crash is its end, and the value rides a status event onto the bus.
 	stderrTailBytes = 2048
+	// stderrScanBytes is how much stderr is held before the scrub, which
+	// runs on the whole window before the tail is cut to stderrTailBytes,
+	// as the bridge scrubs its tails: a value the cut would split is still
+	// whole when it's redacted.
+	stderrScanBytes = 64 << 10
 	// harnessEventDepth buffers events between the scanner goroutine and the
 	// adapter loop, so a slow publish does not stall the read that keeps the
 	// harness's stdout pipe draining.
@@ -97,7 +104,8 @@ type harnessEvent struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype"`
 	// type:"assistant" carries an API Message; content blocks are inspected
-	// for text / thinking / tool_use.
+	// for text / thinking / tool_use. type:"user" carries the tool_result
+	// blocks the harness fed back to the model.
 	Message *harnessMessage `json:"message,omitempty"`
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
@@ -206,7 +214,27 @@ func (ev harnessEvent) telemetry(model string) resultTelemetry {
 }
 
 type harnessMessage struct {
-	Content []harnessBlock `json:"content"`
+	Content harnessContent `json:"content"`
+}
+
+// harnessContent is a message's content blocks. A user message's content may
+// be a plain string (a prompt the harness echoes) rather than a list; it
+// carries no block the adapter reads, so it decodes as none rather than
+// failing the whole line.
+type harnessContent []harnessBlock
+
+func (c *harnessContent) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		*c = nil
+		return nil
+	}
+	var blocks []harnessBlock
+	if err := json.Unmarshal(b, &blocks); err != nil {
+		return err
+	}
+	*c = blocks
+	return nil
 }
 
 type harnessBlock struct {
@@ -215,6 +243,10 @@ type harnessBlock struct {
 	Thinking string          `json:"thinking,omitempty"`
 	Name     string          `json:"name,omitempty"`  // tool_use
 	Input    json.RawMessage `json:"input,omitempty"` // tool_use
+	// Content is a tool_result block's result, as the harness reported it
+	// on a user message: a JSON string, or a list of content blocks (text,
+	// image). Read only for the answer's scrub (adapter.collectToolResults).
+	Content json.RawMessage `json:"content,omitempty"`
 }
 
 // userMessage is the stream-json stdin shape for both the opening prompt and
@@ -289,7 +321,7 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 	if err != nil {
 		return nil, fmt.Errorf("harness stdout: %w", err)
 	}
-	stderr := &tailBuffer{max: stderrTailBytes}
+	stderr := &tailBuffer{max: stderrScanBytes}
 	cmd.Stderr = stderr
 	// WaitDelay bounds every reap. A descendant that left the process group
 	// survives the group kill and can hold stderr open, and Wait reads stderr
@@ -413,7 +445,7 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 		if errors.Is(serr, os.ErrClosed) {
 			serr = nil
 		}
-		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence())
+		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence(answerscrub.ScrubInline))
 	}
 	return p, nil
 }
@@ -482,12 +514,26 @@ func exitEvidence(waitErr error) string {
 // stderrEvidence is the harness's stderr tail as a failure reason carries
 // it, or nothing when the harness wrote none. Call it after Wait, which is
 // what guarantees the tail holds everything the harness wrote.
-func (p *harnessProc) stderrEvidence() string {
-	tail := strings.TrimSpace(p.stderr.String())
+// stderrEvidence is the stderr tail for a failure reason: the held window
+// scrubbed whole, then cut to its last stderrTailBytes.
+func (p *harnessProc) stderrEvidence(scrub func(string) string) string {
+	tail := strings.TrimSpace(scrub(p.stderr.String()))
 	if tail == "" {
 		return ""
 	}
-	return stderrTailHeading + tail
+	return stderrTailHeading + lastBytes(tail, stderrTailBytes)
+}
+
+// lastBytes is s cut to its last max bytes, on a rune boundary.
+func lastBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	i := len(s) - max
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
 
 // writeUser writes one user message line onto the harness stdin. Steers

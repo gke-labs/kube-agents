@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 )
 
 // Config is the adapter's contract with its pod: everything here arrives as
@@ -398,6 +401,13 @@ type adapter struct {
 	// and finalize sees it first, they all see it after.
 	abandonSeen   bool
 	abandonReason string
+
+	// seen is this task's set of secret values its tool results carried
+	// (answerscrub.Seen), fed from the harness's tool_result blocks
+	// (collectToolResults) and redacted out of every model-written text the
+	// task publishes (scrub). The adapter is per task, so the set is too,
+	// and finalize clears and closes it.
+	seen answerscrub.Seen
 }
 
 // errAbandoned is finalize's answer for an abandoned task: no terminal went
@@ -989,6 +999,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
+			case "user":
+				a.collectToolResults(ev)
 			case "result":
 				// What the turn cost goes out first, whatever the turn
 				// decided: a delegating turn, a steered one and an errored
@@ -1159,6 +1171,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	switch {
 	case a.abandoned():
 		return Result{Abandoned: true}, nil
+	case sawResult && resultErr == "" && !delegated && answerscrub.OpensWithUnstructuredReasoning(resultText):
+		// The model's reasoning, not an answer (#3206): withheld, as the
+		// bridge withholds it, with the harness session if one is known.
+		a.log.Warn("answer withheld: it opens with a thought line (unstructured model reasoning)",
+			"task", a.taskID, "harnessSession", a.harnessSession, "bytes", len(resultText),
+			"reason", answerscrub.UnstructuredReasoningToken)
+		state := lib.StateFailed
+		return Result{State: state}, a.finalize(state, unstructuredReasoningReason(a.harnessSession), "")
 	case sawResult && resultErr == "":
 		return a.completeWith(resultText)
 	case sawResult:
@@ -1175,15 +1195,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		state := lib.StateFailed
 		reason := "reason: stream-ended-without-result" +
 			reapEvidence(waitErr, reapTook, proc.cmd.WaitDelay) +
-			scanEvidence(proc.scanErr()) +
-			proc.stderrEvidence()
+			a.scrub(scanEvidence(proc.scanErr())) + proc.stderrEvidence(a.scrub)
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
 }
 
 // completeWith publishes the deliverable and the completed terminal: the
-// harness's clean result, or a delegating turn's one-line result. A result
-// that cannot be published fails the task with the publish error.
+// harness's clean result, a delegating turn's one-line result, or a script
+// run's output. The deliverable is scrubbed (publishResult). A result that
+// cannot be published fails the task with the publish error.
 func (a *adapter) completeWith(resultText string) (Result, error) {
 	if err := a.publishResult(resultText); err != nil {
 		state := lib.StateFailed
@@ -1240,17 +1260,28 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 	for _, block := range ev.Message.Content {
 		switch block.Type {
 		case "thinking":
-			if block.Thinking != "" {
-				a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: block.Thinking}, false)
+			// Scrubbed as the answer is before it's published: the debug
+			// and audit views read it from TASKS.
+			if text := a.scrub(block.Thinking); text != "" {
+				a.publishArtifactChunk(ctx, lib.ArtifactThinking, lib.Part{Kind: "text", Text: text}, false)
 			}
 		case "text":
-			if block.Text != "" {
-				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: block.Text}, false)
+			// The model's prose is scrubbed as the answer is (scrub). A block
+			// that opens with unstructured reasoning isn't published at all:
+			// the harness's result is its last text block, and an answer
+			// withheld at the end must not already be on TASKS as progress.
+			if answerscrub.OpensWithUnstructuredReasoning(block.Text) {
+				continue
+			}
+			if text := a.scrub(block.Text); text != "" {
+				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: text}, false)
 			}
 		case "tool_use":
+			// The bridge's shape: the tool and a short scrubbed title, no
+			// arguments (activityTitle).
 			entry, err := json.Marshal(map[string]any{
 				"tool":  block.Name,
-				"input": json.RawMessage(block.Input),
+				"title": a.scrub(activityTitle(block.Name, block.Input)),
 			})
 			if err != nil {
 				continue
@@ -1306,7 +1337,7 @@ func (a *adapter) publishArtifactPart(ctx context.Context, name string, part lib
 // "delegated" for a request the gateway never saw waits for a wake that
 // never comes.
 func (a *adapter) publishDelegate(ctx context.Context, req lib.DelegateRequest) error {
-	data, err := json.Marshal(req)
+	data, err := json.Marshal(a.scrubDelegate(req))
 	if err != nil {
 		return err
 	}
@@ -1315,13 +1346,43 @@ func (a *adapter) publishDelegate(ctx context.Context, req lib.DelegateRequest) 
 	return a.publishArtifactPart(ctx, lib.ArtifactDelegate, lib.Part{Kind: "data", Data: data}, false, true)
 }
 
-// publishResult publishes the deliverable as the result artifact, chunked.
-// Empty output still yields one empty chunk: completed must carry a result
-// artifact (assertion 18).
+// scrubDelegate is a delegation with its texts scrubbed as the answer is:
+// the child's request is the model's text, and its parameters' values are
+// too. The maps are copied, not changed in place.
+func (a *adapter) scrubDelegate(req lib.DelegateRequest) lib.DelegateRequest {
+	req.Text = a.scrub(req.Text)
+	req.Parameters = a.scrubParameters(req.Parameters)
+	if len(req.Tasks) > 0 {
+		tasks := make([]lib.DelegateTask, len(req.Tasks))
+		for i, t := range req.Tasks {
+			t.Text = a.scrub(t.Text)
+			t.Parameters = a.scrubParameters(t.Parameters)
+			tasks[i] = t
+		}
+		req.Tasks = tasks
+	}
+	return req
+}
+
+// scrubParameters is a copy of params with each value scrubbed.
+func (a *adapter) scrubParameters(params map[string]string) map[string]string {
+	if params == nil {
+		return nil
+	}
+	out := make(map[string]string, len(params))
+	for k, v := range params {
+		out[k] = a.scrub(v)
+	}
+	return out
+}
+
+// publishResult publishes the deliverable as the result artifact, scrubbed
+// (scrub) and then chunked. Empty output still yields one empty chunk:
+// completed must carry a result artifact (assertion 18).
 func (a *adapter) publishResult(text string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), terminalPublishTimeout)
 	defer cancel()
-	chunks := chunkString(text, resultChunkSize)
+	chunks := chunkString(a.scrub(text), resultChunkSize)
 	for i, chunk := range chunks {
 		if err := a.publishArtifactPart(ctx, lib.ArtifactResult, lib.Part{Kind: "text", Text: chunk},
 			i > 0, i == len(chunks)-1); err != nil {
@@ -1400,7 +1461,7 @@ func truncateRunes(s string, n int) string {
 // finalize publishes the one terminal event, exactly once per process, on a
 // fresh context (the caller's may already be dead - eviction). A reason
 // travels as the status message; evidence (partial output) rides along when
-// present.
+// present, scrubbed (scrub). The task's seen-values set is cleared after.
 func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	if a.abandoned() {
 		return errAbandoned
@@ -1421,7 +1482,11 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 		err = a.exec.PublishStatus(ctx, state, true)
 	} else {
 		text := reason
-		if evidence != "" {
+		if answerscrub.OpensWithUnstructuredReasoning(evidence) {
+			// The same rule as the result: withheld, not attached.
+			evidence = ""
+		}
+		if evidence = a.scrub(evidence); evidence != "" {
 			text += "\npartial output:\n" + truncate(evidence, failureEvidenceCap)
 		}
 		update := lib.StatusUpdate{
@@ -1459,7 +1524,80 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	a.mu.Lock()
 	a.finalErr = err
 	a.mu.Unlock()
+	a.clearSeen()
 	return err
+}
+
+// collectToolResults hands each tool_result block on one user message to the
+// task's seen-values set (answerscrub.Seen.CollectToolResult), one call per
+// result. The harness reports a result's content as a JSON string, which
+// goes in as it is, or as a list of content blocks, whose text blocks go in
+// as one JSON list of strings (an image's data is not read).
+func (a *adapter) collectToolResults(ev harnessEvent) {
+	if ev.Message == nil {
+		return
+	}
+	for _, block := range ev.Message.Content {
+		if block.Type != "tool_result" || len(block.Content) == 0 {
+			continue
+		}
+		a.seen.CollectToolResult(toolResultRaw(block.Content))
+	}
+}
+
+// toolResultRaw is the raw JSON CollectToolResult reads for one tool_result
+// block's content: a string as it is; a list of blocks as the list of its
+// text blocks' texts; anything else as it is.
+func toolResultRaw(content json.RawMessage) json.RawMessage {
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return content
+	}
+	texts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			texts = append(texts, b.Text)
+		}
+	}
+	raw, err := json.Marshal(texts)
+	if err != nil {
+		return content
+	}
+	return raw
+}
+
+// scrub is what of a model-written text this task publishes: the task's seen
+// values exact-matched out, then the shape rules (answerscrub.Scrub), one
+// shared implementation for the bridge and session paths.
+func (a *adapter) scrub(text string) string {
+	if text == "" {
+		return ""
+	}
+	return answerscrub.Scrub(text, &a.seen)
+}
+
+// clearSeen empties and closes the task's seen-values set, and says at debug
+// how many values the set refused because a pool was full: a count only,
+// never a value.
+func (a *adapter) clearSeen() {
+	if n := a.seen.Clear(); n > 0 {
+		a.log.Debug(fmt.Sprintf("seen-set refused %d values", n), "task", a.taskID, "refused", n)
+	}
+}
+
+// unstructuredReasoningReason is the terminal message for an answer withheld
+// because it opens with unstructured reasoning: the bridge's token and
+// notice, and the harness session when one is known. The answer's text stays
+// out.
+func unstructuredReasoningReason(harnessSession string) string {
+	reason := fmt.Sprintf("reason: %s - %s", answerscrub.UnstructuredReasoningToken, answerscrub.UnstructuredReasoningNotice)
+	if harnessSession != "" {
+		reason += "; session: " + harnessSession
+	}
+	return reason
 }
 
 // sessionConsumer creates one of the adapter's three consumers, by name.
@@ -2047,4 +2185,98 @@ func chunkString(s string, size int) []string {
 		chunks = append(chunks, s)
 	}
 	return chunks
+}
+
+// activityTitle is a tool call's title for the activity artifact, with none
+// of its arguments: a shell command's program and subcommand, a file tool's
+// file name, otherwise the tool's name. It goes through the scrub's shape
+// rules here, and the caller scrubs it again with the task's seen values, so
+// a seen value that looks like a bare word is redacted too.
+func activityTitle(tool string, input json.RawMessage) string {
+	var args map[string]any
+	_ = json.Unmarshal(input, &args)
+	str := func(k string) string { v, _ := args[k].(string); return strings.TrimSpace(v) }
+	title := tool
+	switch tool {
+	case "Bash":
+		if bin, sub := leadingCommand(str("command")); bin != "" {
+			title = strings.TrimSpace(tool + " " + bin + " " + sub)
+		}
+	case "Read", "Write", "Edit", "NotebookEdit":
+		path := str("file_path")
+		if path == "" {
+			path = str("notebook_path")
+		}
+		if path != "" {
+			title = tool + " " + filepath.Base(path)
+		}
+	}
+	return answerscrub.ScrubInline(title)
+}
+
+// leadingCommand is a shell command's program (its base name) and, when the
+// next word isn't a flag, an assignment or a quoted or path-like value, its
+// subcommand. Nothing after those two words is kept.
+func leadingCommand(cmd string) (bin, sub string) {
+	fields := strings.Fields(cmd)
+	i := 0
+	for i < len(fields) && strings.Contains(fields[i], "=") && !strings.HasPrefix(fields[i], "-") {
+		// Leading VAR=value assignments are dropped, but only plain ones:
+		// a quote, an escape or a substitution means the word split may not
+		// be the shell's, so there's no program to name with confidence.
+		if !simpleAssignment.MatchString(fields[i]) {
+			return "", ""
+		}
+		i++
+	}
+	if i >= len(fields) {
+		return "", ""
+	}
+	bin = filepath.Base(fields[i])
+	if !bareWord(bin) {
+		// Not a command name (a quoted value split on its spaces, say):
+		// no program at all rather than a guess.
+		return "", ""
+	}
+	if verbCLIs[bin] && i+1 < len(fields) && lowerVerb(fields[i+1]) {
+		sub = fields[i+1]
+	}
+	return bin, sub
+}
+
+// simpleAssignment is a leading NAME=value word with nothing a shell would
+// treat specially in the value.
+var simpleAssignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,-]*$`)
+
+// verbCLIs are the programs whose first argument is a verb worth a title
+// (kubectl get, git status). Any other program's next word could be data, so
+// its title is the program alone.
+var verbCLIs = map[string]bool{"kubectl": true, "gcloud": true, "git": true, "helm": true, "gh": true, "terraform": true, "docker": true, "kustomize": true}
+
+// lowerVerb reports whether w is a lowercase verb: a-z and '-', 2 to 20 bytes.
+func lowerVerb(w string) bool {
+	if len(w) < 2 || len(w) > 20 {
+		return false
+	}
+	for _, r := range w {
+		if !(r >= 'a' && r <= 'z' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// bareWord reports whether w looks like a command or subcommand name:
+// letters, digits, '-', '_' and '.', not starting with '-' or '.', at most
+// 32 bytes. A flag, an assignment, a path, a URL or a quoted value isn't.
+func bareWord(w string) bool {
+	if w == "" || len(w) > 32 || w[0] == '-' || w[0] == '.' {
+		return false
+	}
+	for _, r := range w {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
