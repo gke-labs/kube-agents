@@ -1,5 +1,5 @@
 {
-  "version": "d96d0de3efed8422",
+  "version": "a651c97dcd131f96",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -231,8 +231,10 @@
           "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-tse-read-child",
           "$JS.ACK.PROFILE_SUBMITS.profile-tse-read-child.>",
           "a2a.tasks.gone.*.supervisor",
+          "a2a.tasks.p.gone.*.supervisor",
           "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.gone.*",
           "a2a.tasks.tse.*.supervisor",
+          "a2a.tasks.p.tse.*.supervisor",
           "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.*",
           "$KV.PROFILE_LEASES.>",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
