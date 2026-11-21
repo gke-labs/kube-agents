@@ -1,5 +1,5 @@
 {
-  "description": "Synthetic tool results labelled halt or no_halt for a definitive write refusal. Read by deploy/docker/patches/test_permission_refusal_stop.py (permission_refusal_stop.classify_refusal) and a2a/worker-adapter/refusal_test.go (classifyRefusal), so the two predicates cannot drift. kind is the classification both must return; failed is the call's failure flag; argv, where present, lists the refused argvs whose shim lines make up result, and the Python test checks result against command_policy.py's current text.",
+  "description": "Synthetic tool results labelled halt or no_halt for a definitive write refusal, as the Hermes runtime's text stop classifies them. Read by deploy/docker/patches/test_permission_refusal_stop.py (permission_refusal_stop.classify_refusal), which also checks that the broker's write_refusal mark agrees with each halt case's argv, and by a2a/worker-adapter/refusal_test.go, which feeds the halt cases to a profile worker as tool output that must not stop it: that worker stops only on the broker client's record. kind is the classification the text stop must return; failed is the call's failure flag; argv, where present, lists the refused argvs whose shim lines make up result, and the Python test checks result against command_policy.py's current text.",
   "cases": [
     {
       "name": "refused scale",

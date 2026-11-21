@@ -1998,6 +1998,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 status, body = self.vcs_post(verb, None)
                 self.assert_permit_refused(verb, status, body)
                 self.assertIn("needs a task credential", body["error"])
+                # Every verb is refused without a credential, reads too: not a write's refusal.
+                self.assertIs(False, body[credential_proxy.WRITE_REFUSAL_KEY])
 
     def test_a_refused_credential_is_refused_whole(self):
         status, body = self.vcs_post("publish", CASES["permits on the nats audience"]["token"])
@@ -2015,6 +2017,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
                     status, body = self.vcs_post(spelling, VALID["token"])
                     self.assert_permit_refused(verb, status, body)
                     self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, body["error"])
+                    # A definitive write refusal, which the in-pod client records.
+                    self.assertIs(True, body[credential_proxy.WRITE_REFUSAL_KEY])
 
     def test_a_refused_write_with_a_large_body_still_reads_its_403(self):
         """The refusal comes before the body is read; the broker drains it first,

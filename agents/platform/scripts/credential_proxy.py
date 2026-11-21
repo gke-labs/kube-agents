@@ -1510,6 +1510,14 @@ RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
 # The refusal code a profile caller gets for a version-control verb its task
 # credential doesn't cover (no credential, or a write without the permit).
 CALLER_PERMIT_REQUIRED_CODE = "CALLER_PERMIT_REQUIRED"
+# A refusal body's mark of a definitive write refusal: a write refused however
+# it is attempted, which a retry or another spelling cannot get through. Set on
+# the read-only rule's refusal of a mutating kubectl verb (read_only_refusal)
+# and on a profile task's permit-gated version-control write refused for want
+# of the permit. The in-pod client (credential_proxy_client.WRITE_REFUSAL_KEY)
+# records such a refusal for the profile worker, which stops the task at the
+# first one; every other refusal carries it false or not at all.
+WRITE_REFUSAL_KEY = "write_refusal"
 # A profile caller's permitted write that names a proposal or branch this
 # install does not own (VcsBroker.require_agent_proposal, #3993).
 RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
@@ -2709,6 +2717,14 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
             "published only for a request that asked for one"
         )
     return None
+
+
+def profile_vcs_write_refused(principal: Any, verb: str) -> bool:
+    """Whether ``profile_vcs_refusal`` refused a write: a permit-gated verb from a
+    task whose credential carries no permit. A caller with no task credential at
+    all is refused every verb, reads included, so that refusal is not a write's.
+    """
+    return getattr(principal, "task", None) is not None and verb in PROFILE_PERMIT_GATED_VCS_VERBS
 
 
 # What a profile caller's issue-list `query` may not hold, because each can
@@ -13906,8 +13922,10 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     # so the shim can print them beside the rule: the agent runtime's refusal
     # stop reads those lines instead of re-deriving the verb from shell text.
     verb_words = list(decision.verb_tuple) if decision.verb_tuple else None
-    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE:
+    read_only_rule = decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE
+    if verb_words and read_only_rule:
         verb_words = verb_words[:2] if verb_words[1:2] and verb_words[1] in _KUBECTL_SUBCOMMANDS.get(verb_words[0], ()) else verb_words[:1]
+    rendered = read_only_rule and command_policy.local_render(argv)
     return (
         {
             "status": "blocked",
@@ -13915,7 +13933,13 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
             "rule": decision.rule_id,
             "message": decision.message,
             "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in verb_words] if verb_words else None,
-            "local_render": decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and command_policy.local_render(argv),
+            "local_render": rendered,
+            # A definitive write refusal: the read-only rule refused a mutating
+            # kubectl verb that was not a local render. The in-pod client
+            # records it for the profile worker's stop (WRITE_REFUSAL_KEY).
+            WRITE_REFUSAL_KEY: read_only_rule
+            and not rendered
+            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),
         },
         log_hint,
     )
@@ -17760,6 +17784,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "error": refusal,
                         "code": CALLER_PERMIT_REQUIRED_CODE,
                         "rule": RULE_CALLER_VCS_PERMIT,
+                        WRITE_REFUSAL_KEY: profile_vcs_write_refused(principal, verb),
                     },
                 )
                 return TOOL_STATUS_BLOCKED

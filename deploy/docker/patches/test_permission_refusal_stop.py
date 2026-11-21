@@ -374,8 +374,10 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(observe(controller, REFUSAL).action, "halt")
 
 
-#: The tool results this module and the profile worker's stop (a2a/worker-adapter/refusal.go)
-#: both classify, each labelled halt or no_halt, so the two predicates cannot drift.
+#: Tool results labelled halt or no_halt for this module. The profile worker does not read tool
+#: output: it stops on the broker client's record of a refusal the broker marked a write
+#: (a2a/worker-adapter/refusal.go), and its tests feed the halt cases as tool output that must
+#: not stop it. The broker's mark and this module's halt agree on the cases' argvs (below).
 _SHARED_FIXTURE = Path(__file__).resolve().parents[3] / "tests" / "conformance" / "fixtures" / "write-refusal-results.json"
 
 
@@ -404,6 +406,32 @@ class SharedFixtureTests(unittest.TestCase):
         for case in self.cases:
             if "argv" in case:
                 self.assertEqual(case["result"], "\n".join(shim_lines(a) for a in case["argv"]), case["name"])
+
+    def test_the_brokers_write_mark_agrees_with_the_halt_on_each_refused_kubectl_argv(self):
+        # credential_proxy.read_only_refusal marks a refusal ``write_refusal`` from the same
+        # policy reads: the read-only rule, a mutating verb, not a local render.
+        def marked(argv):
+            decision = command_policy.evaluate(argv)
+            return (
+                not decision.allowed
+                and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE
+                and not command_policy.local_render(argv)
+                and command_policy.kubectl_verb_is_mutating(decision.verb_tuple)
+            )
+
+        for case in self.cases:
+            argvs = [a for a in case.get("argv", ()) if a[0] == "kubectl"]
+            if not argvs:
+                continue
+            with self.subTest(case["name"]):
+                if case["expect"] == "halt":
+                    self.assertTrue(any(marked(a) for a in argvs), case["name"])
+                elif case["failed"] and case["kind"] == "advisory":
+                    self.assertFalse(any(marked(a) for a in argvs), case["name"])
+
+    def test_the_mutating_verb_tables_are_the_policys(self):
+        self.assertEqual(stop.MUTATING_VERBS, command_policy.KUBECTL_MUTATING_VERBS)
+        self.assertEqual(stop.MUTATING_SUBVERBS, command_policy.KUBECTL_MUTATING_SUBVERBS)
 
 
 class NudgeTests(unittest.TestCase):

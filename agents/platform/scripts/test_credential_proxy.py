@@ -2838,10 +2838,12 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual("kubernetes.read-only", body["rule"])
         self.assertEqual(["scale"], body["verb"], "the positional after the verb is the caller's and stays out of the body")
         self.assertFalse(body["local_render"])
+        self.assertIs(True, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
         self.assertEqual(403, status)
         self.assertEqual(["create"], body["verb"])
         self.assertTrue(body["local_render"])
+        self.assertIs(False, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "rollout", "restart", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
         self.assertEqual(["rollout", "restart"], body["verb"])
         status, body = self.post({"argv": ["kubectl", "certificate", "approve", "csr-tenant-b"], "cwd": "/tmp"})
@@ -10937,6 +10939,30 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertIsNotNone(refusal)
         self.assertEqual("kubernetes.read-only", refusal["rule"])
         self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
+
+    def test_only_a_refused_kubectl_write_is_marked_a_write_refusal(self):
+        # The mark the in-pod client records for a profile worker's stop
+        # (credential_proxy_client.record_write_refusal).
+        writes = (
+            ["kubectl", "delete", "ns", "prod"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3"],
+            ["kubectl", "rollout", "restart", "deploy/x"],
+            ["kubectl", "certificate", "approve", "csr-1"],
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=server"],
+        )
+        for argv in writes:
+            with self.subTest(argv=argv):
+                self.assertIs(True, self._decide(argv)[credential_proxy.WRITE_REFUSAL_KEY])
+        not_writes = (
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"],  # a local render
+            ["kubectl", "exec", "web-0", "--", "sh"],  # refused, but not a state change the runtime stops on
+            ["kubectl", "rollout", "csr-tenant-b", "deploy/x"],  # a positional, not a subverb
+            ["kubectl", "--as=admin", "get", "pods"],  # a flag rule
+            ["gcloud", "container", "clusters", "delete", "prod"],  # gcp.read-only: also refuses unlisted reads
+        )
+        for argv in not_writes:
+            with self.subTest(argv=argv):
+                self.assertIs(False, self._decide(argv).get(credential_proxy.WRITE_REFUSAL_KEY, False))
 
     def test_the_gate_can_be_switched_off(self):
         CredentialProxyHandler.enforce_read_only = False

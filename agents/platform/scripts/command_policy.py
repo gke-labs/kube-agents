@@ -1636,6 +1636,35 @@ def local_render(argv: list[str]) -> bool:
     return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
 
 
+# The kubectl verbs that change state (``debug`` starts a pod or container), and
+# the verbs whose second word decides. A ``kubernetes.read-only`` refusal of one
+# of these, not a local render, is a definitive write refusal: the broker marks
+# its refusal body so (credential_proxy.read_only_refusal, ``write_refusal``),
+# and a profile worker stops its task on the in-pod client's record of it. The
+# Hermes runtime's text stop holds the same two tables
+# (deploy/docker/patches/permission_refusal_stop.py MUTATING_VERBS and
+# MUTATING_SUBVERBS); test_permission_refusal_stop holds them equal.
+KUBECTL_MUTATING_VERBS = frozenset({
+    "scale", "patch", "edit", "apply", "replace", "autoscale", "annotate", "label", "create",
+    "delete", "set", "run", "expose", "cordon", "uncordon", "drain", "taint", "debug",
+})
+KUBECTL_MUTATING_SUBVERBS: dict[str, frozenset[str]] = {
+    "rollout": frozenset({"restart", "undo", "pause", "resume"}),
+    "auth": frozenset({"reconcile"}),
+    "certificate": frozenset({"approve", "deny"}),
+}
+
+
+def kubectl_verb_is_mutating(verb_words) -> bool:
+    """Whether the kubectl verb the policy resolved (``Decision.verb_tuple``) changes state."""
+    if not verb_words:
+        return False
+    head = verb_words[0]
+    if head in KUBECTL_MUTATING_SUBVERBS:
+        return len(verb_words) > 1 and verb_words[1] in KUBECTL_MUTATING_SUBVERBS[head]
+    return head in KUBECTL_MUTATING_VERBS
+
+
 def _refused_flags(tool: str) -> frozenset[str]:
     """Every flag the policy refuses by name for `tool`, whatever the command."""
     if tool == "kubectl":

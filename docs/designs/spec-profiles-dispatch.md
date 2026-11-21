@@ -437,16 +437,26 @@ leave open:
   refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
   SIGTERM ends it as `worker-evicted`.
 
-- **Write refusals.** A model-turn task's worker reads each tool result in the harness's
-  stream-json. At the first definitive write refusal it stops the harness (closed stdin, SIGTERM to
-  its process group, SIGKILL after the kill grace) and ends the task `rejected` with
-  `reason: write-refused`, whose detail names the policy rule and the refused verb and carries no
-  other tool output. The predicate is the Hermes runtime's
-  (`deploy/docker/patches/permission_refusal_stop.py`): the action boundary notice and a
-  `kubernetes.read-only` block whose `policy verb:` is a mutating kubectl verb, with no
-  `policy render: local` line. A `gcp.read-only` refusal, a refused read spelling, a local render
-  and an API 403 don't stop the task. Both runtimes are tested against
-  `tests/conformance/fixtures/write-refusal-results.json`.
+- **Write refusals.** A model-turn task's worker stops at the first write refusal the broker
+  marked definitive, and reads no tool output to find it. The broker marks its 403 body
+  `write_refusal: true` when the `kubernetes.read-only` rule refuses a mutating kubectl verb that
+  is not a local render, or when a profile task's `publish`, `proposal-create` or
+  `proposal-update` is refused for want of the permit. On such a refusal the in-pod broker client
+  appends one JSON record (task, rule, verb, route, time) to the file the worker names in
+  `CREDENTIAL_PROXY_REFUSAL_FILE`: `write-refusals` on the task token's tmpfs, made empty before
+  the harness starts and removed after. The client opens it append-only, without following a
+  symlink and without creating it, and a missing or unwritable file is a line on stderr. After
+  each tool-result line the worker reads the file. At the first record it stops the harness
+  (closed stdin, SIGTERM to its process group, SIGKILL after the kill grace) and ends the task
+  `rejected` with `reason: write-refused`, whose detail names the record's rule and verb and
+  carries no other output. A `gcp.read-only` refusal, a refused read spelling, a local render, an
+  MCP relay refusal and an API 403 don't stop the task. The broker refuses the write whether or
+  not the task stops, so a lost record only lets the task run on. Every route a definitive write
+  refusal can take to the model runs through the client: `kubectl` and `gcloud` on a profile
+  worker are the broker shim, and the version-control skill calls the broker through it. The
+  routes that don't (the MCP relay, the stock kubectl binary run directly, a direct HTTP call to
+  the broker or the cluster API, local git, the harness's file and web tools) carry no definitive
+  write refusal; `a2a/worker-adapter/refusal.go` lists them.
 
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every

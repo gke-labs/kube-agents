@@ -148,11 +148,16 @@ type Config struct {
 	// configuration in which this executor runs work a verifier refused.
 	CapabilityOptional bool
 
-	// StopOnWriteRefusal stops the harness at the first tool result that
-	// carries a definitive write refusal (refusal.go) and ends the task
-	// rejected with the refused rule and verb. applyDefaults sets it for a
-	// profile pod (ProfileExecutor); a test sets it directly.
+	// StopOnWriteRefusal stops the harness at the first definitive write
+	// refusal the broker client recorded in WriteRefusalFile (refusal.go)
+	// and ends the task rejected with the refused rule and verb. No tool
+	// output is read for it. applyDefaults sets it for a profile pod
+	// (ProfileExecutor); a test sets it directly.
 	StopOnWriteRefusal bool
+	// WriteRefusalFile is the task's record file (EnvWriteRefusalFile),
+	// which the profile worker makes beside the task token. Empty reads
+	// nothing, and the task is never stopped at a refusal.
+	WriteRefusalFile string
 
 	// TaskDeadline bounds the harness wall clock below the pod's own
 	// activeDeadlineSeconds so the failure is ours to report, not the
@@ -956,10 +961,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		pendingTurns = 1
 		// refused is the definitive write refusal that stopped the harness
 		// (StopOnWriteRefusal): the task's end is decided, and nothing the
-		// harness says after it changes that. toolCommands maps each tool
-		// call's id to its input's text, which the refusal predicate reads.
-		refused      *writeRefusal
-		toolCommands = map[string]string{}
+		// harness says after it changes that.
+		refused *writeRefusal
+		// refusalReadFailed keeps an unreadable record file to one log line.
+		refusalReadFailed bool
 	)
 
 	// stopForAbandon reports an abandon, from whichever arm finds it first,
@@ -1011,20 +1016,25 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					}
 				}
 			case "assistant":
-				if a.cfg.StopOnWriteRefusal {
-					recordToolCommands(toolCommands, ev)
-				}
 				a.publishAssistant(ctx, ev)
 			case "user":
-				if !a.cfg.StopOnWriteRefusal || sawResult || delegated || canceled || deadlineHit {
+				// A user line carries tool results: each call that wrote a
+				// record has exited before its result is printed. Only the
+				// record is read, never the results.
+				if !a.cfg.StopOnWriteRefusal || a.cfg.WriteRefusalFile == "" || sawResult || delegated || canceled || deadlineHit {
 					continue
 				}
-				if refused = firstWriteRefusal(toolCommands, ev); refused != nil {
+				r, err := readWriteRefusal(a.cfg.WriteRefusalFile, a.taskID)
+				if err != nil && !refusalReadFailed {
+					refusalReadFailed = true
+					log.Warn("the write-refusal record can't be read; the task runs on", "task", a.taskID, "err", err)
+				}
+				if refused = r; refused != nil {
 					// Stopped the way cancel stops it: closed stdin, SIGTERM
 					// to the process group, SIGKILL after KillGrace. The loop
 					// still drains its stdout and reaps it before the
 					// terminal below.
-					log.Info("a tool result carries a definitive write refusal; stopping the harness",
+					log.Info("the broker refused a write; stopping the harness",
 						"task", a.taskID, "rule", refused.rule, "verb", refused.verb)
 					proc.closeStdin()
 					proc.kill(a.cfg.KillGrace)
@@ -1235,36 +1245,6 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 func (a *adapter) endRefused(r *writeRefusal) (Result, error) {
 	state := lib.StateRejected
 	return Result{State: state}, a.finalize(state, writeRefusedReason(r), "")
-}
-
-// recordToolCommands keeps each tool call's input text by its id, for the
-// tool result that answers it.
-func recordToolCommands(commands map[string]string, ev harnessEvent) {
-	if ev.Message == nil {
-		return
-	}
-	for _, block := range ev.Message.Content {
-		if block.Type == "tool_use" && block.ID != "" {
-			commands[block.ID] = toolCommandText(block.Input)
-		}
-	}
-}
-
-// firstWriteRefusal is the first definitive write refusal among a user
-// line's tool results, or nil.
-func firstWriteRefusal(commands map[string]string, ev harnessEvent) *writeRefusal {
-	if ev.Message == nil {
-		return nil
-	}
-	for _, block := range ev.Message.Content {
-		if block.Type != "tool_result" {
-			continue
-		}
-		if r := definitiveRefusal(commands[block.ToolUseID], toolResultText(block.Content), block.IsError); r != nil {
-			return r
-		}
-	}
-	return nil
 }
 
 // completeWith publishes the deliverable and the completed terminal: the
