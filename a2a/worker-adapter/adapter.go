@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1346,19 +1347,33 @@ func (a *adapter) publishDelegate(ctx context.Context, req lib.DelegateRequest) 
 }
 
 // scrubDelegate is a delegation with its texts scrubbed as the answer is:
-// the child's request is the model's text. Parameters are the card's checked
-// fields and go as written.
+// the child's request is the model's text, and its parameters' values are
+// too. The maps are copied, not changed in place.
 func (a *adapter) scrubDelegate(req lib.DelegateRequest) lib.DelegateRequest {
 	req.Text = a.scrub(req.Text)
+	req.Parameters = a.scrubParameters(req.Parameters)
 	if len(req.Tasks) > 0 {
 		tasks := make([]lib.DelegateTask, len(req.Tasks))
 		for i, t := range req.Tasks {
 			t.Text = a.scrub(t.Text)
+			t.Parameters = a.scrubParameters(t.Parameters)
 			tasks[i] = t
 		}
 		req.Tasks = tasks
 	}
 	return req
+}
+
+// scrubParameters is a copy of params with each value scrubbed.
+func (a *adapter) scrubParameters(params map[string]string) map[string]string {
+	if params == nil {
+		return nil
+	}
+	out := make(map[string]string, len(params))
+	for k, v := range params {
+		out[k] = a.scrub(v)
+	}
+	return out
 }
 
 // publishResult publishes the deliverable as the result artifact, scrubbed
@@ -2206,10 +2221,10 @@ func leadingCommand(cmd string) (bin, sub string) {
 	fields := strings.Fields(cmd)
 	i := 0
 	for i < len(fields) && strings.Contains(fields[i], "=") && !strings.HasPrefix(fields[i], "-") {
-		// Leading VAR=value assignments are dropped. One whose quote
-		// doesn't close in the same word was split on its spaces: what
-		// follows is still its value, so there's no program to name.
-		if strings.Count(fields[i], "'")%2 == 1 || strings.Count(fields[i], "\"")%2 == 1 {
+		// Leading VAR=value assignments are dropped, but only plain ones:
+		// a quote, an escape or a substitution means the word split may not
+		// be the shell's, so there's no program to name with confidence.
+		if !simpleAssignment.MatchString(fields[i]) {
 			return "", ""
 		}
 		i++
@@ -2228,6 +2243,10 @@ func leadingCommand(cmd string) (bin, sub string) {
 	}
 	return bin, sub
 }
+
+// simpleAssignment is a leading NAME=value word with nothing a shell would
+// treat specially in the value.
+var simpleAssignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,-]*$`)
 
 // verbCLIs are the programs whose first argument is a verb worth a title
 // (kubectl get, git status). Any other program's next word could be data, so

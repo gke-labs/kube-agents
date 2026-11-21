@@ -454,3 +454,42 @@ func TestADelegationsTextsAreScrubbed(t *testing.T) {
 		t.Fatalf("parameters = %v, want them as written", got.Parameters)
 	}
 }
+
+// A delegation's parameter values are scrubbed with the task's seen values,
+// in a copy: the caller's map is left as it was.
+func TestADelegationsParameterValuesAreScrubbedInACopy(t *testing.T) {
+	a := &adapter{}
+	a.seen.Add(synthSeenValue)
+	in := map[string]string{"note": "uses " + synthSeenValue, "cluster": "prod"}
+	got := a.scrubDelegate(lib.DelegateRequest{Addressee: "platform", Text: "x", Parameters: in,
+		Tasks: []lib.DelegateTask{{Addressee: "cluster", Text: "y", Parameters: map[string]string{"k": synthSeenValue}}}})
+	if strings.Contains(got.Parameters["note"], synthSeenValue) || strings.Contains(got.Tasks[0].Parameters["k"], synthSeenValue) {
+		t.Fatalf("parameters = %v / %v, want the seen value redacted", got.Parameters, got.Tasks[0].Parameters)
+	}
+	if got.Parameters["cluster"] != "prod" {
+		t.Fatalf("parameters = %v, want an unmatched value kept", got.Parameters)
+	}
+	if in["note"] != "uses "+synthSeenValue {
+		t.Fatalf("the caller's map was changed: %v", in)
+	}
+}
+
+// A leading assignment counts only when it's plain: a quote, an escape or a
+// substitution in it leaves no program named.
+func TestAnActivityTitleFailsClosedOnUnplainAssignments(t *testing.T) {
+	for cmd, want := range map[string]string{
+		`TOKEN=a\'b c curl`:                   "Bash",
+		"TOKEN=$(cat f) curl":                 "Bash",
+		"TOKEN=`cat f` curl":                  "Bash",
+		`TOKEN="x" curl`:                      "Bash",
+		"PATH=/usr/bin:/bin kubectl get pods": "Bash kubectl get",
+	} {
+		input, err := json.Marshal(map[string]any{"command": cmd})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := activityTitle("Bash", input); got != want {
+			t.Errorf("activityTitle(%q) = %q, want %q", cmd, got, want)
+		}
+	}
+}
