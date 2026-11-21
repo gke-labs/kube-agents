@@ -423,6 +423,9 @@ func notWrittenFor(what string, err error) inferenceKeysOutcome {
 	if errors.Is(err, errInferenceKeysStatusPruned) {
 		return notWritten("the served PlatformAgent CRD has no status.inferenceKeys, so the operator can't record the Secrets it creates and creates none; apply the current CRD", false)
 	}
+	if errors.Is(err, errFreshRecordUnreadable) {
+		return notWritten(what+" is not in the record, and the PlatformAgent could not be read past the cache to confirm that ("+apiFailure(err)+"); nothing is replaced on this pass", true)
+	}
 	return notWritten(what+" could not be read or written: "+apiFailure(err), true)
 }
 
@@ -624,7 +627,8 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 
 // ensureInferenceKey returns c's key, creating its Secret when absent and
 // recording it, and repairing the recorded one when it holds no well-formed
-// key. A Secret at that name whose UID isn't recordedUID is replaced
+// key. A Secret at that name whose UID isn't recordedUID, nor the UID the
+// record holds when read again past the cache, is replaced
 // (replaceUnrecorded) and its key never read.
 func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent *agentv1alpha1.PlatformAgent, c inferenceKeyClass, recordedUID types.UID) (apiKey string, minted bool, err error) {
 	existing := &corev1.Secret{}
@@ -632,28 +636,37 @@ func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent 
 	if err != nil && !apierrors.IsNotFound(err) {
 		return "", false, err
 	}
-	if err == nil {
+	if err == nil && !inferenceKeySecretIsOurs(existing, agent, c, recordedUID) {
+		// The record came from the pass's copy of the agent, which can lag a
+		// record this operator just wrote: read it again, uncached, first.
+		fresh, ferr := r.freshRecordedSecretUIDs(ctx, agent)
+		if ferr != nil {
+			return "", false, ferr
+		}
+		recordedUID = fresh[c.secret.Name]
 		if !inferenceKeySecretIsOurs(existing, agent, c, recordedUID) {
 			if err := r.replaceUnrecorded(ctx, agent, existing); err != nil {
 				return "", false, err
 			}
-		} else {
-			if current := string(existing.Data[inferenceKeyDataKey]); wellFormedInferenceKey(current) {
-				return current, false, nil
-			}
-			fresh, gerr := newInferenceKey()
-			if gerr != nil {
-				return "", false, gerr
-			}
-			if existing.Data == nil {
-				existing.Data = map[string][]byte{}
-			}
-			existing.Data[inferenceKeyDataKey] = []byte(fresh)
-			if err := r.Update(ctx, existing); err != nil {
-				return "", false, err
-			}
-			return fresh, true, nil
+			existing = nil
 		}
+	}
+	if err == nil && existing != nil {
+		if current := string(existing.Data[inferenceKeyDataKey]); wellFormedInferenceKey(current) {
+			return current, false, nil
+		}
+		fresh, gerr := newInferenceKey()
+		if gerr != nil {
+			return "", false, gerr
+		}
+		if existing.Data == nil {
+			existing.Data = map[string][]byte{}
+		}
+		existing.Data[inferenceKeyDataKey] = []byte(fresh)
+		if err := r.Update(ctx, existing); err != nil {
+			return "", false, err
+		}
+		return fresh, true, nil
 	}
 
 	fresh, err := newInferenceKey()
@@ -677,6 +690,23 @@ func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent 
 		return "", false, err
 	}
 	return fresh, true, nil
+}
+
+// errFreshRecordUnreadable is a failed uncached read of the record before a
+// replacement: nothing is replaced on that pass.
+var errFreshRecordUnreadable = errors.New("the PlatformAgent could not be read past the cache to confirm the record")
+
+// freshRecordedSecretUIDs is the record as the API server holds it, read
+// past the cache. The pass's copy of the agent can predate a record this
+// operator wrote a moment ago, and replacing on that copy would delete the
+// operator's own new Secret. The read happens only before a replacement, so
+// a steady install never makes it.
+func (r *PlatformAgentReconciler) freshRecordedSecretUIDs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]types.UID, error) {
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		return nil, fmt.Errorf("%w: %w", errFreshRecordUnreadable, err)
+	}
+	return recordedSecretUIDs(live), nil
 }
 
 // replaceUnrecorded deletes existing, a Secret at a name reserved for the
@@ -725,10 +755,17 @@ func recordedTiers(agent *agentv1alpha1.PlatformAgent, recorded map[string]types
 // that isn't the recorded one. It reports whether it wrote.
 func (r *PlatformAgentReconciler) writeCallerKeysMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.Secret, found, recorded bool, doc []byte) (bool, error) {
 	if found && !recorded {
-		if err := r.replaceUnrecorded(ctx, agent, existing); err != nil {
+		// As for a key Secret: the uncached record decides, not the pass's copy.
+		fresh, err := r.freshRecordedSecretUIDs(ctx, agent)
+		if err != nil {
 			return false, err
 		}
-		found = false
+		if uid := fresh[callerKeysSecretName]; uid == "" || existing.UID != uid {
+			if err := r.replaceUnrecorded(ctx, agent, existing); err != nil {
+				return false, err
+			}
+			found = false
+		}
 	}
 	if found {
 		if string(existing.Data[callerKeysFileKey]) == string(doc) {

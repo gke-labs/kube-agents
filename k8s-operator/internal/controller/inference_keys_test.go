@@ -1068,3 +1068,76 @@ func TestAPrunedStatusFieldCreatesNoKeys(t *testing.T) {
 	}
 	assertNoInferenceKeys(t, cl, stored)
 }
+
+// The pass's copy of the agent can lag a record the operator just wrote.
+// With a stale copy that lacks the record while the API server holds it,
+// nothing is deleted or replaced: the uncached read decides.
+func TestAStaleCachedRecordReplacesNothing(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	before := allInferenceKeys(t, cl, agent, "read", "unattended")
+
+	stale := agent.DeepCopy()
+	stale.Status.InferenceKeys = nil
+	rec := record.NewFakeRecorder(64)
+	deletes := 0
+	var mu sync.Mutex
+	inner := cl.(client.WithWatch)
+	r.Client = interceptor.NewClient(inner, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			mu.Lock()
+			deletes++
+			mu.Unlock()
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	r.APIReader = inner
+	r.Recorder = rec
+	r.inferenceKeysServedFor.Delete(client.ObjectKeyFromObject(agent))
+	if out := r.reconcileInferenceKeys(ctx, stale); out.condition.Status != metav1.ConditionTrue {
+		t.Errorf("condition %+v", out.condition)
+	}
+	if deletes != 0 {
+		t.Errorf("%d deletes on a stale copy", deletes)
+	}
+	for _, e := range drainEvents(rec) {
+		if strings.Contains(e, reasonInferenceKeySecretReplaced) {
+			t.Errorf("replaced on a stale copy: %s", e)
+		}
+	}
+	if after := allInferenceKeys(t, cl, agent, "read", "unattended"); !mapsEqual(before, after) {
+		t.Error("a key changed on a stale copy")
+	}
+}
+
+// When the uncached read fails, a Secret the pass's copy doesn't record is
+// not replaced: the condition says so, fail-closed, and the pass looks
+// again.
+func TestAFailedUncachedReadReplacesNothing(t *testing.T) {
+	agent := inferenceKeysTestAgent()
+	planted := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: inferenceKeySecretName(agent, inferenceKeyClassAgent), Namespace: agent.Namespace, UID: "uid-planted-agent"},
+		Data:       map[string][]byte{inferenceKeyDataKey: []byte("sk-" + strings.Repeat("C", 43))},
+	}
+	r, cl, agent := inferenceKeysFixture(t, planted)
+	r.APIReader = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				return apierrors.NewServiceUnavailable("unavailable")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	out := r.reconcileInferenceKeys(context.Background(), agent)
+	if out.condition.Status != metav1.ConditionFalse || out.condition.Reason != inferenceKeysReasonNotWritten || out.requeue == 0 ||
+		!strings.Contains(out.condition.Message, "nothing is replaced") {
+		t.Errorf("outcome %+v", out)
+	}
+	if got := readInferenceKey(t, cl, client.ObjectKeyFromObject(planted)); got.UID != planted.UID {
+		t.Error("a Secret was replaced although the record couldn't be confirmed")
+	}
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: callerKeysSecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Errorf("a map was written on a pass that confirmed nothing: %v", err)
+	}
+}
