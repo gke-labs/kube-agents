@@ -381,10 +381,21 @@ TRIAGE_RETRY_MAX_DELAY_S = 60.0
 TRIAGE_RETRY_JITTER = (0.5, 1.0)
 # The gateway's loopback address, when PLATFORM_API_URL does not name one.
 PLATFORM_API_URL_DEFAULT = "http://127.0.0.1:8642"
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A 3xx from the gateway API is an error, not a place to send the key to again."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
 # The gateway API is on the pod's loopback address by default: a proxy from the
 # environment must not get a turn's prompt, and urllib does not leave out a
-# loopback host by itself.
-_GATEWAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# loopback host by itself. It follows no redirect either: urllib sends the
+# `Authorization` header again to the next URL, and a 200 answer there reads as
+# a session made or a turn started.
+_GATEWAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects())
 # A start queued longer than this still gets one attempt, then no retry, whatever
 # the budget says: the wait bounds the retries, never the first try.
 TRIAGE_QUEUE_WAIT_LIMIT_S = 1200.0
