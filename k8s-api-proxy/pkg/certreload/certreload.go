@@ -35,8 +35,10 @@ const (
 	DefaultCheckInterval = time.Second
 
 	pemTypeCertificate = "CERTIFICATE"
-	// pemBeginMarker opens every PEM block; parseCABundle counts them.
-	pemBeginMarker = "-----BEGIN "
+	// pemBeginMarker opens every PEM block; parseCABundle requires one where each block
+	// starts, and pemCommentPrefix opens a comment line it allows between blocks.
+	pemBeginMarker   = "-----BEGIN "
+	pemCommentPrefix = '#'
 
 	// dialTimeout and dialKeepAlive match http.DefaultTransport's dialer.
 	dialTimeout   = 30 * time.Second
@@ -246,8 +248,9 @@ type CAPool struct {
 }
 
 // NewCAPool loads the CERTIFICATE blocks of the PEM bundle in file. It fails when the file
-// cannot be read, holds no certificate, holds a certificate that does not parse, or ends in
-// bytes that are not a whole PEM block (a file cut off mid-write). Other PEM block types
+// cannot be read, holds no certificate, holds a certificate that does not parse, or holds
+// anything besides PEM blocks, blank lines and # comment lines between them (a block that
+// does not decode, a damaged BEGIN line, a file cut off mid-write). Other PEM block types
 // are skipped.
 func NewCAPool(file string, opts Options) (*CAPool, error) {
 	if file == "" {
@@ -269,15 +272,24 @@ func NewCAPool(file string, opts Options) (*CAPool, error) {
 
 func parseCABundle(data []byte) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
-	count, blocks := 0, 0
+	count := 0
 	rest := data
 	for {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
+		// pem.Decode skips anything before a line-start BEGIN marker, a damaged block
+		// included, so each block is required where the previous one ended: only blank
+		// lines and # comment lines may come between blocks.
+		rest = skipBundleFiller(rest)
+		if len(rest) == 0 {
 			break
 		}
-		blocks++
+		if !bytes.HasPrefix(rest, []byte(pemBeginMarker)) {
+			return nil, errors.New("data that is not a PEM block or a # comment line")
+		}
+		block, next := pem.Decode(rest)
+		if block == nil {
+			return nil, errors.New("a PEM block that could not be decoded")
+		}
+		rest = next
 		if block.Type != pemTypeCertificate {
 			continue
 		}
@@ -288,18 +300,25 @@ func parseCABundle(data []byte) (*x509.CertPool, error) {
 		pool.AddCert(cert)
 		count++
 	}
-	if len(bytes.TrimSpace(rest)) > 0 {
-		return nil, errors.New("trailing data is not a complete PEM block")
-	}
-	// pem.Decode skips a block it cannot decode and returns the next one, so a corrupt
-	// block followed by a good one leaves no trailing data: count the markers instead.
-	if markers := bytes.Count(data, []byte(pemBeginMarker)); markers != blocks {
-		return nil, fmt.Errorf("%d of %d PEM blocks could not be decoded", markers-blocks, markers)
-	}
 	if count == 0 {
 		return nil, errors.New("no CERTIFICATE block")
 	}
 	return pool, nil
+}
+
+// skipBundleFiller drops leading whitespace and whole lines that start with '#'.
+func skipBundleFiller(data []byte) []byte {
+	for {
+		data = bytes.TrimLeft(data, " \t\r\n")
+		if len(data) == 0 || data[0] != pemCommentPrefix {
+			return data
+		}
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			data = data[i+1:]
+		} else {
+			return nil
+		}
+	}
 }
 
 // Pool returns the current pool. Do not modify it.

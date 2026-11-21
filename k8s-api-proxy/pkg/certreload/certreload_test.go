@@ -562,7 +562,9 @@ func TestNewCAPoolFailsFast(t *testing.T) {
 		"bad certificate": []byte("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
 		"trailing bytes":  append(append([]byte{}, ca.pem...), []byte("garbage")...),
 		// pem.Decode skips an undecodable block and returns the next good one.
-		"corrupt block before a good one": append([]byte("-----BEGIN CERTIFICATE-----\n!corrupt!\n-----END CERTIFICATE-----\n"), ca.pem...),
+		"corrupt block before a good one":      append([]byte("-----BEGIN CERTIFICATE-----\n!corrupt!\n-----END CERTIFICATE-----\n"), ca.pem...),
+		"damaged BEGIN line before a good one": append([]byte("----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"), ca.pem...),
+		"lost head before a good one":          append([]byte("AAAA\n-----END CERTIFICATE-----\n"), ca.pem...),
 	} {
 		t.Run(name, func(t *testing.T) {
 			caFile := filepath.Join(t.TempDir(), caName)
@@ -577,6 +579,19 @@ func TestNewCAPoolFailsFast(t *testing.T) {
 	}
 	if _, err := NewCAPool("", Options{}); err == nil {
 		t.Error("NewCAPool with no file succeeded, want an error")
+	}
+}
+
+// Comment lines between blocks, a BEGIN marker inside one included, are not blocks.
+func TestNewCAPoolAllowsCommentLinesBetweenBlocks(t *testing.T) {
+	ca := newAuthority(t, "ca")
+	other := newAuthority(t, "other")
+	data := append([]byte("# rotated bundle, each -----BEGIN CERTIFICATE----- is one root\n\n"), ca.pem...)
+	data = append(append(data, []byte("\n# second root\n")...), other.pem...)
+	caFile := filepath.Join(t.TempDir(), caName)
+	writeFile(t, caFile, data)
+	if _, err := NewCAPool(caFile, Options{}); err != nil {
+		t.Fatalf("NewCAPool with comment lines: %v", err)
 	}
 }
 
