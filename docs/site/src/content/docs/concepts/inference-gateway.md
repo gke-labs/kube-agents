@@ -241,11 +241,15 @@ Both the chart and the kustomize base still load a pre-call hook that drops repl
 
 Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs.
 
-`litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`. Before LiteLLM calls the provider, the hook rewrites:
+`litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`. Before LiteLLM calls the provider, the hook rewrites every request shape the gateway serves:
 
-- `messages[].content` (strings and `text` parts);
-- each assistant message's `tool_calls[].function.arguments`, parsed, so a key name such as `password` counts as it does in a mapping;
-- embeddings `input` and completion `prompt`.
+- chat completions: `messages[].content` and each assistant message's `tool_calls[].function.arguments`, parsed, so a key name such as `password` counts as it does in a mapping;
+- Anthropic messages: the same `messages`, where content blocks include a tool's input, what a tool returned and the model's thinking, plus the top-level `system` text;
+- Gemini (`/v1beta/models/...`): every part of `contents`, including function calls and function responses, and `systemInstruction`;
+- embeddings `input` and completion `prompt`;
+- any other top-level field that is not a generation setting or the gateway's own bookkeeping, such as tool definitions, by the text rules.
+
+Only a part's binary payload (base64 image or document data, an inline `data:` URL, Gemini inline data) and the provider's opaque blocks (redacted thinking, a thought signature) are left as they are. A request the hook cannot walk is refused: one that carries none of these shapes, a `messages` or `contents` that is not a list, or Gemini inline data of a text type.
 
 The rendered default config does not change while the value is off.
 
@@ -299,7 +303,7 @@ The same switch reaches the agent pod. The chart projects this rule file there a
 
 Each process reads the file once at start. A changed rule file reaches the gateway on its next roll. In the agent pod a long-lived process keeps the rules it started with while each new worker process reads the current file, so roll the pod to move them all. The image parses the file with the grammar it shipped with, so keep the chart and the agent image at one version when this switch is on. It does not touch chat egress.
 
-A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
+A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook, including a refused request shape, fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
 
 ### Pass-through trajectory logging
 
