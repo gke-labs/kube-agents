@@ -9,8 +9,11 @@
 # was in the node's serial console and in Cloud Logging within 90 seconds. No
 # node condition and no event changed. GKE's system metrics have no series for
 # the table, so a share of nf_conntrack_max cannot be read without a new data
-# source, and the serial console log can be turned off for a cluster or an
-# organization. A real load at the default size was not tested.
+# source, and the collection of the serial console log can be turned off for a
+# cluster (node metadata `serial-port-logging-enable`) or for an organization
+# (the constraint `compute.disableSerialPortLogging`), by GKE's logging and
+# Autopilot troubleshooting pages. A real load at the default size was not
+# tested.
 # Nothing is planted. A fixture is possible: a privileged pod on a node of its
 # own that lowers the limit and fills the table again and again. That repeating
 # form was not run, and the fleet's owner has not been asked. The objective

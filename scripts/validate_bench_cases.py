@@ -371,14 +371,16 @@ FIXTURE_NOT_READY = {
     ),
     # Needs the order of two times on one node: a workload container that
     # starts before a per-node agent's pod is Ready. That order is evidence
-    # only on a node made after the agent's DaemonSet; a fleet node is made
-    # only at an upgrade or a repair, and a workload's restart resets it. The
-    # first plan's signal, a label only a fixture writes, is not a fixture
-    # (fixture rule 9). #5411 owns the gap.
+    # only on a node made after the agent's DaemonSet, and a workload's restart
+    # resets it. The fleet's pools make a node only at an upgrade or a repair,
+    # and its one zero-node pool is read by other cases as empty; the cost,
+    # not tried, is a pool of its own with one standing small node. The first
+    # plan's signal, a label only a fixture writes, is not a fixture (fixture
+    # rule 9). #5411 owns the gap and proposes the first plan's check.
     "node-kubelet-startup-admission-race": (
         "#5411: needs a workload that starts before a per-node agent is Ready on a node made "
-        "after the agent's DaemonSet; that order does not stand on a fleet node (made only at an "
-        "upgrade or a repair, reset by a restart), and a fixture-only label is not a fixture"
+        "after the agent's DaemonSet; no present fleet pool makes such a node, and the cost, not "
+        "tried, is a pool of its own with one standing small node whose two times stay readable"
     ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the

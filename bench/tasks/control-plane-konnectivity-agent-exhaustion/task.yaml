@@ -6,14 +6,15 @@
 # What live tests showed (2026-11-20, one scratch cluster, GKE Standard 1.35.8,
 # 1 agent against GKE's 6): on Standard a hand edit of the ConfigMap
 # `konnectivity-agent-autoscaler-config` stays and the agent count follows it;
-# Autopilot refuses the edit, and a hand scale of the Deployment is undone.
-# With free CPU, 1 agent carried heavy use with no error. With each node's CPU
-# full under heavy use, the tunnel went dead with 1 agent until its pod was
-# replaced, while the pod read Running and ready: one clean run and one on a
-# node that had been crashed before; the cause is not known, and the run with 6
-# agents had another timing of the load. A hard restart of the one agent's node
-# failed webhook-guarded writes for 35 seconds, and none with 6 agents (one run
-# each). The agent's container has no CPU limit, so no limit throttles it.
+# a hand scale of the Deployment is undone; on a second cluster, Autopilot
+# 1.36.4, a server-side dry run of the same edit was refused. With free CPU, 1
+# agent carried heavy use with no error. With each node's CPU full under heavy
+# use, the tunnel went dead with 1 agent until its pod was replaced, while the
+# pod read Running and ready: one clean run and one on a node that had been
+# crashed before; the cause is not known, and the run with 6 agents had another
+# timing of the load. A hard restart of the one agent's node failed
+# webhook-guarded writes for 35 seconds, and none with 6 agents (one run each).
+# The agent's container has no CPU limit, so no limit throttles it.
 # Nothing is planted. A fixture is possible: the size table set to 1 agent on
 # one Standard fleet cluster, which leaves that cluster with the weakness
 # above; the fleet's owner has not been asked. Signals that showed the dead
@@ -50,9 +51,9 @@ infrastructure:
 validated: false
 
 verification_spec:
-  # The form a finding would take; the fixing pull request replaces it with a
-  # clean-read objective. The three slugs are the names the case accepts; the
-  # first is the one #5415 proposes.
+  # The form a finding would take; it changes with the fixture decision. The
+  # three slugs are the names the case accepts; the first is the one #5415
+  # proposes.
   - name: ledger-reports-konnectivity-sizing-on-the-agent
     role: objective
     mode: assert

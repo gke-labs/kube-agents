@@ -17,7 +17,11 @@
 # seeded-shapes on slot a, a shell supervisor forking two workers under a 32Mi
 # memory limit, on the default pool, whose kubelet configuration sets no pod
 # PID limit. By that text it cannot hold many processes, and the tests above do
-# not support a finding on it as the fault. The readiness rule group-oom-kill
+# not support a finding on it as the fault. A pool with no pod PID limit is
+# also the platform's default, which fixture rule 9 does not take as a fixture;
+# the case stays on the lane only until the decision on a fixture for the
+# node's own PIDPressure. Until then the flip condition is the first plan's: a
+# check that names that workload on its pool. The readiness rule group-oom-kill
 # and the case upgrades-fleet-readiness-multi-process-container assert it is
 # the fleet's only forking container, so no second forking plant may land. The
 # objective below keeps the form of the first plan, a finding on that workload;
@@ -25,7 +29,7 @@
 # Domain `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-pid-pressure-fork-exhaustion
-name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload on a pool with no pod PID limit)"
+name: "Node PID exhaustion (declared gap; reads the fleet's multi-process workload, the first plan's shape; a fixture for PIDPressure is not shown)"
 domain: fleet-audits
 suite: validated-capabilities
 suite_part: 2
@@ -39,11 +43,12 @@ prompt: >-
   gce-compute-fleet-audit SOP.
 expected_output: >-
   Reads the fleet's existing multi-process workload on a pool with no pod PID
-  limit. Customer failure: kubelet PIDPressure and eviction. Validated means:
-  the ledger issue carries a finding that names Deployment
-  `multi-process-worker` in namespace `seeded-shapes` as a multi-process
-  workload on pool `default-pool`, whose kubelet configuration sets no pod PID
-  limit. The closing response is the SOP's one line with the ledger URL.
+  limit. Customer failure, as live tests showed it: several leaking containers
+  used all process IDs of a large node, and the kubelet set PIDPressure and
+  evicted; one container did not. Validated needs a fixture for that state; the
+  present objective accepts a finding that names Deployment
+  `multi-process-worker` in namespace `seeded-shapes` on pool `default-pool`.
+  The closing response is the SOP's one line with the ledger URL.
 infrastructure:
   deployer: noop
 validated: false

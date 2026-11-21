@@ -1,8 +1,8 @@
 # Node OS, kubelet and auto-repair (gce-compute-fleet-audit): a new node takes
 # workload pods before a per-node agent is ready on it, because the pool has no
 # startup taint that the agent removes. Parked as FIXTURE_NOT_READY
-# (gke-labs/kube-agents#5411): no fixture that a correct check finds can stand
-# today, so the case carries no suite line.
+# (gke-labs/kube-agents#5411): no fixture that a correct check finds stands on
+# the fleet today, so the case carries no suite line.
 # What live tests showed (2026-11-20 and 2026-11-21, GKE Standard 1.35.8, pools
 # that grow by themselves, an agent that needs 90 seconds, one run each): with
 # no startup taint the workload started 92 seconds before the agent was ready.
@@ -13,20 +13,25 @@
 # autoscaler added nodes up to the pool's limit while the first new node still
 # had the taint. With the prefix and no remover the workload was still Pending
 # after 20 minutes.
-# Why no fixture stands: the evidence is the order of two times on one node,
-# the workload container's start and the agent pod's Ready. On a node that is
-# older than the agent's DaemonSet every workload started before the agent by
-# days, which is a late DaemonSet and not a race, so a correct check uses only
-# nodes made after the DaemonSet; a fleet node is made only at an upgrade or a
-# repair, and a workload's restart removes the evidence. The first plan's
-# signal, a label `init-critical`, is one that only a fixture writes; no
-# customer cluster carries it. The remover is one for each plug-in and needs
-# the right to change nodes. No open issue plans the check. The objective below
+# Why no fixture stands today: the evidence is the order of two times on one
+# node, the workload container's start and the agent pod's Ready. On a node
+# that is older than the agent's DaemonSet every workload started before the
+# agent by days, which is a late DaemonSet and not a race, so a correct check
+# uses only nodes made after the DaemonSet, and a workload's restart resets the
+# times. The fleet's present pools make a node only at an upgrade or a repair;
+# its one zero-node pool is read by other cases as empty. The cost of a
+# fixture, not tried: a pool of its own that makes a node after the agent's
+# DaemonSet (one standing small node) with a pinned workload, and the times
+# must then stay readable. The first plan's signal, a label `init-critical`, is
+# one that this case made up; a check that reads it finds a customer's cluster
+# only by chance. The remover of a startup taint is one for each plug-in and
+# needs the right to change nodes. #5411 proposes the first plan's check; no
+# open issue plans a check on the order of the two times. The objective below
 # keeps the form of the first plan; the pull request that brings a fixture
-# rewrites it and restores the suite line. `fixtures: []`: the run plants
-# nothing and reads no fixture, so no fixture's drift may excuse it; no
-# safeguard reads a fixture because none exists. Domain `fleet-audits` as the
-# other GCE compute cases.
+# rewrites it, and the un-park pull request restores the suite line. `fixtures:
+# []`: the run plants nothing and reads no fixture, so no fixture's drift may
+# excuse it; no safeguard reads a fixture because none exists. Domain
+# `fleet-audits` as the other GCE compute cases.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: node-kubelet-startup-admission-race
 name: "Kubelet startup admission race (parked: no fixture that a correct check finds can stand today)"
@@ -52,7 +57,7 @@ validated: false
 verification_spec:
   # One finding must carry both the check and the shape's object, the
   # DaemonSet or the pool. The two slugs are the names the case accepts; the
-  # first is the one #5411 proposes.
+  # first is the one #5411 proposes for the first plan's check.
   # The branch's third slug, containerd-disk-error, is dropped: a disk-error
   # check would flip a taint case.
   - name: ledger-files-the-startup-race-shape-on-the-daemonset-or-pool
