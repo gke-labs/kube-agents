@@ -127,8 +127,8 @@ const (
 	inferenceKeyTierClassPrefix = "tier-"
 
 	// A class's key Secret is <agent>-inference-key-<class>. The session
-	// class's name and its data key are pinned by the A2A gateway pod
-	// admission policy as well, so neither changes on its own.
+	// class's Secret name and data key are fixed: the A2A gateway pod
+	// admission policy is to pin them, so neither may change on its own.
 	inferenceKeySecretInfix = "-inference-key-"
 	// inferenceKeyDataKey is the data key the key is stored under, the one a
 	// caller's secretKeyRef names.
@@ -499,6 +499,9 @@ func (r *PlatformAgentReconciler) notWrittenFor(what string, err error) inferenc
 		r.forgetServedCRDAnswer()
 		return notWritten("the served PlatformAgent CRD has no status.inferenceKeys, so the operator can't record the Secrets it creates and creates none; apply the current CRD", false)
 	}
+	if errors.Is(err, errReservedSecretTerminating) {
+		return notWritten(what+" is being deleted; the operator creates its own once it's gone", true)
+	}
 	if errors.Is(err, errFreshRecordUnreadable) {
 		return notWritten(what+" is not in the record, and the PlatformAgent could not be read past the cache to confirm that ("+apiFailure(err)+"); nothing is replaced on this pass", true)
 	}
@@ -697,6 +700,10 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 	var minted []string
 	for _, c := range classes {
 		apiKey, wasMinted, err := r.ensureInferenceKey(ctx, agent, c, recorded[c.secret.Name])
+		if errors.Is(err, errReservedSecretTerminating) && c.inProfileNamespace {
+			carry(c.name)
+			continue
+		}
 		if err != nil && c.inProfileNamespace && !errors.Is(err, errInferenceKeysStatusPruned) && !errors.Is(err, errFreshRecordUnreadable) {
 			// Confined to the profile namespace (profileNamespaceFailure):
 			// reported there, and the tier keeps its stored entry, if any.
@@ -791,6 +798,9 @@ func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent 
 	if err != nil && !apierrors.IsNotFound(err) {
 		return "", false, err
 	}
+	if err == nil && existing.DeletionTimestamp != nil {
+		return "", false, errReservedSecretTerminating
+	}
 	if err == nil && !inferenceKeySecretIsOurs(existing, agent, c, recordedUID) {
 		// The record came from the pass's copy of the agent, which can lag a
 		// record this operator just wrote: read it again, uncached, first.
@@ -846,6 +856,11 @@ func (r *PlatformAgentReconciler) ensureInferenceKey(ctx context.Context, agent 
 	}
 	return fresh, true, nil
 }
+
+// errReservedSecretTerminating is a Secret at a reserved name that is
+// already being deleted: nothing is deleted or reported, and the operator
+// creates its own once it's gone.
+var errReservedSecretTerminating = errors.New("a Secret at that name is being deleted")
 
 // errFreshRecordUnreadable is a failed uncached read of the record before a
 // replacement: nothing is replaced on that pass.
@@ -943,6 +958,9 @@ func recordedTiers(agent *agentv1alpha1.PlatformAgent, recorded map[string]types
 // Secret, else a recorded create, replacing first a map Secret at the name
 // that isn't the recorded one. It reports whether it wrote.
 func (r *PlatformAgentReconciler) writeCallerKeysMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.Secret, found, recorded bool, doc []byte) (bool, error) {
+	if found && existing.DeletionTimestamp != nil {
+		return false, errReservedSecretTerminating
+	}
 	if found && !recorded {
 		// As for a key Secret: the uncached record decides, not the pass's copy.
 		fresh, err := r.freshRecordedSecretUIDs(ctx, agent)
@@ -1103,8 +1121,9 @@ func (r *PlatformAgentReconciler) probeInferenceKeys(ctx context.Context, agent 
 		}
 	}
 	if len(ready) == 0 {
+		// Pods aren't watched, so the pass that sees one turn Ready is asked for.
 		return inferenceKeysOutcome{condition: inferenceKeysCondition(metav1.ConditionUnknown, inferenceKeysReasonNoReadyGateway,
-			"no inference gateway pod is Ready, so none can say whether it has loaded the caller keys")}
+			"no inference gateway pod is Ready, so none can say whether it has loaded the caller keys"), requeue: inferenceKeysUnreachableRecheck}
 	}
 	slices.SortFunc(ready, func(a, b *corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
 	names := make([]string, len(classes))

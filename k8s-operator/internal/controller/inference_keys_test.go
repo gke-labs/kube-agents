@@ -507,7 +507,8 @@ func TestTheProbeGateNeedsEveryPodToAdmitTheProbeKey(t *testing.T) {
 		prober := admitEverything()
 		r.inferenceKeyProbe = prober
 		out := r.reconcileInferenceKeys(ctx, agent)
-		if out.condition.Status != metav1.ConditionUnknown || out.condition.Reason != inferenceKeysReasonNoReadyGateway || prober.probes.Load() != 0 {
+		if out.condition.Status != metav1.ConditionUnknown || out.condition.Reason != inferenceKeysReasonNoReadyGateway || prober.probes.Load() != 0 ||
+			out.requeue != inferenceKeysUnreachableRecheck {
 			t.Errorf("outcome %+v after %d probes", out, prober.probes.Load())
 		}
 	})
@@ -1519,4 +1520,58 @@ func TestUnreadableProfilesCreateNoTierKeyWithoutTheNamespace(t *testing.T) {
 			t.Errorf("the map still names %s", class)
 		}
 	}
+}
+
+// A Secret at a reserved name that is already being deleted is waited for:
+// no delete, no Warning, and the operator creates its own once it's gone. A
+// tier's doesn't hold up the map.
+func TestATerminatingReservedSecretIsWaitedFor(t *testing.T) {
+	agent := inferenceKeysTestAgent()
+	terminating := func(name, ns string) *corev1.Secret {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: ns, UID: types.UID("uid-terminating-" + name),
+			DeletionTimestamp: &metav1.Time{Time: metav1.Now().Time}, Finalizers: []string{"example.com/hold"},
+		}}
+	}
+	t.Run("a class key", func(t *testing.T) {
+		leaving := terminating(inferenceKeySecretName(agent, inferenceKeyClassAgent), agent.Namespace)
+		r, cl, agent := inferenceKeysFixture(t, leaving)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		var writes atomic.Int32
+		r.Client = writeCounter(cl.(client.WithWatch), &writes)
+		out := r.reconcileInferenceKeys(context.Background(), agent)
+		if out.condition.Reason != inferenceKeysReasonNotWritten || out.requeue == 0 || !strings.Contains(out.condition.Message, "being deleted") {
+			t.Errorf("outcome %+v", out)
+		}
+		if got := readInferenceKey(t, cl, client.ObjectKeyFromObject(leaving)); got.UID != leaving.UID {
+			t.Error("a terminating Secret was replaced")
+		}
+		for _, e := range drainEvents(rec) {
+			if strings.Contains(e, reasonInferenceKeySecretReplaced) {
+				t.Errorf("a terminating Secret was reported: %s", e)
+			}
+		}
+	})
+	t.Run("a tier key", func(t *testing.T) {
+		leaving := terminating(inferenceKeySecretName(agent, "tier-read"), profileNamespaceName(agent))
+		r, cl, agent := inferenceKeysFixture(t, leaving)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		r.reconcileInferenceKeys(context.Background(), agent)
+		if got := readInferenceKey(t, cl, client.ObjectKeyFromObject(leaving)); got.UID != leaving.UID {
+			t.Error("a terminating tier Secret was replaced")
+		}
+		entries, _ := readCallerKeysMap(t, cl, agent)
+		for _, class := range entries {
+			if class == "tier-read" {
+				t.Error("the map names the tier whose Secret is being deleted")
+			}
+		}
+		for _, e := range drainEvents(rec) {
+			if strings.HasPrefix(e, corev1.EventTypeWarning) {
+				t.Errorf("a Warning for a terminating Secret: %s", e)
+			}
+		}
+	})
 }
