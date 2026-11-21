@@ -31,7 +31,9 @@ func childProfileChain(parent TaskRef, profileParent bool) []string {
 }
 
 // profileParentRefusal is why a profile parent may not delegate at all, as
-// a rule and a notice, or "" when it may. Checked once, before any child.
+// a rule and a notice, or "" when it may. Checked once, before any child,
+// after the card check (delegation.profile-not-delegating), which needs the
+// directory and so sits in handleDelegateRequest.
 func profileParentRefusal(parent TaskRef) (rule, notice string) {
 	// An unattended grant is bound to its trigger (09), and the child mint
 	// carries no trigger: refused until the child's inheritance is designed.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -93,5 +94,51 @@ func TestAProfileWhoseCardDoesNotDelegateIsRefused(t *testing.T) {
 	})
 	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">")); after != before {
 		t.Fatalf("%d submission(s) for a profile that doesn't delegate", after-before)
+	}
+}
+
+// TestARefusedProfileParentsRequestAgainIsIgnored: the parent was told its
+// refusal ends its wait, so the same task's request seen again (a
+// redelivery after a restart reads the same way) is ignored: not refused
+// twice, and not minted late once what refused it has cleared.
+func TestARefusedProfileParentsRequestAgainIsIgnored(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-again"
+	parent, taskID := startProfileParent(t, r, conv)
+	setScope := func(scope string) {
+		putRecord(t, r, conv, func(rec *SessionRecord) {
+			for j := range rec.Tasks {
+				if rec.Tasks[j].ID == taskID {
+					rec.Tasks[j].Scope = scope
+				}
+			}
+		})
+	}
+	var prodScope string
+	if rec, _ := r.g.reg.Get(ctx, conv); rec != nil {
+		ref, _ := rec.TaskRefFor(taskID)
+		prodScope = ref.Scope
+	}
+	setScope(devScope)
+	ask := delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))
+	if err := parent.PublishArtifact(ctx, ask); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the refusal on the parent's .in", func() bool { return len(refusalsOn(t, r, "prod-east", taskID)) == 1 })
+	// What refused it clears; the request comes again.
+	setScope(prodScope)
+	before := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">"))
+	ask.ArtifactID += "-again"
+	if err := parent.PublishArtifact(ctx, ask); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := refusalsOn(t, r, "prod-east", taskID); len(got) != 1 {
+		t.Fatalf("%d refusals after the request came again, want 1", len(got))
+	}
+	if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">")); after != before {
+		t.Fatalf("%d submission(s) for a request already answered", after-before)
 	}
 }

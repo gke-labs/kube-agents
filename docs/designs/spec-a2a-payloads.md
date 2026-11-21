@@ -818,7 +818,7 @@ nothing.
 **A refused request.** A profile parent whose delegate request mints no child, because the gateway
 refused it or nothing started, gets a `message` on its `…in` carrying `{"delegationRefused": {"text"}}`
 (#4860), so it stops waiting for a child that won't exist. `text` is the notice the room sees, at most
-64 KiB. A waiting parent reads it as the end of the whole wait. A batch whose plan was written gets
+64 KiB. A waiting parent reads it as the end of the whole wait. A refusal that fails to publish is logged and not sent again, so the parent's own deadline still bounds its wait. A batch whose plan was written gets
 its per-entry ends instead, and a stopped or ended parent gets nothing.
 
 This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A

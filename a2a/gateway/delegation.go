@@ -196,6 +196,25 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		ignore(ruleDelegationStale, "busSession", rec.BusSession)
 		return
 	}
+	if profileParent {
+		// A profile parent's request that already ended with no child
+		// (DelegationEnd) has had its answer, and the parent was told it
+		// was the end of its wait (#4860): its redelivery, after a restart
+		// or a fenced batch, is ignored, never refused twice or minted late.
+		if parent.DelegationEnd != "" && len(parent.Children) == 0 {
+			ignore(ruleDelegationStale, "delegationEnd", "already answered")
+			return
+		}
+		// Only a profile whose card says it delegates (spec.delegates):
+		// the worker's tool is the profile admin's opt-in, and this is
+		// where it holds, not the tool's absence on the worker (#6789).
+		// Checked first, so a profile that may not delegate learns
+		// nothing else from the checks below (another task's id).
+		if card, ok := g.profiles.lookup(parent.Addressee); !ok || !card.Delegates {
+			refuse(ruleDelegationProfileNotDelegating, noticeDelegationRefusedFor+fmt.Sprintf(noticeProfileDoesNotDelegate, parent.Addressee))
+			return
+		}
+	}
 	// A request is accepted once per task, whether it asked for one child
 	// or a batch: a parent with any child has had its request. Checked
 	// before the active task, so a repeat from the parent logs as what it
@@ -277,13 +296,6 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	if profileParent {
-		// Only a profile whose card says it delegates (spec.delegates):
-		// the worker's tool is the profile admin's opt-in, and this is
-		// where it holds, not the tool's absence on the worker (#6789).
-		if card, ok := g.profiles.lookup(parent.Addressee); !ok || !card.Delegates {
-			refuse(ruleDelegationProfileNotDelegating, noticeDelegationRefusedFor+fmt.Sprintf(noticeProfileDoesNotDelegate, parent.Addressee))
-			return
-		}
 		if rule, notice := profileParentRefusal(parent); rule != "" {
 			refuse(rule, noticeDelegationRefusedFor+notice)
 			return

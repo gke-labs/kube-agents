@@ -351,7 +351,7 @@ func TestAWithdrawnProfileBatchEndsEveryEntry(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := childResultsOn(t, r, "chat", origin.TaskID); len(got) != 2 {
 		t.Fatalf("%d ends after the withdrawn child's terminal, want 2: %+v", len(got), got)
-	}	// Each entry has its own end, so the parent gets no whole-request
+	} // Each entry has its own end, so the parent gets no whole-request
 	// refusal on top of them (#4860).
 	if got := refusalsOn(t, r, "chat", origin.TaskID); len(got) != 0 {
 		t.Fatalf("a withdrawn batch's parent got a refusal too: %+v", got)

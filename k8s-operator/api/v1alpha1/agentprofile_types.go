@@ -101,9 +101,10 @@ type AgentProfileSpec struct {
 	YieldToPinned bool `json:"yieldToPinned,omitempty"`
 
 	// Delegates lets this profile's tasks hand tasks on to other profiles.
-	// The gateway refuses a delegation from a task of a profile without it,
-	// and the profile's worker offers its model the delegate tool only with
-	// it. A child it starts is held to the gateway's delegation checks
+	// The gateway refuses a delegation from a task of a profile without it.
+	// Profile workers have no delegate tool yet (the pool sets
+	// A2A_DELEGATE_TOOL=off); when they do, it will be offered only with
+	// this set. A child it starts is held to the gateway's delegation checks
 	// (tier, scope, chain, the target's allow-lists) whatever this says.
 	// +optional
 	Delegates bool `json:"delegates,omitempty"`
