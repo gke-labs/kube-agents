@@ -332,3 +332,30 @@ func TestAnActivityEntryCarriesNoRawArgument(t *testing.T) {
 		}
 	}
 }
+
+// A shell title never takes an argument: leading NAME=value words (a quoted
+// one split on its spaces included) are skipped, and a subcommand counts only
+// as a bare word, so a path, a URL or an assignment there leaves the program alone.
+func TestAnActivityTitleSkipsAssignmentsAndNonWords(t *testing.T) {
+	for cmd, want := range map[string]string{
+		"TOKEN=" + synthShapeValue + " curl https://example.invalid": "Bash curl",
+		"TOKEN='" + synthShapeValue + " more' curl -s x":             "Bash",
+		"A=1 B=2 kubectl get pods":                                   "Bash kubectl get",
+		"kubectl --token=" + synthShapeValue + " get pods":           "Bash kubectl",
+		"curl https://example.invalid/" + synthShapeValue:            "Bash curl",
+		"env FOO=" + synthShapeValue + " app":                        "Bash env",
+		"/usr/bin/git status":                                        "Bash git status",
+	} {
+		input, err := json.Marshal(map[string]any{"command": cmd})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := activityTitle("Bash", input)
+		if got != want {
+			t.Errorf("activityTitle(%q) = %q, want %q", cmd, got, want)
+		}
+		if strings.Contains(got, synthShapeValue) || strings.Contains(got, "example.invalid") {
+			t.Errorf("activityTitle(%q) = %q leaks an argument", cmd, got)
+		}
+	}
+}

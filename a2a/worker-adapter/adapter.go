@@ -2185,11 +2185,28 @@ func leadingCommand(cmd string) (bin, sub string) {
 		return "", ""
 	}
 	bin = filepath.Base(fields[i])
-	if i+1 < len(fields) {
-		next := fields[i+1]
-		if next != "" && !strings.ContainsAny(next[:1], "-'\"/$~.") && !strings.ContainsAny(next, "=:/@") && len(next) <= 32 {
-			sub = next
-		}
+	if !bareWord(bin) {
+		// Not a command name (a quoted value split on its spaces, say):
+		// no program at all rather than a guess.
+		return "", ""
+	}
+	if i+1 < len(fields) && bareWord(fields[i+1]) {
+		sub = fields[i+1]
 	}
 	return bin, sub
+}
+
+// bareWord reports whether w looks like a command or subcommand name:
+// letters, digits, '-', '_' and '.', not starting with '-' or '.', at most
+// 32 bytes. A flag, an assignment, a path, a URL or a quoted value isn't.
+func bareWord(w string) bool {
+	if w == "" || len(w) > 32 || w[0] == '-' || w[0] == '.' {
+		return false
+	}
+	for _, r := range w {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
