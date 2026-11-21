@@ -438,7 +438,9 @@ func TestTheProbeGateNeedsEveryPodToAdmitTheProbeKey(t *testing.T) {
 		}}
 		r.inferenceKeyProbe = prober
 		out := r.reconcileInferenceKeys(ctx, agent)
-		if out.condition.Status != metav1.ConditionTrue || out.requeue != 0 {
+		// The Served pass marks the keys and asks for the pass that renders
+		// their callers (inference_key_callers.go).
+		if out.condition.Status != metav1.ConditionTrue || out.requeue != inferenceKeysMarkedRecheck {
 			t.Fatalf("outcome %+v", out)
 		}
 		if got := prober.probes.Load(); got != 2 {

@@ -2270,6 +2270,13 @@ type managedDatabaseConfig struct {
 }
 
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
+	return renderConfigYAMLWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// renderConfigYAMLWith is renderConfigYAML with model.api_key set to apiKey:
+// the placeholder, or agentInferenceKeyConfigRef once the agent sends its
+// inference gateway key (reconcileConfigMap).
+func renderConfigYAMLWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 
 	cfg := struct {
@@ -2365,7 +2372,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.Model.Default = agentModelName
 	cfg.Model.Model = agentModelName
 	cfg.Model.BaseURL = fmt.Sprintf("http://%s.%s.svc.cluster.local/v1", inferenceGatewayServiceName, agent.Namespace)
-	cfg.Model.APIKey = "none"
+	cfg.Model.APIKey = apiKey
 	// What `provider: custom` against a non-OpenAI base_url already resolves to
 	// (_resolve_plain_custom_api_mode in hermes_cli/runtime_provider.py), so this
 	// changes no behaviour — it only makes the value one the agent cannot rewrite.
@@ -2852,6 +2859,10 @@ type renderOptions struct {
 	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
 	// so the zero value renders byte-identical manifests.
 	enabledProfiles []string
+	// inferenceKeys is the classes whose callers this pass gives their
+	// inference gateway key (inference_key_callers.go). The zero value gives
+	// none, so it renders the agent as an install without keys.
+	inferenceKeys inferenceKeyCallers
 }
 
 const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
@@ -3742,6 +3753,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "MEMORY_PROVIDER",
 		Value: resolveMemoryProvider(agent),
 	})
+	// The agent class's inference gateway key, once the gateway serves it: the
+	// managed config's model.api_key expands it (renderConfigYAMLWith), and the
+	// pod's other in-process callers read it by this name. After the plugin
+	// merge, so a plugin's entry of the same name gives way (lastWinsEnv in
+	// buildBaseContainers). The platform-agent container alone: the shell
+	// sandbox stays keyless.
+	if env, ok := opts.inferenceKeys.envVar(inferenceKeyClassAgent, agentInferenceKeyEnv); ok {
+		envVars = append(envVars, env)
+	}
 
 	var runtimeClassName *string
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil {

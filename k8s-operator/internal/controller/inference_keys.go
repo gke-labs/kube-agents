@@ -57,9 +57,10 @@ import (
 // lowercase-hex sha256 of a caller key to the caller class it is admitted
 // as. This file mints one key per class, writes that map, and asks every
 // Ready gateway pod whether it has loaded the map yet, which is the
-// InferenceKeysServed condition. Nothing sends these keys yet: callers are
-// given them only once the condition is True, so a caller never sends a key
-// the gateway would refuse.
+// InferenceKeysServed condition. Callers are given their key only once a
+// pass has found the condition True for a map holding it
+// (inference_key_callers.go), so a caller never sends a key the gateway
+// would refuse.
 //
 // The question is asked with a probe key of its own, in the reserved class
 // gateway-probe, which the hook admits on GET /v1/models alone and no
@@ -106,7 +107,8 @@ import (
 // Secrets are read by name through the uncached reader: the operator never
 // lists or watches a Secret (tests/test_operator_secrets_grant.py). Nothing
 // here logs, records or reports a key or a key's digest; counts, class names
-// and Secret names only.
+// and Secret names only. The one exception is a key Secret's own served mark
+// (inferenceKeyServedAnnotation), its key's digest on the same Secret.
 const (
 	inferenceKeysServedCondition = "InferenceKeysServed"
 	// Reasons the condition carries.
@@ -780,7 +782,16 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		log.Info("inference gateway caller keys reconciled", "callerClasses", len(served), "minted", minted, "mapWritten", mapWritten, "removedTiers", removed)
 	}
 
-	return r.probeInferenceKeys(ctx, agent, &gateway, served, keys, doc)
+	outcome := r.probeInferenceKeys(ctx, agent, &gateway, served, keys, doc)
+	// Served: every Ready pod has loaded a map holding each of these keys, so
+	// each class's Secret is marked for the key it holds, and its callers get
+	// it from the next pass on (inference_key_callers.go).
+	if outcome.condition != nil && outcome.condition.Status == metav1.ConditionTrue {
+		if r.markInferenceKeysServed(ctx, agent, served, keys) > 0 && (outcome.requeue == 0 || outcome.requeue > inferenceKeysMarkedRecheck) {
+			outcome.requeue = inferenceKeysMarkedRecheck
+		}
+	}
+	return outcome
 }
 
 // ensureInferenceKey returns c's key, creating its Secret when absent and

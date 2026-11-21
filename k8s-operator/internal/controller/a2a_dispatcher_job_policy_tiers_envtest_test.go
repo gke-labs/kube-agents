@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -127,6 +128,76 @@ func TestTheJobPolicyHoldsAReadTierJobToItsOwnTemplate(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), c.rule) {
 			t.Errorf("%s: refused for %q, want the rule %q", name, err, c.rule)
+		}
+	}
+}
+
+// A Job template that carries its tier's inference gateway key is the
+// template the policy compares a Job with: the operator writes the reference
+// into the one rendering the param and the dispatch config share
+// (withTierInferenceKeys), so a Job copied from it, reference and all, is
+// admitted, while a Job of the read tier carrying the unattended tier's key,
+// or the right key under an extra Secret reference, is not.
+func TestTheJobPolicyAdmitsATemplateCarryingItsTiersKey(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	ctx, admin, dispatcher, agent := envtestJobPolicySetup(t)
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	templates := dispatchJobTemplates(agent, profiles, false, "")
+	callers := inferenceKeyCallers{secrets: map[string]types.NamespacedName{}}
+	for _, tier := range []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended} {
+		c := tierInferenceKeyClass(agent, tier)
+		callers.secrets[c.name] = c.secret
+	}
+	withTierInferenceKeys(templates, callers)
+	r := &PlatformAgentReconciler{Client: admin}
+	for _, set := range templates {
+		hash := dispatchJobTemplatesHash(set)
+		for name, tmpl := range set {
+			defaulted, err := r.defaultedJobTemplate(ctx, profileNamespaceName(agent), name, tmpl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			param, err := buildDispatchJobTemplate(agent, name, hash, defaulted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustCreate(ctx, t, admin, param)
+		}
+	}
+	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, templates))
+	read := templates["tse"][dispatchJobTierTemplatePrefix+"tse.read"]
+	unattended := templates["tse"][dispatchJobTemplatePrefix+"tse"]
+	waitAdmitted(ctx, t, dispatcher, "read-with-key", read)
+	waitAdmitted(ctx, t, dispatcher, "unattended-with-key", unattended)
+
+	keyRef := func(tmpl *corev1.PodTemplateSpec) *corev1.EnvVar {
+		for i, e := range tmpl.Spec.Containers[0].Env {
+			if e.Name == workerInferenceKeyEnv {
+				return &tmpl.Spec.Containers[0].Env[i]
+			}
+		}
+		t.Fatalf("template carries no %s", workerInferenceKeyEnv)
+		return nil
+	}
+	for name, mutate := range map[string]func(*corev1.PodTemplateSpec){
+		"the read tier carrying the unattended tier's key": func(tmpl *corev1.PodTemplateSpec) {
+			keyRef(tmpl).ValueFrom.SecretKeyRef.Name = tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret.Name
+		},
+		"an extra Secret reference beside the key": func(tmpl *corev1.PodTemplateSpec) {
+			tmpl.Spec.Containers[0].Env = append(tmpl.Spec.Containers[0].Env, corev1.EnvVar{Name: "EXTRA", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "platform-agent-secrets"}, Key: "API_SERVER_KEY"}}})
+		},
+	} {
+		tmpl := read.DeepCopy()
+		mutate(tmpl)
+		err := dispatcher.Create(ctx, dispatcherJob("borrow-key", tmpl, nil))
+		if !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err) {
+			t.Errorf("%s: admitted (%v)", name, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must have exactly the pod spec") {
+			t.Errorf("%s: refused for %q, want the template equality rule", name, err)
 		}
 	}
 }
