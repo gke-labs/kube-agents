@@ -144,6 +144,7 @@ class PracticeLabelTest(unittest.TestCase):
         view = {
             "proposal": {
                 "state": state, "author": author, "labels": list(labels), "target": target, "sourceRevision": "a" * 40,
+                "source": "platform-agent/raise-pdb",
             },
             "diff": diff_adding(PATH, TEXT) if diff is None else diff,
         }
@@ -176,22 +177,25 @@ class PracticeLabelTest(unittest.TestCase):
     def writes(self, calls):
         return [c for c in calls if c[0] != "proposal-view"]
 
-    def edit_verb(self, *, recipes=(), base_file=("", ""), labels=()):
-        """An edit to one existing manifest, judged with `recipes` opted in and `base_file` read."""
+    def edit_verb(self, *, recipes=(), base_file=None, head_file=None, labels=()):
+        """An edit to one existing manifest, judged with `recipes` opted in;
+        `base_file` and `head_file` override what the two reads return."""
         import test_automerge_edit as te
 
         head = te.BASE.replace("minAvailable: 1  #", "minAvailable: 2  #")
         reads = []
 
-        def read_base(payload, ref, path):
+        def read_file(payload, ref, path):
             reads.append((ref, path))
-            return base_file if base_file != ("", "") else (te.BASE, "")
+            if ref == "main":
+                return base_file or (te.BASE, "", "c" * 40)
+            return head_file or (head, "", "a" * 40)
 
         fixes = {"raise-pdb": te.FIX}
         with (
             mock.patch.object(vcs_broker.fix_recipes_registry, "recipes", return_value=tuple(recipes)),
             mock.patch.object(vcs_broker.fix_recipes_registry, "generator", side_effect=lambda kind: fixes[kind]),
-            mock.patch.object(vcs_broker.VcsBroker, "_base_file", lambda self, payload, ref, path: read_base(payload, ref, path)),
+            mock.patch.object(vcs_broker.VcsBroker, "_base_file", lambda self, payload, ref, path: read_file(payload, ref, path)),
         ):
             answer, calls = self.run_verb(diff=te.git_diff(te.BASE, head), labels=labels)
         return answer, calls, reads
@@ -208,20 +212,32 @@ class PracticeLabelTest(unittest.TestCase):
         answer, calls, reads = self.edit_verb(recipes=[te.RECIPE], labels=[ae.PRACTICE_LABEL])
         self.assertFalse(answer["labelled"])
         self.assertEqual(answer["reason"], "the edit is the raise-pdb recipe's, but edited manifests are not labelled yet")
-        self.assertEqual(reads, [("main", te.PATH)])
+        self.assertEqual(reads, [("main", te.PATH), ("platform-agent/raise-pdb", te.PATH)])
         self.assertEqual(self.reads, [], "no cluster is read for an edit yet")
         self.assertEqual(self.writes(calls), [("proposal-update", {"number": 7, "labelsRemove": [ae.PRACTICE_LABEL]})])
 
     def test_an_edit_whose_base_cannot_be_read_is_refused(self):
         import test_automerge_edit as te
 
-        answer, _, _ = self.edit_verb(recipes=[te.RECIPE], base_file=(None, "not one regular file"))
+        answer, _, _ = self.edit_verb(recipes=[te.RECIPE], base_file=(None, "not one regular file", ""))
         self.assertIn("could not be read as the edit's base (not one regular file)", answer["reason"])
 
     def test_an_edit_that_is_not_the_declared_one_is_refused(self):
         import test_automerge_edit as te
 
-        answer, _, _ = self.edit_verb(recipes=[te.RECIPE], base_file=(te.BASE.replace("keep one up", "moved"), ""))
+        answer, _, _ = self.edit_verb(recipes=[te.RECIPE], base_file=(te.BASE.replace("keep one up", "moved"), "", "c" * 40))
+        self.assertEqual(answer["reason"], "the proposal's edit is not exactly one recipe's declared edit")
+
+    def test_the_head_is_read_at_the_proposals_own_revision(self):
+        import test_automerge_edit as te
+
+        head = te.BASE.replace("minAvailable: 1  #", "minAvailable: 2  #")
+        answer, _, _ = self.edit_verb(recipes=[te.RECIPE], head_file=(head, "", "b" * 40))
+        self.assertEqual(answer["reason"], "the proposal's branch moved while its head was read")
+        answer, _, _ = self.edit_verb(recipes=[te.RECIPE], head_file=(None, "executable", ""))
+        self.assertIn("could not be read as the edit's head (executable)", answer["reason"])
+        # A head that is not the diff applied to the base: the base moved, or the diff lies.
+        answer, _, _ = self.edit_verb(recipes=[te.RECIPE], head_file=(head.replace("replicas: 3", "replicas: 4"), "", "a" * 40))
         self.assertEqual(answer["reason"], "the proposal's edit is not exactly one recipe's declared edit")
 
     def test_switch_off_reads_no_cluster_and_writes_nothing(self):
@@ -503,7 +519,7 @@ class BaseFileTest(unittest.TestCase):
         with tarfile.open(fileobj=buf, mode="w") as tar:
             for info, data in members:
                 tar.addfile(info, io.BytesIO(data) if data is not None else None)
-        snap = {"archiveBase64": base64.b64encode(buf.getvalue()).decode()}
+        snap = {"archiveBase64": base64.b64encode(buf.getvalue()).decode(), "revision": "d" * 40}
         with tempfile.TemporaryDirectory() as tmp:
             broker = vcs_broker.VcsBroker(Path(tmp) / "scratch", git_runner=mock.Mock())
             with mock.patch.object(broker, "snapshot", return_value=snap):
@@ -519,7 +535,7 @@ class BaseFileTest(unittest.TestCase):
         return info, (data if kind is None else None)
 
     def test_one_regular_file(self):
-        self.assertEqual(self.read([self.info()]), ("a: 1\n", ""))
+        self.assertEqual(self.read([self.info()]), ("a: 1\n", "", "d" * 40))
 
     def test_everything_else_is_refused(self):
         import tarfile
@@ -534,7 +550,7 @@ class BaseFileTest(unittest.TestCase):
             ([self.info(data=b"a: \xff\n")], "not UTF-8"),
         ):
             with self.subTest(why=why):
-                text, said = self.read(members)
+                text, said, _ = self.read(members)
                 self.assertIsNone(text)
                 self.assertIn(why, said)
 
@@ -542,7 +558,7 @@ class BaseFileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             broker = vcs_broker.VcsBroker(Path(tmp) / "scratch", git_runner=mock.Mock())
             with mock.patch.object(broker, "snapshot", side_effect=WorkspaceError("PATH_NOT_FOUND")):
-                self.assertEqual(broker._base_file({}, "main", self.PATH), (None, "not read (WorkspaceError)"))
+                self.assertEqual(broker._base_file({}, "main", self.PATH), (None, "not read (WorkspaceError)", ""))
 
 if __name__ == "__main__":
     unittest.main()
