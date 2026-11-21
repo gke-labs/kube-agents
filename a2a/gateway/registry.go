@@ -619,12 +619,15 @@ func (rec *SessionRecord) fanOutPending(taskID string) bool {
 	return ok && ref.fanOut() && ref.DelegationEnd == "" && rec.batchLeft(ref) > 0
 }
 
-// endedBatchEntries is the entries of taskID's batch whose child has ended.
-func (rec *SessionRecord) endedBatchEntries(taskID string) map[int]bool {
-	ended := map[int]bool{}
+// endedBatchEntries is the recorded end of each entry of taskID's batch whose
+// child has ended, read before a withdrawal drops those children from the
+// record: an end already sent gets nothing more, and an end recorded Unsent
+// is sent as recorded (endWithdrawnProfileBatch).
+func (rec *SessionRecord) endedBatchEntries(taskID string) map[int]TaskRef {
+	ended := map[int]TaskRef{}
 	for _, k := range rec.batchChildren(taskID) {
 		if k.BatchEnd != nil {
-			ended[k.BatchIndex] = true
+			ended[k.BatchIndex] = k
 		}
 	}
 	return ended
