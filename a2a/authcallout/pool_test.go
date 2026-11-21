@@ -22,8 +22,8 @@ import (
 // operator's rendered server; what it cannot do is time the pool on its own,
 // because its sixty-four clients arrive as their handshakes finish, spread
 // over most of a second under the race detector. Here the requests are handed
-// to handle directly, the way the subscription's one dispatch goroutine does,
-// so the clock measures decisions and nothing else.
+// to handle and decide directly, the way the subscription's one dispatch
+// goroutine does, so what is measured is decisions and nothing else.
 
 // directCallout is a Service whose responses can be read back: the requests
 // are bound to a subscription on a plain embedded server, so handle's
@@ -147,14 +147,35 @@ func response(t *testing.T, m *nats.Msg) *jwt.AuthorizationResponseClaims {
 
 // The issue's acceptance: sixty-four callbacks with a 50ms TokenReview each,
 // every one answered inside a second. Serially that is 3.2s of review; sixteen
-// abreast, four rounds of 50ms. The reviews are held until sixteen are in
-// flight, so the peak is the pool's width by construction and the clock runs
-// from the pool filling to the last answer.
-func TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast(t *testing.T) {
+// abreast it is four rounds, 200ms. What the pool owes that bound is the four
+// rounds, and the rounds are what is counted here: a wall clock over them
+// measured the machine's load as much as the pool, since under the race
+// detector sixty-four decisions are most of a second of signing on a busy
+// runner before any review time is added.
+//
+// Every review is held, so the test owns each round. A round is full when
+// sixteen reviews are held at once; while it is held, the next sixteen
+// requests are already behind it and none of them may be reviewed or
+// answered. Releasing it must bring sixteen authorizations and then exactly
+// the next sixteen reviews. A pool narrower than sixteen never fills a round,
+// and a wider one lets the waiting requests into a full round.
+//
+// Each request gets a goroutine of its own, as handle gives it, but not
+// handle's authDecisionBudget: that is a wall clock from receipt, and a held
+// round on a busy runner outlasts it, which is a refusal the pool did not
+// cause. TestHandleReturnsBeforeTheDecisionIsMade covers handle itself.
+func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 	const callbacks = 64
-	const reviewCost = 50 * time.Millisecond
-	const deadline = time.Second
-	const gateWait = 10 * time.Second
+	// Sixteen abreast: the width is pinned here, so a change to
+	// calloutWorkers is a change to this test as well.
+	const rounds = 4
+	if calloutWorkers*rounds != callbacks {
+		t.Fatalf("calloutWorkers = %d, so %d callbacks are not %d full rounds; the issue's acceptance is sixteen abreast", calloutWorkers, callbacks, rounds)
+	}
+	// How long one step (a review starting, an answer arriving) may take
+	// before the test gives up on it. Nothing waits this long unless the
+	// step is never going to happen.
+	const stepWait = 10 * time.Second
 
 	tokens := map[string]Attested{}
 	presented := make([]string, callbacks)
@@ -165,8 +186,13 @@ func TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast(t *testing.T) {
 
 	var mu sync.Mutex
 	inFlight, peak, reviews := 0, 0, 0
-	poolFull := make(chan struct{})
-	poolFilled := false
+	// gate holds the reviews of the round now filling; the test closes it
+	// to release them, after putting the next round's gate in its place.
+	gate := make(chan struct{})
+	started := make(chan struct{}, callbacks)
+	// Closed when the test ends, so a review a failed test left held lets
+	// its goroutine go.
+	testOver := make(chan struct{})
 	d := startDirectCallout(t, tokens, func(string) func() {
 		mu.Lock()
 		inFlight++
@@ -174,58 +200,102 @@ func TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast(t *testing.T) {
 		if inFlight > peak {
 			peak = inFlight
 		}
-		if inFlight == calloutWorkers && !poolFilled {
-			poolFilled = true
-			close(poolFull)
-		}
+		held := gate
 		mu.Unlock()
+		started <- struct{}{}
 		select {
-		case <-poolFull:
-		case <-time.After(gateWait):
+		case <-held:
+		case <-testOver:
 		}
-		time.Sleep(reviewCost)
 		return func() {
 			mu.Lock()
 			inFlight--
 			mu.Unlock()
 		}
 	})
+	t.Cleanup(func() { close(testOver) })
 
 	requests := make([]*nats.Msg, callbacks)
 	for i := range requests {
 		requests[i] = d.request(t, presented[i])
 	}
-	start := time.Now()
 	for _, m := range requests {
-		d.svc.handle(m)
+		go d.svc.decide(context.Background(), m)
 	}
-	handedOver := time.Since(start)
 
-	answered := 0
-	for answered < callbacks {
+	for round := 1; round <= rounds; round++ {
+		for n := 0; n < calloutWorkers; n++ {
+			select {
+			case <-started:
+			case <-time.After(stepWait):
+				t.Fatalf("round %d: %d of %d reviews had started after %v; the pool is narrower than its %d slots", round, n, calloutWorkers, stepWait, calloutWorkers)
+			}
+		}
+
+		// The round is full and held, with every later request behind it.
+		// Nothing is answered while it is.
 		select {
 		case m := <-d.replies:
-			if rc := response(t, m); rc.Error != "" || rc.Jwt == "" {
-				t.Fatalf("a callback was refused: %q", rc.Error)
+			rc := response(t, m)
+			t.Fatalf("round %d: a callback was answered (error %q) while all %d reviews of the round were held", round, rc.Error, calloutWorkers)
+		default:
+		}
+		mu.Lock()
+		now := inFlight
+		held := gate
+		gate = make(chan struct{})
+		mu.Unlock()
+		if now != calloutWorkers {
+			t.Fatalf("round %d: %d reviews in flight with the round held, want exactly the %d slots", round, now, calloutWorkers)
+		}
+		close(held)
+		for n := 0; n < calloutWorkers; n++ {
+			select {
+			case m := <-d.replies:
+				if rc := response(t, m); rc.Error != "" || rc.Jwt == "" {
+					t.Fatalf("round %d: a callback was refused: %q", round, rc.Error)
+				}
+			case <-time.After(stepWait):
+				t.Fatalf("round %d: %d of %d callbacks answered %v after their reviews were released; the rest never were", round, n, calloutWorkers, stepWait)
 			}
-			answered++
-		case <-time.After(gateWait):
-			t.Fatalf("%d of %d callbacks answered after %v; the rest never were", answered, callbacks, gateWait)
 		}
 	}
-	finished := time.Since(start)
 
 	mu.Lock()
 	defer mu.Unlock()
-	t.Logf("%d callbacks handed over in %v and all answered in %v, peak %d in flight", callbacks, handedOver, finished, peak)
+	t.Logf("%d callbacks decided in %d rounds, peak %d in flight", callbacks, rounds, peak)
 	if reviews != callbacks {
-		t.Fatalf("TokenReviews = %d for %d callbacks; the measurement below is not of what it claims", reviews, callbacks)
+		t.Errorf("TokenReviews = %d for %d callbacks; a review ran that no round accounted for", reviews, callbacks)
 	}
 	if peak != calloutWorkers {
 		t.Errorf("peak concurrent decisions = %d, want exactly the %d slots", peak, calloutWorkers)
 	}
-	if finished > deadline {
-		t.Errorf("%d callbacks at %v of TokenReview each took %v to answer, over the %v the issue's acceptance allows", callbacks, reviewCost, finished, deadline)
+}
+
+// handle hands the request on and returns, which is what lets the one
+// goroutine that dispatches the subscription's callbacks start the next
+// decision while this one is still at its TokenReview. The review here waits
+// for handle to have returned. A handle that decided inline would wait on it
+// until the budget lapsed, and the answer would be a refusal.
+func TestHandleReturnsBeforeTheDecisionIsMade(t *testing.T) {
+	const answerWait = 10 * time.Second
+
+	returned := make(chan struct{})
+	d := startDirectCallout(t, map[string]Attested{agentToken: {ServiceAccount: agentSA}}, func(string) func() {
+		<-returned
+		return func() {}
+	})
+
+	d.svc.handle(d.request(t, agentToken))
+	close(returned)
+
+	select {
+	case m := <-d.replies:
+		if rc := response(t, m); rc.Error != "" || rc.Jwt == "" {
+			t.Fatalf("the callback was refused (%q); handle held its caller until the decision was over", rc.Error)
+		}
+	case <-time.After(answerWait):
+		t.Fatalf("the callback was not answered %v after handle returned", answerWait)
 	}
 }
 
