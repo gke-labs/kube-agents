@@ -333,7 +333,13 @@ func TestAClosedGatewayProxyStopsListening(t *testing.T) {
 		t.Fatal(err)
 	}
 	if conn, err := net.DialTimeout("tcp", strings.TrimPrefix(p.URL, "http://"), time.Second); err == nil {
+		// A dial to a loopback port nothing listens on can, rarely, pick
+		// that port as its own source and connect to itself. That is no
+		// listener.
+		self := conn.LocalAddr().String() == conn.RemoteAddr().String()
 		conn.Close()
-		t.Error("the proxy still accepts connections after Close")
+		if !self {
+			t.Error("the proxy still accepts connections after Close")
+		}
 	}
 }

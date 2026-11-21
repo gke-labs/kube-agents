@@ -208,10 +208,17 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 func (p *GatewayProxy) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), gatewayProxyShutdownTimeout)
 	defer cancel()
-	if err := p.srv.Shutdown(ctx); err != nil {
-		return p.srv.Close()
+	err := p.srv.Shutdown(ctx)
+	if err != nil {
+		err = p.srv.Close()
 	}
-	return nil
+	// Serve runs in its own goroutine and may not have taken the listener
+	// yet, and then Shutdown has no listener to close: the port would go on
+	// accepting into its backlog until Serve starts and sees the shutdown.
+	// Closing it here frees the port before Close returns; a second close
+	// of a listener Serve already closed is harmless.
+	_ = p.ln.Close()
+	return err
 }
 
 // cappedBody reads at most left bytes, then fails, so a response past the
