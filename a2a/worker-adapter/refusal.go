@@ -101,7 +101,9 @@ type writeRefusalRecord struct {
 // task, or nil. A missing file is nil and no error. The file is opened
 // without following a symlink and must be a regular file; a record counts
 // only when it is marked a write refusal, its rule and verb have the broker's
-// shape, and it names this task or no task.
+// shape, and it names this task. A record naming no task, as from a stray
+// earlier process on a pool pod, never counts, and with no task id nothing
+// does.
 func readWriteRefusal(path, taskID string) (*writeRefusal, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) // #nosec G304 -- the worker's own per-task file
 	if err != nil {
@@ -128,7 +130,7 @@ func readWriteRefusal(path, taskID string) (*writeRefusal, error) {
 		if !rec.WriteRefusal || !refusalRuleShape.MatchString(rec.Rule) || !refusalVerbShape.MatchString(rec.Verb) {
 			continue
 		}
-		if rec.Task != "" && rec.Task != taskID {
+		if taskID == "" || rec.Task != taskID {
 			continue
 		}
 		return &writeRefusal{rule: rec.Rule, verb: rec.Verb}, nil

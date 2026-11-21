@@ -361,8 +361,11 @@ func TestReadWriteRefusal(t *testing.T) {
 	if r, err := readWriteRefusal(write("good", good+"\n"), "t1"); err != nil || r == nil || r.rule != "kubernetes.read-only" || r.verb != "rollout restart" {
 		t.Fatalf("good record: %+v %v", r, err)
 	}
-	if r, err := readWriteRefusal(write("untasked", refusalRecord(t, true, "caller.vcs-permit", "publish", "")+"\n"), "t1"); err != nil || r == nil || r.verb != "publish" {
-		t.Fatalf("a record naming no task: %+v %v", r, err)
+	if r, err := readWriteRefusal(write("untasked", refusalRecord(t, true, "caller.vcs-permit", "publish", "")+"\n"), "t1"); err != nil || r != nil {
+		t.Fatalf("a record naming no task counted: %+v %v", r, err)
+	}
+	if r, err := readWriteRefusal(write("untasked-empty-id", refusalRecord(t, true, "caller.vcs-permit", "publish", "")+"\n"), ""); err != nil || r != nil {
+		t.Fatalf("a record counted with no task id: %+v %v", r, err)
 	}
 	if r, err := readWriteRefusal(filepath.Join(dir, "missing"), "t1"); err != nil || r != nil {
 		t.Fatalf("missing file: %+v %v", r, err)
