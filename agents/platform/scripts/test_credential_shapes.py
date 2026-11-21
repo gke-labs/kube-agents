@@ -26,9 +26,6 @@ TOKENS = {
     "private key material": "-----BEGIN RSA PRIVATE KEY-----",
 }
 PREFIXED_PROVIDER_KEY = "sk-ant-api03-" + "Ab1" * 12
-# The fragment length the shared conformance fixture names: no run of this many
-# characters of a redacted token may survive.
-FRAGMENT_CHARS = 8
 # The secret part of the URL token: its scheme, user and host are not.
 URL_PASSWORD = "s3cretpass"
 # Each shape's literal lead in TOKENS: what the cut-tail pass keeps when fewer
