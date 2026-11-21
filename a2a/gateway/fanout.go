@@ -199,14 +199,15 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 		// A profile parent waits open and takes each end as it comes, so
 		// nothing is held for a wake: the end is sent now and recorded
 		// without its text, which only a wake would read. A send that
-		// failed leaves the end unrecorded, so the heal can find the child
-		// ended and send it again; the parent dedupes on the entry. The
+		// failed is recorded Unsent with its text, and the heal sends it
+		// again (healProfileBatch); the parent dedupes on the entry. The
 		// last end changes nothing: the parent holds the conversation until
 		// its own end, which is the chain's.
-		if !g.profileBatchChildEnded(ctx, rec, parent, child, end, reason) {
-			return
+		if g.profileBatchChildEnded(ctx, rec, parent, child, end, reason) {
+			end.Text = ""
+		} else {
+			end.Unsent = true
 		}
-		end.Text = ""
 		rec.setBatchEnd(child.ID, &end)
 		log.Info("fan-out child ended", "state", end.State, "left", rec.batchLeft(parent), "parent", "profile")
 		return
@@ -389,6 +390,34 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 			continue
 		}
 		changed = g.healBatchChild(ctx, rec, kid) || changed
+	}
+	if changed {
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
+		}
+	}
+}
+
+// healProfileBatch heals a waiting profile parent's batch children: a child
+// with no end recorded is healed as a session fan-out's is (healBatchChild),
+// which sends its end to the parent, and an end recorded Unsent is sent
+// again. The parent itself is healed by the caller, as any task is. It
+// writes the record when anything changed.
+func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, parent TaskRef) {
+	changed := false
+	for _, kid := range rec.batchChildren(parent.ID) {
+		fresh, _ := rec.TaskRefFor(kid.ID)
+		switch {
+		case fresh.BatchEnd == nil:
+			changed = g.healBatchChild(ctx, rec, fresh) || changed
+		case fresh.BatchEnd.Unsent:
+			end := *fresh.BatchEnd
+			if g.profileBatchChildEnded(ctx, rec, parent, fresh, end, end.Text) {
+				end.Unsent, end.Text = false, ""
+				rec.setBatchEnd(fresh.ID, &end)
+				changed = true
+			}
+		}
 	}
 	if changed {
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {

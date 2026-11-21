@@ -804,10 +804,10 @@ A profile parent's batch gets one end per entry. `entry` is the entry's 1-based 
 batch, on every end of a batch, and absent for a single delegation. A `tasks` list of one entry is
 a single delegation, so its end has no `entry`. An end can arrive twice, so a parent waiting on a
 batch dedupes its ends on `entry` and counts them to the batch's size, and a single delegation's
-on `childTaskId`. An end can also be lost: a send that fails is left unrecorded and sent again when
-the gateway's heal next reads the conversation, and a gateway restart at the wrong moment can drop
-one. Nothing heals a conversation no one writes to, so the parent's own deadline is what bounds its
-wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the
+on `childTaskId`. An end can also be late or lost. A send that fails is recorded unsent and sent again when the
+gateway's heal next reads the conversation, which also finds a child whose terminal the relay
+missed. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
+writes to, so the parent's own deadline is what bounds its wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the
 gateway cancels its live children, each with its stop record, since nothing reads their results. A batch child that reaches `input-required` is cancelled and ends
 `canceled`, with its question as `text`. A batch withdrawn whole (cut short, or a child that
 couldn't reach the bus) ends each entry that has no end yet `failed`, with the reason as `text`.

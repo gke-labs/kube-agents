@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // profileBatchParent starts a top-level profile task on "chat" in a console
@@ -610,4 +612,142 @@ func TestAProfileParentThatEndsCancelsItsSingleLiveChild(t *testing.T) {
 		_, stop := dispatchStopFor(t, r.url, "cluster", child.TaskID)
 		return cancelled && stop
 	})
+}
+
+// TestABatchChildUnderAConfirmedParentCarriesItsChangeRequest: each batch
+// child takes the parent's changeRequested from the gateway's record, as a
+// single child does, and can't raise it.
+func TestABatchChildUnderAConfirmedParentCarriesItsChangeRequest(t *testing.T) {
+	t.Parallel()
+	for _, confirm := range []bool{true, false} {
+		r := startProfileRig(t)
+		r.g.cfg.DelegationWidthMax = 10
+		r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+		ctx := context.Background()
+		conv := fmt.Sprintf("discord:cr-batch/%v", confirm)
+		turn := profileTurn(conv, "chat", nil)
+		if confirm {
+			turn.Intent = IntentConfirm
+		}
+		r.adapter.inbox <- turn
+		origin := submissionOn(t, r, "chat")
+		parent := r.execFor(t, origin, "chat")
+		if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+			t.Fatal(err)
+		}
+		art := delegateBatchArtifact(t,
+			lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+			lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+		if err := parent.PublishArtifact(ctx, art); err != nil {
+			t.Fatal(err)
+		}
+		var kids []subjectEnvelope
+		waitFor(t, "both children submitted", func() bool {
+			kids = streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>")
+			return len(kids) == 2
+		})
+		for _, k := range kids {
+			if found, got := submittedChange(t, k.env); !found || got != confirm {
+				t.Fatalf("confirm=%v: batch child changeRequested = %v (part found %v)", confirm, got, found)
+			}
+		}
+	}
+}
+
+// TestAnUnsentBatchChildEndIsSentAgainByTheHeal: a child's end that couldn't
+// be published to its profile parent is recorded unsent, and the heal sends
+// it once the bus takes it again, so the parent isn't left to its deadline.
+func TestAnUnsentBatchChildEndIsSentAgainByTheHeal(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	conv := "console:tab-profile-batch-unsent"
+	_, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+	// The parent's .in stops being stored, so the publish fails.
+	restore := withoutTaskInSubject(t, r.url, "chat", origin.TaskID)
+	completeChild(t, r, kids[0], "a is fine")
+	waitForRecord(t, r, conv, "a's end recorded unsent", func(rec *SessionRecord) bool {
+		k, ok := rec.TaskRefFor(kids[0].TaskID)
+		return ok && k.BatchEnd != nil && k.BatchEnd.Unsent
+	})
+	restore()
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Backend: consoleBackend, Kind: "dm", AuthorID: consoleAuthor,
+		MessageID: "heal-unsent", Text: "how's it going?"}
+	waitFor(t, "a's end sent by the heal", func() bool {
+		for _, c := range childResultsOn(t, r, "chat", origin.TaskID) {
+			if c.ChildTaskID == kids[0].TaskID && c.Entry == 1 && c.Text == "a is fine" {
+				return true
+			}
+		}
+		return false
+	})
+	waitForRecord(t, r, conv, "a's end no longer unsent", func(rec *SessionRecord) bool {
+		k, _ := rec.TaskRefFor(kids[0].TaskID)
+		return k.BatchEnd != nil && !k.BatchEnd.Unsent
+	})
+}
+
+// TestAMissedBatchChildTerminalIsHealedForAProfileParent: a child terminal
+// the relay never delivered is found by the heal while the profile parent
+// waits, and its end goes to the parent.
+func TestAMissedBatchChildTerminalIsHealedForAProfileParent(t *testing.T) {
+	t.Parallel()
+	r := startRestartableProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-profile-batch-missed"
+	_, origin, kids := profileBatchParent(t, r, conv, "a", "b")
+	child := r.execFor(t, kids[0], "cluster")
+	r2, _ := restartRig(t, r, func() {
+		if err := child.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-missed", Name: lib.ArtifactResult,
+			Parts: []lib.Part{{Kind: "text", Text: "a is fine"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+	r2.adapter.inbox <- InboundMessage{Conversation: conv, Backend: consoleBackend, Kind: "dm", AuthorID: consoleAuthor,
+		MessageID: "heal-missed", Text: "how's it going?"}
+	waitFor(t, "a's end sent by the heal", func() bool {
+		for _, c := range childResultsOn(t, r2, "chat", origin.TaskID) {
+			if c.ChildTaskID == kids[0].TaskID && c.State == lib.StateCompleted {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// withoutTaskInSubject stops TASKS storing one task's .in, so a publish to
+// it fails, and returns the function that puts it back.
+func withoutTaskInSubject(t *testing.T, url, addressee, taskID string) func() {
+	t.Helper()
+	nc, err := connectTest(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := stream.CachedInfo().Config
+	cfg := orig
+	cfg.Subjects = []string{"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.tasks.cluster.*.in"}
+	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		defer nc.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := js.UpdateStream(ctx, orig); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

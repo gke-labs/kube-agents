@@ -515,11 +515,14 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			SteerAuthors:         parent.SteerAuthors,
 			SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 			RootTaskID:           parent.rootID(),
-			LinkParent:           true,
-			Addressee:            addressee,
-			KeepActive:           true,
-			BatchIndex:           i + 1,
-			Target:               batchTarget(batchParams(e, routes[i])),
+			// The parent's entry, as for a single child: a child can't
+			// raise it.
+			ChangeRequested: parent.ChangeRequested,
+			LinkParent:      true,
+			Addressee:       addressee,
+			KeepActive:      true,
+			BatchIndex:      i + 1,
+			Target:          batchTarget(batchParams(e, routes[i])),
 		})
 		if !ok {
 			// The parent records that its request ran nothing, whether or

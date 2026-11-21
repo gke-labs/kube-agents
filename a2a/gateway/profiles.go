@@ -762,8 +762,8 @@ func (g *Gateway) sendChildResult(ctx context.Context, rec *SessionRecord, paren
 // ends (lib.ChildResult). Nothing is sent once the batch was withdrawn,
 // whose entries were each ended then (endWithdrawnProfileBatch), or to a
 // parent that no longer reads. It reports false only for a send that
-// failed, so the caller leaves the end unrecorded and the heal finds the
-// child ended and tries again.
+// failed, which the caller records Unsent for the heal to send again
+// (healProfileBatch).
 func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord, parent, child TaskRef, end BatchEnd, reason string) bool {
 	if parent.DelegationEnd != "" || !g.profileParentListens(ctx, &parent, child.ID) {
 		return true

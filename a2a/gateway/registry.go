@@ -570,6 +570,10 @@ type BatchEnd struct {
 	Stopped  bool           `json:"stopped,omitempty"`
 	Unposted bool           `json:"unposted,omitempty"`
 	Cards    bool           `json:"cards,omitempty"`
+	// Unsent marks a profile parent's batch child whose end couldn't be
+	// published to the parent: Text is kept, and the heal sends it again
+	// (healProfileBatch) and clears this.
+	Unsent bool `json:"unsent,omitempty"`
 }
 
 // fanOut reports a turn whose request was a batch of two or more children.
