@@ -3,11 +3,13 @@
 // skills/<name>/SKILL.md, adapted for a session (transform.go). It runs at
 // image build time (a2a/Dockerfile.worker), so agents/cluster/skills stays
 // the one source of those skills and a2a/persona/session/persona.md the one
-// source of the persona.
+// source of the persona. It also writes the tree's content manifest
+// (persona.IntegrityManifestFile) over CLAUDE.md and skills/, which the
+// session worker checks the shipped tree against at start.
 //
 //	session-persona -skills agents/cluster/skills -persona a2a/persona/session/persona.md -out /out/claude
 //
-// Only SKILL.md is shipped. The skills' scripts and assets are not: the
+// Of each skill, only SKILL.md is shipped. The skills' scripts and assets are not: the
 // session pod has no shell beyond the cluster view's kubectl and gcloud, and
 // a file the model can see but not use is an invitation to go looking.
 package main
