@@ -2945,11 +2945,21 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
 RUN getent group 10000 >/dev/null || groupadd --gid 10000 hermes; \
     useradd --no-log-init --no-create-home --uid 10001 --gid 10000 \
       --home-dir /tmp/credential-proxy --shell /usr/sbin/nologin credential-proxy; \
-    chmod 0750 /opt/defaults
+    chmod 0750 /opt/defaults; \
+    mkdir -p -m 0755 /usr/local/share/kube-agents
 
 COPY --from=envoy-bin --chmod=0755 /usr/local/bin/envoy /usr/local/bin/envoy
 COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
 COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
+# The kubectl cost gate's classifier and table: the shell sandbox's own
+# deploy/sandbox/kubectl-admit.py and kubectl-costs.json, which
+# credential_proxy.py loads from here (KUBECTL_ADMIT_PATH,
+# KUBECTL_COST_TABLE_PATH) to charge a brokered cluster-wide kubectl read its
+# profiled peak. Read, never executed, so 0644; the directory is made above
+# rather than by this COPY, whose --chmod would otherwise reach it and leave
+# it untraversable for the runtime uid. A broker that cannot load either runs
+# every command on the flat child reserve, as before the gate.
+COPY --chmod=0644 deploy/sandbox/kubectl-admit.py deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/
 
 # --- CREDENTIAL PROXY TARGET ---
 # Only this image contains the real credential-aware CLIs. The platform target
