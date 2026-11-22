@@ -21,6 +21,7 @@ import base64
 import pathlib
 import re
 import subprocess
+import tempfile
 import textwrap
 import unittest
 
@@ -37,16 +38,37 @@ _AGENT_TOKEN = "agent-api-key"
 _INJECT_TOKEN = "door-bearer-token"
 _A2A_DOOR_TOKEN = "a2a-door-bearer-token-never-echoed"
 
+# What kubectl prints when it cannot reach the API server, and for an absent Secret.
+_CONNECTION_ERROR = "Unable to connect to the server: net/http: TLS handshake timeout"
+_NOT_FOUND_ERROR = "Error from server (NotFound): secrets not found"
+
 # A kubectl that answers the two Secret reads the section makes, with the
 # encoded values the real API returns for a jsonpath into .data, and records
-# every call.
+# every call. `<NAME>_READ_FAILURES=n` makes the first n reads of that Secret
+# fail as a connection error does; the count is in a file, because each read
+# runs in a subshell. An absent Secret is what kubectl makes of it: a read that
+# succeeds with no output when the call has `--ignore-not-found`, and a
+# NotFound error with exit 1 when it does not. `sleep` only records.
 _KUBECTL_STUB = textwrap.dedent(
     f"""\
+    sleep() {{ echo "SLEEP $*" >&2; }}
+    absent() {{
+      case "$*" in *" --ignore-not-found "*) return 0 ;; esac
+      echo "{_NOT_FOUND_ERROR}" >&2
+      return 1
+    }}
+    fails_first() {{
+      local limit_name="$1_READ_FAILURES" count_file="${{READ_COUNT_DIR}}/$1" count=0
+      local limit="${{!limit_name:-0}}"
+      [ ! -f "${{count_file}}" ] || count="$(cat "${{count_file}}")"
+      echo "$((count + 1))" > "${{count_file}}"
+      [ "${{count}}" -ge "${{limit}}" ] || {{ echo "{_CONNECTION_ERROR}" >&2; return 1; }}
+    }}
     kubectl() {{
       echo "KUBECTL $*" >&2
       case "$*" in
-        *"secret platform-agent-secrets "*) printf '%s' '{base64.b64encode(_AGENT_TOKEN.encode()).decode()}' ;;
-        *"secret platform-agent-a2a-inject "*) [ -n "${{INJECT_SECRET_MISSING:-}}" ] && return 1; printf '%s' '{base64.b64encode(_INJECT_TOKEN.encode()).decode()}' ;;
+        *"secret platform-agent-secrets "*) fails_first AGENT || return 1; [ -z "${{AGENT_SECRET_MISSING:-}}" ] || {{ absent "$@"; return; }}; [ -z "${{AGENT_KEY_EMPTY:-}}" ] || return 0; printf '%s' '{base64.b64encode(_AGENT_TOKEN.encode()).decode()}' ;;
+        *"secret platform-agent-a2a-inject "*) fails_first INJECT || return 1; [ -z "${{INJECT_SECRET_MISSING:-}}" ] || {{ absent "$@"; return; }}; printf '%s' '{base64.b64encode(_INJECT_TOKEN.encode()).decode()}' ;;
         *"secret platform-agent-a2a-door "*) [ -n "${{DOOR_SECRET_MISSING:-}}" ] && return 1; printf '%s' '{base64.b64encode(_A2A_DOOR_TOKEN.encode()).decode()}' ;;
         *) echo "unexpected kubectl call: $*" >&2; return 1 ;;
       esac
@@ -139,10 +161,32 @@ def flag_lines(mode_next: str | None) -> list[str]:
     return [] if mode_next is None else [f'export EVAL_MODE_NEXT="{mode_next}"']
 
 
-def run_section(mode_next: str | None, secret_missing: bool = False, door_secret_missing: bool = False) -> subprocess.CompletedProcess:
+def run_section(
+    mode_next: str | None,
+    secret_missing: bool = False,
+    door_secret_missing: bool = False,
+    read_failures: dict[str, int] | None = None,
+    agent_secret: str = "",
+) -> subprocess.CompletedProcess:
+    """`agent_secret` is "" for a Secret with its key, or `AGENT_SECRET_MISSING` or `AGENT_KEY_EMPTY`."""
+    with tempfile.TemporaryDirectory() as count_dir:
+        return _run_section(mode_next, secret_missing, door_secret_missing, read_failures or {}, agent_secret, count_dir)
+
+
+def _run_section(
+    mode_next: str | None,
+    secret_missing: bool,
+    door_secret_missing: bool,
+    read_failures: dict[str, int],
+    agent_secret: str,
+    count_dir: str,
+) -> subprocess.CompletedProcess:
     script = "\n".join(
         [
             "set -euo pipefail",
+            f'export READ_COUNT_DIR="{count_dir}"',
+            *(f'export {name}_READ_FAILURES="{count}"' for name, count in read_failures.items()),
+            f'export {agent_secret}="1"' if agent_secret else "",
             # "Not exported by the test" has to mean unset, not whatever the
             # shell running the tests happens to export: the retired flags,
             # and the three variables the section exports, which a developer
@@ -174,6 +218,15 @@ def kubectl_calls(result: subprocess.CompletedProcess) -> list[str]:
     return [line.removeprefix("KUBECTL ") for line in result.stderr.splitlines() if line.startswith("KUBECTL ")]
 
 
+def error_lines(result: subprocess.CompletedProcess) -> list[str]:
+    """The script's own ERROR lines, not the stub's echo of a kubectl call."""
+    return [line for line in result.stderr.splitlines() if line.startswith("ERROR:")]
+
+
+def waits(result: subprocess.CompletedProcess) -> list[str]:
+    return [line.removeprefix("SLEEP ") for line in result.stderr.splitlines() if line.startswith("SLEEP ")]
+
+
 class EveryRunGoesThroughTheDoorTest(unittest.TestCase):
     def test_the_matrix_runs_through_the_door_with_its_token_whatever_the_flag_says(self) -> None:
         for value in _FLAG_SPELLINGS:
@@ -186,11 +239,13 @@ class EveryRunGoesThroughTheDoorTest(unittest.TestCase):
                 self.assertEqual(out["INJECT_TOKEN"], _INJECT_TOKEN)
                 calls = kubectl_calls(result)
                 self.assertEqual(len(calls), 3, calls)
-                self.assertIn("secret platform-agent-secrets", calls[0])
+                # No `--ignore-not-found` on this read: with it, an absent Secret goes on with an empty token.
+                self.assertEqual(calls[0], f"get secret platform-agent-secrets -n {_NAMESPACE} -o jsonpath={{.data.API_SERVER_KEY}}")
                 self.assertEqual(
                     calls[1],
-                    f"get secret platform-agent-a2a-inject -n {_NAMESPACE} -o jsonpath={{.data.token}}",
+                    f"get secret platform-agent-a2a-inject -n {_NAMESPACE} --ignore-not-found -o jsonpath={{.data.token}}",
                 )
+                self.assertEqual(waits(result), [], "a read that succeeds is not tried again")
 
     def test_the_retired_flags_are_read_nowhere(self) -> None:
         """EVAL_MODE_NEXT once chose the door over the agent API and
@@ -256,12 +311,15 @@ class EveryRunGoesThroughTheDoorTest(unittest.TestCase):
     def test_a_missing_token_secret_stops_the_run_before_the_matrix(self) -> None:
         result = run_section(None, secret_missing=True)
         self.assertNotEqual(result.returncode, 0)
-        # The script's own line, not the stub's echo of the kubectl call.
-        errors = [line for line in result.stderr.splitlines() if line.startswith("ERROR:")]
+        errors = error_lines(result)
         self.assertEqual(len(errors), 1, result.stderr)
         self.assertIn("platform-agent-a2a-inject", errors[0])
+        self.assertIn("missing or empty", errors[0])
         self.assertNotIn("EVAL_MODE_NEXT", errors[0])
         self.assertNotIn("TRANSPORT=", result.stdout)
+        # The API server answered, so the read is not tried again.
+        self.assertEqual(waits(result), [])
+        self.assertEqual(len(kubectl_calls(result)), 2, result.stderr)
 
     def test_the_secret_and_transport_names_are_the_operators_and_the_harnesss(self) -> None:
         consts = constants()
@@ -282,6 +340,65 @@ class EveryRunGoesThroughTheDoorTest(unittest.TestCase):
         self.assertIn('export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"', block)
         # Unconditionally: no `if` stands between the section's header and the export.
         self.assertNotIn("\nif ", block.split("export AGENT_INJECT_TOKEN")[0].split("EVAL_INJECT_TOKEN_SECRET=")[0])
+
+
+class ASecretReadThatFailsTest(unittest.TestCase):
+    """A connection error to the API server is a failure of the read, not a state
+    of the install. One such error ended a nightly lane after its deploy, with a
+    message that the Secret was missing (#6633)."""
+
+    SECRETS = (("AGENT", "platform-agent-secrets"), ("INJECT", "platform-agent-a2a-inject"))
+
+    def test_a_read_that_fails_one_time_is_tried_again_and_the_run_goes_on(self) -> None:
+        c = constants()
+        for name, secret in self.SECRETS:
+            with self.subTest(secret=secret):
+                result = run_section(None, read_failures={name: 1})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                out = exported(result)
+                self.assertEqual((out["TOKEN"], out["INJECT_TOKEN"], out["TRANSPORT"]), (_AGENT_TOKEN, _INJECT_TOKEN, "inject"))
+                self.assertEqual(sum(f"secret {secret} " in call for call in kubectl_calls(result)), 2)
+                self.assertEqual(waits(result), [c["EVAL_SECRET_READ_RETRY_SECONDS"]])
+                self.assertEqual(error_lines(result), [])
+                self.assertIn(_CONNECTION_ERROR, result.stderr)
+
+    def test_a_read_that_always_fails_says_that_the_read_failed(self) -> None:
+        c = constants()
+        attempts = int(c["EVAL_SECRET_READ_ATTEMPTS"])
+        for name, secret in self.SECRETS:
+            with self.subTest(secret=secret):
+                result = run_section(None, read_failures={name: attempts})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(sum(f"secret {secret} " in call for call in kubectl_calls(result)), attempts)
+                self.assertEqual(len(waits(result)), attempts - 1, "no wait after the last try")
+                errors = error_lines(result)
+                self.assertEqual(len(errors), 1, result.stderr)
+                self.assertIn(f"the read of Secret {secret} ", errors[0])
+                self.assertIn(f"failed {attempts} times", errors[0])
+                # The Secret was not read, so the message does not say what the install has.
+                self.assertNotIn("missing or empty", result.stderr)
+                # The error of kubectl is in the log, above the message.
+                self.assertLess(result.stderr.index(_CONNECTION_ERROR), result.stderr.index(errors[0]))
+                self.assertNotIn("TRANSPORT=", result.stdout)
+
+
+    def test_an_absent_agent_secret_is_still_the_end_of_the_run(self) -> None:
+        result = run_section(None, agent_secret="AGENT_SECRET_MISSING")
+        self.assertNotEqual(result.returncode, 0)
+        errors = error_lines(result)
+        self.assertEqual(len(errors), 1, result.stderr)
+        self.assertIn("the read of Secret platform-agent-secrets ", errors[0])
+        # The message names no cause; the error of kubectl above it does.
+        self.assertLess(result.stderr.index(_NOT_FOUND_ERROR), result.stderr.index(errors[0]))
+        self.assertNotIn("not a state of the install", result.stderr)
+        self.assertNotIn("TOKEN=", result.stdout)
+
+    def test_an_agent_secret_with_an_empty_key_goes_on_as_before(self) -> None:
+        result = run_section(None, agent_secret="AGENT_KEY_EMPTY")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = exported(result)
+        self.assertEqual((out["TOKEN"], out["INJECT_TOKEN"]), ("<unset>", _INJECT_TOKEN))
+        self.assertEqual(waits(result), [])
 
 
 class RecordsUnderTheNextKeyTest(unittest.TestCase):
