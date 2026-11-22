@@ -47,19 +47,5 @@
 # is withdrawn by moving its line from presubmit-cases.txt back to
 # nightly-cases.txt, no roster edit.
 
-reliability-pdb-probe
-capacity-pinned-pool-probe
-security-overgrant-probe
-upgrades-lagging-master-probe
-cost-idle-pool-probe
-consistency-drift-outlier
-obtainability-remediation-proposal
-pdb-remediation-pr
-cluster-agent-crashloop-debug
-cluster-agent-crashloop-misleading-symptom
-cluster-agent-crashloop-evidence-chain
-incident-triage-oom-event-probe
-monitoring-alert-policy-read
-agent-kanban-smoke
-vcs-spent-branch-reuse
-compliance-rbac-overgrant
+
+profile-configmap-read-keeps-no-credential
