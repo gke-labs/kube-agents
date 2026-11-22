@@ -790,14 +790,36 @@ credential-proxy token.
 - A reader that finds the part and it breaks these bounds, or carries no parameters object, refuses
   the task rather than running it without parameters (`lib.TaskParametersOf`). The dispatcher also
   checks that every parameter the persona declares is present before it builds the resource.
-- A child result that is malformed (no task id, a non-terminal state, text past the cap) is
-  skipped: it is no event, where a malformed parameter set would change what runs.
+- A child result that is malformed (a non-terminal state, text past the cap, or no task id
+  outside a not-started batch entry) is skipped: it is no event, where a malformed parameter set
+  would change what runs.
 
 **Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
-carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?}}`. The parent's per-task
+carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?}}`. The parent's per-task
 reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
 when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
 `result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
+
+A profile parent's batch gets one end per entry. `entry` is the entry's 1-based index in the
+batch, on every end of a batch, and absent for a single delegation. A `tasks` list of one entry is
+a single delegation, so its end has no `entry`. An end can arrive twice, so a parent waiting on a
+batch dedupes its ends on `entry` and counts them to the batch's size, and a single delegation's
+on `childTaskId`. An end can also be late or lost. A send that fails is recorded unsent and sent again when the
+gateway's heal next reads the conversation, which also finds a child whose terminal the relay
+missed. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
+writes to, so the parent's own deadline is what bounds its wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the
+gateway cancels its live children, each with its stop record, since nothing reads their results. A batch child that reaches `input-required` is cancelled and ends
+`canceled`, with its question as `text`. A batch withdrawn whole (cut short, or a child that
+couldn't reach the bus) ends each entry that has no end yet `failed`, with the reason as `text`.
+The end names no `childTaskId`, except for a child whose cancel couldn't be sent and which may
+still run. A withdrawn child's own later end sends nothing more, and a stopped parent gets
+nothing.
+
+**A refused request.** A profile parent whose delegate request mints no child, because the gateway
+refused it or nothing started, gets a `message` on its `…in` carrying `{"delegationRefused": {"text"}}`
+(#4860), so it stops waiting for a child that won't exist. `text` is the notice the room sees, at most
+64 KiB. A waiting parent reads it as the end of the whole wait. A refusal that fails to publish is logged and not sent again, so the parent's own deadline still bounds its wait. A batch whose plan was written gets
+its per-entry ends instead, and a stopped or ended parent gets nothing.
 
 This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A
 profile parent that has already ended gets no child result; the gateway drops it and logs it. A

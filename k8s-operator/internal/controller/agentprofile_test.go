@@ -175,6 +175,7 @@ func agentProfileSpecPaths() []string {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "cluster", Required: true}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Delegates = true
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage
@@ -618,11 +619,12 @@ func checkFixture(t *testing.T, path, rendered string) {
 // holds its hand-built envelope to the protocol.
 func TestTheAgentCardFixtureIsWhatTheOperatorRenders(t *testing.T) {
 	at := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
-	// With declared parameters and yieldToPinned, so the a2a contract test
-	// can hold the routing fields' names to lib.AgentCard's.
+	// With declared parameters, yieldToPinned and delegates, so the a2a
+	// contract test can hold the routing fields' names to lib.AgentCard's.
 	card := desiredAgentCard(ptr.To(testAgentProfile("ns", "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Delegates = true
 	})))
 	body, err := renderDirectoryEnvelope("auditor", &card, at, "000000000000000000000000")
 	if err != nil {
@@ -1582,10 +1584,17 @@ func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 		p.Spec.ClusterRef = &agentv1alpha1.AgentProfileClusterRef{ProjectID: "p", Location: "us-central1", Cluster: "a"}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "namespace"}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Delegates = true
 	})
 	card := desiredAgentCard(&p)
 	if !card.YieldToPinned {
 		t.Error("yieldToPinned didn't reach the card")
+	}
+	if !card.Delegates {
+		t.Error("delegates didn't reach the card")
+	}
+	if desiredAgentCard(ptr.To(testAgentProfile("ns", "plain"))).Delegates {
+		t.Error("a profile without spec.delegates has a card that delegates")
 	}
 	if !slices.Equal(card.Tiers, []string{"read", "unattended"}) {
 		t.Errorf("tiers = %v", card.Tiers)

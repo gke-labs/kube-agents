@@ -204,14 +204,50 @@ func TestChildResultRoundTrip(t *testing.T) {
 	}
 }
 
+// A batch entry that never got a child ends with its entry and no task id,
+// failed, and reads back the same.
+func TestChildResultForAnEntryThatNeverStarted(t *testing.T) {
+	in := ChildResult{Entry: 3, Addressee: "cluster", State: StateFailed, Text: "not started"}
+	part, err := ChildResultPart(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ChildResultOf([]Part{part}); !ok || got != in {
+		t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, in)
+	}
+	withID := ChildResult{ChildTaskID: "task-7", Entry: 2, State: StateCanceled}
+	part, err = ChildResultPart(withID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ChildResultOf([]Part{part}); !ok || got != withID {
+		t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, withID)
+	}
+}
+
+// A single delegation's result carries no entry on the wire, so a reader
+// built before entries reads it unchanged.
+func TestASingleChildResultCarriesNoEntry(t *testing.T) {
+	part, err := ChildResultPart(ChildResult{ChildTaskID: "task-7", Addressee: "cluster", State: StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(part.Data), "entry") {
+		t.Fatalf("wire = %s", part.Data)
+	}
+}
+
 // A child result names a finished task: no id, a non-terminal state or text
 // past the cap is refused on the way out and skipped on the way in.
 func TestChildResultRefusesWhatIsNotAnEnd(t *testing.T) {
 	for name, c := range map[string]ChildResult{
-		"no task id":           {State: StateCompleted},
-		"a task id with a dot": {ChildTaskID: "task.7", State: StateCompleted},
-		"a working state":      {ChildTaskID: "task-7", State: StateWorking},
-		"text past the cap":    {ChildTaskID: "task-7", State: StateCompleted, Text: strings.Repeat("a", ChildResultTextCap+1)},
+		"no task id":                  {State: StateCompleted},
+		"no task id, completed entry": {Entry: 1, State: StateCompleted},
+		"a negative entry":            {ChildTaskID: "task-7", Entry: -1, State: StateCompleted},
+		"an entry past the batch cap": {Entry: DelegateBatchMax + 1, State: StateFailed},
+		"a task id with a dot":        {ChildTaskID: "task.7", State: StateCompleted},
+		"a working state":             {ChildTaskID: "task-7", State: StateWorking},
+		"text past the cap":           {ChildTaskID: "task-7", State: StateCompleted, Text: strings.Repeat("a", ChildResultTextCap+1)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ChildResultPart(c); err == nil {
@@ -613,5 +649,30 @@ func TestDelegateTargetsCarryTheWidth(t *testing.T) {
 		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{}, WidthMax: w}); err == nil {
 			t.Errorf("width %d accepted", w)
 		}
+	}
+}
+
+// TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText: the
+// parent's model reads the text, so it must be there and within the cap.
+func TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText(t *testing.T) {
+	p, err := DelegationRefusalPart(DelegationRefusal{Text: "⚠️ delegation refused: out of scope"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := DelegationRefusalOf([]Part{{Kind: "text", Text: "x"}, p})
+	if !ok || got.Text != "⚠️ delegation refused: out of scope" {
+		t.Fatalf("round trip = %+v, %v", got, ok)
+	}
+	if _, ok := ChildResultOf([]Part{p}); ok {
+		t.Fatal("a refusal read as a child result")
+	}
+	for _, text := range []string{"", strings.Repeat("a", ChildResultTextCap+1)} {
+		if _, err := DelegationRefusalPart(DelegationRefusal{Text: text}); err == nil {
+			t.Fatalf("a refusal with %d bytes of text was built", len(text))
+		}
+	}
+	bad := Part{Kind: "data", Data: []byte(`{"delegationRefused":{"text":""}}`)}
+	if _, ok := DelegationRefusalOf([]Part{bad}); ok {
+		t.Fatal("an empty refusal was read")
 	}
 }
