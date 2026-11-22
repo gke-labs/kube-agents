@@ -846,13 +846,15 @@ Layout:
   `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
+  **Amended:** the MCP server now runs by default unless `A2A_MCP_DOOR` is `false` (set by
+  the chart's `operator.mcpServer.enabled: false`).
 
 - **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
-  publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
+  publish on `chat.notify.gchat`, `chat.notify.slack`, `chat.notify.teams` and `chat.notify.console` (one subject per
   backend the gateway can hold, and the console's) and subscribe on `chat.notify.reply.agent.>`;
-  the gateway user gains the matching grants (subscribe on the three request subjects, publish on
+  the gateway user gains the matching grants (subscribe on the four request subjects, publish on
   the reply namespace). No other
   principal holds either subject. The reply namespace is its own rather than the agent's
   `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream

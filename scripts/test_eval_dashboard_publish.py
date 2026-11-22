@@ -59,6 +59,7 @@ def run_hook(
     timeout_s: str = "",
     rc_commit_sha: str = "",
     path_prepend: str = "",
+    front_door: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -79,6 +80,7 @@ def run_hook(
         f'export ARTIFACTS="{artifacts}"',
         f'export EVAL_DASHBOARD_TIMEOUT="{timeout_s}"',
         f'export EVAL_DASHBOARD_TARGET="{target}"',
+        f'export EVAL_FRONT_DOOR="{front_door}"',
     ]
     if path_prepend:
         lines.append(f'export PATH="{path_prepend}:$PATH"')
@@ -157,6 +159,17 @@ class PublishHookFailSafeTest(unittest.TestCase):
         skip_line = next(l for l in result.stdout.splitlines() if SKIP in l)
         self.assertIn(reason_fragment, skip_line)
         self.assertIn(f"called dumper with {exit_code}", result.stdout)
+
+    def test_a_session_front_door_run_never_publishes(self):
+        """A front-door A/B run (EVAL_FRONT_DOOR=session, #6539) is compared
+        with a platform run, not filed as main's nightly history: the hook
+        skips with the target set and nothing in scripts/eval_dashboard/ runs."""
+        marker = "import pathlib, sys\npathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), marker)
+            result = run_hook(0, fake_hack, target="gs://bucket/evals", front_door="session")
+            self.assert_skipped_once(result, 0, "EVAL_FRONT_DOOR=session")
+            self.assertFalse((fake_hack.parent / "scripts" / "eval_dashboard" / "collect.py.ran").exists())
 
     def test_unset_target_skips_and_preserves_the_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:

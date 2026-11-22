@@ -28,6 +28,11 @@ func cfg(name, model string) string {
 	return fmt.Sprintf("- model_name: %s\n  litellm_params:\n    model: %s\n", name, model)
 }
 
+// cfgWith renders one model_list entry with one more litellm_params line after model.
+func cfgWith(name, model, extra string) string {
+	return cfg(name, model) + "    " + extra + "\n"
+}
+
 func TestParseLiteLLMDefaultModel(t *testing.T) {
 	cases := []struct {
 		name, yaml, provider, model string
@@ -436,7 +441,7 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 2 {
 		t.Fatalf("%d samples after two agents published, want 2", n)
 	}
-	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "a")); v != 1 {
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "a", "")); v != 1 {
 		t.Errorf("model a sample = %v, want 1", v)
 	}
 
@@ -445,10 +450,10 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 2 {
 		t.Fatalf("%d samples after the model changed, want 2: the old pair was not deleted", n)
 	}
-	if g.model.DeleteLabelValues("ns", "pa", "gemini", "a") {
+	if g.model.DeleteLabelValues("ns", "pa", "gemini", "a", "") {
 		t.Error("the model a sample survived the change")
 	}
-	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "b")); v != 1 {
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "b", "")); v != 1 {
 		t.Errorf("model b sample = %v, want 1", v)
 	}
 
@@ -463,8 +468,24 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 		t.Errorf("%d samples with only a provider, want 1: one field alone is no sample", n)
 	}
 
-	agent.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "c"}
+	agent.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "c", ReasoningEffort: "high"}
 	g.publish(agent)
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "c", "high")); v != 1 {
+		t.Errorf("effort high sample = %v, want 1", v)
+	}
+	agent.Status.Inference.ReasoningEffort = "low"
+	g.publish(agent)
+	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 2 {
+		t.Fatalf("%d samples after the effort changed, want 2: the old effort was not deleted", n)
+	}
+	if g.model.DeleteLabelValues("ns", "pa", "gemini", "c", "high") {
+		t.Error("the effort high sample survived the change")
+	}
+	agent.Status.Inference.ReasoningEffort = ""
+	g.publish(agent)
+	if v := testutil.ToFloat64(g.model.WithLabelValues("ns", "pa", "gemini", "c", "")); v != 1 {
+		t.Errorf("unset effort sample = %v, want 1 under an empty label", v)
+	}
 	g.forget("ns", "pa")
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 1 {
 		t.Errorf("%d samples after forget, want 1 (the other agent's)", n)
@@ -594,5 +615,167 @@ func TestInferenceStatusKeyIsAbsentUntilRead(t *testing.T) {
 	g.publish(&agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "ns"}})
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 0 {
 		t.Errorf("%d samples for an agent with no inference key, want 0", n)
+	}
+}
+
+func TestParseLiteLLMDefaultModelReadsTheReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name, yaml, effort string
+		ok                 bool
+	}{
+		{"quoted", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", `reasoning_effort: "high"`), "high", true},
+		{"bare", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", "reasoning_effort: low"), "low", true},
+		{"absent", cfg("model-default", "vertex_ai/gemini-3.8-flash"), "", true},
+		{"empty", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", `reasoning_effort: ""`), "", true},
+		{"whitespace drops the effort alone", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", `reasoning_effort: "very high"`), "", true},
+		{"a number drops the effort alone", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", "reasoning_effort: 1"), "", true},
+		{"a bool drops the effort alone", cfgWith("model-default", "vertex_ai/gemini-3.8-flash", "reasoning_effort: true"), "", true},
+		{"from the fallback entry", cfgWith("other", "openai/gpt-5.4", "reasoning_effort: medium"), "medium", true},
+		{"effort before model", "- model_name: model-default\n  litellm_params:\n    reasoning_effort: high\n    model: gemini/g\n", "high", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseLiteLLMDefaultModel("model_list:\n" + c.yaml)
+			if ok != c.ok || got.ReasoningEffort != c.effort {
+				t.Fatalf("got %+v ok=%v, want effort %q ok=%v", got, ok, c.effort, c.ok)
+			}
+			if c.ok && (got.Provider == "" || got.Model == "") {
+				t.Fatalf("the pair must survive the effort rule: %+v", got)
+			}
+		})
+	}
+}
+
+func TestUpdateStatusReadyWritesAndClearsTheReasoningEffort(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	cm := litellmConfigMap("litellm-config", time.Now(), "vertex_ai/gemini-3.8-flash")
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "vertex_ai/gemini-3.8-flash", "reasoning_effort: high")
+	r := inferenceReconciler(t, nil, agent, cm)
+
+	settleReady(t, r, agent)
+	stored := readBack(t, r, agent)
+	want := &agentv1alpha1.InferenceStatus{Provider: "vertex_ai", Model: "gemini-3.8-flash", ReasoningEffort: "high"}
+	if !inferenceStatusEqual(stored.Status.Inference, want) {
+		t.Fatalf("status.inference = %+v, want %+v", stored.Status.Inference, want)
+	}
+
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfg(agentModelName, "vertex_ai/gemini-3.8-flash")
+	if err := r.Update(context.Background(), cm); err != nil {
+		t.Fatal(err)
+	}
+	settleReady(t, r, stored)
+	stored = readBack(t, r, agent)
+	want.ReasoningEffort = ""
+	if !inferenceStatusEqual(stored.Status.Inference, want) {
+		t.Fatalf("status.inference = %+v after the key was removed, want %+v", stored.Status.Inference, want)
+	}
+}
+
+// A served CRD from before reasoningEffort keeps the pair and drops the effort. The echo
+// is recorded like a pruned block, so the gate holds until the record ages rather than
+// writing the effort back on every pass.
+func TestUpdateStatusReadyRecordsAPrunedReasoningEffort(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	counter := &statusWriteCounter{}
+	funcs := counter.interceptors()
+	persist := funcs.SubResourceUpdate
+	pruning := true
+	funcs.SubResourceUpdate = func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && pruning && pa.Status.Inference != nil {
+			pa.Status.Inference.ReasoningEffort = ""
+		}
+		return persist(ctx, cl, subResourceName, obj, opts...)
+	}
+	cm := litellmConfigMap("litellm-config", time.Now(), "gemini/gemini-3.5-flash")
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "gemini/gemini-3.5-flash", "reasoning_effort: high")
+	r := inferenceReconciler(t, &funcs, agent, cm)
+
+	settleReady(t, r, agent)
+	pair := &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}
+	if !inferenceStatusEqual(agent.Status.Inference, pair) {
+		t.Fatalf("the fixture did not prune the effort alone (got %+v)", agent.Status.Inference)
+	}
+	if !r.inferencePruned(agent) {
+		t.Fatal("the echo dropped reasoningEffort and no record was kept")
+	}
+	settleReady(t, r, agent)
+	settleReady(t, r, agent)
+	if counter.writes != 1 {
+		t.Errorf("%d status writes across three passes under a pruning CRD, want 1", counter.writes)
+	}
+
+	age := func() {
+		r.prunedNewerFieldsMu.Lock()
+		r.prunedNewerFields[usagePollKey(agent)][inferenceNewerField] = time.Now().Add(-2 * usageStatusReprobeInterval)
+		r.prunedNewerFieldsMu.Unlock()
+	}
+	age()
+	settleReady(t, r, agent)
+	settleReady(t, r, agent)
+	if counter.writes != 2 {
+		t.Errorf("%d writes after the record aged under a still-pruning CRD, want 2", counter.writes)
+	}
+
+	pruning = false
+	age()
+	settleReady(t, r, agent)
+	full := &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash", ReasoningEffort: "high"}
+	if counter.writes != 3 || !inferenceStatusEqual(agent.Status.Inference, full) {
+		t.Fatalf("after the CRD was applied: %d writes, status.inference=%+v; want 3 and %+v", counter.writes, agent.Status.Inference, full)
+	}
+	if r.inferencePruned(agent) {
+		t.Error("the echo carried the effort and the record was not cleared")
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 3 {
+		t.Errorf("%d writes on an unchanged pass, want 3", counter.writes)
+	}
+}
+
+// Under an effort-only record the served status still carries the pair, so a pair change
+// (and a negative) must write at once; only the effort waits for the reprobe.
+func TestUpdateStatusReadyWritesAPairChangeUnderAnEffortOnlyRecord(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	counter := &statusWriteCounter{}
+	funcs := counter.interceptors()
+	persist := funcs.SubResourceUpdate
+	funcs.SubResourceUpdate = func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && pa.Status.Inference != nil {
+			pa.Status.Inference.ReasoningEffort = ""
+		}
+		return persist(ctx, cl, subResourceName, obj, opts...)
+	}
+	cm := litellmConfigMap("litellm-config", time.Now(), "gemini/gemini-3.5-flash")
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "gemini/gemini-3.5-flash", "reasoning_effort: high")
+	r := inferenceReconciler(t, &funcs, agent, cm)
+
+	settleReady(t, r, agent)
+	if !r.inferencePruned(agent) || counter.writes != 1 {
+		t.Fatalf("fixture: pruned=%v writes=%d, want true and 1", r.inferencePruned(agent), counter.writes)
+	}
+
+	cm.Data[litellmConfigKey] = "model_list:\n" + cfgWith(agentModelName, "anthropic/claude-opus-5", "reasoning_effort: high")
+	if err := r.Update(context.Background(), cm); err != nil {
+		t.Fatal(err)
+	}
+	settleReady(t, r, agent)
+	want := &agentv1alpha1.InferenceStatus{Provider: "anthropic", Model: "claude-opus-5"}
+	if counter.writes != 2 || !inferenceStatusEqual(agent.Status.Inference, want) {
+		t.Fatalf("after the pair changed under an effort-only record: %d writes, status.inference=%+v; want 2 and %+v", counter.writes, agent.Status.Inference, want)
+	}
+	if !r.inferencePruned(agent) {
+		t.Error("the effort is still pruned and the record was dropped")
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 2 {
+		t.Errorf("%d writes on an unchanged pass under the record, want 2", counter.writes)
+	}
+
+	if err := r.Delete(context.Background(), cm); err != nil {
+		t.Fatal(err)
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 3 || !inferenceStatusEqual(agent.Status.Inference, &agentv1alpha1.InferenceStatus{}) {
+		t.Fatalf("after the ConfigMap was deleted under the record: %d writes, status.inference=%+v; want 3 and the empty object", counter.writes, agent.Status.Inference)
 	}
 }

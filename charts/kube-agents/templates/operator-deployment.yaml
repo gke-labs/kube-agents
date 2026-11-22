@@ -220,8 +220,8 @@ spec:
             - name: IMAGE_PULL_SECRETS
               value: {{ . | quote }}
             {{- end }}
-            {{- /* Operator flags turned on by first-class values (operator.mcpServer.enabled
-                   sets A2A_MCP_DOOR). */}}
+            {{- /* Operator flags set by first-class values (operator.mcpServer.enabled,
+                   operator.profileDispatcher.enabled, operator.slackTestUsers). */}}
             {{- with (include "kube-agents.operatorFlagEnv" .) }}
             {{- . | nindent 12 }}
             {{- end }}

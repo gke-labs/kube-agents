@@ -424,8 +424,8 @@ user and disable personal memory in group conversations) in the pod's session-kv
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
-be posted back. A Google Chat, Slack or console conversation is posted back. A console
-conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
+be posted back. A Google Chat, Slack, Teams or console conversation is posted back. A console
+conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google- or Entra-token A2A door, or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
 Before the same first turn the bridge also puts the report a reply is under ahead of it. A reply
@@ -435,14 +435,20 @@ arrives with no link to that report, and nothing else attaches it, since the Her
 `incident_context` hook runs on no turn of the `api` executor. Two sources, in order. First the
 gateway's relay: the A2A gateway keeps the text of each report its notify route posts into a
 console conversation (a card's report, marked `report` by the notifier and naming its task; a
-progress note, which shares the thread and the task, is not kept; a Slack or Google Chat
-thread's posts, a relayed scheduled report and an alert's triage report it does not keep, and the
-lookup still serves them; `docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it
-on a reply's submission as a `pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the
-reply names the task the report was on (a console or MCP client's `replyTo`, the chain's root even
-when a delegated child filed the card); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so
-what it kept is what the person read; it holds reports only, and when two reports share one root
-(two cards from one turn) the reply carries the newest. This is how a card filed in a delegated
+progress note, which shares the thread and the task, is not kept) and into a chat thread (a Slack
+or Google Chat thread key, `lib.ThreadKeyedConversation`: the same marked report, kept under the
+thread's key with no task named; a post into a whole space or a thread-less DM, a relayed scheduled report
+and an alert's triage report it does not keep, and the lookup still serves them;
+`docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it on a reply's submission as a
+`pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the reply names the task the report
+was on (a console or MCP client's `replyTo`, the chain's root even when a delegated child filed the
+card) or is the next human turn that opens in a thread the gateway kept a report for (the newest
+one; `taskId` absent; once that turn is on the bus the gateway forgets the reports it read, and a
+message steered into the thread's running task empties them once the steer is on the bus, so the
+turn after falls back to the lookup below, and an alert's triage report is hidden for that one turn
+and no longer); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so what it kept is what
+the person read; it holds reports only, and when two reports share one root (two cards from one
+turn) or one thread the reply carries the newest. This is how a card filed in a delegated
 child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
 reply never reads, and the relay carries the report across. The relay rides a human turn on every
 route; this executor frames it on the platform route (the install's default), and a conversation
@@ -457,10 +463,10 @@ with the reply; a reply while the turn is still running is steered into it and c
 `replyTo`, since the report is attached on an opening turn only); then by the thread the
 conversation key names (`slack:<channel>/<ts>` is the row `(channel, ts)`;
 `gchat:spaces/A/threads/B` is `(spaces/A, the thread name)`); then by the Hermes session and the
-conversation key, which is how the notifier keys a card's report it posted into a Slack or Google
-Chat gateway conversation. A console reply that names no task takes only the last,
+conversation key, which is how the notifier keys a card's report it posted into a Slack, Google
+Chat or Teams gateway conversation. A console reply that names no task takes only the last,
 `(session, key)`, and finds no row, since the console row's key carries the task; a key naming a
-whole DM or space rather than a thread is not looked up at all, since every later message there
+whole DM or space rather than a thread (a Teams personal or group chat among them) is not looked up at all, since every later message there
 shares it and would carry the first stored report for the row's life. A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with

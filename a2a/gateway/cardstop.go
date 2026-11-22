@@ -192,7 +192,7 @@ func cardStopPayload(taskID, contextID string) ([]byte, error) {
 // answer is still posted when it comes; the door shows it only on a task
 // running by then.
 func cardStopPlaceholderOn(backend string) bool {
-	return backend != a2aBackend && backend != a2aGoogleBackend
+	return backend != a2aBackend && backend != a2aGoogleBackend && backend != a2aEntraBackend
 }
 
 // stopCards starts a card-stop control on rec's addressee and records it on

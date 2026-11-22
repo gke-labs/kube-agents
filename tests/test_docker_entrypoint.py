@@ -1921,6 +1921,33 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             self.assertIn("the bootstrap_onboarding plugin is missing", proc.stderr)
             self.assertNotIn("keeps the previous image's copy", proc.stderr)
 
+    def test_a_file_in_the_place_of_a_plugin_folder_is_no_earlier_copy(self):
+        # A file where the plugin's folder must be fails the copy for each user, root or
+        # not. It is no copy of the plugin: the warning names the plugin as missing, and
+        # the start goes on. Without the `[ -d "$_plugin_dst" ]` test of step 2b, `find`
+        # prints the file itself and the warning says that a previous copy is kept.
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            in_the_way = pvc / "plugins" / "bootstrap_onboarding"
+            in_the_way.parent.mkdir(parents=True)
+            in_the_way.write_text("not a folder\n", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(in_the_way.read_text(encoding="utf-8"), "not a folder\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("the bootstrap_onboarding plugin is missing", proc.stderr)
+        self.assertNotIn("keeps the previous image's copy", proc.stderr)
+
 
 class ManagedScopeAssertionTest(unittest.TestCase):
     """Step 2d's other half: the check that the operator's pins actually arrived.
@@ -3195,9 +3222,7 @@ class TerminalEnvPinGateTest(unittest.TestCase):
         self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
 
 
-_TIRITH_CLEANUP_OPENER = (
-    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then'
-)
+_SCANNER_CLEANUP_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ]; then'
 
 
 def _entrypoint_readonly(name):
@@ -3208,33 +3233,28 @@ def _entrypoint_readonly(name):
     return match.group(1)
 
 
-class TirithCleanupTest(unittest.TestCase):
-    """Step 4.4 removes the tirith copies Hermes downloaded into each home.
+class StaleScannerCleanupTest(unittest.TestCase):
+    """Step 4.4 removes the command scanner copies earlier images left in each home.
 
-    Gated on the image's copy being what PATH resolves, which no host has, so every other
-    entrypoint test skips it. The block runs extracted, with IMAGE_TIRITH pointed at a stub
-    first on PATH. It must never execute a candidate: the files sit on a volume the agent's
-    workers can write.
+    The block runs extracted. It must never execute a candidate: the files sit on a
+    volume the agent's workers can write.
     """
 
     ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 57
 
     @classmethod
     def setUpClass(cls):
-        cls._BLOCK = _extract_shell_block(_TIRITH_CLEANUP_OPENER)
+        cls._BLOCK = _extract_shell_block(_SCANNER_CLEANUP_OPENER)
         cls._ELF_MAGIC_HEX = _entrypoint_readonly("ELF_MAGIC_HEX")
+        cls._NAME = _entrypoint_readonly("STALE_SCANNER_BINARY")
+        cls._DATA_PARENTS = ".local/share .local/state"
 
-    def _run(self, seed, primary="1", image_on_path=True):
+    def _run(self, seed, primary="1"):
         """Seed $TARGET_DIR via `seed(target, tmp)`, run the block, return (proc, target, tmp)."""
         tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         target = tmp / "data"
-        image = tmp / "image" / "tirith"
-        image.parent.mkdir(parents=True)
-        image.write_text("#!/bin/sh\necho tirith 0.4.2\n", encoding="utf-8")
-        image.chmod(0o755)
         seed(target, tmp)
-        path = f"{image.parent}:{os.environ['PATH']}" if image_on_path else os.environ["PATH"]
         proc = subprocess.run(
             ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
             capture_output=True,
@@ -3242,10 +3262,10 @@ class TirithCleanupTest(unittest.TestCase):
             timeout=60,
             env={
                 **os.environ,
-                "PATH": path,
                 "TARGET_DIR": str(target),
                 "IS_BOOTSTRAP_PRIMARY": primary,
-                "IMAGE_TIRITH": str(image),
+                "STALE_SCANNER_BINARY": self._NAME,
+                "STALE_SCANNER_DATA_PARENTS": self._DATA_PARENTS,
                 "ELF_MAGIC_HEX": self._ELF_MAGIC_HEX,
             },
         )
@@ -3260,47 +3280,75 @@ class TirithCleanupTest(unittest.TestCase):
         return path
 
     def _seed_copies(self, target, tmp):
-        self._plant(target / "bin" / "tirith", self.ELF)
-        self._plant(target / "profiles" / "cluster-a" / "bin" / "tirith", self.ELF)
+        self._plant(target / "bin" / self._NAME, self.ELF)
+        self._plant(target / "profiles" / "cluster-a" / "bin" / self._NAME, self.ELF)
 
     def test_the_downloaded_copies_are_removed_and_logged(self):
         proc, target, _ = self._run(self._seed_copies)
-        self.assertFalse((target / "bin" / "tirith").exists())
-        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
-        self.assertEqual(proc.stdout.count("Reclaimed a per-profile tirith copy:"), 2, proc.stdout)
+        self.assertFalse((target / "bin" / self._NAME).exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / self._NAME).exists())
+        self.assertEqual(proc.stdout.count("Removed a per-profile command scanner copy:"), 2, proc.stdout)
+
+    def test_the_entrypoint_names_the_data_parents_this_test_runs_with(self):
+        self.assertIn(
+            f'readonly STALE_SCANNER_DATA_PARENTS="{self._DATA_PARENTS}"',
+            _ENTRYPOINT.read_text(encoding="utf-8"),
+        )
+
+    def test_the_scanner_data_directories_are_removed_and_logged(self):
+        def seed(target, tmp):
+            self._plant(target / "home" / ".local" / "share" / self._NAME / "log.jsonl", b"{}\n", mode=0o600)
+            self._plant(target / "home" / ".local" / "state" / self._NAME / "sessions" / "a.id", b"x", mode=0o600)
+            self._plant(
+                target / "profiles" / "cluster-a" / "home" / ".local" / "share" / self._NAME / "db.dat", b"x"
+            )
+            self._plant(target / "home" / ".local" / "share" / "other" / "keep", b"x")
+
+        proc, target, _ = self._run(seed)
+        self.assertFalse((target / "home" / ".local" / "share" / self._NAME).exists())
+        self.assertFalse((target / "home" / ".local" / "state" / self._NAME).exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "home" / ".local" / "share" / self._NAME).exists())
+        self.assertTrue((target / "home" / ".local" / "share" / "other" / "keep").exists())
+        self.assertEqual(proc.stdout.count("Removed command scanner data:"), 3, proc.stdout)
+
+    def test_a_symlinked_data_directory_and_its_target_stay(self):
+        def seed(target, tmp):
+            self._plant(tmp / "elsewhere" / "data" / "keep", b"x")
+            link = target / "home" / ".local" / "share" / self._NAME
+            link.parent.mkdir(parents=True)
+            link.symlink_to(tmp / "elsewhere" / "data")
+
+        _, target, tmp = self._run(seed)
+        self.assertTrue((target / "home" / ".local" / "share" / self._NAME).is_symlink())
+        self.assertTrue((tmp / "elsewhere" / "data" / "keep").exists())
 
     def test_a_non_primary_replica_leaves_them(self):
         _, target, _ = self._run(self._seed_copies, primary="0")
-        self.assertTrue((target / "bin" / "tirith").exists())
-        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
-
-    def test_without_the_image_copy_on_path_they_stay(self):
-        """Hermes would still need them: with nothing on PATH it falls back to the home copy."""
-        _, target, _ = self._run(self._seed_copies, image_on_path=False)
-        self.assertTrue((target / "bin" / "tirith").exists())
+        self.assertTrue((target / "bin" / self._NAME).exists())
+        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / self._NAME).exists())
 
     def test_a_file_that_is_not_an_elf_binary_stays_and_is_never_run(self):
         def seed(target, tmp):
             marker = tmp / "executed"
             self._plant(
-                target / "profiles" / "cluster-b" / "bin" / "tirith",
-                f'#!/bin/sh\ntouch "{marker}"\necho tirith 0.3.3\n'.encode(),
+                target / "profiles" / "cluster-b" / "bin" / self._NAME,
+                f'#!/bin/sh\ntouch "{marker}"\necho 0.3.3\n'.encode(),
             )
 
         _, target, tmp = self._run(seed)
-        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / self._NAME).exists())
         self.assertFalse((tmp / "executed").exists(), "the cleanup executed a file from the volume")
 
     def test_a_symlink_and_its_target_stay(self):
         def seed(target, tmp):
-            real = self._plant(tmp / "elsewhere" / "tirith", self.ELF)
-            link = target / "profiles" / "cluster-c" / "bin" / "tirith"
+            real = self._plant(tmp / "elsewhere" / self._NAME, self.ELF)
+            link = target / "profiles" / "cluster-c" / "bin" / self._NAME
             link.parent.mkdir(parents=True)
             link.symlink_to(real)
 
         _, target, tmp = self._run(seed)
-        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / "tirith").is_symlink())
-        self.assertTrue((tmp / "elsewhere" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / self._NAME).is_symlink())
+        self.assertTrue((tmp / "elsewhere" / self._NAME).exists())
 
 
 _NPM_CACHE_SHARE_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then'

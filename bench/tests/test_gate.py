@@ -572,6 +572,17 @@ def test_the_version_key_rides_in_the_hand_off(kanban_task, tmp_path, monkeypatc
     assert payload(out)["version_key"] == NEXT_KEY
 
 
+def test_a_session_front_door_run_keys_apart_from_next(kanban_task, tmp_path, monkeypatch):
+    """A run that deployed the default session as its front door
+    (EVAL_FRONT_DOOR=session, #6539) files under next-session, so a
+    front-door A/B run never moves the main nightly's bar."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("EVAL_FRONT_DOOR", "session")
+    out = tmp_path / "case.json"
+    run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], out)
+    assert payload(out)["version_key"] == {**NEXT_KEY, "mode": "next-session"}
+
+
 def test_no_judge_model_means_no_key(kanban_task, tmp_path):
     """`JUDGE_MODEL` unset is not a key of four components; it is no key.
 

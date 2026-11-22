@@ -93,8 +93,11 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 #   workload and waits for that repetition's own card
 #   (autoops-warning-event-triage, autoops-crashloop-config-triage,
 #   autoops-warning-event-no-action-triage, whose plant also fails on any
-#   answer but `injected`). A window longer than the gap folds repetition 2's
-#   incident into repetition 1's and no card comes. The fan-out in
+#   answer but `injected`; the workload-image-pull-refused-* cases also
+#   re-plant one workload, where the turn and not the plant waits for the
+#   card, and their shortest measured repetition is 5.5 minutes). A window
+#   longer than the gap folds repetition 2's incident into repetition 1's
+#   and no card comes. The fan-out in
 #   hack/ci-eval-pr.sh queues case by case and can launch a case's next
 #   repetition as soon as its last ends (#3939), so the gap can be as short
 #   as one repetition: at least 4.5 minutes (the third's shortest). Under
@@ -640,6 +643,15 @@ readonly A2A_TASKS_FLOOR=64
 readonly A2A_SESSION_CONSUMERS=3
 readonly A2A_RESERVE_FIXED=20
 readonly A2A_RESERVE_PER_WORKER=6
+# On the session route each session also counts its conversation's task
+# replays (a2aTasksReplaySessionAsks: the replay tail factor times one ask),
+# so a session costs A2A_SESSION_CONSUMERS + A2A_SESSION_REPLAY_ASKS. Pinned
+# by the same two tests.
+readonly A2A_SESSION_REPLAY_ASKS=4
+# Sessions a fair session run (EVAL_FRONT_DOOR=session) gets past one per
+# parallel conversation, so the cap's eviction of the longest-idle pod has an
+# idle pod to take that isn't a multi-turn case between its turns.
+readonly FRONT_DOOR_SESSION_HEADROOM=2
 # The line the bridge logs once its durable consumer is bound
 # (a2a/hermes-bridge/bridge.go, Run): a JSON record with these three fields.
 # Until it appears the bus has an executor for nobody, and every case on the
@@ -1689,12 +1701,44 @@ if [ "${MODE_NEXT_BRIDGE_CONCURRENCY_OK}" != "true" ] || [ "${MODE_NEXT_BRIDGE_C
   echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (an integer 1..${BRIDGE_QUEUE_CAPACITY})." >&2
   exit 1
 fi
+# --- Which front door this run deploys (EVAL_FRONT_DOOR, #6539) -------------
+# platform (the default) sends a plain conversation to the platform agent, as
+# every install does today. session sets spec.harness.tuning.defaultRoute to
+# session, so each new conversation gets a session pod of its own: the route
+# the sessions-by-default flip (#2371) makes the default. The inject door every
+# matrix goes through takes the install's route, so the cases run unchanged
+# and a platform run and a session run of the same cases compare the two front
+# doors (scripts/eval_front_door_ab.py). EVAL_FRONT_DOOR_SESSIONS picks how a
+# session run sizes its session cap: fair (the default) gives it one session
+# per parallel conversation plus FRONT_DOOR_SESSION_HEADROOM, so the cap's
+# eviction (the gateway evicts the longest-idle pod at the cap, or refuses;
+# nothing queues) doesn't land on a multi-turn case between its turns; shipped
+# leaves the cap at the install default, what a customer install gets, and an
+# eviction or refusal there is a finding about that default.
+EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
+EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
+case "${EVAL_FRONT_DOOR}" in
+platform | session) ;;
+*)
+  echo "ERROR: EVAL_FRONT_DOOR='${EVAL_FRONT_DOOR}' is not a front door this deploy knows; use platform (default) or session." >&2
+  exit 1
+  ;;
+esac
+case "${EVAL_FRONT_DOOR_SESSIONS}" in
+fair | shipped) ;;
+*)
+  echo "ERROR: EVAL_FRONT_DOOR_SESSIONS='${EVAL_FRONT_DOOR_SESSIONS}' is not a sizing this deploy knows; use fair (default) or shipped." >&2
+  exit 1
+  ;;
+esac
+
 # The maxSessions the install is given, so that the provision's budget, which
 # counts the rendered bridge's workers from the first render, fits the
 # floor: the largest value with maxSessions * A2A_SESSION_CONSUMERS +
 # A2A_RESERVE_FIXED + A2A_RESERVE_PER_WORKER * workers <= A2A_TASKS_FLOOR,
-# and at least 1 (the API's minimum; the eval spawns no session pods, so the
-# number is capacity nobody draws on). At the presubmit's 4 workers that is
+# and at least 1 (the API's minimum; on the platform front door the eval
+# spawns no session pods, so the number is capacity nobody draws on; a session
+# run sizes its own cap below). At the presubmit's 4 workers that is
 # 6, at 6 it is 2. At 8 or more the floor cannot hold even the reserve: the
 # clamp gives 1 and the one provision creates TASKS at the budget, wider
 # than the floor. Nothing re-renders the budget afterwards, so nothing is
@@ -1702,6 +1746,30 @@ fi
 MODE_NEXT_MAX_SESSIONS=$(((A2A_TASKS_FLOOR - A2A_RESERVE_FIXED - A2A_RESERVE_PER_WORKER * MODE_NEXT_BRIDGE_CONCURRENCY) / A2A_SESSION_CONSUMERS))
 if [ "${MODE_NEXT_MAX_SESSIONS}" -lt 1 ]; then
   MODE_NEXT_MAX_SESSIONS=1
+fi
+# On the session route the eval does spawn session pods, one per parallel
+# conversation, and each costs A2A_SESSION_CONSUMERS + A2A_SESSION_REPLAY_ASKS.
+# A fair run's cap takes the budget past the floor (at the presubmit's 4
+# workers: (4+2)*7 + 20 + 6*4 = 86), so the one provision creates TASKS at the
+# budget, and nothing re-renders it. That holds on a fresh bus: a TASKS a failed
+# teardown left behind (the NATS claims are retained) keeps its old width, and
+# the provision refuses the wider budget, the risk the 8-worker nightlies
+# already carry. A shipped run sets no cap (MODE_NEXT_MAX_SESSIONS empty): the
+# install default applies.
+MODE_NEXT_SESSION_CONSUMERS="${A2A_SESSION_CONSUMERS}"
+FRONT_DOOR_HELM_SETS=()
+if [ "${EVAL_FRONT_DOOR}" = "session" ]; then
+  MODE_NEXT_SESSION_CONSUMERS=$((A2A_SESSION_CONSUMERS + A2A_SESSION_REPLAY_ASKS))
+  FRONT_DOOR_HELM_SETS=(--set-string "platformAgent.harness.tuning.defaultRoute=session")
+  if [ "${EVAL_FRONT_DOOR_SESSIONS}" = "fair" ]; then
+    MODE_NEXT_MAX_SESSIONS=$((MODE_NEXT_BRIDGE_CONCURRENCY + FRONT_DOOR_SESSION_HEADROOM))
+  else
+    MODE_NEXT_MAX_SESSIONS=""
+  fi
+fi
+MAX_SESSIONS_HELM_SETS=()
+if [ -n "${MODE_NEXT_MAX_SESSIONS}" ]; then
+  MAX_SESSIONS_HELM_SETS=(--set "${MAX_SESSIONS_HELM_VALUE}=${MODE_NEXT_MAX_SESSIONS}")
 fi
 
 # ─── 2d. The seeded fleet's read-only credential ──────────────────────────────
@@ -2384,7 +2452,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "litellm.vertex.sessionAffinity.slots=${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
-    --set "${MAX_SESSIONS_HELM_VALUE}=${MODE_NEXT_MAX_SESSIONS}" \
+    ${MAX_SESSIONS_HELM_SETS[@]+"${MAX_SESSIONS_HELM_SETS[@]}"} \
+    ${FRONT_DOOR_HELM_SETS[@]+"${FRONT_DOOR_HELM_SETS[@]}"} \
     --set-string "platformAgent.deployment.credentialProxy.resources.limits.memory=${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT}" \
     --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
     --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
@@ -3147,8 +3216,19 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Gating the A2A stack of ${PLATFORM_
 # The session cap step 5 set, for a reader of the artifact who finds a
 # non-default maxSessions on the eval CR: section 2b sized it so the budget
 # the first provisioning Job measures, which counts the rendered bridge's
-# workers, fits the floor.
-echo "spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} was set at the install so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge's budget (${MODE_NEXT_MAX_SESSIONS}*${A2A_SESSION_CONSUMERS} + ${A2A_RESERVE_FIXED} + ${A2A_RESERVE_PER_WORKER}*${MODE_NEXT_BRIDGE_CONCURRENCY} <= ${A2A_TASKS_FLOOR})"
+# workers, fits the floor, or on a session run for its parallel conversations.
+echo "Front door: ${EVAL_FRONT_DOOR} (EVAL_FRONT_DOOR; session sizing ${EVAL_FRONT_DOOR_SESSIONS})"
+# The directory may not exist yet on a passing deploy (report_cr_status makes
+# it later), and the compare reads a missing file as platform.
+mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
+echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
+if [ -z "${MODE_NEXT_MAX_SESSIONS}" ]; then
+  echo "spec.harness.tuning.maxSessions: not set (EVAL_FRONT_DOOR_SESSIONS=shipped); the install default applies, and the provision sizes TASKS for it"
+elif [ "${EVAL_FRONT_DOOR}" = "session" ]; then
+  echo "spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} was set at the install, one session per parallel conversation; TASKS is created at the budget (${MODE_NEXT_MAX_SESSIONS}*${MODE_NEXT_SESSION_CONSUMERS} + ${A2A_RESERVE_FIXED} + ${A2A_RESERVE_PER_WORKER}*${MODE_NEXT_BRIDGE_CONCURRENCY}) or the ${A2A_TASKS_FLOOR} floor, whichever is wider"
+else
+  echo "spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} was set at the install so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge's budget (${MODE_NEXT_MAX_SESSIONS}*${A2A_SESSION_CONSUMERS} + ${A2A_RESERVE_FIXED} + ${A2A_RESERVE_PER_WORKER}*${MODE_NEXT_BRIDGE_CONCURRENCY} <= ${A2A_TASKS_FLOOR})"
+fi
 echo "managed .env reads:"
 # Whole, for the artifact log.
 kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true

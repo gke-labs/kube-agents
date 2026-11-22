@@ -414,13 +414,29 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveA2AGooglePrincipal", "a2aGoogleCallerPrefix"),
     ),
+    # The A2A door's Microsoft Entra class: the same four seams, with the
+    # token checked locally against the tenant's keys rather than asked of
+    # an endpoint.
+    "a2a_door_entra": Source(
+        "a2a/gateway/a2adoor_entra.go",
+        (
+            "func (v *entraTokenVerifier) verify",
+            "func (v *entraTokenVerifier) identity",
+            "a2aEntraCallerPrefix =",
+            ") identifyEntra(",
+        ),
+    ),
+    "a2a_door_entra_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2AEntraPrincipal", "a2aEntraCallerPrefix"),
+    ),
     "a2a_door_callers": Source(
         "a2a/gateway/a2adoor.go",
         ("func callerOf(",),
     ),
     "a2a_door_roster": Source(
         "a2a/gateway/gateway.go",
-        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend"),
+        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend", "a2aEntraBackend"),
     ),
     # The gateway's Slack identity rule: the allowlist gates, the map
     # overrides, and the member id is the principal otherwise.

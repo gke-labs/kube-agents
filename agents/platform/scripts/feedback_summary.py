@@ -17,8 +17,9 @@ module assembles that block from four sources and nothing else:
   stands in, rendered the same way the chat gateway's ``/feedback summary``
   renders it;
 * ``kubectl version`` and cluster object counts for the Kubernetes version and the
-  cluster scale line (optional); the model name is the resource's ``status.inference``,
-  and the gateway's ConfigMap whenever the status has no ``inference`` key (optional):
+  cluster scale line (optional); the model name and its reasoning effort are the
+  resource's ``status.inference``, and the gateway's ConfigMap whenever the status has
+  no ``inference`` key (optional):
   under an operator older than the field, before this operator's first Ready write
   (so for a CR Degraded since it was created), and under a served CRD that prunes
   the field.
@@ -54,7 +55,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextI
 
 # Independent of the gateway's usageSummaryMaxLines: this block has lines the
 # gateway's lacks.
-SUMMARY_MAX_LINES = 59
+SUMMARY_MAX_LINES = 60
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
@@ -96,6 +97,9 @@ EXIT_LEAK = 3
 #: The one stderr prefix, here and in the feedback client's ``summary`` subcommand.
 LOG_PREFIX = "feedback-summary: "
 UNAVAILABLE = "unavailable"
+#: The ``reasoning effort`` line's value when the model is known and the config
+#: states no effort, so the model thinks at its own default.
+REASONING_EFFORT_UNSET = "unset"
 NEVER = "never"
 UNKNOWN = "unknown"
 NONE = "none"
@@ -291,15 +295,20 @@ PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^
 LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
 #: The environment lines, in the order the block prints them; the gateway's
 #: usageSummaryEnvironmentKeys verbatim.
-ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "kubernetes", "installed", "interfaces")
-#: ``status.inference``: the operator's reading of the install's default model.
+ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "reasoning effort", "kubernetes", "installed", "interfaces")
+#: ``status.inference``: the operator's reading of the install's default model, and
+#: of the reasoning effort configured on it.
 INFERENCE_STATUS_KEY = "inference"
 INFERENCE_PROVIDER_FIELD = "provider"
 INFERENCE_MODEL_FIELD = "model"
+INFERENCE_REASONING_EFFORT_FIELD = "reasoningEffort"
 #: The model line's start; the audit runs over the block without this line.
 MODEL_LINE_PREFIX = "  model: "
+#: The reasoning effort line's start: a setting, not an identifier, printed by design
+#: like the model line, so an install named after its effort word is not refused for it.
+REASONING_EFFORT_LINE_PREFIX = "  reasoning effort: "
 #: The lines printed by design, each removed (its first occurrence) before the audit.
-FIXED_LINE_PREFIXES: Tuple[str, ...] = (MODEL_LINE_PREFIX, ORIGIN_LINE_PREFIX)
+FIXED_LINE_PREFIXES: Tuple[str, ...] = (MODEL_LINE_PREFIX, REASONING_EFFORT_LINE_PREFIX, ORIGIN_LINE_PREFIX)
 #: The model_list entry whose model is the install's default (the operator's agentModelName).
 LITELLM_DEFAULT_MODEL_ALIAS = "model-default"
 #: The ``model_name: model-default`` line, quoted or bare, at any indent.
@@ -331,13 +340,42 @@ LITELLM_DEFAULT_NAME_LINE = re.compile(
 #: unquoted value with a space (``gemini/flash 2``) reads the text before the
 #: space here and is malformed in Go; and two entries both named
 #: ``model-default``, the first in params-first order, read the second here and
-#: the first in Go.
+#: the first in Go. The effort reader below shares the shape and adds three
+#: divergences of its own: a bare ``reasoning_effort: 1`` or ``true`` prints as
+#: typed here, where the Go reader drops any non-string; a quoted value with a
+#: ``#`` (``"high#1"``) reads ``unset`` here and is kept in Go; and a
+#: ``litellm_params:`` nested under a sibling block, when the entry's own block
+#: states no effort, can answer here and not in Go; and a comment line inside the
+#: block indented less than its keys stops this reader (``unset``) where the YAML
+#: parser reads on. A value with a space, a key
+#: under a sibling of ``litellm_params`` or nested below its direct keys, a second
+#: ``model-default`` entry and a trailing comment read the same in both: absent,
+#: absent, the first entry's, and the value before the comment.
 LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
     r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
     r"[ \t]+litellm_params:[ \t]*(?:#[^\n]*)?\n"
     r"(?:(?:[ \t]+(?![ \t-])(?!model:)[^\n]*)?\n)*?"
     r"[ \t]+model:[ \t]*(?P<mq>['\"]?)(?P<model>[^'\"\s#]*)(?P=mq)",
+    re.MULTILINE,
+)
+#: The same entry's ``reasoning_effort:`` line, a direct key of its ``litellm_params:``
+#: block, before or after the ``model:`` line, quoted or bare, captured possibly empty,
+#: and ending the line (a trailing comment allowed): a value with a space does not
+#: match. The block's child indent is the first non-blank line's after
+#: ``litellm_params:`` (``ci``, deeper than ``pi``); every line skipped starts with it,
+#: and the key line is exactly at it, so a sibling block's key and a key nested below
+#: the direct keys are never read. Matched at the first ``model-default`` name line,
+#: not searched, so a second entry of that name cannot answer. Read on the same
+#: fallback path, and only when that entry is the one that answered the model line.
+LITELLM_DEFAULT_ENTRY_REASONING_EFFORT = re.compile(
+    LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
+    r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
+    r"(?P<pi>[ \t]+)litellm_params:[ \t]*(?:#[^\n]*)?\n"
+    r"(?:[ \t]*\n)*"
+    r"(?P<ci>(?P=pi)[ \t]+)"
+    r"(?:(?!reasoning_effort:)[^\n]*\n(?:(?:(?P=ci)(?!reasoning_effort:)[^\n]*|[ \t]*)\n)*?(?P=ci))?"
+    r"reasoning_effort:[ \t]*(?P<eq>['\"]?)(?P<effort>[^'\"\s#]*)(?P=eq)[ \t]*(?:#[^\n]*)?$",
     re.MULTILINE,
 )
 #: A CRLF line end, normalised to LF before the LiteLLM regexes run: MULTILINE ``$``
@@ -601,6 +639,22 @@ def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
     return None
 
 
+def reasoning_effort_from_litellm_config(config_yaml: Optional[str]) -> str:
+    """The ``reasoning effort`` line on the fallback path: the ``reasoning_effort`` of
+    the ``model-default`` entry when that entry answers the model line (UNSET when it
+    states none), UNAVAILABLE otherwise, the first-qualified scan included, whose
+    entry this reader does not know."""
+    if not config_yaml:
+        return UNAVAILABLE
+    config_yaml = config_yaml.replace(CRLF_LINE_END, LF_LINE_END)
+    name = LITELLM_DEFAULT_NAME_LINE.search(config_yaml)
+    if name is None or model_from_litellm_config(config_yaml) is None:
+        return UNAVAILABLE
+    match = LITELLM_DEFAULT_ENTRY_REASONING_EFFORT.match(config_yaml, name.start())
+    effort = match.group("effort") if match else ""
+    return effort or REASONING_EFFORT_UNSET
+
+
 def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
     """``provider/model`` from ``status.inference``; UNAVAILABLE when the key is
     present without both fields (the operator's definite negative); None when the
@@ -615,6 +669,21 @@ def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
     if isinstance(provider, str) and isinstance(model, str) and provider and model:
         return f"{provider}{MODEL_SEGMENT_SEPARATOR}{model}"
     return UNAVAILABLE
+
+
+def reasoning_effort_from_status(status: Mapping[str, Any]) -> Optional[str]:
+    """The ``reasoning effort`` line from ``status.inference``: None when the key is
+    absent (the fallback path answers); UNAVAILABLE whenever the model line is; UNSET
+    when the pair is present without an effort; the effort as written otherwise."""
+    model = model_from_status(status)
+    if model is None:
+        return None
+    if model == UNAVAILABLE:
+        return UNAVAILABLE
+    effort = status[INFERENCE_STATUS_KEY].get(INFERENCE_REASONING_EFFORT_FIELD)
+    if isinstance(effort, str) and effort:
+        return effort
+    return REASONING_EFFORT_UNSET
 
 
 # --- the roll-up ----------------------------------------------------------------
@@ -766,7 +835,7 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
 
 
 def _without_fixed_lines(text: str) -> str:
-    """The block less its first ``model:`` line and its first origin line, the lines printed by design.
+    """The block less its first ``model:``, ``reasoning effort:`` and origin lines, the lines printed by design.
 
     A deployment name can carry a spec identifier as a segment
     (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``), and the
@@ -801,8 +870,8 @@ def _origin_line(usage: Mapping[str, Any]) -> str:
 def audited_block(snapshot: Snapshot) -> Tuple[str, List[str]]:
     """The rendered block and the identifiers that leak into it.
 
-    The audit runs over the block less its model line and its origin line, the
-    lines printed by design. ``main`` and the feedback client's ``summary``
+    The audit runs over the block less its model, reasoning effort and origin lines,
+    the lines printed by design. ``main`` and the feedback client's ``summary``
     subcommand both go through here, so the check that guards a pasted block
     and the check that guards an attached one are one check.
     """
@@ -858,13 +927,16 @@ def render(snapshot: Snapshot) -> str:
     usage = status.get("usage") or {}
     lines: List[str] = ["```", f"{SUMMARY_TITLE} ({now.strftime('%Y-%m-%d')})", "environment:"]
     model = model_from_status(status)
+    effort = reasoning_effort_from_status(status)
     if model is None:
         model = model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE
+        effort = reasoning_effort_from_litellm_config(snapshot.litellm_config)
     interfaces = usage.get("activeInterfaces") or []
     environment = {
         "version": (spec.get("deployment") or {}).get("tag") or UNKNOWN,
         "mode": spec.get("mode") or DEFAULT_MODE,
         "model": model,
+        "reasoning effort": effort,
         "kubernetes": _server_version(snapshot.server_version),
         "installed": f"{_install_age(cr, now)}; ready: {_ready(cr)}",
         "interfaces": ", ".join(sorted(str(i) for i in interfaces)) or NONE,

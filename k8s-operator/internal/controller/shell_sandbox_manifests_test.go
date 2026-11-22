@@ -1591,8 +1591,8 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 		t.Fatalf("expected exactly two ingress rules (the callers, the collector), got %d", len(np.Spec.Ingress))
 	}
 	in := np.Spec.Ingress[0]
-	if len(in.From) != 3 {
-		t.Fatalf("expected exactly three peers (sandbox, gateway, A2A gateway), got %#v", in.From)
+	if len(in.From) != 4 {
+		t.Fatalf("expected four default peers (sandbox, gateway, A2A gateway, MCP), got %#v", in.From)
 	}
 	// A peer with a nil PodSelector matches every pod, and a NamespaceSelector
 	// widens it past this namespace. Either reads as a peer list in `kubectl get`.
@@ -1613,6 +1613,9 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	if got := in.From[2].PodSelector.MatchLabels["app"]; got != "test-agent-a2a-gateway" {
 		t.Errorf("third peer app = %q, want the A2A gateway pod (its report reader)", got)
 	}
+	if got := in.From[3].PodSelector.MatchLabels["app"]; got != "test-agent-a2a-mcp" {
+		t.Errorf("fourth peer app = %q, want the MCP server pod", got)
+	}
 
 	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
 		t.Errorf("expected ingress only on %d, got %#v", credentialProxyPort, in.Ports)
@@ -1632,18 +1635,18 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	}
 }
 
-// TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag: a fourth
+// TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag: a fifth
 // caller peer on the credentialed port, present exactly when the view is on.
 func TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
-	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 3 {
-		t.Fatalf("flag off: %d caller peers, want 3", got)
+	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 4 {
+		t.Fatalf("flag off: %d caller peers, want 4 (sandbox, gateway, A2A gateway, MCP)", got)
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	in := buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0]
-	if len(in.From) != 4 {
-		t.Fatalf("flag on: %d caller peers, want 4", len(in.From))
+	if len(in.From) != 5 {
+		t.Fatalf("flag on: %d caller peers, want 5", len(in.From))
 	}
 	peer := in.From[3]
 	if peer.PodSelector == nil || peer.NamespaceSelector != nil || peer.IPBlock != nil {

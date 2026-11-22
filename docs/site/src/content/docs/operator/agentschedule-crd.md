@@ -27,7 +27,7 @@ spec:
     silentWhenClean: true
 ```
 
-- The `kubeagents.x-k8s.io/origin` label says who owns a schedule. A schedule runs as `builtin` only when it reads `builtin` and the install's `PlatformAgent` is its controller, as on the schedules the operator renders. Any other schedule is a user schedule. User schedules wait on a later change, so for now one reads `Accepted=False` (`UserSchedulesDeferred`) and never fires.
+- The `kubeagents.x-k8s.io/origin` label says who owns a schedule. A schedule runs as `builtin` only when it reads `builtin`, the install's `PlatformAgent` is its controller, and its name is one of the built-in schedules that `PlatformAgent` renders. The operator renders none yet. Only the operator may set, change or remove the `builtin` label or a controller reference, or change a built-in schedule's spec (except `spec.suspend`): an admission policy (`kube-agents-agentschedule-builtin`) refuses anyone else. Annotations such as `run-now`, and suspending a built-in schedule (`spec.suspend`), still pass. A schedule labelled `builtin` that isn't one the operator renders reads `Accepted=False` (`BuiltinNotFromOperator`). Any other schedule is a user schedule. User schedules wait on a later change, so for now one reads `Accepted=False` (`UserSchedulesDeferred`) and never fires.
 - The name is a dot-free DNS-1123 label of at most 63 characters, because each run's trigger is `schedule/<name>`. A schedule with any other name reads `Accepted=False` (`InvalidName`).
 - `schedule` is a standard 5-field cron expression, read in UTC, as a Kubernetes `CronJob` reads it. It takes no time zone prefix.
 - `profileRef` names an `AgentProfile` in the same namespace whose `allowedTiers` includes `unattended`. A schedule whose profile is missing or doesn't allow it reads `Accepted=False` and never fires.
@@ -44,6 +44,16 @@ spec:
 ```sh
 kubectl annotate agentschedule compliance-audit kubeagents.x-k8s.io/run-now="$(date -u +%s)" --overwrite
 ```
+
+**Stop the run in flight.** Setting the annotation `kubeagents.x-k8s.io/stop` to a new value ends the schedule's current run through the A2A gateway. A running task is canceled, and one still starting has its Job removed. The run is recorded as `Cancelled`, and the next slot runs as usual:
+
+```sh
+kubectl annotate agentschedule compliance-audit kubeagents.x-k8s.io/stop="$(date -u +%s)" --overwrite
+```
+
+The value is recorded in `status.lastHandledStop` once acted on, so the same value never stops a later run. With no run in flight, the value is recorded and nothing else happens. A slot still being submitted isn't dropped, because the gateway may already have taken it: the stop waits until it becomes a run, then stops it. A `run-now` set after a stop starts a new run once the stopped one has ended.
+
+A stop that is still being retried, because the gateway hasn't answered yet, stays in effect if the annotation is removed or set back. A `run-now` set meanwhile still waits for that run to end, then starts a new one. The gateway stops only a run it started for this schedule.
 
 **Status is the run ledger.** No run state lives in a pod: `status` holds the next and last slots, the run in flight, the last outcome, the skip counts and the last ten runs. A slot is claimed in `status.pendingSlot` before its submission, with an idempotency key the gateway answers with the same task, so an operator restart neither runs a slot twice nor drops it. The operator also exports `kubeagents_schedule_runs_total{schedule,outcome}` and `kubeagents_schedule_skips_total{schedule,reason}`. The `Submitted` condition shows how the gateway answered the last submission. It reads `False` (`GatewayRefused`, with the gateway's reason) when the gateway refused a run, which drops that slot without retrying it.
 

@@ -1,9 +1,10 @@
 # The a2a console image: the console page (a2a/web) built to static files,
 # and the Go server that serves them, hands the page its bus credential and
 # proxies its websocket to the bus. It also carries the MCP server
-# (a2a/cmd/mcp) and the OKF memory curator (a2a/cmd/curator), which the
-# operator runs from this image with /mcp or /curator as its command when an
-# install opts in, so each ships without an image of its own.
+# (a2a/cmd/mcp, run by default unless switched off) and the OKF memory curator
+# (a2a/cmd/curator, run when an install opts in), which the operator runs from
+# this image with /mcp or /curator as its command so each ships without an
+# image of its own.
 #
 # Build from the a2a/ module root:
 #   docker build --platform linux/amd64 -f Dockerfile.console -t <registry>/a2a-console:<tag> .
