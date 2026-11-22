@@ -92,7 +92,10 @@ KUBEBUILDER_ASSETS="$(make -C k8s-operator -s envtest-path)" go test ./...
 
 from `a2a/` before believing a security change in that module. A fourth tier,
 `a2a/worker-adapter/live_test.go` and `a2a/gateway/live_test.go`, needs a real install and is
-gated on `A2A_LIVE_NATS_URL`; nothing automatic runs it.
+gated on `A2A_LIVE_NATS_URL`; nothing automatic runs it. A fifth,
+`a2a/cmd/worker-adapter/harness_isolation_canary_test.go`, runs a real Claude Code binary with
+the adapter's argv against a fake model endpoint and is gated on `A2A_HARNESS_CANARY_CLAUDE`
+(the binary's path; the worker image has one). Nothing automatic runs it either.
 
 **`tests/e2e/` is not manual-only.** `rc-scheduler.yml` runs on `cron: "17 */3 * * *"` and
 dispatches `rc-release-pipeline.yml` whenever a new candidate exists, and

@@ -1,13 +1,18 @@
-// Package isolation removes harness configuration entries from the
-// directories a harness reads configuration from, so a turn starts with only
-// the configuration the adapter gave it (#6710).
+// Package isolation removes the Antigravity CLI's (agy's) configuration
+// entries from the writable directories it reads configuration from: the
+// workspace and its per-conversation directories under HOME (#6710). The
+// rest of agy's HOME configuration is not scrubbed here; it is meant to be
+// on a read-only layout baked into the image. Claude Code needs none of
+// this: the adapter's argv limits its setting sources instead.
 //
-// The entries are the harness's discovery paths for one exact version, kept
-// in a table. An unknown version is refused rather than handled with another
+// The entries are agy's discovery paths for one exact version, kept in a
+// table. An unknown version is refused rather than handled with another
 // version's list.
 //
-// This package only removes and creates entries. The harness driver decides
-// when it runs: before each spawn.
+// This package only removes and creates entries. The harness driver calls
+// PrepareTurn before each spawn, and only while no harness process or
+// anything it started is still running: nothing here guards against a
+// concurrent writer replacing an entry or a directory mid-scrub.
 package isolation
 
 import (
@@ -87,13 +92,21 @@ func ForVersion(versionOutput string) (Table, error) {
 	return t, nil
 }
 
-// parseVersion takes the last field of the first non-empty line, so both
-// "1.5.13" and "agy 1.5.13" give "1.5.13".
+// parseVersion reads the first non-empty line, which must be exactly
+// "<version>" or "agy <version>". Anything else gives "", which no table
+// matches.
 func parseVersion(out string) string {
 	for _, line := range strings.Split(out, "\n") {
-		if f := strings.Fields(line); len(f) > 0 {
-			return f[len(f)-1]
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 0:
+			continue
+		case len(f) == 1:
+			return f[0]
+		case len(f) == 2 && f[0] == "agy":
+			return f[1]
 		}
+		return ""
 	}
 	return ""
 }
@@ -105,13 +118,21 @@ const BrainDir = ".gemini/antigravity-cli/brain"
 // PrepareTurn readies a turn's configuration directories: it scrubs and
 // places placeholders in the workspace, then scrubs every conversation
 // directory under home's BrainDir. It fails closed: an empty or relative
-// workspace or home is an error, as is any entry it cannot remove. Removed
+// workspace or home is an error, as is a home at or under the workspace, a
+// symlink among BrainDir's parents, and any entry it cannot remove. Removed
 // paths are returned for the caller to log.
 func (t Table) PrepareTurn(workspace, home string) ([]string, error) {
 	if err := checkRoot("workspace", workspace); err != nil {
 		return nil, err
 	}
 	if err := checkRoot("home", home); err != nil {
+		return nil, err
+	}
+	if rel, err := filepath.Rel(filepath.Clean(workspace), filepath.Clean(home)); err == nil && (rel == "." || !strings.HasPrefix(rel, "..")) {
+		return nil, fmt.Errorf("isolation: home %q is at or under the workspace %q", home, workspace)
+	}
+	brain, err := brainDir(home)
+	if err != nil {
 		return nil, err
 	}
 	removed, err := t.Scrub(workspace)
@@ -121,8 +142,30 @@ func (t Table) PrepareTurn(workspace, home string) ([]string, error) {
 	if err := t.Place(workspace); err != nil {
 		return removed, err
 	}
-	r, err := t.scrubBrain(filepath.Join(home, BrainDir))
+	r, err := t.scrubBrain(brain)
 	return append(removed, r...), err
+}
+
+// brainDir returns home's BrainDir after checking that no directory between
+// home and it is a symlink, so a scrub there cannot land elsewhere. BrainDir
+// itself may be one: the read-only HOME layout links it to writable storage.
+func brainDir(home string) (string, error) {
+	parts := strings.Split(BrainDir, "/")
+	p := home
+	for _, part := range parts[:len(parts)-1] {
+		p = filepath.Join(p, part)
+		fi, err := os.Lstat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			return filepath.Join(home, BrainDir), nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("isolation: %w", err)
+		}
+		if !fi.IsDir() {
+			return "", fmt.Errorf("isolation: %s is not a directory", p)
+		}
+	}
+	return filepath.Join(home, BrainDir), nil
 }
 
 func checkRoot(what, dir string) error {
@@ -137,14 +180,18 @@ func checkRoot(what, dir string) error {
 
 // Scrub removes every table entry in root that is not an inert placeholder,
 // and returns the removed paths. It never follows a symlink: a link under
-// an entry's name is removed, not its target.
+// an entry's name is removed, not its target, and a root that is itself a
+// symlink is refused (callers pass resolved paths).
 func (t Table) Scrub(root string) ([]string, error) {
 	if err := checkRoot("root", root); err != nil {
 		return nil, err
 	}
-	fi, err := os.Stat(root)
+	fi, err := os.Lstat(root)
 	if err != nil {
 		return nil, fmt.Errorf("isolation: %w", err)
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		return nil, fmt.Errorf("isolation: %s is a symlink", root)
 	}
 	if !fi.IsDir() {
 		return nil, fmt.Errorf("isolation: %s is not a directory", root)
@@ -171,8 +218,9 @@ func (t Table) Scrub(root string) ([]string, error) {
 }
 
 // removeAll removes p and everything under it, first restoring the owner
-// write bit on directories so a read-only tree the task made cannot make
-// the removal fail. It never follows symlinks.
+// write bit on directories under p, so a read-only tree there cannot make
+// the removal fail. A read-only root (the directory holding p) still fails
+// it, which fails the turn closed. It never follows symlinks.
 func removeAll(p string) error {
 	_ = filepath.WalkDir(p, func(q string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {

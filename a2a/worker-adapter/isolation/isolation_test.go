@@ -51,13 +51,15 @@ func tempDir(t *testing.T) string {
 }
 
 func TestForVersion(t *testing.T) {
-	for _, in := range []string{"1.5.13", "1.5.13\n", "agy 1.5.13\n", "\n  1.5.13  \nextra"} {
+	for _, in := range []string{"1.5.13", "1.5.13\n", "agy 1.5.13\n", "\n  1.5.13  \nextra", "agy 1.5.13\nagy 1.6.0"} {
 		tb, err := ForVersion(in)
 		if err != nil || tb.Version != "1.5.13" {
 			t.Errorf("ForVersion(%q) = %q, %v; want 1.5.13", in, tb.Version, err)
 		}
 	}
-	for _, in := range []string{"", "\n", "1.5.14", "1.5.13-rc1", "1.5", "agy"} {
+	for _, in := range []string{"", "\n", "1.5.14", "1.5.13-rc1", "1.5", "agy",
+		"agy 1.6.0 (compat 1.5.13)", "update available: 1.5.13", "\nagy version 1.5.13",
+		"version 1.5.13", "agy 1.5.13 beta"} {
 		_, err := ForVersion(in)
 		if !errors.Is(err, ErrUnknownVersion) {
 			t.Errorf("ForVersion(%q) err = %v; want ErrUnknownVersion", in, err)
@@ -327,5 +329,89 @@ func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPrepareTurnRefusesAHomeAtOrUnderTheWorkspace(t *testing.T) {
+	ws := tempDir(t)
+	write(t, filepath.Join(ws, ".gemini", "antigravity-cli", "brain", "c1", "transcript.jsonl"), "{}")
+	for _, home := range []string{ws, filepath.Join(ws, "home"), ws + "/"} {
+		if _, err := table(t).PrepareTurn(ws, home); err == nil {
+			t.Errorf("PrepareTurn(%q, %q) succeeded; want an error", ws, home)
+		}
+	}
+	if !exists(filepath.Join(ws, ".gemini", "antigravity-cli", "brain", "c1", "transcript.jsonl")) {
+		t.Fatal("a refused PrepareTurn still removed HOME state")
+	}
+	// A sibling whose name only starts like the workspace is fine.
+	if _, err := table(t).PrepareTurn(ws, ws+"-home"); err != nil {
+		t.Errorf("sibling home refused: %v", err)
+	}
+}
+
+func TestPrepareTurnRefusesSymlinksAboveTheBrainDir(t *testing.T) {
+	for _, linked := range []string{".gemini", ".gemini/antigravity-cli"} {
+		t.Run(linked, func(t *testing.T) {
+			ws, home, elsewhere := tempDir(t), tempDir(t), tempDir(t)
+			write(t, filepath.Join(elsewhere, "sub", "AGENTS.md"), "not ours")
+			target := filepath.Join(home, "real")
+			must(t, os.MkdirAll(filepath.Join(target, "antigravity-cli", "brain"), 0o755))
+			if linked == ".gemini" {
+				must(t, os.Symlink(target, filepath.Join(home, ".gemini")))
+			} else {
+				must(t, os.MkdirAll(filepath.Join(home, ".gemini"), 0o755))
+				must(t, os.Symlink(elsewhere, filepath.Join(home, ".gemini", "antigravity-cli")))
+			}
+			if _, err := table(t).PrepareTurn(ws, home); err == nil {
+				t.Fatal("PrepareTurn succeeded through a symlinked parent; want an error")
+			}
+			if !exists(filepath.Join(elsewhere, "sub", "AGENTS.md")) {
+				t.Fatal("scrub followed a symlinked parent")
+			}
+		})
+	}
+}
+
+// The read-only HOME layout links BrainDir itself to writable storage.
+func TestPrepareTurnFollowsALinkedBrainDir(t *testing.T) {
+	ws, home, store := tempDir(t), tempDir(t), tempDir(t)
+	write(t, filepath.Join(store, "c1", "AGENTS.md"), "rule")
+	write(t, filepath.Join(store, "c1", "plan.md"), "artifact")
+	must(t, os.MkdirAll(filepath.Join(home, ".gemini", "antigravity-cli"), 0o755))
+	must(t, os.Symlink(store, filepath.Join(home, BrainDir)))
+	removed, err := table(t).PrepareTurn(ws, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists(filepath.Join(store, "c1", "AGENTS.md")) || len(removed) != 1 {
+		t.Fatalf("removed %v; want the conversation's AGENTS.md", removed)
+	}
+	if !exists(filepath.Join(store, "c1", "plan.md")) {
+		t.Fatal("artifact removed")
+	}
+}
+
+func TestScrubRefusesASymlinkedRoot(t *testing.T) {
+	real, link := tempDir(t), filepath.Join(tempDir(t), "ws")
+	write(t, filepath.Join(real, "AGENTS.md"), "rule")
+	must(t, os.Symlink(real, link))
+	if _, err := table(t).Scrub(link); err == nil {
+		t.Fatal("Scrub followed a symlinked root")
+	}
+	if !exists(filepath.Join(real, "AGENTS.md")) {
+		t.Fatal("Scrub removed through a symlinked root")
+	}
+}
+
+// A read-only workspace root cannot be scrubbed, so the turn fails closed.
+func TestPrepareTurnFailsOnAReadOnlyWorkspaceWithAnEntry(t *testing.T) {
+	ws, home := tempDir(t), tempDir(t)
+	write(t, filepath.Join(ws, "AGENTS.md"), "rule")
+	must(t, os.Chmod(ws, 0o555))
+	if err := os.WriteFile(filepath.Join(ws, "probe"), nil, 0o644); err == nil {
+		t.Skip("running as a user that ignores permissions")
+	}
+	if _, err := table(t).PrepareTurn(ws, home); err == nil {
+		t.Fatal("PrepareTurn succeeded on a read-only workspace holding an entry")
 	}
 }
