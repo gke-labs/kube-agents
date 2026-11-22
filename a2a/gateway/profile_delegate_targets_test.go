@@ -1,0 +1,247 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"slices"
+	"testing"
+
+	"github.com/gke-labs/kube-agents/a2a/capability"
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+// startDelegateTargetsRig is the profile rig (startProfileRig) with the
+// profiles the list tests read: chat delegates and takes no target, dev-east
+// is pinned to p1/us-east1/dev, needs takes a required service and no target,
+// and writer runs only unattended, a tier no console task has.
+func startDelegateTargetsRig(t *testing.T) *rig {
+	t.Helper()
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 10
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
+	r.g.profiles.put("dev-east", &lib.AgentCard{Name: "dev-east", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "dev"}})
+	r.g.profiles.put("needs", &lib.AgentCard{Name: "needs", Parameters: []lib.ProfileParameter{{Name: "service", Required: true}}})
+	r.g.profiles.put("writer", &lib.AgentCard{Name: "writer", Tiers: []string{string(capability.TierUnattended)}})
+	return r
+}
+
+// rootOn starts a console task for profile in conv and returns its
+// submission, found by the task id the record holds, so several
+// conversations can share a rig.
+func rootOn(t *testing.T, r *rig, conv, profile string) *lib.Envelope {
+	t.Helper()
+	turn := profileTurn(conv, profile, nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	rec := waitForRecord(t, r, conv, "the task on record", func(rec *SessionRecord) bool { return rec.ActiveTask != nil })
+	return submissionFor(t, r, profile, rec.ActiveTask.TaskID)
+}
+
+// submissionFor waits for taskID's submission on profile's queue.
+func submissionFor(t *testing.T, r *rig, profile, taskID string) *lib.Envelope {
+	t.Helper()
+	var env *lib.Envelope
+	waitFor(t, "the submission of "+taskID, func() bool {
+		for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+profile+".>") {
+			if e.env.TaskID == taskID {
+				env = e.env
+				return true
+			}
+		}
+		return false
+	})
+	return env
+}
+
+// targetsOn is the delegateTargets part on a submission, failing the test
+// when there is none.
+func targetsOn(t *testing.T, env *lib.Envelope) lib.DelegateTargets {
+	t.Helper()
+	got, ok, err := lib.DelegateTargetsOf(messageParts(t, env))
+	if !ok || err != nil {
+		t.Fatalf("delegateTargets part: found=%v err=%v", ok, err)
+	}
+	return got
+}
+
+// delegateFrom starts a profile root in conv, delegates e from it, and
+// reports whether the delegation minted a child, with the parent's id and the
+// child's when it did.
+func delegateFrom(t *testing.T, r *rig, conv, profile string, e lib.DelegateTask) (minted bool, parentID, childID string) {
+	t.Helper()
+	ctx := context.Background()
+	origin := rootOn(t, r, conv, profile)
+	parent := r.execFor(t, origin, profile)
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, e.Addressee, e.Text, e.Parameters)); err != nil {
+		t.Fatal(err)
+	}
+	rec := waitForRecord(t, r, conv, "the delegation's outcome", func(rec *SessionRecord) bool {
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && (len(ref.Children) > 0 || ref.DelegationEnd != "")
+	})
+	ref, _ := rec.TaskRefFor(origin.TaskID)
+	if len(ref.Children) > 0 {
+		return true, origin.TaskID, ref.Children[0]
+	}
+	return false, origin.TaskID, ""
+}
+
+// TestADelegatingProfileRootListsWhatTheDelegationAccepts: a delegating
+// profile's own task carries the profiles it may delegate to (#6789), and the
+// list is the delegation's rules, not a guess: every target listed is
+// accepted when the parent delegates to it, and one left off is refused. The
+// width is the setting the delegation refuses a wider batch under.
+func TestADelegatingProfileRootListsWhatTheDelegationAccepts(t *testing.T) {
+	t.Parallel()
+	r := startDelegateTargetsRig(t)
+	type entry struct {
+		name   string
+		params map[string]string
+	}
+	cases := []struct {
+		parent   string
+		listed   []entry // in name order, each with the parameters a delegation passes
+		unlisted []entry
+	}{
+		{
+			// The install's scope: any profile it reaches, at the parent's
+			// tier, its own profile once (the head's self-nest).
+			parent: "chat",
+			listed: []entry{
+				{"chat", nil},
+				{"cluster", targetParams("p1", "us-east1", "staging")},
+				{"dev-east", nil},
+				{"needs", map[string]string{"service": "web"}},
+				{"prod-east", nil},
+			},
+			unlisted: []entry{{"writer", nil}, {targetPlatform, nil}},
+		},
+		{
+			// Scoped to p1/us-east1/prod: only what runs on that cluster.
+			parent: "prod-east",
+			listed: []entry{
+				{"cluster", targetParams("p1", "us-east1", "prod")},
+				{"prod-east", nil},
+			},
+			unlisted: []entry{
+				{"chat", nil},
+				{"dev-east", nil},
+				{"needs", map[string]string{"service": "web"}},
+				{"writer", nil},
+			},
+		},
+	}
+	for _, tc := range cases {
+		got := targetsOn(t, rootOn(t, r, "console:tab-list-"+tc.parent, tc.parent))
+		var want []string
+		for _, e := range tc.listed {
+			want = append(want, e.name)
+		}
+		if names := targetNames(got); !slices.Equal(names, want) {
+			t.Fatalf("%s's targets = %v, want %v", tc.parent, names, want)
+		}
+		if got.WidthMax != r.g.cfg.DelegationWidthMax || got.Truncated {
+			t.Fatalf("%s's width = %d (truncated %v), want %d", tc.parent, got.WidthMax, got.Truncated, r.g.cfg.DelegationWidthMax)
+		}
+		for _, e := range tc.listed {
+			conv := "console:tab-listed-" + tc.parent + "-" + e.name
+			if minted, _, _ := delegateFrom(t, r, conv, tc.parent, lib.DelegateTask{Addressee: e.name, Text: "look", Parameters: e.params}); !minted {
+				rec, _ := r.g.reg.Get(context.Background(), conv)
+				t.Errorf("%s -> %s is listed but was refused: %+v", tc.parent, e.name, rec.Tasks)
+			}
+		}
+		for _, e := range tc.unlisted {
+			conv := "console:tab-unlisted-" + tc.parent + "-" + e.name
+			if minted, _, _ := delegateFrom(t, r, conv, tc.parent, lib.DelegateTask{Addressee: e.name, Text: "look", Parameters: e.params}); minted {
+				t.Errorf("%s -> %s is not listed but was accepted", tc.parent, e.name)
+			}
+		}
+	}
+}
+
+// TestAProfileParentTheDelegationRefusesOutrightListsNobody: an unattended
+// parent is refused every child on this gateway (profileParentRefusal), so
+// its list is empty, never a profile it can't reach.
+func TestAProfileParentTheDelegationRefusesOutrightListsNobody(t *testing.T) {
+	t.Parallel()
+	r := startDelegateTargetsRig(t)
+	rec := &SessionRecord{Key: "console:tab-unattended"}
+	requester := TaskRequester{Backend: consoleBackend, Subject: "hmac:00"}
+	for _, parent := range []TaskRef{
+		{Addressee: "chat", Tier: string(capability.TierUnattended), Scope: installScope, Requester: &requester},
+		{Addressee: "chat", Tier: string(capability.TierRead), Scope: "", Requester: &requester},
+		{Addressee: "chat", Tier: string(capability.TierRead), Scope: installScope, Requester: &requester, Depth: r.g.cfg.DelegationDepthMax},
+	} {
+		if got := r.g.profileDelegateTargets(rec, parent); len(got.Targets) != 0 {
+			t.Errorf("parent %+v lists %v, want nobody", parent, targetNames(got))
+		}
+	}
+	// And the same parent at read is offered the profiles, so the empty
+	// lists above are the refusal's, not the rig's.
+	read := TaskRef{Addressee: "chat", Tier: string(capability.TierRead), Scope: installScope, Requester: &requester}
+	if got := r.g.profileDelegateTargets(rec, read); len(got.Targets) == 0 {
+		t.Fatal("a read parent lists nobody")
+	}
+}
+
+// TestAProfileSubmissionWithoutAListIsAsBefore: a profile whose card doesn't
+// delegate, and a child of one that does, are submitted byte for byte as
+// they were before the list (#6789): no delegateTargets part, nothing else
+// moved. A worker from before the part reads the same submission either way.
+func TestAProfileSubmissionWithoutAListIsAsBefore(t *testing.T) {
+	t.Parallel()
+	r := startDelegateTargetsRig(t)
+	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	asBefore := func(what string, env *lib.Envelope, params map[string]string, tier capability.Tier, kind string) {
+		t.Helper()
+		parts := messageParts(t, env)
+		if _, ok, _ := lib.DelegateTargetsOf(parts); ok {
+			t.Fatalf("%s carries a delegateTargets part", what)
+		}
+		route, err := r.g.profileRouteFor("prod-east", params, tier, kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := submissionPayload(parts[0].Text, env.TaskID, env.ContextID, route, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The one field minted afresh per build is the message id.
+		var gotMsg, wantMsg lib.Message
+		if err := json.Unmarshal(env.Payload, &gotMsg); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(want, &wantMsg); err != nil {
+			t.Fatal(err)
+		}
+		want = bytes.Replace(want, []byte(`"messageId":"`+wantMsg.MessageID+`"`), []byte(`"messageId":"`+gotMsg.MessageID+`"`), 1)
+		if !bytes.Equal(env.Payload, want) {
+			t.Fatalf("%s's payload =\n%s\nwant\n%s", what, env.Payload, want)
+		}
+	}
+
+	conv := "console:tab-asbefore-root"
+	root := rootOn(t, r, conv, "prod-east")
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	ref, _ := rec.TaskRefFor(root.TaskID)
+	asBefore("a root of a profile that doesn't delegate", root, nil, capability.Tier(ref.Tier), lib.SubmitKindTop)
+
+	// A child of a delegating parent, to a profile that delegates too: a
+	// child has a via, so it carries no list.
+	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams, Delegates: true,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	conv = "console:tab-asbefore-child"
+	minted, parentID, childID := delegateFrom(t, r, conv, "chat", lib.DelegateTask{Addressee: "prod-east", Text: "look"})
+	if !minted {
+		t.Fatal("the child was refused")
+	}
+	rec, _ = r.g.reg.Get(context.Background(), conv)
+	parentRef, _ := rec.TaskRefFor(parentID)
+	asBefore("a child", submissionFor(t, r, "prod-east", childID), nil, capability.Tier(parentRef.Tier), lib.SubmitKindChild)
+}

@@ -239,7 +239,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// withdrawn (the deferred withdrawCutShortBatch); before every check
 	// whose notice could name another task.
 	if profileParent {
-		if card, ok := g.profiles.lookup(parent.Addressee); !ok || !card.Delegates {
+		if !g.profileDelegates(parent.Addressee) {
 			refuse(ruleDelegationProfileNotDelegating, noticeDelegationRefusedFor+fmt.Sprintf(noticeProfileDoesNotDelegate, parent.Addressee))
 			return
 		}
@@ -304,97 +304,16 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			return
 		}
 	}
-	// Each child the request asks for meets the same checks, all of them
-	// before any is minted, so one entry that fails refuses the request with
-	// nothing minted. check refuses (with the notice a single child would
-	// get) and reports false, or reports the entry's route: nil for
-	// platform.
+	// Each child the request asks for meets the same checks
+	// (delegateEntryCheck), all of them before any is minted, so one entry
+	// that fails refuses the request with nothing minted. check refuses
+	// (with the notice a single child would get) and reports false, or
+	// reports the entry's route: nil for platform.
 	check := func(e lib.DelegateTask) (*profileRoute, bool) {
-		// Anything but platform is an AgentProfile: resolved, its target checked
-		// against the scope, and minted at the parent's tier, which for a
-		// session parent is its requester's (profileRouteFor).
-		var route *profileRoute
-		var err error
-		addressee := strings.TrimSpace(e.Addressee)
-		// A profile task delegates only to another profile: a platform child is
-		// minted at the install's tier and scope, wider than the parent's.
-		if profileParent && addressee == targetPlatform {
-			refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
+		route, no := g.delegateEntryCheck(rec, parent, profileParent, e, true)
+		if no != nil {
+			refuse(no.rule, no.notice, no.extra...)
 			return nil, false
-		}
-		if addressee == targetPlatform && len(e.Parameters) > 0 {
-			// Only a profile route carries parameters; platform's would be dropped.
-			refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
-			return nil, false
-		}
-		if addressee != targetPlatform {
-			tier := capability.Tier(parent.Tier)
-			if !profileParent {
-				authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
-				if tier, err = g.tierFor(authors, unknown); err != nil {
-					refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
-					return nil, false
-				}
-			}
-			if route, err = g.profileRouteFor(addressee, e.Parameters, tier, lib.SubmitKindChild); err != nil {
-				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
-				return nil, false
-			}
-			if profileParent {
-				if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {
-					refuse(rule, noticeDelegationRefusedFor+notice, "child", route.Profile)
-					return nil, false
-				}
-			}
-		}
-		// The lists are the target's: the profile the address resolved to, so a
-		// list on a pinned profile can't be stepped round by addressing another.
-		target := addressee
-		if route != nil {
-			target = route.Profile
-		}
-		// The A2A door's callers delegate only under a list of their own,
-		// which nothing renders yet (gke-labs#2478): an absent list there is
-		// nobody, where on a chat backend it is everyone the ingress admits.
-		if g.doorUnlisted(target, parent.Requester.Backend) {
-			refuse(ruleDelegationDoorUnlisted, fmt.Sprintf(noticeDelegationNotAllowed, target))
-			return nil, false
-		}
-		if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
-			refuse(ruleDelegationAllowedUsers, fmt.Sprintf(noticeDelegationNotAllowed, target))
-			return nil, false
-		}
-		// Anyone in the room can steer the turn, so everyone who did is checked
-		// as the requester is: otherwise an off-list human steers the session
-		// into delegating under the requester's name.
-		if parent.SteerAuthorsOverflow {
-			refuse(ruleDelegationSteerAuthor, noticeDelegationSteerOverflow, "steerAuthors", "over-cap")
-			return nil, false
-		}
-		for _, a := range parent.SteerAuthors {
-			if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
-				refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "steerBackend", a.Backend, "steerAuthor", a.Subject)
-				return nil, false
-			}
-		}
-		// And everyone whose text reached this incarnation, on any turn: the
-		// pod keeps what it was told, so an off-list human's earlier turn can
-		// leave the instruction a later on-list turn delegates on. The check
-		// above pinned the parent to rec.BusSession, so the set is the parent's
-		// incarnation's.
-		sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
-		if profileParent {
-			sessionAuthors, sessionUnknown = nil, false
-		}
-		if sessionUnknown {
-			refuse(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
-			return nil, false
-		}
-		for _, a := range sessionAuthors {
-			if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
-				refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
-				return nil, false
-			}
 		}
 		return route, true
 	}
@@ -468,6 +387,113 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee)
+}
+
+// entryRefusal is why delegateEntryCheck refused an entry: the rule and the
+// notice handleDelegateRequest refuses with, and the audit line's extras.
+type entryRefusal struct {
+	rule, notice string
+	extra        []any
+}
+
+func refuseEntry(rule, notice string, extra ...any) *entryRefusal {
+	return &entryRefusal{rule: rule, notice: notice, extra: extra}
+}
+
+// delegateEntryCheck is whether parent may start a child for one entry of
+// its delegate request: the entry's route (nil for platform), or why not. It
+// is the one statement of the per-child rules, read by the delegation as it
+// arrives (handleDelegateRequest) and by the list a delegating profile
+// parent's submission carries (profileDelegateTargets), so the list offers
+// nothing the delegation refuses. scopeChecked false leaves out only the
+// install-scope check of a target the entry names (profileRouteWith), for
+// the list's probe of a profile whose cluster is the asker's to choose; the
+// delegation always passes true.
+func (g *Gateway) delegateEntryCheck(rec *SessionRecord, parent TaskRef, profileParent bool, e lib.DelegateTask, scopeChecked bool) (*profileRoute, *entryRefusal) {
+	// Anything but platform is an AgentProfile: resolved, its target checked
+	// against the scope, and minted at the parent's tier, which for a
+	// session parent is its requester's (profileRouteFor).
+	var route *profileRoute
+	var err error
+	addressee := strings.TrimSpace(e.Addressee)
+	// A profile task delegates only to another profile: a platform child is
+	// minted at the install's tier and scope, wider than the parent's.
+	if profileParent && addressee == targetPlatform {
+		return nil, refuseEntry(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
+	}
+	if addressee == targetPlatform && len(e.Parameters) > 0 {
+		// Only a profile route carries parameters; platform's would be dropped.
+		return nil, refuseEntry(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
+	}
+	if addressee != targetPlatform {
+		tier := capability.Tier(parent.Tier)
+		if !profileParent {
+			authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
+			if tier, err = g.tierFor(authors, unknown); err != nil {
+				return nil, refuseEntry(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+			}
+		}
+		if route, err = g.profileRouteWith(addressee, e.Parameters, tier, lib.SubmitKindChild, scopeChecked); err != nil {
+			return nil, refuseEntry(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+		}
+		if profileParent {
+			if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {
+				return nil, refuseEntry(rule, noticeDelegationRefusedFor+notice, "child", route.Profile)
+			}
+		}
+	}
+	// The lists are the target's: the profile the address resolved to, so a
+	// list on a pinned profile can't be stepped round by addressing another.
+	target := addressee
+	if route != nil {
+		target = route.Profile
+	}
+	// The A2A door's callers delegate only under a list of their own,
+	// which nothing renders yet (gke-labs#2478): an absent list there is
+	// nobody, where on a chat backend it is everyone the ingress admits.
+	if g.doorUnlisted(target, parent.Requester.Backend) {
+		return nil, refuseEntry(ruleDelegationDoorUnlisted, fmt.Sprintf(noticeDelegationNotAllowed, target))
+	}
+	if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
+		return nil, refuseEntry(ruleDelegationAllowedUsers, fmt.Sprintf(noticeDelegationNotAllowed, target))
+	}
+	// Anyone in the room can steer the turn, so everyone who did is checked
+	// as the requester is: otherwise an off-list human steers the session
+	// into delegating under the requester's name.
+	if parent.SteerAuthorsOverflow {
+		return nil, refuseEntry(ruleDelegationSteerAuthor, noticeDelegationSteerOverflow, "steerAuthors", "over-cap")
+	}
+	for _, a := range parent.SteerAuthors {
+		if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
+			return nil, refuseEntry(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "steerBackend", a.Backend, "steerAuthor", a.Subject)
+		}
+	}
+	// And everyone whose text reached this incarnation, on any turn: the
+	// pod keeps what it was told, so an off-list human's earlier turn can
+	// leave the instruction a later on-list turn delegates on. The caller
+	// pinned a session parent to rec.BusSession, so the set is the parent's
+	// incarnation's.
+	sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
+	if profileParent {
+		sessionAuthors, sessionUnknown = nil, false
+	}
+	if sessionUnknown {
+		return nil, refuseEntry(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
+	}
+	for _, a := range sessionAuthors {
+		if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
+			return nil, refuseEntry(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
+		}
+	}
+	return route, nil
+}
+
+// profileDelegates reports whether profile's card says its tasks may
+// delegate (AgentProfile spec.delegates, #6789): the delegation's check of a
+// profile parent, and whether its submission carries a delegateTargets part.
+func (g *Gateway) profileDelegates(profile string) bool {
+	card, ok := g.profiles.lookup(profile)
+	return ok && card.Delegates
 }
 
 // noticeBatchChildWithdrawn closes the line of a batch child that reached
