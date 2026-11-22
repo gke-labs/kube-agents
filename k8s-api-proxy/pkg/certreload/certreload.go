@@ -39,6 +39,8 @@ const (
 	// starts, and pemCommentPrefix opens a comment line it allows between blocks.
 	pemBeginMarker   = "-----BEGIN "
 	pemCommentPrefix = '#'
+	// pemEndMarker closes a PEM block.
+	pemEndMarker = "-----END "
 
 	// dialTimeout and dialKeepAlive match http.DefaultTransport's dialer.
 	dialTimeout   = 30 * time.Second
@@ -286,7 +288,9 @@ func parseCABundle(data []byte) (*x509.CertPool, error) {
 			return nil, errors.New("data that is not a PEM block or a # comment line")
 		}
 		block, next := pem.Decode(rest)
-		if block == nil {
+		// A block whose body does not decode is skipped too, and the next one returned:
+		// the decoded block must end at the first END line.
+		if block == nil || len(next) != len(afterFirstEndLine(rest)) {
 			return nil, errors.New("a PEM block that could not be decoded")
 		}
 		rest = next
@@ -304,6 +308,19 @@ func parseCABundle(data []byte) (*x509.CertPool, error) {
 		return nil, errors.New("no CERTIFICATE block")
 	}
 	return pool, nil
+}
+
+// afterFirstEndLine returns what follows the line holding the first END marker in data,
+// or nothing when there is none.
+func afterFirstEndLine(data []byte) []byte {
+	i := bytes.Index(data, []byte(pemEndMarker))
+	if i < 0 {
+		return nil
+	}
+	if j := bytes.IndexByte(data[i:], '\n'); j >= 0 {
+		return data[i+j+1:]
+	}
+	return nil
 }
 
 // skipBundleFiller drops leading whitespace and whole lines that start with '#'.
