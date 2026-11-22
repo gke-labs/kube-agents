@@ -1101,6 +1101,17 @@ agree. When it cannot read them, or fails in any other way, it runs the command 
 that cannot take the lock waits for it in the kernel for up to 5 s, once, and is then refused: in a fan-out of 60 commands on two CPUs, the commands that ran unslotted after a lock
 timeout outgrew the shell.
 
+A2A session Pods under the cluster view run kubectl against the kube-proxy too, in a container
+limited to `A2A_SESSION_MEMORY_LIMIT` (2 GiB by default) with no guard running. The worker image's
+wrapper execs the same admission there, with three settings from its environment: its state in a
+directory the session user owns (`KUBECTL_ADMIT_RUN_DIR`), the guard loaded only as a library for
+its memory figure and watermark (`KUBECTL_ADMIT_GUARD_PATH`), and `KUBECTL_ADMIT_ON_BUSY=run`.
+With `run`, every command the sandbox would refuse with exit 75 runs instead, unslotted, as it did
+before the admission, and the event log records it as `ran-busy`; only a read larger than one read
+may ever take is still refused, with exit 3. The tier comes from `KUBEAGENTS_KUBECTL_COST_TIER`,
+which the operator passes to the gateway and the gateway to each session Pod, both checking it is a
+plain lowercase word.
+
 ### Running the sandbox under gVisor
 
 `harness.experimental.shellSandbox.runtimeClassName` puts the sandbox pod on a sandboxed

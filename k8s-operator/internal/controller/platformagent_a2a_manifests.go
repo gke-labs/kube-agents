@@ -7123,6 +7123,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
 		}
+		// The kubectl admission's tier, normalised as for the shell sandbox;
+		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
+		if tier, ok := kubectlCostTier(agent); ok {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aKubectlCostTierEnv, Value: tier})
+		}
 		// The exec tier's address, while it renders, for the session pods'
 		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
 		if credentialProxyExecTierEnabled(agent) {

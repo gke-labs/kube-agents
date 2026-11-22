@@ -8,6 +8,7 @@ shared helpers two of them source live in the sibling [`../installer/`](../insta
 | Script                                     | What it does                                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `dev_rebuild_agent.sh`                     | Rebuilds the agent image and the two that follow its tag, and redeploys (see below)     |
+| `measure_kubectl_admission_overhead.sh`    | Times kubectl with and without the kubectl admission inside a pod; prints p50 and p95   |
 | `profile_kubectl_costs.py`                 | Profiles each fleet-wide `kubectl get` and writes `deploy/sandbox/kubectl-costs.json`   |
 | `profile_kubectl_costs_job.sh`             | Runs that profiler as a Job on a tier's reference cluster                               |
 | `repeat_under_load.sh`                     | Runs a new or changed test several times under CPU load; prints the PR body's line      |

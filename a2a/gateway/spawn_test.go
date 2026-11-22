@@ -501,6 +501,51 @@ func TestClusterViewPassesTheExecTierURLWhenSet(t *testing.T) {
 	}
 }
 
+// The kubectl admission's tier reaches the session pod beside KUBE_PROXY_URL,
+// only when the gateway has a valid one, and only where the wrapper runs the
+// admission (the cluster view with a kube-proxy).
+func TestClusterViewPassesTheKubectlCostTierWhenSet(t *testing.T) {
+	const proxy = "https://agent-kube-proxy.test-ns.svc.cluster.local:8443"
+	for name, tc := range map[string]struct {
+		view  bool
+		proxy string
+		tier  string
+		want  string
+	}{
+		"view with tier":       {view: true, proxy: proxy, tier: "fleet", want: "fleet"},
+		"view without tier":    {view: true, proxy: proxy},
+		"view with a bad tier": {view: true, proxy: proxy, tier: "Fleet/../x"},
+		"view without a proxy": {view: true, tier: "fleet"},
+		"no view":              {proxy: proxy, tier: "fleet"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cs := k8sfake.NewSimpleClientset()
+			cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+				TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222", SessionClusterView: tc.view,
+				CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765",
+				KubeProxyURL:       tc.proxy, KubectlCostTier: tc.tier}
+			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
+			if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
+				t.Fatal(err)
+			}
+			pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, set := "", false
+			for _, e := range pod.Spec.Containers[0].Env {
+				if e.Name == "KUBEAGENTS_KUBECTL_COST_TIER" {
+					got, set = e.Value, true
+				}
+			}
+			if got != tc.want || set != (tc.want != "") {
+				t.Errorf("KUBEAGENTS_KUBECTL_COST_TIER = %q (set %v), want %q", got, set, tc.want)
+			}
+		})
+	}
+}
+
 // TestNoClusterViewSpawnsTodaysPod: the flag off renders the pod exactly as
 // before - no broker env, one projected audience.
 func TestNoClusterViewSpawnsTodaysPod(t *testing.T) {
