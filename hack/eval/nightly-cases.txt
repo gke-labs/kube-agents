@@ -1245,13 +1245,6 @@
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
 
-# A question about the last fleet audit says when that stream's last run did
-# not finish (#6812). prebuilt/unfinished-audit-run plants a clean compliance-
-# audit report and a newer run-start record never marked done, from the shell
-# sandbox; report_contains grades the reply. Red on main, which has no record.
-# Read-only turn, no fixture; the stack holds the infra lock and the stream's.
-./tasks/fleet-audit-unfinished-run-reported/task.yaml
-
 # A scheduled audit over a fleet that did not change since the last scheduled
 # run is closed by `audit_report.py precheck` from that run's stored findings
 # document, with no document drafted by hand (gke-labs/kube-agents#4724).
@@ -1264,6 +1257,13 @@
 # the 900s audit band plus the plant. Listed in nightly-main-c.txt to balance
 # the stack chains.
 ./tasks/fleet-audit-unchanged-manifest-skips-synthesis/task.yaml
+
+# A question about the last fleet audit says when that stream's last run did
+# not finish (#6812). prebuilt/unfinished-audit-run plants a clean compliance-
+# audit report and a newer run-start record never marked done, from the shell
+# sandbox; report_contains grades the reply. Red on main, which has no record.
+# Read-only turn, no fixture; the stack holds the infra lock and the stream's.
+./tasks/fleet-audit-unfinished-run-reported/task.yaml
 
 # A drift run over a coverage gap keeps the previous finding on the cluster it
 # did not compare as a held row, with its id in the ledger's hidden block.
