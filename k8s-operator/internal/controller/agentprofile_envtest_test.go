@@ -57,6 +57,14 @@ func TestTheAgentProfileCRDRefusesWhatTheLoaderRefused(t *testing.T) {
 	if err := c.Create(ctx, &valid); err != nil {
 		t.Fatalf("a valid AgentProfile was refused: %v", err)
 	}
+	explicit := valid.DeepCopy()
+	explicit.ResourceVersion = ""
+	explicit.Name = "explicit-claude"
+	explicit.Spec.Bus.PublishTopics = []string{"agent.explicit-claude.findings"}
+	explicit.Spec.Harness.Type = agentv1alpha1.AgentProfileHarnessClaudeCode
+	if err := c.Create(ctx, explicit); err != nil {
+		t.Fatalf("an AgentProfile naming claude-code was refused: %v", err)
+	}
 
 	cases := map[string]func(*agentv1alpha1.AgentProfile){
 		"blank description":                  func(p *agentv1alpha1.AgentProfile) { p.Spec.Description = "   " },
@@ -80,6 +88,10 @@ func TestTheAgentProfileCRDRefusesWhatTheLoaderRefused(t *testing.T) {
 		"bad serviceAccountName":   func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "Not_A_Name" },
 		"another profile's SA":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "agentprofile-other" },
 		"oversize description":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Description = strings.Repeat("x", 4097) },
+		// Antigravity is not selectable until its worker isolation lands.
+		"harness type antigravity": func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.Type = "antigravity" },
+		"harness type typo":        func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.Type = "claude" },
+		"harness type case":        func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.Type = "Claude-Code" },
 	}
 	// The loader's resources check (cpu and memory, requests and limits) is
 	// required fields in the schema. A typed client cannot omit them (a zero

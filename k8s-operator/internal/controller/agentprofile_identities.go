@@ -254,6 +254,11 @@ func resolveOneAgentProfile(p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.
 		// profile admitted by an older or edited CRD drops out of the map
 		// instead of failing the whole render.
 		return agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name), reason: reasonAgentProfileInvalid}
+	case !agentProfileHarnessSupported(p.Spec.Harness.Type):
+		// The CRD's enum refuses these too. Refused here as well so that a
+		// type admitted by an older, newer or edited CRD renders no worker
+		// rather than one this operator would start as Claude Code.
+		return agentProfileResolution{refused: fmt.Errorf("spec.harness.type %q is not a harness this operator renders (supported: %s)", p.Spec.Harness.Type, agentv1alpha1.AgentProfileHarnessClaudeCode), reason: reasonAgentProfileHarnessNotSupported}
 	case malformedTopicGrant(p) != "":
 		return agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
 	case foreignPublishTopic(p) != "":
@@ -482,4 +487,10 @@ func isDispatcherBucketUser(name string) bool {
 	}
 	n, err := strconv.Atoi(rest)
 	return err == nil && n >= 0 && n < a2aDispatcherBuckets
+}
+
+// agentProfileHarnessSupported is whether the operator renders workers for
+// a profile's spec.harness.type: absent (Claude Code) or claude-code.
+func agentProfileHarnessSupported(t string) bool {
+	return t == "" || t == agentv1alpha1.AgentProfileHarnessClaudeCode
 }

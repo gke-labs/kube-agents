@@ -59,7 +59,8 @@ network, no credentials, no environment. Whatever the pod knows, such as
 the relay's address, the worker passes in as a `Target`. What a harness
 cannot express comes back as a warning, never an error.
 `render.For(harness)` picks the adapter by the harness value the worker is
-started with (`claude-code` or `antigravity`).
+started with (`claude-code` or `antigravity`): `A2A_HARNESS`, which the
+operator sets from the AgentProfile's `spec.harness.type`.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
