@@ -3145,8 +3145,11 @@ class VcsBroker:
         - `KUBEAGENTS_AUTOMERGE` is `practice` or `on` in this process;
         - the proposal is open and this credential's own;
         - its diff adds one file and changes nothing else, and that file is,
-          byte for byte, the PodDisruptionBudget the fleet audit generates
-          (`automerge_eligibility.parse_budget`);
+          byte for byte, what the `no-pdb` recipe's generator writes for the
+          inputs it names (`automerge_eligibility.verify_added_manifest`);
+        - the file is also, byte for byte, what the generator writes from the
+          workload's live selector, read here
+          (`automerge_eligibility.regenerates_from`);
         - the rules file on the proposal's target branch allows the `no-pdb`
           fix in the environment the cluster's own labels declare
           (`automation_rules`);
@@ -3254,15 +3257,15 @@ class VcsBroker:
             return "the proposal is not open"
         if not viewer or _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
             return "the proposal is not this credential's own"
-        added = automerge_eligibility.added_file_from_diff(diff)
-        budget = automerge_eligibility.parse_budget(added[1]) if added else None
-        if budget is None:
+        fix = automerge_eligibility.verify_added_manifest(automerge_eligibility.FIX_TYPE, diff, check_path=False)
+        if fix is None:
             return "the proposal does not add exactly one file that is the audit's generated PodDisruptionBudget"
-        if not automerge_eligibility.path_fits(added[0], budget):
-            return f"{added[0]} is not where the budget for {budget.cluster} goes"
-        target = _gke_cluster(budget.cluster)
-        if target is None or not _KUBERNETES_NAME.fullmatch(budget.namespace):
-            return f"the budget names no cluster or namespace this broker reads ({budget.cluster!r}, {budget.namespace!r})"
+        cluster, namespace = fix.candidate["cluster"], fix.candidate["namespace"]
+        if not automerge_eligibility.path_fits(fix.path, fix.name, cluster):
+            return f"{fix.path} is not where the budget for {cluster} goes"
+        target = _gke_cluster(cluster)
+        if target is None or not _KUBERNETES_NAME.fullmatch(namespace):
+            return f"the budget names no cluster or namespace this broker reads ({cluster!r}, {namespace!r})"
         if self._cluster_read is None:
             return "this broker has no cluster reader"
         recipe_checks = fix_recipes_registry.checks_module(automerge_eligibility.FIX_TYPE)
@@ -3285,7 +3288,7 @@ class VcsBroker:
         # Fixed words to the caller, who wrote the cluster's name: what the
         # read said would tell it which clusters exist. The log keeps it.
         if code != 0:
-            LOGGER.info("practice label: cluster labels not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            LOGGER.info("practice label: cluster labels not read cluster=%s exit=%s: %s", cluster, code, err[:400])
             return "the cluster's labels could not be read"
         try:
             labels = (json.loads(out or "{}") or {}).get("resourceLabels") or {}
@@ -3294,10 +3297,10 @@ class VcsBroker:
         environment = automation_rules.cluster_environment(labels)
         decision = automation_rules.decide(rules, automerge_eligibility.FIX_TYPE, environment)
         if not decision.allowed:
-            LOGGER.info("practice label: rules refuse cluster=%s: %s", budget.cluster, decision.reason)
+            LOGGER.info("practice label: rules refuse cluster=%s: %s", cluster, decision.reason)
             return f"{automation_rules.RULES_FILE} does not allow this fix in this cluster's environment"
         code, out, err = self._cluster_read(
-            ["kubectl", "get", recipe_checks.read_kinds, "-n", budget.namespace, "-o", "json"],
+            ["kubectl", "get", recipe_checks.read_kinds, "-n", namespace, "-o", "json"],
             f"gke_{project}_{location}_{name}",
         )
         try:
@@ -3305,9 +3308,26 @@ class VcsBroker:
         except json.JSONDecodeError:
             dump = None
         if not isinstance(dump, dict) or not isinstance(dump.get("items"), list):
-            LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", cluster, code, err[:400])
             return "the workload's namespace could not be read"
-        checks += recipe_checks.checks(budget, dump)
+        kind, _, workload_name = fix.candidate["object"].partition("/")
+        workload = next(
+            (
+                item for item in dump["items"]
+                if isinstance(item, dict) and item.get("kind") == kind
+                and (item.get("metadata") or {}).get("name") == workload_name
+                and (item.get("metadata") or {}).get("namespace") == namespace
+            ),
+            None,
+        )
+        # The file's selector is only what the file says. Regenerate from the
+        # workload's live selector, which this broker read itself: the file
+        # must be those bytes too. A missing workload is judged below.
+        if workload is not None and not automerge_eligibility.regenerates_from(
+            fix, {"pod_selector": (workload.get("spec") or {}).get("selector")}
+        ):
+            return "the added file is not, byte for byte, what the recipe generates from the workload's live selector"
+        checks += recipe_checks.checks(fix, dump)
         failed = [check["name"] for check in checks if not check["passed"]]
         return f"safety checks failed: {', '.join(failed)}" if failed else None
 

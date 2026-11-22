@@ -259,6 +259,9 @@ spec:
                 lastHandledRunNow:
                   description: LastHandledRunNow is the last run-now token acted on.
                   type: string
+                lastHandledStop:
+                  description: LastHandledStop is the last stop token acted on.
+                  type: string
                 lastOutcome:
                   description: LastOutcome is how the most recent run ended.
                   enum:
@@ -407,6 +410,12 @@ spec:
                     - rateLimited
                     - suspended
                   type: object
+                stoppedTaskID:
+                  description: |-
+                    StoppedTaskID is the run in flight a stop was sent for, until it
+                    settles: a run-now asked for meanwhile waits for it to end rather than
+                    adopting it.
+                  type: string
               type: object
           type: object
       served: true

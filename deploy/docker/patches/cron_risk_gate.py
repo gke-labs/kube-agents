@@ -11,8 +11,7 @@ Addresses Issue #993 (THREAT-002, SKILL-002):
 4. Per-job risk tiers: 'high' applies a fail-closed read-only command policy
    (allowlist of inspection verbs); 'low' retains the denylist-only floor.
 
-Gates 1-3 are unconditional on every cron run. ``approvals.cron_scan`` opts out
-of the Tirith content scan only (see cron_tirith_scan.py), never these.
+Gates 1-3 are unconditional on every cron run; no configuration key opts out of them.
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ logger = logging.getLogger(__name__)
 RISK_LOW = "low"
 RISK_HIGH = "high"
 
-CRON_SCAN_KEY = "cron_scan"
-APPROVALS_KEY = "approvals"
 
 #: Hex digits of the SHA-256 digest a refusal log line uses to identify the
 #: command in place of reproducing it; a refused command is user-authored
@@ -408,18 +405,6 @@ def _load_config_readonly() -> dict:
         return {}
 
 
-def cron_scan_enabled(config: Optional[dict]) -> bool:
-    """Whether ``approvals.cron_scan`` leaves the scan on. Default: yes.
-
-    Anything other than an explicit false-y value keeps the scan, matching the
-    opt-out contract in cron_tirith_scan.py.
-    """
-    approvals = (config or {}).get(APPROVALS_KEY)
-    if not isinstance(approvals, dict):
-        return True
-    return bool(approvals.get(CRON_SCAN_KEY, True))
-
-
 def _lex_segments(command: str) -> Optional[list[list[str]]]:
     """Tokenize a command into segments, honoring quotes and shell operators.
 
@@ -755,9 +740,9 @@ def cron_content_block(
 ) -> Optional[dict]:
     """Refuse escape/control-char injection and lookalike-domain evasion.
 
-    Unconditional on every cron run: ``approvals.cron_scan`` gates the Tirith
-    content scan only, not these THREAT-002 evasion classes. ``load_config`` is
-    accepted for backward-compatible call sites and ignored.
+    Unconditional on every cron run: no configuration key opts out of these
+    THREAT-002 evasion classes. ``load_config`` is accepted for
+    backward-compatible call sites and ignored.
     """
     if not command or not isinstance(command, str):
         return None
