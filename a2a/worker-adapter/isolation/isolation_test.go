@@ -415,3 +415,16 @@ func TestPrepareTurnFailsOnAReadOnlyWorkspaceWithAnEntry(t *testing.T) {
 		t.Fatal("PrepareTurn succeeded on a read-only workspace holding an entry")
 	}
 }
+
+// An unrecognised first line is quoted in the error; only output with no
+// line at all says it was empty.
+func TestForVersionQuotesAnUnrecognisedLine(t *testing.T) {
+	_, err := ForVersion("\nagy 1.5.13 (linux/amd64)\n")
+	if !errors.Is(err, ErrUnknownVersion) || !strings.Contains(err.Error(), `"agy 1.5.13 (linux/amd64)"`) || strings.Contains(err.Error(), "empty") {
+		t.Fatalf("err = %v; want the line quoted, not empty output", err)
+	}
+	_, err = ForVersion(" \n\t\n")
+	if !errors.Is(err, ErrUnknownVersion) || !strings.Contains(err.Error(), "empty version output") {
+		t.Fatalf("blank output: err = %v", err)
+	}
+}

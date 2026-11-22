@@ -83,6 +83,9 @@ var tables = map[string]Table{
 func ForVersion(versionOutput string) (Table, error) {
 	v := parseVersion(versionOutput)
 	if v == "" {
+		if line := firstLine(versionOutput); line != "" {
+			return Table{}, fmt.Errorf("%w: unrecognised version line %q", ErrUnknownVersion, line)
+		}
 		return Table{}, fmt.Errorf("%w: empty version output", ErrUnknownVersion)
 	}
 	t, ok := tables[v]
@@ -90,6 +93,16 @@ func ForVersion(versionOutput string) (Table, error) {
 		return Table{}, fmt.Errorf("%w: %q", ErrUnknownVersion, v)
 	}
 	return t, nil
+}
+
+// firstLine is the first non-empty line of out, trimmed.
+func firstLine(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if l := strings.TrimSpace(line); l != "" {
+			return l
+		}
+	}
+	return ""
 }
 
 // parseVersion reads the first non-empty line, which must be exactly
