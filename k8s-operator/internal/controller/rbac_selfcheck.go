@@ -336,6 +336,17 @@ type permissionTuple struct {
 type deniedPermission struct {
 	label     string
 	namespace string
+	// builtinScheduleWrite marks the built-in renderer's writes on
+	// agentschedules: the renderer reports their refusal itself
+	// (WritesForbidden), so DeniedFor leaves them out and an older Role
+	// doesn't degrade the agent.
+	builtinScheduleWrite bool
+}
+
+// isBuiltinScheduleWrite is a tuple the built-in schedule renderer writes with.
+func isBuiltinScheduleWrite(t permissionTuple) bool {
+	return t.group == "kubeagents.x-k8s.io" && t.resource == "agentschedules" && t.subresource == "" &&
+		slices.Contains(agentScheduleWriteVerbs, t.verb)
 }
 
 func flattenRequiredPermissions() []permissionTuple {
@@ -468,7 +479,8 @@ func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAcc
 			if p.namespace != namespace {
 				deniedNamespace = p.namespace
 			}
-			out = append(out, deniedPermission{label: p.label, namespace: deniedNamespace})
+			out = append(out, deniedPermission{label: p.label, namespace: deniedNamespace,
+				builtinScheduleWrite: isBuiltinScheduleWrite(p.tuple)})
 		}
 	}
 	return out, nil
@@ -641,6 +653,9 @@ func (c *RBACChecker) DeniedFor(namespaces ...string) []string {
 	defer c.mu.Unlock()
 	var out []string
 	for _, d := range c.denied {
+		if d.builtinScheduleWrite {
+			continue
+		}
 		if d.namespace == "" || slices.Contains(namespaces, d.namespace) {
 			out = append(out, d.label)
 		}
@@ -701,7 +716,7 @@ func AgentScheduleAccessDenied(c *RBACChecker) []string {
 	}
 	var out []string
 	for _, tuple := range flattenRequiredPermissions() {
-		if tuple.subresource == "" && slices.Contains(agentScheduleWriteVerbs, tuple.verb) {
+		if isBuiltinScheduleWrite(tuple) {
 			continue
 		}
 		if tuple.resource == "agentschedules" && slices.Contains(denied, tuple.label) {

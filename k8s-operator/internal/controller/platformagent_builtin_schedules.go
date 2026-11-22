@@ -161,6 +161,7 @@ const builtinAppliedSuspendAnnotation = "kubeagents.x-k8s.io/builtin-applied-sus
 // someone set directly.
 func desiredBuiltinSpec(agent *agentv1alpha1.PlatformAgent, row builtinSchedule, existing *agentv1alpha1.AgentSchedule) (agentv1alpha1.AgentScheduleSpec, *bool) {
 	spec := *row.Spec.DeepCopy()
+	defaultBuiltinSpec(&spec)
 	if row.Canary {
 		spec.Delivery.Mode = agentv1alpha1.AgentScheduleDeliveryLocal
 		if spec.Parameters == nil {
@@ -174,7 +175,7 @@ func desiredBuiltinSpec(agent *agentv1alpha1.PlatformAgent, row builtinSchedule,
 		spec.Suspend = true
 	case overridden:
 		spec.Suspend = o.Suspend
-	case existing != nil && existing.Annotations[builtinAppliedSuspendAnnotation] != strconv.FormatBool(existing.Spec.Suspend):
+	case existing != nil && directlySetSuspend(existing):
 		// Someone set it directly since the operator last did: it stands.
 		spec.Suspend = existing.Spec.Suspend
 		return spec, nil
@@ -183,6 +184,32 @@ func desiredBuiltinSpec(agent *agentv1alpha1.PlatformAgent, row builtinSchedule,
 	}
 	applied := spec.Suspend
 	return spec, &applied
+}
+
+// defaultBuiltinSpec fills in what the AgentSchedule CRD defaults, so a
+// schedule the API server has defaulted compares equal to its row and isn't
+// written again on every pass.
+func defaultBuiltinSpec(spec *agentv1alpha1.AgentScheduleSpec) {
+	if spec.ConcurrencyPolicy == "" {
+		spec.ConcurrencyPolicy = agentv1alpha1.AgentScheduleConcurrencyForbid
+	}
+	if spec.StartingDeadlineSeconds == nil {
+		d := int64(agentScheduleDefaultStartingDeadline / time.Second)
+		spec.StartingDeadlineSeconds = &d
+	}
+	if spec.Delivery.Mode == "" {
+		spec.Delivery.Mode = agentv1alpha1.AgentScheduleDeliveryChat
+	}
+}
+
+// directlySetSuspend is a built-in whose suspend someone set since the
+// operator last did: the annotation records what the operator applied, and
+// the schedule now says otherwise. A schedule without the annotation (one a
+// GitOps tool stripped, say) isn't one: it follows its row and gets the
+// annotation back.
+func directlySetSuspend(s *agentv1alpha1.AgentSchedule) bool {
+	applied, ok := s.Annotations[builtinAppliedSuspendAnnotation]
+	return ok && applied != strconv.FormatBool(s.Spec.Suspend)
 }
 
 // builtinOverrideProblems is what the condition reports about the overrides: entries naming no

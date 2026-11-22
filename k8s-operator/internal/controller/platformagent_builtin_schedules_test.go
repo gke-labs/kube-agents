@@ -486,3 +486,99 @@ func TestTheDryRunParameterIsANameTheGatewayAccepts(t *testing.T) {
 		t.Fatalf("%q isn't a task parameter name the gateway accepts", builtinDryRunParameter)
 	}
 }
+
+// An older Role without the renderer's writes doesn't degrade the agent: the
+// renderer reports the refusal as WritesForbidden, and the rest of the
+// reconcile runs. Other namespaced denials still degrade it.
+func TestScheduleWriteDenialsDoNotDegradeTheAgent(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "team-a"}}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	writes := NewRBACChecker((&fakeAuthorizer{deny: func(a *authorizationv1.ResourceAttributes) bool {
+		return a.Resource == "agentschedules" && a.Subresource == "" && slices.Contains(agentScheduleWriteVerbs, a.Verb)
+	}}).reviews(), builtinTestNS)
+	if _, err := writes.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: cl.Scheme(), RBAC: writes}
+	degraded, err := r.reportRBACSkew(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if degraded {
+		t.Fatalf("schedule write denials degraded the agent: %v", agent.Status.Conditions)
+	}
+	others := NewRBACChecker((&fakeAuthorizer{deny: func(a *authorizationv1.ResourceAttributes) bool {
+		return a.Resource == "configmaps" && a.Verb == "create"
+	}}).reviews(), builtinTestNS)
+	if _, err := others.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.RBAC = others
+	if degraded, err = r.reportRBACSkew(context.Background(), agent); err != nil || !degraded {
+		t.Fatalf("a configmaps create denial: degraded=%v err=%v, want degraded", degraded, err)
+	}
+}
+
+// Once the API server has applied the CRD's defaults, a schedule that matches
+// its row isn't written again: the comparison is against the defaulted row.
+func TestADefaultedBuiltinIsNotRewritten(t *testing.T) {
+	agent := builtinTestAgent()
+	row := builtinTestRow("compliance-audit", func(r *builtinSchedule) { r.Spec.Delivery = agentv1alpha1.AgentScheduleDelivery{} })
+	updates := 0
+	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if s, ok := obj.(*agentv1alpha1.AgentSchedule); ok {
+					// What the API server does with the CRD's defaults.
+					if s.Spec.ConcurrencyPolicy == "" {
+						s.Spec.ConcurrencyPolicy = agentv1alpha1.AgentScheduleConcurrencyForbid
+					}
+					if s.Spec.StartingDeadlineSeconds == nil {
+						d := int64(900)
+						s.Spec.StartingDeadlineSeconds = &d
+					}
+					if s.Spec.Delivery.Mode == "" {
+						s.Spec.Delivery.Mode = agentv1alpha1.AgentScheduleDeliveryChat
+					}
+				}
+				return cl.Create(ctx, obj, opts...)
+			},
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*agentv1alpha1.AgentSchedule); ok {
+					updates++
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: c.Scheme(),
+		BuiltinSchedules: func(*agentv1alpha1.PlatformAgent) []builtinSchedule { return []builtinSchedule{row} }}
+	for range 3 {
+		if _, _, err := r.reconcileBuiltinSchedules(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if updates != 0 {
+		t.Fatalf("a defaulted schedule matching its row was rewritten %d times", updates)
+	}
+}
+
+// A built-in missing the applied-suspend annotation (stripped by a GitOps
+// tool, say) follows its row and gets the annotation back; it isn't read as
+// a suspend someone set directly.
+func TestABuiltinWithoutTheAppliedAnnotationFollowsItsRow(t *testing.T) {
+	agent := builtinTestAgent()
+	g := newBuiltinRig(t, agent, []builtinSchedule{builtinTestRow("compliance-audit", nil)})
+	g.pass(t)
+	s, _ := g.get(t, "compliance-audit")
+	delete(s.Annotations, builtinAppliedSuspendAnnotation)
+	s.Spec.Suspend = true
+	if err := g.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	g.pass(t)
+	s, _ = g.get(t, "compliance-audit")
+	if s.Spec.Suspend || s.Annotations[builtinAppliedSuspendAnnotation] != "false" {
+		t.Fatalf("suspend=%v annotations=%v; want the row's suspend and the annotation back", s.Spec.Suspend, s.Annotations)
+	}
+}
