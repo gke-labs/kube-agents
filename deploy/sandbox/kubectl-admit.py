@@ -34,6 +34,15 @@ The admission is advisory: a session can run `/usr/local/libexec/kubectl` direct
 the memory guard (`shell-memory-guard`) is the boundary that holds either way. Any error
 in this admission runs the command unchanged. A lock it cannot take within
 `LOCK_WAIT_SECONDS` is not an error: the command is refused with exit 75.
+
+A session pod (a2a/Dockerfile.worker) runs this same admission with three settings from its
+environment: `KUBECTL_ADMIT_RUN_DIR` for the state, `KUBECTL_ADMIT_GUARD_PATH` for the guard
+(loaded as a library; no guard runs there), and `KUBECTL_ADMIT_ON_BUSY=run`. With `run`, every
+command the sandbox refuses with exit 75 (slots full, queue full, lock busy, charge not fitting
+by the deadline, no process to spawn) runs instead, unslotted, as kubectl ran there before the
+admission, and the event log records it as `ran-busy`. Only exit 3 is still a refusal. The tier
+is the tier file's when there is one, else `KUBEAGENTS_KUBECTL_COST_TIER` if it is a plain
+lowercase name, else `default`. Unset, each is the sandbox's.
 """
 
 from __future__ import annotations
@@ -50,10 +59,49 @@ import time
 # passes through needs neither: load_slow_path() binds them once the command is slotted.
 json = subprocess = None
 
+# The sandbox's layout is the default. A session pod (a2a/Dockerfile.worker) runs the same
+# admission with these overridden: its guard is named explicitly, its state lives in a
+# directory the session user owns, and its tier comes from the environment, since nothing
+# writes a root-owned tier file there. The admission is advisory either way (the docstring).
+RUN_DIR_ENV = "KUBECTL_ADMIT_RUN_DIR"
+GUARD_PATH_ENV = "KUBECTL_ADMIT_GUARD_PATH"
+ON_BUSY_ENV = "KUBECTL_ADMIT_ON_BUSY"
+TIER_ENV = "KUBEAGENTS_KUBECTL_COST_TIER"
+DEFAULT_RUN_DIR = "/run/kube-agents-sandbox"
+DEFAULT_GUARD_PATH = "/usr/local/libexec/shell-memory-guard"
+# What a command still waiting at ADMIT_WAIT_SECONDS does: `refuse` (exit 75) in the sandbox;
+# `run` on a session pod, where kubectl ran unadmitted before, so the admission adds no
+# refusal there but the one for a read larger than one read may ever take.
+ON_BUSY_REFUSE = "refuse"
+ON_BUSY_RUN = "run"
+TIER_MAX_CHARS = 32
+TIER_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+
+
+def env_path(environ, name: str, default: str) -> str:
+    """An absolute path from the environment, else the default."""
+    value = environ.get(name, "")
+    return value if value.startswith("/") else default
+
+
+def env_on_busy(environ) -> str:
+    return ON_BUSY_RUN if environ.get(ON_BUSY_ENV, "").strip().lower() == ON_BUSY_RUN else ON_BUSY_REFUSE
+
+
+def plain_tier(value: str | None) -> str | None:
+    """A tier name as deploy/sandbox/entrypoint.sh accepts it (a lowercase letter, then
+    lowercase letters, digits and hyphens; the operator caps it at 32), else None."""
+    value = (value or "").strip()
+    if not value or len(value) > TIER_MAX_CHARS or not value[0].isalpha() or not set(value) <= TIER_CHARS:
+        return None
+    return value
+
+
 KUBECTL_NEXT = "/usr/local/libexec/kubectl"
-GUARD_PATH = "/usr/local/libexec/shell-memory-guard"
+GUARD_PATH = env_path(os.environ, GUARD_PATH_ENV, DEFAULT_GUARD_PATH)
 COST_TABLE = "/usr/local/share/kube-agents/kubectl-costs.json"
-RUN_DIR = "/run/kube-agents-sandbox"
+RUN_DIR = env_path(os.environ, RUN_DIR_ENV, DEFAULT_RUN_DIR)
+ON_BUSY = env_on_busy(os.environ)
 TIER_FILE = f"{RUN_DIR}/kubectl-cost-tier"
 LIMIT_FILE = f"{RUN_DIR}/memory-limit-bytes"
 STATE_DIR = f"{RUN_DIR}/kubectl-admission"
@@ -307,7 +355,7 @@ def collection(kinds: list[str]) -> str:
     return f"{API_GROUP_PATHS.get(name, CORE_API_PATH)}/{name}"
 
 
-def load_guard(path: str = GUARD_PATH):
+def load_guard(path: str):
     """The memory guard's module, for its memory figure and watermark: one formula for both."""
     loader = importlib.machinery.SourceFileLoader("shell_memory_guard", path)
     spec = importlib.util.spec_from_loader("shell_memory_guard", loader)
@@ -522,17 +570,22 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
     # process in memory.
     running, waiting = count_alive(SLOT_DIR), count_alive(WAIT_DIR)
     if running >= slots_max and waiting >= slots_max:
+        if ON_BUSY == ON_BUSY_RUN:
+            run_busy(argv, "flood", tier, key, slots=running, waiting=waiting)
         return refuse_flood(running, waiting, tier, key)
     deadline = time.monotonic() + ADMIT_WAIT_SECONDS
     mine = str(os.getpid())
     my_wait = os.path.join(WAIT_DIR, mine)
-    slots, free, reservations, queued = [], 0, [], False
+    slots, free, reservations, queued, busy = [], 0, [], False, None
     try:
         while True:
             with open(LEDGER_LOCK, "a", encoding="utf-8") as lock:
                 # A command that cannot take the lock is refused, never run unslotted: unslotted
                 # commands after a lock timeout are how a starved burst outgrew the shell.
                 if not take_lock(lock):
+                    if ON_BUSY == ON_BUSY_RUN:
+                        busy = "lock"
+                        break
                     sys.stderr.write("capacity: the shell is too busy to admit this kubectl command now; the "
                                      f"install cannot take it now. {SLOT_ALTERNATIVES}\n")
                     log({"event": "refused-lock", "tier": tier, "key": key})
@@ -554,21 +607,33 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
                 if not queued:
                     waiting = len(live_reservations(WAIT_DIR))
                     if waiting >= slots_max:
+                        if ON_BUSY == ON_BUSY_RUN:
+                            busy = "flood"
+                            break
                         return refuse_flood(len(slots), waiting, tier, key)
                     write_shared(my_wait, {"pid": os.getpid()})
                     queued = True
             if time.monotonic() >= deadline:
+                if ON_BUSY == ON_BUSY_RUN:
+                    busy = "slots" if len(slots) >= slots_max or not charged else "memory"
+                    break
                 return refuse_full(cmd, slots, slots_max, charged, need, free, reservations, tier, key)
             time.sleep(ADMIT_POLL_SECONDS)
     finally:
         if queued:
             unlink_quietly(my_wait)
+    if busy:
+        run_busy(argv, busy, tier, key, slots=len(slots), need=need, free=free)
     if not charged:
         pass_through(argv)  # the same pid, so the slot lasts exactly as long as kubectl
     log({"event": "admitted", "tier": tier, "key": key, "need": book, "free": free})
     try:
         return run(argv, reservation, cmd)
     except OSError:
+        if ON_BUSY == ON_BUSY_RUN:
+            for path in (os.path.join(SLOT_DIR, mine), os.path.join(LEDGER_DIR, mine)):
+                unlink_quietly(path)
+            run_busy(argv, "spawn", tier, key)
         # No process to start kubectl in: refuse, rather than let the fail-open path run it unslotted.
         sys.stderr.write(f"capacity: the shell could not start this read; the install cannot take it now. "
                          f"{SLOT_ALTERNATIVES}\n")
@@ -577,6 +642,14 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
     finally:
         for path in (os.path.join(SLOT_DIR, mine), os.path.join(LEDGER_DIR, mine)):
             unlink_quietly(path)
+
+
+def run_busy(argv: list[str], reason: str, tier: str, key, **detail) -> None:
+    """Under ON_BUSY=run, what a command the sandbox would refuse as busy does instead: it runs
+    unslotted and unbooked, in this process, as kubectl ran before the admission. The event log
+    records it; the session sees nothing."""
+    log({"event": "ran-busy", "reason": reason, "tier": tier, "key": key, **detail})
+    pass_through(argv)
 
 
 def refuse_full(cmd, slots, slots_max, charged, need, free, reservations, tier, key) -> int:
@@ -593,6 +666,14 @@ def refuse_full(cmd, slots, slots_max, charged, need, free, reservations, tier, 
     return REFUSED_BUSY
 
 
+def make_state_dirs() -> None:
+    """The state directories, under a run directory the environment names. The sandbox's
+    entrypoint makes its own as root; a session pod's run directory belongs to its one user,
+    so the first command that needs them makes them."""
+    for path in (LEDGER_DIR, SLOT_DIR, WAIT_DIR):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+
+
 def load_slow_path() -> None:
     global json, subprocess
     import json
@@ -607,10 +688,12 @@ def main(argv: list[str]) -> int:
             pass_through(argv)
         load_slow_path()
         global GUARD
-        guard = GUARD = load_guard()
+        guard = GUARD = load_guard(GUARD_PATH)
         with open(COST_TABLE, encoding="utf-8") as f:
             table = json.load(f)
-        tier = read(TIER_FILE) or DEFAULT_TIER
+        tier = read(TIER_FILE) or plain_tier(os.environ.get(TIER_ENV)) or DEFAULT_TIER
+        if RUN_DIR != DEFAULT_RUN_DIR:
+            make_state_dirs()
         text = read(LIMIT_FILE) or ""
         limit = int(text) if text.isdecimal() and int(text) > 0 else guard.memory_limit({})
         return admit(argv, guard, table, tier, limit)

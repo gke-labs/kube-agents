@@ -611,6 +611,12 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			if s.cfg.KubeProxyHostContext != "" {
 				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
 			}
+			// The kubectl admission's tier (a2a/Dockerfile.worker runs the
+			// admission only when KUBE_PROXY_URL is set). Checked again here
+			// for a Config built without FromEnv.
+			if tier := kubectlCostTier(s.cfg.KubectlCostTier); tier != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
+			}
 		}
 		if s.cfg.KubeProxyCAConfigMap != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})
