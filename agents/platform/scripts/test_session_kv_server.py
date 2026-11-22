@@ -1917,6 +1917,21 @@ class TestActivePlatformFallback(unittest.TestCase):
     def test_an_install_with_neither_falls_back_to_google_chat(self):
         self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
 
+    def test_teams_is_a_platform_only_through_the_gateway_route(self):
+        # The gateway's Teams backend is a destination through its chat.notify
+        # route (A2A_NOTIFY_PLATFORM names it when the CR sets a home); the
+        # Hermes teams platform never was one here, and stays that way.
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "teams"
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "teams"
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["teams"])
+        self.assertEqual(session_kv_server.get_active_platform(), "teams")
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,teams"
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["google_chat", "teams"])
+        os.environ.pop(chat_notify.NOTIFY_PLATFORM_ENV)
+        os.environ.pop(chat_notify.NOTIFY_CONVERSATIONS_ENV)
+        os.environ["TEAMS_HOME_CHANNEL"] = "19:abc@thread.tacv2"
+        self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
+
     def test_an_absent_config_falls_back_rather_than_raising(self):
         # setUp writes an unparseable file; a missing one takes a different
         # branch of the same `except` and must not escape to the caller.
@@ -5474,6 +5489,10 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
         self.assertIn("not delivered to google_chat (no home channel: set", msg)
         self.assertIn("not delivered to slack (no home channel: set", msg)
         self.assertIn("; ", msg)
+        with patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "teams",
+                                     chat_notify.NOTIFY_PLATFORM_ENV: ""}, clear=False):
+            msg = session_kv_server._no_chat_route_error()
+        self.assertIn("not delivered to teams (no home channel: set spec.integration.teams.homeChannel)", msg)
 
     def test_the_relay_posts_one_leg_per_routed_platform(self):
         # both platforms routed, no earlier delivery: relay_cron_report sends one leg to google_chat and one to slack,

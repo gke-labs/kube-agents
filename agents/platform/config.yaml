@@ -81,6 +81,13 @@ mcp_servers:
       # container (platformagent_manifests.go), so only the allowlist was
       # missing. test_mcp_env_contract.py is what catches this class of gap.
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
+      # The Teams half, declared for the same contract: send_notification
+      # derives TEAMS_HOME_CHANNEL from the platform table. On the Planning
+      # Agent path the operator puts the value on the container; with the A2A
+      # gateway's Teams backend armed it does not, send_notification reads
+      # empty, and the bare `teams` target rides the gateway's own home
+      # through `a2a notify`, which is the intended route there.
+      TEAMS_HOME_CHANNEL: "${TEAMS_HOME_CHANNEL}"
       # Under next send_notification posts through the A2A gateway with
       # `a2a notify` (chat_notify.py) instead of `hermes send`: the platform it
       # routes, and the bus address and identity the CLI connects with, and

@@ -201,7 +201,9 @@ NON_JSON_RESPONSE_TEXT = "non-JSON response"
 # refusal. A broker answer is a few levels deep. Python 3.14 parses a body of
 # 100,000 levels, and `json.dumps` and `repr` then raise RecursionError on the
 # result, in whatever caller uses it. The bound is under the limit of each of
-# them, and it is the bound of the version-control skill's print step.
+# them, and it is the bound of the version-control skill's print step. The
+# shim holds a `/v1/exec` refusal and a relayed API refusal to the same bound
+# (`_refusal_payload`, `ApiSession._json_body`), with the same trim.
 MAX_VCS_BODY_DEPTH = 500
 # The message of the error for a 2xx body over that bound. It names no value:
 # `vcs_client` gives the caller a text of its own.
@@ -1442,7 +1444,9 @@ def _merge_context_into_kubeconfig_file(
                 return
             content = path.read_bytes()
             doc = yaml.safe_load(content.decode("utf-8", errors="replace"))
-        except (OSError, yaml.YAMLError, RecursionError):
+        except (OSError, yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError):
+            # The plain exceptions are PyYAML's for a scalar that it cannot
+            # build (`read_current_context` lists them). The file stays as it is.
             return
         if not isinstance(doc, dict):
             return
@@ -1881,6 +1885,10 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
     connection closed while the body was read. The error is closed here, on
     every way out: nothing reads the response again, and the status and the
     headers stay on it.
+
+    A top-level value that puts the refusal over MAX_VCS_BODY_DEPTH gets a text
+    in its place (`_refusal_without_deep_parts`). The parser takes a deeper body
+    than `str` and `print` do, and each reader of a refusal prints its values.
     """
     exc.shim_dropped = False
     exc.shim_payload = None
@@ -1895,7 +1903,7 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
         return None
     finally:
         exc.close()
-    exc.shim_payload = payload if isinstance(payload, dict) else None
+    exc.shim_payload = _refusal_without_deep_parts(payload, exc.code) if isinstance(payload, dict) else None
     return exc.shim_payload
 
 
@@ -1954,9 +1962,11 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
         print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
         # The verb the policy resolved and whether this was a local render:
         # the agent runtime's refusal stop reads these two lines.
-        if payload.get("verb"):
+        if isinstance(payload.get("verb"), list) and payload["verb"]:
             # Each word is an argv token the agent chose; keep it to one line
-            # and to the characters a verb or resource name is made of.
+            # and to the characters a verb or resource name is made of. A
+            # `verb` that is not a list has no words (a text would give its
+            # letters, one for each word).
             words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
             print(f"policy verb: {' '.join(words)}", file=sys.stderr)
         if payload.get("local_render"):
@@ -2741,10 +2751,15 @@ class ApiSession:
     @staticmethod
     def _json_body(response):
         try:
-            return response.json()
+            body = response.json()
         except (ValueError, AttributeError, RecursionError):
             # RecursionError: a body nested deeper than the parser goes.
             return None
+        if isinstance(body, dict):
+            # The retry line prints the refusal's text: as for a `/v1/exec`
+            # refusal, a value that is too deep gets a text in its place.
+            return _refusal_without_deep_parts(body, getattr(response, "status_code", None))
+        return body
 
     def _refused_admission(self, response) -> bool:
         status = getattr(response, "status_code", None)
