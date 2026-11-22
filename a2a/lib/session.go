@@ -78,6 +78,12 @@ const (
 	// worker and only when EnvHarness is unset. It once picked the persona
 	// adapter alone.
 	EnvProfileHarness = "PROFILE_HARNESS"
+	// EnvHarnessUnisolated must be HarnessUnisolatedAllow for a worker to
+	// select persona.Antigravity, which runs without its per-task HOME
+	// locking and workspace scrub until #6710 lands; #6710 removes it. The
+	// operator renders it empty on profile workers.
+	EnvHarnessUnisolated   = "A2A_HARNESS_UNISOLATED"
+	HarnessUnisolatedAllow = "allow"
 	// EnvPrimerFile names the file the spawner mounts the conversation's
 	// transcript primer at (the pod's rehydration-primer annotation, through
 	// the downward API). A pod spawned cold for a conversation that already

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"time"
 
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
@@ -22,6 +23,11 @@ type harnessSpec struct {
 	delegate            *delegateServer
 	prompts             []string
 	extra               []string
+	// turnBudget is the task deadline less the kill grace: how long the
+	// harness may run before the adapter stops it. A harness with its own
+	// wall-clock bound sets it below this, so the harness ends the turn
+	// with a result rather than the adapter killing it (agyBuilder).
+	turnBudget time.Duration
 }
 
 // delegateServer is the delegate tool's MCP server: this binary run as

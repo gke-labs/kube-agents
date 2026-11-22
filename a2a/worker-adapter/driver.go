@@ -165,7 +165,7 @@ func DriverFor(h persona.Harness) (Driver, error) {
 	case "", persona.ClaudeCode:
 		return claudeDriver{}, nil
 	case persona.Antigravity:
-		return nil, fmt.Errorf("harness %q has no worker driver yet", h)
+		return agyDriver{}, nil
 	}
 	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.ClaudeCode, persona.Antigravity)
 }
