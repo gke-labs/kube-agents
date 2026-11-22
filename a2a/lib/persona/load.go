@@ -59,8 +59,15 @@ var (
 
 // Load reads and validates the persona directory dir. A validation failure
 // is an *InvalidError listing every problem found; any other error is I/O.
+// A persona that ships an IntegrityManifestFile has its content checked
+// against it; one that doesn't loads as IntegrityUnverified.
 func Load(dir string) (*Persona, error) {
-	l := &loader{dir: dir}
+	return LoadWithOptions(dir, Options{})
+}
+
+// LoadWithOptions is Load with what Options change.
+func LoadWithOptions(dir string, opts Options) (*Persona, error) {
+	l := &loader{dir: dir, opts: opts}
 	p := l.load()
 	if l.err != nil {
 		return nil, l.err
@@ -73,6 +80,7 @@ func Load(dir string) (*Persona, error) {
 
 type loader struct {
 	dir      string
+	opts     Options
 	imports  []pendingImport
 	problems []Problem
 	err      error
@@ -89,7 +97,7 @@ func (l *loader) load() *Persona {
 		l.err = err
 		return nil
 	}
-	known := map[string]bool{ManifestFile: true, InstructionsFile: true, SkillsDir: true, MCPFile: true, ReadmeFile: true}
+	known := map[string]bool{ManifestFile: true, InstructionsFile: true, SkillsDir: true, MCPFile: true, ReadmeFile: true, IntegrityManifestFile: true}
 	for _, e := range entries {
 		// README.md is never read, so its symlink check is here; the files
 		// that are read get theirs at the open.
@@ -97,11 +105,17 @@ func (l *loader) load() *Persona {
 			l.add(e.Name(), "", "is not a regular file (symlinks and devices are refused)")
 		}
 		if !known[e.Name()] {
-			l.add(e.Name(), "", "not part of the persona format (%s, %s, %s/, %s or %s)",
-				ManifestFile, InstructionsFile, SkillsDir, MCPFile, ReadmeFile)
+			l.add(e.Name(), "", "not part of the persona format (%s, %s, %s/, %s, %s or %s)",
+				ManifestFile, InstructionsFile, SkillsDir, MCPFile, ReadmeFile, IntegrityManifestFile)
 		}
 	}
 	p := &Persona{}
+	// Content first: a persona whose files aren't the ones its build
+	// recorded reports that, beside whatever else is wrong with it.
+	p.Integrity, p.IntegrityFiles = l.checkIntegrity(l.opts.RequireIntegrity)
+	if l.err != nil {
+		return nil
+	}
 	if data, ok := l.read(ManifestFile, true); ok {
 		// A tier gets its own problem rather than the strict decoder's
 		// "unknown field": a tier is authority, which the AgentProfile

@@ -11,13 +11,14 @@ This is the persona format. The bus persona content (the session agent's
 persona and the `a2a-topics` skill) is a different thing and lives in
 [`a2a/persona`](../../persona/README.md).
 
-| Path              | What it holds                                                                                                                                                                                           |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `persona.yaml`    | The manifest: `apiVersion: persona.kube-agents.x-k8s.io/v1alpha1`, `name`, `description` (at most 1024 bytes), `model` (a hint), `tools`, `parameters`, `requires.commands` (a hint), `harness` (hints) |
-| `instructions.md` | The instructions, AGENTS.md-compatible                                                                                                                                                                  |
-| `skills/<name>/`  | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 bytes), optionally `license` and `metadata`, plus the skill's files                                           |
-| `mcp.yaml`        | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                                            |
-| `README.md`       | Optional, never rendered                                                                                                                                                                                |
+| Path                     | What it holds                                                                                                                                                                                           |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `persona.yaml`           | The manifest: `apiVersion: persona.kube-agents.x-k8s.io/v1alpha1`, `name`, `description` (at most 1024 bytes), `model` (a hint), `tools`, `parameters`, `requires.commands` (a hint), `harness` (hints) |
+| `instructions.md`        | The instructions, AGENTS.md-compatible                                                                                                                                                                  |
+| `skills/<name>/`         | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 bytes), optionally `license` and `metadata`, plus the skill's files                                           |
+| `mcp.yaml`               | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                                            |
+| `README.md`              | Optional, never rendered                                                                                                                                                                                |
+| `skills_manifest.sha256` | Optional. The build-time content manifest: one `sha256sum` line per file in the persona but itself (see below)                                                                                          |
 
 `tools` is the allowlist. An entry is a built-in (`read_file`,
 `web_search`, `shell`), an MCP server from `mcp.yaml` (`gke`), or one of
@@ -51,6 +52,27 @@ a server reached around the broker would be outside both.
   harness's config directory beside files the persona does not own;
 - unknown and repeated keys in `persona.yaml` and `mcp.yaml`;
 - a file over 1 MiB, or a persona over 16 MiB in total.
+
+## Content manifest
+
+A persona may carry `skills_manifest.sha256` at its root: the output of
+`find . -type f ! -name skills_manifest.sha256 -exec sha256sum {} +` run
+in the persona directory at build time, sorted. When it is present, `Load`
+compares every file in the persona with it and refuses the persona on any
+difference: a changed file, a file the manifest lists that is missing, a
+file it doesn't list, or a symlink or other non-regular file anywhere. A
+file of that name below the root is an ordinary file and must be listed.
+A persona without one loads, and `Persona.Integrity` says it was not
+checked; `Options.RequireIntegrity` refuses it instead. A profile worker
+sets that from `A2A_PERSONA_INTEGRITY=required`, and logs whether its
+persona loaded verified or unverified.
+
+The check shows that the persona's files are the ones its build recorded:
+it catches a bad build, a corrupted layer or a staging copy that went
+wrong. The manifest ships inside the image it describes, so it does not
+detect a replaced or deliberately altered image, and it is not a security
+boundary. The platform agent image checks its own skill trees the same way
+(`agents/platform/scripts/verify_skills_provenance.py`).
 
 ## Adapters
 

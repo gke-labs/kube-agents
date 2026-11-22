@@ -65,6 +65,10 @@ type Persona struct {
 	Skills []Skill
 	// MCP is empty when the persona has no mcp.yaml.
 	MCP MCP
+	// Integrity says whether the persona's files were checked against its
+	// IntegrityManifestFile, and IntegrityFiles how many were checked.
+	Integrity      Integrity
+	IntegrityFiles int
 }
 
 // Manifest is persona.yaml.
