@@ -665,7 +665,20 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	if err != nil {
 		return "", nil, nil, err
 	}
-	// DriverFor answers only for the harnesses below; Claude Code is the one
-	// with a driver today.
-	return driver.Harness(), driver, claudeBuilder{}, nil
+	builder, err := builderFor(driver.Harness())
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return driver.Harness(), driver, builder, nil
+}
+
+// builderFor is the argv and env builder for a harness that has a driver. A
+// harness with a driver but no builder is an error, never Claude Code's
+// argv and env under another harness's driver.
+func builderFor(h persona.Harness) (harnessBuilder, error) {
+	switch h {
+	case persona.ClaudeCode:
+		return claudeBuilder{}, nil
+	}
+	return nil, fmt.Errorf("harness %q has no argv builder", h)
 }
