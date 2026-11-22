@@ -701,6 +701,232 @@ func TestAPublishedRunsRetryNeedsNoDirectory(t *testing.T) {
 	}
 }
 
+// stop asks the gateway to stop taskID of s's schedule, on the source's own
+// reply namespace, as the operator will. The stop subscription runs on its
+// own loop, so the first ask waits for it.
+func (tr *triggerRig) stop(t *testing.T, s lib.TriggerSubmit, taskID string) lib.TriggerStopReply {
+	t.Helper()
+	data, err := json.Marshal(lib.TriggerStop{Schedule: s.Schedule, TaskID: taskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out lib.TriggerStopReply
+	waitFor(t, "the stop's answer", func() bool {
+		reply := lib.TriggerReplySubject("schedule", nats.NewInbox()[len("_INBOX."):])
+		sub, err := tr.nc.SubscribeSync(reply)
+		if err != nil {
+			return false
+		}
+		defer func() { _ = sub.Unsubscribe() }()
+		if err := tr.nc.PublishRequest(lib.TriggerStopSubject("schedule"), reply, data); err != nil {
+			return false
+		}
+		msg, err := sub.NextMsg(time.Second)
+		if err != nil {
+			return false
+		}
+		return json.Unmarshal(msg.Data, &out) == nil
+	})
+	return out
+}
+
+// A schedule's stop ends its own run and no other (#6052): the gateway writes
+// the run's cancel on its .in subject, under the run's own trigger authority,
+// and its dispatcher stop record, so a run still starting has its Job removed.
+// A second stop writes nothing again. A task the schedule's record doesn't
+// hold, or another schedule's run, is an unknown run, and nothing is written.
+func TestATriggerStopEndsItsOwnRunOnly(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	var mu sync.Mutex
+	var cancels, stops []*nats.Msg
+	if _, err := tr.nc.Subscribe("a2a.tasks.fleet-audit.*.in", func(m *nats.Msg) {
+		mu.Lock()
+		cancels = append(cancels, m)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.nc.Subscribe(lib.DispatchStopPrefix+">", func(m *nats.Msg) {
+		mu.Lock()
+		stops = append(stops, m)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	count := func() (int, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(cancels), len(stops)
+	}
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+
+	// Another schedule with a run of its own still can't stop this one.
+	other := s
+	other.Schedule.Name = "stockout-prevention"
+	other.Trigger = lib.TriggerClaim{Name: "schedule/stockout-prevention", Origin: lib.TriggerOriginBuiltin, Stream: "stockout-prevention"}
+	other.IdempotencyKey = "schedule/kubeagents-system/stockout-prevention/1763100000"
+	other.Delivery.JobKey = "stockout-prevention"
+	if r := tr.submit(t, "schedule", other); r.Refused != nil {
+		t.Fatalf("the other schedule's run was refused: %+v", r.Refused)
+	}
+	waitFor(t, "both submissions", func() bool { return len(tr.submissions()) == 2 })
+	if got := tr.stop(t, other, reply.TaskID); got.Result != lib.TriggerStopUnknownRun {
+		t.Fatalf("another schedule's stop of this run = %+v, want unknown_run", got)
+	}
+	if got := tr.stop(t, s, "task-not-this-schedules"); got.Result != lib.TriggerStopUnknownRun {
+		t.Fatalf("a task the record doesn't hold = %+v, want unknown_run", got)
+	}
+	if c, st := count(); c != 0 || st != 0 {
+		t.Fatalf("an unknown run's stop wrote %d cancels and %d stop records", c, st)
+	}
+
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopStopped {
+		t.Fatalf("the schedule's own stop = %+v, want stopped", got)
+	}
+	waitFor(t, "the cancel and the stop record", func() bool { c, st := count(); return c == 1 && st == 1 })
+	mu.Lock()
+	cancel, stopRec := cancels[0], stops[0]
+	mu.Unlock()
+	if want := lib.TaskInSubject("fleet-audit", reply.TaskID); cancel.Subject != want {
+		t.Errorf("cancel on %s, want %s", cancel.Subject, want)
+	}
+	if want := lib.DispatchStopSubject("fleet-audit", reply.TaskID); stopRec.Subject != want {
+		t.Errorf("stop record on %s, want %s", stopRec.Subject, want)
+	}
+	var env lib.Envelope
+	if err := json.Unmarshal(cancel.Data, &env); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := capability.TriggerFromAuthority(env.Authority)
+	if err != nil || claimed == nil || claimed.Name != s.Trigger.Name {
+		t.Errorf("the cancel's authority trigger = %+v, %v; want the run's", claimed, err)
+	}
+	// The run's own authority: the trigger as requester, its conversation as
+	// the audience, and the run's grant.
+	auth := string(env.Authority)
+	for _, want := range []string{triggerRequesterBackend, triggerConversationKey("schedule", s.Schedule), s.Trigger.Name} {
+		if !strings.Contains(auth, want) {
+			t.Errorf("the cancel's authority lacks %q: %s", want, auth)
+		}
+	}
+	if ref, present, err := capability.RefFromAuthority(env.Authority); err != nil || !present || ref.Key == "" {
+		t.Errorf("the cancel's authority carries no grant: %+v, %v, %v", ref, present, err)
+	}
+
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopStopped {
+		t.Fatalf("a second stop = %+v, want stopped", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if c, st := count(); c != 1 || st != 1 {
+		t.Fatalf("a second stop wrote again: %d cancels, %d stop records", c, st)
+	}
+}
+
+// A stop for a run that has already ended writes nothing and says so.
+func TestATriggerStopOfAnEndedRunWritesNothing(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, tr.execFor(t, &origin, "fleet-audit"), "No findings.")
+	waitFor(t, "the terminal", func() bool { return tr.status(t, s, reply.TaskID).Terminal })
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopAlreadyFinal {
+		t.Fatalf("an ended run's stop = %+v, want already_final", got)
+	}
+}
+
+// A stop whose reply names anything but the source's own reply namespace is
+// dropped, as a submission's is.
+func TestATriggerStopWithAReplyOutsideItsNamespaceIsNotAnswered(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	_ = tr.stop(t, s, "t") // the stop subscription is up
+	data, err := json.Marshal(lib.TriggerStop{Schedule: s.Schedule, TaskID: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.nc.Request(lib.TriggerStopSubject("schedule"), data, 500*time.Millisecond); err == nil {
+		t.Fatal("a stop with an inbox reply was answered")
+	}
+}
+
+// The stop subscription's refusal restarts the stop loop alone, and the
+// ingress's own refusals don't count the stop's: a bus that hasn't loaded the
+// newer stop grant leaves submissions and status queries running.
+func TestTheStopSubscriptionsRefusalIsItsOwn(t *testing.T) {
+	stop := `nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.stop"`
+	submit := `nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.submit"`
+	if isTriggerSubscriptionRefusal(errors.New(stop)) {
+		t.Error("the stop's refusal restarts the ingress")
+	}
+	if !isTriggerStopSubscriptionRefusal(errors.New(stop)) {
+		t.Error("the stop's refusal doesn't restart the stop loop")
+	}
+	if isTriggerStopSubscriptionRefusal(errors.New(submit)) || isTriggerStopSubscriptionRefusal(nil) {
+		t.Error("another refusal restarts the stop loop")
+	}
+}
+
+// A stop whose stop record can't be published is refused unavailable and
+// marks nothing, so the operator asks again and the retry sends the record:
+// the record is what removes a run still starting, and a stop answered
+// stopped without it could never be sent again.
+func TestATriggerStopWhoseRecordFailsIsRefusedAndSentOnRetry(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	ctx := context.Background()
+	js, err := jetstream.New(tr.nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.DeleteStream(ctx, lib.DispatchStopStream); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.stop(t, s, reply.TaskID); got.Refused == nil || got.Refused.Reason != lib.TriggerRefusedUnavailable {
+		t.Fatalf("a stop with no stop record = %+v, want unavailable", got)
+	}
+	rec, err := tr.g.reg.Get(ctx, "trigger:schedule/kubeagents-system/compliance-audit")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if ref, _ := rec.TaskRefFor(reply.TaskID); ref.Canceled {
+		t.Fatal("the task was marked canceled though its stop record never went out")
+	}
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name: lib.DispatchStopStream, Subjects: []string{lib.DispatchStopPrefix + ">"},
+		Retention: jetstream.LimitsPolicy, MaxMsgsPerSubject: 1, AllowDirect: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopStopped {
+		t.Fatalf("the retry = %+v, want stopped", got)
+	}
+	if _, err := js.Stream(ctx, lib.DispatchStopStream); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := js.Stream(ctx, lib.DispatchStopStream)
+	if _, err := stream.GetLastMsgForSubject(ctx, lib.DispatchStopSubject("fleet-audit", reply.TaskID)); err != nil {
+		t.Fatalf("the retry wrote no stop record: %v", err)
+	}
+}
+
 // failingMint makes the gateway's trigger mints fail with err while fail is
 // above zero, counting each down, and mint for real after.
 func failingMint(tr *triggerRig, fail *int, err error) {

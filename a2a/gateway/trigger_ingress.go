@@ -46,6 +46,8 @@ const (
 	triggerSubmitWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerSubmitSubjectSuffix
 	// triggerStatusWildcard is every source's status query subject.
 	triggerStatusWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerStatusSubjectSuffix
+	// triggerStopWildcard is every source's stop subject.
+	triggerStopWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerStopSubjectSuffix
 	// triggerConversationPrefix opens a trigger's own conversation key:
 	// trigger:<source>/<namespace>/<name>.
 	triggerConversationPrefix = "trigger:"
@@ -81,6 +83,7 @@ const (
 // submission subject, retrying a failed subscribe as the directory does, for
 // as long as the term's ctx lives.
 func (g *Gateway) startTriggerIngress(ctx context.Context) {
+	g.startTriggerStop(ctx)
 	denied := make(chan struct{}, 1)
 	remove := g.client.OnAsyncError(func(err error) {
 		if isTriggerSubscriptionRefusal(err) {
@@ -173,7 +176,71 @@ func isTriggerSubscriptionRefusal(err error) bool {
 	}
 	text := err.Error()
 	return (errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(text, "Permissions Violation")) &&
-		strings.Contains(text, "Subscription to \"a2a.trigger.")
+		strings.Contains(text, "Subscription to \"a2a.trigger.") && !strings.Contains(text, "Subscription to \""+triggerStopWildcard+"\"")
+}
+
+// isTriggerStopSubscriptionRefusal reports whether err is the server refusing
+// the stop subscription, which is retried on its own.
+func isTriggerStopSubscriptionRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return (errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(text, "Permissions Violation")) &&
+		strings.Contains(text, "Subscription to \""+triggerStopWildcard+"\"")
+}
+
+// startTriggerStop subscribes the elected gateway to every source's stop
+// subject (#6052), on its own retry loop: the stop grant is newer than the
+// submit and status ones, so a bus that hasn't loaded it yet refuses this
+// subscription alone, and submissions and status queries carry on meanwhile.
+func (g *Gateway) startTriggerStop(ctx context.Context) {
+	denied := make(chan struct{}, 1)
+	remove := g.client.OnAsyncError(func(err error) {
+		if isTriggerStopSubscriptionRefusal(err) {
+			select {
+			case denied <- struct{}{}:
+			default:
+			}
+		}
+	})
+	go func() {
+		defer remove()
+		for {
+			select {
+			case <-denied:
+			default:
+			}
+			sub, err := g.client.SubscribeCore(triggerStopWildcard, func(m *nats.Msg) {
+				source, err := lib.ParseTriggerStopSubject(m.Subject)
+				if err != nil || !lib.ValidTriggerReplySubject(source, m.Reply) {
+					g.log.Info("trigger stop dropped: no reply subject in the source's namespace", "subject", m.Subject)
+					return
+				}
+				if data, err := json.Marshal(g.handleTriggerStop(ctx, m.Subject, m.Data)); err == nil {
+					if err := m.Respond(data); err != nil {
+						g.log.Warn("trigger stop reply failed", "subject", m.Subject, "err", err)
+					}
+				}
+			})
+			if err == nil {
+				select {
+				case <-ctx.Done():
+					sub.Stop()
+					return
+				case <-denied:
+					sub.Stop()
+					err = errTriggerSubscriptionRefused
+				}
+			}
+			g.log.Warn("trigger stop subscription failed; retrying", "err", err, "in", triggerIngressRetry)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(triggerIngressRetry):
+			}
+		}
+	}()
 }
 
 // triggerRefused is a refusal reply, logged with the trigger it was for.
@@ -377,16 +444,7 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	if trigger == nil {
 		trigger = &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream, Script: s.Trigger.Script}
 	}
-	authority := Authority{
-		Requester: AuthorityRequester{
-			Principal:  g.ps.Hash("trigger:" + s.Trigger.Name),
-			Backend:    triggerRequesterBackend,
-			Subject:    s.Trigger.Name,
-			VerifiedBy: triggerRequesterVerifiedBy,
-		},
-		Audience: AuthorityAudience{Conversation: rec.Key, Kind: triggerAudienceKind},
-		Trigger:  trigger,
-	}
+	authority := g.triggerAuthority(rec, s.Trigger.Name, trigger)
 	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route, false)
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the task's message could not be built")
@@ -520,6 +578,125 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
 	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+}
+
+// triggerAuthority is the authority a trigger's task rides: the trigger as
+// requester, its own conversation as audience, and the trigger the grant was
+// minted with. The run's cancel rides the same.
+func (g *Gateway) triggerAuthority(rec *SessionRecord, triggerName string, trigger *capability.Trigger) Authority {
+	return Authority{
+		Requester: AuthorityRequester{
+			Principal:  g.ps.Hash("trigger:" + triggerName),
+			Backend:    triggerRequesterBackend,
+			Subject:    triggerName,
+			VerifiedBy: triggerRequesterVerifiedBy,
+		},
+		Audience: AuthorityAudience{Conversation: rec.Key, Kind: triggerAudienceKind},
+		Trigger:  trigger,
+	}
+}
+
+// handleTriggerStop ends one of a schedule's tasks (#6052), for a task this
+// gateway recorded on that schedule's trigger record and no other, so a
+// source stops only the tasks it started. It writes the task's cancel on its
+// .in subject and its dispatcher stop record: a run still starting has its
+// Job removed, and a running one is canceled. A task already ended, or one
+// already stopped, writes nothing again.
+func (g *Gateway) handleTriggerStop(ctx context.Context, subject string, data []byte) lib.TriggerStopReply {
+	refuse := func(reason, detail string) lib.TriggerStopReply {
+		return lib.TriggerStopReply{Refused: &lib.TriggerRefusal{Reason: reason, Detail: detail}}
+	}
+	source, err := lib.ParseTriggerStopSubject(subject)
+	if err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	var q lib.TriggerStop
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, "the stop is not well-formed")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return refuse(lib.TriggerRefusedInvalid, "the stop has data after its object")
+	}
+	if err := lib.ValidateTriggerStop(source, q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	if g.cfg.Namespace == "" || q.Schedule.Namespace != g.cfg.Namespace {
+		return refuse(lib.TriggerRefusedInvalid, "schedule "+q.Schedule.Namespace+"/"+q.Schedule.Name+" is not in the install's namespace")
+	}
+	key := triggerConversationKey(source, q.Schedule)
+	// Under the trigger's lock, as a submission and the relay's batches are:
+	// the cancel mark written back is on the record they read.
+	lock := g.lockSession(key)
+	lock.Lock()
+	defer lock.Unlock()
+	rec, err := g.reg.Get(ctx, key)
+	if err != nil {
+		return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
+	}
+	var run *TriggerRun
+	if rec != nil {
+		for i := range rec.TriggerRuns {
+			if rec.TriggerRuns[i].Task == q.TaskID {
+				run = &rec.TriggerRuns[i]
+			}
+		}
+	}
+	// Only a published run has a task to stop: a source learns a task id
+	// from the answer to a submission that reached the bus.
+	if run == nil || !run.Published {
+		return lib.TriggerStopReply{Result: lib.TriggerStopUnknownRun}
+	}
+	ref, held := rec.TaskRefFor(q.TaskID)
+	if !held {
+		return lib.TriggerStopReply{Result: lib.TriggerStopUnknownRun}
+	}
+	if task, err := g.replayForTerminal(ctx, ref.Addressee, q.TaskID); err == nil && task != nil && task.Final {
+		return lib.TriggerStopReply{Result: lib.TriggerStopAlreadyFinal}
+	}
+	if ref.Canceled {
+		return lib.TriggerStopReply{Result: lib.TriggerStopStopped}
+	}
+	if run.Trigger == nil {
+		// A run recorded before its trigger was kept: the cancel's authority
+		// has to equal the grant's trigger, which this record can't say.
+		return refuse(lib.TriggerRefusedInvalid, "the run predates the record of its trigger; it ends at its deadline")
+	}
+	correlation := ref.CorrelationID
+	if correlation == "" {
+		correlation = run.CorrelationID
+	}
+	authority := g.triggerAuthority(rec, run.Trigger.Name, run.Trigger)
+	env, err := lib.NewCancelEnvelope(gatewayParty, q.TaskID, rec.ContextID, correlation,
+		lib.WithTo(lib.Party{Session: ref.Addressee}),
+		lib.WithAuthority(authority.Render(run.Capability)))
+	if err != nil {
+		g.log.Error("trigger stop envelope build failed", "taskId", q.TaskID, "err", err)
+		return refuse(lib.TriggerRefusedInvalid, "the cancel could not be built")
+	}
+	// The stop record first: the dispatcher reads that, not the cancel, for
+	// a submission it still holds queued or a Job still starting, so it is
+	// the half the stop exists for. Either publish failing is refused
+	// unavailable with nothing marked, so the operator asks again and both
+	// are sent again (the record is one per subject, and a second cancel for
+	// the same task is answered as the first).
+	if ref.Tier != "" {
+		if err := g.client.PublishDispatchStop(ctx, ref.Addressee, ref.ID); err != nil {
+			g.log.Error("trigger stop record publish failed", "taskId", q.TaskID, "profile", ref.Addressee, "err", err)
+			return refuse(lib.TriggerRefusedUnavailable, "the stop record could not be published")
+		}
+	}
+	if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, q.TaskID), env); err != nil {
+		g.log.Error("trigger stop cancel publish failed", "taskId", q.TaskID, "err", err)
+		return refuse(lib.TriggerRefusedUnavailable, "the cancel could not be published")
+	}
+	rec.MarkCanceled(q.TaskID)
+	if err := g.reg.Put(ctx, rec); err != nil {
+		g.log.Error("trigger stop record write failed", "conversation", rec.Key, "taskId", q.TaskID, "err", err)
+	}
+	g.log.Info("trigger task stopped", "conversation", rec.Key, "taskId", q.TaskID, "profile", ref.Addressee)
+	return lib.TriggerStopReply{Result: lib.TriggerStopStopped}
 }
 
 // triggerConversationKey is a trigger's own conversation:

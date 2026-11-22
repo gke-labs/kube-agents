@@ -50,6 +50,8 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `lastCompletionTime` | `metav1.Time` | no |  |  | LastCompletionTime is when the most recent run ended. |
 | `lastOutcome` | `string` | no |  | one of `Succeeded`, `Failed`, `Cancelled`, `Lost` | LastOutcome is how the most recent run ended. |
 | `lastHandledRunNow` | `string` | no |  |  | LastHandledRunNow is the last run-now token acted on. |
+| `lastHandledStop` | `string` | no |  |  | LastHandledStop is the last stop token acted on. |
+| `stoppedTaskID` | `string` | no |  |  | StoppedTaskID is the run in flight a stop was sent for, until it settles: a run-now asked for meanwhile waits for it to end rather than adopting it. |
 | `skipCounts` | `object` | no |  |  | SkipCounts counts slots that did not run. |
 | `skipCounts.alreadyRunning` | `integer` | yes |  |  | AlreadyRunning: the last run was still going (Forbid). |
 | `skipCounts.missedWindow` | `integer` | yes |  |  | MissedWindow: the slot was more than the starting deadline late. |

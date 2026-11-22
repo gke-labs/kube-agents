@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -72,11 +74,25 @@ func (t *fakeScheduleTracker) State(context.Context, *agentv1alpha1.AgentSchedul
 	return t.state, nil
 }
 
+// fakeScheduleStopper is the gateway's stop: it records the tasks it was
+// asked to stop and answers result, or err.
+type fakeScheduleStopper struct {
+	result string
+	err    error
+	stops  []string
+}
+
+func (s *fakeScheduleStopper) Stop(_ context.Context, _ *agentv1alpha1.AgentSchedule, taskID string) (string, error) {
+	s.stops = append(s.stops, taskID)
+	return s.result, s.err
+}
+
 type scheduleFixture struct {
 	r       *AgentScheduleReconciler
 	c       client.Client
 	gw      *fakeScheduleGateway
 	tracker *fakeScheduleTracker
+	stopper *fakeScheduleStopper
 	clock   time.Time
 	key     types.NamespacedName
 }
@@ -134,11 +150,11 @@ func newScheduleFixtureWith(t *testing.T, mutate func(*agentv1alpha1.AgentSchedu
 	c := fake.NewClientBuilder().WithScheme(setupScheme()).
 		WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.AgentSchedule{}).Build()
 	f := &scheduleFixture{c: c, gw: &fakeScheduleGateway{}, tracker: &fakeScheduleTracker{state: ScheduleTaskState{Found: true}},
-		key: client.ObjectKeyFromObject(sched)}
+		stopper: &fakeScheduleStopper{result: triggerStopStopped}, key: client.ObjectKeyFromObject(sched)}
 	// The fixture's schedule is one the PlatformAgent renders, so a labelled,
 	// controlled one runs as built-in.
 	builtin := sched.Name
-	f.r = &AgentScheduleReconciler{Client: c, Scheme: c.Scheme(), Submitter: f.gw, Tracker: f.tracker, Now: func() time.Time { return f.clock },
+	f.r = &AgentScheduleReconciler{Client: c, Scheme: c.Scheme(), Submitter: f.gw, Tracker: f.tracker, Stopper: f.stopper, Now: func() time.Time { return f.clock },
 		BuiltinNames: func(*agentv1alpha1.PlatformAgent) []string { return []string{builtin} }}
 	return f
 }
@@ -383,6 +399,160 @@ func TestAgentScheduleRunNowStartsOrAdoptsARun(t *testing.T) {
 	f.at(t, hourAt(0, 55))
 	if s = f.get(t); len(f.gw.sends) != 1 || s.Status.LastHandledRunNow != "t2" || s.Status.ActiveTaskID != "task-1" {
 		t.Fatalf("a run-now during a live run started a second one: sends = %v, status = %+v", f.gw.sends, s.Status)
+	}
+}
+
+// annotate sets the schedule's stop token.
+func (f *scheduleFixture) annotateStop(t *testing.T, token string) {
+	t.Helper()
+	s := f.get(t)
+	if s.Annotations == nil {
+		s.Annotations = map[string]string{}
+	}
+	s.Annotations[agentv1alpha1.AgentScheduleStopAnnotation] = token
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A new stop token ends the run in flight through the gateway, once (#6052):
+// the token is recorded as handled, the same token again stops nothing, and
+// the run's canceled terminal lands as Cancelled.
+func TestAgentScheduleAStopTokenEndsTheRunInFlightOnce(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	active := f.get(t).Status.ActiveTaskID
+	if active == "" {
+		t.Fatal("no run in flight")
+	}
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 2))
+	s := f.get(t)
+	if len(f.stopper.stops) != 1 || f.stopper.stops[0] != active || s.Status.LastHandledStop != "s1" {
+		t.Fatalf("stops = %v, lastHandledStop = %q", f.stopper.stops, s.Status.LastHandledStop)
+	}
+	f.at(t, hourAt(1, 3))
+	if len(f.stopper.stops) != 1 {
+		t.Fatalf("a handled token stopped again: %v", f.stopper.stops)
+	}
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: scheduleOutcomeFor(a2aStateCanceled), CompletedAt: hourAt(1, 4)}
+	f.at(t, hourAt(1, 5))
+	s = f.get(t)
+	if s.Status.ActiveTaskID != "" || len(s.Status.RecentRuns) != 1 || s.Status.RecentRuns[0].Outcome != agentv1alpha1.AgentScheduleOutcomeCancelled {
+		t.Fatalf("after the canceled terminal: %+v", s.Status)
+	}
+}
+
+// With nothing running, a stop token is handled at once and asks the gateway
+// nothing. A claim still in flight isn't dropped (the gateway may already have
+// taken it): the token waits until the claim resolves into a run, which the
+// next pass stops.
+func TestAgentScheduleAStopWaitsForAClaimInFlight(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.annotateStop(t, "s0")
+	f.at(t, hourAt(0, 45))
+	if s := f.get(t); s.Status.LastHandledStop != "s0" || len(f.stopper.stops) != 0 {
+		t.Fatalf("with nothing running: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+	f.gw.err = fmt.Errorf("dial: %w", ErrScheduleGatewayUnavailable)
+	f.at(t, hourAt(1, 0))
+	if f.get(t).Status.PendingSlot == nil {
+		t.Fatal("no claim held")
+	}
+	f.annotateStop(t, "s1")
+	f.gw.err = nil
+	f.at(t, hourAt(1, 1))
+	s := f.get(t)
+	if s.Status.ActiveTaskID == "" || s.Status.LastHandledStop != "s0" || len(f.stopper.stops) != 0 {
+		t.Fatalf("the claim in flight: status = %+v, stops = %v", s.Status, f.stopper.stops)
+	}
+	f.at(t, hourAt(1, 2))
+	s = f.get(t)
+	if s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 1 || f.stopper.stops[0] != s.Status.ActiveTaskID {
+		t.Fatalf("the run the claim became: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+}
+
+// A run-now asked for after a stop isn't an adoption of the run being
+// stopped: it waits for that run to settle, then starts a new one.
+func TestAgentScheduleARunNowAfterAStopStartsANewRun(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	first := f.get(t).Status.ActiveTaskID
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	s := f.get(t)
+	s.Annotations[agentv1alpha1.AgentScheduleRunNowAnnotation] = "r1"
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(1, 2))
+	if s = f.get(t); s.Status.LastHandledRunNow != "" || len(f.gw.sends) != 1 {
+		t.Fatalf("the run-now adopted the stopping run: lastHandledRunNow = %q, sends = %v", s.Status.LastHandledRunNow, f.gw.sends)
+	}
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: scheduleOutcomeFor(a2aStateCanceled), CompletedAt: hourAt(1, 3)}
+	f.at(t, hourAt(1, 4))
+	s = f.get(t)
+	if s.Status.LastHandledRunNow != "r1" || len(f.gw.sends) != 2 || s.Status.ActiveTaskID == first || s.Status.StoppedTaskID != "" {
+		t.Fatalf("after the stopped run settled: status = %+v, sends = %v", s.Status, f.gw.sends)
+	}
+}
+
+// A stop the gateway refuses for good is handled, not retried.
+func TestAgentScheduleARefusedStopIsNotRetried(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.stopper.err = fmt.Errorf("%w (invalid): the run predates the record of its trigger", errTriggerStopRefused)
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	f.at(t, hourAt(1, 2))
+	if s := f.get(t); s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 1 {
+		t.Fatalf("lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+}
+
+// An API server serving a CRD from before lastHandledStop prunes it. The
+// stop isn't sent then: a token that can't be recorded would read as new on
+// every pass and stop every later run.
+func TestAgentScheduleAStopIsNotSentWhenTheTokenCantBeRecorded(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.r.Client = interceptor.NewClient(f.c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if s, ok := obj.(*agentv1alpha1.AgentSchedule); ok {
+				s.Status.LastHandledStop, s.Status.StoppedTaskID = "", ""
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	f.at(t, hourAt(1, 2))
+	if len(f.stopper.stops) != 0 {
+		t.Fatalf("a stop was sent with its token pruned: %v", f.stopper.stops)
+	}
+}
+
+// A gateway that doesn't answer the stop (an older one, say) leaves the token
+// unhandled and comes back soon; the next pass that's answered handles it.
+func TestAgentScheduleAnUnansweredStopIsTriedAgain(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.stopper.err = fmt.Errorf("no answer: %w", ErrScheduleGatewayUnavailable)
+	f.annotateStop(t, "s1")
+	res := f.at(t, hourAt(1, 1))
+	if s := f.get(t); s.Status.LastHandledStop != "" || res.RequeueAfter > agentScheduleRetry {
+		t.Fatalf("an unanswered stop: lastHandledStop = %q, requeue = %s", s.Status.LastHandledStop, res.RequeueAfter)
+	}
+	f.stopper.err = nil
+	f.at(t, hourAt(1, 2))
+	if s := f.get(t); s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 2 {
+		t.Fatalf("the retry: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
 	}
 }
 
@@ -872,6 +1042,101 @@ func TestAgentScheduleRecordsHowARunsReportWasDelivered(t *testing.T) {
 			t.Fatalf("a delivery was asked after past the window: %+v", s.Status.RecentRuns[0])
 		}
 	})
+}
+
+// A stop whose answer never made it into status (the stop failed and the
+// pass's last status write failed too, or the operator died meanwhile) is
+// sent again on the next pass: the token is recorded only once the gateway
+// has answered, never before.
+func TestAgentScheduleAStopLostBeforeItsAnswerIsSentAgain(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	inner := f.r.Client
+	writes := 0
+	f.r.Client = interceptor.NewClient(f.c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			writes++
+			if writes > 1 {
+				return errors.New("the API server is unavailable")
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	f.stopper.err = fmt.Errorf("no answer: %w", ErrScheduleGatewayUnavailable)
+	f.annotateStop(t, "s1")
+	f.clock = hourAt(1, 1)
+	_, _ = f.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: f.key})
+	if s := f.get(t); s.Status.LastHandledStop == "s1" {
+		t.Fatal("the token was persisted as handled before the gateway answered")
+	}
+	f.r.Client = inner
+	f.stopper.err = nil
+	f.at(t, hourAt(1, 2))
+	if s := f.get(t); s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 2 {
+		t.Fatalf("the lost stop: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+}
+
+// While a stop is retried after a transient failure, the run being stopped
+// stays recorded (as a claimed slot does): a run-now set meanwhile isn't an
+// adoption of it and starts a new run once it has ended, and a retry pass that
+// changes nothing writes nothing.
+func TestAgentScheduleARetriedStopKeepsTheRunItStops(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	active := f.get(t).Status.ActiveTaskID
+	f.stopper.err = fmt.Errorf("no answer: %w", ErrScheduleGatewayUnavailable)
+	s := f.get(t)
+	s.Annotations = map[string]string{
+		agentv1alpha1.AgentScheduleStopAnnotation:   "s1",
+		agentv1alpha1.AgentScheduleRunNowAnnotation: "r1",
+	}
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(1, 1))
+	s = f.get(t)
+	if s.Status.StoppedTaskID != active || s.Status.LastHandledRunNow != "" || s.Status.LastHandledStop != "" {
+		t.Fatalf("after a failed stop: stoppedTaskID = %q, lastHandledRunNow = %q, lastHandledStop = %q",
+			s.Status.StoppedTaskID, s.Status.LastHandledRunNow, s.Status.LastHandledStop)
+	}
+	inner := f.r.Client
+	writes := 0
+	f.r.Client = interceptor.NewClient(f.c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			writes++
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	f.at(t, hourAt(1, 2))
+	if writes != 0 {
+		t.Fatalf("a retry pass that changed nothing wrote status %d times", writes)
+	}
+	f.r.Client = inner
+	f.stopper.err = nil
+	f.at(t, hourAt(1, 3))
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: scheduleOutcomeFor(a2aStateCanceled), CompletedAt: hourAt(1, 4)}
+	f.at(t, hourAt(1, 5))
+	s = f.get(t)
+	if s.Status.LastHandledStop != "s1" || s.Status.LastHandledRunNow != "r1" || s.Status.ActiveTaskID == active || len(f.gw.sends) != 2 {
+		t.Fatalf("after the stop and the run's end: status = %+v, sends = %v", s.Status, f.gw.sends)
+	}
+}
+
+// A stop the gateway refuses for good clears the run being stopped, so a
+// run-now afterwards adopts the run still going, as it would with no stop.
+func TestAgentScheduleARefusedStopClearsTheRunItStops(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.stopper.err = fmt.Errorf("%w (invalid): the run predates the record of its trigger", errTriggerStopRefused)
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	if s := f.get(t); s.Status.StoppedTaskID != "" || s.Status.LastHandledStop != "s1" {
+		t.Fatalf("after a refused stop: stoppedTaskID = %q, lastHandledStop = %q", s.Status.StoppedTaskID, s.Status.LastHandledStop)
+	}
 }
 
 // A controller reference of another kind that carries the PlatformAgent's uid

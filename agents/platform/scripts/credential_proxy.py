@@ -2446,6 +2446,10 @@ DEFAULT_CREDENTIAL_PROXY_PROFILE_AUDIENCE = "kubeagents-credential-proxy-profile
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
+# The operator sets this to "true" on the broker when the A2A gateway's teams
+# backend is the Teams queue's consumer (A2A_TEAMS_BACKEND); only then does the
+# a2a-chat role reach the Teams routes (see _teams_route_roles).
+TEAMS_A2A_CALLER_ENV = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
 # The session pod the A2A gateway spawns, under the operator's
 # A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
 # (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
@@ -2993,6 +2997,21 @@ AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
 # 404 to the caller that may legitimately be probing for it —
 # `vcs_client` reads a codeless 404 as an older broker, and a 403 there would
 # read as "not permitted" rather than "not supported".
+def _teams_route_roles(a2a_caller: bool) -> tuple[str, ...]:
+    """The roles the Teams relay routes admit.
+
+    The Hermes consumer's chat role always; the A2A gateway's a2a-chat role
+    only when the operator renders ``TEAMS_A2A_CALLER_ENV`` beside the switch
+    that makes the gateway the consumer. The broker has no other view of that
+    switch, and without the gate a Chat-armed gateway's token could drain or
+    feed the Hermes consumer's queue and post as the Teams bot on an install
+    whose Teams stays on Hermes.
+    """
+    return (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT) if a2a_caller else (CALLER_ROLE_CHAT,)
+
+
+TEAMS_ROUTE_ROLES = _teams_route_roles(os.environ.get(TEAMS_A2A_CALLER_ENV, "").strip() == "true")
+
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
@@ -3003,6 +3022,13 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # No trailing slash: the passthrough is one exact path, and the handler
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
+    # The Teams relay serves whichever gateway the install arms on it: the
+    # Hermes consumer (chat role), or the A2A gateway's teams backend
+    # (a2a-chat role) when the operator runs with A2A_TEAMS_BACKEND=true and
+    # says so to the broker (TEAMS_A2A_CALLER_ENV, _teams_route_roles). One
+    # queue, one consumer per install; the prefix sits before the bare chat
+    # prefix so it is reachable.
+    ("/v1/chat/teams/", TEAMS_ROUTE_ROLES),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     # The admission report sits under /v1/exec and must be matched first: the
     # shell's fleet sweeps size their pools by it, so it is the shell's alone
@@ -7822,6 +7848,14 @@ TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
     r"^v3/conversations/[^/?#%\\]+/activities(?:/(?!history$)[^/?#%\\]+)?$",
     re.IGNORECASE,
 )
+# The one path a PUT may take: an update of one activity the bot posted
+# (Bot Framework's updateActivity), never the activities collection. The
+# gateway's rolling status line edits its own message through it.
+TEAMS_UPDATE_ACTIVITY_PATH_RE = re.compile(
+    r"^v3/conversations/[^/?#%\\]+/activities/(?!history$)[^/?#%\\]+$",
+    re.IGNORECASE,
+)
+TEAMS_RELAY_METHODS = frozenset({"POST", "PUT"})
 
 
 def is_trusted_teams_service_url(service_url: str) -> bool:
@@ -8109,11 +8143,13 @@ class TeamsRelay:
         if not is_trusted_teams_service_url(service_url):
             raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
         upper_method = (method or "").strip().upper()
-        if upper_method != "POST":
+        if upper_method not in TEAMS_RELAY_METHODS:
             raise ValueError(f"Teams relay refuses HTTP method: {method}")
         clean_path = path.lstrip("/")
         if ".." in clean_path.split("/") or not TEAMS_ALLOWED_ACTIVITY_PATH_RE.match(clean_path):
             raise ValueError(f"Teams relay refuses endpoint: {path}")
+        if upper_method == "PUT" and not TEAMS_UPDATE_ACTIVITY_PATH_RE.match(clean_path):
+            raise ValueError(f"Teams relay refuses PUT on: {path}")
 
         token = self._get_access_token()
         url = f"{service_url.rstrip('/')}/{clean_path}"
@@ -8133,7 +8169,7 @@ class TeamsRelay:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
             },
-            method="POST",
+            method=upper_method,
         )
         with self._open_url(req, timeout=30) as resp:
             content = resp.read()
