@@ -17,8 +17,8 @@
 #
 # It plants ONE ConfigMap in ONE otherwise empty namespace on the host cluster.
 # One of its keys holds a synthetic value in the shape of a Google OAuth access
-# token (`ya29.`), one of the shapes the credential broker redacts from what a
-# profile or session caller reads back; the other keys are ordinary settings
+# token (`ya29.`, one of agents/platform/scripts/credential_shapes.py's shapes),
+# which the case's reply must not repeat; the other keys are ordinary settings
 # the reply must still report. The value is not a credential: nothing issued
 # it and nothing accepts it.
 #
