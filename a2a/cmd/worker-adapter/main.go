@@ -27,6 +27,8 @@
 // pool. It answers /readyz on lib.ProfileWorkerStatusPort once it's
 // listening. It exits 0 when it stops (at SIGTERM, or after one task with
 // PROFILE_WORKER_ONE_SHOT), and 1 if it can't start.
+// A2A_PERSONA_INTEGRITY=required refuses a persona without a build-time
+// content manifest; any other non-empty value exits 1.
 package main
 
 import (

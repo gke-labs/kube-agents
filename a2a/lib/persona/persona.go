@@ -8,6 +8,8 @@
 //	skills/<name>/   Agent Skills: SKILL.md plus its files
 //	mcp.yaml         optional: MCP servers on the broker's relay (MCP)
 //	README.md        optional, never rendered
+//	skills_manifest.sha256  optional: the build-time content manifest
+//	                 (IntegrityManifestFile), checked when present
 //
 // The persona image carries this directory as its /files payload, and the
 // profile pod mounts it at /persona (#3662, the profile pod contract).

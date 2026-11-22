@@ -35,6 +35,8 @@ a server reached around the broker would be outside both.
 
 `Load` also refuses:
 
+- a persona whose files differ from its `skills_manifest.sha256`, or one
+  without it under `RequireIntegrity` (see [Content manifest](#content-manifest));
 - a `tier` in `persona.yaml`: a tier is authority, which the AgentProfile
   grants, never the persona;
 - a symlink anywhere, and any top-level file the format does not define
@@ -64,7 +66,8 @@ file it doesn't list, or a symlink or other non-regular file anywhere. A
 file of that name below the root is an ordinary file and must be listed.
 A persona without one loads, and `Persona.Integrity` says it was not
 checked; `Options.RequireIntegrity` refuses it instead. A profile worker
-sets that from `A2A_PERSONA_INTEGRITY=required`, and logs whether its
+sets that from `A2A_PERSONA_INTEGRITY=required` (nothing in the operator
+or chart renders it yet), and logs whether its
 persona loaded verified or unverified.
 
 The check shows that the persona's files are the ones its build recorded:
