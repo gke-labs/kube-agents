@@ -2429,7 +2429,10 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
   set +e
   # DO NOT MERGE (session cluster-view twin): the operator turns the session
   # route's cluster view on, so session pods run kubectl through kube-proxy.
-  _cv_i=$(( ${#A2A_OPERATOR_ENV_ARGS[@]} / 4 ))
+  _cv_i=0
+  for _cv_a in ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"}; do
+    case "${_cv_a}" in operator.extraEnv\[*\].name=*) _cv_i=$((_cv_i + 1)) ;; esac
+  done
   A2A_OPERATOR_ENV_ARGS+=(--set-string "operator.extraEnv[${_cv_i}].name=A2A_SESSION_CLUSTER_VIEW" --set-string "operator.extraEnv[${_cv_i}].value=true")
   helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
     --namespace "${NAMESPACE}" --create-namespace \
