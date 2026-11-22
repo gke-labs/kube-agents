@@ -280,6 +280,28 @@ const (
 // lowercase word, as the cost table's tier keys are.
 var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
+// kubectlCostTierEnv is the KUBEAGENTS_KUBECTL_COST_TIER entry for a container
+// whose kubectl cost gate reads it: the shell sandbox's admission and the
+// credential broker's (agents/platform/scripts/credential_proxy.py), so both
+// charge the same column. A literal only, and only a plain lowercase name,
+// since the sandbox's entrypoint writes it to a file the admission opens by
+// name and the broker reads a table column by it; nothing otherwise, and each
+// side then charges the default tier.
+func kubectlCostTierEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Deployment == nil {
+		return nil
+	}
+	for _, v := range agent.Spec.Deployment.Env {
+		if v.Name == envKubectlCostTier && v.ValueFrom == nil {
+			if tier := strings.ToLower(strings.TrimSpace(v.Value)); kubectlCostTierPattern.MatchString(tier) {
+				return []corev1.EnvVar{{Name: envKubectlCostTier, Value: tier}}
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
 var (
 	// The /opt/defaults trees deploy/sandbox/Dockerfile ships and the
 	// entrypoint stages. See shellSandboxImageTreesMode.
@@ -616,16 +638,8 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 				break
 			}
 		}
-		// The tier the same way: a literal only, and only a plain lowercase name,
-		// since the entrypoint writes it to a file the admission opens by name.
-		for _, v := range agent.Spec.Deployment.Env {
-			if v.Name == envKubectlCostTier && v.ValueFrom == nil {
-				if tier := strings.ToLower(strings.TrimSpace(v.Value)); kubectlCostTierPattern.MatchString(tier) {
-					env = append(env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
-				}
-				break
-			}
-		}
+		// The tier the same way (kubectlCostTierEnv).
+		env = append(env, kubectlCostTierEnv(agent)...)
 	}
 	env = append(env, autonomySwitchEnv(agent)...)
 

@@ -4934,6 +4934,13 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// credentialProxyStateLimitEnv for why they are values and why reserved;
 	// in the managed set, so the merge below reserves both names.
 	envVars = append(envVars, credentialProxyVolumeLimitEnv(agent)...)
+	// The kubectl cost tier, for the broker's kubectl cost gate: a brokered
+	// cluster-wide read reserves its profiled peak from this column of the
+	// cost table, beside the output cap above in the child memory budget's
+	// terms. Normalised as the shell sandbox's copy is (kubectlCostTierEnv),
+	// and reserved in mergeCredentialProxyEnv, so a value the normalisation
+	// refuses never reaches the broker raw.
+	envVars = append(envVars, kubectlCostTierEnv(agent)...)
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
@@ -5313,6 +5320,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// what still holds when that happens.
 		"CREDENTIAL_PROXY_ENFORCE_READ_ONLY",
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
+		// In `managed` only when spec.deployment.env names a tier the
+		// normalisation keeps (kubectlCostTierEnv); reserved by name so a
+		// valueFrom or an unnormalised literal never reaches the broker.
+		envKubectlCostTier,
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
 		// Both port variables are in the broker's `managed` (buildCredentialProxyEnv)
