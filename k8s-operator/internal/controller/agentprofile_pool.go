@@ -40,6 +40,13 @@ const (
 	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
 	// directories the worker empties after every task.
 	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
+	// profileWorkerDelegateToolEnv and profileWorkerDelegateToolOff are
+	// lib.EnvDelegateTool turned off, on the worker of a profile that
+	// doesn't delegate; profileWorkerDelegatesEnv is lib.EnvProfileDelegates,
+	// in its place on the worker of one that does (spec.delegates).
+	profileWorkerDelegateToolEnv = "A2A_DELEGATE_TOOL"
+	profileWorkerDelegateToolOff = "off"
+	profileWorkerDelegatesEnv    = "A2A_PROFILE_DELEGATES"
 	// profileWorkerUID is the worker image's user (a2a-worker, the node base image's
 	// node user), and its FSGroup.
 	profileWorkerUID = 1000
@@ -117,6 +124,14 @@ func profileWorkerLabels(agent *agentv1alpha1.PlatformAgent, profile, tier strin
 // (profilepod.RenderPersonaAndTools).
 func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile, tier, serviceAccount string, mode profileWorkerMode, imageVolumes bool) corev1.PodSpec {
 	rendered := profilepod.RenderPersonaAndTools(profile, imageVolumes)
+	// The delegate tool is the profile's opt-in (spec.delegates): its worker
+	// renders the tool and its tasks wait on their children. The entry stays
+	// in the same place either way, so a profile that doesn't delegate keeps
+	// the pod spec it had.
+	delegateTool := corev1.EnvVar{Name: profileWorkerDelegateToolEnv, Value: profileWorkerDelegateToolOff}
+	if profile.Spec.Delegates {
+		delegateTool = corev1.EnvVar{Name: profileWorkerDelegatesEnv, Value: "true"}
+	}
 	env := []corev1.EnvVar{
 		{Name: "PROFILE", Value: profile.Name},
 		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
@@ -129,9 +144,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_WORKDIR", Value: profileWorkerScratchPath},
 		{Name: "HOME", Value: profileWorkerHomePath},
 		{Name: "A2A_PROFILE_CONFIG_ROOT", Value: profileWorkerConfigPath},
-		// Children of a profile task go through the gateway, which a later
-		// change wires; until then the worker has no delegate tool.
-		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
+		delegateTool,
 		// The install's inference gateway, by its full name: the worker runs
 		// in the profile namespace, where the session worker's short default
 		// doesn't resolve. The gateway runs keyless. Do not set

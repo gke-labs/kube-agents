@@ -32,6 +32,30 @@ func envOf(c corev1.Container) map[string]string {
 	return env
 }
 
+// Only a profile that delegates gets the delegate tool: its worker carries
+// A2A_PROFILE_DELEGATES and not the tool's off switch; every other profile's
+// worker keeps the switch off and has no opt-in.
+func TestOnlyADelegatingProfilesWorkerGetsTheDelegateTool(t *testing.T) {
+	agent := a2aTestAgent()
+	for _, delegates := range []bool{false, true} {
+		profile := testAgentProfile(agent.Namespace, "auditor")
+		profile.Spec.Delegates = delegates
+		for _, mode := range []profileWorkerMode{profileWorkerPool, profileWorkerOneShot} {
+			env := envOf(buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", mode, false).Containers[0])
+			opt, hasOpt := env[profileWorkerDelegatesEnv]
+			off, hasOff := env[profileWorkerDelegateToolEnv]
+			if delegates && (!hasOpt || opt != "true" || hasOff) {
+				t.Errorf("delegates, mode %d: %s=%q (%v), %s=%q (%v); want the opt-in and no off switch",
+					mode, profileWorkerDelegatesEnv, opt, hasOpt, profileWorkerDelegateToolEnv, off, hasOff)
+			}
+			if !delegates && (hasOpt || off != profileWorkerDelegateToolOff) {
+				t.Errorf("no delegates, mode %d: %s=%q (%v), %s=%q; want the tool off and no opt-in",
+					mode, profileWorkerDelegatesEnv, opt, hasOpt, profileWorkerDelegateToolEnv, off)
+			}
+		}
+	}
+}
+
 // The worker pod is contract addendum 10's: one harness container running
 // the adapter's profile mode, the volumes it lists and no others, Ready on
 // the worker's own /readyz, and nothing that schedules it apart.
