@@ -625,6 +625,11 @@ class TestCallback(unittest.TestCase):
         self.assertNotIn("10.0.0.7", sent)
         self.assertEqual(json.loads(sent), {"cmd": "safe"})
 
+    def test_tool_arguments_with_nothing_to_redact_keep_their_exact_bytes(self) -> None:
+        untouched = '{"command":   "kubectl get pods",\n "n": 1}'
+        data = {"messages": [{"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "t", "arguments": untouched}}]}]}
+        self.assertEqual(self._run(data)["messages"][0]["tool_calls"][0]["function"]["arguments"], untouched)
+
     def test_a_numeric_value_under_a_credential_key_stays_valid_json(self) -> None:
         arguments = json.dumps({"token": 98765, "user": "admin"})
         data = {"messages": [{"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": arguments}}]}]}
