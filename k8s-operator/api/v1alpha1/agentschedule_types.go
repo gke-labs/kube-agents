@@ -116,6 +116,7 @@ type AgentScheduleDelivery struct {
 // it, and what it asks (docs/designs/scheduling-on-profiles.md, section 1).
 // Each run is submitted through the A2A gateway as an Unattended task.
 // +kubebuilder:validation:XValidation:rule="has(self.prompt) != has(self.script)",message="exactly one of spec.prompt and spec.script must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.script) || (!has(self.skills) && !has(self.maxTurns))",message="spec.skills and spec.maxTurns apply to a model run; a script run takes neither"
 type AgentScheduleSpec struct {
 	// Schedule is a 5-field cron expression, read in UTC.
 	// +kubebuilder:validation:XValidation:rule="self.trim().split(' ').filter(f, f != '').size() == 5",message="schedule must be a 5-field cron expression (minute hour day-of-month month day-of-week)"

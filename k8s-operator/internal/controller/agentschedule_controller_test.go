@@ -901,6 +901,26 @@ func TestAgentScheduleScriptNamesEnvtest(t *testing.T) {
 		!strings.Contains(err.Error(), "exactly one of spec.prompt and spec.script") {
 		t.Errorf("neither: create = %v, want the CEL rule's refusal", err)
 	}
+	// skills and maxTurns shape a model run: beside a script they are
+	// refused, and on a prompt run (an object as it was before script
+	// existed) they still validate.
+	turns := int32(5)
+	withSkills := mk("", "stall-watch")
+	withSkills.Spec.Skills = []string{"fleet-audit"}
+	withTurns := mk("", "stall-watch")
+	withTurns.Spec.MaxTurns = &turns
+	for what, s := range map[string]*agentv1alpha1.AgentSchedule{"skills": withSkills, "maxTurns": withTurns} {
+		if err := cl.Create(ctx, s); err == nil || !apierrors.IsInvalid(err) ||
+			!strings.Contains(err.Error(), "a script run takes neither") {
+			t.Errorf("a script with %s: create = %v, want the CEL rule's refusal", what, err)
+		}
+	}
+	promptRun := mk("Run the audit.", "")
+	promptRun.Spec.Skills = []string{"fleet-audit"}
+	promptRun.Spec.MaxTurns = &turns
+	if err := cl.Create(ctx, promptRun); err != nil {
+		t.Errorf("a prompt run with skills and maxTurns: create = %v, want accepted", err)
+	}
 	// An empty script sent explicitly is refused too, not read as absent.
 	u := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": agentv1alpha1.GroupVersion.String(), "kind": "AgentSchedule",

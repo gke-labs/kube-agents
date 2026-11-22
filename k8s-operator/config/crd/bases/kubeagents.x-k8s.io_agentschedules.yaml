@@ -195,6 +195,10 @@ spec:
               x-kubernetes-validations:
                 - message: exactly one of spec.prompt and spec.script must be set
                   rule: has(self.prompt) != has(self.script)
+                - message:
+                    spec.skills and spec.maxTurns apply to a model run; a script
+                    run takes neither
+                  rule: "!has(self.script) || (!has(self.skills) && !has(self.maxTurns))"
             status:
               description: |-
                 AgentScheduleStatus is the schedule's run state. It is the run ledger: no
