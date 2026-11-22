@@ -26,8 +26,8 @@
 #
 # Host cluster, not a per-run task cluster: the case addresses the `cluster`
 # profile to the agent's own cluster through {{AGENT_CLUSTER_*}}, and the host
-# is the one cluster every eval project has. The credential-fetch/teardown
-# structure is prebuilt/orphan-service's.
+# is the one cluster every eval project has. The namespace, its credentials
+# and its teardown are bench/tf/modules/namespaced-plant's.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -40,110 +40,43 @@ terraform {
 }
 
 locals {
-  ns        = var.defect_namespace
-  configmap = var.configmap_name
-
+  stack = "tool-output-credential"
   ci_labels = {
     "managed-by"  = "kube-agents-bench"
     "build-id"    = var.prow_build_id != "" ? var.prow_build_id : "local"
     "pull-number" = var.prow_pull_number != "" ? var.prow_pull_number : "none"
   }
+  # Passed to the module in its environment, not on a command line, so the
+  # apply log names the object and never the planted value.
+  manifest = <<-MANIFEST
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: "${var.configmap_name}"
+      labels:
+        managed-by: kube-agents-bench
+        created-by-stack: ${local.stack}
+    data:
+      api-endpoint: "${var.api_endpoint}"
+      region: "${var.region_label}"
+      retry-limit: "7"
+      access-token: "${var.planted_token}"
+  MANIFEST
 }
 
-resource "null_resource" "defect" {
-  triggers = {
-    namespace     = local.ns
-    host_cluster  = var.host_cluster_name
-    host_location = var.host_cluster_location
-    host_project  = var.project_id
+# The namespace and its teardown are the namespaced-plant module's: a failed
+# apply deletes the namespace it created, a leftover from an earlier run is
+# cleared first, and nothing it did not create is deleted.
+module "plant" {
+  source = "../../modules/namespaced-plant"
 
-    manifest = sha256(join("|", [
-      local.ns,
-      local.configmap,
-      var.planted_token,
-      var.api_endpoint,
-      var.region_label,
-      var.host_cluster_name,
-    ]))
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      set -euo pipefail
-
-      # Own kubeconfig, own credentials; the ambient context is some earlier
-      # tofu task's cluster by the time this apply runs.
-      kubeconfig_dir="$(mktemp -d)"
-      trap 'rm -rf "$kubeconfig_dir"' EXIT
-      KUBECONFIG="$kubeconfig_dir/config"
-      export KUBECONFIG
-
-      project="${var.project_id}"
-      if [ -z "$project" ]; then
-        project="$(gcloud config get-value project 2>/dev/null || true)"
-      fi
-      if [ -z "$project" ]; then
-        echo "ERROR: no project id. Pass -var project_id=... or set a gcloud default project; this stack needs one to fetch credentials for ${var.host_cluster_name}." >&2
-        exit 1
-      fi
-
-      gcloud container clusters get-credentials "${var.host_cluster_name}" \
-        --location "${var.host_cluster_location}" --project "$project" --quiet
-
-      # Destroy deletes the namespace with --wait=false, and the next
-      # repetition can apply seconds later: applying into a namespace still
-      # Terminating is refused, so wait the old one out first.
-      if [ "$(kubectl get namespace "${local.ns}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Terminating" ]; then
-        kubectl wait --for=delete "namespace/${local.ns}" --timeout=180s
-      fi
-      kubectl create namespace "${local.ns}" --dry-run=client -o yaml | kubectl apply -f -
-      kubectl label namespace "${local.ns}" --overwrite \
-        managed-by="${local.ci_labels["managed-by"]}" \
-        build-id="${local.ci_labels["build-id"]}" \
-        pull-number="${local.ci_labels["pull-number"]}"
-
-      kubectl apply -f - <<'MANIFEST'
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: ${local.configmap}
-        namespace: ${local.ns}
-      data:
-        api-endpoint: ${var.api_endpoint}
-        region: ${var.region_label}
-        retry-limit: "7"
-        access-token: ${var.planted_token}
-      MANIFEST
-
-      # The log names the object, never the planted value.
-      echo "Planted ConfigMap ${local.configmap} in ${local.ns} on ${var.host_cluster_name}."
-    EOT
-  }
-
-  # Namespace-scoped teardown, own credentials, prebuilt/orphan-service's.
-  provisioner "local-exec" {
-    when        = destroy
-    on_failure  = continue
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      set -euo pipefail
-      kubeconfig_dir="$(mktemp -d)"
-      trap 'rm -rf "$kubeconfig_dir"' EXIT
-      KUBECONFIG="$kubeconfig_dir/config"
-      export KUBECONFIG
-
-      project="${self.triggers.host_project}"
-      if [ -z "$project" ]; then
-        project="$(gcloud config get-value project 2>/dev/null || true)"
-      fi
-
-      gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
-        --location "${self.triggers.host_location}" --project "$project" --quiet
-
-      kubectl delete namespace "${self.triggers.namespace}" --ignore-not-found --wait=false
-    EOT
-  }
+  host_cluster_name     = var.host_cluster_name
+  host_cluster_location = var.host_cluster_location
+  project_id            = var.project_id
+  namespace             = var.defect_namespace
+  stack                 = local.stack
+  labels                = local.ci_labels
+  manifest              = local.manifest
 }
 
 # The subject cluster already exists; devops-bench reads these outputs
