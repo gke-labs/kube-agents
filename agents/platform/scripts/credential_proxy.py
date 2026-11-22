@@ -5939,9 +5939,11 @@ class ServiceAccountAuthenticator:
                 request, timeout=self.timeout_seconds, context=context
             ) as response:
                 review = json.load(response)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             # A TokenReview that cannot be completed is a rejection, not an
             # allow. An API server outage must not turn into an open broker.
+            # HTTPException: an answer that is not HTTP, or a body that ends
+            # early, is not an OSError.
             raise AuthenticationError(
                 f"TokenReview could not be completed: {type(exc).__name__}"
             ) from exc

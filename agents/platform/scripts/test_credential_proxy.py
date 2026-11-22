@@ -13677,6 +13677,29 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
             with self.assertRaises(credential_proxy.AuthenticationError):
                 authenticator.authenticate(self._headers("Bearer agent-token"))
 
+    def test_an_answer_that_is_not_http_is_a_rejection_not_a_dropped_connection(self):
+        # An error of `http.client` is not an `OSError`. One that leaves `_review`
+        # ends the caller's request with no answer, where the caller is owed a 401.
+        class CutShort(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"status":')
+
+        for label, answer in (
+            ("a status line that is not HTTP", http.client.BadStatusLine("garbage")),
+            ("a body that ends early", [CutShort()]),
+        ):
+            with self.subTest(label):
+                # `urlopen` goes through an opener's `open` too, so this stands in for both.
+                with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=answer):
+                    with self.assertRaises(credential_proxy.AuthenticationError):
+                        self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
         captured = {}
