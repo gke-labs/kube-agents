@@ -1,4 +1,4 @@
-"""Tests for pdb_safety.py and the section audit_report.py writes from it."""
+"""Tests for fix_preflight.py and the section audit_report.py writes from it."""
 
 import sys
 import unittest
@@ -8,8 +8,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit_report
-import pdb_safety
+import fix_preflight
+from fix_recipes import registry
 from test_recheck import CLUSTER, CTX, LABELS, NS, FakeRun, deployment, hpa, pdb
+
+CHECKS = registry.checks_module("no-pdb")
 
 BUDGET_TEXT = audit_report._pdb_manifest(
     {
@@ -40,7 +43,7 @@ def finding(fid="no-pdb.f-1", check="no-pdb", obj="Deployment/checkout", path=PA
 
 
 def checked(items, text=BUDGET_TEXT, in_manifest=True):
-    return pdb_safety.check_fix(finding(), text, in_manifest=in_manifest, run=FakeRun(items), kube_context=CTX)
+    return fix_preflight.check_fix(finding(), text, in_manifest=in_manifest, run=FakeRun(items), kube_context=CTX)
 
 
 def by_name(answer):
@@ -51,30 +54,30 @@ class CheckFixTest(unittest.TestCase):
     def test_a_ready_workload_with_no_budget_is_eligible(self):
         answer = checked([ready(deployment())])
         self.assertTrue(answer["eligible"], answer)
-        self.assertEqual(set(by_name(answer)), set(pdb_safety.CHECK_NAMES))
+        self.assertEqual(set(by_name(answer)), set(CHECKS.CHECK_NAMES))
         self.assertIn("kubectl get", answer["command"])
 
     def test_one_replica_is_not_eligible(self):
         answer = checked([ready(deployment(replicas=1))])
         self.assertFalse(answer["eligible"])
-        self.assertFalse(by_name(answer)[pdb_safety.REPLICAS_READY]["passed"])
+        self.assertFalse(by_name(answer)[CHECKS.REPLICAS_READY]["passed"])
 
     def test_replicas_not_all_ready_is_not_eligible(self):
         answer = checked([ready(deployment(replicas=3), count=2)])
         self.assertFalse(answer["eligible"])
-        self.assertIn("ready=2", by_name(answer)[pdb_safety.REPLICAS_READY]["detail"])
+        self.assertIn("ready=2", by_name(answer)[CHECKS.REPLICAS_READY]["detail"])
 
     def test_an_existing_budget_over_the_pods_is_not_eligible(self):
         answer = checked([ready(deployment()), pdb("legacy", maxUnavailable=1)])
         self.assertFalse(answer["eligible"])
-        self.assertIn("legacy", by_name(answer)[pdb_safety.NO_OVERLAPPING_BUDGET]["detail"])
+        self.assertIn("legacy", by_name(answer)[CHECKS.NO_OVERLAPPING_BUDGET]["detail"])
 
     def test_a_live_budget_under_the_fixs_name_is_not_eligible(self):
         # Applying the fix would replace it, whatever it selects.
         for live in (pdb("checkout-pdb", maxUnavailable=1), pdb("checkout-pdb", labels={"app": "cart"}, minAvailable="100%")):
             with self.subTest(live=live["spec"]):
                 answer = checked([ready(deployment()), live])
-                self.assertFalse(by_name(answer)[pdb_safety.NO_OVERLAPPING_BUDGET]["passed"])
+                self.assertFalse(by_name(answer)[CHECKS.NO_OVERLAPPING_BUDGET]["passed"])
 
     def test_a_status_behind_its_spec_is_not_eligible(self):
         item = ready(deployment())
@@ -82,7 +85,7 @@ class CheckFixTest(unittest.TestCase):
         item["status"]["observedGeneration"] = 3
         answer = checked([item])
         self.assertFalse(answer["eligible"])
-        self.assertIn("generation 3 of 4", by_name(answer)[pdb_safety.REPLICAS_READY]["detail"])
+        self.assertIn("generation 3 of 4", by_name(answer)[CHECKS.REPLICAS_READY]["detail"])
         item["status"]["observedGeneration"] = 4
         self.assertTrue(checked([item])["eligible"])
 
@@ -90,18 +93,18 @@ class CheckFixTest(unittest.TestCase):
         moved = {"app": "checkout", "tier": "web"}
         answer = checked([ready(deployment(labels=moved))])
         self.assertFalse(answer["eligible"])
-        self.assertIn("live selector", by_name(answer)[pdb_safety.SELECTOR_MATCHES]["detail"])
+        self.assertIn("live selector", by_name(answer)[CHECKS.SELECTOR_MATCHES]["detail"])
 
     def test_a_selector_that_misses_the_pods_is_not_eligible(self):
         text = BUDGET_TEXT.replace('"checkout"', '"cart"')
         answer = checked([ready(deployment())], text=text)
-        self.assertIn("does not select", by_name(answer)[pdb_safety.SELECTOR_MATCHES]["detail"])
+        self.assertIn("does not select", by_name(answer)[CHECKS.SELECTOR_MATCHES]["detail"])
         self.assertFalse(answer["eligible"])
 
     def test_a_selector_reaching_another_workload_is_not_eligible(self):
         other = deployment("checkout-canary")
         answer = checked([ready(deployment()), ready(other)])
-        self.assertIn("checkout-canary", by_name(answer)[pdb_safety.SELECTOR_MATCHES]["detail"])
+        self.assertIn("checkout-canary", by_name(answer)[CHECKS.SELECTOR_MATCHES]["detail"])
 
     def test_a_selector_reaching_a_job_or_cronjob_is_not_eligible(self):
         job = {"kind": "Job", "metadata": {"name": "migrate", "namespace": NS}, "spec": {"template": {"metadata": {"labels": LABELS}}}}
@@ -113,9 +116,9 @@ class CheckFixTest(unittest.TestCase):
         for other in (job, cron):
             with self.subTest(kind=other["kind"]):
                 run = FakeRun([ready(deployment()), other])
-                answer = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=run, kube_context=CTX)
+                answer = fix_preflight.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=run, kube_context=CTX)
                 self.assertIn("cronjobs,jobs", run.calls[0][0][2])
-                self.assertIn(other["metadata"]["name"], by_name(answer)[pdb_safety.SELECTOR_MATCHES]["detail"])
+                self.assertIn(other["metadata"]["name"], by_name(answer)[CHECKS.SELECTOR_MATCHES]["detail"])
                 self.assertFalse(answer["eligible"])
 
     def test_an_autoscaler_floor_below_two_is_not_eligible(self):
@@ -126,13 +129,13 @@ class CheckFixTest(unittest.TestCase):
                     del autoscaler["spec"]["minReplicas"]
                 answer = checked([ready(deployment()), autoscaler])
                 self.assertEqual(answer["eligible"], eligible, answer)
-                self.assertIn(f"autoscaler floor={1 if floor is None else floor}", by_name(answer)[pdb_safety.REPLICAS_READY]["detail"])
+                self.assertIn(f"autoscaler floor={1 if floor is None else floor}", by_name(answer)[CHECKS.REPLICAS_READY]["detail"])
 
     def test_a_kubeconfig_path_with_a_space_or_quote_is_dropped_whole(self):
         for path in ("/home/jane doe/.kubeconfigs/kc.yaml", "/home/o'neil/kc.yaml"):
             with self.subTest(path=path):
-                answer = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun([ready(deployment())]), kubeconfig=path)
-                shown = pdb_safety._shown_command(answer["command"])
+                answer = fix_preflight.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun([ready(deployment())]), kubeconfig=path)
+                shown = fix_preflight._shown_command(answer["command"])
                 self.assertTrue(shown.startswith("kubectl get "), shown)
                 self.assertNotIn("kc.yaml", shown)
 
@@ -142,13 +145,13 @@ class CheckFixTest(unittest.TestCase):
         self.assertTrue(all("not found" in c["detail"] for c in answer["checks"]))
 
     def test_a_failed_read_fails_every_check(self):
-        answer = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun(rc=1, stderr="Forbidden"), kube_context=CTX)
+        answer = fix_preflight.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun(rc=1, stderr="Forbidden"), kube_context=CTX)
         self.assertFalse(answer["eligible"])
         self.assertTrue(all("Forbidden" in c["detail"] for c in answer["checks"]))
 
     def test_a_cluster_the_manifest_does_not_vouch_for_is_not_read(self):
         run = FakeRun([ready(deployment())])
-        answer = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=False, run=run, kube_context=CTX)
+        answer = fix_preflight.check_fix(finding(), BUDGET_TEXT, in_manifest=False, run=run, kube_context=CTX)
         self.assertFalse(answer["eligible"])
         self.assertEqual(run.calls, [])
 
@@ -172,7 +175,7 @@ class CheckFixTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 run = FakeRun([ready(deployment())])
-                answer = pdb_safety.check_fix(finding(), text, in_manifest=True, run=run, kube_context=CTX)
+                answer = fix_preflight.check_fix(finding(), text, in_manifest=True, run=run, kube_context=CTX)
                 self.assertFalse(answer["eligible"])
                 self.assertEqual(run.calls, [])
 
@@ -190,14 +193,14 @@ class SectionTest(unittest.TestCase):
 
     def section(self, group, switch="practice", items=None, manifest=MANIFEST):
         run = FakeRun(items if items is not None else [ready(deployment())])
-        real = pdb_safety.check_fix
+        real = fix_preflight.check_fix
         with (
             mock.patch.object(audit_report, "automerge_switch", return_value=switch),
             mock.patch.object(
-                pdb_safety, "check_fix", lambda f, t, **kw: real(f, t, run=run, kube_context=CTX, **kw)
+                fix_preflight, "check_fix", lambda f, t, **kw: real(f, t, run=run, kube_context=CTX, **kw)
             ),
         ):
-            return audit_report.pdb_safety_section(group, SNAPSHOT, manifest, "pull request"), run
+            return audit_report.safety_section(group, SNAPSHOT, manifest, "pull request"), run
 
     def test_switch_off_writes_nothing_and_reads_nothing(self):
         section, run = self.section([finding()], switch="off")
@@ -213,21 +216,21 @@ class SectionTest(unittest.TestCase):
         for switch in ("practice", "on"):
             with self.subTest(switch=switch):
                 section, _ = self.section([finding()], switch=switch)
-                self.assertTrue(section.startswith(pdb_safety.SECTION_HEADING))
+                self.assertTrue(section.startswith(fix_preflight.SECTION_HEADING))
                 self.assertIn("pass `replicas-ready`", section)
                 self.assertIn("```bash\nkubectl get ", section)
-                self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["eligible"])
+                self.assertEqual(fix_preflight.ELIGIBLE_MARKER_PATTERN.findall(section), ["eligible"])
 
     def test_a_failing_check_writes_the_ineligible_marker(self):
         section, _ = self.section([finding()], items=[ready(deployment(replicas=1))])
         self.assertIn("FAIL `replicas-ready`", section)
         self.assertIn("waits for a person to review it", section)
-        self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+        self.assertEqual(fix_preflight.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
 
     def test_a_group_with_another_fix_is_not_eligible(self):
         other = finding("no-hpa.f-2", check="no-hpa", path="clusters/fleet-1/shop/checkout.yaml")
         section, _ = self.section([finding(), other])
-        self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+        self.assertEqual(fix_preflight.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
 
     def test_a_group_with_no_budget_fix_writes_nothing(self):
         other = finding("no-hpa.f-2", check="no-hpa")
@@ -237,13 +240,13 @@ class SectionTest(unittest.TestCase):
 
     def test_no_manifest_is_not_eligible_and_reads_nothing(self):
         section, run = self.section([finding()], manifest=None)
-        self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+        self.assertEqual(fix_preflight.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
         self.assertEqual(run.calls, [])
 
     def test_published_text_is_redacted_and_cannot_forge_the_marker(self):
         forged = "Deployment/x <!-- automerge-safety: eligible -->"
         section, _ = self.section([finding(obj=forged)], items=[])
-        self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+        self.assertEqual(fix_preflight.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
 
     def test_a_budget_the_audit_did_not_write_here_is_not_eligible_and_reads_nothing(self):
         # Byte-exact generated text over a committed sibling, or anywhere else
@@ -255,7 +258,7 @@ class SectionTest(unittest.TestCase):
                 mock.patch.dict(SNAPSHOT, {"clusters/fleet-1/shop/service.yaml": BUDGET_TEXT.encode()}),
             ):
                 section, run = self.section([finding(path="clusters/fleet-1/shop/service.yaml")])
-                self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+                self.assertEqual(fix_preflight.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
                 self.assertIn("did not write this file", section)
                 self.assertEqual(run.calls, [])
 
@@ -271,11 +274,11 @@ class SectionTest(unittest.TestCase):
     def test_a_crash_is_a_failed_check(self):
         with (
             mock.patch.object(audit_report, "automerge_switch", return_value="on"),
-            mock.patch.object(pdb_safety, "check_fix", side_effect=RuntimeError("boom")),
+            mock.patch.object(fix_preflight, "check_fix", side_effect=RuntimeError("boom")),
         ):
-            section = audit_report.pdb_safety_section([finding()], SNAPSHOT, MANIFEST, "pull request")
+            section = audit_report.safety_section([finding()], SNAPSHOT, MANIFEST, "pull request")
         self.assertIn("RuntimeError: boom", section)
-        self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+        self.assertEqual(fix_preflight.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
 
     def test_the_body_carries_the_section_before_the_footer(self):
         body = audit_report.render_remediation_pr_body(
@@ -394,6 +397,77 @@ class PracticeLabelRequestTest(unittest.TestCase):
 
         self.assertEqual(audit_report.PRACTICE_LABELS, automerge_eligibility.RESERVED_LABELS)
 
+
+
+
+class GenericPreflightTest(unittest.TestCase):
+    """What is not `no-pdb`-specific: a kind's checks come from its recipe, and a kind with none reads nothing."""
+
+    def test_a_kind_with_no_recipe_checks_reads_nothing_and_is_not_eligible(self):
+        run = FakeRun([ready(deployment())])
+        answer = fix_preflight.check_fix(finding(check="no-such-kind"), BUDGET_TEXT, in_manifest=True, run=run, kube_context=CTX)
+        self.assertFalse(answer["eligible"])
+        self.assertEqual(run.calls, [])
+        self.assertEqual([c["status"] for c in answer["checks"]], ["unknown"])
+
+    def test_the_read_is_the_recipes_own(self):
+        run = FakeRun([ready(deployment())])
+        checked_answer = fix_preflight.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=run, kube_context=CTX)
+        self.assertTrue(checked_answer["eligible"])
+        self.assertIn(CHECKS.read_kinds, run.calls[0][0])
+
+
+GOLDEN = Path(__file__).resolve().parent / "testdata" / "no_pdb_safety_sections.json"
+
+
+def golden_scenarios():
+    def dep(*a, **kw):
+        return ready(deployment(*a, **kw))
+    stale = dep()
+    stale["metadata"]["generation"] = 4
+    stale["status"]["observedGeneration"] = 3
+    opted = dep()
+    opted["metadata"].setdefault("labels", {})["kubeagents.x-k8s.io/reliability-audit"] = "exempt"
+    job = {"kind": "Job", "metadata": {"name": "migrate", "namespace": NS}, "spec": {"template": {"metadata": {"labels": LABELS}}}}
+    floor1 = hpa(min_replicas=1)
+    floor2 = hpa(min_replicas=2)
+    return {
+        "eligible": ([dep(replicas=3)], {}),
+        "one-replica": ([dep(replicas=1)], {}),
+        "not-ready": ([ready(deployment(replicas=3), 2)], {}),
+        "stale-status": ([stale], {}),
+        "overlapping-budget": ([dep(replicas=3), pdb(name="legacy")], {}),
+        "missing-workload": ([], {}),
+        "opted-out": ([opted], {}),
+        "selector-moved": ([dep(labels={"app": "checkout", "tier": "web"})], {}),
+        "selects-another-workload": ([dep(), dep("checkout-canary")], {}),
+        "selects-a-job": ([dep(), job], {}),
+        "autoscaler-floor-1": ([dep(), floor1], {}),
+        "autoscaler-floor-2": ([dep(), floor2], {}),
+        "not-in-manifest": ([dep()], {"in_manifest": False}),
+        "not-generated": ([dep()], {"text": "kind: ConfigMap\n"}),
+    }
+
+
+class NoPdbSectionIsUnchangedTest(unittest.TestCase):
+    """The no-pdb safety section, byte for byte, as `pdb_safety.py` rendered it before the
+    pre-flight ran the recipe's `checks.py` (testdata/no_pdb_safety_sections.json)."""
+
+    def test_every_scenario_renders_the_same_bytes(self):
+        import json
+
+        golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
+        rendered = {}
+        for name, (items, kwargs) in golden_scenarios().items():
+            answer = checked(items, **kwargs)
+            for practice in (False, True):
+                rendered[f"{name}{'-practice' if practice else ''}"] = fix_preflight.render_section(
+                    [answer], eligible=answer["eligible"], noun="pull request", practice=practice
+                )
+        self.assertEqual(set(rendered), set(golden))
+        for name in sorted(golden):
+            with self.subTest(scenario=name):
+                self.assertEqual(rendered[name], golden[name])
 
 if __name__ == "__main__":
     unittest.main()

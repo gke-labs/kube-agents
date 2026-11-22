@@ -25,11 +25,16 @@ legible: "I could not look" must never render as "nothing is wrong".
 from __future__ import annotations
 
 import argparse
+import base64
+import fcntl
 import json
 import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 # Identical to audit_report.py's, and deliberately not imported from it: this
@@ -126,6 +131,8 @@ def stream_ids(root: str) -> list[str]:
     other OSError propagates — `project` turns "the root is there but
     unreadable" into `root_exists: false` rather than into an empty fleet.
     """
+    if isinstance(root, BrokerReportStore):
+        return root.stream_ids()
     try:
         with os.scandir(root) as entries:
             return sorted(entry.name for entry in entries if entry.is_dir())
@@ -147,6 +154,8 @@ def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
     readable siblings'. The stream directory's own failure other than absence
     still propagates: then there is nothing to list at all.
     """
+    if isinstance(root, BrokerReportStore):
+        return root.repo_dirs(audit_id), []
     try:
         owners = _subdirs(os.path.join(root, audit_id))
     except FileNotFoundError:
@@ -211,6 +220,12 @@ def store_path(root: str, audit_id: str, repo: str) -> str:
     case-sensitive, so neither is the store; a repository on another forge is
     one directory below its host, the path spelled with `%2F`; and GitHub named with its host
     shares the bare slug's directory."""
+    return os.path.join(root, audit_id, *_store_segments(repo))
+
+
+def _store_segments(repo: str) -> list[str]:
+    """The two directory names below the stream that `store_path` opens for
+    `repo`. ValueError as `store_path`."""
     segments = str(repo).lower().split("/")
     if len(segments) == 3 and segments[0] == GITHUB_HOST:
         segments = segments[1:]
@@ -222,7 +237,17 @@ def store_path(root: str, audit_id: str, repo: str) -> str:
         raise ValueError(f"repository {repo!r} is not owner/name or host/path")
     if len(segments) > 2:
         segments = [segments[0], STORE_PATH_SEPARATOR.join(segments[1:])]
-    return os.path.join(root, audit_id, *segments)
+    return segments
+
+
+def broker_store_key(repo: str) -> str:
+    """The broker's store key for `repo`: the directories `store_path` opens,
+    as one URL segment (`acme%2Ffleet`, `gitlab.com%2Fa%252Fb`).
+
+    credential_proxy.report_store_key spells the same key, and a test holds
+    the two equal. ValueError as `store_path`.
+    """
+    return urllib.parse.quote("/".join(_store_segments(repo)), safe="")
 
 
 def store_key(root: str, audit_id: str, repo: str) -> str:
@@ -234,6 +259,8 @@ def store_key(root: str, audit_id: str, repo: str) -> str:
     name against the listing compares this, so the two spellings cannot
     disagree about whether the store is there. ValueError as `store_path`.
     """
+    if isinstance(root, BrokerReportStore):
+        return "/".join(_store_segments(repo)).replace(STORE_PATH_SEPARATOR, "/")
     rel = os.path.relpath(store_path(root, audit_id, repo), os.path.join(root, audit_id))
     return rel.replace(os.sep, "/").replace(STORE_PATH_SEPARATOR, "/")
 
@@ -287,6 +314,16 @@ def _read_object(path: str) -> dict | None:
     return value
 
 
+def _parse_object(data: bytes | None) -> dict | None:
+    """`_read_object` for bytes the broker store answered: None for None."""
+    if data is None:
+        return None
+    value = json.loads(data.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("not a JSON object")
+    return value
+
+
 def _lease_epoch(value: object) -> float | None:
     """`started_at` as an epoch a clock can be compared with and a date made
     of, or None. A millisecond epoch, `1e400` (JSON's inf) or NaN is no
@@ -334,6 +371,8 @@ def load_latest(root: str, audit_id: str, repo: str) -> dict | None:
     The projection strips `document`; report_query.py needs it, so this helper
     is the one that does not.
     """
+    if isinstance(root, BrokerReportStore):
+        return _parse_object(root.read_latest(audit_id, repo))
     return _read_object(os.path.join(store_path(root, audit_id, repo), LATEST_NAME))
 
 
@@ -414,6 +453,8 @@ def _newer_ring_entry(
 def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
     """Filenames in `runs/`, sorted ascending — which is time order, because
     the stamp is UTC. [] when the ring does not exist yet."""
+    if isinstance(root, BrokerReportStore):
+        return root.list_runs(audit_id, repo)
     try:
         names = os.listdir(os.path.join(store_path(root, audit_id, repo), RUNS_DIR))
     except FileNotFoundError:
@@ -425,6 +466,8 @@ def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
 
 def load_run(root: str, audit_id: str, repo: str, name: str) -> dict | None:
     """One ring entry, whole. None when that stamp is not in the ring."""
+    if isinstance(root, BrokerReportStore):
+        return _parse_object(root.read_run(audit_id, repo, name))
     return _read_object(os.path.join(store_path(root, audit_id, repo), RUNS_DIR, name))
 
 
@@ -467,10 +510,13 @@ def project(
     wrapped and a failure becomes that stream's `error` plus `liveness:
     "error"` while the sweep continues.
     """
-    root = reports_root(root)
+    if not isinstance(root, BrokerReportStore):
+        root = reports_root(root)
     scratch = scratch_root(scratch)
     now_epoch = _now_epoch(now)
-    root_exists = os.path.isdir(root)
+    # The broker store has no root directory to be absent: it is there when
+    # it answers, and a listing it refuses is the `root_error` below.
+    root_exists = isinstance(root, BrokerReportStore) or os.path.isdir(root)
     root_error: str | None = None
     try:
         ids = stream_ids(root)
@@ -488,7 +534,7 @@ def project(
         in_flight, lease_error = [], _failure(f"{scratch}/", exc)
     ids = sorted(set(ids) | set(in_flight))
     return {
-        "root": root,
+        "root": str(root),
         "root_exists": root_exists,
         "root_error": root_error,
         "generated_at": datetime.fromtimestamp(now_epoch, timezone.utc).isoformat(),
@@ -665,6 +711,550 @@ def _now_epoch(now: float | datetime | None) -> float:
     return float(now)
 
 
+# --------------------------------------------------------------------------- #
+# The broker store (#5619): the same store over the credential broker's
+# /v1/audit-reports, for a pod that cannot see the volume the store is on.
+#
+# Here rather than in a module of its own because this file imports nothing
+# outside the standard library and no sibling (the module docstring): the
+# view streams it into a pod on stdin, and audit_report.py and report_query.py
+# import it for the client. `credential_proxy_client` is not importable from
+# a skill, so its two header rules are restated below, stdlib-only.
+# --------------------------------------------------------------------------- #
+
+#: The switch. The operator renders `broker` on the shell sandbox's shell
+#: container and on profile workers; unset, or anything else, is the file
+#: store, as before the broker store existed.
+REPORT_STORE_ENV = "FLEET_AUDIT_REPORT_STORE"
+REPORT_STORE_BROKER = "broker"
+# credential_proxy_client's names: the broker's address, the projected token
+# that authenticates this caller, and a profile task's credential.
+BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
+BROKER_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TOKEN_FILE"  # noqa: S105 - an env name
+TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"  # noqa: S105 - an env name
+TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
+# credential_proxy_client.MAX_TASK_CREDENTIAL_BYTES and its shape check.
+MAX_TASK_CREDENTIAL_BYTES = 8192
+_TASK_CREDENTIAL_SHAPE = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
+AUDIT_REPORTS_ROUTE = "/v1/audit-reports"
+# Longer than the broker's own relay deadline (15 s), so its 504 arrives
+# rather than this side giving up first.
+BROKER_TIMEOUT_S = 20.0
+# The broker's own answers for a store it cannot use now: 503 with no store
+# configured (or a ConfigMap it cannot read), 502 for a listener that failed,
+# 504 for one that did not answer in time.
+UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
+# The ring's stamp, as the broker's route spells it (_REPORT_RUN_STAMP).
+RUN_NAME_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}\.[0-9]{6}Z\.json\Z")
+# The store listener's answer for a file that is not there
+# (audit_report_store._read_at and handle), which the broker relays whole. The
+# broker's own route refusal is `{"status": "not_found"}`, and the listener's
+# unknown route `{"error": "no such route"}`: neither is a missing file.
+LISTENER_NOT_FOUND = {"error": "not found"}
+# How much of a refusal's body is read for its `code`, `rule` or `status`.
+MAX_ANSWER_BODY_BYTES = 4096
+#: Left in a local stream directory once its envelopes are copied into the
+#: broker store, so the copy happens once.
+SEED_MARKER_NAME = ".seeded-to-broker"
+
+
+class ReportStoreError(OSError):
+    """The broker store refused or failed a request. An OSError, so every
+    reader and writer that already handles a store it cannot read or write
+    handles this one the same way. `status` is the HTTP status, None when no
+    answer came."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class ReportStoreUnavailable(ReportStoreError):
+    """The store cannot be used now: no broker address or token, no answer,
+    or the broker's 502, 503 or 504."""
+
+
+def task_credential_headers(path: str) -> dict[str, str]:
+    """credential_proxy_client.task_credential_headers, restated stdlib-only.
+
+    The task credential is sent only when the file holds one, and a report
+    credential (one that names no target) only on the audit-report routes.
+    Every request this client makes is on those routes, so in practice: sent
+    when present. A missing file is no task. A file that cannot be read, or
+    whose value is not one compact JWT, raises ReportStoreUnavailable rather
+    than send a request that would earn a refusal hiding the fault.
+    """
+    token_file = os.environ.get(TASK_TOKEN_FILE_ENV, "").strip()
+    if not token_file:
+        return {}
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ReportStoreUnavailable(
+            f"the task credential file could not be read ({type(exc).__name__})"
+        ) from None
+    if not token:
+        return {}
+    if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
+        raise ReportStoreUnavailable("the task credential file does not hold a task credential")
+    if _is_report_credential(token) and not _audit_reports_path(path):
+        return {}
+    return {TASK_CREDENTIAL_HEADER: token}
+
+
+def _is_report_credential(token: str) -> bool:
+    """credential_proxy_client._is_report_credential: claims read unverified."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    segment = parts[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, RecursionError):
+        return False
+    nats = claims.get("nats") if isinstance(claims, dict) else None
+    return isinstance(nats, dict) and "target" not in nats
+
+
+def _audit_reports_path(path: str) -> bool:
+    path = urllib.parse.urlsplit(path).path
+    return path == AUDIT_REPORTS_ROUTE or path.startswith(AUDIT_REPORTS_ROUTE + "/")
+
+
+def _bearer_headers() -> dict[str, str]:
+    """credential_proxy_client.authorization_headers: read fresh on every call,
+    because the kubelet rewrites a projected token in place."""
+    token_file = os.environ.get(BROKER_TOKEN_FILE_ENV, "").strip()
+    if not token_file:
+        return {}
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError as exc:
+        raise ReportStoreUnavailable(
+            f"the broker token file could not be read ({exc.strerror or type(exc).__name__})"
+        ) from None
+    if not token:
+        raise ReportStoreUnavailable("the broker token file is empty")
+    return {"Authorization": f"Bearer {token}"}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect out of the broker (credential_proxy_client's
+    rule): urllib re-sends the Authorization header across a cross-host
+    redirect, so following one would hand the bearer and the task credential
+    to whatever host the answer names. The 3xx comes back as an HTTPError."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
+def _broker_opener() -> urllib.request.OpenerDirector:
+    """An opener of this module's own for every broker call: no proxy from
+    HTTP(S)_PROXY, which would see both credentials, and no redirect."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+class BrokerReportStore(str):
+    """The report store, read and written through the broker's /v1/audit-reports.
+
+    A `str` whose value names it (`broker <url>`), so a reader that prints or
+    serialises the store root prints this; every reader that would open a path
+    under the root asks `isinstance(root, BrokerReportStore)` first.
+
+    The same names as the file store, by stream and repository: `latest.json`
+    and the ring's `<stamp>.json`. A missing file is FileNotFoundError (the
+    broker's 404); any other failure is ReportStoreError, ReportStoreUnavailable
+    for 502/503/504 or no answer. The listener prunes the ring and refuses a
+    `latest` that is not a byte copy of a ring entry.
+
+    `local_root` is a file store on this pod, if there is one (the shell
+    sandbox's, from before the switch). A stream it holds that the broker
+    store does not is copied in once, the first time this client touches that
+    stream (`_maybe_seed`).
+    """
+
+    url: str
+    local_root: str | None
+
+    def __new__(cls, url: str, local_root: str | None = None, log=None):
+        self = super().__new__(cls, f"{REPORT_STORE_BROKER} {url or '(no ' + BROKER_URL_ENV + ')'}")
+        self.url = (url or "").rstrip("/")
+        self.local_root = local_root
+        self._log = log or _stderr_line
+        self._seed_checked: set[tuple[str, str]] = set()
+        self._streams: list[dict] | None = None
+        return self
+
+    # -- the wire ----------------------------------------------------------- #
+
+    def _request(self, method: str, path: str, body: bytes | None = None) -> bytes:
+        """One request; the body of a 2xx answer. Raises as the class says."""
+        if not self.url:
+            raise ReportStoreUnavailable(f"the report store is unavailable: {BROKER_URL_ENV} is unset")
+        if urllib.parse.urlsplit(self.url).scheme not in ("http", "https"):
+            raise ReportStoreUnavailable(f"the report store is unavailable: {BROKER_URL_ENV} is not an http(s) URL")
+        headers = {**_bearer_headers(), **task_credential_headers(path)}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(self.url + path, data=body, method=method, headers=headers)
+        try:
+            with _broker_opener().open(request, timeout=BROKER_TIMEOUT_S) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            answer = _answer_body(exc)
+            exc.close()
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            reason = getattr(exc, "reason", None) or exc
+            raise ReportStoreUnavailable(
+                f"the report store at {self} is unavailable: {' '.join(str(reason).split())}"
+            ) from None
+        where = f"{method} {urllib.parse.unquote(path[len(AUDIT_REPORTS_ROUTE):]) or '/'}"
+        detail = _answer_detail(answer)
+        if status == 404 and answer == LISTENER_NOT_FOUND:
+            raise FileNotFoundError(f"the report store has no {where}")
+        if status in UNAVAILABLE_STATUSES or 300 <= status < 400 or status == 404:
+            # Only the listener's own "not found", relayed whole, is a missing
+            # file. Any other 404 is the broker refusing the route (`not_found`,
+            # as a broker that predates the routes answers) or the listener
+            # not knowing it: a store that can't be used now, never an empty
+            # one, which would read as a first run.
+            # A redirect is never followed (_NoRedirect): the store is not
+            # where it should be, which is a store that can't be used now.
+            raise ReportStoreUnavailable(
+                f"the report store at {self} is unavailable: HTTP {status}{detail}", status
+            )
+        raise ReportStoreError(f"the report store refused {where}: HTTP {status}{detail}", status)
+
+    def _stream_path(self, audit_id: str, repo: str, *rest: str) -> str:
+        if not REPO_SEGMENT_RE.match(audit_id) or audit_id in (os.curdir, os.pardir):
+            raise ValueError(f"stream {audit_id!r} is not a name inside the report store")
+        return "/".join((AUDIT_REPORTS_ROUTE, audit_id, broker_store_key(repo), *rest))
+
+    @staticmethod
+    def _stamp(name: str) -> str:
+        if not RUN_NAME_RE.match(name):
+            raise ValueError(f"run {name!r} is not a report stamp")
+        return name[: -len(".json")]
+
+    # -- the store ---------------------------------------------------------- #
+
+    def streams(self) -> list[dict]:
+        """The broker's stream list: `audit_id`, `key`, `newest_run`,
+        `latest_finished_at` per store. Read once per client, after copying in
+        any local stream the broker does not hold."""
+        if self._streams is None:
+            self._seed_local_streams()
+            listed = json.loads(self._request("GET", AUDIT_REPORTS_ROUTE).decode("utf-8"))
+            if not isinstance(listed, list):
+                raise ReportStoreError("the report store's stream list is not a list")
+            self._streams = [row for row in listed if isinstance(row, dict)]
+        return self._streams
+
+    def stream_ids(self) -> list[str]:
+        return sorted({str(row.get("audit_id")) for row in self.streams() if row.get("audit_id")})
+
+    def repo_dirs(self, audit_id: str) -> list[str]:
+        """The stream's repositories as `scan_repo_dirs` spells them."""
+        names = []
+        for row in self.streams():
+            if row.get("audit_id") != audit_id or not isinstance(row.get("key"), str):
+                continue
+            owner, _, below = urllib.parse.unquote(row["key"]).partition("/")
+            if owner and below:
+                names.append(f"{owner}/{below.replace(STORE_PATH_SEPARATOR, '/')}")
+        return sorted(names)
+
+    def read_latest(self, audit_id: str, repo: str) -> bytes | None:
+        """`latest.json`'s bytes; None when there is none."""
+        self._maybe_seed(audit_id, repo)
+        try:
+            return self._request("GET", self._stream_path(audit_id, repo, "latest"))
+        except FileNotFoundError:
+            return None
+
+    def list_runs(self, audit_id: str, repo: str) -> list[str]:
+        """The ring's names, oldest first, as `list_runs` lists the directory."""
+        self._maybe_seed(audit_id, repo)
+        return self._ring(audit_id, repo)
+
+    def _ring(self, audit_id: str, repo: str) -> list[str]:
+        try:
+            stamps = json.loads(self._request("GET", self._stream_path(audit_id, repo, "runs")).decode("utf-8"))
+        except FileNotFoundError:
+            return []
+        if not isinstance(stamps, list):
+            raise ReportStoreError("the report store's run list is not a list")
+        return sorted(f"{stamp}.json" for stamp in stamps if isinstance(stamp, str))
+
+    def read_run(self, audit_id: str, repo: str, name: str) -> bytes | None:
+        """One ring entry's bytes; None when that stamp is not in the ring."""
+        self._maybe_seed(audit_id, repo)
+        try:
+            return self._request("GET", self._stream_path(audit_id, repo, "runs", self._stamp(name)))
+        except FileNotFoundError:
+            return None
+
+    def write_run(self, audit_id: str, repo: str, name: str, data: bytes) -> None:
+        self._maybe_seed(audit_id, repo)
+        self._request("PUT", self._stream_path(audit_id, repo, "runs", self._stamp(name)), data)
+        self._streams = None
+
+    def write_latest(self, audit_id: str, repo: str, data: bytes) -> None:
+        self._maybe_seed(audit_id, repo)
+        self._request("PUT", self._stream_path(audit_id, repo, "latest"), data)
+        self._streams = None
+
+    def delete_latest(self, audit_id: str, repo: str) -> None:
+        """Drop `latest.json`. Absent already is not an error."""
+        self._maybe_seed(audit_id, repo)
+        try:
+            self._request("DELETE", self._stream_path(audit_id, repo, "latest"))
+        except FileNotFoundError:
+            pass
+        self._streams = None
+
+    # -- the seed (Q-L2) ---------------------------------------------------- #
+
+    def _seed_local_streams(self) -> None:
+        """Copy in every local stream the broker store lacks, for a listing."""
+        if not self.local_root or not os.path.isdir(self.local_root):
+            return
+        try:
+            for audit_id in stream_ids(self.local_root):
+                for repo in scan_repo_dirs(self.local_root, audit_id)[0]:
+                    if repo == repo.lower():
+                        self._maybe_seed(audit_id, repo)
+        except ReportStoreUnavailable:
+            # The broker, not the local store: the listing fails as an outage.
+            raise
+        except (OSError, ValueError) as exc:
+            self._log(f"report store: the local store at {self.local_root} could not be listed to seed the broker: {exc}")
+
+    def _maybe_seed(self, audit_id: str, repo: str) -> None:
+        """Copy this stream's local envelopes into the broker store, once.
+
+        Only when there is a local file store holding the stream and it
+        carries no SEED_MARKER_NAME. Under an flock on the local stream
+        directory, so two seeds on this pod (and a `finish` here, whose writes
+        seed first) take turns. Then, by what the broker's ring holds:
+
+        - nothing, or only stamps the local ring holds (a seed that stopped
+          part way): the local entries it lacks, newer than its newest, go
+          oldest first, then `latest.json` (`_seed_latest`), then the marker;
+        - stamps the local ring does not hold (a run wrote there since): when
+          every local entry is already in it, the marker alone, so later runs
+          skip the reads; otherwise nothing is copied and nothing marked.
+
+        Never deletes or changes a local envelope. A stream whose writes the
+        broker refuses (403: a repository the install does not register) is
+        skipped and logged, with no marker, so a later registration can still
+        seed it. A broker that cannot be used now (ReportStoreUnavailable)
+        raises out of here, and the stream is not counted as checked: the read
+        or write that touched it fails as an outage, rather than read a stream
+        part copied as a first run or land a run on it (which would leave the
+        broker's ring with a stamp the local one lacks, and nothing left
+        copied ever after), and the next touch in this process tries again.
+        Any other failure is logged and left for the next run, which resumes
+        where this one stopped.
+        """
+        try:
+            key = (audit_id, broker_store_key(repo))
+        except ValueError:
+            return
+        if key in self._seed_checked:
+            return
+        self._seed_checked.add(key)
+        try:
+            self._seed_unchecked(audit_id, repo)
+        except ReportStoreUnavailable:
+            self._seed_checked.discard(key)
+            raise
+
+    def _seed_unchecked(self, audit_id: str, repo: str) -> None:
+        """`_maybe_seed`'s work, once the stream is counted as checked."""
+        if not self.local_root or not os.path.isdir(self.local_root):
+            return
+        local = store_path(self.local_root, audit_id, repo)
+        if not os.path.isdir(local) or os.path.lexists(os.path.join(local, SEED_MARKER_NAME)):
+            return
+        label = f"{audit_id} in {'/'.join(_store_segments(repo)).replace(STORE_PATH_SEPARATOR, '/')}"
+        try:
+            lock = os.open(local, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+        except OSError as exc:
+            self._log(f"report store: not seeding {label} into the broker: {local} could not be opened ({exc})")
+            return
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.path.lexists(os.path.join(local, SEED_MARKER_NAME)):
+                return
+            self._seed_locked(audit_id, repo, local, label)
+        finally:
+            os.close(lock)  # closing the descriptor drops the lock
+
+    def _seed_locked(self, audit_id: str, repo: str, local: str, label: str) -> None:
+        """`_maybe_seed`'s work, with the local stream directory locked."""
+        try:
+            runs = sorted(name for name in os.listdir(os.path.join(local, RUNS_DIR)) if RUN_NAME_RE.match(name))
+        except FileNotFoundError:
+            runs = []
+        except OSError as exc:
+            self._log(f"report store: not seeding {label} into the broker: the local ring could not be listed ({exc})")
+            return
+        try:
+            with open(os.path.join(local, LATEST_NAME), "rb") as handle:
+                latest: bytes | None = handle.read()
+        except FileNotFoundError:
+            latest = None
+        except OSError as exc:
+            self._log(f"report store: not seeding {label} into the broker: the local latest.json could not be read ({exc})")
+            return
+        if not runs and latest is None:
+            return
+        copied = 0
+        try:
+            remote = self._ring(audit_id, repo)
+            if not set(remote) <= set(runs):
+                # A run wrote this stream through the broker since: its ring is
+                # not a partial copy of the local one, so nothing is resumed.
+                if set(runs) <= set(remote):
+                    self._leave_marker(local, label, {"seeded_to": self.url, "runs": 0, "latest": False})
+                return
+            if not remote and self._get_latest(audit_id, repo) is not None:
+                # A `latest` with no ring is no state the listener writes;
+                # leave it to a run rather than guess.
+                return
+            missing = [name for name in runs if name not in remote and (not remote or name > remote[-1])]
+            for name in missing:
+                with open(os.path.join(local, RUNS_DIR, name), "rb") as handle:
+                    data = handle.read()
+                try:
+                    self._request("PUT", self._stream_path(audit_id, repo, "runs", self._stamp(name)), data)
+                except ReportStoreError as exc:
+                    if exc.status == 403:
+                        self._log(
+                            f"report store: not seeding {label} into the broker: it refused the write "
+                            f"(HTTP 403: a repository this install does not register)"
+                        )
+                        return
+                    if exc.status in (400, 409, 413) and not isinstance(exc, ReportStoreUnavailable):
+                        # This one entry: not JSON, too large, or stamped in
+                        # the future. The rest of the ring still copies.
+                        self._log(f"report store: seeding {label}: skipped runs/{name} ({exc})")
+                        continue
+                    raise
+                copied += 1
+            latest_copied = self._seed_latest(audit_id, repo, local, runs, latest)
+        except ReportStoreUnavailable as exc:
+            self._log(
+                f"report store: seeding {label} into the broker stopped after {copied} run(s), "
+                f"to be resumed by the next request: {exc}"
+            )
+            raise
+        except (OSError, ValueError) as exc:
+            self._log(
+                f"report store: seeding {label} into the broker stopped after {copied} run(s), "
+                f"to be resumed by the next run: {exc}"
+            )
+            return
+        self._streams = None
+        self._leave_marker(local, label, {"seeded_to": self.url, "runs": copied, "latest": latest_copied})
+        self._log(
+            f"report store: seeded {label} into the broker from {local}: {copied} run(s), "
+            f"latest {'copied' if latest_copied else 'not copied'}"
+        )
+
+    def _get_latest(self, audit_id: str, repo: str) -> bytes | None:
+        try:
+            return self._request("GET", self._stream_path(audit_id, repo, "latest"))
+        except FileNotFoundError:
+            return None
+
+    def _seed_latest(self, audit_id: str, repo: str, local: str, runs: list[str], latest: bytes | None) -> bool:
+        """PUT the local `latest.json` when it is a byte copy of the newest local
+        entry and the broker has nothing newer; whether it was written.
+
+        Checked again just before the write: a run that landed through the
+        broker since (a ring entry newer than the newest local one, or a
+        `latest` that is not this one) keeps its own, so a seed never rolls
+        `latest` back.
+        """
+        if latest is None or not runs:
+            return False
+        with open(os.path.join(local, RUNS_DIR, runs[-1]), "rb") as handle:
+            if handle.read() != latest:
+                return False
+        remote = self._ring(audit_id, repo)
+        if not remote or remote[-1] != runs[-1]:
+            return False
+        current = self._get_latest(audit_id, repo)
+        if current is not None:
+            return current == latest
+        self._request("PUT", self._stream_path(audit_id, repo, "latest"), latest)
+        return True
+
+    def _leave_marker(self, local: str, label: str, record: dict) -> None:
+        try:
+            with open(os.path.join(local, SEED_MARKER_NAME), "x", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            self._log(f"report store: seeded {label} but could not leave {SEED_MARKER_NAME} in {local} ({exc})")
+
+
+def _answer_body(exc: urllib.error.HTTPError) -> dict | None:
+    """A refusal's JSON object body, or None."""
+    try:
+        body = json.loads(exc.read(MAX_ANSWER_BODY_BYTES).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _answer_detail(body: dict | None) -> str:
+    """The broker's `code`, `rule` or `status` from a refusal body, for the log line."""
+    if not isinstance(body, dict):
+        return ""
+    words = [str(body[key]) for key in ("code", "rule", "status") if isinstance(body.get(key), str)]
+    return f" ({', '.join(words)})" if words else ""
+
+
+def _stderr_line(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def select_report_store(root: str | None = None, log=None) -> tuple[str, str]:
+    """The store a script uses, and the one line saying which and why.
+
+    An explicit root (`--root`) is the file store at that root. Otherwise the
+    broker store when FLEET_AUDIT_REPORT_STORE is `broker`, else the file
+    store at `reports_root()`, exactly as before the switch existed. The line
+    names the broker's URL, never a token.
+    """
+    if root:
+        return str(root), f"report store: file {root} (--root)"
+    choice = os.environ.get(REPORT_STORE_ENV, "").strip()
+    if choice == REPORT_STORE_BROKER:
+        store = BrokerReportStore(os.environ.get(BROKER_URL_ENV, "").strip(), reports_root(), log=log)
+        return store, f"report store: {store} ({REPORT_STORE_ENV}={REPORT_STORE_BROKER})"
+    why = f"{REPORT_STORE_ENV} is {choice!r}, not {REPORT_STORE_BROKER}" if choice else f"{REPORT_STORE_ENV} unset"
+    local = reports_root()
+    return local, f"report store: file {local} ({why})"
+
+
+def report_store(root: str | None = None) -> str:
+    """`select_report_store`, with its line logged on stderr: a script's one
+    call, made where it picks its store."""
+    store, line = select_report_store(root)
+    _stderr_line(line)
+    return store
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Project the fleet-audit report store as one JSON document."
@@ -680,7 +1270,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     # Exit 0 even with no store: `root_exists: false` is the answer, and the
     # view decides what a missing store costs.
-    print(json.dumps(project(args.root, scratch=args.scratch), sort_keys=True))
+    print(json.dumps(project(report_store(args.root), scratch=args.scratch), sort_keys=True))
     return 0
 
 

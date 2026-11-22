@@ -26814,6 +26814,7 @@ class TestTriageMarkedFindings(BaseTestCase):
             "namespace-token",
             "service-selector",
             "hard-spread",
+            "reserved-pool",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)

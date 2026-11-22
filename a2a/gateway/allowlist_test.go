@@ -90,6 +90,7 @@ func TestTargetAllowedUsersParseFromEnv(t *testing.T) {
 	setBaseEnv(t) // the shared FromEnv environment from config_test.go
 	t.Setenv(EnvTargetAllowedUsersGchat, " Alice@Example.com, bob@example.com ,")
 	t.Setenv(EnvTargetAllowedUsersSlack, "U0ABC,,U0DEF")
+	t.Setenv(EnvTargetAllowedUsersTeams, " 05E62547-5ee7-41be-9639-155d9212be8f ,29:1abc")
 	cfg, err := FromEnv()
 	if err != nil {
 		t.Fatal(err)
@@ -101,19 +102,23 @@ func TestTargetAllowedUsersParseFromEnv(t *testing.T) {
 	if len(got[slackBackend]) != 2 || got[slackBackend][1] != "U0DEF" {
 		t.Fatalf("slack list = %v", got[slackBackend])
 	}
+	if len(got[teamsBackend]) != 2 || got[teamsBackend][0] != "05E62547-5ee7-41be-9639-155d9212be8f" || got[teamsBackend][1] != "29:1abc" {
+		t.Fatalf("teams list = %v", got[teamsBackend])
+	}
 	// Set but empty is a list that admits nobody: the operator renders it
 	// for a CR list of blanks.
 	t.Setenv(EnvTargetAllowedUsersGchat, " , ")
 	t.Setenv(EnvTargetAllowedUsersSlack, "")
+	t.Setenv(EnvTargetAllowedUsersTeams, "")
 	cfg, err = FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
 	lists, ok := cfg.TargetAllowedUsers["platform"]
-	if !ok || len(lists) != 2 {
+	if !ok || len(lists) != 3 {
 		t.Fatalf("set-but-empty env parsed as no lists: %v", lists)
 	}
-	for _, backend := range []string{gchatBackend, slackBackend} {
+	for _, backend := range []string{gchatBackend, slackBackend, teamsBackend} {
 		if l, present := lists[backend]; !present || len(l) != 0 {
 			t.Fatalf("%s list = %v (present=%v), want present and empty", backend, l, present)
 		}
@@ -121,11 +126,28 @@ func TestTargetAllowedUsersParseFromEnv(t *testing.T) {
 	// Unset is no list.
 	os.Unsetenv(EnvTargetAllowedUsersGchat)
 	os.Unsetenv(EnvTargetAllowedUsersSlack)
+	os.Unsetenv(EnvTargetAllowedUsersTeams)
 	cfg, err = FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lists := cfg.TargetAllowedUsers["platform"]; len(lists) != 0 {
 		t.Fatalf("unset env parsed as lists: %v", lists)
+	}
+}
+
+// TestTeamsTargetSubjectsAreLowercased: a Teams requester's subject is the id
+// lowercased, as its ingress list is compared, so a list entry in any case
+// admits the same person, and a Teams requester on no list is allowed as the
+// absent-list rule says.
+func TestTeamsTargetSubjectsAreLowercased(t *testing.T) {
+	ps := NewPseudonymizer([]byte("salt"))
+	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{"platform": {teamsBackend: {"05E62547-5EE7-41BE-9639-155D9212BE8F"}}}}
+	g := &Gateway{targetAllowed: buildTargetAllowed(cfg, ps)}
+	if !g.targetAllows("platform", teamsBackend, requesterSubject(ps, teamsBackend, "05e62547-5ee7-41be-9639-155d9212be8f")) {
+		t.Fatal("a listed object id in another case was refused")
+	}
+	if g.targetAllows("platform", teamsBackend, requesterSubject(ps, teamsBackend, "29:someone-else")) {
+		t.Fatal("an unlisted Teams requester was allowed under a list")
 	}
 }

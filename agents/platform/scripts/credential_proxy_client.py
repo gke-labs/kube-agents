@@ -196,6 +196,24 @@ RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
 # What an answer with no JSON body is reported as, a refusal or a 2xx; the
 # broker's own text is used when a refusal sent one.
 NON_JSON_RESPONSE_TEXT = "non-JSON response"
+# How deep a `/v1/vcs/*` body can nest lists and objects. `vcs_call` refuses a
+# 2xx answer over the bound and takes the parts that are too deep out of a
+# refusal. A broker answer is a few levels deep. Python 3.14 parses a body of
+# 100,000 levels, and `json.dumps` and `repr` then raise RecursionError on the
+# result, in whatever caller uses it. The bound is under the limit of each of
+# them, and it is the bound of the version-control skill's print step. The
+# shim holds a `/v1/exec` refusal and a relayed API refusal to the same bound
+# (`_refusal_payload`, `ApiSession._json_body`), with the same trim.
+MAX_VCS_BODY_DEPTH = 500
+# The message of the error for a 2xx body over that bound. It names no value:
+# `vcs_client` gives the caller a text of its own.
+_VCS_ANSWER_TOO_DEEP_TEXT = "the broker's answer is JSON nested too deep to read"
+# A refusal over the bound keeps its keys, and each value that is too deep
+# becomes this text. Its `error`, when that is one of them, becomes the status,
+# as for a body that is no refusal document.
+_REFUSAL_PART_TOO_DEEP_TEXT = "left out: nested too deep to read"
+_REFUSAL_ERROR_FIELD = "error"
+_REFUSAL_STATUS_TEXT = "HTTP {status}"
 CLASS_INTERACTIVE = "interactive"
 CLASS_BACKGROUND = "background"
 CLASS_LABEL = "class"
@@ -1426,7 +1444,9 @@ def _merge_context_into_kubeconfig_file(
                 return
             content = path.read_bytes()
             doc = yaml.safe_load(content.decode("utf-8", errors="replace"))
-        except (OSError, yaml.YAMLError, RecursionError):
+        except (OSError, yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError):
+            # The plain exceptions are PyYAML's for a scalar that it cannot
+            # build (`read_current_context` lists them). The file stays as it is.
             return
         if not isinstance(doc, dict):
             return
@@ -1865,6 +1885,10 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
     connection closed while the body was read. The error is closed here, on
     every way out: nothing reads the response again, and the status and the
     headers stay on it.
+
+    A top-level value that puts the refusal over MAX_VCS_BODY_DEPTH gets a text
+    in its place (`_refusal_without_deep_parts`). The parser takes a deeper body
+    than `str` and `print` do, and each reader of a refusal prints its values.
     """
     exc.shim_dropped = False
     exc.shim_payload = None
@@ -1879,7 +1903,7 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
         return None
     finally:
         exc.close()
-    exc.shim_payload = payload if isinstance(payload, dict) else None
+    exc.shim_payload = _refusal_without_deep_parts(payload, exc.code) if isinstance(payload, dict) else None
     return exc.shim_payload
 
 
@@ -1938,9 +1962,11 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
         print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
         # The verb the policy resolved and whether this was a local render:
         # the agent runtime's refusal stop reads these two lines.
-        if payload.get("verb"):
+        if isinstance(payload.get("verb"), list) and payload["verb"]:
             # Each word is an argv token the agent chose; keep it to one line
-            # and to the characters a verb or resource name is made of.
+            # and to the characters a verb or resource name is made of. A
+            # `verb` that is not a list has no words (a text would give its
+            # letters, one for each word).
             words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
             print(f"policy verb: {' '.join(words)}", file=sys.stderr)
         if payload.get("local_render"):
@@ -2386,6 +2412,30 @@ class BrokerDisconnected(RuntimeError):
     """
 
 
+class VcsAnswerTooDeep(ValueError):
+    """A 2xx `/v1/vcs/*` body that nests deeper than MAX_VCS_BODY_DEPTH, or deeper than the parser goes.
+
+    The request reached the broker, so the verb can have taken effect. A
+    ValueError, as for a body that is not JSON, so a caller with an arm for
+    that one still takes this one.
+    """
+
+
+def nests_deeper_than(document: object, bound: int) -> bool:
+    """Whether `document` nests lists and objects more than `bound` levels. A loop, with no recursion."""
+    layer = [document]
+    for _ in range(bound):
+        layer = [
+            child
+            for node in layer
+            if isinstance(node, (dict, list))
+            for child in (node.values() if isinstance(node, dict) else node)
+        ]
+        if not layer:
+            return False
+    return any(isinstance(node, (dict, list)) for node in layer)
+
+
 class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
@@ -2499,9 +2549,11 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
                 answer = json.load(response)
             except RecursionError as exc:
                 # A body nested deeper than the parser goes. A RuntimeError by
-                # type, so no clause for a body that is not JSON sees it. A
-                # ValueError, as for the answer below that is not an object.
-                raise ValueError("the broker's answer is JSON nested too deep to read") from exc
+                # type, so no clause for a body that is not JSON sees it.
+                raise VcsAnswerTooDeep(_VCS_ANSWER_TOO_DEEP_TEXT) from exc
+            if nests_deeper_than(answer, MAX_VCS_BODY_DEPTH):
+                # The parser took it; an encoder or `repr` of a caller may not.
+                raise VcsAnswerTooDeep(_VCS_ANSWER_TOO_DEEP_TEXT)
             if not isinstance(answer, dict):
                 # Valid JSON, but not an object, and every consumer reads the
                 # answer as one. A ValueError, as for a body that is not JSON:
@@ -2534,6 +2586,8 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
             # Valid JSON, but not an object, so no refusal document either.
             # The status is the whole answer, as above.
             raise _vcs_refusal(exc, {"error": f"HTTP {exc.code}"}, None) from exc
+        if nests_deeper_than(answer, MAX_VCS_BODY_DEPTH):
+            answer = _refusal_without_deep_parts(answer, exc.code)
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
@@ -2548,6 +2602,27 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
         raise
     except (http.client.HTTPException, OSError) as exc:
         raise BrokerDisconnected(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _refusal_without_deep_parts(refusal: dict, status: int) -> dict:
+    """`refusal` with a text in place of each top-level value that puts it over MAX_VCS_BODY_DEPTH.
+
+    The other values stay, so a caller still reads the refusal's `code` and its
+    text. The key of a value that is too deep stays too: a reader then sees a
+    mark that it does not know, and not a mark that is absent, which can have a
+    meaning of its own (a busy refusal with no `bound` is sent again). An
+    `error` that is too deep becomes the status.
+    """
+    trimmed = {}
+    for name, value in refusal.items():
+        # The refusal object is one level; a value has the rest of the bound.
+        if not nests_deeper_than(value, MAX_VCS_BODY_DEPTH - 1):
+            trimmed[name] = value
+        elif name == _REFUSAL_ERROR_FIELD:
+            trimmed[name] = _REFUSAL_STATUS_TEXT.format(status=status)
+        else:
+            trimmed[name] = _REFUSAL_PART_TOO_DEEP_TEXT
+    return trimmed
 
 
 def _vcs_refusal(exc: urllib.error.HTTPError, payload: dict, json_body: object) -> WorkspaceRequestError:
@@ -2676,10 +2751,15 @@ class ApiSession:
     @staticmethod
     def _json_body(response):
         try:
-            return response.json()
+            body = response.json()
         except (ValueError, AttributeError, RecursionError):
             # RecursionError: a body nested deeper than the parser goes.
             return None
+        if isinstance(body, dict):
+            # The retry line prints the refusal's text: as for a `/v1/exec`
+            # refusal, a value that is too deep gets a text in its place.
+            return _refusal_without_deep_parts(body, getattr(response, "status_code", None))
+        return body
 
     def _refused_admission(self, response) -> bool:
         status = getattr(response, "status_code", None)

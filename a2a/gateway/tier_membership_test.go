@@ -11,11 +11,11 @@ import (
 )
 
 func TestParseTierMembership(t *testing.T) {
-	got, err := parseTierMembership(" gchat:a@x.com=oncall, slack:U2=read ,,a2a-google:a@x.com=oncall")
-	if err != nil || len(got) != 3 || got[0] != (TierMember{Backend: "gchat", User: "a@x.com", Tier: "oncall"}) {
+	got, err := parseTierMembership(" gchat:a@x.com=oncall, slack:U2=read ,,a2a-google:a@x.com=oncall, a2a-entra:1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d=oncall")
+	if err != nil || len(got) != 4 || got[0] != (TierMember{Backend: "gchat", User: "a@x.com", Tier: "oncall"}) || got[3].Backend != a2aEntraBackend {
 		t.Fatalf("parse = %+v, %v", got, err)
 	}
-	for _, bad := range []string{"gchat:u", "gchat=read", "teams:u=read", "console:x=read", "a2a:svc=read", "gchat:u=on.call", "gchat:u=read,gchat:u=oncall", "gchat:Alice=read,gchat:alice=oncall", "gchat:=read"} {
+	for _, bad := range []string{"gchat:u", "gchat=read", "teams:u=read", "console:x=read", "a2a:svc=read", "gchat:u=on.call", "gchat:u=read,gchat:u=oncall", "gchat:Alice=read,gchat:alice=oncall", "gchat:=read", "a2a-entra:1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D=read,a2a-entra:1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d=oncall"} {
 		if _, err := parseTierMembership(bad); err == nil {
 			t.Errorf("parse(%q) accepted a bad list", bad)
 		}
@@ -117,14 +117,16 @@ func TestTierForRefusesAnUnknownAuthorListWithMembership(t *testing.T) {
 	}
 }
 
-// A member is keyed as their turns are: a Google Chat email case-blind, and
-// an a2a-google email as the door's caller for it (a2aGoogleCaller).
+// A member is keyed as their turns are: a Google Chat email case-blind, an
+// a2a-google email as the door's caller for it (a2aGoogleCaller), and an
+// a2a-entra object id as the door's caller for it (a2aEntraCaller).
 func TestTierMembersAreKeyedAsTheirTurns(t *testing.T) {
 	ps := NewPseudonymizer([]byte("salt"))
-	got := buildTierMembers([]TierMember{{gchatBackend, "Alice@X.com", "oncall"}, {a2aGoogleBackend, "bob@x.com", "oncall"}}, ps)
+	got := buildTierMembers([]TierMember{{gchatBackend, "Alice@X.com", "oncall"}, {a2aGoogleBackend, "bob@x.com", "oncall"}, {a2aEntraBackend, entraTestObjectID, "oncall"}}, ps)
 	for _, r := range []TaskRequester{
 		{Backend: gchatBackend, Subject: requesterSubject(ps, gchatBackend, "alice@x.com")},
 		{Backend: a2aGoogleBackend, Subject: requesterSubject(ps, a2aGoogleBackend, a2aGoogleCaller("bob@x.com"))},
+		{Backend: a2aEntraBackend, Subject: requesterSubject(ps, a2aEntraBackend, a2aEntraCaller(entraTestObjectID))},
 	} {
 		if got[r] != "oncall" {
 			t.Errorf("%s's turn doesn't find its member: %v", r.Backend, got)

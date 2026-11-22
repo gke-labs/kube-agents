@@ -76,7 +76,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NamedTuple
 
-# The shared scripts dir holds github_token_refresh and gitops_workspace (see
+# The shared scripts dir holds github_token_refresh, gitops_workspace and the
+# fix_recipes package (the no-pdb generator) (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
 # copied per-profile). The import itself is lazy so `--dry-run` works on a dev
 # machine with no sandbox. The third entry is the same directory in a source
@@ -2224,11 +2225,9 @@ RUN_RECORD_STARTED_KEY = "started_at"
 # cleared finding of it `manual`: a PodDisruptionBudget is fully determined by
 # the workload's selector (obtainability SOP §3.3), which the collector reads.
 GENERATED_FIX_CHECK = "no-pdb"
-# The new file `finish` writes beside the workload's declaration.
-GENERATED_PDB_SUFFIX = "-pdb"
+# The extension of the new file `finish` writes beside the workload's
+# declaration; its name is the recipe's (`fix_recipes/no-pdb/fix.py`).
 GENERATED_PDB_EXTENSION = ".yaml"
-# A DNS-1123 subdomain, what Kubernetes requires of a PDB's name and namespace.
-KUBERNETES_NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 # A clone's own directory, which no search of the repository's files enters.
 GIT_DIR_NAME = ".git"
 # What marks a directory as a Kustomize root, as the collector reads it: a
@@ -2302,8 +2301,6 @@ HTTP_TOO_MANY_REQUESTS = 429
 MANUAL_NOTE_MANIFEST_LINES = 60
 # The last line of a copied file that went past either cap.
 MANUAL_NOTE_TRUNCATED = "# (truncated)"
-# The selector keys `policy/v1` takes, and nothing else.
-LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
 GENERATED_FIX_NOTE = (
     "_(The audit wrote this PodDisruptionBudget from the workload's own selector, "
@@ -2901,7 +2898,7 @@ def _manifest_delta():
 # The install's auto-merge switch (`KUBEAGENTS_AUTOMERGE`, read by
 # kubeagents_switches.py in the shared scripts directory). Anything but "off"
 # has every disruption-budget fix checked against its cluster before its pull
-# request opens, and the answer written into the body (pdb_safety.py).
+# request opens, and the answer written into the body (fix_preflight.py).
 AUTOMERGE_SWITCH = "AUTOMERGE"
 SWITCH_OFF = "off"
 AUTOMERGE_PRACTICE = "practice"
@@ -2922,7 +2919,7 @@ def automerge_switch() -> str:
         return SWITCH_OFF
 
 
-def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
+def safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
     """The safety-check section for a group's disruption-budget fixes, or "".
 
     "" while the auto-merge switch is off, and for a group with no `no-pdb`
@@ -2944,7 +2941,7 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:
         sys.path.insert(0, here)
-    import pdb_safety  # lazy, as manifest_delta is
+    import fix_preflight as preflight  # lazy, as manifest_delta is
 
     read = {
         str(entry.get("name") or "")
@@ -2962,13 +2959,14 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(
+                "checks": preflight.unanswered(
+                    GENERATED_FIX_CHECK,
                     "the audit did not write this file on this run at the path it chooses for the budget, so it was not read again"
                 ),
             })
             continue
         try:
-            answer = pdb_safety.check_fix(
+            answer = preflight.check_fix(
                 finding,
                 raw.decode("utf-8", errors="replace") if raw is not None else None,
                 in_manifest=str(finding.get("cluster") or "") in read,
@@ -2978,12 +2976,12 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
                 "finding_id": str(finding.get("id", "")),
                 "command": "",
                 "eligible": False,
-                "checks": pdb_safety._unanswered(f"the check failed ({type(exc).__name__}: {exc})"),
+                "checks": preflight.unanswered(GENERATED_FIX_CHECK, f"the check failed ({type(exc).__name__}: {exc})"),
             }
         answers.append(answer)
     eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
     log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
-    return pdb_safety.render_section(
+    return preflight.render_section(
         answers, eligible=eligible, noun=noun, clean=publishable_text, practice=automerge_switch() == AUTOMERGE_PRACTICE
     )
 
@@ -3195,7 +3193,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Nine markers. A cost collector sets `service-fronted` on an idle
+# Twelve markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -3211,6 +3209,12 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # two files, where a finding carries one `remediation.path`, so the sweep's
 # pull request would land a class nothing selects. `/remediate` opens the same
 # one-file pull request, for a person who knows to add the selector to it.
+#
+# The stockout collector also sets `reserved-pool` on a §3.10(d) finding, a
+# node pool whose named reservation is in none of its zones. Each fix creates
+# a reservation, which is billed from the moment it exists, or replaces the
+# pool. The SOP has that finding published as `manual`, and the marker keeps a
+# `manifest` the model wrote anyway out of the sweep.
 #
 # The cost collector sets `autopilot-bumped` on a sizing finding (§3.1, §3.12)
 # whose `major` grade the Autopilot bump supplied rather than its magnitude.
@@ -3247,6 +3251,7 @@ TRIAGE_REASONS = {
     "service-fronted": "stands down a controller a Service routes to",
     "new-computeclass": "needs a new ComputeClass and a workload that selects it",
     "class-status": "changes a node pool or a ComputeClass, and the audit did not read what else runs on that pool",
+    "reserved-pool": "creates a billed reservation or replaces the node pool",
     "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",
@@ -4462,6 +4467,179 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     return root.joinpath(audit_id, *segments)
 
 
+# The broker store (#5619): with FLEET_AUDIT_REPORT_STORE=broker, which the
+# operator renders on the shell sandbox and on profile workers, every read and
+# write below goes to the credential broker's /v1/audit-reports instead of the
+# directory reports_dir_for names. The client is report_status.py's
+# (BrokerReportStore), so the two scripts cannot spell a request differently;
+# report_status imports nothing outside the standard library. The names,
+# semantics and order are the file store's: the ring entry, then latest as its
+# byte copy, latest dropped before each ledger rewrite and after a failed
+# write, and the server prunes the ring.
+_REPORT_STORE_LOGGED: set[str] = set()
+
+
+def _report_status():
+    """report_status.py beside this file, imported on first use, as
+    `_manifest_delta` is."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import report_status
+
+    return report_status
+
+
+def _report_store_client():
+    """The broker store client when FLEET_AUDIT_REPORT_STORE is `broker`, else
+    None for the file store. Logs which, once per choice per process, whenever
+    the switch is set to anything. With it unset the file store is used and
+    nothing is logged, so `finish`'s stderr stays what it was before the switch
+    (TestFinishWithoutAManifestIsUnchanged records it byte for byte)."""
+    status = _report_status()
+    store, line = status.select_report_store(log=log)
+    if os.environ.get(status.REPORT_STORE_ENV, "").strip() and line not in _REPORT_STORE_LOGGED:
+        _REPORT_STORE_LOGGED.add(line)
+        log(line)
+    if not isinstance(store, status.BrokerReportStore):
+        return None
+    # One client per process and URL, so a stream is checked for a seed once.
+    cached = _BROKER_CLIENTS.get(str(store))
+    if cached is None or cached.local_root != store.local_root:
+        _BROKER_CLIENTS[str(store)] = cached = store
+    return cached
+
+
+_BROKER_CLIENTS: dict = {}
+
+
+class _FileStoreDir:
+    """One stream's store for one repository in the file store: the
+    directory reports_dir_for names. Names are relative to it: `latest.json`
+    and `runs/<stamp>.json`."""
+
+    def __init__(self, directory: Path):
+        self.path = directory
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def has(self, name: str) -> bool:
+        return (self.path / name).exists()
+
+    def read(self, name: str) -> str:
+        return (self.path / name).read_text(encoding="utf-8")
+
+    def ring(self) -> list[str]:
+        """The ring's names, oldest first."""
+        return sorted(p.name for p in (self.path / REPORT_RUNS_DIR).glob("*.json"))
+
+    def write_run(self, name: str, text: str) -> None:
+        runs = self.path / REPORT_RUNS_DIR
+        _make_store_dirs(runs)
+        _atomic_write(runs / name, text)
+
+    def write_latest(self, text: str) -> None:
+        _atomic_write(self.path / REPORT_LATEST_NAME, text)
+
+    def delete_latest(self, missing_ok: bool = False) -> None:
+        (self.path / REPORT_LATEST_NAME).unlink(missing_ok=missing_ok)
+
+    def prune(self) -> None:
+        for stale in sorted((self.path / REPORT_RUNS_DIR).glob("*.json"))[:-REPORT_HISTORY]:
+            stale.unlink()
+
+
+class _BrokerStoreDir:
+    """The same stream store, through the broker (report_status.BrokerReportStore).
+
+    Reads are cached for the life of this object, which a caller makes per
+    question, so `has` then `read` is one request. A store the broker cannot
+    answer for is there and unreadable, never absent: absent would read as a
+    first run, where unreadable is a lost memory.
+    """
+
+    def __init__(self, client, audit_id: str, repo: str):
+        self.client = client
+        self.audit_id = audit_id
+        self.repo = repo
+        self._reads: dict[str, object] = {}
+
+    def __str__(self) -> str:
+        return f"{self.client} {self.audit_id}/{self.repo}"
+
+    def _get(self, name: str) -> bytes | None:
+        if name not in self._reads:
+            try:
+                if name == REPORT_LATEST_NAME:
+                    value: object = self.client.read_latest(self.audit_id, self.repo)
+                else:
+                    value = self.client.read_run(self.audit_id, self.repo, name[len(REPORT_RUNS_DIR) + 1 :])
+            except OSError as exc:
+                value = exc
+            self._reads[name] = value
+        value = self._reads[name]
+        if isinstance(value, BaseException):
+            raise value
+        return value  # type: ignore[return-value]
+
+    def exists(self) -> bool:
+        try:
+            return self.has(REPORT_LATEST_NAME) or bool(self.ring())
+        except OSError:
+            return True
+
+    def has(self, name: str) -> bool:
+        try:
+            return self._get(name) is not None
+        except OSError:
+            return True
+
+    def read(self, name: str) -> str:
+        data = self._get(name)
+        if data is None:
+            raise FileNotFoundError(f"{self}: no {name}")
+        return data.decode("utf-8")
+
+    def ring(self) -> list[str]:
+        return self.client.list_runs(self.audit_id, self.repo)
+
+    def write_run(self, name: str, text: str) -> None:
+        self._reads.clear()
+        self.client.write_run(self.audit_id, self.repo, name, text.encode("utf-8"))
+
+    def write_latest(self, text: str) -> None:
+        self._reads.clear()
+        self.client.write_latest(self.audit_id, self.repo, text.encode("utf-8"))
+
+    def delete_latest(self, missing_ok: bool = False) -> None:
+        # The broker answers 204 whether or not there was one.
+        self._reads.clear()
+        self.client.delete_latest(self.audit_id, self.repo)
+
+    def prune(self) -> None:
+        """The listener prunes the ring on every write."""
+
+
+def report_store_dir(audit_id: str, repo: str):
+    """The store for one stream's ledger in one repository: the file store's
+    directory (reports_dir_for), or the broker store's when it is selected.
+    ValueError for a `repo` reports_dir_for refuses, either way."""
+    directory = reports_dir_for(audit_id, repo)
+    client = _report_store_client()
+    if client is None:
+        return _FileStoreDir(directory)
+    return _BrokerStoreDir(client, audit_id, repo)
+
+
+def _as_store_dir(directory):
+    """A store directory; a Path is the file store's."""
+    return _FileStoreDir(directory) if isinstance(directory, Path) else directory
+
+
 def _redact_document(value: object) -> object:
     """`value` with the body's redaction backstop applied to every string in it.
 
@@ -5219,18 +5397,16 @@ def write_report(
     describes that body exactly.
     """
     try:
-        directory = reports_dir_for(audit_id, str(envelope.get("repo")))
+        store = report_store_dir(audit_id, str(envelope.get("repo")))
     except ValueError as exc:
         log(f"WARNING: report store write for {audit_id} skipped: {exc}")
         return False
-    runs = directory / REPORT_RUNS_DIR
     try:
-        _make_store_dirs(runs)
         text = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
         stamp = now.astimezone(timezone.utc).strftime(REPORT_STAMP_FORMAT)
-        _atomic_write(runs / f"{stamp}.json", text)
+        store.write_run(f"{stamp}.json", text)
         # A copy, not a symlink: one fewer behaviour to ask of the mount.
-        _atomic_write(directory / REPORT_LATEST_NAME, text)
+        store.write_latest(text)
     except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
         log(f"WARNING: report store write for {audit_id} failed: {exc}{_ownership_note(exc)}")
         if ledger_unchanged:
@@ -5242,7 +5418,7 @@ def write_report(
         # same ledger, same scheme, so the next run would trust a memory that
         # lacks everything this one published. Absent is honest; stale is not.
         try:
-            (directory / REPORT_LATEST_NAME).unlink(missing_ok=True)
+            store.delete_latest(missing_ok=True)
         except OSError as unlink_exc:
             log(
                 f"WARNING: could not drop the stale latest.json for {audit_id}: "
@@ -5250,8 +5426,7 @@ def write_report(
             )
         return False
     try:
-        for stale in sorted(runs.glob("*.json"))[:-REPORT_HISTORY]:
-            stale.unlink()
+        store.prune()
     except Exception as exc:  # noqa: BLE001 — the memory is already written
         # Not the invalidating path above: the envelope landed and is correct,
         # and an over-long ring costs disk rather than accuracy.
@@ -5283,12 +5458,12 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     if issue_number is None:
         return None
     try:
-        path = reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME
+        store = report_store_dir(audit_id, repo)
     except ValueError as exc:
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None
     try:
-        envelope = json.loads(path.read_text(encoding="utf-8"))
+        envelope = json.loads(store.read(REPORT_LATEST_NAME))
     except FileNotFoundError:
         log(
             f"No stored report for {audit_id} in {repo}, but issue #{issue_number} is open; "
@@ -5308,7 +5483,7 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         # A run that could not reach this repository stored its envelope here
         # with no ledger. The memory is the newest envelope a run that
         # published here wrote, from the ring.
-        envelope = _newest_published_envelope(path.parent / REPORT_RUNS_DIR)
+        envelope = _newest_published_envelope(store)
         if envelope is None:
             log(
                 f"Stored reports for {audit_id} in {repo} since the last published run are "
@@ -5333,26 +5508,51 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     return envelope
 
 
-def _ring_envelopes(runs: Path) -> list[dict]:
-    """The readable envelopes in the `runs/` ring, newest first."""
+def _ring_envelopes(store) -> list[dict]:
+    """The readable envelopes in the `runs/` ring of a store directory, newest first."""
+    return _read_ring_envelopes(store)[0]
+
+
+def _read_ring_envelopes(store) -> tuple[list[dict], bool]:
+    """`_ring_envelopes`, and whether the store answered for its whole ring:
+    False when the listing or a read of an entry failed (an OSError other
+    than the entry being gone), so a reader can tell a ring it could not read
+    from an empty one. An entry that is not a JSON object was read, and is
+    skipped."""
+    store = _as_store_dir(store)
     try:
-        paths = sorted(runs.glob("*.json"), reverse=True)
+        names = sorted(store.ring(), reverse=True)
     except OSError:
-        return []
+        return [], False
     envelopes = []
-    for path in paths:
+    answered = True
+    for name in names:
         try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            envelope = json.loads(store.read(f"{REPORT_RUNS_DIR}/{name}"))
+        except FileNotFoundError:
+            continue  # pruned since the listing: gone, not unread
+        except OSError:
+            answered = False
+            continue
+        except ValueError:
             continue
         if isinstance(envelope, dict):
             envelopes.append(envelope)
-    return envelopes
+    return envelopes, answered
 
 
-def _newest_published_envelope(runs: Path) -> dict | None:
-    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
-    return next((e for e in _ring_envelopes(runs) if not is_diverted(e)), None)
+def _newest_published_envelope(store) -> dict | None:
+    """The newest envelope in a store directory's `runs/` ring that `is_diverted` does not mark, or None."""
+    return _read_newest_published_envelope(store)[0]
+
+
+def _read_newest_published_envelope(store) -> tuple[dict | None, bool]:
+    """`_newest_published_envelope`, and whether None means the ring holds no
+    such envelope: False when none was found and part of the ring could not
+    be read (`_read_ring_envelopes`), where one may be."""
+    envelopes, answered = _read_ring_envelopes(store)
+    envelope = next((e for e in envelopes if not is_diverted(e)), None)
+    return envelope, envelope is not None or answered
 
 
 def _envelope_document(envelope: object, key: str) -> dict | None:
@@ -5396,7 +5596,7 @@ def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
     if not repo:
         return None
     try:
-        directory = reports_dir_for(audit_id, repo)
+        directory = report_store_dir(audit_id, repo)
     except ValueError:
         return None
     key = _ledger_key(repo)
@@ -5419,7 +5619,7 @@ def invalidate_report_memory(audit_id: str, repo: str) -> None:
     issue is never trusted again anyway. The ring is left alone.
     """
     try:
-        (reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME).unlink()
+        report_store_dir(audit_id, repo).delete_latest()
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:
@@ -5523,15 +5723,21 @@ def store_never_published(directory: Path) -> bool:
     that is not marked: a run that could not reach the repository creates
     the directory, but it leaves no memory of the ledger. An unreadable or
     absent `latest.json` in a directory that exists is a lost memory, not a
-    store that was never written.
+    store that was never written, and so is a ring that could not be read
+    behind a marked one: a published envelope may be in it. `directory` is a store directory
+    (report_store_dir) or the file store's Path.
     """
-    if not directory.exists():
+    store = _as_store_dir(directory)
+    if not store.exists():
         return True
     try:
-        latest = json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8"))
+        latest = json.loads(store.read(REPORT_LATEST_NAME))
     except (OSError, ValueError):
         return False
-    return is_diverted(latest) and _newest_published_envelope(directory / REPORT_RUNS_DIR) is None
+    if not is_diverted(latest):
+        return False
+    envelope, known = _read_newest_published_envelope(store)
+    return envelope is None and known
 
 
 def previous_run_memory(
@@ -5549,7 +5755,7 @@ def previous_run_memory(
     if issue_number is None:
         return None
     try:
-        never_stored = store_never_published(reports_dir_for(audit_id, repo))
+        never_stored = store_never_published(report_store_dir(audit_id, repo))
     except ValueError:
         never_stored = False
     if never_stored:
@@ -10268,25 +10474,30 @@ def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
     return [str(fid) for fid in stored] if isinstance(stored, list) else None
 
 
-def first_stored_record(directory: Path, trusted: Callable[[dict], bool]) -> dict | None:
+def first_stored_record(directory, trusted: Callable[[dict], bool]) -> dict | None:
     """The newest stored envelope in `directory` that `trusted` accepts.
 
     `latest.json` first, then the `runs/` ring from newest to oldest: a
     failed write drops `latest.json` and leaves the ring. `{}` when the
     directory holds no envelope at all. None when it holds envelopes and
-    none can be read or `trusted` accepts none.
+    none can be read or `trusted` accepts none, and when the ring cannot be
+    listed and no `latest.json` was read and trusted: an unlisted ring may
+    hold envelopes, so it is never "no envelope at all". `directory` is a store
+    directory (report_store_dir) or the file store's Path.
     """
-    candidates = [directory / REPORT_LATEST_NAME]
+    store = _as_store_dir(directory)
+    candidates = [REPORT_LATEST_NAME]
+    listed = True
     try:
-        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
+        candidates.extend(f"{REPORT_RUNS_DIR}/{name}" for name in sorted(store.ring(), reverse=True))
     except OSError:
-        pass
-    present = [path for path in candidates if path.exists()]
+        listed = False
+    present = [name for name in candidates if store.has(name)]
     if not present:
-        return {}
-    for path in present:
+        return {} if listed else None
+    for name in present:
         try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
+            envelope = json.loads(store.read(name))
         except (OSError, ValueError):
             continue
         if isinstance(envelope, dict) and trusted(envelope):
@@ -10311,7 +10522,7 @@ def newest_stored_record(audit_id: str, repo: str) -> dict | None:
     when the store holds only marked envelopes, the answer is None.
     """
     try:
-        directory = reports_dir_for(audit_id, repo)
+        directory = report_store_dir(audit_id, repo)
     except ValueError:
         return None
     key = _ledger_key(repo)
@@ -15080,7 +15291,7 @@ def render_remediation_pr_body(
     `unlabelled` is a forge with no labels: the body then also carries the
     stream marker, which is how the next run finds this pull request.
 
-    `safety` is `pdb_safety_section`'s answer, placed after the files.
+    `safety` is `safety_section`'s answer, placed after the files.
     """
     ordered = sort_findings(group)
     ids = sorted(str(f.get("id", "")) for f in ordered if f.get("id"))
@@ -16672,12 +16883,12 @@ def _stored_ledger_numbers(audit_id: str, repo: str) -> list[int]:
     the list is short, and it usually has one number.
     """
     try:
-        directory = reports_dir_for(audit_id, repo)
+        store = report_store_dir(audit_id, repo)
     except ValueError:
         return []
-    envelopes = _ring_envelopes(directory / REPORT_RUNS_DIR)
+    envelopes = _ring_envelopes(store)
     try:
-        envelopes.append(json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8")))
+        envelopes.append(json.loads(store.read(REPORT_LATEST_NAME)))
     except (OSError, ValueError):
         pass
     numbers: set[int] = set()
@@ -17923,7 +18134,7 @@ def open_remediation_pr(
     # known is taken to have labels, and the label write below corrects it.
     labelled = _LABELS.get(repo, True)
     # Read once: the label fallback below re-renders the same body.
-    safety = pdb_safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
+    safety = safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
     body = render_remediation_pr_body(
         audit_id,
         group,
@@ -18023,7 +18234,7 @@ def carries_practice_label(pr: dict | None) -> bool:
 def request_practice_label(repo: str, number: int | str) -> None:
     """Ask the broker to judge pull request `number` for the auto-merge label.
 
-    Called where `pdb_safety_section` wrote a section (the switch on, a group
+    Called where `safety_section` wrote a section (the switch on, a group
     holding a disruption-budget fix), and on a refresh of a pull request that
     already carries the label. The broker reads everything itself and decides;
     this sends the number and logs the answer. A refusal is logged and nothing
@@ -18735,53 +18946,27 @@ def unwritten_refusal_message(
     return " ".join(parts)
 
 
+def _no_pdb_fix():
+    """The `no-pdb` recipe's generator (`fix_recipes/no-pdb/fix.py`).
+
+    Lazy, as `gitops_workspace` is (the module comment on `sys.path`)."""
+    from fix_recipes import registry
+
+    return registry.generator(GENERATED_FIX_CHECK)
+
+
 def _pdb_unbuildable_reason(candidate: dict) -> str:
     """Why `_pdb_manifest` builds nothing for `candidate`, in the refusal's words,
-    or "" where it builds one. The one place those refusals are decided, so the
-    note the worker reads names the refusal `_pdb_manifest` made."""
-    selector = candidate.get("pod_selector")
-    if not isinstance(selector, dict) or not selector:
-        return "the collector attached no selector to write it from"
-    if set(selector) - LABEL_SELECTOR_KEYS:
-        return "the collector's selector has keys `policy/v1` does not take"
-    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
-        return "the collector's selector is empty, and would select every pod in the namespace"
-    workload = str(candidate.get("object") or "").partition("/")[2]
-    if not KUBERNETES_NAME_PATTERN.match(f"{workload}{GENERATED_PDB_SUFFIX}"):
-        return "its name would not be a valid Kubernetes name"
-    if not KUBERNETES_NAME_PATTERN.match(str(candidate.get("namespace") or "")):
-        return "the collector named no valid namespace for it"
-    return ""
+    or "" where it builds one: the recipe's `unbuildable_reason`, so the note the
+    worker reads names the refusal `_pdb_manifest` made."""
+    return _no_pdb_fix().unbuildable_reason(candidate)
 
 
 def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
-    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None.
-
-    `maxUnavailable: 1` and the workload's `spec.selector` verbatim, which the
-    collector carries as `pod_selector`. None where that cannot be written
-    safely (`_pdb_unbuildable_reason`): no selector, an empty one (which would
-    select every pod in the namespace), keys `policy/v1` does not take, or a
-    name or namespace Kubernetes refuses.
-    """
-    if _pdb_unbuildable_reason(candidate):
-        return None
-    selector = candidate["pod_selector"]
-    name = f"{str(candidate.get('object') or '').partition('/')[2]}{GENERATED_PDB_SUFFIX}"
-    namespace = str(candidate.get("namespace") or "")
-    # JSON is YAML, so the selector is written exactly as it was read.
-    text = (
-        f"# {candidate.get('cluster', '')}: {GENERATED_FIX_CHECK} on {candidate.get('object')} "
-        f"({finding_id})\n"
-        "apiVersion: policy/v1\n"
-        "kind: PodDisruptionBudget\n"
-        "metadata:\n"
-        f"  name: {name}\n"
-        f"  namespace: {namespace}\n"
-        "spec:\n"
-        "  maxUnavailable: 1\n"
-        f"  selector: {json.dumps(selector, sort_keys=True)}\n"
-    )
-    return name, text
+    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None: the
+    `no-pdb` recipe's `generate` (`fix_recipes/no-pdb/fix.py`), which says when
+    it refuses and pins the text byte for byte."""
+    return _no_pdb_fix().generate(candidate, finding_id)
 
 
 def _broker_outage(exc: BaseException) -> bool:
@@ -23158,7 +23343,7 @@ def _open_promoted_prs(
     """Open (or refresh) one pull request per group holding a promoted finding.
 
     `on_open` runs after each one, before the next is tried. `manifest` is the
-    run's collector manifest, which `pdb_safety_section` needs.
+    run's collector manifest, which `safety_section` needs.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
@@ -23804,7 +23989,7 @@ def _previous_store_envelope(
     path, which closes fixes, reads `_store_ledger_envelope` instead.
     """
     try:
-        directory = reports_dir_for(audit_id, store_repo)
+        directory = report_store_dir(audit_id, store_repo)
     except ValueError as exc:
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None, False
@@ -23882,7 +24067,7 @@ def _store_ledger_envelope(
       one that failed; trusting it would miss what the failed run published.
     - A diverted `latest.json` (`is_diverted`) defers to the newest envelope in
       `runs/` that is not diverted (`_newest_published_envelope`). When there
-      is none, and the ring is shorter than `REPORT_HISTORY` and no fix of
+      is none in a ring read whole, and the ring is shorter than `REPORT_HISTORY` and no fix of
       this stream is open, no run ever stored a ledger here and nothing can
       close: the run is first, as when a run that could not reach the
       repository created the directory. Otherwise the memory stays lost: a
@@ -23899,7 +24084,7 @@ def _store_ledger_envelope(
       stored body of another scheme.
     """
     try:
-        directory = reports_dir_for(audit_id, repo)
+        directory = report_store_dir(audit_id, repo)
     except ValueError as exc:
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None, False
@@ -23917,9 +24102,8 @@ def _store_ledger_envelope(
             f"stream is open; {MEMORY_UNKNOWABLE}"
         )
         return None, False
-    path = directory / REPORT_LATEST_NAME
     try:
-        envelope = json.loads(path.read_text(encoding="utf-8"))
+        envelope = json.loads(directory.read(REPORT_LATEST_NAME))
     except FileNotFoundError:
         log(
             f"No stored ledger for {audit_id} in {repo}: latest.json is absent from a store "
@@ -23933,11 +24117,10 @@ def _store_ledger_envelope(
         )
         return None, False
     if is_diverted(envelope):
-        runs = directory / REPORT_RUNS_DIR
-        envelope = _newest_published_envelope(runs)
-        if envelope is None and open_fix is False:
+        envelope, known = _read_newest_published_envelope(directory)
+        if envelope is None and open_fix is False and known:
             try:
-                ring = len(list(runs.glob("*.json")))
+                ring = len(directory.ring())
             except OSError:
                 ring = REPORT_HISTORY
             if ring < REPORT_HISTORY:
@@ -25316,7 +25499,7 @@ def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | No
     except Exception as exc:  # noqa: BLE001 -- a resolver failure is a reason to run in full
         return None, f"the repository could not be resolved ({exc})"
     try:
-        directory = reports_dir_for(audit_id, store_repo)
+        directory = report_store_dir(audit_id, store_repo)
     except ValueError as exc:
         return None, f"no report store for {store_repo} ({exc})"
     key = _ledger_key(store_repo)

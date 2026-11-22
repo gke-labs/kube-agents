@@ -220,7 +220,7 @@ func TestTheTriggerGrantsFollowTheScheduleSwitch(t *testing.T) {
 	}
 	t.Setenv(AgentSchedulesEnvVar, "true")
 	id, _ = operatorIdentity()
-	for _, want := range []string{triggerSubmitSubject, triggerStatusSubject} {
+	for _, want := range []string{triggerSubmitSubject, triggerStatusSubject, triggerStopSubject} {
 		if !slices.Contains(id.publish, want) {
 			t.Errorf("operator publish lacks %q", want)
 		}
@@ -229,7 +229,7 @@ func TestTheTriggerGrantsFollowTheScheduleSwitch(t *testing.T) {
 		t.Errorf("operator subscribe lacks %q", triggerReplyPrefix+">")
 	}
 	gw := gatewayIdentity(a2aTestAgent(), "kubeagents-system")
-	for _, want := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status"} {
+	for _, want := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status", "a2a.trigger.*.stop"} {
 		if !slices.Contains(gw.subscribe, want) {
 			t.Errorf("gateway subscribe lacks %q", want)
 		}
@@ -286,14 +286,17 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 	t.Cleanup(gateway.Close)
 	answer := func(m *nats.Msg) {
 		var data []byte
-		if m.Subject == triggerSubmitSubject {
+		switch m.Subject {
+		case triggerSubmitSubject:
 			data, _ = json.Marshal(triggerSubmitReplyWire{TaskID: "task-1"})
-		} else {
+		case triggerStopSubject:
+			data, _ = json.Marshal(triggerStopReplyWire{Result: triggerStopStopped})
+		default:
 			data, _ = json.Marshal(triggerStatusReplyWire{Found: true, State: "working"})
 		}
 		_ = m.Respond(data)
 	}
-	for _, subject := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status"} {
+	for _, subject := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status", "a2a.trigger.*.stop"} {
 		if _, err := gateway.Subscribe(subject, answer); err != nil {
 			t.Fatal(err)
 		}
@@ -313,8 +316,12 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 	if st, err := sub.State(context.Background(), submitterSchedule(), "task-1"); err != nil || !st.Found {
 		t.Fatalf("status under the rendered grants: %+v, %v", st, err)
 	}
+	if res, err := sub.Stop(context.Background(), submitterSchedule(), "task-1"); err != nil || res != triggerStopStopped {
+		t.Fatalf("stop under the rendered grants: %q, %v", res, err)
+	}
 
 	_ = operator.Publish("a2a.trigger.drift-detector.submit", []byte("{}"))
+	_ = operator.Publish("a2a.trigger.drift-detector.stop", []byte("{}"))
 	if _, err := operator.SubscribeSync("a2a.trigger.reply.drift-detector.>"); err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +331,7 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 		mu.Lock()
 		n := len(violations)
 		mu.Unlock()
-		if n >= 2 {
+		if n >= 3 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -332,7 +339,7 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	joined := strings.Join(violations, "\n")
-	for _, s := range []string{"a2a.trigger.drift-detector.submit", "a2a.trigger.reply.drift-detector.>"} {
+	for _, s := range []string{"a2a.trigger.drift-detector.submit", "a2a.trigger.drift-detector.stop", "a2a.trigger.reply.drift-detector.>"} {
 		if !strings.Contains(joined, s) {
 			t.Errorf("the operator was not refused on %q; got:\n%s", s, joined)
 		}

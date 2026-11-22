@@ -17,8 +17,8 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 # make command line only: the golang image exports an environment variable of
 # the same name (a bare version, no `-alpine`), and a build inside such a
 # container must not take its builder tag from there.
-ifeq ($(origin GOLANG_VERSION),environment)
-GOLANG_VERSION :=
+ifneq ($(filter environment%,$(origin GOLANG_VERSION)),)
+override GOLANG_VERSION :=
 endif
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE GOLANG_VERSION
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
@@ -940,7 +940,7 @@ skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG=
 skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
 	@$(SKILL_OVERLAY) generate $(SKILL)
 
-skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, and every shipped skill document fits skill_view.
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line, and every shipped skill document fits skill_view.
 	@$(SKILL_OVERLAY) check
 	@python3 scripts/check_skill_size.py
 

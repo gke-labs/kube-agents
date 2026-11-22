@@ -34,6 +34,13 @@ const (
 	// in flight (docs/designs/scheduling-on-profiles.md, section 7).
 	AgentScheduleRunNowAnnotation = "kubeagents.x-k8s.io/run-now"
 
+	// AgentScheduleStopAnnotation asks to stop the run in flight: setting it
+	// to a token the status has not handled yet ends status.activeTaskID
+	// through the gateway, which cancels a running task and removes the Job
+	// of one still starting. With no run in flight, the token is handled and
+	// nothing else happens.
+	AgentScheduleStopAnnotation = "kubeagents.x-k8s.io/stop"
+
 	// AgentScheduleConditionAccepted reports whether the schedule parses and
 	// its profile allows the unattended tier.
 	AgentScheduleConditionAccepted = "Accepted"
@@ -273,6 +280,14 @@ type AgentScheduleStatus struct {
 	// LastHandledRunNow is the last run-now token acted on.
 	// +optional
 	LastHandledRunNow string `json:"lastHandledRunNow,omitempty"`
+	// LastHandledStop is the last stop token acted on.
+	// +optional
+	LastHandledStop string `json:"lastHandledStop,omitempty"`
+	// StoppedTaskID is the run in flight a stop was sent for, until it
+	// settles: a run-now asked for meanwhile waits for it to end rather than
+	// adopting it.
+	// +optional
+	StoppedTaskID string `json:"stoppedTaskID,omitempty"`
 	// SkipCounts counts slots that did not run.
 	// +optional
 	SkipCounts AgentScheduleSkipCounts `json:"skipCounts,omitempty"`

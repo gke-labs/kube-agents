@@ -2822,12 +2822,13 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
-// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
-// config states it.
+// InferenceStatus reports the Platform Agent's default model, and the reasoning effort
+// configured on it, as the install's LiteLLM config states them.
 //
 // A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
-// only, so a project id, a region or an account id never appears here. Both fields are
-// absent when the config states no default model.
+// only, so a project id, a region or an account id never appears here. The provider and
+// model are absent when the config states no default model; the reasoning effort is
+// absent whenever the entry states none.
 type InferenceStatus struct {
 	// Provider is the LiteLLM provider slug, the text before the first "/" of the
 	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
@@ -2838,6 +2839,13 @@ type InferenceStatus struct {
 	// for a resource reference.
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+	// the default model's entry, as typed: low, medium or high from the chart, or
+	// whatever a hand-edited config says. Absent when the entry states none, so the
+	// model thinks at its own default, and absent while the served CRD predates it.
+	// +optional
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
@@ -3488,7 +3496,8 @@ type AgentUsageStatus struct {
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
 	// chat platform the install enables is served through Hermes (Microsoft
-	// Teams), and while the served CRD
+	// Teams, unless the operator arms the gateway's Teams backend), and
+	// while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional
