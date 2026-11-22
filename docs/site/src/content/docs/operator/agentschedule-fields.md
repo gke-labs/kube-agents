@@ -19,7 +19,8 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `suspend` | `boolean` | no |  |  | Suspend skips every run while true. A slot that passes while suspended is counted, not run later. |
 | `profileRef` | `object` | yes |  |  | ProfileRef is the AgentProfile the runs go to. It must allow the unattended tier. |
 | `profileRef.name` | `string` | yes |  | min length `1`; max length `63` | Name is the AgentProfile's name, in the schedule's namespace. |
-| `prompt` | `string` | yes |  | min length `1`; max length `16384` | Prompt is what each run asks. |
+| `prompt` | `string` | no |  | min length `1`; max length `16384` | Prompt is what each run asks. Exactly one of prompt and script is set. |
+| `script` | `string` | no |  | min length `1`; max length `63`; pattern `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$` | Script names a helper script each run executes in place of a model turn: one of the profile's spec.scripts, by name, never a path. It is a DNS-1123 label (no dots), as the run's trigger carries it. Exactly one of prompt and script is set. Only a built-in schedule, one the PlatformAgent renders, may name a script: any other schedule that does is not accepted, and never runs. |
 | `parameters` | `map[string]string` | no |  | max properties `16` | Parameters are passed to each run as task parameters, at most 16, the bound every task submission has. A built-in schedule's report stream is its own name, carried on its trigger, not a parameter. |
 | `skills` | `[]string` | no |  | max items `16` | Skills the run asks the profile to use. |
 | `delivery` | `object` | no | `{}` |  | Delivery is where each run's report goes. Omitted, it is the home channel (chat). |

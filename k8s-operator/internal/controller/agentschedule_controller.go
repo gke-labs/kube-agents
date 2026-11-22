@@ -281,6 +281,23 @@ func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha
 	return agentv1alpha1.AgentScheduleOriginUser
 }
 
+// agentScheduleScriptProblem says why a schedule's prompt or script can't
+// run, or "" when they can. Exactly one of them is set, which the CRD's rule
+// holds too; this is the same check for an object stored without it. A script
+// runs only on a built-in schedule (agentScheduleOrigin): a helper script runs
+// with no model in the loop, so only the operator may pick one, and the
+// gateway, dispatcher and worker each check the script again.
+func agentScheduleScriptProblem(sched *agentv1alpha1.AgentSchedule, origin string) string {
+	hasPrompt, hasScript := sched.Spec.Prompt != "", sched.Spec.Script != ""
+	switch {
+	case hasPrompt == hasScript:
+		return "exactly one of spec.prompt and spec.script must be set"
+	case hasScript && origin != agentv1alpha1.AgentScheduleOriginBuiltin:
+		return fmt.Sprintf("spec.script names helper script %q, which only a built-in schedule the PlatformAgent renders may run", sched.Spec.Script)
+	}
+	return ""
+}
+
 // controlledByAPlatformAgent reports whether the schedule's controller
 // reference names a PlatformAgent, not only its uid: metav1.IsControlledBy
 // compares uids alone.
@@ -394,7 +411,13 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 		return nil, nil, false, nil
 	}
 	agent := &agents.Items[0]
-	if agentScheduleOrigin(sched, agent, r.builtinNames(agent)) != agentv1alpha1.AgentScheduleOriginBuiltin {
+	origin := agentScheduleOrigin(sched, agent, r.builtinNames(agent))
+	if msg := agentScheduleScriptProblem(sched, origin); msg != "" {
+		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, agentScheduleReasonInvalidSchedule, msg
+		meta.SetStatusCondition(&sched.Status.Conditions, cond)
+		return nil, nil, false, nil
+	}
+	if origin != agentv1alpha1.AgentScheduleOriginBuiltin {
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonUserDeferred
 		cond.Message = "only schedules the PlatformAgent renders run for now; user schedules wait on Track 7 (#5624)"
 		if sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin {

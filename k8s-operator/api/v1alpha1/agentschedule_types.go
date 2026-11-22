@@ -115,6 +115,7 @@ type AgentScheduleDelivery struct {
 // AgentScheduleSpec is a recurring task: when it runs, which profile runs
 // it, and what it asks (docs/designs/scheduling-on-profiles.md, section 1).
 // Each run is submitted through the A2A gateway as an Unattended task.
+// +kubebuilder:validation:XValidation:rule="has(self.prompt) != has(self.script)",message="exactly one of spec.prompt and spec.script must be set"
 type AgentScheduleSpec struct {
 	// Schedule is a 5-field cron expression, read in UTC.
 	// +kubebuilder:validation:XValidation:rule="self.trim().split(' ').filter(f, f != '').size() == 5",message="schedule must be a 5-field cron expression (minute hour day-of-month month day-of-week)"
@@ -132,11 +133,24 @@ type AgentScheduleSpec struct {
 	// +required
 	ProfileRef AgentScheduleProfileRef `json:"profileRef"`
 
-	// Prompt is what each run asks.
+	// Prompt is what each run asks. Exactly one of prompt and script is
+	// set.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=16384
-	// +required
-	Prompt string `json:"prompt"`
+	// +optional
+	Prompt string `json:"prompt,omitempty"`
+
+	// Script names a helper script each run executes in place of a model
+	// turn: one of the profile's spec.scripts, by name, never a path. It is a
+	// DNS-1123 label (no dots), as the run's trigger carries it. Exactly one
+	// of prompt and script is set. Only a built-in schedule, one the
+	// PlatformAgent renders, may name a script: any other schedule that does
+	// is not accepted, and never runs.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`
+	// +optional
+	Script string `json:"script,omitempty"`
 
 	// Parameters are passed to each run as task parameters, at most 16, the
 	// bound every task submission has. A built-in schedule's report stream

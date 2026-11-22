@@ -1,0 +1,24 @@
+{
+  "_comment": "Script names for AgentSchedule.spec.script and lib.ValidateTrigger's script: the operator's CRD test (agentschedule_controller_test.go) and a2a/lib's trigger test read this one list, so the CRD rule and lib's can't disagree.",
+  "accepted": [
+    "a",
+    "0",
+    "stall-watch",
+    "leeway-watch-2",
+    "upgrade-readiness-weekly-review",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "refused": [
+    "Stall-Watch",
+    "stall.watch",
+    "stall_watch",
+    "stall watch",
+    "-stall",
+    "stall-",
+    "/opt/kube-agents/scripts/stall-watch",
+    "scripts/stall-watch",
+    "../stall-watch",
+    "stall;rm",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ]
+}

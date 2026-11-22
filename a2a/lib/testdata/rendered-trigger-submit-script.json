@@ -1,0 +1,28 @@
+{
+  "trigger": {
+    "name": "schedule/compliance-audit",
+    "origin": "builtin",
+    "stream": "compliance-audit",
+    "script": "compliance-audit"
+  },
+  "idempotencyKey": "schedule/kubeagents-system/compliance-audit/1763100000",
+  "schedule": {
+    "namespace": "kubeagents-system",
+    "name": "compliance-audit"
+  },
+  "profile": "fleet-audit",
+  "prompt": "Run the helper script compliance-audit.",
+  "skills": [
+    "fleet-audit"
+  ],
+  "parameters": {
+    "schedule_mode": "scheduled"
+  },
+  "activeDeadlineSeconds": 3600,
+  "maxTurns": 250,
+  "delivery": {
+    "mode": "chat",
+    "silentWhenClean": true,
+    "jobKey": "compliance-audit"
+  }
+}

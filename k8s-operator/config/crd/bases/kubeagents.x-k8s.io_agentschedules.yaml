@@ -139,7 +139,9 @@ spec:
                     - name
                   type: object
                 prompt:
-                  description: Prompt is what each run asks.
+                  description: |-
+                    Prompt is what each run asks. Exactly one of prompt and script is
+                    set.
                   maxLength: 16384
                   minLength: 1
                   type: string
@@ -152,6 +154,18 @@ spec:
                         schedule must be a 5-field cron expression (minute hour
                         day-of-month month day-of-week)
                       rule: self.trim().split(' ').filter(f, f != '').size() == 5
+                script:
+                  description: |-
+                    Script names a helper script each run executes in place of a model
+                    turn: one of the profile's spec.scripts, by name, never a path. It is a
+                    DNS-1123 label (no dots), as the run's trigger carries it. Exactly one
+                    of prompt and script is set. Only a built-in schedule, one the
+                    PlatformAgent renders, may name a script: any other schedule that does
+                    is not accepted, and never runs.
+                  maxLength: 63
+                  minLength: 1
+                  pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
+                  type: string
                 skills:
                   description: Skills the run asks the profile to use.
                   items:
@@ -176,9 +190,11 @@ spec:
                   type: boolean
               required:
                 - profileRef
-                - prompt
                 - schedule
               type: object
+              x-kubernetes-validations:
+                - message: exactly one of spec.prompt and spec.script must be set
+                  rule: has(self.prompt) != has(self.script)
             status:
               description: |-
                 AgentScheduleStatus is the schedule's run state. It is the run ledger: no
