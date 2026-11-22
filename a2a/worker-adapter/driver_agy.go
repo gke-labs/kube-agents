@@ -49,7 +49,7 @@ const agyResumeFlag = "--conversation"
 // than SUCCESS reuses the generic token whose meaning matches; the other
 // two are agy's own, and the gateway words them (relay.go reasonSentences).
 const (
-	agyErrorToken            = "error_during_execution"
+	agyErrorToken            = "error_during_execution" // #nosec G101 -- a failure reason token, not a credential
 	agyPrintTimeoutToken     = "print-timeout"
 	agyPermissionDeniedToken = "permission-denied"
 )
