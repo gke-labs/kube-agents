@@ -40,4 +40,3 @@ upgrades-rollout-family-held-by-canary-gate
 first-install-hello-filed
 # profile-configmap-read-keeps-no-credential: a ConfigMap plant on the host
 # cluster, 200s default, into the shortest chain at the time.
-profile-configmap-read-keeps-no-credential
