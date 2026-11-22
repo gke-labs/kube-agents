@@ -21,6 +21,8 @@
 # ==============================================================================
 
 set -euo pipefail
+# DO NOT MERGE: session-mode twin for the #6826 session-tree check.
+export EVAL_FRONT_DOOR=session
 
 # The eval rosters, four files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, what
