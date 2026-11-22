@@ -39,6 +39,9 @@ const (
 	// second.
 	sha256sumBinaryMarker = "*"
 	findDotPrefix         = "./"
+	// sha256sumTextSeparator is what sha256sum writes between a digest and
+	// its path in text mode.
+	sha256sumTextSeparator = "  "
 	// manifestFieldSeparators split a manifest line's digest from its path.
 	manifestFieldSeparators = " \t"
 )
@@ -150,6 +153,8 @@ func (l *loader) parseIntegrityManifest(data []byte) (map[string]string, bool) {
 			l.add(IntegrityManifestFile, field, "%q is not a lowercase hex SHA-256 digest", digest)
 		case !LocalPath(name) || path.Clean(name) != name:
 			l.add(IntegrityManifestFile, field, "%q is not a plain path inside the persona", name)
+		case l.scope != nil && !l.scope(name):
+			l.add(IntegrityManifestFile, field, "%q is outside the files this check covers", name)
 		case entries[name] != "":
 			l.add(IntegrityManifestFile, field, "%q is listed twice", name)
 		default:
@@ -183,6 +188,12 @@ func (l *loader) scanForIntegrity() (map[string]string, bool) {
 		rel, _ := filepath.Rel(root, full)
 		rel = filepath.ToSlash(rel)
 		if rel == "." {
+			return nil
+		}
+		if l.scope != nil && !l.scope(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
@@ -245,4 +256,36 @@ func hashNoFollow(full string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// CheckTree compares the files under dir that scope selects with dir's
+// IntegrityManifestFile, for a tree that is not a persona directory: the
+// session pod's Claude Code home, say, where the harness keeps its own state
+// beside the shipped files. scope takes a dir-relative, slash-separated path
+// and reports whether the check covers it; a directory it rejects is not
+// entered, and a manifest entry it rejects is a problem. A tree without a
+// manifest is IntegrityUnverified with a nil error; any difference is an
+// *InvalidError listing them all.
+func CheckTree(dir string, scope func(rel string) bool) (Integrity, int, error) {
+	l := &loader{dir: dir, scope: scope}
+	integrity, files := l.checkIntegrity(false)
+	if l.err != nil {
+		return IntegrityUnverified, 0, l.err
+	}
+	if len(l.problems) > 0 {
+		return IntegrityUnverified, files, &InvalidError{Dir: dir, Problems: l.problems}
+	}
+	return integrity, files, nil
+}
+
+// FormatIntegrityManifest renders files, keyed by slash-separated path
+// relative to the tree's root, as an IntegrityManifestFile: one sha256sum
+// line each, "./"-prefixed and sorted by path, as the image builds write it.
+func FormatIntegrityManifest(files map[string][]byte) []byte {
+	var b strings.Builder
+	for _, rel := range sortedKeys(files) {
+		sum := sha256.Sum256(files[rel])
+		b.WriteString(hex.EncodeToString(sum[:]) + sha256sumTextSeparator + findDotPrefix + rel + "\n")
+	}
+	return []byte(b.String())
 }
