@@ -36,8 +36,9 @@ const (
 // tierMemberBackends are the backends membership can name: the ones whose
 // requester is one verified person. Not the console, whose principal
 // everyone on it shares (#5557); not inject, the eval transport; and not the
-// a2a door, whose caller names itself under a shared token.
-var tierMemberBackends = []string{gchatBackend, slackBackend, discordBackend, a2aGoogleBackend}
+// a2a door's eval class, whose caller names itself under a shared token. The
+// door's two sign-in classes count: each verifies one person.
+var tierMemberBackends = []string{gchatBackend, slackBackend, discordBackend, a2aGoogleBackend, a2aEntraBackend}
 
 // parseTierMembership reads A2A_TIER_MEMBERSHIP. An entry that isn't
 // backend:user=tier, names an unknown backend or a tier that isn't a subject
@@ -63,9 +64,10 @@ func parseTierMembership(raw string) ([]TierMember, error) {
 			return nil, fmt.Errorf("%s: entry %q names tier %q, which isn't a subject token", EnvTierMembership, entry, tier)
 		}
 		// The key a turn is matched on (requesterSubject): a Google Chat id
-		// is case-blind, so two spellings of one person are a repeat.
+		// is case-blind, and so is an Entra object id (a GUID), so two
+		// spellings of one person are a repeat.
 		key := backend + ":" + strings.TrimSpace(user)
-		if backend == gchatBackend {
+		if backend == gchatBackend || backend == a2aEntraBackend {
 			key = strings.ToLower(key)
 		}
 		if seen[key] {
@@ -83,9 +85,13 @@ func buildTierMembers(members []TierMember, ps *Pseudonymizer) map[TaskRequester
 	out := make(map[TaskRequester]capability.Tier, len(members))
 	for _, m := range members {
 		id := m.User
-		if m.Backend == a2aGoogleBackend {
+		switch m.Backend {
+		case a2aGoogleBackend:
 			// The door's caller for a verified email, as its turns carry it.
 			id = a2aGoogleCaller(strings.TrimSpace(id))
+		case a2aEntraBackend:
+			// The door's caller for a verified object id, as its turns carry it.
+			id = a2aEntraCaller(strings.TrimSpace(id))
 		}
 		if subject := requesterSubject(ps, m.Backend, id); subject != "" {
 			out[TaskRequester{Backend: m.Backend, Subject: subject}] = m.Tier

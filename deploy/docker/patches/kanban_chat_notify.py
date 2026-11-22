@@ -189,7 +189,7 @@ ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # the route), and its chat_id is the session that holds the route, whose
 # context id conversation_context reads back: the report is sent with
 # --conversation and --context rather than --thread.
-CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "console:")
+CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "teams:", "console:")
 # The console door's platform (lib.NotifyPlatformConsole). The gateway serves
 # its chat.notify route whenever the console runs, so it counts as served
 # with no environment variable naming it. Hermes has no console platform, and
