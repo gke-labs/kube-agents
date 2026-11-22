@@ -15,7 +15,9 @@ the system text under any spelling, tool definitions, embeddings `input`, a
 completion `prompt`, and any field newer than this file. Each field is
 walked whole with the key-aware walk the audit hooks use, so a value is
 redacted wherever it sits -- a tool's input, what a tool returned, a
-per-message field -- and JSON held in a string stays valid JSON.
+per-message field. A tool call's arguments held as JSON in a string (and an
+Anthropic tool input sent as a string) are decoded, walked as a document and
+re-encoded only if a rule changed them, so they stay valid JSON.
 
 Left exactly as they came, and only at the positions the provider APIs
 define (content parts, a tool result's own content list, `system`,
@@ -178,12 +180,22 @@ ROLE_KEY = "role"
 THINKING_BLOCKS_KEY = "thinking_blocks"
 SYSTEM_KEY = "system"
 PARTS_KEY = "parts"
-# A string holding a JSON object or array (a tool call's arguments, a tool's
-# JSON output) is decoded and walked as a document, so key names count and a
-# value after an escaped newline is matched, then re-encoded only if a rule
-# changed it.
-JSON_OPENERS = ("{", "[")
+# Tool calls whose arguments are JSON held in a string: a chat tool call's
+# `function.arguments`, a legacy `function_call.arguments`, and an Anthropic
+# `tool_use.input` sent as a string.
+TOOL_CALLS_KEY = "tool_calls"
+FUNCTION_KEY = "function"
+FUNCTION_CALL_KEY = "function_call"
+ARGUMENTS_KEY = "arguments"
+TOOL_USE_TYPE = "tool_use"
+TOOL_USE_INPUT_KEY = "input"
 DATA_KEY = "data"
+
+
+def _is_data_url(value: Any) -> bool:
+    """A `data:` URL, as providers read the scheme: case-insensitive, after
+    surrounding whitespace."""
+    return isinstance(value, str) and value.strip()[: len(DATA_URL_PREFIX)].lower() == DATA_URL_PREFIX
 
 
 class UnwalkableRequestError(ValueError):
@@ -272,7 +284,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
         kept.append((path, data))
 
     def _keep_data_url(self, url: str, path: tuple, kept: List[tuple]) -> None:
-        match = STRICT_DATA_URL.match(url)
+        match = STRICT_DATA_URL.match(url.strip())
         if match is None:
             raise self._refuse("a data URL that is not base64")
         self._keep_payload(match.group(1), match.group(2), path, kept)
@@ -297,9 +309,9 @@ class KubeAgentsRedactionCallback(CustomLogger):
         if isinstance(source, dict) and source.get(TYPE_KEY) == BASE64_SOURCE_TYPE:
             self._keep_payload(source.get(MEDIA_TYPE_KEY), source.get(DATA_KEY), path + (SOURCE_KEY, DATA_KEY), kept)
         image_url = part.get(IMAGE_URL_KEY)
-        if isinstance(image_url, dict) and isinstance(image_url.get(URL_KEY), str) and image_url[URL_KEY].startswith(DATA_URL_PREFIX):
+        if isinstance(image_url, dict) and _is_data_url(image_url.get(URL_KEY)):
             self._keep_data_url(image_url[URL_KEY], path + (IMAGE_URL_KEY, URL_KEY), kept)
-        elif isinstance(image_url, str) and image_url.startswith(DATA_URL_PREFIX):
+        elif _is_data_url(image_url):
             self._keep_data_url(image_url, path + (IMAGE_URL_KEY,), kept)
         audio = part.get(INPUT_AUDIO_KEY)
         if isinstance(audio, dict) and DATA_KEY in audio:
@@ -366,29 +378,6 @@ class KubeAgentsRedactionCallback(CustomLogger):
         except (KeyError, IndexError, TypeError):
             return
 
-    @classmethod
-    def _expand_json(cls, node: Any, path: tuple, found: List[tuple]) -> Any:
-        """node with each string that holds a JSON object or array replaced by
-        its decoded document, recording (path, original string) in found so
-        _collapse_json can re-encode it. Nothing is added to the tree, so no
-        caller data can be mistaken for a marker."""
-        if isinstance(node, str):
-            text = node.strip()
-            if text[:1] in JSON_OPENERS:
-                try:
-                    decoded = json.loads(text)
-                except ValueError:
-                    return node
-                if isinstance(decoded, (dict, list)):
-                    found.append((path, node))
-                    return cls._expand_json(decoded, path, found)
-            return node
-        if isinstance(node, list):
-            return [cls._expand_json(item, path + (i,), found) for i, item in enumerate(node)]
-        if isinstance(node, dict):
-            return {key: cls._expand_json(value, path + (key,), found) for key, value in node.items()}
-        return node
-
     @staticmethod
     def _get(root: Any, path: tuple) -> Any:
         node = root
@@ -396,88 +385,77 @@ class KubeAgentsRedactionCallback(CustomLogger):
             node = node[step]
         return node
 
-    def _redact_keys(self, node: Any, counts: Dict[str, int]) -> Any:
-        """node with the text rules run over every key name: the walk reads
-        values, so a value written as a key is redacted here."""
-        if isinstance(node, list):
-            return [self._redact_keys(item, counts) for item in node]
-        if isinstance(node, dict):
-            rebuilt = {}
-            for key, value in node.items():
-                if isinstance(key, str):
-                    key, made = AuditRedactor.redact_text_counted(key, self._rules)
-                    for name, count in made.items():
-                        counts[name] = counts.get(name, 0) + count
-                rebuilt[key] = self._redact_keys(value, counts)
-            return rebuilt
-        return node
-
-    @staticmethod
-    def _has_duplicate_keys(source: str) -> bool:
-        """Whether an object in source repeats a key: the decoder keeps one
-        value and drops the others, which the walk then never sees."""
-        found = False
-
-        def pairs(items: List[tuple]) -> Dict[str, Any]:
-            nonlocal found
-            keys = [key for key, _ in items]
-            found = found or len(keys) != len(set(keys))
-            return dict(items)
-
-        json.loads(source.strip(), object_pairs_hook=pairs)
-        return found
-
-    def _encode_json(self, document: Any, source: str, counts: Dict[str, int]) -> str:
-        """A walked, key-redacted document back to a string: the original one
-        only if the walk changed nothing, the string has no repeated key, and
-        the text rules over the raw string and over the canonical encoding
-        change nothing either; otherwise the canonical encoding, redacted."""
-        # The canonical encoding as well as the raw string: escapes in the
-        # raw string (a key written as \u-sequences) can hide a value the
-        # canonical one shows.
-        canonical = json.dumps(document, ensure_ascii=False)
-        encoded, made = AuditRedactor.redact_text_counted(canonical, self._rules)
-        raw, _ = AuditRedactor.redact_text_counted(source, self._rules)
-        unchanged = encoded == canonical and raw == source and document == json.loads(source.strip())
-        if unchanged and not self._has_duplicate_keys(source):
-            return source
-        for name, count in made.items():
-            counts[name] = counts.get(name, 0) + count
-        return encoded
-
-    def _collapse_json(self, walked: Any, found: List[tuple], counts: Dict[str, int]) -> Any:
-        """Undo _expand_json on a walked tree, deepest document first, so an
-        outer document is re-encoded with its inner ones already strings.
-        Paths name the tree as expanded, and key names are redacted only
-        after every path is used."""
-        for path, source in sorted(found, key=lambda item: len(item[0]), reverse=True):
-            document = self._redact_keys(self._get(walked, path), counts)
-            encoded = self._encode_json(document, source, counts)
-            if path:
-                self._put(walked, path, encoded)
-            else:
-                walked = encoded
-        return self._redact_keys(walked, counts)
-
-    def _redact_field(self, value: Any, kept: List[tuple], counts: Dict[str, int]) -> Any:
+    def _redact_field(self, value: Any, kept: List[tuple], arguments: List[tuple], counts: Dict[str, int]) -> Any:
         """One top-level field: every string redacted, key names counted, the
-        kept fields put back as they came. The original is left unchanged
-        (the walk returns a copy)."""
-        if kept and isinstance(value, (dict, list)):
+        kept fields put back as they came. Tool-call arguments held as JSON in
+        a string are walked as the document they encode and re-encoded only if
+        a rule changed it. The original is left unchanged (the walk returns a
+        copy)."""
+        if (kept or arguments) and isinstance(value, (dict, list)):
             placeholder = copy.deepcopy(value)
             for path, _ in kept:
                 self._put(placeholder, path, None)
+            for path, _, document in arguments:
+                self._put(placeholder, path, copy.deepcopy(document))
         else:
             placeholder = value
-        found: List[tuple] = []
-        expanded = self._expand_json(placeholder, (), found)
-        walked, made = AuditRedactor.redact_counted(expanded, self._rules)
+        redacted, made = AuditRedactor.redact_counted(placeholder, self._rules)
         for name, count in made.items():
             counts[name] = counts.get(name, 0) + count
-        redacted = self._collapse_json(walked, found, counts)
+        for path, source, document in arguments:
+            walked = self._get(redacted, path)
+            # Compared, not counted: a substitution that swaps one marker for
+            # another nets zero on the counts but still changed the payload.
+            keep = source is not None and walked == document
+            self._put(redacted, path, source if keep else json.dumps(walked, ensure_ascii=False))
         for path, original in kept:
             self._put(redacted, path, original)
         return redacted
+
+    @staticmethod
+    def _tool_arguments(data: Dict[str, Any]) -> List[tuple]:
+        """(path from the request, string, decoded document) for each tool
+        call's arguments held as JSON in a string: a chat tool call's and a
+        legacy function call's `arguments`, and an Anthropic tool input sent
+        as a string. Arguments that are not a JSON object or array stay a
+        string, walked as text."""
+        found: List[tuple] = []
+
+        def take(path: tuple, value: Any) -> None:
+            if not isinstance(value, str):
+                return
+            repeated = False
+
+            def pairs(items: List[tuple]) -> Dict[str, Any]:
+                nonlocal repeated
+                keys = [key for key, _ in items]
+                repeated = repeated or len(keys) != len(set(keys))
+                return dict(items)
+
+            try:
+                document = json.loads(value, object_pairs_hook=pairs)
+            except ValueError:
+                return
+            if isinstance(document, (dict, list)):
+                # A repeated key: the decoder kept one value and the walk never
+                # sees the other, so the string is re-encoded from the document
+                # rather than sent as it came.
+                found.append((path, None if repeated else value, document))
+
+        for i, message in enumerate(data.get(MESSAGES_KEY) or []):
+            for j, call in enumerate(message.get(TOOL_CALLS_KEY) or []):
+                function = call.get(FUNCTION_KEY) if isinstance(call, dict) else None
+                if isinstance(function, dict):
+                    take((MESSAGES_KEY, i, TOOL_CALLS_KEY, j, FUNCTION_KEY, ARGUMENTS_KEY), function.get(ARGUMENTS_KEY))
+            legacy = message.get(FUNCTION_CALL_KEY)
+            if isinstance(legacy, dict):
+                take((MESSAGES_KEY, i, FUNCTION_CALL_KEY, ARGUMENTS_KEY), legacy.get(ARGUMENTS_KEY))
+            content = message.get(CONTENT_KEY)
+            if isinstance(content, list):
+                for j, part in enumerate(content):
+                    if isinstance(part, dict) and part.get(TYPE_KEY) == TOOL_USE_TYPE:
+                        take((MESSAGES_KEY, i, CONTENT_KEY, j, TOOL_USE_INPUT_KEY), part.get(TOOL_USE_INPUT_KEY))
+        return found
 
     @staticmethod
     def _check_shape(data: Dict[str, Any]) -> None:
@@ -506,12 +484,14 @@ class KubeAgentsRedactionCallback(CustomLogger):
         """
         self._check_shape(data)
         kept = self._carve(data)
+        arguments = self._tool_arguments(data)
         counts: Dict[str, int] = {}
         for key in list(data):
             if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
                 continue
             mine = [(path[1:], value) for path, value in kept if path[0] == key]
-            data[key] = self._redact_field(data[key], mine, counts)
+            args = [(path[1:], source, document) for path, source, document in arguments if path[0] == key]
+            data[key] = self._redact_field(data[key], mine, args, counts)
         return counts
 
 

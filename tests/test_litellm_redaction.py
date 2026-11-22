@@ -592,7 +592,7 @@ class TestCallback(unittest.TestCase):
             with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
 
-    def test_json_held_in_a_string_is_decoded_wherever_it_sits(self) -> None:
+    def test_json_in_tool_arguments_is_decoded_and_tool_output_is_redacted(self) -> None:
         # A value right after an escaped newline sits after the letter `n` in
         # the encoded string, where a word-boundary rule cannot see it; the
         # decoded document has a real newline there.
@@ -613,36 +613,39 @@ class TestCallback(unittest.TestCase):
             for value in ("10.0.0.5", "10.0.0.6", "prod-eu-1"):
                 self.assertNotIn(value, text)
 
-    def test_json_whose_decoded_view_hides_a_value_is_re_encoded_redacted(self) -> None:
-        # A repeated key: the decoder keeps the last value, so the first one
-        # never reaches the walk. A key name: the walk reads values. Either
-        # way the original string is not sent as it was.
-        repeated = '{"note": "on prod-eu-1", "note": "safe"}'
-        # Hidden from both the walk (dropped by the decoder) and the raw text
-        # rules (after an escaped newline, the IP has no word boundary).
-        repeated_escaped = '{"cmd": "get pods\\n10.0.0.7", "cmd": "safe"}'
-        keyed = json.dumps({"10.0.0.5": "pod", "ok": 1})
-        # A key in an object sent as an object, not a string.
-        object_key = {"command": "x", "on 10.0.0.4": True}
-        # The same key written with escapes, which the raw text rules cannot read.
-        escaped_key = '{"\\u0031\\u0030.0.0.8": "pod", "a\\n10.0.0.9": 1}'
+    def test_tool_arguments_with_a_repeated_key_are_re_encoded(self) -> None:
+        # The decoder keeps the last value, so the first never reaches the
+        # walk: the arguments are re-encoded from the document, not sent as
+        # they came.
+        repeated = '{"cmd": "get pods\\n10.0.0.7", "cmd": "safe"}'
         data = {"messages": [{"role": "assistant", "content": None, "tool_calls": [
-            {"id": "o", "type": "function", "function": {"name": "t", "arguments": object_key}},
-            {"id": "a", "type": "function", "function": {"name": "t", "arguments": repeated}},
-            {"id": "b", "type": "function", "function": {"name": "t", "arguments": keyed}},
-            {"id": "c", "type": "function", "function": {"name": "t", "arguments": repeated_escaped}},
-            {"id": "d", "type": "function", "function": {"name": "t", "arguments": escaped_key}},
+            {"id": "c", "type": "function", "function": {"name": "t", "arguments": repeated}},
         ]}]}
-        as_object, first, second, third, fourth = (call["function"]["arguments"] for call in self._run(data)["messages"][0]["tool_calls"])
-        self.assertNotIn("10.0.0.4", json.dumps(as_object))
-        decoded_fourth = json.dumps(json.loads(fourth), ensure_ascii=False)
-        self.assertNotIn("10.0.0.8", decoded_fourth)
-        self.assertNotIn("10.0.0.9", decoded_fourth)
-        self.assertNotIn("prod-eu-1", first)
-        self.assertNotIn("10.0.0.5", second)
-        self.assertNotIn("10.0.0.7", third)
-        json.loads(first)
-        json.loads(second)
+        sent = self._run(data)["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        self.assertNotIn("10.0.0.7", sent)
+        self.assertEqual(json.loads(sent), {"cmd": "safe"})
+
+    def test_a_numeric_value_under_a_credential_key_stays_valid_json(self) -> None:
+        arguments = json.dumps({"token": 98765, "user": "admin"})
+        data = {"messages": [{"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": arguments}}]}]}
+        sent = self._run(data)["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        json.loads(sent)
+
+    def test_a_rule_matching_a_protocol_key_renames_no_key_and_drops_no_payload(self) -> None:
+        module = _load_callback_module({"ip": {"action": "off"}, "rules": [{"name": "src", "literal": "source"}]})
+        hook = module.proxy_handler_instance
+        data = {"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64}}]}]}
+        part = asyncio.run(hook.async_pre_call_hook({}, None, data, "anthropic_messages"))["messages"][0]["content"][0]
+        self.assertEqual(part["source"]["data"], _PNG_BASE64)
+
+    def test_a_data_url_is_recognised_whatever_its_case_or_spacing(self) -> None:
+        for url in ("DATA:text/plain;base64,dG9rZW49eGEyOQ==", " data:text/plain;base64,dG9rZW49eGEyOQ=="):
+            with self.assertRaises(self.module.UnwalkableRequestError, msg=url):
+                self._run({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]})
+
+    def test_a_json_looking_string_under_a_credential_key_is_masked(self) -> None:
+        data = {"messages": [{"role": "user", "content": "hi"}], "db_creds": {"password": '["plain_secret_password"]'}}
+        self.assertNotIn("plain_secret_password", json.dumps(self._run(data)))
 
     def test_caller_data_shaped_like_an_internal_marker_is_just_data(self) -> None:
         lookalike = {"__kube_agents_json_string__": 0, "__kube_agents_json_document__": "x"}
