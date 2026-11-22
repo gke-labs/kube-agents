@@ -19,7 +19,9 @@ import (
 // `sha256sum` line for every file in the persona but itself. Its name is the
 // one the platform agent image gives the manifest of its skill trees
 // (deploy/docker/Dockerfile, agents/platform/scripts/verify_skills_provenance.py),
-// and the line format is the same.
+// and the line format is the one sha256sum writes. Unlike that script, only
+// the root manifest is left out: a file of the same name in a skill is
+// rendered, so it must be listed.
 //
 // What the check proves, and what it doesn't: the persona's files are the
 // ones its build recorded. That catches a bad build, a corrupted layer, a
@@ -37,6 +39,8 @@ const (
 	// second.
 	sha256sumBinaryMarker = "*"
 	findDotPrefix         = "./"
+	// manifestFieldSeparators split a manifest line's digest from its path.
+	manifestFieldSeparators = " \t"
 )
 
 // sha256HexRE is a SHA-256 digest as sha256sum writes it.
@@ -128,9 +132,14 @@ func (l *loader) parseIntegrityManifest(data []byte) (map[string]string, bool) {
 			continue
 		}
 		field := fmt.Sprintf("line %d", n)
-		digest, name, ok := strings.Cut(line, " ")
-		name = strings.TrimSpace(name)
-		if !ok || name == "" {
+		// sha256sum -c splits on the first run of blanks, tabs included.
+		cut := strings.IndexAny(line, manifestFieldSeparators)
+		if cut < 0 {
+			l.add(IntegrityManifestFile, field, "is not a sha256sum line (<digest>  <path>)")
+			continue
+		}
+		digest, name := line[:cut], strings.TrimSpace(line[cut:])
+		if name == "" {
 			l.add(IntegrityManifestFile, field, "is not a sha256sum line (<digest>  <path>)")
 			continue
 		}
@@ -154,18 +163,24 @@ func (l *loader) parseIntegrityManifest(data []byte) (map[string]string, bool) {
 }
 
 // scanForIntegrity hashes every regular file under the persona directory
-// except the root manifest. A symlink or other non-regular entry anywhere is
+// except the root manifest. A file the format reader already read is taken
+// at the digest of those bytes, so what is verified is what renders; the
+// rest (README.md, say) is hashed here. A symlink or other non-regular entry anywhere is
 // a problem rather than something to follow or skip: the build records
 // regular files only, so one is always something it did not produce. A file
 // named like the manifest below the root is an ordinary file here, and is
 // reported unless the manifest lists it.
 func (l *loader) scanForIntegrity() (map[string]string, bool) {
 	found := map[string]string{}
-	err := filepath.WalkDir(l.dir, func(full string, d fs.DirEntry, err error) error {
+	// The trailing separator makes WalkDir descend into a persona directory
+	// that is itself a symlink (a mount path pointing at the payload), as
+	// os.ReadDir does for the format reader.
+	root := l.dir + string(filepath.Separator)
+	err := filepath.WalkDir(root, func(full string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, _ := filepath.Rel(l.dir, full)
+		rel, _ := filepath.Rel(root, full)
 		rel = filepath.ToSlash(rel)
 		if rel == "." {
 			return nil
@@ -182,6 +197,10 @@ func (l *loader) scanForIntegrity() (map[string]string, bool) {
 		}
 		if !d.Type().IsRegular() {
 			l.add(rel, "", "is not a regular file; %s covers regular files only", IntegrityManifestFile)
+			return nil
+		}
+		if sum, read := l.readSums[rel]; read {
+			found[rel] = sum
 			return nil
 		}
 		sum, err := hashNoFollow(full)

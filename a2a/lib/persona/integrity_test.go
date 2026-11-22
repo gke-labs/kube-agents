@@ -302,3 +302,31 @@ func appendTo(t *testing.T, dir, rel, content string) {
 		t.Fatal(err)
 	}
 }
+
+// A persona directory that is itself a symlink (a mount path pointing at
+// the payload) is walked through, as the format reader reads through it.
+func TestIntegrityFollowsASymlinkedPersonaRoot(t *testing.T) {
+	dir := copyExample(t)
+	writeIntegrityManifest(t, dir)
+	link := filepath.Join(t.TempDir(), "persona")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Load(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Integrity != IntegrityVerified {
+		t.Errorf("Integrity = %v, want verified", p.Integrity)
+	}
+}
+
+// sha256sum -c splits a line on the first run of blanks, tabs included.
+func TestIntegrityAcceptsATabSeparatedLine(t *testing.T) {
+	dir := copyExample(t)
+	writeIntegrityManifest(t, dir)
+	replaceIn(t, dir, IntegrityManifestFile, "  ./", "\t./")
+	if p, err := Load(dir); err != nil || p.Integrity != IntegrityVerified {
+		t.Fatalf("Load = %v, %v; want verified", p, err)
+	}
+}

@@ -56,8 +56,8 @@ a server reached around the broker would be outside both.
 ## Content manifest
 
 A persona may carry `skills_manifest.sha256` at its root: the output of
-`find . -type f ! -name skills_manifest.sha256 -exec sha256sum {} +` run
-in the persona directory at build time, sorted. When it is present, `Load`
+`find . -type f ! -path ./skills_manifest.sha256 -exec sha256sum {} +`
+run in the persona directory at build time, sorted. When it is present, `Load`
 compares every file in the persona with it and refuses the persona on any
 difference: a changed file, a file the manifest lists that is missing, a
 file it doesn't list, or a symlink or other non-regular file anywhere. A
@@ -72,7 +72,13 @@ it catches a bad build, a corrupted layer or a staging copy that went
 wrong. The manifest ships inside the image it describes, so it does not
 detect a replaced or deliberately altered image, and it is not a security
 boundary. The platform agent image checks its own skill trees the same way
-(`agents/platform/scripts/verify_skills_provenance.py`).
+(`agents/platform/scripts/verify_skills_provenance.py`), except that it
+leaves out a file of the manifest's name at any depth; here only the root
+manifest is left out, because a skill's files are rendered.
+
+A worker that predates this check refuses `skills_manifest.sha256` as a
+top-level file the format does not define. A persona image must not carry
+one until every worker it can run under accepts the name.
 
 ## Adapters
 

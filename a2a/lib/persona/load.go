@@ -2,6 +2,8 @@ package persona
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,8 +81,12 @@ func LoadWithOptions(dir string, opts Options) (*Persona, error) {
 }
 
 type loader struct {
-	dir      string
-	opts     Options
+	dir  string
+	opts Options
+	// readSums are the SHA-256 digests of the bytes readFile returned, by
+	// persona-relative path: the integrity check compares what was read and
+	// will be rendered, not a second read of the file.
+	readSums map[string]string
 	imports  []pendingImport
 	problems []Problem
 	err      error
@@ -110,12 +116,6 @@ func (l *loader) load() *Persona {
 		}
 	}
 	p := &Persona{}
-	// Content first: a persona whose files aren't the ones its build
-	// recorded reports that, beside whatever else is wrong with it.
-	p.Integrity, p.IntegrityFiles = l.checkIntegrity(l.opts.RequireIntegrity)
-	if l.err != nil {
-		return nil
-	}
 	if data, ok := l.read(ManifestFile, true); ok {
 		// A tier gets its own problem rather than the strict decoder's
 		// "unknown field": a tier is authority, which the AgentProfile
@@ -145,6 +145,12 @@ func (l *loader) load() *Persona {
 		p.Instructions = string(data)
 	}
 	p.Skills = l.skills()
+	if l.err != nil {
+		return nil
+	}
+	// After every read, so the files checked against the manifest are the
+	// bytes this persona renders from.
+	p.Integrity, p.IntegrityFiles = l.checkIntegrity(l.opts.RequireIntegrity)
 	if l.err != nil {
 		return nil
 	}
@@ -211,6 +217,11 @@ func (l *loader) readFile(rel, full string) (data []byte, ok, missing bool) {
 		l.add(rel, "", "the persona passes %d bytes in total", maxTotalBytes)
 		return nil, false, false
 	}
+	if l.readSums == nil {
+		l.readSums = map[string]string{}
+	}
+	sum := sha256.Sum256(data)
+	l.readSums[rel] = hex.EncodeToString(sum[:])
 	return data, true, false
 }
 
