@@ -84,9 +84,14 @@ the session can't run as unavailable, and every piped read as one command per
 call, replaces the cluster agent's kanban reporting steps with "give it in your
 answer", rewrites cross-skill `SKILL.md` links to backticked skill names for
 shipped skills, and rewrites references to its scripts, reference files,
-example files, settings and unshipped skill files as not in this session. Only
-`SKILL.md` ships. The Dockerfile copies the result
-into `CLAUDE_CONFIG_DIR` (`/home/node/.claude`), owned by root.
+example files, settings and unshipped skill files as not in this session. Of
+each skill, only `SKILL.md` ships. The tool also writes `skills_manifest.sha256`
+over `CLAUDE.md` and `skills/`. The Dockerfile copies the result into
+`CLAUDE_CONFIG_DIR` (`/home/node/.claude`), owned by root. At start, the
+session worker compares the shipped tree with the manifest: a difference stops
+the worker, and a missing manifest is logged as unverified. The harness's own
+state in that directory is not checked (see
+[Content manifest](../lib/persona/README.md#content-manifest)).
 
 Editing a skill in `sessionSkills` now also feeds the worker image: its build
 fails if the skill's frontmatter stops parsing, its `name` stops matching its
