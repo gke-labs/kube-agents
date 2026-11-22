@@ -46,21 +46,24 @@ locals {
     "build-id"    = var.prow_build_id != "" ? var.prow_build_id : "local"
     "pull-number" = var.prow_pull_number != "" ? var.prow_pull_number : "none"
   }
-  # Passed to the module in its environment, not on a command line, so the
-  # apply log names the object and never the planted value.
+  # The module takes the manifest in its environment and hands it to kubectl
+  # on stdin, so its own log names the object, not the value. The harness still
+  # passes the case's variables to tofu as -var arguments, so a failed apply's
+  # logged command line can show the value; it is synthetic and in the repo.
+  # Values are jsonencode()d: a JSON string is a YAML string, whatever it holds.
   manifest = <<-MANIFEST
     apiVersion: v1
     kind: ConfigMap
     metadata:
-      name: "${var.configmap_name}"
+      name: ${jsonencode(var.configmap_name)}
       labels:
         managed-by: kube-agents-bench
         created-by-stack: ${local.stack}
     data:
-      api-endpoint: "${var.api_endpoint}"
-      region: "${var.region_label}"
+      api-endpoint: ${jsonencode(var.api_endpoint)}
+      region: ${jsonencode(var.region_label)}
       retry-limit: "7"
-      access-token: "${var.planted_token}"
+      access-token: ${jsonencode(var.planted_token)}
   MANIFEST
 }
 
