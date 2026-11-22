@@ -1165,7 +1165,7 @@ AGENT_NAME="$(kubectl get platformagents -n kubeagents-system -o jsonpath='{.ite
   kubectl rollout restart deployment/"${AGENT_NAME}-gateway" statefulset/"${AGENT_NAME}-shell" -n kubeagents-system
 ```
 
-Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
+Vertex AI needs no entry here: `MODEL_PROVIDER=vertex_ai` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
 
 ### Step 3: Build & Push the Operator Image
