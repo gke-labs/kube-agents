@@ -225,7 +225,7 @@ func removeAll(p string) error {
 	_ = filepath.WalkDir(p, func(q string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
 			if fi, err := d.Info(); err == nil {
-				_ = os.Chmod(q, fi.Mode().Perm()|0o700)
+				_ = os.Chmod(q, fi.Mode().Perm()|0o700) // #nosec G122 G302 -- restores the owner bits on a tree about to be removed; PrepareTurn runs with no harness process alive, so nothing swaps entries mid-walk
 			}
 		}
 		return nil
@@ -259,19 +259,19 @@ func (t Table) Place(root string) error {
 // makePlaceholder leaves the opposite kind of entry, empty and read-only.
 func makePlaceholder(p string, k Kind) error {
 	if k == File {
-		if err := os.Mkdir(p, 0o555); err != nil {
+		if err := os.Mkdir(p, 0o555); err != nil { // #nosec G301 -- a read-only placeholder; 0555 is the mode the harness was shown to run with
 			return err
 		}
-		return os.Chmod(p, 0o555) // umask-independent
+		return os.Chmod(p, 0o555) // #nosec G302 -- umask-independent read-only placeholder, as above
 	}
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o444)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o444) // #nosec G302 G304 -- an empty read-only placeholder created (O_EXCL) at a table entry's name in the scrubbed root
 	if err != nil {
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Chmod(p, 0o444)
+	return os.Chmod(p, 0o444) // #nosec G302 -- umask-independent read-only placeholder, as above
 }
 
 // isPlaceholder reports whether fi (from Lstat) is an inert stand-in for an
@@ -290,7 +290,7 @@ func isPlaceholder(p string, fi fs.FileInfo, k Kind) bool {
 }
 
 func emptyDir(p string) bool {
-	f, err := os.Open(p)
+	f, err := os.Open(p) // #nosec G304 -- only lists a table entry's directory in the scrubbed root to see whether it is empty
 	if err != nil {
 		return false
 	}
