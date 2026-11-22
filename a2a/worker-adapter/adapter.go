@@ -408,6 +408,12 @@ type adapter struct {
 	// task publishes (scrub). The adapter is per task, so the set is too,
 	// and finalize clears and closes it.
 	seen answerscrub.Seen
+
+	// childCh carries a dispatched task's child ends from its .in
+	// (handleInMsg) to supervise, which waits on them once the task has
+	// delegated (childwait.go). Nil for every other task, whose .in drops
+	// them as it always has.
+	childCh chan childEnd
 }
 
 // errAbandoned is finalize's answer for an abandoned task: no terminal went
@@ -790,6 +796,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	// originSeq+1 means input published before this line still arrives.
 	steerCh := make(chan string, steerQueueDepth)
 	cancelCh := make(chan struct{}, 1)
+	if a.dispatched {
+		a.childCh = make(chan childEnd, childQueueDepth)
+	}
 	stopIn, err := a.consumeIn(ctx, originSeq+1, origin.EnvelopeID, steerCh, cancelCh)
 	if err != nil {
 		state := lib.StateFailed
@@ -912,6 +921,7 @@ func (a *adapter) dispatchedOr(check func(context.Context, *nats.Conn, *lib.Enve
 // result event buffered behind a fast exit must still win.
 func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-chan string, cancelCh <-chan struct{}, delegateCh <-chan delegateAsk) (Result, error) {
 	log := a.log
+	started := time.Now()
 	deadline := time.NewTimer(a.cfg.TaskDeadline)
 	defer deadline.Stop()
 
@@ -946,10 +956,21 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		reapTook      time.Duration
 		resultText    string
 		resultErr     string // failure subtype from the harness, if any
-		// delegated is set once a delegate request is published: the
-		// turn's deliverable is decided, and nothing the harness says
+		// delegated is set once a session's delegate request is published:
+		// the turn's deliverable is decided, and nothing the harness says
 		// after it changes that.
 		delegated bool
+		// wait is a dispatched task's open delegation (childwait.go): set
+		// when its delegate request is published, it keeps the task open
+		// until the children's ends are delivered as one more turn, whose
+		// result is the deliverable. Kept apart from delegated, which ends
+		// a session's turn, so a profile parent's answer is held to the
+		// same checks as any other.
+		wait *childWait
+		// reserve fires the wait's delivery ahead of the deadline
+		// (childWaitReserve); nil until the task delegates.
+		reserve  *time.Timer
+		reserveC <-chan time.Time
 		// pendingTurns counts user messages written minus result events
 		// seen: the opening prompt is turn one, every absorbed steer runs
 		// another turn, and the task's deliverable is the result that
@@ -972,6 +993,33 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		return true
 	}
+
+	// deliver writes the wait's ends to the harness as one user turn, once:
+	// all of them, or what has arrived when the request was refused or the
+	// reserve fired. The turn is counted like a steer, so the result that
+	// settles it is the deliverable.
+	deliver := func(why string) {
+		if wait == nil || wait.delivered {
+			return
+		}
+		wait.delivered = true
+		if reserve != nil {
+			reserve.Stop()
+			reserveC = nil
+		}
+		if err := proc.writeUser(wait.childDelivery(a.scrub)); err != nil {
+			log.Warn("delivering the delegated tasks' results failed", "task", a.taskID, "err", err)
+			return
+		}
+		pendingTurns++
+		log.Info("delegated tasks' results delivered as one turn", "task", a.taskID, "why", why,
+			"results", len(wait.got), "asked", len(wait.asked), "refused", wait.refusal != nil)
+	}
+	defer func() {
+		if reserve != nil {
+			reserve.Stop()
+		}
+	}()
 
 	events := proc.events
 	for events != nil || !exited {
@@ -1031,6 +1079,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					sawResult = true
 					resultErr = ev.Subtype
 					resultText = ev.Result
+				} else if pendingTurns <= 0 && wait != nil && !wait.delivered {
+					// A turn that ends while the children run is not the
+					// deliverable: stdin stays open for the delivery turn,
+					// and the stream says what the task is waiting on.
+					pendingTurns = 0
+					log.Info("turn result absorbed; waiting on delegated tasks",
+						"task", a.taskID, "outstanding", wait.outstanding())
+					a.publishWorkingNote(waitingText(wait.outstanding()))
+					continue
 				} else if pendingTurns <= 0 {
 					sawResult = true
 					resultText = ev.Result
@@ -1079,6 +1136,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				ask.reply <- delegateReply{Message: "a task is already delegated this turn"}
 				continue
 			}
+			if wait != nil {
+				ask.reply <- delegateReply{Message: refuseSecondDelegation}
+				continue
+			}
 			// Cancel and the deadline end the turn when they fire, not when
 			// the harness finally dies: a call in that window would publish
 			// a child and turn the canceled task into a completed one.
@@ -1095,8 +1156,23 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				ask.reply <- delegateReply{Message: "could not publish the delegation; try again"}
 				continue
 			}
-			delegated = true
 			line := delegatedTo(ask.req)
+			if a.dispatched {
+				// A profile task stays open: no deliverable, no kill, no
+				// final. Its children's ends arrive on its .in, and the
+				// reserve delivers what has arrived ahead of the deadline.
+				wait = newChildWait(ask.req)
+				next := profileDelegatedOne
+				if len(wait.asked) > 1 {
+					next = profileDelegatedMany
+				}
+				ask.reply <- delegateReply{OK: true, Message: line + next}
+				reserve = time.NewTimer(max(time.Until(started.Add(a.cfg.TaskDeadline-childWaitReserve(a.cfg.TaskDeadline))), 0))
+				reserveC = reserve.C
+				log.Info("delegation published; the task waits on its children", "task", a.taskID, "tasks", len(wait.asked), "delegated", line)
+				continue
+			}
+			delegated = true
 			next := "; this turn ends now and the result arrives as your next turn"
 			if ask.req.IsBatch() {
 				next = "; this turn ends now and the results arrive together as your next turn"
@@ -1111,6 +1187,36 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// it before the terminal decision below.
 			proc.closeStdin()
 			proc.kill(a.cfg.KillGrace)
+
+		case end := <-a.childCh:
+			if stopForAbandon() {
+				continue
+			}
+			if wait == nil || wait.delivered || sawResult || exited || canceled || deadlineHit {
+				log.Warn("child result with no open wait dropped", "task", a.taskID)
+				continue
+			}
+			if end.refusal != nil {
+				// Nothing was minted: the whole wait ends.
+				wait.refusal = end.refusal
+				deliver("refused")
+				continue
+			}
+			if !wait.add(*end.result) {
+				log.Info("child result not counted (a duplicate, or an entry not asked for)",
+					"task", a.taskID, "child", end.result.ChildTaskID, "entry", end.result.Entry)
+				continue
+			}
+			if wait.complete() {
+				deliver("complete")
+			}
+
+		case <-reserveC:
+			reserveC = nil
+			if sawResult || exited || canceled || deadlineHit || stopForAbandon() {
+				continue
+			}
+			deliver("deadline-reserve")
 
 		case reason := <-a.abandon:
 			// The dispatcher took the task back (deadline, lease expiry, a
@@ -1413,6 +1519,31 @@ func (a *adapter) publishSteerRefusal(steer, reason string) {
 	if echo := truncateRunes(strings.TrimSpace(steer), steerEchoCap); echo != "" {
 		text += "\nrefused message: " + echo
 	}
+	if err := a.publishWorking(ctx, text); err != nil {
+		// Loud: the user's correction is now lost with nothing on the
+		// stream saying so, which is exactly the failure this publish
+		// exists to prevent.
+		a.log.Error("steer refusal publish failed; the refused message is now silent",
+			"task", a.taskID, "err", err)
+		return
+	}
+	a.log.Info("steer refusal published", "task", a.taskID)
+}
+
+// publishWorkingNote publishes text as a non-final working status-update,
+// best-effort like publishSteerRefusal: a dispatched task's word, mid-wait,
+// of what it is waiting on.
+func (a *adapter) publishWorkingNote(text string) {
+	ctx, cancel := context.WithTimeout(context.Background(), steerRefusalPublishTimeout)
+	defer cancel()
+	if err := a.publishWorking(ctx, text); err != nil {
+		a.log.Warn("working note publish failed", "task", a.taskID, "err", err)
+	}
+}
+
+// publishWorking publishes one non-final status-update in state working
+// carrying text: never the thing that moves the task, and never final.
+func (a *adapter) publishWorking(ctx context.Context, text string) error {
 	update := lib.StatusUpdate{
 		TaskID:    a.taskID,
 		ContextID: a.contextID,
@@ -1428,23 +1559,13 @@ func (a *adapter) publishSteerRefusal(steer, reason string) {
 	}
 	payload, err := json.Marshal(update)
 	if err != nil {
-		a.log.Error("steer refusal marshal failed", "task", a.taskID, "err", err)
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
 	env, err := lib.NewStatusUpdateEnvelope(a.from, a.taskID, a.contextID, a.correlationID, payload)
 	if err != nil {
-		a.log.Error("steer refusal envelope failed", "task", a.taskID, "err", err)
-		return
+		return fmt.Errorf("envelope: %w", err)
 	}
-	if err := a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env); err != nil {
-		// Loud: the user's correction is now lost with nothing on the
-		// stream saying so, which is exactly the failure this publish
-		// exists to prevent.
-		a.log.Error("steer refusal publish failed; the refused message is now silent",
-			"task", a.taskID, "err", err)
-		return
-	}
-	a.log.Info("steer refusal published", "task", a.taskID)
+	return a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env)
 }
 
 // truncateRunes cuts on a rune boundary. The steer echo is user text and may
@@ -2079,6 +2200,22 @@ func (a *adapter) handleInMsg(msg jetstream.Msg, subject string, seen map[string
 			var m lib.Message
 			if err := json.Unmarshal(env.Payload, &m); err != nil {
 				a.log.Error("follow-up message unparseable", "err", err)
+				return
+			}
+			// A child's end, or the refusal of the task's delegation, is the
+			// gateway's word to a dispatched task that waits on its
+			// children (childwait.go); supervise decides whether a wait is
+			// open for it.
+			if end, ok := childEndOf(m.Parts); ok {
+				if a.childCh == nil {
+					a.log.Warn("child result on a task that waits on no children dropped", "task", a.cfg.TaskID)
+					return
+				}
+				select {
+				case a.childCh <- end:
+				default:
+					a.log.Error("child result queue full; the end is dropped and the deadline reserve bounds the wait", "task", a.cfg.TaskID)
+				}
 				return
 			}
 			text := textFromParts(m.Parts)
