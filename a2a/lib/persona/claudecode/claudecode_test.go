@@ -301,3 +301,65 @@ func TestARelayWithoutTheURLPlaceholderIsAnError(t *testing.T) {
 		t.Fatal("a relay with no {url} in its args rendered")
 	}
 }
+
+// The delegate tool's server name is the worker's: a persona declaring it is
+// refused at render, with or without a delegate tool to render.
+func TestAPersonaServerNamedA2AIsRefused(t *testing.T) {
+	p := load(t, exampleDir)
+	p.MCP.Servers[persona.DelegateServer] = persona.Server{Broker: "gke"}
+	p.Manifest.Tools = append(p.Manifest.Tools, persona.DelegateServer)
+	for _, target := range []persona.Target{{Relay: relay}, {Relay: relay, Delegate: delegate}} {
+		_, err := (Adapter{}).Render(p, target)
+		if err == nil || !strings.Contains(err.Error(), "servers."+persona.DelegateServer) {
+			t.Fatalf("a persona server named %q rendered: err=%v", persona.DelegateServer, err)
+		}
+	}
+}
+
+// delegate is the shape the profile worker passes for a profile that
+// delegates: this binary's mcp subcommand at the task's socket.
+var delegate = persona.Delegate{
+	Command: "/usr/local/bin/worker-adapter",
+	Args:    []string{"mcp"},
+	Env:     map[string]string{"A2A_DELEGATE_SOCKET": "/scratch/a2a-delegate.sock"},
+	Tool:    "delegate",
+}
+
+// A target with the worker's delegate tool adds its server beside the
+// persona's and its one tool to the allowlist; without one, neither appears.
+func TestTheDelegateToolIsRenderedOnlyWhenTheTargetCarriesIt(t *testing.T) {
+	p := load(t, exampleDir)
+	with := goldenOf(t, render(t, p, persona.Target{Relay: relay, Delegate: delegate}))
+	servers, _ := with.MCPConfig[mcpServersKey].(map[string]any)
+	srv, ok := servers[persona.DelegateServer].(map[string]any)
+	if !ok || srv["command"] != delegate.Command {
+		t.Fatalf("no %s server in %v", persona.DelegateServer, with.MCPConfig)
+	}
+	if env, _ := srv["env"].(map[string]any); env["A2A_DELEGATE_SOCKET"] != "/scratch/a2a-delegate.sock" {
+		t.Fatalf("delegate server env = %v", srv["env"])
+	}
+	for _, name := range p.SortedServers() {
+		if name == "unused" {
+			continue
+		}
+		if _, ok := servers[name]; !ok {
+			t.Errorf("persona server %s lost beside the delegate tool", name)
+		}
+	}
+	out := render(t, p, persona.Target{Relay: relay, Delegate: delegate})
+	if !slices.Contains(out.Allowed, "mcp__a2a__delegate") {
+		t.Fatalf("allowlist %v lacks the delegate tool", out.Allowed)
+	}
+	i := slices.Index(out.Args, AllowedToolsFlag)
+	if i < 0 || !strings.Contains(out.Args[i+1], "mcp__a2a__delegate") {
+		t.Fatalf("--allowedTools lacks the delegate tool: %v", out.Args)
+	}
+
+	without := render(t, p, persona.Target{Relay: relay})
+	if slices.Contains(without.Allowed, "mcp__a2a__delegate") || strings.Contains(strings.Join(without.Args, " "), `"a2a"`) {
+		t.Fatalf("a target with no delegate tool rendered one: %v", without.Args)
+	}
+	if _, err := (Adapter{}).Render(p, persona.Target{Relay: relay, Delegate: persona.Delegate{Command: "x"}}); err == nil {
+		t.Fatal("a delegate server with no tool rendered")
+	}
+}
