@@ -27,6 +27,9 @@ type harnessSpec struct {
 	// harness may run before the adapter stops it. A harness with its own
 	// wall-clock bound sets it below this, so the harness ends the turn
 	// with a result rather than the adapter killing it (agyBuilder).
+	// TODO(#6710 PR 2): with one agy process per turn, each spawn's bound
+	// must come from the time left on the task deadline, not this budget
+	// fixed once at startup.
 	turnBudget time.Duration
 }
 

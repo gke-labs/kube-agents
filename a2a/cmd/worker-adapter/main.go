@@ -679,8 +679,9 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	}
 	// Antigravity runs without the per-task HOME locking and workspace scrub
 	// it needs (#6710), so only a pod that says it accepts that may select
-	// it: a test, or a deliberate dev run. The operator renders the variable
-	// empty on profile workers, so no profile can set it through its image.
+	// it: a test, or a deliberate dev run. The operator never sets it; the
+	// operator-side selector (#6716) renders it empty wherever it renders
+	// A2A_HARNESS, so a worker image's own ENV can't set it there.
 	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
 		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
 			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
