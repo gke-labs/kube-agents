@@ -119,6 +119,7 @@ RUN apt-get update \
          '    ;;' \
          '  esac' \
          '  export KUBECTL_ADMIT_RUN_DIR=/tmp/kube-agents-session KUBECTL_ADMIT_GUARD_PATH=/usr/local/libexec/shell-memory-guard KUBECTL_ADMIT_ON_BUSY=run' \
+         '  KUBECTL_ADMIT_T0=$(date +%s%N); export KUBECTL_ADMIT_T0' \
          '  exec python3 -I /usr/local/libexec/kubectl-admit "$@"' \
          'fi' \
          'if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then' \

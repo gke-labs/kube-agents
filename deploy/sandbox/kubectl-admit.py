@@ -438,9 +438,23 @@ def log(record: dict) -> None:
         pass
 
 
+def _twin_timing(path: str) -> None:
+    """DO NOT MERGE (session twin): one JSON line per call on the container log, the admission's
+    own time from the wrapper's exec to kubectl's exec or spawn."""
+    try:
+        t0 = int(os.environ.get("KUBECTL_ADMIT_T0", "0"))
+        if t0 > 0:
+            ms = (time.time_ns() - t0) / 1e6
+            with open("/proc/1/fd/2", "a", encoding="utf-8") as f:
+                f.write('{"kubectl_admit_timing": 1, "path": "%s", "overhead_ms": %.2f}\n' % (path, ms))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def pass_through(argv: list[str]) -> None:
     """Run kubectl in this process as if the admission were not there."""
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # Python ignores it; a pipe reader closing must end kubectl
+    _twin_timing(os.environ.get("KUBECTL_ADMIT_TWIN_PATH", "pass"))
     os.execv(KUBECTL_NEXT, [KUBECTL_NEXT, *argv])
 
 
@@ -456,6 +470,7 @@ def advice(cmd: dict) -> str:
 def run(argv: list[str], reservation: dict, cmd: dict) -> int:
     """Run kubectl as a child under the reservation. Nothing after the spawn may raise: the
     caller's fail-open path would run the command a second time."""
+    _twin_timing("admitted")
     child = subprocess.Popen([KUBECTL_NEXT, *argv])
     path = os.path.join(LEDGER_DIR, str(os.getpid()))
     try:
@@ -625,6 +640,7 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
     if busy:
         run_busy(argv, busy, tier, key, slots=len(slots), need=need, free=free)
     if not charged:
+        os.environ["KUBECTL_ADMIT_TWIN_PATH"] = "slotted"
         pass_through(argv)  # the same pid, so the slot lasts exactly as long as kubectl
     log({"event": "admitted", "tier": tier, "key": key, "need": book, "free": free})
     try:
@@ -649,6 +665,7 @@ def run_busy(argv: list[str], reason: str, tier: str, key, **detail) -> None:
     unslotted and unbooked, in this process, as kubectl ran before the admission. The event log
     records it; the session sees nothing."""
     log({"event": "ran-busy", "reason": reason, "tier": tier, "key": key, **detail})
+    os.environ["KUBECTL_ADMIT_TWIN_PATH"] = "ran-busy"
     pass_through(argv)
 
 
