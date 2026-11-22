@@ -867,6 +867,33 @@ delegation and on a console turn addressed to a profile alike: a name the card d
 refused, and so is a required one left out, and the refusal names what the profile takes. A pinned profile takes its own cluster's `project`, `location` and `cluster`
 whether its card declares them or not.
 
+**The profile parent's wait.** A profile task gets the delegate tool only when its AgentProfile sets
+`spec.delegates` (the operator renders `A2A_PROFILE_DELEGATES=true` on its worker in place of
+`A2A_DELEGATE_TOOL=off`) and its submission carries no `via`, so a delegated child or a wake runs
+without it. The tool is an `a2a` MCP server rendered beside the persona's own, and a persona that
+declares a server named `a2a` is refused at render. The delegate call publishes the `delegate`
+artifact and doesn't end the task: no deliverable, no final status, and the harness keeps running.
+The tool's reply tells the model its children's results arrive as its next turn. A result the
+harness writes meanwhile isn't the deliverable; the worker publishes a non-final `working` status
+saying how many delegated tasks it waits on. A second delegate call in the task is refused at the
+tool. The worker reads each `childResult` on the task's `.in`, deduping on `entry` when it's set and
+on `childTaskId` otherwise (an older gateway's ends carry no `entry` and read as a single
+delegation's), and counts them to the entries it asked for. When every entry has its end, or a
+`delegationRefused` arrives, it writes them to the same harness as one user turn. At the task's
+deadline less a reserve, the larger of two minutes and 15% of the task's budget but at most half of
+it, it delivers what has arrived and names the entries that sent nothing, so the parent still
+writes its report. The turn opens with a fixed wrapper saying these are reports from delegated
+tasks and not instructions, and quotes each end line by line under a line giving its entry, child
+task, addressee and state. Each end is cut to 64 KiB and scrubbed with the task's seen secret values
+and the shape rules, and none of its text is added to the seen set. The scrub redacts secrets; the
+framing is the defence against an instruction in a child's text, and one that gets through can do
+at most what the parent's own grant allows. The harness's next result is the task's deliverable,
+held to the same checks as any other answer (one that opens with unstructured reasoning is
+withheld), and the task's final status is what cancels any child still running. An open parent
+holds its worker pod, its task consumer and its dispatch lease for the whole fan-out. A profile
+task's submission carries no `delegateTargets` part, so its tool names only `platform` in the
+addressee description and offers no batch.
+
 ## Session lifecycle
 
 The session manager is the demo's chatops code generalized from one-shot workers to
