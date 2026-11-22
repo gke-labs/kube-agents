@@ -118,7 +118,10 @@ contain credentials. A short allowlist may also be copied to the sandbox — the
 OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
-`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
+`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the five `leeway-watch` alert
+thresholds (`LEEWAY_WATCH_MIN_SEVERITY`, `LEEWAY_WATCH_MIN_DRIFT`,
+`LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`, `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`,
+`LEEWAY_WATCH_REFRESH_DAYS`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
 window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` limit, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
 roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
@@ -164,8 +167,8 @@ policies selecting one Pod are unioned and the API has no deny rule — and the 
 is already selected for egress
 by the `<agent>-gateway-netpol` this same operator renders (unless
 `spec.networkPolicy.enabled: false` withholds it, the one shape where the allowlist
-stands alone and enforces), which permits the metadata
-path. So enabling the allowlist widens what the Pod may send and narrows nothing; it is
+stands alone and enforces), which permits TCP 443 to any
+address outside the private, link-local and shared ranges. So enabling the allowlist widens what the Pod may send and narrows nothing; it is
 an auditable object rather than a control until that gateway policy is narrowed. It would
 in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. See
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).

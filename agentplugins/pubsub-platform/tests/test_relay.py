@@ -42,6 +42,9 @@ PULL_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}:pull"
 ACK_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}:acknowledge"
 NACK_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}:modifyAckDeadline"
 GET_PATH = f"/v1/pubsub/gcp/pubsub.googleapis.com/v1/{SUB_PATH}"
+# Where a redirect answer of the fake server points, on the second server. A
+# fixed path: no value of the request goes into the Location header.
+REDIRECT_PATH = "/redirected"
 
 
 def _message(message_id, payload, ack_id):
@@ -68,11 +71,24 @@ class FakeBroker:
         # When set, a scripted pull is answered only once this event is set: a
         # pull parked at the broker past the adapter's stop.
         self.pull_hold = None
+        # When set, each call is answered with this 3xx status and a Location
+        # on the server at `redirect_to`, at REDIRECT_PATH.
+        self.redirect_status = None
+        self.redirect_to = None
         self.lock = threading.Lock()
         broker = self
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def _redirected(self):
+                if broker.redirect_status is None:
+                    return False
+                self.send_response(broker.redirect_status)
+                self.send_header("Location", broker.redirect_to + REDIRECT_PATH)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return True
 
             def _answer(self, status, body):
                 raw = json.dumps(body).encode()
@@ -89,6 +105,8 @@ class FakeBroker:
             def do_GET(self):  # noqa: N802
                 with broker.lock:
                     broker.calls.append(("GET", self.path, dict(self.headers), None))
+                if self._redirected():
+                    return
                 time.sleep(broker.get_delay)
                 if broker.get_status == 200:
                     self._answer(200, {"name": SUB_PATH})
@@ -101,6 +119,8 @@ class FakeBroker:
                 with broker.lock:
                     broker.calls.append(("POST", self.path, dict(self.headers), body))
                     script = broker.pulls.pop(0) if (self.path.endswith(":pull") and broker.pulls) else None
+                if self._redirected():
+                    return
                 if self.path.endswith(":pull"):
                     if script is None:
                         time.sleep(broker.idle_delay)
@@ -153,9 +173,6 @@ class RelayTestCase(unittest.TestCase):
             "PUBSUB_RELAY_URL": self.broker.url,
             "CREDENTIAL_PROXY_TOKEN_FILE": self.token_file.name,
             "GCP_PROJECT_ID": PROJECT,
-            # The adapter's opener takes a proxy from the shell's variables. With this value it
-            # uses none, so the calls go to the fake broker.
-            "no_proxy": "*",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -351,6 +368,97 @@ class SettleTest(RelayTestCase):
         time.sleep(0.2)
         settles = [(path, body) for _, path, _, body in self.broker.calls]
         self.assertEqual(settles, [(NACK_PATH, {"ackIds": ["ack-1"], "ackDeadlineSeconds": 0})])
+
+
+class NoProxyTest(RelayTestCase):
+    def _the_adapter_loaded_with_a_proxy_in_the_environment(self):
+        """A stand-in proxy that records requests, and the adapter loaded after the proxy is set."""
+        proxy = FakeBroker()
+        self.addCleanup(proxy.close)
+        # The patch of os.environ in setUp puts these back. urllib reads the name in any case.
+        for name in [name for name in os.environ if name.lower() == "no_proxy"]:
+            del os.environ[name]
+        for name in ("http_proxy", "HTTP_PROXY"):
+            os.environ[name] = proxy.url
+        # A load of its own, after the variables are set: an opener that the module builds when
+        # it loads takes its proxy at that time.
+        loaded, put_back = test_dedup.load_adapter_for_a_test_file()
+        self.addCleanup(put_back)
+        return proxy, loaded
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_relay(self):
+        """The relay is an in-cluster Service, and each call to it has the gateway's token on it."""
+        proxy, loaded = self._the_adapter_loaded_with_a_proxy_in_the_environment()
+        relay = loaded.PubsubRelay(self.broker.url, self.token_file.name)
+        relay.get_subscription(SUB_PATH, timeout=5)
+        self.assertEqual(proxy.calls, [])
+        self.assertEqual([(method, path) for method, path, _, _ in self.broker.calls], [("GET", GET_PATH)])
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_gateway_api(self):
+        """The gateway's API is on loopback: a proxy cannot reach it, and would get the alert's prompt."""
+        proxy, loaded = self._the_adapter_loaded_with_a_proxy_in_the_environment()
+        os.environ["PLATFORM_API_URL"] = self.broker.url
+        os.environ["API_SERVER_KEY"] = "api-server-key"
+        adapter = loaded.PubSubAdapter.__new__(loaded.PubSubAdapter)
+        asyncio.run(adapter._run_turn_via_api("platform", "look at this alert", "alert-1", ROUTE))
+        self.assertEqual(proxy.calls, [])
+        self.assertEqual(
+            [(method, path, headers["Authorization"]) for method, path, headers, _ in self.broker.calls],
+            [
+                ("POST", "/p/platform/api/sessions", "Bearer api-server-key"),
+                ("POST", "/p/platform/api/sessions/alert-1/chat", "Bearer api-server-key"),
+            ],
+        )
+
+
+class NoRedirectTest(RelayTestCase):
+    """A 3xx answer is an error. urllib follows one with a request that keeps the call's headers."""
+
+    # Each status that urllib follows: for a GET all five, for a POST the first three.
+    GET_STATUSES = (301, 302, 303, 307, 308)
+    POST_STATUSES = (301, 302, 303)
+
+    def setUp(self):
+        super().setUp()
+        # The server that the first one redirects each call to.
+        self.second = FakeBroker()
+        self.addCleanup(self.second.close)
+        self.broker.redirect_to = self.second.url
+
+    def _the_first_server_answers_with(self, status):
+        self.broker.redirect_status = status
+        self.broker.calls.clear()
+        self.second.calls.clear()
+
+    def test_a_redirect_from_the_relay_is_not_followed(self):
+        """The call has the gateway's token on it."""
+        for status in self.GET_STATUSES:
+            with self.subTest(status=status):
+                self._the_first_server_answers_with(status)
+                relay = adapter_mod.PubsubRelay(self.broker.url, self.token_file.name)
+                with self.assertRaises(adapter_mod.RelayRefused) as caught:
+                    relay.get_subscription(SUB_PATH, timeout=5)
+                self.assertEqual(caught.exception.status, status)
+                self.assertEqual(self.second.calls, [])
+                self.assertEqual([(method, path) for method, path, _, _ in self.broker.calls], [("GET", GET_PATH)])
+
+    def test_a_redirect_from_the_gateway_api_is_not_followed(self):
+        """The call has the API key header on it. The session call fails, and the prompt is not sent."""
+        os.environ["PLATFORM_API_URL"] = self.broker.url
+        os.environ["API_SERVER_KEY"] = "api-server-key"
+        for status in self.POST_STATUSES:
+            with self.subTest(status=status):
+                self._the_first_server_answers_with(status)
+                with self.assertLogs(LOGGER_NAME, logging.ERROR) as logs:
+                    asyncio.run(self.adapter._run_turn_via_api("platform", "look at this alert", "alert-1", ROUTE))
+                    self.assertEqual(
+                        [(method, path, headers.get("Authorization")) for method, path, headers, _ in self.second.calls], []
+                    )
+                self.assertEqual(
+                    [(method, path) for method, path, _, _ in self.broker.calls],
+                    [("POST", "/p/platform/api/sessions")],
+                )
+                self.assertIn(f"HTTP {status}", logs.output[-1])
 
 
 class PreflightTest(RelayTestCase):

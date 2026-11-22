@@ -258,7 +258,9 @@ type VerifiedObserver interface {
 // adapter does, with Agent Sessions' Working… status, the ask's reaction and
 // the plan rows, as the today path shows no receipt either. With it true the
 // gateway posts no placeholder for a task, so the relay has no line to edit
-// and every line edit is skipped; the notices that stand on their own (the
+// and every line edit is skipped, except for a session turn's child
+// delegated to an AgentProfile, whose progress nothing else shows
+// (childKeepsLine, #6532); the notices that stand on their own (the
 // queue notice, a publish failure, a failed or canceled task) still post.
 // Asked per conversation, so a wrapper (the mux, the side door) answers for
 // the backend that owns it.
@@ -302,6 +304,37 @@ var errNoPrivatePosts = errors.New("the conversation's backend posts no private 
 // as data.
 type LineAnswerer interface {
 	AnswersOnLine(conversation string) bool
+}
+
+// WholeLineAnswerer is a LineAnswerer that takes a completed task's whole
+// answer on the task's live message when it fits one piece (PieceSizer):
+// the line becomes the answer, in place of a post under a bare mark. Teams
+// implements it: it draws no reaction, so without it every direct answer
+// sits under a card holding ✅ alone. An answer past the piece size posts
+// as on any backend, and the line ends as lineDoneMark. An edit raises no
+// notification where a post does; a backend takes that trade knowingly.
+type WholeLineAnswerer interface {
+	AnswersWholeOnLine(conversation string) bool
+}
+
+// PieceSizer names the most bytes one post or edit to conversation carries
+// A backend that does not implement it takes discordChunk, Discord's cap,
+// which every other backend fits under; one whose cap is far above it
+// (Teams, 28 KiB an activity) says so, and a table that fits one card is not
+// cut into two. The relay splits posts at it (Gateway.post) and truncates
+// line edits to it; the notifier splits home and conversation posts at it.
+type PieceSizer interface {
+	PieceSize(conversation string) int
+}
+
+// pieceSizeOf is the backend's PieceSize for conversation, or discordChunk.
+func pieceSizeOf(a any, conversation string) int {
+	if sizer, ok := a.(PieceSizer); ok {
+		if n := sizer.PieceSize(conversation); n > 0 {
+			return n
+		}
+	}
+	return discordChunk
 }
 
 // OutMessage is one post or edit as a value: the text, and the chat message

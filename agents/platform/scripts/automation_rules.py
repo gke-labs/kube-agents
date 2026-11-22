@@ -27,16 +27,18 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from fix_recipes import registry
+
 RULES_FILE = ".kube-agents/automation.yaml"
 SCHEMA_VERSION = 1
 # Larger than any hand-written rules file; the cap keeps a hostile file from
 # costing more than a glance to refuse.
 MAX_FILE_BYTES = 64 * 1024
-# The kinds of fix kube-agents opens today, by the audit check that finds them.
-# A rule naming anything else makes the file invalid.
-KNOWN_FIX_TYPES = frozenset({"no-pdb"})
+# The kinds of fix kube-agents opens today, by the audit check that finds them
+# (`fix_recipes/registry.py`). A rule naming anything else makes the file invalid.
+KNOWN_FIX_TYPES = registry.kinds()
 # What a person calls each of them, for text kube-agents writes; one per known type.
-FIX_TYPE_NAMES = {"no-pdb": "disruption-budget fixes"}
+FIX_TYPE_NAMES = {recipe.kind: recipe.name for recipe in registry.recipes()}
 WILDCARD = "*"
 # The label on a fix pull request the customer's pipeline may merge on its own
 # (`KUBEAGENTS_AUTOMERGE=on`). A merged pull request carrying it is one that

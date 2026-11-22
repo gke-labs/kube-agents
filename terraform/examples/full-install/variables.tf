@@ -666,6 +666,16 @@ variable "google_chat_home_channel" {
   default     = ""
 }
 
+variable "google_chat_home_channel_policy" {
+  description = "\"auto\" (also empty) or \"manual\". With google_chat_home_channel empty, \"auto\" lets the A2A gateway make the space of the first top-level mention of the agent in a named space the home channel; \"manual\" leaves google_chat_home_channel alone to decide. A set google_chat_home_channel wins under either. Only used when enable_google_chat is true."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "auto", "manual"], var.google_chat_home_channel_policy)
+    error_message = "google_chat_home_channel_policy must be \"\", \"auto\" or \"manual\"."
+  }
+}
+
 variable "google_chat_mode" {
   description = "Google Chat output verbosity: 'default' (quiet) or 'debug' (surfaces tool progress, memory reviews, and approval cards). Mirrors GOOGLE_CHAT_MODE."
   type        = string

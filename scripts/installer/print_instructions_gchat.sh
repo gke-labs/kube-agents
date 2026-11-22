@@ -54,16 +54,19 @@ if [ -n "${CHAT_TOPIC_NAME:-}" ] && [ -z "${CHAT_SUB_NAME:-}" ]; then
   CHAT_SUB_NAME="$(derive_chat_sub_name "$CHAT_TOPIC_NAME")"
 fi
 
-# Google Chat on the A2A gateway: no pairing, and a home channel that only
-# GOOGLE_CHAT_HOME_CHANNEL sets. $1 the number of the first step to print.
+# Google Chat on the A2A gateway: no pairing, and a home channel that
+# GOOGLE_CHAT_HOME_CHANNEL sets or, under homeChannelPolicy auto, the gateway
+# learns from the first mention in a named space. $1 the number of the first
+# step to print.
 print_a2a_gateway_steps() {
   local step="$1" home not_a_space
   home="$(trim_go_space "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
   not_a_space="$(gchat_home_channel_not_a_space_name "$home")"
   if [ -z "$home" ]; then
-    echo -e "[ ] ${step}. No home channel is configured, so the agent posts no alerts or scheduled reports to Google Chat."
-    echo -e "       Set ${C_WHITE}GOOGLE_CHAT_HOME_CHANNEL${C_RESET} in install.env to a space name (${C_WHITE}spaces/<id>${C_RESET}) and re-run the installer."
-    echo -e "       A chat message or ${C_WHITE}/sethome${C_RESET} does not set it."
+    echo -e "[ ] ${step}. No home channel is configured, so the agent posts no alerts or scheduled reports to Google Chat yet."
+    echo -e "       Set ${C_WHITE}GOOGLE_CHAT_HOME_CHANNEL${C_RESET} in install.env to a space name (${C_WHITE}spaces/<id>${C_RESET}) and re-run the installer;"
+    echo -e "       or, under homeChannelPolicy auto (the default), @mention the app once, top-level, in the named space you want."
+    echo -e "       A direct message or ${C_WHITE}/sethome${C_RESET} does not set it."
   elif [ -n "$not_a_space" ]; then
     echo -e "[ ] ${step}. GOOGLE_CHAT_HOME_CHANNEL is '${not_a_space}', which is not a space name, so the A2A gateway turns off its notify route:"
     echo -e "       no alerts or scheduled reports, and no card reports back to the conversation that asked for them."

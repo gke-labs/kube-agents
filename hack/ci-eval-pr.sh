@@ -754,6 +754,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: EVAL_REPLAY_LANE=true: replayed runs repeat the nightly's recordings, which is not main's live history"
     return 0
   fi
+  if [ "${EVAL_FRONT_DOOR:-platform}" = "session" ]; then
+    echo "eval-dashboard publish skipped: EVAL_FRONT_DOOR=session: a front-door A/B run's record is its comparison with a platform run (scripts/eval_front_door_ab.py), not main's nightly history"
+    return 0
+  fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
     echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
     return 0

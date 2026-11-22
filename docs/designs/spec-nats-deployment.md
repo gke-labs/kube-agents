@@ -82,6 +82,13 @@ another `busReplicas` change while one runs.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.
+- **Reshape**, on request only (the `kubeagents.x-k8s.io/bus-reshape` annotation): TASKS alone is
+  snapshotted, deleted and restored at the width the CR renders, at the count the bus runs,
+  behind the same write freeze as one to three, with the same way back. It starts only on a
+  provisioned bus whose live TASKS is narrower than the render, and never twice for one
+  annotation value, which the bus StatefulSet records. The run's phases are only names the hold below
+  knows, so an operator rolled back to the release that added the hold holds a reshape too
+  (amended 11/19).
 - **A run of a leg this operator does not run** (one a later release started, found after a
   rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
   the bus keeps its count, until the operator that started it is back or a person gives it up
@@ -166,7 +173,7 @@ Streams bind to the payload spec's subjects and topic classes:
 | Stream            | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | :---------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TASKS`           | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
-| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. No other principal holds a consumer verb here; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                                                               |
+| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. A bus migration deletes and recreates them with the stream, and its restore reads them; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                      |
 | `DISPATCH_STOPS`  | `a2a.stop.>`         | 24h, `max_msgs_per_subject: 1`, 64MiB (amended 10/30, #3655)     | The gateway's stop records for AgentProfile tasks, one per task, written only by the gateway (its grant comes with #4127) and read by the dispatcher by subject, per profile it dispatches for. Outside `a2a.dispatch.`, because the dispatcher publishes there. No consumers. The browser credentials are denied it, and the dispatch subjects.                                                                                                                         |
 | `DIRECTORY`       | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `TOPICS-STATE`    | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -441,8 +448,10 @@ connection per bucket beside its control connection, and is Ready only with all 
 profile the config adds reconnects only its own bucket. The dispatcher's image has to move with
 the operator's: one from before the bucket connections ignores the switch, binds no durable on
 its control connection, and stays not Ready. With a dispatcher the
-operator principal also creates and deletes those durables, and it is the only principal
-with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
+operator principal also creates and deletes those durables, and outside a bus migration it is
+the only principal that creates or deletes a consumer on that stream. A migration's clear deletes
+them with the stream, and its restore recreates them from the snapshot and lists and reads their
+info. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web` and `console`, because a browser never can;
@@ -837,13 +846,15 @@ Layout:
   `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
+  **Amended:** the MCP server now runs by default unless `A2A_MCP_DOOR` is `false` (set by
+  the chart's `operator.mcpServer.enabled: false`).
 
 - **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
-  publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
+  publish on `chat.notify.gchat`, `chat.notify.slack`, `chat.notify.teams` and `chat.notify.console` (one subject per
   backend the gateway can hold, and the console's) and subscribe on `chat.notify.reply.agent.>`;
-  the gateway user gains the matching grants (subscribe on the three request subjects, publish on
+  the gateway user gains the matching grants (subscribe on the four request subjects, publish on
   the reply namespace). No other
   principal holds either subject. The reply namespace is its own rather than the agent's
   `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream

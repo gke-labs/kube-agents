@@ -641,7 +641,7 @@
       "cluster_slot": "d",
       "namespace": "seeded-topology",
       "probes": ["statefulset/zone-bound-store"],
-      "fixture": "zone-bound-store StatefulSet with a standard-rwo PersistentVolumeClaim, so the pod is bound to whichever zone its disk landed in and cannot move",
+      "fixture": "zone-bound-store StatefulSet, two replicas whose PersistentVolumeClaims use seeded-zonal-pd, a class whose allowedTopologies names only the first zone, so both claims bind there and neither pod can change zone without leaving its data",
       "state": [
         {
           "subject": "persistentvolumeclaim?app=zone-bound-store",
@@ -666,7 +666,7 @@
         "deployment/capacity-starved-worker",
         "deployment/first-zone-sponge"
       ],
-      "fixture": "capacity-starved-worker Deployment, four replicas at 120m CPU each against two e2-small nodes, so some pods run and the rest stay Pending with an insufficient-cpu event",
+      "fixture": "capacity-starved-worker Deployment, four replicas at 500m CPU each against the first zone's e2-small, which first-zone-sponge keeps below one replica's worth of free CPU, and the second zone's e2-standard-2, so every replica that runs is in the second zone and the rest stay Pending with an insufficient-cpu event",
       "state": [
         {
           "subject": "pod?app=capacity-starved-worker",
@@ -687,7 +687,7 @@
           "path": "spec.replicas",
           "op": "ge",
           "value": 6,
-          "why": "the asymmetry is planted, not found: this sponge keeps the first zone's node below one worker's worth of free CPU whatever the system set does, so every worker that runs is in the second zone and the surplus is Pending for want of CPU. Scale it down or remove it and a node rebuild that leaves the two nodes evenly loaded spreads one worker per zone, both assertions above pass, and the scan calls a balanced cluster skewed"
+          "why": "the asymmetry is planted, not found: this sponge keeps the first zone's node below one worker's worth of free CPU whatever the system set does, so every worker that runs is in the second zone and the surplus is Pending for want of CPU. Scale it down or remove it and a node rebuild that leaves 500m free on the first zone's e2-small puts a worker there, both assertions above pass, and the scan calls a balanced cluster skewed"
         }
       ]
     },
@@ -1444,7 +1444,7 @@
       "cluster_slot": null,
       "namespace": null,
       "probes": ["network/mtu-peer-declared*", "network/default*"],
-      "fixture": "mtu-peer-declared, a custom-mode VPC at MTU 8896 with no subnet, peered both ways with `default` (MTU 1460): the networking SOP's 2.4 peered-MTU mismatch (object NetworkPeering/default--mtu-peer-declared), a posture an owner can keep on purpose. Project-scoped, as world-open-ingress is; the second probe is the project's own `default` network, which the stack peers with rather than plants. The name carries no cluster_prefix so a declaration can spell the object without knowing it. Inert for the audit until the stream's declared-intent slice lands: until then the finding publishes and no case grades it",
+      "fixture": "mtu-peer-declared, a custom-mode VPC at MTU 8896 with no subnet, peered both ways with `default` (MTU 1460): the networking SOP's 2.4 peered-MTU mismatch (object NetworkPeering/default--mtu-peer-declared), a posture an owner can keep on purpose. Project-scoped, as world-open-ingress is; the second probe is the project's own `default` network, which the stack peers with rather than plants. The name carries no cluster_prefix so a declaration can spell the object without knowing it: the pool project's GitOps knowledge/ note declares the pair on purpose, and the networking audit lists it under Declared intent rather than as a finding",
       "state": [
         {
           "subject": "network/mtu-peer-declared*",
@@ -1478,7 +1478,7 @@
           "subject": "repository/knowledge/notification-relay-no-pdb.md",
           "path": null,
           "op": "as_seeded",
-          "why": "the declaration this posture will rest on lives in the same note as the other declared-* roles'; once the networking stream's declared-intent case grades it, a note missing or edited away from what provisioning seeds files the peering as a finding, and the case fails on a correct report"
+          "why": "the note is the declaration networking-declared-intent-no-finding grades against; a note missing the peering's mtu-packet-fragmentation item, or edited away from what provisioning seeds, files the peering as a finding, and the case fails on a correct report"
         }
       ]
     },
@@ -1570,7 +1570,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/app-worker-a", "computeclass/general-ccc"],
-      "fixture": "app-worker-a Deployment, three replicas, no cloud.google.com/compute-class nodeSelector and no compute-class affinity, in a namespace with no default class, on the cluster whose only untainted pool carries the general-ccc label; the untargeted workload the obtainability audit's 3.24 and the stockout audit's pre-filter check name",
+      "fixture": "app-worker-a Deployment, three replicas, no cloud.google.com/compute-class nodeSelector and no compute-class affinity, in a namespace with no default class, on the cluster whose only untainted pool carries the general-ccc label; the untargeted workload the obtainability audit's 3.24 names",
       "state": [
         {
           "subject": "deployment/app-worker-a",
@@ -1583,7 +1583,7 @@
           "subject": "deployment/app-worker-a",
           "path": "spec.template.spec.nodeSelector",
           "op": "absent",
-          "why": "the defect is the missing selector; the remediation the cases forbid is adding it"
+          "why": "the defect is the missing selector; the remediation the case forbids is adding it"
         },
         {
           "subject": "computeclass/general-ccc",
@@ -1619,7 +1619,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/batch-worker-a", "computeclass/general-ccc"],
-      "fixture": "batch-worker-a Deployment, one replica, nodeSelector on ComputeClass general-ccc with a hand-written toleration for the class taint that names key, value and effect and no operator (planted through a raw manifest: the provider's typed Deployment would write `operator: Equal`); the pool carries no taint, so the pod runs and the shape, not a scheduling failure, is the fixture",
+      "fixture": "batch-worker-a Deployment, one replica, nodeSelector on ComputeClass general-ccc with a hand-written toleration for the class taint that names key, value and effect and no operator (planted through a raw manifest: the provider's typed Deployment would write `operator: Equal`); GKE adds its own `operator: Equal` toleration to a Pod that selects a class, and a live test ran this shape on a tainted class pool, hand-made and GKE-created (Standard 1.35.8, Autopilot 1.36.4; older versions not tested): no defect, and no check flags it; the pool carries no taint, so the pod runs",
       "state": [
         {
           "subject": "deployment/batch-worker-a",
@@ -1633,13 +1633,13 @@
           "path": "spec.template.spec.nodeSelector[\"cloud.google.com/compute-class\"]",
           "op": "eq",
           "value": "general-ccc",
-          "why": "the workload is targeted; the defect is in its toleration, not its selector"
+          "why": "the workload is targeted through its selector"
         },
         {
           "subject": "deployment/batch-worker-a",
           "path": "spec.template.spec.tolerations[?(@.key=='cloud.google.com/compute-class')].operator",
           "op": "absent",
-          "why": "the defect is the toleration without an operator; the API server stores it as written, and anyone adding `operator: Equal` heals the shape the check reads"
+          "why": "the control is the toleration with no operator, which the API server stores as written; an operator added makes it the plain explicit form"
         }
       ]
     },
@@ -1647,7 +1647,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/batch-worker-a"],
-      "fixture": "the same batch-worker-a Deployment, read for a second defect: its container sets no ephemeral-storage request or limit, as every planted workload in the fleet does (GKE Standard admission adds none, where Autopilot writes a 1Gi request and limit onto every container), so its writable layer and logs can fill the node's boot disk until the kubelet evicts pods under DiskPressure",
+      "fixture": "the same batch-worker-a Deployment, read for its defect: its container sets no ephemeral-storage request or limit, as every planted workload in the fleet does (GKE Standard admission adds none, where Autopilot writes a 1Gi request and limit onto every container), so its writable layer and logs can fill the node's boot disk until the kubelet evicts pods under DiskPressure",
       "state": [
         {
           "subject": "deployment/batch-worker-a",

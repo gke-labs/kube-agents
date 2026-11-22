@@ -12,6 +12,14 @@ profile is resolved (a generic profile yields to the one pinned to the
 target), and its card, tier, parameters and target scope are checked. A
 refusal is posted to the conversation like any other.
 
+One field is not a parameter: ``intent=confirm`` submits the ask as a
+structured confirm, the inject door's ``"intent":"confirm"``, so the task
+runs as a change a person confirmed (the gateway sets ``changeRequested``),
+which a profile's write path needs. ``confirm`` is the only value; a case that
+does not name the field sends a typed message, as before. The door takes it
+only where the gateway has ``A2A_INJECT_CONFIRM=true`` (an eval install) and
+answers 400 otherwise.
+
 The directive ends at its first ``]``, so the ask may follow on the same line
 (a folded YAML block joins the lines) or on the next. Values take the
 harness's ``{{AGENT_CLUSTER_*}}`` and ``{{FLEET_CLUSTER_*}}`` placeholders,
@@ -34,8 +42,13 @@ from dataclasses import dataclass, field
 #: The directive's opening, and where it ends.
 PROFILE_DIRECTIVE = "[bench:profile"
 DIRECTIVE_END = "]"
-#: The field naming the profile; every other field is a parameter.
+#: The field naming the profile, and the one submitting the ask as a
+#: structured confirm; every other field is a parameter.
 NAME_FIELD = "name"
+INTENT_FIELD = "intent"
+#: The values ``intent=`` takes: the inject door's (inject_transport.INTENTS,
+#: restated because scripts/validate_bench_cases.py loads this file alone).
+INTENTS = frozenset({"confirm"})
 FIELD_SEPARATOR = "="
 #: A profile name the gateway accepts: a DNS-1123 label, which is what its
 #: ValidSubjectToken holds a profile name to (a2a/lib/envelope.go). The
@@ -56,6 +69,8 @@ class ProfileAsk:
     name: str
     prompt: str
     parameters: dict[str, str] = field(default_factory=dict)
+    #: ``confirm`` when the directive carries ``intent=confirm``, else empty.
+    intent: str = ""
 
 
 def is_profile_ask(prompt: str) -> bool:
@@ -70,7 +85,7 @@ def parse(prompt: str) -> ProfileAsk | None:
     Raises:
         ValueError: The directive is there but malformed: unclosed, no name, a
             field that isn't ``key=value``, a repeated key, a name that can't be
-            a profile's, or no ask after it.
+            a profile's, an ``intent`` other than ``confirm``, or no ask after it.
     """
     text = prompt.lstrip()
     if not text.startswith(PROFILE_DIRECTIVE):
@@ -92,6 +107,12 @@ def parse(prompt: str) -> ProfileAsk | None:
         raise ValueError(f"{PROFILE_DIRECTIVE}: {NAME_FIELD}= is required")
     if not PROFILE_NAME.match(name):
         raise ValueError(f"{PROFILE_DIRECTIVE}: {name!r} is not a profile's name")
+    intent = fields.pop(INTENT_FIELD, "")
+    if intent and intent not in INTENTS:
+        raise ValueError(
+            f"{PROFILE_DIRECTIVE}: {INTENT_FIELD}={intent} is not one the inject door takes "
+            f"(only {', '.join(sorted(INTENTS))})"
+        )
     for key in fields:
         if not PARAMETER_KEY.match(key):
             raise ValueError(f"{PROFILE_DIRECTIVE}: {key!r} is not a parameter's name")
@@ -100,4 +121,4 @@ def parse(prompt: str) -> ProfileAsk | None:
     if ask.startswith(BENCH_DIRECTIVE):
         raise ValueError(f"no other {BENCH_DIRECTIVE}...] directive may follow {PROFILE_DIRECTIVE}: "
                          "its scheduling readers see only a prompt's first line")
-    return ProfileAsk(name=name, prompt=ask, parameters=fields)
+    return ProfileAsk(name=name, prompt=ask, parameters=fields, intent=intent)

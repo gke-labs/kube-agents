@@ -19,6 +19,7 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "dev" / "repeat_under_load.sh"
@@ -116,21 +117,35 @@ NO_PROC_STATUS = (
     "this machine has no /proc/self/status: the test reads the kernel's own cpu list or "
     "ignored-signal mask there, to show what the script pinned, clamped to or left ignored"
 )
-RUN_STARTS_WITH_SIGINT_IGNORED = (
-    "this machine has setsid and a bash that does not restore SIGINT in an async subshell, "
-    "as bash 3.2 does not: the run starts with Ctrl-C ignored, and the test shows the "
-    "command's own answer to Ctrl-C reaching its log"
-)
-# A command started the way the script starts a run where the machine has setsid: an
-# async subshell that restores SIGINT and execs. The command traps SIGINT, signals itself,
-# and prints the mark from the trap; a command that started with SIGINT ignored cannot
-# trap it and prints nothing.
+# A command started the way the script starts a run under setsid: an async subshell that
+# restores SIGINT and execs. The command traps SIGINT, signals itself, and prints the mark
+# from the trap; a command that started with SIGINT ignored cannot trap it and prints
+# nothing. The script makes the same probe of its own bash before it uses setsid.
 SIGINT_RESTORED_MARK = "restored"
 SIGINT_RESTORE_PROBE = (
     f"( trap - INT QUIT; exec bash -c 'trap \"echo {SIGINT_RESTORED_MARK}\" INT; kill -INT $$; :' ) "
     "</dev/null & wait $!"
 )
 SIGINT_PROBE_DEADLINE_SECONDS = 20
+# A stand-in for setsid that records its use in the file SETSID_MARK_ENV names, then runs
+# the command in a new session: through the real setsid where REAL_SETSID_ENV names one,
+# else with a session of its own making. Without the new session the run would stay in
+# the script's process group, and a test's Ctrl-C to that group would reach it two times.
+SETSID_MARK_ENV = "REPEAT_UNDER_LOAD_TEST_SETSID_MARK"
+REAL_SETSID_ENV = "REPEAT_UNDER_LOAD_TEST_REAL_SETSID"
+SETSID_STAND_IN = (
+    f"#!{sys.executable}\n"
+    "import os, sys\n"
+    f'open(os.environ["{SETSID_MARK_ENV}"], "w").close()\n'
+    f'real = os.environ.get("{REAL_SETSID_ENV}")\n'
+    "if real:\n"
+    "    os.execv(real, [real, *sys.argv[1:]])\n"
+    "os.setsid()\n"
+    "os.execvp(sys.argv[1], sys.argv[1:])\n"
+)
+# Inside the directory that `path_hiding` makes: the name of a folder of stand-ins, before
+# the number of the PATH folder that it stands in for.
+STAND_INS_FOLDER_PREFIX = "stand-ins-for-path-"
 # Builtins that bash 4 added and macOS's /bin/bash 3.2 lacks.
 BASH_4_BUILTINS = ("mapfile", "readarray")
 # A cpu count below the cores the fallback test asks for, so the clamp shows.
@@ -140,10 +155,9 @@ ASKED_CORES_ABOVE_STAND_IN = "8"
 
 def sigint_at_its_default():
     """Run in a child before it starts: SIGINT at its default, whatever the test runner
-    inherited. A runner started in the background of a non-interactive shell (or under
-    this script on bash 3.2 with setsid) hands SIGINT on ignored, and a shell cannot trap
-    a signal it started with ignored, so the script under test could not answer Ctrl-C at
-    all."""
+    inherited. A runner started in the background of a non-interactive shell hands SIGINT
+    on ignored, and a shell cannot trap a signal it started with ignored, so the script
+    under test could not answer Ctrl-C at all."""
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
@@ -179,49 +193,50 @@ def wait_until(condition, deadline=INTERRUPT_DEADLINE_SECONDS):
     return condition()
 
 
-def path_without(name):
-    """A PATH holding every tool on the current PATH except `name`."""
-    bin_dir = Path(os.environ.get("TMPDIR", "/tmp")) / f"repeat-under-load-path-{os.getpid()}-{name}"
-    if bin_dir.exists():
-        shutil.rmtree(bin_dir)
-    bin_dir.mkdir()
-    for d in os.environ["PATH"].split(os.pathsep):
-        for entry in os.listdir(d) if os.path.isdir(d) else []:
-            link = bin_dir / entry
-            if entry == name or link.is_symlink() or link.exists():
-                continue
-            link.symlink_to(Path(d) / entry)
-    return bin_dir
-
-
 def path_hiding(name):
-    """A directory and a PATH on which `name` is not found. The caller may add a stand-in
-    to the directory and removes it afterwards.
+    """A new directory and a PATH on which `name` is not found. The directory is first on
+    that PATH: the caller may add a stand-in to it, and removes it afterwards.
 
-    Where the machine has no `name` there is nothing to hide: the PATH is the current one
-    behind a new, empty directory, and no tool is linked. Otherwise the PATH is
-    `path_without(name)` alone.
+    Each folder of the current PATH that holds `name` gives way to a folder, inside the new
+    directory, of stand-ins for its other tools. A stand-in is a script of the test's own
+    that runs the tool by its full path. It is not a link to the tool: on a managed machine
+    a link to a protected tool is one that the test cannot remove again, and the folder
+    then stays behind. A folder that does not hold `name` stays on the PATH as it is, so
+    where the machine has no `name` the PATH is the current one behind the new directory.
     """
-    if shutil.which(name) is None:
-        bin_dir = Path(mkdtemp(prefix=f"repeat-under-load-path-{name}-"))
-        return bin_dir, f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
-    bin_dir = path_without(name)
-    return bin_dir, str(bin_dir)
+    bin_dir = Path(mkdtemp(prefix=f"repeat-under-load-path-{name}-"))
+    folders = [str(bin_dir)]
+    try:
+        for number, folder in enumerate(os.environ["PATH"].split(os.pathsep)):
+            # An empty entry of a PATH is the current folder, here that of the test.
+            here = os.path.abspath(folder or os.curdir)
+            if not os.path.lexists(os.path.join(here, name)):
+                folders.append(folder)
+                continue
+            stand_ins = bin_dir / f"{STAND_INS_FOLDER_PREFIX}{number}"
+            stand_ins.mkdir()
+            for entry in os.listdir(here):
+                tool = os.path.join(here, entry)
+                if entry != name and os.path.isfile(tool) and os.access(tool, os.X_OK):
+                    add_stand_in(stand_ins, entry, f'#!/bin/sh\nexec {shlex.quote(tool)} "$@"\n')
+            folders.append(str(stand_ins))
+    except BaseException:
+        # The caller gets no directory to remove, so it must not stay.
+        shutil.rmtree(bin_dir)
+        raise
+    return bin_dir, os.pathsep.join(folders)
 
 
 def add_stand_in(bin_dir, name, script):
-    """Put an executable `script` at `bin_dir/name`, in place of a link to the real tool:
-    the link is removed first, so the write never follows it to the tool itself."""
+    """Put an executable `script` at `bin_dir/name`."""
     stand_in = bin_dir / name
-    if stand_in.is_symlink() or stand_in.exists():
-        stand_in.unlink()
     stand_in.write_text(script)
     stand_in.chmod(0o755)
 
 
 def run_starts_with_sigint_ignored():
-    """Whether a command started the way the script starts a run with setsid has SIGINT
-    ignored."""
+    """Whether a command started the way the script starts a run under setsid has SIGINT
+    ignored, on the bash that the script runs on here."""
     probe = subprocess.run(
         ["bash", "-c", SIGINT_RESTORE_PROBE],
         capture_output=True,
@@ -231,12 +246,6 @@ def run_starts_with_sigint_ignored():
         preexec_fn=sigint_at_its_default,
     )
     return SIGINT_RESTORED_MARK not in probe.stdout
-
-
-# Probed once, for the skips below and for the test that holds the probe to the kernel.
-# Without setsid the script starts a run under job control, and no skip applies: there a
-# run that starts with SIGINT ignored fails the tests.
-RUN_SIGINT_IGNORED = shutil.which("setsid") is not None and run_starts_with_sigint_ignored()
 
 
 def allowed_cpus(status_text):
@@ -259,6 +268,99 @@ def pid_alive(pid):
     except PermissionError:
         return True
     return True
+
+
+class PathHidingTest(unittest.TestCase):
+    """`path_hiding`, which the tests below use to take a tool off the PATH."""
+
+    # A tool that prints the name it was started by, its pid and its arguments.
+    NAME_PID_ARGUMENTS = '#!/bin/sh\necho "${0##*/} $$ got: $*"\n'
+
+    def setUp(self):
+        # Two folders of tools on the PATH, each with the tool to hide, as `/usr/bin` and
+        # `/bin` both hold a tool on Linux. The first has a space in its name, one more
+        # tool, a link to that one (as a package manager makes a link for a tool), a file
+        # that is not executable and a sub-folder.
+        tools = TemporaryDirectory(prefix="tools with a space ")
+        more = TemporaryDirectory()
+        for folder in (tools, more):
+            self.addCleanup(folder.cleanup)
+        self.tools, self.more = Path(tools.name), Path(more.name)
+        for folder, name, script in (
+            (self.tools, "hidden-tool", "#!/bin/sh\nexit 0\n"),
+            (self.tools, "other-tool", self.NAME_PID_ARGUMENTS),
+            (self.more, "hidden-tool", "#!/bin/sh\nexit 0\n"),
+            (self.more, "second-tool", self.NAME_PID_ARGUMENTS),
+        ):
+            (folder / name).write_text(script)
+            (folder / name).chmod(0o755)
+        (self.tools / "linked-tool").symlink_to(self.tools / "other-tool")
+        (self.tools / "not-a-tool.txt").write_text("a file that is not executable\n")
+        (self.tools / "a-folder").mkdir()
+        path = mock.patch.dict(os.environ, {"PATH": os.pathsep.join([str(self.tools), str(self.more), os.environ["PATH"]])})
+        path.start()
+        self.addCleanup(path.stop)
+
+    def test_the_tool_is_not_found_and_the_other_tools_of_its_folders_still_run(self):
+        bin_dir, path = path_hiding("hidden-tool")
+        try:
+            # Neither folder gives the tool.
+            self.assertIsNone(shutil.which("hidden-tool", path=path))
+            # Each other tool runs as itself: by its own name (a tool behind a link can read
+            # that name), with the pid that the caller started, and with its arguments whole.
+            for tool in ("other-tool", "linked-tool", "second-tool"):
+                started = subprocess.Popen([tool, "a b", "c"], env=dict(os.environ, PATH=path), stdout=subprocess.PIPE, text=True)
+                printed, _ = started.communicate()
+                self.assertEqual((started.returncode, printed), (0, f"{tool} {started.pid} got: a b c\n"))
+            for not_a_tool in ("not-a-tool.txt", "a-folder"):
+                self.assertIsNone(shutil.which(not_a_tool, path=path), not_a_tool)
+            # A tool of a folder that does not hold the hidden one is found where it is.
+            self.assertEqual(shutil.which("sh", path=path), shutil.which("sh"))
+            # The new directory is first: a stand-in that the caller adds wins over the tool.
+            add_stand_in(bin_dir, "other-tool", "#!/bin/sh\necho stand-in\n")
+            done = subprocess.run(["other-tool"], env=dict(os.environ, PATH=path), capture_output=True, text=True, check=False)
+            self.assertEqual(done.stdout, "stand-in\n")
+        finally:
+            shutil.rmtree(bin_dir)
+
+    def test_the_directory_holds_no_link_so_the_test_can_remove_all_of_it(self):
+        """On a managed machine a link to a protected tool cannot be removed again. A file of
+        the test's own can, whatever tool it runs."""
+        bin_dir, _ = path_hiding("hidden-tool")
+        try:
+            made = sorted(bin_dir.rglob("*"))
+            self.assertEqual([str(path) for path in made if path.is_symlink()], [])
+            self.assertIn("linked-tool", [path.name for path in made])
+        finally:
+            shutil.rmtree(bin_dir)
+        self.assertFalse(bin_dir.exists())
+
+    def test_a_tool_that_the_machine_does_not_have_changes_nothing_on_the_path(self):
+        bin_dir, path = path_hiding("a-tool-that-no-machine-has")
+        try:
+            self.assertEqual(path, f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+            self.assertEqual(list(bin_dir.iterdir()), [])
+        finally:
+            shutil.rmtree(bin_dir)
+
+    def test_a_helper_that_fails_part_way_leaves_no_directory(self):
+        """The caller gets no directory to remove when the helper raises."""
+        made = []
+        real_mkdtemp = mkdtemp
+
+        def recording_mkdtemp(**options):
+            made.append(Path(real_mkdtemp(**options)))
+            # A helper that does leave its directory fails this test; the test removes it then.
+            self.addCleanup(shutil.rmtree, made[-1], ignore_errors=True)
+            return str(made[-1])
+
+        fault = OSError("no space left on device")
+        with mock.patch(f"{__name__}.mkdtemp", recording_mkdtemp), mock.patch(f"{__name__}.add_stand_in", side_effect=fault):
+            with self.assertRaises(OSError) as caught:
+                path_hiding("hidden-tool")
+        self.assertIs(caught.exception, fault)
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made[0].exists())
 
 
 class RepeatUnderLoadTest(unittest.TestCase):
@@ -496,7 +598,6 @@ class RepeatUnderLoadTest(unittest.TestCase):
         # bash's own "Terminated" line for the sleep may precede the command's answer.
         self.assertEqual(log.split()[-1:], ["termed"], f"the command was killed before it could answer TERM: {log!r}")
 
-    @unittest.skipIf(RUN_SIGINT_IGNORED, RUN_STARTS_WITH_SIGINT_IGNORED)
     def test_a_child_that_outlives_the_leader_finishes_its_own_report(self):
         returncode, log, _, stderr = self.interrupt_after_ready(CHILD_OUTLIVES_LEADER)
         self.assertEqual(returncode, SIGINT_EXIT_CODE, stderr)
@@ -556,13 +657,14 @@ class RepeatUnderLoadTest(unittest.TestCase):
         for pid in pids:
             self.assertTrue(wait_until(lambda: not pid_alive(pid)), f"busy loop {pid} outlived a killed script")
 
-    @unittest.skipIf(RUN_SIGINT_IGNORED, RUN_STARTS_WITH_SIGINT_IGNORED)
-    def test_an_interrupt_lets_the_command_finish_its_own_report(self):
+    def interrupted_report(self, env=None):
+        """Start the script over INTERRUPT_REPORT, Ctrl-C it once `ready` exists, and return
+        (returncode, run-1 log text)."""
         with TemporaryDirectory() as tmp:
             proc = subprocess.Popen(
                 [str(SCRIPT), "-n", "2", *LIGHT_LOAD, "--", sys.executable, "-c", INTERRUPT_REPORT],
                 cwd=tmp,
-                env=dict(os.environ, TMPDIR=tmp),
+                env=dict(os.environ, TMPDIR=tmp, **(env or {})),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -581,8 +683,57 @@ class RepeatUnderLoadTest(unittest.TestCase):
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate()
             log = next(Path(tmp).glob("repeat-under-load.*/run-1.log")).read_text()
-        self.assertEqual(proc.returncode, SIGINT_EXIT_CODE)
+        return proc.returncode, log
+
+    def test_an_interrupt_lets_the_command_finish_its_own_report(self):
+        returncode, log = self.interrupted_report()
+        self.assertEqual(returncode, SIGINT_EXIT_CODE)
         self.assertEqual(log.split(), ["first", "second"], "the command's interrupt report was cut short")
+
+    def test_with_setsid_on_the_path_a_run_still_starts_with_ctrl_c_at_its_default(self):
+        """A bash that does not restore SIGINT in an async subshell, as bash 3.2 does not, would
+        start a run under setsid with Ctrl-C ignored. The script uses setsid only where this
+        bash restores it, and job control elsewhere; the command's own report arrives either way."""
+        real_setsid = shutil.which("setsid") or ""
+        bin_dir, path = path_hiding("setsid")
+        try:
+            add_stand_in(bin_dir, "setsid", SETSID_STAND_IN)
+            with TemporaryDirectory() as marks:
+                mark = Path(marks) / "setsid.used"
+                env = {"PATH": path, SETSID_MARK_ENV: str(mark), REAL_SETSID_ENV: real_setsid}
+                returncode, log = self.interrupted_report(env=env)
+                used = mark.exists()
+        finally:
+            shutil.rmtree(bin_dir)
+        self.assertEqual(returncode, SIGINT_EXIT_CODE)
+        self.assertEqual(log.split(), ["first", "second"], "the command's interrupt report did not arrive whole")
+        self.assertEqual(used, not run_starts_with_sigint_ignored(), "setsid is for a bash that restores SIGINT only")
+
+    def test_a_script_that_started_with_ctrl_c_ignored_keeps_setsid(self):
+        """Job control repairs one state: a bash that keeps SIGINT ignored in an async subshell.
+        A script that itself started with SIGINT ignored gains nothing from it on any bash, so
+        it keeps setsid, with which a command that opens the terminal fails and does not stop."""
+        real_setsid = shutil.which("setsid") or ""
+        bin_dir, path = path_hiding("setsid")
+        try:
+            add_stand_in(bin_dir, "setsid", SETSID_STAND_IN)
+            with TemporaryDirectory() as tmp:
+                mark = Path(tmp) / "setsid.used"
+                result = subprocess.run(
+                    [str(SCRIPT), "-n", "1", *LIGHT_LOAD, "--", "true"],
+                    cwd=tmp,
+                    env=dict(os.environ, TMPDIR=tmp, PATH=path, **{SETSID_MARK_ENV: str(mark), REAL_SETSID_ENV: real_setsid}),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=SCRIPT_DEADLINE_SECONDS,
+                    preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+                )
+                used = mark.exists()
+        finally:
+            shutil.rmtree(bin_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(used, "the script left setsid for job control, which cannot restore SIGINT here")
 
     @unittest.skipUnless(PROC_STATUS.exists(), NO_PROC_STATUS)
     def test_the_command_can_still_be_interrupted_by_sigint(self):
@@ -594,8 +745,6 @@ class RepeatUnderLoadTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         ignored = int(log.split(":", 1)[1].strip(), 16)
         self.assertFalse(ignored & (1 << (signal.SIGINT - 1)), f"SIGINT is ignored under the script: {log.strip()}")
-        # The probe that skips the interrupt-report tests must agree with the kernel here.
-        self.assertFalse(RUN_SIGINT_IGNORED, "the SIGINT probe says ignored where the kernel says it is not")
 
     def test_a_flag_as_a_flag_value_prints_usage(self):
         with TemporaryDirectory() as tmp:

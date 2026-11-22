@@ -104,7 +104,7 @@ which is the bound the anti-goal below sets. The ChatOps page gets a paragraph t
 which is where the page already says what a kept record holds and who can read it.
 
 A turn counts when the gateway has verified its sender and its backend is a chat platform a
-person writes on: one of the gateway's three chat backends, Google Chat, Slack or Discord, named
+person writes on: one of the gateway's chat backends, Google Chat, Slack, Discord or (armed) Teams, named
 as such in the code and not by reference to any counter's label set. The program doors (`inject`,
 `a2a`, and the Google door) are not people, and an eval or CI install must not read its inject
 principals as such; the console is not counted either, since every console user resolves to the
@@ -137,8 +137,8 @@ added: a third reading kind, `people`, with two fields, `peopleSeen7d` and `peop
 one, `max` across pods, never moving `lastActiveTime`). They are readings and not counters because
 a window count falls when people stop writing, which a monotonic counter cannot say. The operator reads the `people` reading only while no chat platform the install enables is
 served through Hermes: not Chat on its legacy consumer, not Slack on its legacy consumer (the
-facts that choose the Slack consumer), and not Teams, which Hermes alone serves and the gateway
-has no backend for; while any of them is, the fields stay absent, since a real 0 would say nobody
+facts that choose the Slack consumer), and not Teams while Hermes serves it (the gateway's Teams backend takes it only under the
+operator's `A2A_TEAMS_BACKEND` switch); while any of them is, the fields stay absent, since a real 0 would say nobody
 wrote while those platforms' users were writing, and the summary prints "no reading". The slot as
 that design specifies it reads the broker's body alone; this design generalises it to a target per
 reading, the

@@ -307,7 +307,7 @@ func TestAJobNameCoversTheWholeKeyUnambiguously(t *testing.T) {
 func TestAKeyThatIsNotSubjectTokensNamesNoJob(t *testing.T) {
 	cfg := kubeJobsConfig(t)
 	kube := fake.NewClientset()
-	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+	k := newKubeJobsWithParam(t, kube, &cfg)
 	ctx := context.Background()
 	for _, id := range []string{"a/b", "Task-1", ""} {
 		if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, id); err == nil {
@@ -361,7 +361,7 @@ func TestDeleteRemovesOnlyThisTasksLegacyJob(t *testing.T) {
 		{"no annotations", nil, lib.SubmitKindTop, false},
 	} {
 		kube := fake.NewClientset(legacy(c.annotations))
-		k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+		k := newKubeJobsWithParam(t, kube, &cfg)
 		if err := k.Delete(context.Background(), "inv", "unattended", c.kind, "task-1"); err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -461,7 +461,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 	cfg := kubeJobsConfig(t)
 	ctx := context.Background()
 	own := func(t *testing.T) *batchv1.Job {
-		j, err := buildJob(cfg, &cfg.Profiles[0], cfg.Profiles[0].JobTemplate, "unattended", lib.SubmitKindTop, "task-1")
+		j, err := buildJob(cfg, &cfg.Profiles[0], kubeJobsTemplateRaw(t), "unattended", lib.SubmitKindTop, "task-1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -476,7 +476,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			impostor := own(t)
 			mutate(impostor)
-			k := NewKubeJobs(fake.NewClientset(impostor), func() lib.DispatchConfig { return cfg })
+			k := newKubeJobsWithParam(t, fake.NewClientset(impostor), &cfg)
 			if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
 				t.Errorf("Launch over an impostor: %v, want ErrJobNotOurs", err)
 			}
@@ -490,7 +490,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 	// if its template names no ServiceAccount to compare.
 	bare := own(t)
 	bare.Spec.Template.Spec.ServiceAccountName = ""
-	kb := NewKubeJobs(fake.NewClientset(bare), func() lib.DispatchConfig { return cfg })
+	kb := newKubeJobsWithParam(t, fake.NewClientset(bare), &cfg)
 	if _, _, err := kb.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
 		t.Errorf("Pod of a never-checked Job with no ServiceAccount: %v, want ErrJobNotOurs", err)
 	}
@@ -498,7 +498,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 	// Launched and checked, then swapped for an impostor, or holding a pod
 	// that runs as another ServiceAccount: Pod refuses both.
 	kube := fake.NewClientset()
-	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+	k := newKubeJobsWithParam(t, kube, &cfg)
 	if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 		t.Fatal(err)
 	}

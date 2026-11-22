@@ -7799,6 +7799,22 @@ class CurrentContextTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertIsNone(read_current_context(document))
 
+    def test_returns_none_for_text_that_the_yaml_reader_refuses_with_a_plain_exception(self):
+        # PyYAML builds a tagged or dated scalar with int(), datetime, a lookup
+        # table and a pattern match. For text that does not fit, those raise a
+        # ValueError, a KeyError, an IndexError or an AttributeError, and not a
+        # yaml.YAMLError.
+        for label, document in (
+            ("a date that does not exist (ValueError)", "current-context: gke_p_l_c\na: 2001-13-45\n"),
+            ("an int tag on text (ValueError)", "current-context: gke_p_l_c\na: !!int x\n"),
+            ("a bool tag on text (KeyError)", "current-context: gke_p_l_c\na: !!bool x\n"),
+            ("an int tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!int ''\n"),
+            ("a float tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!float ''\n"),
+            ("a timestamp tag on text (AttributeError)", "current-context: gke_p_l_c\na: !!timestamp x\n"),
+        ):
+            with self.subTest(label):
+                self.assertIsNone(read_current_context(document))
+
     def test_survives_a_document_built_to_kill_the_parser(self):
         # Both shapes are reachable: the caller's kubeconfig is agent-authored
         # and only bounded by MAX_KUBECONFIG_BYTES. Deep nesting is why the
@@ -10716,7 +10732,10 @@ class SlackRelayTest(unittest.TestCase):
         retried = relay.pull(timeout_seconds=1)
         self.assertEqual("events_api", retried["type"])
 
-    def test_nack_does_not_block_or_lose_receipt_when_queue_is_full(self):
+    def test_nack_against_a_full_queue_drops_the_event_and_spends_the_receipt(self):
+        # Nothing retries a failed nack, so an event kept back here would
+        # never be delivered and the receipt table would grow; the event is
+        # dropped, with a warning, and the queue's own entries are untouched.
         relay = self.relay()
         relay._events = queue.Queue(maxsize=1)
         relay._receipts["receipt"] = {
@@ -10725,11 +10744,14 @@ class SlackRelayTest(unittest.TestCase):
         }
         relay._events.put_nowait({"type": "existing", "payload": {}})
 
-        with self.assertLogs("credential-proxy", level="WARNING"):
-            self.assertFalse(relay.settle("receipt", acknowledge=False))
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.assertTrue(relay.settle("receipt", acknowledge=False))
 
-        self.assertIn("receipt", relay._receipts)
+        self.assertIn("dropped, not requeued", logs.output[0])
+        self.assertNotIn("receipt", relay._receipts)
+        self.assertFalse(relay.settle("receipt", acknowledge=False))
         self.assertEqual("existing", relay._events.get_nowait()["type"])
+        self.assertTrue(relay._events.empty())
 
     def test_incoming_event_is_acknowledged_and_dropped_when_queue_is_full(self):
         relay = self.relay()
@@ -14072,6 +14094,40 @@ class RequiredRoleTest(unittest.TestCase):
             (credential_proxy.CALLER_ROLE_A2A_CHAT,),
             credential_proxy.required_roles("/v1/chat/a2a/events"),
         )
+
+    def test_the_teams_routes_admit_the_a2a_gateway_only_when_the_operator_says_so(self):
+        """The Teams relay has one consumer per install, Hermes or the A2A
+        gateway's teams backend (the operator's A2A_TEAMS_BACKEND switch). The
+        broker learns which from CREDENTIAL_PROXY_TEAMS_A2A_CALLER: without it
+        the routes are the chat role's alone, so a Chat-armed gateway's token
+        cannot reach a Hermes-served Teams queue; with it both roles are
+        admitted. The Slack and legacy Chat event routes stay the chat role's."""
+        teams_paths = (
+            "/v1/chat/teams/events",
+            "/v1/chat/teams/events/ack",
+            "/v1/chat/teams/events/nack",
+            "/v1/chat/teams/api",
+        )
+        self.assertEqual((credential_proxy.CALLER_ROLE_CHAT,), credential_proxy._teams_route_roles(False))
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_A2A_CHAT),
+            credential_proxy._teams_route_roles(True),
+        )
+        for armed in (False, True):
+            table = tuple(
+                (prefix, credential_proxy._teams_route_roles(armed)) if prefix == "/v1/chat/teams/" else (prefix, roles)
+                for prefix, roles in credential_proxy.ROUTE_ROLES
+            )
+            credential_proxy._validate_route_roles(table)
+            with mock.patch.object(credential_proxy, "ROUTE_ROLES", table):
+                for path in teams_paths:
+                    self.assertEqual(
+                        credential_proxy._teams_route_roles(armed), credential_proxy.required_roles(path), (armed, path)
+                    )
+                self.assertEqual(
+                    (credential_proxy.CALLER_ROLE_CHAT,),
+                    credential_proxy.required_roles("/v1/chat/slack/events"),
+                )
 
     def test_a_route_belonging_to_neither(self):
         self.assertEqual((), credential_proxy.required_roles("/healthz"))
@@ -21394,6 +21450,24 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertEqual(str(entra), "HTTP 401: invalid_client")
         self.assertEqual(entra.fields["message"], "")
 
+    def test_teams_nack_against_a_full_queue_drops_the_activity_and_its_attempts(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._events = queue.Queue(maxsize=1)
+        activity = {"type": "message", "text": "first"}
+        relay._receipts["receipt"] = activity
+        relay._attempts[id(activity)] = 2
+        relay._events.put_nowait({"type": "message", "text": "existing"})
+
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.assertTrue(relay.settle("receipt", acknowledge=False))
+
+        self.assertIn("dropped, not requeued", logs.output[0])
+        self.assertEqual(relay._receipts, {})
+        self.assertEqual(relay._attempts, {})
+        self.assertFalse(relay.settle("receipt", acknowledge=False))
+        self.assertEqual(relay._events.get_nowait()["text"], "existing")
+        self.assertTrue(relay._events.empty())
+
     def test_teams_relay_token_acquisition_and_caching(self):
         relay = TeamsRelay(
             app_id="app-id-123",
@@ -21549,6 +21623,39 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertEqual(result, {"id": "act-1"})
         posted = opened.call_args.args[0].data.decode("utf-8")
         self.assertIn("ok ? done", posted)
+
+    def test_teams_relay_admits_put_on_one_activity_only(self):
+        """The gateway's status line edits its own activity: a PUT at the
+        activity's id goes through with its method kept; a PUT on the
+        collection, on history, or any other verb is refused before the
+        token is minted."""
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+            relay._get_access_token()
+            mock_resp.read.return_value = json.dumps({"id": "act-1"}).encode("utf-8")
+            res = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/19:abc@thread.tacv2;messageid=1/activities/act-1",
+                method="put",
+                payload={"type": "message", "id": "act-1", "text": "done"},
+            )
+            self.assertEqual(res, {"id": "act-1"})
+            sent = mock_open.call_args[0][0]
+            self.assertEqual(sent.get_method(), "PUT")
+            self.assertTrue(sent.full_url.endswith("/activities/act-1"))
+        for path, method in (
+            ("v3/conversations/19:abc/activities", "PUT"),
+            ("v3/conversations/19:abc/activities/history", "PUT"),
+            ("v3/conversations/19:abc/activities/act-1", "DELETE"),
+            ("v3/conversations/19:abc/activities/act-1", "PATCH"),
+        ):
+            with self.subTest(path=path, method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path=path, method=method, payload={})
 
     def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
         class RedirectingHandler(http.server.BaseHTTPRequestHandler):
