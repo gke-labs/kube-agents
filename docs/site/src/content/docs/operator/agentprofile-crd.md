@@ -34,6 +34,7 @@ spec:
     image: registry.example.com/kube-agents/agent-worker:1.0
     model: model-default
     maxTurns: 50
+    # type: claude-code # optional; absent is claude-code, the only value accepted today
   tools: # optional
     - name: jq # at most 24 characters
       image: registry.example.com/kube-agents/tools-jq:1.7
@@ -60,6 +61,10 @@ spec:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "1", memory: 2Gi }
 ```
+
+`harness.type` names the harness the worker image runs. Absent is `claude-code`, which is also the only value the CRD accepts today. Leave it out for Claude Code. The operator passes it to the worker as `A2A_HARNESS` only when it is set, so a profile without it keeps the pods it had. On an older CRD that lacks the field, a client that validates fields strictly, as kubectl does by default, refuses a manifest that sets it. A client that doesn't applies it with the field dropped, so the profile runs as Claude Code.
+
+The type is pod configuration only. It isn't on the profile's card, and no bus subject or permission depends on it. If a profile's type is one this operator doesn't render (an older, newer or edited CRD let it in), the operator refuses the profile: `IdentityReady` is False with reason `HarnessNotSupported`, and nothing is rendered for it.
 
 The persona image and each tools image keep their content under a `/files` directory. The persona mounts read-only at `/persona`. Each tool mounts read-only at `/opt/tools/<name>`, and its `/opt/tools/<name>/bin` goes on `PATH` in list order, so put a tool's binaries in `/files/bin`. Where the cluster can't mount image volumes (GKE Autopilot, Kubernetes below 1.35), an init container copies `/files` into an emptyDir instead, so these images also need `/bin/sh`. A tools image holds no credentials: a tool that needs them gets them from the broker, per task.
 
@@ -92,7 +97,7 @@ The operator looks for AgentProfiles once, at startup. If the CRD isn't installe
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 
-`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
+`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Work a scheduled run delegates runs at `read`, but the gateway hands it only to a profile that also lists `unattended`. Absent means `read` alone.
 
 A listed tier name is at most 10 lowercase letters or digits, with no hyphen. It becomes part of the profile's bus identity (`profile-<name>-<tier>`, one 63-character label) and of its queue names, so the cap keeps every derived name valid, and the missing hyphen keeps two profiles' queue names from colliding. A longer or hyphenated `Tier` can exist, but no profile can list it.
 
@@ -154,6 +159,6 @@ With the dispatcher on, each admitted profile also gets a warm pool for each of 
 
 | Condition                 | Meaning                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `TierUnknown` or `TierModeConflict` when no listed tier renders).                                                            |
+| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `HarnessNotSupported`, `TierUnknown` or `TierModeConflict` when no listed tier renders).                                     |
 | `TiersRendered` condition | Every listed tier renders (`AllTiersRendered`), or which don't and why (`TierUnknown`, `TierModeConflict`). Its message names the tiers that render.                                                                                                                                                                                                        |
 | `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, `BusConfigPending` while the bus loads a new profile's config, or the same mode and binding reasons as `IdentityReady`). `DurableRecheck` means a durable that existed can't be found, and waits a pass before it's re-created. |

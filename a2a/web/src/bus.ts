@@ -98,6 +98,12 @@ export interface Durable {
 }
 
 /**
+ * The agent types a session worker publishes under: the harness it runs
+ * (the worker adapter's Driver.Harness). Each keeps a per-task durable.
+ */
+export const WORKER_HARNESSES: ReadonlySet<string> = new Set(["claude-code", "antigravity"]);
+
+/**
  * The durables the page can find a session by. Nothing publishes heartbeats,
  * so a consumer with a pull outstanding is the only liveness signal on the
  * bus. The names come from the executors themselves: the gateway's relay,
@@ -112,7 +118,7 @@ export function durablesFor(agents: Iterable<AgentView>): Durable[] {
       d = { session: a.session, name: GATEWAY_RELAY, stream: "TASKS", perTask: false };
     } else if (a.agentType === "hermes-bridge" && a.profile) {
       d = { session: a.session, name: `bridge-${a.profile}`, stream: "TASKS", perTask: false };
-    } else if (a.agentType === "claude-code" && a.status !== "done" && a.status !== "closed") {
+    } else if (WORKER_HARNESSES.has(a.agentType) && a.status !== "done" && a.status !== "closed") {
       d = { session: a.session, name: `${a.session}-in`, stream: "TASKS", perTask: true };
     }
     if (d !== null && CONSUMER_NAME_RE.test(d.name)) out.push(d);

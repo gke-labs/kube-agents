@@ -33,4 +33,4 @@ stop-on-permission-refusal
 vcs-review-feedback-read-back
 scale-request-proposes-pr
 provisioning-cluster-request-never-creates
-post-merge-verified-fixed
+cluster-profile-finds-the-managed-repository

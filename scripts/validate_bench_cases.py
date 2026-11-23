@@ -356,6 +356,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Its harness applied the merged fix to a shared planted defect, which the
+    # read-only fleet refuses and about thirty other cases read. It needs a fixture of
+    # its own and Config Sync to apply the merge, as a customer's reconciler would.
+    "post-merge-verified-fixed": (
+        "#6905: needs its own no-PDB workload and a Config Sync reconciler on the seeded fleet"
+    ),
     # Needs a pool with a live node whose surge node, or green pool, draws more
     # of a regional quota than the project has left. GKE bounds the surge by
     # the pool's live nodes, so a zero-node pool is not a fixture; the suite's

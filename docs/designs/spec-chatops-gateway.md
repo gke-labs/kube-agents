@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat, Slack and Teams adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod, the same four widened when the Teams backend is armed, `a2aRelayCaller`); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` until the flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat, Slack and Teams adapters, the console adapter, and the A2A door with its eval, Google sign-in and Microsoft Entra sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the env of either sign-in class, Google or Entra); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS` and in `CREDENTIAL_PROXY_A2A_CHAT_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod, the same four widened when the Teams backend is armed, `a2aRelayCaller`); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled, with Chat or without it, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, its replacement by the profile path is tracked in #6483, and since 2026-11-20 it is on by default for the session route (#6538), so `defaultRoute: session` routes plain turns to session pods with the view on; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` 10, a batch's results coming back in one wake and one stop canceling the conversation's whole task tree); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip, whose switch is built: the PlatformAgent's `spec.harness.tuning.defaultRoute`, which the operator renders as `A2A_DEFAULT_ADDRESSEE` and which stays `platform` when unset until the flip, a later change gated on evidence; `defaultRoute: session` opts an install in, with the session cap fitted to the live `TASKS` stream's width (`status.effectiveSessionCap`)
 
 ## Purpose
 
@@ -578,7 +578,7 @@ One exception stands while its flag is on: the session pod's temporary read-only
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
 credential broker directly, with the platform agent's scope and no child task, so the only gate
 between the requester and that read is the gateway's ingress allowlist, not the target's
-`AllowedUsers`. The view retires on the default flip (#2371); until then, on an install whose
+`AllowedUsers`. Its replacement by the profile path is tracked in #6483. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with it on (#6538, 2026-11-20). Until it is replaced, on an install whose
 operator has turned the flag on and whose CR narrows the platform agent's allowlist, a person the
 gateway refuses a delegation to `platform` can still read its clusters through a session's view.
 
@@ -734,9 +734,17 @@ or, when no wake followed, the end the observers were told. Chat backends read t
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
 setting, the PlatformAgent's `spec.harness.tuning.defaultRoute` (`session` or `platform`, unset
-meaning `platform` until the default flips), which the operator renders as
+meaning `platform`; making `session` the default is a later change, gated on evidence), which the operator renders as
 `A2A_DEFAULT_ADDRESSEE` on the gateway and on the platform agent container (which the hermes-bridge sidecar copies) from one resolver,
-so the two cannot disagree. The Delegate flow covers one task; the
+so the two cannot disagree. An install that sets `defaultRoute: session` opts into the session route,
+where the operator reads the live `TASKS` stream's `max_consumers` off the bus's monitoring endpoint
+and fits the session cap to it, since a stream cannot be widened once it exists:
+`status.effectiveSessionCap` is `maxSessions` or the sessions the stream has room for, whichever is
+fewer, the gateway's cap, the session quota and the provision Job's check follow it, and a stream
+with no room for one session sends plain conversations to `platform`. On an existing install, until
+the width has been read once, the provision Job waits. The operator's `A2A_SESSION_CLUSTER_VIEW`
+doesn't change the route: with the session pods' cluster view on, plain turns still go to session
+pods (#6538, 2026-11-20). On `platform` none of this runs. The Delegate flow covers one task; the
 per-conversation opt-in is `/session`: deterministic, resolved before status, stop and steer,
 naming a route rather than a handle. A bare `/session` marks the conversation session-routed
 and the next message opens the pod; `/session <text>` marks it and runs the text as the first
@@ -814,7 +822,7 @@ leaves the record as it was:
    console is `read`, and a requester with no identity is refused. The one path that mints
    `unattended` is the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which
    ships dark until the callout grants a trigger source its submit subject. A delegated profile child runs at its
-   parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
+   parent's tier when the parent is a profile task (`read` when the parent is `unattended`), and at its requester's otherwise. A profile
    task can't delegate to `platform`, whose child would be minted at the install's tier and
    scope.
 4. **Submit.** The submission goes on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the `PROFILE_SUBMITS` stream, `top`
@@ -840,8 +848,12 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent runs at `unattended`
-(`delegation.unattended-parent`), whose trigger binding a child's grant doesn't carry yet. A child's
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
+(a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
+parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
+trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
+(`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
+child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
@@ -3482,7 +3494,11 @@ which reads the gateway's inbound-message counter. Each armed door renders a cop
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every install now so that it is not (decided
-10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+10/6 on #2473). It is Ingress-only. The gateway's own dials are governed by a second policy,
+`<name>-a2a-gateway-egress` (#6553), which renders and goes with the fence: cluster DNS, the
+bus's client port, the broker's port, the Kubernetes API server, and TCP 443 except to private,
+link-local and shared addresses, for Slack, Discord and the A2A door's token check. Google Chat
+reaches Google through the broker's relay.
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
 once the gateway has bound its event relay and 503 until then, with the reason as the body

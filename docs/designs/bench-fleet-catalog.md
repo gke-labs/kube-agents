@@ -9,7 +9,7 @@ case when one is not.
 
 **The role vocabulary is owned by `bench/tf/fleet/fixtures.json`**, which sits beside the
 Terraform that plants the fixtures and is what `hack/fleet-kubeconfigs.sh` resolves a role
-against at run time, the project-scoped `startup-fail-vm`, `world-open-ingress`, `declared-mtu-peering`,
+against at run time, the project-scoped `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`,
 `declared-orphan-snapshot` and `orphan-snapshot` included (`cluster_slot: null`). `docs/designs/fleet-fixtures.yaml` is the
 machine-readable form of the rest of this document — the day-N gates below, and
 `orphan-disks`, the one project-scoped fixture the catalog does not probe — and it may not
@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Fifty-three fixtures: forty-seven across the four cluster slots and six project-scoped. Five of the project-scoped ones, `startup-fail-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Fifty-four fixtures: forty-seven across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the fourteen seeded namespaces `seeded-debug`,
@@ -138,6 +138,7 @@ its roles are never published.
 | `config-connector-namespaced`       | a       | 0   | the GKE Config Connector add-on and its ConfigConnector object in namespaced mode; not a defect, the cluster the Config Connector eval cases plant their objects on                                                                                                                                                                           |
 | `orphan-disks`                      | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                                                                                                                                                                              |
 | `startup-fail-vm`                   | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                                                                                                                                       |
+| `rotated-console-vm`                | project | 0   | `serial-flood-<prefix>`, a standalone e2-micro in `var.zone` whose startup script fails at boot and whose systemd timer then writes about 2 MiB of counted filler lines to serial port 1, two minutes after boot and daily after, so the boot's failure lines rotate out of the 1 MiB buffer within minutes; the reconcile does not reset it  |
 | `world-open-ingress`                | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                                                                                                                               |
 | `declared-mtu-peering`              | project | 0   | `mtu-peer-declared`, a custom-mode VPC at MTU 8896, no subnet, peered both ways with `default` (MTU 1460); not a defect, the networking SOP's 2.4 peered-MTU posture, declared in `knowledge/`, listed under Declared intent                                                                                                                  |
 | `declared-orphan-snapshot`          | project | 91  | `declared-orphan-snap-<prefix>`, a snapshot of a throwaway disk the planter deleted, taken by no schedule: the GCE compute audit's orphaned-snapshots posture once it is more than 90 full days old, declared on purpose in the GitOps repository's `knowledge/` note and so listed under Declared intent; not ready, not drifted, until then |
@@ -423,7 +424,10 @@ A third way is slower and needs no one to act. The startup-fail VM prints its fa
 once per boot, and its serial buffer rotates the line out about three weeks later. The
 reconcile resets the VM after each project whose state it reads, whatever the plan outcome
 ([§6.2](../ci-pool-projects.md#62-the-scheduled-reconcile)), and the `serial_contains` assertion in
-the fixture scan reads a buffer without the line as drift.
+the fixture scan reads a buffer without the line as drift. The serial-flood VM
+(`rotated-console-vm`) is that fixture's mirror image: its healthy state is the console
+whose boot lines have rotated out, the reconcile does not reset it, and the VM's own
+daily flood pass is what keeps the filler in the buffer.
 
 None of these is a reason for a case to hedge. A case that tolerates its fixture being
 absent cannot tell "the agent missed it" from "it was not there", which is the same defect

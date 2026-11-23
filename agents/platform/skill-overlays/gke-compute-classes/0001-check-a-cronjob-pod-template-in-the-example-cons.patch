@@ -3,7 +3,6 @@ Subject: Check a CronJob pod template in the example consumption VAP
 Why: the example policy matches CronJobs but reads `spec.template`, which a CronJob does not have, so it falls back to the CronJob's own spec and admits a CronJob that targets the restricted ComputeClass. The pod template is at `spec.jobTemplate.spec.template.spec`.
 Local-Issue: #2694
 Eval-Case: none (exempt: a direct live test of the policy)
-Upstream-Issue: none filed yet
 Retire-When: upstream's `podSpec` variable reads `spec.jobTemplate.spec.template.spec` for a CronJob
 
 diff --git a/assets/restrict-computeclass-usage-vap.yaml b/assets/restrict-computeclass-usage-vap.yaml

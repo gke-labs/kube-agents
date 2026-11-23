@@ -337,6 +337,16 @@ type Gateway struct {
 	// fails relayTerminal's replay of the task's stream, as a transport
 	// error would.
 	terminalReplayHook func(taskID string) error
+	// fanOutReplayHook is an optional test hook, called with the task id each
+	// time a fan-out path replays a task's stream in full (fanOutReplay),
+	// so a test can tell those reads from the direct gets that open no
+	// consumer (#6646). Read under mu.
+	fanOutReplayHook func(taskID string)
+	// fanOutSpotChecks is, per fan-out parent, the running child the heal
+	// replayed in full last (nextFanOutSpotCheck). Read under mu; in memory,
+	// so a restart starts each fan-out's turn over, and dropped once the
+	// parent has no running child.
+	fanOutSpotChecks map[string]string
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
@@ -3244,6 +3254,8 @@ type taskStart struct {
 	// the waiting profile tasks above it, set only by a profile parent's
 	// child mint.
 	ProfileChain []string
+	// Scheduled goes onto a profile task's history entry (TaskRef.Scheduled).
+	Scheduled bool
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
 	Role         string
@@ -3559,6 +3571,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.Tier = string(ts.Route.Tier)
 		ref.Scope = string(ts.Route.Scope)
 		ref.ProfileChain = ts.ProfileChain
+		ref.Scheduled = ts.Scheduled
 	}
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {

@@ -140,6 +140,10 @@ _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
 # A backslash before a blank in a stored typed call: an escaped space or tab, or what the pod's
 # scrub leaves of an escaped backslash at a line end (`worker_transcript.fold_shell_command`).
 _ESCAPED_BLANK_RE = re.compile(r"\\[ \t]")
+# A heredoc operator anywhere in a typed call's text (`<<` or `<<-`, not the here-string `<<<`).
+# Read on the raw text, quotes and substitutions included, so a quoted `<<` or a shift in an
+# arithmetic span counts too: the caller only keeps such a call on its card log row.
+_HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(?!<)")
 # The checks below read the line as the shell reader keeps it, quotes in place and line
 # continuations gone, so a quote or a backslash that ends a name in bash ends it here too.
 # A word that reads the last argument back (`$_`, `${_}`), or a variable through another
@@ -463,6 +467,12 @@ def _typed_call_may_join(command: str) -> bool:
     if not words:
         return bool(command.strip())
     return any(isinstance(word, _ShellOperator) and word == _SHELL_LINE_END for word in words)
+
+
+def _holds_heredoc(command: str) -> bool:
+    """Whether a typed call's text holds a heredoc operator. The argv reader splits a heredoc
+    body into one argv for each line, so a line written into a file would read as a run."""
+    return bool(_HEREDOC_OPERATOR_RE.search(command))
 
 
 def _can_read_a_word_back(line: str) -> bool:
