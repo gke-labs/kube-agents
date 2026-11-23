@@ -258,6 +258,7 @@ AUDITS: dict[str, AuditSpec] = {
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
             "ingress-gateway-healthcheck-mismatch",
+            "image-pull-failing",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -1294,6 +1295,7 @@ CHECK_PHRASES = {
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
+    "image-pull-failing": "{object} cannot pull its image",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -3267,6 +3269,7 @@ TRIAGE_REASONS = {
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
     "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
     "manual-pool-fallback": "creates node pools or turns on automatic node pool creation, and which of the two is the owners' call",
+    "image-pull": "follows from why the pull fails, which the alert's triage establishes and this audit does not",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 

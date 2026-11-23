@@ -72,7 +72,8 @@
 #     runs, or a route held in a variable that an earlier row set. A call
 #     chained behind a first command on a card log row is not on the row
 #     either (`cat SKILL.md + 1 command(s)`): the rendering keeps only the
-#     first command.
+#     first command. The forbidden runs read such a call in the card's typed
+#     call, unless the call holds a heredoc.
 #   - A row that is not one grep and names the route or a verb counts as a
 #     call, which is a spurious red: an echo, a cat or another command that
 #     names it, a grep behind `if`, a wrapper such as timeout or an absolute
@@ -200,7 +201,8 @@ verification_spec:
   # hermes's one-line rendering of a command as an argv: it skips a leading
   # `cd` and keeps the first command of a chain. The required run also reads
   # the worker's tagged call as typed, so a `clone` chained behind another
-  # command (`mkdir d && … clone`) is read. The rendering joins a continued
+  # command (`mkdir d && … clone`) is read; the forbidden runs do the same for
+  # a call that holds no heredoc. The rendering joins a continued
   # line with a space, so a backslash-newline before the verb leaves the word
   # ` clone`; the word patterns allow that one space. An objective, because a
   # safeguard cannot carry the red.

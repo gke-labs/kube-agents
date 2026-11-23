@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -157,6 +158,15 @@ const (
 // spec.telemetry.peopleSeen=false.
 const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+
+// envKubectlCostTier is the variable the kubectl admission
+// (deploy/sandbox/kubectl-admit.py) reads its sizing tier from when no tier
+// file names one: the shell sandbox's name for it, on the session pod.
+const envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
+
+// defaultKubectlCostTier is the tier the admission charges when none is
+// named; spawn names it rather than leave the variable unset.
+const defaultKubectlCostTier = "default"
 
 // The A2A door's Microsoft Entra sign-in class (a2adoor_entra.go), set by
 // hand on the gateway as the Google class's variables are.
@@ -713,12 +723,19 @@ type Config struct {
 	// New refuses the view without it. CredentialProxyExecURL is the
 	// broker's exec tier, empty while the operator renders none; the shim
 	// sends its commands there and falls back to CredentialProxyURL.
+	// KubectlCostTier is the sizing tier whose column of the kubectl cost
+	// table (deploy/sandbox/kubectl-costs.json) the session pod's kubectl
+	// admission charges; spawn passes it on as KUBEAGENTS_KUBECTL_COST_TIER
+	// beside KUBE_PROXY_URL. The operator forwards it normalised, as for the
+	// shell sandbox; anything but a plain lowercase name is dropped here too,
+	// and empty passes the admission's default tier by name.
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
 	KubeProxyURL           string
 	KubeProxyCAConfigMap   string
 	KubeProxyHostContext   string
+	KubectlCostTier        string
 	UniverseDomain         string
 	ImagePullRefs          []string
 
@@ -988,6 +1005,7 @@ func FromEnv() (*Config, error) {
 		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
 		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
 		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
+		KubectlCostTier:        kubectlCostTier(os.Getenv("A2A_KUBECTL_COST_TIER")),
 		UniverseDomain:         strings.TrimSpace(os.Getenv(envGoogleCloudUniverseDomain)),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
@@ -1431,6 +1449,19 @@ func pyStrip(s string) string {
 	return strings.TrimFunc(s, func(r rune) bool {
 		return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f)
 	})
+}
+
+// kubectlCostTierPattern is the tier name the operator forwards (its own
+// kubectlCostTierPattern) and the sandbox entrypoint accepts.
+var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+
+// kubectlCostTier is a forwarded tier name if it is a plain lowercase one,
+// else empty: the session pod's admission then charges its default tier.
+func kubectlCostTier(raw string) string {
+	if tier := strings.TrimSpace(raw); kubectlCostTierPattern.MatchString(tier) {
+		return tier
+	}
+	return ""
 }
 
 func envOr(key, def string) string {

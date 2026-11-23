@@ -7123,6 +7123,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
 		}
+		// The kubectl admission's tier, normalised as for the shell sandbox;
+		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
+		if tier, ok := kubectlCostTier(agent); ok {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aKubectlCostTierEnv, Value: tier})
+		}
 		// The exec tier's address, while it renders, for the session pods'
 		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
 		if credentialProxyExecTierEnabled(agent) {
@@ -7789,7 +7794,11 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// the render path then creates; a stale miss skips it for one pass on the
 	// refusal path only (on the render path reconcileA2A picks it up).
 	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err == nil {
-		fences = append(fences, a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace))
+		fences = append(fences,
+			a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace),
+			// Its egress policy goes with it, on the same terms (#6553).
+			r.a2aGatewayEgressPolicy(ctx, agent, dnsClusterIPs),
+		)
 		gatewayFenced = true
 	} else if !errors.IsNotFound(err) {
 		return false, false, err
@@ -8605,6 +8614,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err := r.applyManaged(ctx, agent, fence); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", fence.Name, err)
 		}
+		if err := r.applyA2AGatewayEgress(ctx, agent, r.a2aSessionDNSClusterIPs(ctx, agent)); err != nil {
+			return state, err
+		}
 	}
 	// The secret-env digest, on the same terms as the agent gateway and the
 	// broker (platformagent_secret_hash.go). On a Slack-armed install this pod,
@@ -8652,8 +8664,8 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	return state, nil
 }
 
-// removeA2AGatewayFence takes the gateway's own fence away on a pass that
-// holds the gateway for the callout. That happens only while the Deployment
+// removeA2AGatewayFence takes the gateway's own fence, and its egress policy
+// (#6553), away on a pass that holds the gateway for the callout. That happens only while the Deployment
 // is absent (on a live NotFound), so the order the doors' removal needs
 // (after the apply) does not arise. Absent is not the same as no pod
 // listening: a Deployment deleted by hand leaves its ReplicaSet and pod to
@@ -8667,9 +8679,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 // skip theirs (removeA2AInjectBackend): this runs on every held pass, and
 // the render that follows the hold applies the fence over it.
 func (r *PlatformAgentReconciler) removeA2AGatewayFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}
-	if err := r.deleteA2AObjectIfOwned(ctx, agent, np, r.Client, nil); err != nil {
-		return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy: %w", err)
+	for _, name := range []string{a2aGatewayNetpolName(agent), a2aGatewayEgressName(agent)} {
+		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}}
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, np, r.Client, nil); err != nil {
+			return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy %s: %w", name, err)
+		}
 	}
 	return nil
 }
