@@ -1,6 +1,7 @@
-"""The fleet-audit report scripts in the worker image (#5623).
+"""The fleet-audit report scripts and the compliance collector in the worker image (#5623).
 
-a2a/Dockerfile.worker copies the fleet-audit AgentProfile's report scripts into
+a2a/Dockerfile.worker copies the fleet-audit AgentProfile's report scripts, and
+the compliance audit's collector with its closure, into
 /opt/kube-agents/scripts/fleet-audit from their sources at build time, flat, so a script's
 own directory is where Python finds the modules it imports. This holds the COPY
 to exactly that set of sources, and checks the set imports from one directory
@@ -21,8 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER_DOCKERFILE = REPO_ROOT / "a2a" / "Dockerfile.worker"
 DEST = "/opt/kube-agents/scripts/fleet-audit/"
 
-# audit_report.py and the modules its finish paths import: the closure a
-# profile worker needs, and no more.
+# audit_report.py and the modules its finish paths import, and collect.py and
+# the modules its compliance-audit path imports: the closures a profile worker
+# needs, and no more.
 SOURCES = (
     "agents/platform/skills/fleet-audit/scripts/audit_report.py",
     "agents/platform/skills/fleet-audit/scripts/report_status.py",
@@ -122,7 +124,14 @@ class WorkerFleetAuditScriptsTest(unittest.TestCase):
                 rules = [w for w in words[1:-1] if not w.startswith("--")]
         self.assertEqual(sorted(files or []), sorted(str((READINESS_SRC / f).relative_to(REPO_ROOT)) for f in READINESS_FILES))
         self.assertEqual(rules, [str((READINESS_SRC / "readiness_rules").relative_to(REPO_ROOT)) + "/"])
-        self.assertFalse(list((READINESS_SRC / "readiness_rules").glob("test_*.py")), "readiness_rules/ carries tests the copy would ship")
+        # The whole directory is copied, so it may hold modules alone: no
+        # tests, testdata, conftest or data files that would ship with it.
+        entries = list((READINESS_SRC / "readiness_rules").iterdir())
+        stray = [e.name for e in entries if e.name != "__pycache__" and (not e.is_file() or e.suffix != ".py" or e.name.startswith("test_") or e.name == "conftest.py")]
+        self.assertEqual(stray, [], "readiness_rules/ holds files the whole-directory copy would ship")
+        # And no --chmod on that copy, which would set the directories' mode too.
+        rules_copy = next(line for line in text.splitlines() if line.split()[:1] == ["COPY"] and line.split()[-1] == READINESS_DEST + "readiness_rules/")
+        self.assertNotIn("--chmod", rules_copy)
         self.assertEqual(
             Path(DEST).parents[1] / "fleet-upgrade-verification" / "scripts",
             Path(READINESS_DEST),

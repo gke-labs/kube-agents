@@ -142,7 +142,8 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 # the others when the persona's skill runs `python3 /opt/kube-agents/scripts/fleet-audit/
 # audit_report.py`. They're the closure audit_report.py imports on its
 # `finish --dry-run` path (a live finish needs more, which the PR that runs one
-# adds); the RUN below fails the build if one no longer imports from here alone,
+# adds), and, from collect.py on, the compliance collector's (below); the RUN
+# below fails the build if one no longer imports from here alone,
 # and tests/test_worker_fleet_audit_scripts.py runs that finish on a document.
 # Every worker carries them; they act only with the task's own confined
 # credential, so a cluster or tse worker gains nothing it couldn't already do.
@@ -175,12 +176,17 @@ COPY --chmod=0644 agents/platform/skills/fleet-upgrade-verification/scripts/upgr
      agents/platform/skills/fleet-upgrade-verification/scripts/known_issues.json \
      agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json \
      /opt/kube-agents/fleet-upgrade-verification/scripts/
-COPY --chmod=0644 agents/platform/skills/fleet-upgrade-verification/scripts/readiness_rules/ \
+# A directory copy takes no --chmod (it would set the directories' mode too,
+# and a 0644 directory can't be entered); the RUN gives it files 0644 and
+# directories 0755, and the last check imports it as the worker's own user.
+COPY agents/platform/skills/fleet-upgrade-verification/scripts/readiness_rules/ \
      /opt/kube-agents/fleet-upgrade-verification/scripts/readiness_rules/
-RUN cd /opt/kube-agents/scripts/fleet-audit \
+RUN chmod -R u=rwX,go=rX /opt/kube-agents/fleet-upgrade-verification \
+    && cd /opt/kube-agents/scripts/fleet-audit \
     && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report, collect; assert collect._upgrade_readiness() is not None" \
     && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run \
-    && PYTHONDONTWRITEBYTECODE=1 python3 collect.py --help | grep -q -- compliance-audit
+    && PYTHONDONTWRITEBYTECODE=1 python3 collect.py --help | grep -q -- compliance-audit \
+    && su node -s /bin/sh -c 'cd /opt/kube-agents/scripts/fleet-audit && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = [\".\"]; import collect; assert collect._upgrade_readiness() is not None"'
 # git for that skill's local half: the working copy `clone` unpacks from a
 # bundle, and `commit` and `publish` on it. It holds no credential; the profile
 # namespace's NetworkPolicy bounds the pod's egress. deploy/shared/worker-gitconfig,
