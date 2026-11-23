@@ -356,6 +356,15 @@ func a2aStripBusTokenVolume(volumes []corev1.Volume) []corev1.Volume {
 //
 // Silent, like a2aStripBusTokenVolume: the webhook's field.Forbidden is what
 // tells the author why, and this is what holds when admission did not run.
+func a2aHasBusCredentialRoute(v corev1.Volume, agentName string) bool {
+	for _, route := range agentv1alpha1.BusCredentialRoutes(v, agentName) {
+		if route.Kind == agentv1alpha1.BusCredentialRouteAudience || route.Kind == agentv1alpha1.BusCredentialRouteSecret {
+			return true
+		}
+	}
+	return false
+}
+
 func a2aBusCredentialVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
 	if agent.Spec.Deployment == nil {
 		return nil
@@ -363,7 +372,7 @@ func a2aBusCredentialVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]
 	var names map[string]bool
 	for _, list := range [][]corev1.Volume{agent.Spec.Deployment.SidecarVolumes, agent.Spec.Deployment.ExtraVolumes} {
 		for _, v := range list {
-			if len(agentv1alpha1.BusCredentialRoutes(v, agent.Name)) == 0 {
+			if !a2aHasBusCredentialRoute(v, agent.Name) {
 				continue
 			}
 			if names == nil {
@@ -382,7 +391,7 @@ func a2aBusCredentialVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]
 // can drop are the author's.
 func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []corev1.Volume {
 	return stripMatching(volumes, func(v corev1.Volume) bool {
-		return len(agentv1alpha1.BusCredentialRoutes(v, agentName)) > 0
+		return a2aHasBusCredentialRoute(v, agentName)
 	})
 }
 

@@ -145,7 +145,7 @@ def go_int_constant(path: pathlib.Path, name: str) -> int:
 # The variables a lifted section reads from the job environment, the retired
 # flags included. Unset first, so "not exported by the test" means unset rather
 # than whatever the shell running the tests happens to export.
-_AMBIENT_ENV = ("EVAL_MODE_NEXT", "EVAL_ROLLBACK_LANE", "EVAL_TASK_PARALLELISM", "RC_COMMIT_SHA", "PULL_NUMBER", "JOB_NAME")
+_AMBIENT_ENV = ("EVAL_MODE_NEXT", "EVAL_ROLLBACK_LANE", "EVAL_TASK_PARALLELISM", "EVAL_FRONT_DOOR", "EVAL_FRONT_DOOR_SESSIONS", "RC_COMMIT_SHA", "PULL_NUMBER", "JOB_NAME")
 
 
 def run_bash(script: str) -> subprocess.CompletedProcess:
@@ -914,7 +914,8 @@ class TasksBudgetSizingTest(unittest.TestCase):
         release = re.search(r"helm upgrade --install.*?--wait --timeout", script, re.DOTALL)
         self.assertIsNotNone(release)
         assert release is not None
-        self.assertIn('--set "${MAX_SESSIONS_HELM_VALUE}=${MODE_NEXT_MAX_SESSIONS}"', release.group(0))
+        self.assertIn('${MAX_SESSIONS_HELM_SETS[@]+"${MAX_SESSIONS_HELM_SETS[@]}"}', release.group(0))
+        self.assertIn('MAX_SESSIONS_HELM_SETS=(--set "${MAX_SESSIONS_HELM_VALUE}=${MODE_NEXT_MAX_SESSIONS}")', script)
         # Step 6b reports the cap and touches the CR nowhere: the first render
         # saw it, the bridge being the operator's.
         block = lifted(*_MODE_SECTION)
@@ -922,6 +923,117 @@ class TasksBudgetSizingTest(unittest.TestCase):
         self.assertLess(block.index("maxSessions="), block.index('wait_provision_job "the install"'))
         self.assertNotIn("kubectl patch platformagent", block)
         self.assertNotIn("helm upgrade", block)
+
+
+def front_door_sizing(workers: int, front_door: str | None = None, sessions: str | None = None) -> subprocess.CompletedProcess:
+    """Section 2b's front-door switch and session sizing, run for one lane:
+    the validation, the platform derivation, then the session override and
+    the cap's helm arguments."""
+    env = []
+    if front_door is not None:
+        env.append(f'EVAL_FRONT_DOOR="{front_door}"')
+    if sessions is not None:
+        env.append(f'EVAL_FRONT_DOOR_SESSIONS="{sessions}"')
+    return run_bash(
+        "\n".join(
+            [
+                constants_block(),
+                *env,
+                lifted_block('EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"', "# The maxSessions the install is given", "the front-door switch"),
+                f"MODE_NEXT_BRIDGE_CONCURRENCY={workers}",
+                max_sessions_derivation(),
+                lifted_to_line("MODE_NEXT_SESSION_CONSUMERS=", "fi", "the session sizing"),
+                lifted_to_line("MAX_SESSIONS_HELM_SETS=()", "fi", "the cap's helm arguments"),
+                'echo "N=${MODE_NEXT_MAX_SESSIONS} PER=${MODE_NEXT_SESSION_CONSUMERS}"',
+                'echo "SETS=${MAX_SESSIONS_HELM_SETS[*]-} ROUTE=${FRONT_DOOR_HELM_SETS[*]-}"',
+            ]
+        )
+    )
+
+
+class FrontDoorSwitchTest(unittest.TestCase):
+    """EVAL_FRONT_DOOR (#6539): a session run deploys the session route with a
+    session cap the eval's parallel conversations fit, so a platform run and a
+    session run of the same cases compare the two front doors."""
+
+    def test_the_replay_asks_are_the_operators(self) -> None:
+        """A session on the session route also counts its conversation's
+        replays: the operator's a2aTasksReplaySessionAsks, the tail factor
+        times one ask, and a2aTasksConsumersPerSession adds it to the
+        per-session count only there."""
+        consts = constants()
+        tail = go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayTailFactor")
+        ask = go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayAsk")
+        manifests = text(_A2A_MANIFESTS)
+        self.assertRegex(manifests, re.compile(r"^\s*a2aTasksReplaySessionAsks\s*=\s*a2aTasksReplayTailFactor \* a2aTasksReplayAsk$", re.MULTILINE))
+        # The session route's per-session count is the named consumers plus
+        # the replay asks, and the per-route count returns it only there.
+        self.assertRegex(
+            manifests,
+            re.compile(
+                r"^\s*a2aTasksConsumersPerSessionOnSessionRoute\s*=\s*a2aSessionConsumersPerSession \+ a2aTasksReplaySessionAsks$",
+                re.MULTILINE,
+            ),
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSessionOn\(route string\) int \{\s*"
+            r"if route == agentv1alpha1\.DefaultRouteSession \{\s*"
+            r"return a2aTasksConsumersPerSessionOnSessionRoute\s*\}\s*"
+            r"return a2aSessionConsumersPerSession\s*\}",
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSession\(agent \*agentv1alpha1\.PlatformAgent\) int \{\s*"
+            r"return a2aTasksConsumersPerSessionOn\(resolveA2ADefaultRoute\(agent\)\)",
+        )
+        self.assertEqual(int(consts["A2A_SESSION_REPLAY_ASKS"]), tail * ask)
+
+    def test_the_platform_front_door_is_the_default_and_unchanged(self) -> None:
+        for front_door in (None, "platform"):
+            with self.subTest(front_door=front_door):
+                result = front_door_sizing(4, front_door)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("N=6 PER=3", result.stdout)
+                self.assertIn("SETS=--set platformAgent.harness.tuning.maxSessions=6 ROUTE=\n", result.stdout)
+
+    def test_a_fair_session_run_gets_a_session_per_parallel_conversation_and_headroom(self) -> None:
+        """At the presubmit's 4 workers the floor fits only 2 sessions at 7
+        consumers each, under the eval's 4 parallel conversations, so a fair
+        run sets the cap to the parallelism plus the headroom (the cap evicts
+        the longest-idle pod; nothing queues) and TASKS is created at the
+        budget."""
+        headroom = int(constants()["FRONT_DOOR_SESSION_HEADROOM"])
+        self.assertGreaterEqual(headroom, 1)
+        for workers in (1, 4, 6):
+            with self.subTest(workers=workers):
+                result = front_door_sizing(workers, "session")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"N={workers + headroom} PER=7", result.stdout)
+                self.assertIn(f"SETS=--set platformAgent.harness.tuning.maxSessions={workers + headroom}", result.stdout)
+                self.assertIn("ROUTE=--set-string platformAgent.harness.tuning.defaultRoute=session", result.stdout)
+
+    def test_a_shipped_session_run_leaves_the_cap_at_the_install_default(self) -> None:
+        result = front_door_sizing(4, "session", "shipped")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("N= PER=7", result.stdout)
+        self.assertIn("SETS= ROUTE=--set-string platformAgent.harness.tuning.defaultRoute=session", result.stdout)
+
+    def test_an_unknown_front_door_or_sizing_stops_the_deploy(self) -> None:
+        for front_door, sessions, needle in (("hermes", None, "EVAL_FRONT_DOOR='hermes'"), ("session", "big", "EVAL_FRONT_DOOR_SESSIONS='big'")):
+            with self.subTest(front_door=front_door, sessions=sessions):
+                result = front_door_sizing(4, front_door, sessions)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(needle, result.stderr)
+
+    def test_the_release_carries_the_route_and_the_run_records_it(self) -> None:
+        script = text(_CI_DEPLOY)
+        release = re.search(r"helm upgrade --install.*?--wait --timeout", script, re.DOTALL)
+        self.assertIsNotNone(release)
+        assert release is not None
+        self.assertIn('${FRONT_DOOR_HELM_SETS[@]+"${FRONT_DOOR_HELM_SETS[@]}"}', release.group(0))
+        block = lifted(*_MODE_SECTION)
+        self.assertIn('echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt"', block)
 
 
 # A `phase` entry for run_provision_wait that stands for a dropped read.

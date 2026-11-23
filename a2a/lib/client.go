@@ -50,7 +50,8 @@ func TaskEventsSubject(addressee, taskID string) string {
 // the supervisor's `from` that replay could not tell from the real thing. The
 // token is the same count as `events`, so every `a2a.tasks.*.*.<class>`
 // pattern and the TASKS stream filter behave identically and the pair share
-// one stream sequence. tasks/get folds both in that order.
+// one stream sequence. tasks/get folds both in that order, subject to the
+// profile cutoff (AcceptsSupervisorEvent).
 func TaskSupervisorSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
 }
@@ -265,6 +266,9 @@ type Client struct {
 	// disagreements count here too: they are the one protocol error this
 	// client sees and does not refuse.
 	protocolViolations atomic.Int64
+	// profileSupervisorDrops counts the five-token supervisor messages reads
+	// refused as a profile task's terminal (AcceptSupervisorEvent).
+	profileSupervisorDrops atomic.Int64
 }
 
 // ProtocolViolations reports how many protocol errors this client has
@@ -284,6 +288,9 @@ type clientOptions struct {
 	// (WithFirstDialNATSOptions).
 	firstDialOpts []nats.Option
 	agreement     AgreementPolicy
+	// profileSupervisorCutoff is WithProfileSupervisorCutoff's, zero when
+	// unlatched.
+	profileSupervisorCutoff time.Time
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come

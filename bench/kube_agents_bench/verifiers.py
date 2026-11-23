@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2596,6 +2596,15 @@ _PARTIAL_REQUIRED_CAPTURE_REASON = (
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
 _SHOWN_COMMAND_CHARS = 120
+#: A worker command past a limit of the shell reader (:class:`kube_agents_bench.shell_words.ShellReadLimitError`)
+#: has no argvs. When it can hold the run that decides a check, the check cannot be evaluated:
+#: not a pass and not a fail.
+_SHELL_READ_LIMIT_REASON = (
+    "worker command {shown!r} is past the shell reader's limit ({limit}), so its runs cannot be "
+    "read and this check could not be evaluated"
+)
+#: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
+_UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2654,6 +2663,20 @@ class WorkerRun(BaseModel):
             if not flag or any(char.isspace() for char in flag):
                 raise ValueError(f"each flag must be one word, not {flag!r}")
         return flags
+
+
+def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
+    """The argvs of each line that the shell reader reads, and the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
+    Each line is read by itself, so one unread line does not take the others' argvs."""
+    argvs: list[list[str]] = []
+    first_unread = None
+    for line in lines:
+        try:
+            argvs.extend(_shell_argvs(line))
+        except ShellReadLimitError as limit:
+            first_unread = first_unread or (line, limit)
+    return argvs, first_unread
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -3006,7 +3029,15 @@ class WorkerCommandsVerifier(BaseVerifier):
     and the card log's rows join its typed set, so a command the trajectory
     missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
     read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
-    worker commands is ``status="error"``, not a pass.
+    worker commands is ``status="error"``, not a pass. A command past the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`: command lines nested deeper
+    than the reader's limit, or more reading than the line's budget) has no argvs. It is a gap
+    for the runs, graded by the rule for a capture with gaps with one difference: a pattern
+    reads the text of that line too, so a missing required pattern is conclusive, as a forbidden
+    pattern or run that was read is. A required run that is still missing is
+    ``status="error"`` when a line of the commands was not read, and a clean read of the
+    forbidden runs is when a typed line was not read. A check with patterns alone reads no
+    argv and is graded as before the limit.
     """
 
     type: Literal["worker_commands"]
@@ -3224,14 +3255,31 @@ class WorkerCommandsVerifier(BaseVerifier):
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
-        argvs = [argv for c in commands for argv in _shell_argvs(c)]
-        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
+        # The argvs serve the runs only: the commands' for the required runs, the typed calls'
+        # for the forbidden runs. A check with patterns alone reads none. Each line is read by
+        # itself; a line past the reader's limit has no argvs.
+        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
+        typed_argvs, typed_unread = _argvs_and_first_unread(typed if self.forbidden_runs else [])
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
         partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        # A line past the reader's limit is a gap of the same kind for the runs, with one
+        # difference: a pattern reads the text of that line, so a missing required pattern is
+        # conclusive. A required run that is still missing is not when a line of the commands
+        # was not read; with each of them read it is a fail whatever a typed line holds. A clean
+        # read of the forbidden runs is not when a typed line was not read. Not a pass and not a
+        # fail; a capture with gaps keeps its own error, below.
+        past_limit = None if hits or ran or missing else (unread if unrun else typed_unread)
+        if past_limit is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
             if missing:
@@ -3241,7 +3289,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             if unrun:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                parts.append(
+                    f"no worker command ran {named} across {len(commands)} command(s){sources}"
+                    + (_UNREAD_COMMAND_NOTE if unread is not None else "")
+                )
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -7411,7 +7462,7 @@ def _strings_in(value: Any) -> list[str]:
     return []
 
 
-def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
+def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> tuple[str, ShellReadLimitError | None]:
     """What one repetition said and wrote with, for charging a write to it:
     its reply, and the calls that create a branch or a pull request -- the
     front agent's and its delegated workers' tool calls (the worker
@@ -7422,8 +7473,19 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
     easily as this one's
     (:func:`kube_agents_bench.github_writes.writing_segments`), and a card's
     body, a comment or a file's content is prose, whose backticked ``git
-    push <branch>`` quotes a command rather than runs one."""
+    push <branch>`` quotes a command rather than runs one. A command past the
+    shell reader's limit has no segments; the second value is that error for
+    the first such command, or None."""
     parts = [snap.final_message, snap.output]
+    unread: list[ShellReadLimitError] = []
+
+    def segments(command: str) -> list[str]:
+        try:
+            return github_writes.writing_segments(command)
+        except ShellReadLimitError as limit:
+            unread.append(limit)
+            return []
+
     for call in snap.trajectory:
         if not isinstance(call, dict):
             continue
@@ -7433,12 +7495,18 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
         elif command is not None:
             # A terminal or execute_code call, clipped arguments decoded as the worker_commands
             # verifier decodes them (:func:`_code_call_text`).
-            parts.extend(github_writes.writing_segments(command))
+            parts.extend(segments(command))
     for row in snap.worker_commands or []:
         if isinstance(row, dict):
-            parts.extend(github_writes.writing_segments(str(row.get("command") or "")))
-    return "\n".join(parts)
+            parts.extend(segments(str(row.get("command") or "")))
+    return "\n".join(parts), unread[0] if unread else None
 
+
+_WRITES_SHELL_READ_LIMIT_REASON = (
+    "a command of this repetition is past the shell reader's limit ({limit}), so the calls in it "
+    "that create a branch or a pull request cannot be read, and a write in the window that "
+    "nothing else of this repetition names may be its own; this check could not be evaluated"
+)
 
 _NO_GITOPS_REPO_REASON = (
     f"no GitOps repository in the environment: set {github_writes.GITOPS_REPO_ENV_VAR} to "
@@ -7509,7 +7577,14 @@ class GitHubWritesVerifier(BaseVerifier):
     own tool calls, its delegated workers' tool calls, and their terminal
     commands. A read's arguments and every tool result are left out:
     ``gh pr view <url>``, ``vcs.py clone --branch <branch>`` and a listing
-    name another case's pull request as easily as this one's. On the inject
+    name another case's pull request as easily as this one's. A command past
+    the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) has no argvs
+    to read those calls from. The check is then ``status="error"`` when a
+    write that must be attributed by name (each write in a shared window, and
+    a sweep-branch write in an exclusive one) is named by nothing that was
+    read, and no charged write that the case did not request decides the
+    result without it. On the inject
     lane the front agent's arguments arrive as shapes (the bridge sends no
     string value off the pod), so what names a write there is the reply and
     the workers' calls, which the harness reads back from the pod's session
@@ -7658,7 +7733,7 @@ class GitHubWritesVerifier(BaseVerifier):
             )
 
         requested = github_writes.proposal_numbers_named(snap.final_message, repo, forge)
-        own = _own_words_and_calls(snap)
+        own, own_unread = _own_words_and_calls(snap)
         allowance = self.requested_pull_requests
         unrequested = []
         excused = []
@@ -7674,6 +7749,12 @@ class GitHubWritesVerifier(BaseVerifier):
                 excused.append(write.describe())
                 continue
             unrequested.append(write)
+        # A command past the shell reader's limit was not read, and it can name a write that
+        # nothing else of this repetition names. A charged write that the case did not request
+        # is conclusive without it; with none, the check cannot say that the repetition has
+        # nothing to answer for.
+        if own_unread is not None and unattributed and not unrequested:
+            return done(False, _WRITES_SHELL_READ_LIMIT_REASON.format(limit=own_unread), status="error")
         raw = report.as_dict()
         raw.update(
             {
@@ -8595,13 +8676,13 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
-        "ingress-gateway-healthcheck-mismatch",
+        "ingress-gateway-healthcheck-mismatch", "image-pull-failing",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
-        "autoscaler-out-of-resources", "dangling-compute-class",
+        "autoscaler-out-of-resources", "dangling-compute-class", "ccc-unbacked-manual-fallback",
     ),
     "upgrade-retrospective": (
         "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",

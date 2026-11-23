@@ -2794,6 +2794,10 @@ func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
 		{slackBackend, "slack:dm/D1", false},
 		{slackBackend, "not-a-key", false},
 		{discordBackend, "discord:g1/thread-s1", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2;messageid=1794603936403", true},
+		{teamsBackend, "teams:a:1UxxASmI", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2", false},
+		{teamsBackend, "teams:19:group@thread.v2", false},
 	} {
 		if got := conversationIsOwnThread(c.backend, c.key); got != c.want {
 			t.Errorf("conversationIsOwnThread(%s, %s) = %v, want %v", c.backend, c.key, got, c.want)

@@ -285,6 +285,10 @@ def scan_project(
     except Exception as exc:  # noqa: BLE001 -- the contract above: a reason, never a dead scan
         reason = REASON_VERIFIER_UNRUNNABLE.format(error=f"{type(exc).__name__}: {exc}")
         return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
+    if rc == fixture_state.STATUS_CANNOT_EXECUTE:
+        # The spawn failed and `_run` gave it a status: the verifier never ran.
+        reason = REASON_VERIFIER_UNRUNNABLE.format(error=_error_summary(err))
+        return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
     if rc == EXIT_TIMED_OUT:
         reason = REASON_VERIFIER_TIMEOUT.format(seconds=int(timeout))
         return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)

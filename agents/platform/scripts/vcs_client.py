@@ -165,7 +165,9 @@ class VcsError(RuntimeError):
         ceiling: int | None = None,
     ):
         super().__init__(message)
-        self.code = code or None
+        # The far side composes a refusal: a `code` that is not a text is no
+        # code. The callers look a code up in a set, which a list cannot enter.
+        self.code = code if isinstance(code, str) and code else None
         self.detail = detail or None
         # The commit the broker read, on a refusal that has one (`PATH_NOT_FOUND`).
         self.revision = revision or None
@@ -208,6 +210,23 @@ BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 #: caller that only wants a hint from the broker tells "no broker here" from a
 #: broker that refused.
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
+
+#: What a caller reads for a 2xx answer that nests deeper than the broker
+#: client's bound (`credential_proxy_client.VcsAnswerTooDeep`). The verb's
+#: request reached the broker, so the text does not say "retry": a caller does
+#: not send a write again without a look.
+ANSWER_TOO_DEEP_TEXT = (
+    "the broker's answer is nested too deep to read; the request reached the broker and may have taken effect"
+)
+
+#: The values of a `publish` answer that must be a text with characters in
+#: it, because they are a key and a value of the working copy's record, and
+#: what a caller reads when one of them is not. The publish was done, so the
+#: text does not say "retry".
+PUBLISH_ANSWER_TEXT_FIELDS = ("branch", "revision")
+PUBLISH_ANSWER_UNUSABLE_TEXT = (
+    "the broker's answer has no usable `{field}`; the request reached the broker and may have taken effect"
+)
 
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
 #: when the broker answers it with one: a single compact JSON object on its own
@@ -290,6 +309,8 @@ def call(verb: str, payload: dict, target: dict | None = None) -> dict:
     """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`).
 
     `target` goes on that record only (`TARGET_FIELD`), never to the broker.
+    An answer that the broker client refuses as nested too deep raises before
+    the record: the proposal can be open with no record line.
     """
     answer = _call(verb, payload)
     if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
@@ -336,7 +357,8 @@ def _say_opened(answer: object, claim: object = None, target: dict | None = None
         return
     try:
         print(json.dumps(record, separators=(",", ":")), file=stream, flush=True)
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, RecursionError):
+        # RecursionError: a `target` of the caller that the encoder cannot take.
         pass
 
 
@@ -372,6 +394,8 @@ def _call(verb: str, payload: dict) -> dict:
     except credential_proxy_client.WorkspaceRequestError as exc:
         payload = exc.payload or {}
         code = payload.get("code")
+        if not isinstance(code, str) or not code:
+            code = None
         if code is None and exc.status == 404:
             # This is the version skew, and it is the shape an older broker
             # actually answers with. A credential-proxy that has the `/v1/vcs/`
@@ -447,6 +471,8 @@ def _call(verb: str, payload: dict) -> dict:
             f"answer was complete ({exc}). Retry shortly; if it persists the "
             "broker is restarting under load."
         ) from exc
+    except credential_proxy_client.VcsAnswerTooDeep as exc:
+        raise VcsError(ANSWER_TOO_DEEP_TEXT) from exc
     except ValueError as exc:
         raise VcsError(
             "the broker answered with something that is not JSON; retry, and "
@@ -1695,6 +1721,14 @@ def publish(
         answer = call("publish", publish_payload)
     finally:
         bundle_file.unlink(missing_ok=True)
+
+    # The record below has the answer's branch as a key and its revision as a
+    # value. One that is not a text, or is empty, cannot go there, and the
+    # record then stays as it was: a made-up name in it is worse than this error.
+    for field in PUBLISH_ANSWER_TEXT_FIELDS:
+        value = answer.get(field)
+        if not isinstance(value, str) or not value:
+            raise VcsError(PUBLISH_ANSWER_UNUSABLE_TEXT.format(field=field))
 
     # The published tip becomes this branch's base. A second publish of the same
     # branch then sends only what came after it, and its ancestry check is

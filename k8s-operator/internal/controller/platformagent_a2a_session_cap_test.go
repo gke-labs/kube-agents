@@ -574,6 +574,58 @@ func TestTheSessionCapSignalIsGatedOnChange(t *testing.T) {
 // provision Job is not created and the gateway routes to session at
 // maxSessions; once the width reads, the Job is created at the fitted cap
 // and the gateway's cap follows it.
+// A provisioned bus that answers without TASKS (deleted for recreation, as
+// the provision Job's refusal tells an admin to do) and no stored cap: the
+// provision Job is the one thing that creates TASKS, so it is not held. The
+// cap is maxSessions, and the Job runs; on platform it runs as on main.
+func TestAProvisionedBusWithoutTasksRunsTheProvisionJob(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		route *string
+		want  string
+	}{
+		{"session route", ptr.To(agentv1alpha1.DefaultRouteSession), agentv1alpha1.DefaultRouteSession},
+		{"platform route", nil, agentv1alpha1.DefaultRoutePlatform},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := sessionRouteTestAgent()
+			agent.Spec.Harness.Tuning.DefaultRoute = tc.route
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+			r, cl, req := a2aGateTestReconciler(t, agent)
+			r.busStreamState = noTasks
+			ctx := context.Background()
+			for i := 0; i < 3; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d: %v", i+1, err)
+				}
+			}
+			letTheGatewayThrough(t, ctx, cl, r, req, agent)
+			stored := storedCapAgent(t, cl, agent)
+			if c := meta.FindStatusCondition(stored.Status.Conditions, sessionCapFittedConditionType); c != nil {
+				t.Errorf("SessionCapFitted = %s/%s on a bus that answers without TASKS, want none", c.Status, c.Reason)
+			}
+			jobs := &batchv1.JobList{}
+			if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs.Items) != 1 || jobs.Items[0].Name != buildA2AProvisionJob(stored).Name {
+				t.Fatalf("%d provision Jobs, want the one that creates TASKS", len(jobs.Items))
+			}
+			gw := &appsv1.Deployment{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, gw); err != nil {
+				t.Fatal(err)
+			}
+			env := gw.Spec.Template.Spec.Containers[0].Env
+			if v, _ := envValueCount(env, a2aDefaultAddresseeEnvVar); v != tc.want {
+				t.Errorf("the gateway routes to %q, want %q", v, tc.want)
+			}
+			if v, _ := envValueCount(env, "A2A_MAX_SESSIONS"); v != "10" {
+				t.Errorf("A2A_MAX_SESSIONS = %q, want maxSessions", v)
+			}
+		})
+	}
+}
+
 func TestTheProvisionJobWaitsForTheBusWidth(t *testing.T) {
 	agent := sessionRouteTestAgent()
 	// An existing install, provisioned before it opted in.
@@ -937,12 +989,13 @@ func TestTheRefusalNamesTheFittedCap(t *testing.T) {
 	}
 }
 
-// While the operator's A2A_SESSION_CLUSTER_VIEW is on, defaultRoute: session
-// does not engage: an explicit session routes to platform on both
-// containers, at maxSessions, and the condition says why. Off, it is
-// session. (An unset field is platform either way, and writes nothing:
+// The operator's A2A_SESSION_CLUSTER_VIEW doesn't hold the session route off:
+// since 2026-11-20 the cluster view is on by default for the session route
+// (#6538), so an explicit session routes to session on both containers with
+// the view on, and the cap is fitted to TASKS as with it off. Off, it is
+// session too. (An unset field is platform either way, and writes nothing:
 // TestTheDefaultPlatformRouteDoesNothingNew.)
-func TestTheClusterViewHoldsTheSessionDefaultOff(t *testing.T) {
+func TestTheClusterViewDoesNotHoldTheSessionRouteOff(t *testing.T) {
 	ctx := context.Background()
 	for _, route := range []*string{ptr.To(agentv1alpha1.DefaultRouteSession)} {
 		t.Run(ptr.Deref(route, "unset"), func(t *testing.T) {
@@ -952,15 +1005,15 @@ func TestTheClusterViewHoldsTheSessionDefaultOff(t *testing.T) {
 			}, tasksAt(110))
 			r.resolveA2ASessionCap(ctx, agent, nil)
 			gateway, platformAgent := renderedDefaultRoutes(t, agent, nil)
-			if gateway != agentv1alpha1.DefaultRoutePlatform || platformAgent != agentv1alpha1.DefaultRoutePlatform {
-				t.Errorf("with the cluster view on: gateway %q, platform agent %q; both want platform", gateway, platformAgent)
+			if gateway != agentv1alpha1.DefaultRouteSession || platformAgent != agentv1alpha1.DefaultRouteSession {
+				t.Errorf("with the cluster view on: gateway %q, platform agent %q; both want session", gateway, platformAgent)
 			}
-			if gatewayEnv(t, agent, "A2A_MAX_SESSIONS") != "10" {
-				t.Errorf("A2A_MAX_SESSIONS = %q with the view on, want maxSessions", gatewayEnv(t, agent, "A2A_MAX_SESSIONS"))
+			if gatewayEnv(t, agent, "A2A_MAX_SESSIONS") != "4" {
+				t.Errorf("A2A_MAX_SESSIONS = %q with the view on, want the cap fitted to a TASKS 110 wide (4)", gatewayEnv(t, agent, "A2A_MAX_SESSIONS"))
 			}
 			c := meta.FindStatusCondition(storedCapAgent(t, cl, agent).Status.Conditions, sessionCapFittedConditionType)
-			if c == nil || c.Reason != sessionCapClusterViewReason || !strings.Contains(c.Message, a2aSessionClusterViewEnvVar) || !strings.Contains(c.Message, "#6483") {
-				t.Errorf("SessionCapFitted = %+v, want %s naming the flag and its retirement issue", c, sessionCapClusterViewReason)
+			if c == nil || c.Reason != sessionCapNarrowReason {
+				t.Errorf("SessionCapFitted = %+v, want %s: the view changes nothing about the fit", c, sessionCapNarrowReason)
 			}
 		})
 	}

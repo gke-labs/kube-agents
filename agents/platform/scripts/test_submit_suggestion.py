@@ -779,6 +779,24 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 self.assertNotIn("has not used", said)
                 self.assertEqual(self.broker.payloads("branch-delete"), [])
 
+    def test_a_read_refused_with_a_code_that_is_not_a_text_is_a_read_that_did_not_finish(self):
+        """The helper looks the refusal's code up in a set, and a list cannot enter one: the
+        lookup raised TypeError. `vcs_client.VcsError` keeps a code only when it is a text, so
+        such a refusal reads as one with no code."""
+        for number, code in enumerate((["FORGE_CALL_FAILED"], {"name": "GIT_FAILED"})):
+            with self.subTest(code=code):
+                branch = f"platform-agent/scale-web-read-odd-{number}"
+                git(self.origin, "checkout", "--quiet", "-b", branch)
+                (self.origin / "app.yaml").write_text(f"replicas: {number + 9}\n")
+                git(self.origin, "commit", "--quiet", "-am", "round one")
+                git(self.origin, "checkout", "--quiet", "main")
+                self.existing_proposal(branch)["state"] = "closed"
+                self.broker.view_fails_with = vcs_client.VcsError("could not read", code=code)
+                with self.assertRaises(ValueError) as caught:
+                    self.prepare(branch)
+                self.assertIn("run prepare again", str(caught.exception))
+                self.assertEqual(self.broker.payloads("branch-delete"), [])
+
     def test_a_broker_without_the_branch_verbs_refuses_the_name_by_code(self):
         branch = "platform-agent/scale-web"
         git(self.origin, "checkout", "--quiet", "-b", branch)

@@ -183,6 +183,9 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// broker's, so an exec pod confers no a2a-reports role. Its callers
 	// binding stays, holding the gateway's account to its own audiences.
 	credentialProxyA2AReportsAudienceEnvVar: true,
+	// The Teams caller word gates the Teams relay routes, which an exec pod
+	// refuses anyway; flipping the Teams switch must not roll every exec replica.
+	credentialProxyTeamsA2ACallerEnvVar: true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

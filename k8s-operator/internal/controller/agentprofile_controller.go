@@ -116,6 +116,10 @@ const (
 	// reasonAgentProfileDispatcherCeiling: the profile is newer than the ones
 	// the dispatcher's identity can carry (refuseOverDispatcherCeiling).
 	reasonAgentProfileDispatcherCeiling = "DispatcherCeiling"
+	// reasonAgentProfileHarnessNotSupported: spec.harness.type names a
+	// harness this operator doesn't render (an older or edited CRD let it
+	// in). The profile is refused whole, as for an invalid one.
+	reasonAgentProfileHarnessNotSupported = "HarnessNotSupported"
 )
 
 // AgentProfileReconciler reconciles AgentProfile objects.

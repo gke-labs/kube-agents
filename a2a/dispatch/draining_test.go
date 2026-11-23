@@ -26,7 +26,7 @@ func TestADrainingProfileFinishesWhatItHoldsAndTakesNothingNew(t *testing.T) {
 
 	ti.update(func(c *lib.DispatchConfig) {
 		p := c.Profiles[0]
-		p.Durables, p.DrainingUntil = nil, time.Now().Add(time.Hour)
+		p.DrainingUntil = time.Now().Add(time.Hour)
 		c.Profiles[0] = p
 	})
 	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
@@ -61,7 +61,7 @@ func TestADrainingProfilesDurableTakesNothingBeforeItIsDropped(t *testing.T) {
 
 	ti.update(func(c *lib.DispatchConfig) {
 		p := c.Profiles[0]
-		p.Durables, p.DrainingUntil = nil, time.Now().Add(time.Hour)
+		p.DrainingUntil = time.Now().Add(time.Hour)
 		c.Profiles[0] = p
 	})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
