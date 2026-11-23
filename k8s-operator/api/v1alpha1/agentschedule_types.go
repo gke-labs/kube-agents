@@ -240,6 +240,14 @@ type AgentScheduleRun struct {
 	// +kubebuilder:validation:Enum=no_delivery;local;silent;stored_no_home;posted;post_failed;post_unknown
 	// +optional
 	Delivery string `json:"delivery,omitempty"`
+	// Reason is why the run's task ended, as the gateway names it: the
+	// bare token of the executor's terminal reason, for example
+	// write-refused, deadline-exceeded or canceled-by-request, and never
+	// its detail. Empty when the task gave none the gateway knows, and on
+	// a Lost run.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]{1,64}$`
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // AgentScheduleStatus is the schedule's run state. It is the run ledger: no
@@ -277,6 +285,10 @@ type AgentScheduleStatus struct {
 	// +kubebuilder:validation:Enum=Succeeded;Failed;Cancelled;Lost
 	// +optional
 	LastOutcome string `json:"lastOutcome,omitempty"`
+	// LastReason is the last run's Reason.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]{1,64}$`
+	// +optional
+	LastReason string `json:"lastReason,omitempty"`
 	// LastHandledRunNow is the last run-now token acted on.
 	// +optional
 	LastHandledRunNow string `json:"lastHandledRunNow,omitempty"`
@@ -318,6 +330,7 @@ type AgentScheduleStatus struct {
 // +kubebuilder:printcolumn:name="Suspend",type=boolean,JSONPath=`.spec.suspend`
 // +kubebuilder:printcolumn:name="Next",type=date,JSONPath=`.status.nextScheduleTime`
 // +kubebuilder:printcolumn:name="Last",type=string,JSONPath=`.status.lastOutcome`
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.lastReason`
 
 // AgentSchedule runs a prompt on an AgentProfile on a cron schedule, each run
 // an Unattended task submitted through the A2A gateway

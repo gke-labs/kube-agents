@@ -30,6 +30,9 @@ spec:
         - jsonPath: .status.lastOutcome
           name: Last
           type: string
+        - jsonPath: .status.lastReason
+          name: Reason
+          type: string
       name: v1alpha1
       schema:
         openAPIV3Schema:
@@ -270,6 +273,10 @@ spec:
                     - Cancelled
                     - Lost
                   type: string
+                lastReason:
+                  description: LastReason is the last run's Reason.
+                  pattern: ^[A-Za-z0-9._-]{1,64}$
+                  type: string
                 lastScheduleTime:
                   description: LastScheduleTime is the last slot that was run.
                   format: date-time
@@ -354,6 +361,15 @@ spec:
                         type: string
                       outcome:
                         description: Outcome is how it ended.
+                        type: string
+                      reason:
+                        description: |-
+                          Reason is why the run's task ended, as the gateway names it: the
+                          bare token of the executor's terminal reason, for example
+                          write-refused, deadline-exceeded or canceled-by-request, and never
+                          its detail. Empty when the task gave none the gateway knows, and on
+                          a Lost run.
+                        pattern: ^[A-Za-z0-9._-]{1,64}$
                         type: string
                       slotTime:
                         description: SlotTime is the slot it ran for.

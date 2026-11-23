@@ -49,6 +49,7 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `lastTaskID` | `string` | no |  |  | LastTaskID is the most recent run's task. |
 | `lastCompletionTime` | `metav1.Time` | no |  |  | LastCompletionTime is when the most recent run ended. |
 | `lastOutcome` | `string` | no |  | one of `Succeeded`, `Failed`, `Cancelled`, `Lost` | LastOutcome is how the most recent run ended. |
+| `lastReason` | `string` | no |  | pattern `^[A-Za-z0-9._-]{1,64}$` | LastReason is the last run's Reason. |
 | `lastHandledRunNow` | `string` | no |  |  | LastHandledRunNow is the last run-now token acted on. |
 | `lastHandledStop` | `string` | no |  |  | LastHandledStop is the last stop token acted on. |
 | `stoppedTaskID` | `string` | no |  |  | StoppedTaskID is the run in flight a stop was sent for, until it settles: a run-now asked for meanwhile waits for it to end rather than adopting it. |
@@ -66,6 +67,7 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `recentRuns[].completionTime` | `metav1.Time` | no |  |  | CompletionTime is when it ended. |
 | `recentRuns[].outcome` | `string` | yes |  |  | Outcome is how it ended. |
 | `recentRuns[].delivery` | `string` | no |  | one of `no_delivery`, `local`, `silent`, `stored_no_home`, `posted`, `post_failed`, `post_unknown` | Delivery is how its report was delivered, once that is final: posted, stored for want of a home channel, kept local, silent when clean, not delivered, post_failed when the gateway gave up posting it, or post_unknown when a post started or timed out with no outcome, so it may be in the channel and is never retried. Empty until the gateway reports a final value, and on a run it never does. |
+| `recentRuns[].reason` | `string` | no |  | pattern `^[A-Za-z0-9._-]{1,64}$` | Reason is why the run's task ended, as the gateway names it: the bare token of the executor's terminal reason, for example write-refused, deadline-exceeded or canceled-by-request, and never its detail. Empty when the task gave none the gateway knows, and on a Lost run. |
 | `conditions` | `[]metav1.Condition` | no |  |  | Conditions are the latest observations of the schedule. |
 
 <!-- prettier-ignore-end -->

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -144,6 +145,9 @@ type ScheduleTaskState struct {
 	// Delivery is how its report was delivered (an AgentScheduleReport*
 	// value), or empty while the gateway has no record of it.
 	Delivery string
+	// Reason is why it ended when Terminal: the gateway's bare reason
+	// token, or empty.
+	Reason string
 }
 
 // ScheduleTaskTracker reports on a run in flight.
@@ -562,12 +566,12 @@ func (r *AgentScheduleReconciler) trackActive(ctx context.Context, sched *agentv
 	switch {
 	case state.Found && state.Terminal:
 		taskID := st.ActiveTaskID
-		r.settle(pass, sched, state.Outcome, state.CompletedAt)
+		r.settle(pass, sched, state.Outcome, state.Reason, state.CompletedAt)
 		recordDelivery(st, taskID, state.Delivery)
 	case !state.Found:
-		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, "", now)
 	case st.ActiveTaskStartedAt != nil && now.Sub(st.ActiveTaskStartedAt.UTC()) > deadline+agentScheduleLostGrace:
-		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, "", now)
 	}
 }
 
@@ -638,20 +642,38 @@ func knownOutcome(outcome string) string {
 	return agentv1alpha1.AgentScheduleOutcomeFailed
 }
 
+// runReasonShape is the CRD's pattern for a run's Reason, the gateway's own
+// token alphabet (reasonToken: letters, digits, '.', '_', '-'). The gateway sends
+// only tokens from its reason tables, all of this shape
+// (TestRunReasonTokensFitTheOperatorsPattern pins that across the modules);
+// anything else is dropped here rather than failing the status write.
+var runReasonShape = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// knownReason is reason when it has the CRD's shape, else empty.
+func knownReason(reason string) string {
+	if runReasonShape.MatchString(reason) {
+		return reason
+	}
+	return ""
+}
+
 // settle records a run's end and clears it from flight.
-func (r *AgentScheduleReconciler) settle(pass *schedulePass, sched *agentv1alpha1.AgentSchedule, outcome string, at time.Time) {
+func (r *AgentScheduleReconciler) settle(pass *schedulePass, sched *agentv1alpha1.AgentSchedule, outcome, reason string, at time.Time) {
 	st := &sched.Status
 	outcome = knownOutcome(outcome)
+	reason = knownReason(reason)
 	if at.IsZero() {
 		at = r.now()
 	}
 	done := metav1.NewTime(at)
 	st.LastCompletionTime = &done
 	st.LastOutcome = outcome
+	st.LastReason = reason
 	for i := range st.RecentRuns {
 		if st.RecentRuns[i].TaskID == st.ActiveTaskID {
 			st.RecentRuns[i].CompletionTime = &done
 			st.RecentRuns[i].Outcome = outcome
+			st.RecentRuns[i].Reason = reason
 		}
 	}
 	pass.count(agentScheduleRunsTotal.WithLabelValues(sched.Name, strings.ToLower(outcome)))
