@@ -415,3 +415,26 @@ func TestAnUnlatchedServerReadsBothFormsAsBefore(t *testing.T) {
 		t.Errorf("an unlatched server counted %d drops", b.client.ProfileSupervisorDrops())
 	}
 }
+
+// A wait on a profile task whose only message the cutoff refuses answers not
+// found at once, as ReadTask does, rather than holding a reader for the whole
+// wait to say the same.
+func TestAWaitOnATaskWithOnlyARefusedTerminalIsNotFoundAtOnce(t *testing.T) {
+	url, js := testBus(t)
+	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
+	ref := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-only-refused"}
+	publishGatewayTerminal(t, js, ref.Addressee, ref.TaskID)
+	b.kinds.note(ref, TaskKindProfile)
+	ctx := context.Background()
+	if _, err := b.ReadTask(ctx, ref); err != ErrTaskNotFound {
+		t.Fatalf("ReadTask = %v, want ErrTaskNotFound", err)
+	}
+	start := time.Now()
+	_, err := b.WaitForTask(ctx, ref, 10*time.Second)
+	if err != ErrTaskNotFound {
+		t.Fatalf("WaitForTask = %v, want ErrTaskNotFound", err)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("WaitForTask took %s; it should answer at once, not wait out the 10s", took)
+	}
+}

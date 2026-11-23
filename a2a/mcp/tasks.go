@@ -245,6 +245,12 @@ func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 			}
 			return nil, err
 		}
+		if !submitted && w.pending == 0 && len(w.events) == 0 && (w.dropped > 0 || len(w.doubted) > 0) {
+			// Everything the task had was refused by the cutoff or is held
+			// undecided: not found at once, as ReadTask answers it, rather
+			// than holding a reader for the rest of the wait.
+			return nil, ErrTaskNotFound
+		}
 	}
 }
 
