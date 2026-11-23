@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -77,6 +78,16 @@ func (m *Metrics) teamsAPICall(method string, relayStatus, msStatus int, took ti
 		outcome = teamsCallOK
 	}
 	m.teamsAPIDuration.WithLabelValues(method, outcome).Observe(took.Seconds())
+}
+
+// teamsTimestampText is an activity's timestamp when it is a JSON string,
+// and empty for any other type or none.
+func teamsTimestampText(raw json.RawMessage) string {
+	var text string
+	if len(raw) == 0 || json.Unmarshal(raw, &text) != nil {
+		return ""
+	}
+	return text
 }
 
 // teamsIngress records how long the activity stamped ts (Bot Framework's

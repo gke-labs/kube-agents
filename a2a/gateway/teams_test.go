@@ -486,6 +486,70 @@ func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
 	}
 }
 
+// runTeamsOnce runs the adapter against a relay holding one activity until
+// the activity is acked, and returns the turns handed over.
+func runTeamsOnce(t *testing.T, event map[string]any, m *Metrics) []InboundMessage {
+	t.Helper()
+	relay := newFakeTeamsRelay(t, event)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	a.SetMetrics(m)
+	ctx, cancel := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	var turns []InboundMessage
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Run(ctx, func(msg InboundMessage) {
+			mu.Lock()
+			defer mu.Unlock()
+			turns = append(turns, msg)
+		})
+	}()
+	// An empty pull after the activity's means the activity was acked and
+	// either handed over or passed by.
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEmpty)) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the activity was never passed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	return turns
+}
+
+// The lag is a turn's: an activity the adapter does not take as a turn is
+// not observed, whatever its timestamp.
+func TestTeamsIngressLagSkipsAnActivityThatIsNotATurn(t *testing.T) {
+	event := testTeamsActivity("f:10", "<at>Kage</at> hi")
+	event["type"] = "conversationUpdate"
+	event["timestamp"] = time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano)
+	m := NewMetrics()
+	if turns := runTeamsOnce(t, event, m); len(turns) != 0 {
+		t.Fatalf("a conversationUpdate was handed over: %+v", turns)
+	}
+	if got := histogramCount(t, m.teamsIngressLag.WithLabelValues()); got != 0 {
+		t.Errorf("ingress lag observations %d, want 0", got)
+	}
+}
+
+// The timestamp is telemetry only: one that is not a string is not observed
+// and the message is still a turn.
+func TestTeamsATimestampOfAnotherTypeStillHandsTheTurnOver(t *testing.T) {
+	event := testTeamsActivity("f:11", "<at>Kage</at> how many nodes?")
+	event["timestamp"] = 1794603936
+	m := NewMetrics()
+	turns := runTeamsOnce(t, event, m)
+	if len(turns) != 1 || turns[0].Text != "how many nodes?" {
+		t.Fatalf("handed over: %+v", turns)
+	}
+	if got := histogramCount(t, m.teamsIngressLag.WithLabelValues()); got != 0 {
+		t.Errorf("ingress lag observations %d, want 0", got)
+	}
+}
+
 func TestTeamsPostIsTimedUnderTheCreateOperation(t *testing.T) {
 	relay := newFakeTeamsRelay(t, nil)
 	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)

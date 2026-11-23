@@ -63,7 +63,7 @@ const (
 	// by outcome and the events it carried; each Bot Framework call the
 	// adapter makes through the broker's passthrough, by operation and
 	// outcome, and the ones Microsoft answered 429; and how long an activity
-	// took from its own timestamp to the gateway taking it as a turn.
+	// it takes as a turn took from its own timestamp to the gateway's receipt.
 	teamsEventsReceivedName = "teams_events_received_total"
 	teamsPullsName          = "teams_pulls_total"
 	teamsAPIDurationName    = "teams_api_request_duration_seconds"
@@ -480,7 +480,7 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      teamsIngressLagName,
-			Help:      "Seconds from a Teams activity's own timestamp to the gateway taking it as a turn: Microsoft's delivery, the inbound receiver and the broker's queue together; a negative lag (clock skew) is observed as 0. No sample until the first.",
+			Help:      "Seconds from a Teams activity's own timestamp to the gateway's receipt of it, for an activity it takes as a turn: Microsoft's delivery, the receiver in front of the broker and the broker's queue together; a negative lag (clock skew) is observed as 0 and an activity with no readable timestamp is not observed. No sample until the first.",
 			Buckets:   metricsSlackIngressBuckets,
 		}, []string{}),
 		chatMessages: prometheus.NewCounterVec(prometheus.CounterOpts{

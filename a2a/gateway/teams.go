@@ -152,11 +152,14 @@ var errTeamsNoOpenDirect = errors.New("teams: opening a direct conversation is n
 
 // teamsActivity is the part of a Bot Framework activity the adapter reads.
 type teamsActivity struct {
-	Type         string `json:"type"`
-	ID           string `json:"id"`
-	Timestamp    string `json:"timestamp"`
-	Text         string `json:"text"`
-	ServiceURL   string `json:"serviceUrl"`
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	// Timestamp is read for the ingress lag alone and kept raw, so a
+	// timestamp of an unexpected JSON type cannot fail the decode and drop
+	// the turn.
+	Timestamp    json.RawMessage `json:"timestamp"`
+	Text         string          `json:"text"`
+	ServiceURL   string          `json:"serviceUrl"`
 	Conversation struct {
 		ID               string `json:"id"`
 		ConversationType string `json:"conversationType"`
@@ -503,7 +506,7 @@ func (a *TeamsAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			a.log.Info("teams activity is not a turn; acked", "activity", act.ID, "reason", reason)
 			continue
 		}
-		a.metrics.teamsIngress(arrived, act.Timestamp)
+		a.metrics.teamsIngress(arrived, teamsTimestampText(act.Timestamp))
 		handler(msg)
 	}
 }
