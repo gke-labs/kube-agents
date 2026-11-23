@@ -2604,8 +2604,8 @@ def collect(
     # the main flag can collide this way: a part flag's job is its prefix's
     # last segment, so two part flags naming one prefix name one job. The
     # runs of a flag dropped for its prefix are the main flag's, under the
-    # main flag's job, so the warning about the part they file as is for
-    # every other flag.
+    # main flag's job, so that flag gets no warning about the part its
+    # runs file as.
     main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
     main_prefix_key = _prefix_key(nightly_prefix) if nightly_prefix else None
     listed_by: dict[str, str] = {main_job: "--nightly-prefix"} if main_job is not None else {}
