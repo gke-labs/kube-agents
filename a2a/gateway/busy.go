@@ -284,9 +284,9 @@ func (b *busyTasksStream) handle(ctx context.Context) (jetstream.Stream, error) 
 // (lib.TaskReplaySubjects) with a direct get, and no consumer, so a count
 // over many records opens no ephemeral consumer on TASKS. empty is nothing on
 // either subject in the retention window, the question the replay answers
-// with TaskNotFound; any message at all is a message here, as it is for the
-// replay. final is a terminal status as the newest message on either: the
-// executor writes nothing after its terminal, and the supervisor subject
+// with TaskNotFound; any message the replay would fold is a message here.
+// final is a terminal status as the newest message on either: the executor
+// writes nothing after its terminal, and the supervisor subject
 // carries only terminals. An error is the read failing, not the subjects
 // being empty. profile is taskIsProfile's answer for the task: a five-token
 // supervisor message the cutoff refuses on a profile task is not read here,

@@ -222,6 +222,9 @@ func (t *Task) mergeArtifact(u ArtifactUpdate) {
 // executor's events and the supervisor's terminal, if it wrote one, in either
 // supervisor form (ProfileSupervisorSubject: a profile task's, when the
 // dispatch config selects it). All three are on TASKS, and no two overlap.
+// Every message on them is replayed, and a supervisor message is screened by
+// AcceptsSupervisorEvent before the fold: past the install's cutoff, a
+// profile task's five-token terminal is not folded.
 func TaskReplaySubjects(addressee, taskID string) []string {
 	return []string{TaskEventsSubject(addressee, taskID), TaskSupervisorSubject(addressee, taskID), ProfileSupervisorSubject(addressee, taskID)}
 }

@@ -511,12 +511,12 @@ func noFirstEventPastGrace(active *ActiveTask, streamEmpty bool, grace time.Dura
 // taskStreamEmpty reports whether nothing is on either of a task's replay
 // subjects in the retention window. It is the test the replay makes before
 // it opens a consumer (TasksGet answers TaskNotFound exactly when this
-// answers true), made with direct gets and no consumer, so a caller that
-// only needs to know whether the task has a first event does not spend one
-// of the TASKS stream's consumer slots on a five-second ephemeral. The task is
-// read as the replay reads it (taskIsProfile), so a five-token supervisor
-// message the cutoff refuses on a profile task is not a first event here
-// either. An error is the read failing, not the subjects being empty.
+// answers true, but for the case lib.TaskReplayHeads names), made with
+// direct gets and no consumer, so a caller that only needs to know whether
+// the task has a first event does not spend one of the TASKS stream's
+// consumer slots on a five-second ephemeral. The task is read as the
+// replay reads it (taskIsProfile), so a five-token supervisor message the
+// cutoff refuses on a profile task is not a first event here either. An error is the read failing, not the subjects being empty.
 func (g *Gateway) taskStreamEmpty(ctx context.Context, rec *SessionRecord, taskID string) (bool, error) {
 	addressee := rec.AddresseeFor(taskID)
 	heads, err := g.client.TaskReplayHeads(ctx, nil, addressee, taskID, g.profileRead(rec, taskID, addressee))

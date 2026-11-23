@@ -43,7 +43,8 @@ func TaskEventsSubject(addressee, taskID string) string {
 // the supervisor's `from` that replay could not tell from the real thing. The
 // token is the same count as `events`, so every `a2a.tasks.*.*.<class>`
 // pattern and the TASKS stream filter behave identically and the pair share
-// one stream sequence. tasks/get folds both in that order.
+// one stream sequence. tasks/get folds both in that order, subject to the
+// profile cutoff (AcceptsSupervisorEvent).
 func TaskSupervisorSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
 }
