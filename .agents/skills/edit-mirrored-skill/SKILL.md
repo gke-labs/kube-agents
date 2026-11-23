@@ -46,10 +46,6 @@ and shipped skill; `skills-generate` rebuilds the shipped skill.
   produces fails `make skills-check`.
 - Run `make docs-generate` when a skill is added or a frontmatter `description` changes, and
   commit the regenerated skill catalogue. Run `make docs-check` before pushing.
-- Expect the `Docker Build` check (the platform image build), not `make skills-check`, to run every
-  shell block of the shipped skills through `deploy/docker/check_skill_commands.py`. If an edit or sync changes a block listed in its
-  `KNOWN_FINDINGS`, update the entry in the same pull request; rewrite a command Tirith refuses in
-  a patch.
 - Follow the eval loop ([`.agents/rules/eval_driven_development.md`](../../rules/eval_driven_development.md))
   for any change to what the agent reads: adding, changing or removing a patch or `append.md`, or a
   sync. A change that leaves every shipped skill byte-identical, or a patch that only fixes a lint

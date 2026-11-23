@@ -211,6 +211,14 @@ const (
 	// at clusterUpMonitored the clusters monitored.
 	clusterUpSeries    = "k8s_event_watcher_cluster_up"
 	clusterUpMonitored = 1
+	// watchSetReadySeries is 0 while buildWatchSet is assembling the initial
+	// watch set and watchSetReadyDone once every initial cluster's cluster_up
+	// series is published. A value below watchSetReadyDone suppresses
+	// Clusters and DataVolume so an early scrape reads as no reading rather
+	// than an empty fleet; an older watcher without the series keeps its
+	// previous behaviour.
+	watchSetReadySeries = "k8s_event_watcher_watch_set_ready"
+	watchSetReadyDone   = 1
 	// The series' three labels, the cluster's triple as the watcher's profile
 	// names it, read into usageClusterGauges.Refs for the ScopeUndeclared
 	// condition (usage_scope.go). Label values are the peer's text and are
@@ -635,8 +643,10 @@ func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool 
 
 // usageReading is what one scrape yields: each wanted counter summed over its
 // label sets, the start time the body carried, nil when it carried none, and,
-// for the watcher's body alone, its cluster gauges; nil for any other body, so
-// that a poll can tell a watcher reporting no clusters from no watcher read.
+// for a ready watcher's body alone, its cluster gauges; nil for any other
+// body or a watcher still building its initial watch set
+// (watchSetReadySeries < watchSetReadyDone), so that a poll can distinguish a
+// ready watcher reporting no clusters from no fleet reading.
 // For a target that serves readings, Readings holds the reading fields of
 // every requested reading present in its body, by status field, and
 // ReadingsPresent says, for each requested reading, whether it was; both nil
@@ -649,8 +659,9 @@ type usageReading struct {
 	Readings        map[string]int64
 	ReadingsPresent map[usageReadingKind]bool
 	// DataVolume is the watcher's data volume reading, nil when the body
-	// carried no complete one: not the watcher's, or a watcher whose statfs
-	// failed, or one built before it exported the series.
+	// carried no complete one: not the watcher's, a watcher still building its
+	// initial watch set (watchSetReadySeries < watchSetReadyDone), a watcher
+	// whose statfs failed, or one built before it exported the series.
 	DataVolume *usageDataVolume
 	// Dispatcher is the chat plugin's kanban dispatcher reading, nil for any
 	// body but the chat_metrics listener's; an empty one when no board is
@@ -893,6 +904,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			wanted = append(wanted, family)
 		}
 	}
+	watchSetStarting := false
 	for _, counter := range counters {
 		family, filter := usageSeriesFor(counter)
 		sums[counter] = 0
@@ -903,7 +915,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
 			volume = map[string]float64{}
-			wanted = append(wanted, clusterUpSeries, dataVolumeSeries)
+			wanted = append(wanted, clusterUpSeries, watchSetReadySeries, dataVolumeSeries)
 		}
 		if family == kanbanGaveUpSeries {
 			dispatcher = &usageDispatcherReading{}
@@ -1026,6 +1038,12 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						})
 						continue
 					}
+					if name == watchSetReadySeries {
+						if value < watchSetReadyDone {
+							watchSetStarting = true
+						}
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -1079,6 +1097,10 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				dispatcher.Failing[i].Seconds, dispatcher.Failing[i].HasAge = age, true
 			}
 		}
+	}
+	if watchSetStarting {
+		clusters = nil
+		volume = nil
 	}
 	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
 	if readings != nil {

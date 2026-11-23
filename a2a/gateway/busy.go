@@ -122,8 +122,8 @@ func lineStillSubmitted(rs *relayState) bool {
 
 // busyNoticeBackend reports whether a turn that arrived through backend gets
 // the busy notice: the chat backends and the console do. The inject door and
-// both A2A door classes (a2aBackend, and a2aGoogleBackend for Google-verified
-// callers) do not, because their callers are programs that read the status line
+// every A2A door class (a2aBackend, a2aGoogleBackend for Google-verified
+// callers, a2aEntraBackend for Entra-verified ones) do not, because their callers are programs that read the status line
 // as data. The A2A door takes the line's first edit as the task going to
 // working (A2ADoor.Edit), so a queued edit would report a task no worker has
 // as running; the inject door records every edit as an entry the eval
@@ -131,7 +131,7 @@ func lineStillSubmitted(rs *relayState) bool {
 // unedited post of a task as its output, so the notice would be graded or
 // returned as part of the answer.
 func busyNoticeBackend(backend string) bool {
-	return backend != injectBackend && backend != a2aBackend && backend != a2aGoogleBackend
+	return backend != injectBackend && backend != a2aBackend && backend != a2aGoogleBackend && backend != a2aEntraBackend
 }
 
 // busyNoticeAt is the configured threshold, or defaultBusyNoticeAt when the
@@ -193,7 +193,7 @@ func (g *Gateway) fixedRouteBacklog(ctx context.Context, exclude string) (int, e
 			rec.AddresseeFor(active.TaskID) != g.cfg.DefaultAddressee {
 			return
 		}
-		if g.busyTaskLeftOut(ctx, tasks, active, g.cfg.DefaultAddressee, now) {
+		if g.busyTaskLeftOut(ctx, tasks, rec, active, g.cfg.DefaultAddressee, now) {
 			return
 		}
 		n++
@@ -246,11 +246,11 @@ func (r *Registry) eachSessionRecord(ctx context.Context, fn func(*SessionRecord
 // as its newest event. Inside the grace it answers false without reading the
 // stream. A read that fails counts the task: a transport failure cannot rule
 // out events, the rule the heal follows.
-func (g *Gateway) busyTaskLeftOut(ctx context.Context, tasks *busyTasksStream, active *ActiveTask, addressee string, now time.Time) bool {
+func (g *Gateway) busyTaskLeftOut(ctx context.Context, tasks *busyTasksStream, rec *SessionRecord, active *ActiveTask, addressee string, now time.Time) bool {
 	if active.SubmittedAt.IsZero() || now.Sub(active.SubmittedAt) <= g.cfg.FirstEventGrace {
 		return false
 	}
-	empty, final, err := tasks.readTask(ctx, addressee, active.TaskID)
+	empty, final, err := tasks.readTask(ctx, addressee, active.TaskID, g.taskIsProfile(rec, active.TaskID, addressee))
 	if err != nil {
 		g.log.Warn("busy count: stream read failed; counting the task",
 			"taskId", active.TaskID, "err", err)
@@ -284,29 +284,26 @@ func (b *busyTasksStream) handle(ctx context.Context) (jetstream.Stream, error) 
 // (lib.TaskReplaySubjects) with a direct get, and no consumer, so a count
 // over many records opens no ephemeral consumer on TASKS. empty is nothing on
 // either subject in the retention window, the question the replay answers
-// with TaskNotFound; any message at all is a message here, as it is for the
-// replay. final is a terminal status as the newest message on either: the
-// executor writes nothing after its terminal, and the supervisor subject
+// with TaskNotFound; any message the replay would fold is a message here.
+// final is a terminal status as the newest message on either: the executor
+// writes nothing after its terminal, and the supervisor subject
 // carries only terminals. An error is the read failing, not the subjects
-// being empty.
-func (b *busyTasksStream) readTask(ctx context.Context, addressee, taskID string) (empty, final bool, err error) {
+// being empty. profile is taskIsProfile's answer for the task: a five-token
+// supervisor message the cutoff refuses on a profile task is not read here,
+// as the replay does not fold it (lib.TaskReplayHeads).
+func (b *busyTasksStream) readTask(ctx context.Context, addressee, taskID string, profile bool) (empty, final bool, err error) {
 	stream, err := b.handle(ctx)
 	if err != nil {
 		return false, false, err
 	}
-	empty = true
-	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
-		msg, err := stream.GetLastMsgForSubject(ctx, subject)
-		if errors.Is(err, jetstream.ErrMsgNotFound) {
-			continue
-		}
-		if err != nil {
-			return false, false, fmt.Errorf("newest message on %s: %w", subject, err)
-		}
-		empty = false
-		final = final || isFinalStatus(msg.Data)
+	heads, err := b.g.client.TaskReplayHeads(ctx, stream, addressee, taskID, lib.ProfileTaskIf(profile))
+	if err != nil {
+		return false, false, err
 	}
-	return empty, final, nil
+	for _, h := range heads {
+		final = final || isFinalStatus(h.Data)
+	}
+	return len(heads) == 0, final, nil
 }
 
 // isFinalStatus reports whether data is a status-update envelope marked

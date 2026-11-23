@@ -21,11 +21,16 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
-# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
-# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
-readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# The file name of the third-party command scanner earlier images let Hermes
+# download into each home. It is AGPL-licensed and no image runs it any more;
+# step 4.4 removes the copies left on the volume.
+readonly STALE_SCANNER_BINARY=tirith
+# Where that scanner kept its own files under a home: a downloaded threat
+# database, its state, and a log of the commands it scanned. Step 4.4 removes
+# the directory of the scanner's name under each.
+readonly STALE_SCANNER_DATA_PARENTS=".local/share .local/state"
 # The first four bytes of an ELF executable, in hex: step 4.4's check that a file
-# named tirith is a binary before it removes it.
+# of that name is a binary before it removes it.
 readonly ELF_MAGIC_HEX=7f454c46
 # The model-call stale bound (providers.custom.stale_timeout_seconds) every profile
 # shipped with before the kanban workers got a shorter one. The cluster loop moves a
@@ -2219,23 +2224,36 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
     fi
 fi
 
-# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
-# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
-# so with the image's copy there a home's bin/tirith is dead cache, never used
-# again, and it was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data
-# volume at 209 clusters (gke-labs#3325). Removed only when PATH resolves the
-# image's copy, and only a regular file named exactly tirith in $TARGET_DIR/bin
-# or a profile's bin/ that starts with the ELF magic. The file is never run: it
-# sits on a volume workers can write, and this is the bootstrap container. Each
+# 4.4 Remove the command scanner copies earlier images left in each home. Hermes
+# downloaded the binary into every profile's bin/ (38 MiB each: 6.5 GiB of a
+# 10 GiB data volume at 209 clusters, gke-labs#3325). This image replaces the
+# module that ran it (deploy/docker/patches/no_external_scanner.py), so a copy
+# on the volume is never used again, and its licence is one the install does not
+# take. Removed: only a regular file of that exact name in $TARGET_DIR/bin or a
+# profile's bin/ that starts with the ELF magic. The file is never run: it sits
+# on a volume workers can write, and this is the bootstrap container. Each
 # removal is logged with its size, so an operator can see where the space went.
-if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
-    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
-        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
-        [ "$(od -An -tx1 -N4 "$stale_tirith" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
-        stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
-        if rm -f "$stale_tirith"; then
-            echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
+# The scanner's data directories go the same way: a real directory of that name
+# under a home's .local/share or .local/state, never a symlink, so the removal
+# stays inside the directory it names.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ]; then
+    for stale_scanner in "$TARGET_DIR/bin/$STALE_SCANNER_BINARY" "$TARGET_DIR"/profiles/*/bin/"$STALE_SCANNER_BINARY"; do
+        [ -f "$stale_scanner" ] && [ ! -L "$stale_scanner" ] || continue
+        [ "$(od -An -tx1 -N4 "$stale_scanner" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
+        stale_bytes="$(stat -c %s "$stale_scanner" 2>/dev/null || echo unknown)"
+        if rm -f "$stale_scanner"; then
+            echo "Removed a per-profile command scanner copy: $stale_scanner ($stale_bytes bytes); this image does not run it"
         fi
+    done
+    for scanner_home in "$TARGET_DIR/home" "$TARGET_DIR"/profiles/*/home; do
+        for scanner_parent in $STALE_SCANNER_DATA_PARENTS; do
+            stale_scanner="$scanner_home/$scanner_parent/$STALE_SCANNER_BINARY"
+            [ -d "$stale_scanner" ] && [ ! -L "$stale_scanner" ] || continue
+            stale_kib="$(du -sk "$stale_scanner" 2>/dev/null | cut -f1)"
+            if rm -rf "$stale_scanner"; then
+                echo "Removed command scanner data: $stale_scanner (${stale_kib:-unknown} KiB); this image does not run it"
+            fi
+        done
     done
 fi
 

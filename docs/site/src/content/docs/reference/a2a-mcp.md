@@ -1,23 +1,23 @@
 ---
 title: MCP server
-description: The opt-in A2A MCP server, a Model Context Protocol endpoint through which an external coding agent or IDE talks to an install over its message bus.
+description: The A2A MCP server, a Model Context Protocol endpoint through which an external coding agent or IDE talks to an install over its message bus.
 sidebar:
   order: 11
 ---
 
-The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It is off by default.
+The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It runs by default.
 
-## Turning it on
+## What the operator renders
 
-The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`. The chart value `operator.mcpServer.enabled: true` sets it. An `A2A_MCP_DOOR` entry in `operator.extraEnv`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, also works and wins over the value. With it set, the operator renders beside the console server:
+Unless the operator runs with `A2A_MCP_DOOR=false`, it renders beside the console server:
 
 - `<name>-a2a-mcp`: a Deployment running the MCP binary from the `a2a-console` image, a ClusterIP Service on port 8089, and the ServiceAccount of the same name;
 - `<name>-a2a-mcp-netpol`: a deny-all ingress NetworkPolicy on that pod, so the only way in is `kubectl port-forward`;
 - `<name>-a2a-mcp-token`: a Secret holding the bearer token callers present, minted once by the operator.
 
-If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Turn the flag off and all of it is removed, the token included.
+Set `operator.mcpServer.enabled: false` in the chart to turn it off. An `A2A_MCP_DOOR` entry in `operator.extraEnv`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, also works and wins: empty leaves it on, boolean spellings are parsed, and any other value keeps it off. Turning it off removes all of those objects, the token included. If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)).
 
-Its pod adds one to the namespace's session pod quota, and the chart's quota check counts it whenever the flag is on ([Prerequisites](/kube-agents/install/prerequisites/)).
+Its pod adds one to the namespace's session pod quota while enabled, and the chart's quota check counts it with the standing pods ([Prerequisites](/kube-agents/install/prerequisites/)).
 
 ## Connecting a client
 
@@ -72,6 +72,8 @@ A message sent through `send_message` reaches the A2A gateway through its consol
 `send_message` can send a turn straight to an AgentProfile instead of the conversation's agent, as the A2A console can. `addressee` names the profile, for example `cluster`, as one token with no spaces, dots or wildcards. `parameters` is an object of string values holding the profile's task parameters, for `cluster` its `project`, `location` and `cluster`, and is refused without an `addressee`. An `addressee` is refused on a stop word, a bare `/feedback` or `/feedback summary`, and any `/session` text, a message after it included, since those are commands for the conversation rather than tasks. An addressed turn is a new task for the profile, never a session.
 
 The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards by profile. Otherwise the turn is answered from the profile's task, which the gateway names on its status line. A turn still running when the wait ends returns the task as `<profile>/<task-id>`, and `task_control` reads it under that reference, which always resolves. A bare id resolves only while this server still holds the task.
+
+On an install with `A2A_PROFILE_SUPERVISOR_CUTOFF` set, a task is read as a profile task when its addressee has a live agent card, unless one of this server's turns learned its kind. That covers any typed `<addressee>/<task-id>` reference to a task no turn learned, so an old session task whose name a profile has since taken reads as still running if its gateway terminal was stored after the cutoff.
 
 Two known limits:
 

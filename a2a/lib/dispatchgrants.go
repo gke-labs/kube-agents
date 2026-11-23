@@ -98,9 +98,11 @@ var dispatcherSubmitKinds = []string{SubmitKindTop, SubmitKindChild}
 //   - every durable (top and child): INFO, MSG.NEXT and ACK on PROFILE_SUBMITS.
 //
 // For every profile, draining or not:
-//   - publish on a2a.tasks.<profile>.*.supervisor (failing a task it can't run).
-//     The six-token form (ProfileSupervisorSubject) comes with the operator
-//     change that sets DispatchConfig.ProfileSupervisorForm (#5301);
+//   - publish on a2a.tasks.<profile>.*.supervisor and its six-token form
+//     a2a.tasks.p.<profile>.*.supervisor (failing a task it can't run; which
+//     one it writes is DispatchConfig.ProfileSupervisorForm, #5301). Both
+//     through the upgrade window; the five-token one goes when readers drop
+//     it;
 //   - publish on the stop stream's direct get for a2a.stop.<profile>.*
 //     (catching up after a restart);
 //   - subscribe on a2a.stop.<profile>.*.
@@ -129,6 +131,7 @@ func DispatcherGrants(profiles []DispatcherGrantProfile) DispatcherSubjects {
 	for _, p := range profiles {
 		out.Publish = append(out.Publish,
 			"a2a.tasks."+p.Name+".*."+TaskClassSupervisor,
+			ProfileSupervisorSubject(p.Name, "*"),
 			"$JS.API.DIRECT.GET."+DispatchStopStream+"."+DispatchStopPrefix+p.Name+".*",
 		)
 		out.Subscribe = append(out.Subscribe, DispatchStopPrefix+p.Name+".*")

@@ -192,7 +192,7 @@ func cardStopPayload(taskID, contextID string) ([]byte, error) {
 // answer is still posted when it comes; the door shows it only on a task
 // running by then.
 func cardStopPlaceholderOn(backend string) bool {
-	return backend != a2aBackend && backend != a2aGoogleBackend
+	return backend != a2aBackend && backend != a2aGoogleBackend && backend != a2aEntraBackend
 }
 
 // stopCards starts a card-stop control on rec's addressee and records it on
@@ -367,7 +367,7 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 		result, ok := cardStopResultOf(rs.result)
 		if !ok && !rs.local {
 			// A restart lost the render state; the stream has the result.
-			if task, err := g.replayForTerminal(ctx, run.Addressee, taskID); err == nil {
+			if task, err := g.replayForTerminal(ctx, run.Addressee, taskID, false); err == nil {
 				if art := task.Artifact(lib.ArtifactResult); art != nil {
 					result, ok = cardStopResultOf(art.Parts)
 				}

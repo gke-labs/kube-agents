@@ -1345,10 +1345,13 @@ class ReplayTest(ProxyTestCase):
         _, port, out = self.replay()
         calls = len(FakeLiteLLM.calls)
         bodies = []
-        for _ in range(3):
+        for rep in range(3):
             status, headers, payload = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port)
             self.assertEqual((status, headers["x-replay-served"]), (200, "true"))
             bodies.append(json.loads(payload)["choices"][0]["message"])
+            # Each request queues its line after its response, so wait for it before the next request
+            # or two lines can be written in either order.
+            self.lines(rep + 1, out)
         self.assertEqual(len(FakeLiteLLM.calls), calls, "every rep is served")
         self.assertEqual(bodies[0], bodies[2])
         self.assertNotEqual(bodies[0], bodies[1])
