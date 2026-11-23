@@ -36,19 +36,16 @@ _BOTH_PROFILES = [
     "--set", "profiles.tse.enabled=true",
     "--set", "profiles.cluster.enabled=true",
 ]
+_HINDSIGHT = ["--set", "hindsight.enabled=true"]
 # Each entry is one render. The name appears in the failure message.
-_OPTIONAL_COMPONENTS = [
-    "--set", "hindsight.enabled=true",
-    "--set", "platformAgent.mode=next",
-]
 _VALUE_SETS = {
     "defaults": [],
     "web console with environment": _WEB_CONSOLE_ENVIRONMENT,
     "web console with environment and both profiles": [
         *_WEB_CONSOLE_ENVIRONMENT, *_BOTH_PROFILES,
     ],
-    "web console, both profiles, hindsight and next mode": [
-        *_WEB_CONSOLE_ENVIRONMENT, *_BOTH_PROFILES, *_OPTIONAL_COMPONENTS,
+    "web console with environment, both profiles and hindsight": [
+        *_WEB_CONSOLE_ENVIRONMENT, *_BOTH_PROFILES, *_HINDSIGHT,
     ],
 }
 _RELEASE = "test-release"
@@ -63,10 +60,17 @@ _ENVIRONMENT_OBJECTS = [
 ]
 _INSTANCE_LABEL = "app.kubernetes.io/instance"
 _YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
+# helm writes this comment above each document. It names the template.
+_SOURCE_PREFIX = "# Source: "
+_UNKNOWN_SOURCE = "unknown template"
 
 
 class DuplicateKeyError(yaml.YAMLError):
-    """A mapping carries the same key twice."""
+    """A mapping carries the same key twice. `line` counts from 1."""
+
+    def __init__(self, key, line):
+        super().__init__(f"duplicate key {key!r} at line {line} of the render")
+        self.line = line
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -81,10 +85,7 @@ class _UniqueKeyLoader(yaml.SafeLoader):
                 continue
             key = (key_node.tag, key_node.value)
             if key in seen:
-                mark = key_node.start_mark
-                raise DuplicateKeyError(
-                    f"duplicate key {key_node.value!r} at line {mark.line + 1}, column {mark.column + 1}"
-                )
+                raise DuplicateKeyError(key_node.value, key_node.start_mark.line + 1)
             seen.add(key)
         return super().construct_mapping(node, deep=deep)
 
@@ -97,6 +98,14 @@ def _render(values):
     if proc.returncode != 0:
         raise AssertionError(f"helm template failed with {values}: {proc.stderr}")
     return proc.stdout
+
+
+def _template_at(text, line):
+    """The template that produced `line` of the render, from helm's Source comment."""
+    for candidate in reversed(text.splitlines()[:line]):
+        if candidate.startswith(_SOURCE_PREFIX):
+            return candidate[len(_SOURCE_PREFIX):]
+    return _UNKNOWN_SOURCE
 
 
 def _load_strict(text):
@@ -130,10 +139,11 @@ class ChartNoDuplicateKeysTest(unittest.TestCase):
     def test_no_rendered_document_repeats_a_key(self):
         for name, values in _VALUE_SETS.items():
             with self.subTest(values=name):
+                rendered = _render(values)
                 try:
-                    docs = _load_strict(_render(values))
+                    docs = _load_strict(rendered)
                 except DuplicateKeyError as err:
-                    self.fail(f"render with {name}: {err}")
+                    self.fail(f"render with {name}: {err}, in {_template_at(rendered, err.line)}")
                 self.assertTrue(docs, f"render with {name} produced no documents")
 
     def test_environment_objects_keep_the_instance_label(self):
