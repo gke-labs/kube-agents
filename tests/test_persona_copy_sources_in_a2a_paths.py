@@ -28,14 +28,12 @@ _ENTRY = re.compile(r'^\s*"[^"]+":\s*"' + re.escape(_PREFIX) + r'([^"]+)",\s*$')
 # stall_report.py, audit_cluster.sh, workload_triage.py and vcs.py; a read that
 # found fewer saw too little.
 _SOURCES_FLOOR = 4
-# An entry assigned outside the map literal, which _script_sources doesn't read.
-_ASSIGNED = re.compile(r"scriptSources\[[^\]]+\]\s*=")
 
 
-def _script_sources():
-    """Every scriptSources source, and every line of the map this can't read as one."""
-    text = PERSONA_TEST.read_text()
-    start = text.index("var scriptSources = map[string]string{")
+def _map_sources(test_file, var):
+    """Every source in the Go map literal `var`, and every line of it this can't read as one."""
+    text = test_file.read_text()
+    start = text.index(f"var {var} = map[string]string{{")
     end = text.index("\n}", start)
     sources, unreadable = [], []
     for line in text[start:end].splitlines()[1:]:
@@ -48,8 +46,15 @@ def _script_sources():
             sources.append(m.group(1))
         else:
             unreadable.append(line.strip())
-    unreadable += [f"assigned outside the map: {a}" for a in _ASSIGNED.findall(text)]
+    # An entry assigned outside the map literal, which the loop above doesn't read.
+    assigned = re.compile(re.escape(var) + r"\[[^\]]+\]\s*=")
+    unreadable += [f"assigned outside the map: {a}" for a in assigned.findall(text)]
     return sources, unreadable
+
+
+def _script_sources():
+    """Every scriptSources source, and every line of the map this can't read as one."""
+    return _map_sources(PERSONA_TEST, "scriptSources")
 
 
 def _push_paths():
@@ -98,10 +103,14 @@ class FleetAuditPersonaCopySourcesInA2APathsTest(unittest.TestCase):
     the persona's own directory, which its tests read too."""
 
     def test_every_copied_source_and_the_persona_run_the_a2a_job(self):
-        text = FLEET_AUDIT_TEST.read_text()
-        start = text.index("var fleetAuditVendored = map[string]string{")
-        sources = _SOURCE.findall(text[start : text.index("\n}", start)])
-        self.assertTrue(sources, "read nothing from fleetAuditVendored; the regex saw too little")
+        sources, unreadable = _map_sources(FLEET_AUDIT_TEST, "fleetAuditVendored")
+        self.assertEqual(
+            unreadable,
+            [],
+            "these fleetAuditVendored entries aren't a literal \"../../../../<path>\" source, so this test "
+            "can't hold them to a2a-test.yml's path lists: write each source as a literal path",
+        )
+        self.assertTrue(sources, "read nothing from fleetAuditVendored; the parser saw too little")
         paths = _push_paths()
         missing = [s for s in sources + ["agents/fleet-audit/persona/persona.yaml"] if not _covered(s, paths)]
         self.assertEqual(missing, [], "add each to a2a-test.yml's push paths and its a2a filter")
