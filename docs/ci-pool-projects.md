@@ -31,6 +31,7 @@ gcloud services enable \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
   gkehub.googleapis.com \
+  anthosconfigmanagement.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   dns.googleapis.com \
@@ -40,7 +41,7 @@ gcloud services enable \
   --project="${PROJECT_ID}"
 ```
 
-`dns.googleapis.com` is for the private zone that resolves the self-managed forges' hosts (section 5.8). `cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `cloudtrace.googleapis.com` is for the observability nightly case, which reads the install's own traces through the credential broker; the full-install composition enables it too. `gkehub.googleapis.com` is for the readiness report's rollout-sequence precheck, which lists the fleet host project's RolloutSequences on `roles/gkehub.viewer`; the full-install composition enables it too, and the role joined the platform GSA's set with it, so a project registered before that needs the binding by hand, in the same idempotent form as the `roles/cloudtrace.user` repair in section 3, plus `gcloud services enable gkehub.googleapis.com`. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
+`dns.googleapis.com` is for the private zone that resolves the self-managed forges' hosts (section 5.8). `cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `cloudtrace.googleapis.com` is for the observability nightly case, which reads the install's own traces through the credential broker; the full-install composition enables it too. `gkehub.googleapis.com` is for the readiness report's rollout-sequence precheck, which lists the fleet host project's RolloutSequences on `roles/gkehub.viewer`; the full-install composition enables it too, and the role joined the platform GSA's set with it, so a project registered before that needs the binding by hand, in the same idempotent form as the `roles/cloudtrace.user` repair in section 3, plus `gcloud services enable gkehub.googleapis.com`. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE. `anthosconfigmanagement.googleapis.com` is for the seeded fleet's Config Sync on `seeded-a` (`bench/tf/fleet/config-sync.tf`), which the stack turns on as a fleet feature for a project listed in `post_merge_sync_projects`.
 
 The last three serve the eval nightlies' Gemini Developer API key (section 3); `scripts/provision_ci_pool_gemini_key.sh` enables them too. `apikeys.googleapis.com` is for the key itself, which the script creates and the verifier lists to check its restriction. `secretmanager.googleapis.com` holds the key string in the secret that `hack/ci-deploy.sh` reads on a nightly lease. `generativelanguage.googleapis.com` is the Gemini Developer API that the agent's LiteLLM gateway calls with the key, and the one API the key is restricted to.
 
@@ -176,7 +177,7 @@ Every registered project was provisioned before the script ran this step. Measur
   FLEET_RECONCILER_SA="$(sed -n 's/^FLEET_RECONCILER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
   for role in roles/compute.instanceAdmin.v1 roles/compute.loadBalancerAdmin roles/compute.securityAdmin \
               roles/compute.networkAdmin roles/compute.storageAdmin roles/compute.viewer roles/container.admin \
-              roles/iam.serviceAccountAdmin roles/iam.serviceAccountUser \
+              roles/gkehub.editor roles/iam.serviceAccountAdmin roles/iam.serviceAccountUser \
               roles/resourcemanager.projectIamAdmin roles/serviceusage.serviceUsageConsumer; do
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
       --member="${FLEET_RECONCILER_SA}" --role="${role}" --quiet >/dev/null

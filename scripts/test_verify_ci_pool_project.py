@@ -4934,6 +4934,11 @@ FLEET_RESOURCE_ROLES = {
     # orphan_snapshot.py's probe, whose reads are `gcloud compute snapshots
     # describe` and `disks list`: compute.storageAdmin's, held already.
     "external": {"roles/container.admin", "roles/compute.storageAdmin"},
+    # seeded-a's fleet membership and its Config Sync (config-sync.tf). The
+    # membership's create also reads the cluster, which container.admin covers.
+    "google_gke_hub_membership": {"roles/gkehub.editor", "roles/container.admin"},
+    "google_gke_hub_feature": {"roles/gkehub.editor"},
+    "google_gke_hub_feature_membership": {"roles/gkehub.editor"},
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.

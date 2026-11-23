@@ -402,6 +402,9 @@ REQUIRED_APIS = {
     # project's RolloutSequences through the GKE Hub API; the composition
     # enables it for the same reason.
     "gkehub.googleapis.com",
+    # The seeded fleet's Config Sync on seeded-a (bench/tf/fleet/config-sync.tf),
+    # a fleet feature that needs the Config Management API.
+    "anthosconfigmanagement.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
     # The eval nightlies' Gemini Developer API key (check_gemini_api_key): the
@@ -1104,6 +1107,9 @@ FLEET_RECONCILER_ROLES = {
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
+    # gkehub.editor: the stack registers seeded-a to the fleet and turns on Config
+    # Sync for it (config-sync.tf): gkehub.memberships.* and gkehub.features.*.
+    "roles/gkehub.editor",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/resourcemanager.projectIamAdmin",
