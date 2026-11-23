@@ -386,7 +386,9 @@ func (g *Gateway) warmPoolLoop(ctx context.Context) {
 // warmPoolSize. A pod is deleted at the age past which nothing claims it,
 // before it is replaced, so the pool never holds more warm pods than the
 // operator budgeted for: for the seconds a replacement takes to start, a new
-// conversation spawns cold. No lock is held across its API calls.
+// conversation spawns cold. The live count and the creates hold the session
+// cap's check (acquireCapCheck), as a turn's cap check does; the reads and the
+// deletes hold nothing.
 func (g *Gateway) warmPoolOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, warmPassTimeout)
 	defer cancel()
@@ -403,12 +405,6 @@ func (g *Gateway) warmPoolOnce(ctx context.Context) {
 		return
 	}
 	g.dropGoneWarmClaims(ctx, claims, warm)
-	pods, err := g.sessionPods(ctx)
-	if err != nil {
-		g.log.Error("warm pool: live count failed", "err", err)
-		return
-	}
-	live := len(pods) + len(g.capHoldSnapshot("", time.Now()))
 	now := time.Now()
 	// fresh is the pool's own pods: every unclaimed warm pod that is still
 	// there after this pass's deletes, so a pod a delete left in place is
@@ -449,6 +445,24 @@ func (g *Gateway) warmPoolOnce(ctx context.Context) {
 		}
 		fresh = fresh[1:]
 	}
+	// The count and the creates hold the session cap's check
+	// (acquireCapCheck), as a turn's cap check does: one count of live
+	// sessions and granted slots, under one lock, for the cap, its eviction
+	// and the pool. A turn can't take the slot between the pool's count and
+	// its create, and the pool can't size itself on a count a turn is about
+	// to change. The deletes above hold nothing: an unclaimed warm pod isn't
+	// in the count (sessionPods).
+	if !g.acquireCapCheck(ctx) {
+		g.log.Info("warm pool: the session cap check stayed busy; sizing on the next pass")
+		return
+	}
+	defer g.releaseCapCheck()
+	pods, err := g.sessionPods(ctx)
+	if err != nil {
+		g.log.Error("warm pool: live count failed", "err", err)
+		return
+	}
+	live := len(pods) + len(g.capHoldSnapshot("", time.Now()))
 	for n := len(fresh); n < warmPoolSize(g.cfg.WarmSessions, g.cfg.MaxSessions, live); n++ {
 		// A deposed leader creates nothing: the new one sizes the pool.
 		if !g.reg.StillLeading(ctx) {

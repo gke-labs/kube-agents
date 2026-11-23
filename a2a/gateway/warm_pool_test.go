@@ -928,3 +928,29 @@ func TestTheSweepDropsAGoneWarmPodsClaimWithThePoolOff(t *testing.T) {
 		t.Error("the claim of a warm pod that is still there was dropped")
 	}
 }
+
+// The pool counts and creates under the session cap's check, the lock a
+// turn's cap check holds: one count, one lock, for the cap, its eviction and
+// the pool. While a turn holds the check, the pool creates nothing, even with
+// a slot to fill; once it is released, the pool fills the slot.
+func TestTheWarmPoolSizesUnderTheSessionCapCheck(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmRig(t)
+	waitFor(t, "the leader's first warm pod", func() bool { return len(spawn.warmSpawned()) == 1 })
+	if !r.g.acquireCapCheck(context.Background()) {
+		t.Fatal("the cap check wasn't free")
+	}
+	spawn.dropWarm(spawn.warmSpawned()...)
+	held, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	r.g.warmPoolOnce(held)
+	cancel()
+	if n := len(spawn.warmSpawned()); n != 1 {
+		r.g.releaseCapCheck()
+		t.Fatalf("the pool created a warm pod while a turn held the cap check: %d creates", n)
+	}
+	r.g.releaseCapCheck()
+	r.g.warmPoolOnce(context.Background())
+	if n := len(spawn.warmSpawned()); n < 2 {
+		t.Fatalf("the pool didn't refill once the cap check was free: %d creates", n)
+	}
+}
