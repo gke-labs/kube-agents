@@ -103,7 +103,7 @@ refuses any other; a directive without it sends a typed message. The door takes 
 where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
 which is infrastructure, since the agent never saw the ask.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
-lines under it, sends the opening as turn one, stores the report for the conversation in the
+lines under it (one line each; a report of several lines writes each line break as `\n`), sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
 into a Slack or Google Chat gateway conversation, then sends the reply as a second message on the same conversation
 ([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));

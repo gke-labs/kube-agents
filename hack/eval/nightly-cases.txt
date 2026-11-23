@@ -1203,6 +1203,15 @@
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
 
+# A decision typed in words under the nudge, with no finding id: the nudge's
+# card keeps the ids out of its text and in the context stored for its thread,
+# so the reply reaches a finding through a model's read of that context. A
+# replay stores the context the nudge writes for prebuilt/findings-item's rows
+# and sends "dismiss the readiness probe one on bench-shop-east"; the named
+# line has to end up dismissed and the same check on bench-shop-west has to
+# stay open. Inject door only, as every replay; no fixture; the host install.
+./tasks/findings-decision-reply-names-no-id/task.yaml
+
 # The first-install hello when the report was filed as a ledger issue before
 # anyone wrote (#4058): the greeting answers first and links the issue once,
 # never in front of the answer. Same seam, variant filed; no fixture.

@@ -47,7 +47,7 @@ import yaml
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.spec import parse_node
 
-from kube_agents_bench import findings, onboarding, verifiers
+from kube_agents_bench import findings, onboarding, pushed_report, verifiers
 from kube_agents_bench.verifiers import FindingsItemStateVerifier
 
 REPO = Path(__file__).resolve().parents[2]
@@ -57,6 +57,9 @@ QUEUE_SCRIPT = STACK / "queue.py"
 TASK = REPO / "bench" / "tasks" / "findings-decision-covers-item" / "task.yaml"
 UNNAMED_ROWS = STACK / "findings-unnamed.json"
 UNNAMED_TASK = REPO / "bench" / "tasks" / "findings-decision-leaves-unnamed-open" / "task.yaml"
+REPLY_TASK = REPO / "bench" / "tasks" / "findings-decision-reply-names-no-id" / "task.yaml"
+# The hour the nudge adds non-critical findings from, on any day (findings_queue.DEFAULT_NONCRITICAL_AFTER_HOUR).
+NUDGE_ADDS_AT = (2026, 11, 23, 16, 0)
 API_KEY = "k-test"
 
 _spec = importlib.util.spec_from_file_location(
@@ -253,6 +256,64 @@ def test_the_prompt_names_the_id_the_nudge_prints_and_no_other() -> None:
     assert first_of_line == _named_id()
     assert _named_id() in prompt
     assert [f["id"] for f in ranked if f["id"] in prompt] == [_named_id()]
+
+
+# --- the reply that names no id (findings-decision-reply-names-no-id) -----
+
+
+def _nudge():
+    """`findings_nudge`, loaded from the agent's scripts as the queue module above is."""
+    scripts = REPO / "agents" / "platform" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import findings_nudge
+
+    return findings_nudge
+
+
+def _replay() -> pushed_report.Replay:
+    return pushed_report.parse(_task_doc(REPLY_TASK)["prompt"])
+
+
+def _context_the_nudge_stores(tmp_path: Path) -> str:
+    """What the nudge stores for its thread when it names the stack's rows: its text, then the ids."""
+    from datetime import datetime, timezone
+
+    served = _Queue(tmp_path / "nudge.db")
+    served.write(fq.register_findings, [{k: v for k, v in row.items() if k != "plant_state"} for row in _rows()])
+    with sqlite3.connect(served.path) as conn:
+        rows = fq.ranked_findings(conn)
+    plan = fq.pace(rows, datetime(*NUDGE_ADDS_AT, tzinfo=timezone.utc), fq.PacingLimits(), {"critical": 0, "noncritical": 0})
+    open_items = len({fq.item_key(row) for row in rows})
+    return _nudge().build_nudge(plan, open_items, False, rows=rows).card["thread_context"]
+
+
+def test_the_replys_stored_context_is_what_the_nudge_writes_for_the_planted_rows(tmp_path: Path) -> None:
+    assert _replay().report == _context_the_nudge_stores(tmp_path)
+
+
+def test_the_replys_checks_name_the_ids_the_queue_derives_and_one_line() -> None:
+    by_id = {fq.validate_finding(row)["id"]: fq.validate_finding(row) for row in _rows()}
+    named = _check("named-line-dismissed", REPLY_TASK)["finding_ids"]
+    others = _check("similar-line-and-other-finding-undecided", REPLY_TASK)["finding_ids"]
+    assert sorted(named + others) == sorted(by_id)
+    assert len({fq.item_key(by_id[i]) for i in named}) == 1
+    # The neighbour a wrong read dismisses: the same check and the same workload name on another cluster.
+    line = by_id[named[0]]
+    twin = next(by_id[i] for i in others if by_id[i]["check_slug"] == line["check_slug"])
+    assert (twin["namespace"], twin["object"], twin["title"]) == (line["namespace"], line["object"], line["title"])
+    assert twin["cluster"] != line["cluster"]
+
+
+def test_the_reply_names_the_finding_in_words_and_no_id() -> None:
+    replay = _replay()
+    ids = [fq.validate_finding(row)["id"] for row in _rows()]
+    assert not [i for i in ids if i in replay.reply]
+    assert "bench-shop-east" in replay.reply and "readiness probe" in replay.reply
+    # The ids are in the stored context, under the nudge's header, and nowhere in its visible lines.
+    visible, _, block = replay.report.partition(_nudge().METADATA_HEADER)
+    assert block and all(i in block for i in ids)
+    assert not [i for i in ids if i in visible]
 
 
 def test_the_rows_are_not_critical() -> None:

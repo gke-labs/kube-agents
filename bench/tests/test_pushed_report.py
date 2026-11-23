@@ -37,6 +37,13 @@ def test_the_three_fields_parse():
     )
 
 
+def test_a_report_of_several_lines_writes_its_line_breaks_as_backslash_n():
+    replay = pushed_report.parse(f"{DIRECTIVE}\nopening: a\nreport: first line\\n\\n- a row\\n[a block]\nreply: c \\n d")
+    assert replay.report == "first line\n\n- a row\n[a block]"
+    # Only the report: a reply is what a person typed, on one line.
+    assert replay.reply == "c \\n d"
+
+
 @pytest.mark.parametrize(
     "body",
     [

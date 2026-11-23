@@ -85,6 +85,10 @@ __all__ = [
 # authoring error.
 DIRECTIVE = "[bench:reply-under-pushed-report]"
 _FIELDS = ("opening", "report", "reply")
+# A field is one line of the prompt, and a stored report can be many (a
+# scheduled report with rows and a block under them). ``report`` writes each of
+# its line breaks as these two characters; the stored row gets real ones.
+REPORT_LINE_BREAK = "\\n"
 # The trajectory entry the plant writes, and the message-id suffix of the
 # reply turn: the door dedupes on the id, so the reply cannot share the
 # opening's.
@@ -175,7 +179,7 @@ def parse(prompt: str) -> Replay | None:
     missing = [name for name in _FIELDS if not fields.get(name)]
     if missing:
         raise ValueError(f"{DIRECTIVE} prompt is missing {', '.join(missing)}")
-    return Replay(fields["opening"], fields["report"], fields["reply"])
+    return Replay(fields["opening"], fields["report"].replace(REPORT_LINE_BREAK, "\n"), fields["reply"])
 
 
 def plant_command(session_id: str, conversation: str, report: str) -> str:
