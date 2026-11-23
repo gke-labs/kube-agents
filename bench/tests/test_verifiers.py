@@ -11229,6 +11229,62 @@ def test_scan_command_prefix_numeric_wrapper_option_and_duration_with_redirects(
     assert _command_word_index(argv6, script="collect.py") == 3
     assert _argv_runs(argv6, run_collect)
 
+    # 7. stdbuf -o 0 > /tmp/out setsid python3 collect.py:
+    # 0 is consumed as -o buffer size, setsid is recognized as detaching wrapper
+    argv7 = _shell_argvs("stdbuf -o 0 > /tmp/out setsid python3 collect.py")[0]
+    wrappers7, idx7 = _scan_command_prefix(argv7)
+    assert wrappers7 == [("stdbuf", 0, False), ("setsid", 5, True)]
+    assert idx7 == 6 and argv7[idx7] == "python3"
+    assert _has_detaching_wrapper(argv7)
+    assert _command_word_index(argv7, script="collect.py") == 6
+    assert _argv_runs(argv7, run_collect)
+
+    # 8. sudo -T 60 > /tmp/out setsid python3 collect.py:
+    # 60 is consumed as -T command timeout, setsid is recognized as detaching wrapper
+    argv8 = _shell_argvs("sudo -T 60 > /tmp/out setsid python3 collect.py")[0]
+    wrappers8, idx8 = _scan_command_prefix(argv8)
+    assert wrappers8 == [("sudo", 0, False), ("setsid", 5, True)]
+    assert idx8 == 6 and argv8[idx8] == "python3"
+    assert _has_detaching_wrapper(argv8)
+    assert _command_word_index(argv8, script="collect.py") == 6
+    assert _argv_runs(argv8, run_collect)
+
+    # 9. sudo -R 2>/dev/null /mnt setsid python3 collect.py:
+    # 2>/dev/null is skipped as redirect; /mnt is consumed as -R chroot directory
+    argv9 = _shell_argvs("sudo -R 2>/dev/null /mnt setsid python3 collect.py")[0]
+    wrappers9, idx9 = _scan_command_prefix(argv9)
+    assert wrappers9 == [("sudo", 0, False), ("setsid", 6, True)]
+    assert idx9 == 7 and argv9[idx9] == "python3"
+    assert _has_detaching_wrapper(argv9)
+    assert _command_word_index(argv9, script="collect.py") == 7
+    assert _argv_runs(argv9, run_collect)
+
+    # 10. nice -n 10 > /tmp/out "$DIR/collect.py":
+    # 10 is consumed as -n value, $DIR/collect.py is not swallowed as numeric expansion
+    argv10 = _shell_argvs('nice -n 10 > /tmp/out "$DIR/collect.py"')[0]
+    wrappers10, idx10 = _scan_command_prefix(argv10)
+    assert wrappers10 == [("nice", 0, False)]
+    assert idx10 == 5 and argv10[idx10] == "$DIR/collect.py"
+    assert _command_word_index(argv10, script="collect.py") == 5
+
+    # 11. timeout -k 5 > /tmp/out 30 "$DIR/collect.py":
+    # 5 > /tmp/out 30 consumes duration/kill-after, $DIR/collect.py is preserved as command word
+    argv11 = _shell_argvs('timeout -k 5 > /tmp/out 30 "$DIR/collect.py"')[0]
+    wrappers11, idx11 = _scan_command_prefix(argv11)
+    assert wrappers11 == [("timeout", 0, False)]
+    assert idx11 == 6 and argv11[idx11] == "$DIR/collect.py"
+    assert _command_word_index(argv11, script="collect.py") == 6
+
+    # 12. timeout -s 9 > /tmp/out 30 setsid python3 collect.py:
+    # -s 9 is signal option, 30 is duration, setsid is recognized as detaching wrapper
+    argv12 = _shell_argvs("timeout -s 9 > /tmp/out 30 setsid python3 collect.py")[0]
+    wrappers12, idx12 = _scan_command_prefix(argv12)
+    assert wrappers12 == [("timeout", 0, False), ("setsid", 6, True)]
+    assert idx12 == 7 and argv12[idx12] == "python3"
+    assert _has_detaching_wrapper(argv12)
+    assert _command_word_index(argv12, script="collect.py") == 7
+    assert _argv_runs(argv12, run_collect)
+
 
 def test_scan_command_prefix_redirect_descriptor_inside_wrapper():
     from kube_agents_bench.shell_words import _command_word_index, _scan_command_prefix, _shell_argvs

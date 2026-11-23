@@ -382,9 +382,10 @@ _NUMERIC_WRAPPER_VAL_OPTS = {
     "watch": frozenset(("-n", "--interval")),
     "flock": frozenset(("-w", "--timeout", "-E", "--conflict-exit-code")),
     "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata", "--pid")),
-    "timeout": frozenset(("-k", "--kill-after")),
+    "timeout": frozenset(("-s", "-k", "--signal", "--kill-after")),
+    "stdbuf": frozenset(("-i", "-o", "-e", "--input", "--output", "--error")),
     "xargs": frozenset(("-P", "-n", "-s", "-L", "--max-procs")),
-    "sudo": frozenset(("-C", "-R", "--close-from", "--command-timeout")),
+    "sudo": frozenset(("-C", "-T", "--close-from", "--command-timeout")),
 }
 
 
@@ -724,7 +725,11 @@ def _scan_command_prefix(
                                 val_after, _ = _next_shell_arg(argv, idx + 1)
                                 if val_after is None or not (
                                     _SHELL_COUNT_RE.match(val_after)
-                                    or val_after.startswith(_SHELL_EXPANSION_PREFIX)
+                                    or (
+                                        val_after.startswith(_SHELL_EXPANSION_PREFIX)
+                                        and "/" not in val_after
+                                        and not val_after.endswith((".py", ".sh"))
+                                    )
                                 ):
                                     idx += 1
                                     break
@@ -745,7 +750,11 @@ def _scan_command_prefix(
                 continue
 
             if duration_needed:
-                if _SHELL_COUNT_RE.match(w) or w.startswith(_SHELL_EXPANSION_PREFIX):
+                if _SHELL_COUNT_RE.match(w) or (
+                    w.startswith(_SHELL_EXPANSION_PREFIX)
+                    and "/" not in w
+                    and not w.endswith((".py", ".sh"))
+                ):
                     duration_needed = False
                     idx += 1
                     continue
