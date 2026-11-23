@@ -238,8 +238,37 @@ func TestATeamsStopPressFromAnotherMemberIsSaidOnTheLine(t *testing.T) {
 		}
 	}
 
+	// The relay's next update writes the line again though its text is the
+	// one it last rendered: without that, a task whose progress repeats (or
+	// any task under the default display mode) would keep the refusal on its
+	// line until it ended.
+	refusedAt := slices.Index(r.adapter.stopLinesCopy(), want)
+	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the same status to write over the refusal", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		last := lines[len(lines)-1]
+		return len(lines) > refusedAt+1 && last.MessageID == line && strings.Contains(last.Text, "working")
+	})
+
 	pressTeamsStop(r, teamsGateChannel, sessionKindGroup, teamsGateRequester, line+"#f:32", origin.TaskID)
 	waitFor(t, "the requester's press to close the line", func() bool { return lineClosedOnCancelSent(r) })
+}
+
+// A refused press on a line that is not the running task's own is said on
+// the running task's line all the same: that is the line the relay keeps.
+func TestATeamsStopPressRefusedOnAnotherLineIsSaidOnTheRunningLine(t *testing.T) {
+	t.Parallel()
+	r, origin, line := teamsGateRig(t, teamsGateChannel, sessionKindGroup)
+
+	pressTeamsStop(r, teamsGateChannel, sessionKindGroup, teamsGateOther, "1794603935000#f:34", origin.TaskID)
+	teamsSteerAndWait(t, r, teamsGateChannel, sessionKindGroup, teamsGateOther, "1794603936004", origin)
+
+	want := fakePost{teamsGateChannel, line, refusedPressLineMark + refusedPressNotice}
+	if !slices.Contains(r.adapter.stopLinesCopy(), want) {
+		t.Fatalf("the refusal was not said on the running line: %+v", r.adapter.stopLinesCopy())
+	}
 }
 
 // In a direct message a refused press says nothing: the only other member

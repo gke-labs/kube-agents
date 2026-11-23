@@ -2,9 +2,10 @@ package gateway
 
 // Who may press a thread's Stop button (spec-chatops-gateway.md, "Who may press
 // Stop"): only the people who asked for work in it. The rule is the same on
-// each backend that has a button: Slack's native Stop (slack_stop.go) and the
+// each backend that has a button: Slack's native Stop (slack_stop.go), the
 // Stop button the Google Chat adapter draws under a task's line
-// (gchat_stop.go). Anyone else's press cancels nothing, and the gateway logs
+// (gchat_stop.go) and the one the Teams adapter draws on the line's card
+// (teams_press.go). Anyone else's press cancels nothing, and the gateway logs
 // it. What the refused presser sees differs by backend (added 11/11). On
 // Slack nothing is posted: the Working… line and its button are Slack's own
 // and settle on their own. On Google Chat the button is the adapter's
@@ -14,7 +15,7 @@ package gateway
 // see (PrivatePoster, Chat's privateMessageViewer): refusedPressNotice. It
 // notifies nobody else. On Teams the button is the adapter's drawing too,
 // and Teams has no post only one member sees, so the refusal is said on the
-// pressed line itself, which the task's next progress writes over
+// running task's line, which the relay's next update writes over
 // (tellRefusedOnLine). The private post goes out only when the click named the presser as a
 // user (InboundMessage.Viewer), since a post with no viewer would be
 // public, and never in a direct message, where there is no other member to

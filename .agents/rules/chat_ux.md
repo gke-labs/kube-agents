@@ -182,8 +182,8 @@ line, so silence there is a frozen control, and a line nobody else is notified o
 only when it matters"; it names the typed word rather than offering a button, since a button is
 what the gate refuses, so "Choices are buttons" does not apply. Slack's refused press stays silent:
 its button is Slack's own and settles on its own. A refused press on Microsoft Teams, which has
-no post only one member sees, is said on the pressed status line itself until the task's next
-progress replaces it (`tellRefusedOnLine`): an edit notifies nobody, and the line names nobody.
+no post only one member sees, is said on the running task's status line until the task's next
+update replaces it (`tellRefusedOnLine`): an edit notifies nobody, and the line names nobody.
 
 ## Renderers never compose
 

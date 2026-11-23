@@ -13,8 +13,8 @@ import (
 // nothing in return, which is what lets a press travel the broker's queue
 // like any other activity. Action.Execute would not: Teams sends it as an
 // invoke and shows the presser an error unless the endpoint answers it at
-// once, and the receiver in front of the queue answers every activity
-// "accepted" before the gateway has read it.
+// once, and the receiver in front of the queue answers each activity it
+// queues "accepted" before the gateway has read it.
 //
 // The Stop button (spec-chatops-gateway.md, "Who may press Stop") is drawn
 // on a running task's line, names its task, and reaches the gateway as the
@@ -75,13 +75,7 @@ func (a *TeamsAdapter) classifyPress(act *teamsActivity, press teamsPress, conve
 	if pressed == "" {
 		return InboundMessage{}, "stop press names no message"
 	}
-	a.mu.Lock()
-	if act.ServiceURL != "" {
-		a.rememberServiceURLLocked(conversation, act.ServiceURL)
-	}
-	author := a.authorForLocked(act.From.AadObjectID, act.From.ID)
-	dup := act.ID != "" && a.seenLocked(act.ID)
-	a.mu.Unlock()
+	author, dup := a.admit(act, conversation)
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + act.ID
 	}

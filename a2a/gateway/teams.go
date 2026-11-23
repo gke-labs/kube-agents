@@ -390,13 +390,7 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 		return InboundMessage{}, "empty ask (bare mention)"
 	}
 
-	a.mu.Lock()
-	if act.ServiceURL != "" {
-		a.rememberServiceURLLocked(conversation, act.ServiceURL)
-	}
-	author := a.authorForLocked(act.From.AadObjectID, act.From.ID)
-	dup := act.ID != "" && a.seenLocked(act.ID)
-	a.mu.Unlock()
+	author, dup := a.admit(act, conversation)
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + act.ID
 	}
@@ -407,6 +401,20 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 		MessageID:    act.ID,
 		Text:         text,
 	}, ""
+}
+
+// admit records what an activity that passed classify's checks teaches the
+// adapter, and answers who sent it and whether it is a redelivery: the
+// conversation's service URL is remembered, the sender is named as the
+// allowlist names them (authorForLocked), and the activity's id is marked
+// seen. A typed message and a press share it, so the two cannot drift.
+func (a *TeamsAdapter) admit(act *teamsActivity, conversation string) (author string, dup bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if act.ServiceURL != "" {
+		a.rememberServiceURLLocked(conversation, act.ServiceURL)
+	}
+	return a.authorForLocked(act.From.AadObjectID, act.From.ID), act.ID != "" && a.seenLocked(act.ID)
 }
 
 // seenLocked records an activity id and reports whether it was already
