@@ -383,12 +383,16 @@ front door: it renders the tfvars an upgrade would apply and then calls this.
 ### Recovering from an interrupted apply
 
 An apply that stops before Terraform can shut down — a second Ctrl-C, a dropped
-connection, a `kill -9`, a lost machine — leaves remote state locked, and the
-next command fails with `Error acquiring the state lock`. One Ctrl-C at
-`lifecycle.sh apply` is a graceful stop: Terraform finishes the operations in
-flight, saves state and releases the lock, which can take minutes, so wait for
-it. `terraform force-unlock` is the release, and it works here; what trips people up
-is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
+SSH session, a `kill -9`, a lost machine — leaves remote state locked, and the
+next command fails with `Error acquiring the state lock`.
+
+One Ctrl-C at `lifecycle.sh apply`, run directly or through `upgrade.sh`, is a
+graceful stop: Terraform shuts down in order, saves state and releases the lock,
+which can take minutes, so wait for it. Through `install.sh` the same Ctrl-C ends
+the pipe the apply prints to, and the lock can stay.
+
+For a lock that was left, `terraform force-unlock` is the release, and it works
+here; what trips people up is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
 generation number** of the lock object, not a UUID, and it is the `ID:` in the
 error Terraform just printed:
 
