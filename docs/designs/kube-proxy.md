@@ -22,6 +22,7 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 | Caller authentication (TokenReview)      | [`k8s-api-proxy/pkg/tokenreview/`](../../k8s-api-proxy/pkg/tokenreview/)                                                             |
 | Caller authentication (signed JWT)       | [`k8s-api-proxy/pkg/jwtauth/`](../../k8s-api-proxy/pkg/jwtauth/)                                                                     |
 | GKE HTTPS upstream transport             | [`k8s-api-proxy/pkg/upstream/`](../../k8s-api-proxy/pkg/upstream/)                                                                   |
+| Rotated TLS certificate and CA reload    | [`k8s-api-proxy/pkg/certreload/`](../../k8s-api-proxy/pkg/certreload/)                                                               |
 | Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
 | Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
 | Sandbox `kubectl` and `kubeconfig` setup | [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile), [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh) |
@@ -127,7 +128,7 @@ k8s-api-proxy/
 ├── go.sum
 ├── cmd/
 │   └── k8s-api-proxy/
-│       ├── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream
+│       ├── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream + pkg/certreload
 │       └── tokens.go             # Workload Identity Federation and Application Default Credentials token source
 └── pkg/
     ├── k8sapiproxy/
@@ -142,6 +143,8 @@ k8s-api-proxy/
     │   └── transport.go          # CallerAuthenticator and UpstreamTransport interfaces, ErrAuthenticationUnavailable
     ├── tokenreview/
     │   └── tokenreview.go        # TokenReview CallerAuthenticator with TTL cache (the binary's)
+    ├── certreload/
+    │   └── certreload.go         # Server certificate and CA bundle PEM files reloaded when rotated on disk
     ├── jwtauth/
     │   └── jwtauth.go            # Signed-JWT CallerAuthenticator against an issuer's JSON Web Key Set
     └── upstream/
@@ -425,6 +428,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - `kubeagents_kube_proxy_cache_entries`: Gauge of the current number of serialized responses stored in the `kube-proxy` cache.
    - `kubeagents_kube_proxy_request_duration_seconds` (`verb`, `resource`, `outcome`): Histogram of request durations in seconds.
    - `kubeagents_kube_proxy_in_flight_requests`: Gauge of requests currently in flight.
+   - `kubeagents_kube_proxy_certificate_reload_failures_total`: Total changed TLS server certificate or key files that could not be loaded, each time keeping the previous certificate.
    - `process_start_time_seconds`: Gauge of the process start timestamp since the Unix epoch in seconds.
 2. **OpenTelemetry distributed tracing**:
    - The operator injects `OTEL_SERVICE_NAME=<agent>-kube-proxy`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and `OTEL_RESOURCE_ATTRIBUTES` (or `OTEL_SDK_DISABLED=true` when the cluster has no collector).
@@ -440,7 +444,7 @@ The operator reconciles a dedicated **`<agent>-kube-proxy` Deployment and Cluste
 
 - **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment of two replicas, rolled one at a time with no surge (`maxSurge: 0`, `maxUnavailable: 1`) and covered by a `maxUnavailable: 1` PodDisruptionBudget, with a 5-second `preStop` sleep so a terminating replica keeps listening until its endpoint removal propagates, and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` pod (plus session pods when `A2A_SESSION_CLUSTER_VIEW=true` under `mode: next`), and admits `gmp-system` on port `8444`.
 - **In-flight cap**: each replica forwards at most 24 requests at once (`--max-in-flight`, `KUBE_PROXY_MAX_IN_FLIGHT`; `0` turns the cap off) and answers the next with `429 Too Many Requests` and `Retry-After: 1`, which client-go, and so `kubectl`, waits out and retries up to 10 times; a caller that is not client-go sees the 429 unless it retries on its own. Every forwarded list holds upstream response buffers in the proxy, and with no cap concurrent lists drove a replica past its memory limit; 24 keeps one under 512Mi at the roughly 9.5 MiB that a 500-object page held in flight (a redacted Secret response can buffer up to 16 MiB, but Secret lists carry metadata only). Watches and the `log`, `exec`, `attach`, `portforward` and `proxy` subresources stay open as long as the caller follows them, so, as in kube-apiserver's own max-in-flight limit, they take no slot. A request the policy refuses is answered before the cap. A throttled request is audited and counted with outcome `throttled`.
-- **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, `<agent>-kube-proxy.<namespace>.svc`, and `<agent>-kube-proxy.<namespace>.svc.cluster.local`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and the operator publishes `ca.crt` in `<agent>-kube-proxy-ca-bundle` (mounted into session pods under `mode: next` when `A2A_SESSION_CLUSTER_VIEW=true`).
+- **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, `<agent>-kube-proxy.<namespace>.svc`, and `<agent>-kube-proxy.<namespace>.svc.cluster.local`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`; the proxy reloads them when the volume updates (`pkg/certreload`), and the operator also rolls the Deployment when the certificate's hash changes. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and the operator publishes `ca.crt` in `<agent>-kube-proxy-ca-bundle` (mounted into session pods under `mode: next` when `A2A_SESSION_CLUSTER_VIEW=true`).
 - **Upstream identity**: `<agent>-kube-proxy` runs as `agentServiceAccountName(agent)` in its own isolated pod, using the same Workload Identity / Workload Identity Federation configuration, `scopedServiceAccountPool` mapping (`<agent>-credential-proxy-policy`), and `kubeagents:tokenreview:<namespace>:<agent>` / host-cluster reader RBAC bindings as `<agent>-credential-proxy` while restricting network ingress to authorized callers on `:8443` and `gmp-system` on `:8444`.
 - **Clean split of responsibilities**: `<agent>-credential-proxy` continues serving `/v1/vcs/*`, `/v1/gcp/*`, and `gcloud` `/v1/exec` on port `8765` (plus `kubectl` `/v1/exec` for `AgentProfile` workers). `<agent>-shell` and A2A session pods (with `A2A_SESSION_CLUSTER_VIEW=true`) receive `KUBE_PROXY_URL=https://<agent>-kube-proxy.<namespace>.svc.cluster.local:8443` and route all `kubectl` operations through `<agent>-kube-proxy`. Session pods also receive `KUBE_PROXY_MODE`, the mode the operator runs `<agent>-kube-proxy` in, passed through the gateway's `A2A_KUBE_PROXY_MODE`, so their kubectl wrapper records a failed write attempt only under a read-only mode ([the subagent-profiles spec](spec-subagent-profiles.md), "Stopped at a write refusal"). The gateway's agent container gets the same URL as `KUBE_PROXY_IN_USE_URL`, a sign only: it runs no `kubectl` through the proxy, and its scripts read the variable to skip choosing `get-credentials` endpoint flags the sandbox would not use.
 

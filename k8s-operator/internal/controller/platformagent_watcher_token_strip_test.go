@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -97,28 +99,82 @@ func TestNoCRSurfaceHandsAContainerTheWatcherToken(t *testing.T) {
 	}
 }
 
-// TestTheWatcherTokenStripIsReportedOnVolumesDropped keeps the source half of
-// the strip from being silent: the webhook does not refuse a projection of the
-// watcher audience under another name, so VolumesDropped is what tells the
-// author their volume was left out. A CR with no such volume, and a hostPath
-// one, gets the hostPath message exactly as before.
+// TestTheWatcherTokenStripIsReportedOnVolumesDropped keeps the render strip
+// from being silent when the webhook did not run: VolumesDropped reports both
+// dropped volumes (by name or projected audience) and bare mounts of the
+// reserved watcher-token volume across all five surfaces, with Reason
+// WatcherTokenVolumeDropped when no hostPath volume was dropped alongside them,
+// and validateExtraVolumeMounts does not park the CR Degraded before render.
 func TestTheWatcherTokenStripIsReportedOnVolumesDropped(t *testing.T) {
 	agent := federatedTestAgent()
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
-		SidecarVolumes: []corev1.Volume{{Name: "scratch"}, watcherAudienceVolume("cache")},
+		SidecarVolumes:    []corev1.Volume{{Name: "scratch"}, watcherAudienceVolume("cache")},
+		ExtraVolumes:      []corev1.Volume{{Name: watcherTokenVolume}},
+		ExtraVolumeMounts: []corev1.VolumeMount{{Name: watcherTokenVolume, MountPath: "/e"}},
+		InitContainers: []corev1.Container{{
+			Name:         "prep",
+			VolumeMounts: []corev1.VolumeMount{{Name: watcherTokenVolume, MountPath: "/i"}},
+		}},
+		Sidecars: []corev1.Container{{
+			Name:         "helper",
+			VolumeMounts: []corev1.VolumeMount{{Name: watcherTokenVolume, MountPath: "/s"}},
+		}},
+	}
+	if forbidden := validateExtraVolumeMounts(agent); forbidden != "" {
+		t.Errorf("validateExtraVolumeMounts parked a watcher-token CR before render: %q", forbidden)
 	}
 	msg := hostPathDroppedMessage(agent, rolloutNotKnownIncomplete)
-	if !strings.Contains(msg, `spec.deployment.sidecarVolumes[1] "cache"`) || !strings.Contains(msg, "watcher token") {
-		t.Errorf("VolumesDropped message = %q, want it to name sidecarVolumes[1] \"cache\" as a watcher-token drop", msg)
+	for _, want := range []string{
+		`spec.deployment.extraVolumes[0] "watcher-credential-proxy-token"`,
+		`spec.deployment.sidecarVolumes[1] "cache"`,
+		`spec.deployment.extraVolumeMounts[0] "watcher-credential-proxy-token"`,
+		`spec.deployment.initContainers[0].volumeMounts[0] "watcher-credential-proxy-token"`,
+		`spec.deployment.sidecars[0].volumeMounts[0] "watcher-credential-proxy-token"`,
+		"watcher token",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("VolumesDropped message = %q, want it to contain %s", msg, want)
+		}
+	}
+	now := metav1.Now()
+	setHostPathDroppedCondition(agent, msg, now)
+	cond := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
+	if cond == nil || cond.Reason != watcherTokenDroppedReason {
+		t.Fatalf("VolumesDropped condition = %+v, want Reason=%s", cond, watcherTokenDroppedReason)
+	}
+	if !hostPathDroppedConditionCurrent(agent, msg) {
+		t.Errorf("hostPathDroppedConditionCurrent = false right after setHostPathDroppedCondition")
+	}
+	cond.Reason = hostPathDroppedReason
+	meta.SetStatusCondition(&agent.Status.Conditions, *cond)
+	if hostPathDroppedConditionCurrent(agent, msg) {
+		t.Errorf("hostPathDroppedConditionCurrent = true with stale Reason=%s on watcher-only drop", hostPathDroppedReason)
 	}
 
 	hostPathOnly := federatedTestAgent()
 	hostPathOnly.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		ExtraVolumes: []corev1.Volume{{Name: "root", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}}},
 	}
-	if got := hostPathDroppedMessage(hostPathOnly, rolloutNotKnownIncomplete); strings.Contains(got, "watcher") || got == "" {
-		t.Errorf("a hostPath-only CR's message changed: %q", got)
+	hostPathMsg := hostPathDroppedMessage(hostPathOnly, rolloutNotKnownIncomplete)
+	if strings.Contains(hostPathMsg, "watcher") || hostPathMsg == "" {
+		t.Errorf("a hostPath-only CR's message changed: %q", hostPathMsg)
 	}
+	setHostPathDroppedCondition(hostPathOnly, hostPathMsg, now)
+	if cond := meta.FindStatusCondition(hostPathOnly.Status.Conditions, hostPathDroppedConditionType); cond == nil || cond.Reason != hostPathDroppedReason {
+		t.Errorf("hostPath-only VolumesDropped condition = %+v, want Reason=%s", cond, hostPathDroppedReason)
+	}
+
+	both := federatedTestAgent()
+	both.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		ExtraVolumes:      []corev1.Volume{{Name: "root", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}}},
+		ExtraVolumeMounts: []corev1.VolumeMount{{Name: watcherTokenVolume, MountPath: "/e"}},
+	}
+	bothMsg := hostPathDroppedMessage(both, rolloutNotKnownIncomplete)
+	setHostPathDroppedCondition(both, bothMsg, now)
+	if cond := meta.FindStatusCondition(both.Status.Conditions, hostPathDroppedConditionType); cond == nil || cond.Reason != hostPathDroppedReason {
+		t.Errorf("combined hostPath+watcher VolumesDropped condition = %+v, want Reason=%s", cond, hostPathDroppedReason)
+	}
+
 	if got := hostPathDroppedMessage(federatedTestAgent(), rolloutNotKnownIncomplete); got != "" {
 		t.Errorf("a CR dropping nothing has message %q, want none", got)
 	}

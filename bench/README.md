@@ -241,7 +241,7 @@ validator check lands with the first stack that needs it:
    carries the description prefix `kube-agents-bench plant`. The sweeps key on these marks and
    on nothing else: `hack/ci-teardown.sh` runs `hack/ci_sweep_bench_plants.sh` at every lease
    start and end against the host cluster's webhook configurations, node readiness rules,
-   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes clusters, forwarding
+   compute classes, custom resource definitions and node pools, and `hack/ci_sweep_compute_plants.py` takes clusters, forwarding
    rules, service attachments, backend services, health checks, addresses, subnets, networks and
    alert policies every hour.
    `created-by-stack=<stack>` stays the stack's own key for adopting its leftover by name;
