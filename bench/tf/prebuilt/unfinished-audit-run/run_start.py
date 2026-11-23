@@ -122,8 +122,22 @@ def write_record(audit_report, audit_id, repo, now):
     return target
 
 
+def write_note(note_path, note):
+    """The plant note, rewritten as each write lands, so teardown always knows what to undo."""
+    note_path.write_text(json.dumps(note, sort_keys=True), encoding="utf-8")
+
+
 def seed(audit_report, audit_id, repo, now):
-    """Plant the good `latest` and the unfinished run. Returns the note it wrote."""
+    """Plant the good `latest` and the unfinished run. Returns the note it wrote.
+
+    It refuses, writing nothing, when an earlier plant was not torn down (its
+    note or the backup of the real `latest` is still there): seeding over it
+    would move the earlier plant over the real `latest`'s backup. It refuses
+    too when the run ring is already full, since the planted entry would push
+    out a real one that teardown cannot put back. The planted document is built
+    before anything moves, and the note is written first and updated after each
+    write, so a seed that fails part way leaves teardown everything it needs.
+    """
     client = getattr(audit_report, "_report_store_client", lambda: None)()
     if client is not None:
         sys.exit(
@@ -131,20 +145,46 @@ def seed(audit_report, audit_id, repo, now):
             "run-start record; teardown could not remove this plant."
         )
     store = store_dir(audit_report, audit_id, repo)
+    latest = store / audit_report.REPORT_LATEST_NAME
+    backup = store / LATEST_BACKUP
+    note_path = store / PLANT_NOTE
+    for leftover in (note_path, backup):
+        if os.path.lexists(leftover):
+            sys.exit(f"ERROR: an earlier plant was not torn down ({leftover} is still there); run teardown first.")
+    runs = store / audit_report.REPORT_RUNS_DIR
+    if runs.is_dir() and len(list(runs.glob("*.json"))) >= audit_report.REPORT_HISTORY:
+        sys.exit(
+            f"ERROR: the {audit_id} store already keeps {audit_report.REPORT_HISTORY} runs; the planted run "
+            "would push out a real one, which teardown cannot put back."
+        )
+    import report_status  # noqa: PLC0415 -- on the path audit_report runs from
+
+    record_cap = getattr(report_status, "RUN_START_HISTORY", None)
+    starts = store / RUN_STARTS_DIR
+    if record_cap and starts.is_dir() and len(list(starts.glob("*.json"))) >= record_cap:
+        sys.exit(
+            f"ERROR: the {audit_id} store already keeps {record_cap} run-start records; the planted one "
+            "would push out a real one, which teardown cannot put back."
+        )
+    reported = now - REPORT_AGE
+    # Built, and so checked, before anything on disk changes.
+    data = clean_document(audit_report, audit_id)
     # Every directory the seed is about to create, the store's missing parents
     # included, for teardown to remove when it is empty again.
-    created = [str(d) for d in (store / audit_report.REPORT_RUNS_DIR, store / RUN_STARTS_DIR) if not d.exists()]
+    created = [str(d) for d in (runs, store / RUN_STARTS_DIR) if not d.exists()]
     parent = store
     while not parent.exists():
         created.append(str(parent))
         parent = parent.parent
-    latest = store / audit_report.REPORT_LATEST_NAME
-    backup = store / LATEST_BACKUP
     store.mkdir(parents=True, exist_ok=True)
+    ring = runs / f"{reported.astimezone(timezone.utc).strftime(audit_report.REPORT_STAMP_FORMAT)}.json"
+    record_path = store / RUN_STARTS_DIR / f"{RUN_ID}.json"
+    note = {"record": str(record_path), "ring": str(ring), "latest": str(latest), "backup": None, "created": created}
+    write_note(note_path, note)
     if latest.is_file():
         os.replace(latest, backup)
-    reported = now - REPORT_AGE
-    data = clean_document(audit_report, audit_id)
+        note["backup"] = str(backup)
+        write_note(note_path, note)
     payload = {
         "status": CLEAN_STATUS,
         "issue_url": "",
@@ -171,21 +211,11 @@ def seed(audit_report, audit_id, repo, now):
         ),
         reported,
     )
-    ring = store / audit_report.REPORT_RUNS_DIR / f"{reported.astimezone(timezone.utc).strftime(audit_report.REPORT_STAMP_FORMAT)}.json"
     if not latest.is_file() or not ring.is_file():
         sys.exit(f"ERROR: the planted report for {audit_id} in {repo} was not written.")
     record = write_record(audit_report, audit_id, repo, now)
     if not record.is_file():
         sys.exit(f"ERROR: the run-start record for {audit_id} in {repo} was not written.")
-    note = {
-        "record": str(record),
-        "ring": str(ring),
-        "latest": str(latest),
-        "backup": str(backup) if backup.is_file() else None,
-        "created": created,
-    }
-    note_path = store / PLANT_NOTE
-    note_path.write_text(json.dumps(note, sort_keys=True), encoding="utf-8")
     return note_path
 
 

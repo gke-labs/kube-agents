@@ -92,7 +92,17 @@ resource "null_resource" "unfinished_run" {
       printf '%s' '${local.script_b64}' | base64 -d | \
         kubectl exec -i -n "${var.agent_namespace}" "$1" -c "${var.sandbox_container}" \
           --pod-running-timeout=${local.pod_wait}s -- \
-          ${local.python} - seed "${var.audit_id}" ${var.gitops_repo}
+          ${local.python} - seed "${var.audit_id}" "${var.gitops_repo}" || {
+        # A failed create taints the resource, and a tainted resource gets no
+        # destroy-time provisioner, so the seed's own failure runs teardown
+        # here. Teardown undoes whatever the seed's note records.
+        status=$?
+        printf '%s' '${local.script_b64}' | base64 -d | \
+          kubectl exec -i -n "${var.agent_namespace}" "$1" -c "${var.sandbox_container}" \
+            --pod-running-timeout=${local.pod_wait}s -- \
+            ${local.python} - teardown "${var.audit_id}" "${var.gitops_repo}" || true
+        exit "$status"
+      }
     EOT
   }
 
@@ -125,7 +135,7 @@ resource "null_resource" "unfinished_run" {
       printf '%s' '${self.triggers.script_b64}' | base64 -d | \
         kubectl exec -i -n "${self.triggers.namespace}" "$1" -c "${self.triggers.sandbox_container}" \
           --pod-running-timeout=${self.triggers.pod_wait}s -- \
-          ${self.triggers.python} - teardown "${self.triggers.audit_id}" ${self.triggers.gitops_repo}
+          ${self.triggers.python} - teardown "${self.triggers.audit_id}" "${self.triggers.gitops_repo}"
     EOT
   }
 }

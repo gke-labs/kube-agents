@@ -129,6 +129,86 @@ def test_teardown_puts_back_a_latest_the_seed_moved_aside(store):
     assert after == before
 
 
+def real_stream():
+    """A stream with one real run and a real `latest`, returned with its bytes."""
+    stream = audit_report.reports_dir_for(AUDIT, GITOPS)
+    (stream / "runs").mkdir(parents=True)
+    (stream / "runs" / "20261120T090000.000000Z.json").write_text('{"status": "REAL"}')
+    (stream / "latest.json").write_text('{"status": "REAL"}')
+    return stream
+
+
+def snapshot(store):
+    return {name: (store / name).read_bytes() for name in files_under(store) if (store / name).is_file()}
+
+
+def test_a_second_seed_without_teardown_refuses_and_keeps_the_real_latest(store):
+    stream = real_stream()
+    before = snapshot(store)
+    plant.seed(audit_report, AUDIT, GITOPS, NOW)
+    with pytest.raises(SystemExit, match="not torn down"):
+        plant.seed(audit_report, AUDIT, GITOPS, NOW)
+    plant.teardown(audit_report, AUDIT, GITOPS)
+    assert snapshot(store) == before
+    assert json.loads((stream / "latest.json").read_text())["status"] == "REAL"
+
+
+def test_a_seed_that_fails_part_way_leaves_teardown_what_it_needs(store, monkeypatch):
+    real_stream()
+    before = snapshot(store)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("the record write failed")
+
+    monkeypatch.setattr(plant, "write_record", boom)
+    with pytest.raises(RuntimeError):
+        plant.seed(audit_report, AUDIT, GITOPS, NOW)
+    plant.teardown(audit_report, AUDIT, GITOPS)
+    assert snapshot(store) == before
+
+
+def test_a_seed_that_fails_before_any_write_moves_nothing(store, monkeypatch):
+    real_stream()
+    before = snapshot(store)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("the document did not build")
+
+    monkeypatch.setattr(plant, "clean_document", boom)
+    with pytest.raises(RuntimeError):
+        plant.seed(audit_report, AUDIT, GITOPS, NOW)
+    assert snapshot(store) == before
+
+
+def test_the_seed_refuses_a_full_ring_rather_than_push_out_a_real_run(store):
+    stream = real_stream()
+    for i in range(audit_report.REPORT_HISTORY - 1):
+        (stream / "runs" / f"20261119T{i:02d}0000.000000Z.json").write_text('{"status": "REAL"}')
+    before = snapshot(store)
+    with pytest.raises(SystemExit, match="push out a real one"):
+        plant.seed(audit_report, AUDIT, GITOPS, NOW)
+    assert snapshot(store) == before
+
+
+def test_the_seed_refuses_a_full_set_of_run_start_records(store):
+    stream = real_stream()
+    starts = stream / plant.RUN_STARTS_DIR
+    starts.mkdir()
+    for i in range(report_status.RUN_START_HISTORY):
+        (starts / f"run-{i}.json").write_text('{"run_id": "real"}')
+    before = snapshot(store)
+    with pytest.raises(SystemExit, match="run-start records"):
+        plant.seed(audit_report, AUDIT, GITOPS, NOW)
+    assert snapshot(store) == before
+
+
+def test_a_failed_seed_in_the_provisioner_runs_teardown():
+    main_tf = (STACK / "main.tf").read_text(encoding="utf-8")
+    seed_at = main_tf.index("- seed ")
+    fallback = main_tf[seed_at:main_tf.index("EOT", seed_at)]
+    assert "|| {" in fallback and "- teardown " in fallback and 'exit "$status"' in fallback
+
+
 def test_the_seed_refuses_the_broker_store(store, monkeypatch):
     monkeypatch.setattr(audit_report, "_report_store_client", lambda: object())
     with pytest.raises(SystemExit):
