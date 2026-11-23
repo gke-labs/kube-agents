@@ -228,6 +228,14 @@ PUBLISH_ANSWER_UNUSABLE_TEXT = (
     "the broker's answer has no usable `{field}`; the request reached the broker and may have taken effect"
 )
 
+#: The values of a `clone` answer that are checked before an existing copy is
+#: removed, and what a caller reads when one of them is not a text with
+#: characters in it, or when the bundle's text does not decode. Each of them
+#: is used after the removal, where a failure leaves a record with no tree.
+CLONE_ANSWER_BUNDLE_FIELD = "bundleBase64"
+CLONE_ANSWER_TEXT_FIELDS = ("branch", "revision", CLONE_ANSWER_BUNDLE_FIELD)
+CLONE_ANSWER_UNUSABLE_TEXT = "the broker's answer has no usable `{field}`; the working copy is as it was"
+
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
 #: when the broker answers it with one: a single compact JSON object on its own
 #: line, `{"kube-agents.event": "proposal-opened", "proposal": {url, number,
@@ -981,6 +989,19 @@ def clone(
     if branch:
         payload["branch"] = branch
     answer = call("clone", payload)
+    # Read before anything is removed: a `--force` clone takes the existing copy
+    # away, and a value that fails after that leaves a record with no tree.
+    for field in CLONE_ANSWER_TEXT_FIELDS:
+        value = answer.get(field)
+        if not isinstance(value, str) or not value:
+            raise VcsError(CLONE_ANSWER_UNUSABLE_TEXT.format(field=field))
+    try:
+        # `validate`: without it the decoder drops each character that is not base64,
+        # and a text of such characters decodes to no bytes.
+        bundle = base64.b64decode(answer[CLONE_ANSWER_BUNDLE_FIELD], validate=True)
+    except ValueError as exc:
+        # binascii.Error is a ValueError; a text that is not ASCII raises a plain one.
+        raise VcsError(CLONE_ANSWER_UNUSABLE_TEXT.format(field=CLONE_ANSWER_BUNDLE_FIELD)) from exc
 
     # `key` is for the caller that is about to cut a branch this copy is not on
     # yet: `submit-suggestion` clones the base and then switches, and the copy
@@ -1002,7 +1023,7 @@ def clone(
     bundle_file = Path(name)
     try:
         with os.fdopen(handle, "wb") as stream:
-            stream.write(base64.b64decode(answer["bundleBase64"]))
+            stream.write(bundle)
         # Cloning from a file gives the copy an `origin` pointing at the bundle.
         # It is removed immediately: a remote is a thing a later command can be
         # talked into fetching from or pushing to, and there is nothing here

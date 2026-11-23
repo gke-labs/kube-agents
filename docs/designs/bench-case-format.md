@@ -121,6 +121,20 @@ later reports on a UTC day reply inside its first report's thread (one thread pe
 mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
 own. Slack transport only: the other transports refuse it, so
 such a case runs on the Slack lane alone and keeps no inject record.
+A first line of `[bench:session-cap-queue]`, optionally with `max-cap=<n>` (default 2) and
+`hold=<seconds>`, with a `/session` ask under it, grades the gateway's session-cap line (#6882):
+the harness reads the install's session cap off the gateway Deployment, fills it with busy
+`/session` conversations through the inject door, sends the ask on one more, and writes
+`harness_session_cap_queued`, completed when the conversation shows the queued notice, then the
+task, then its answer
+([`bench/kube_agents_bench/session_cap.py`](../../bench/kube_agents_bench/session_cap.py)). A cap
+above `max-cap`, or one the fillers did not hold, is infrastructure; the ask's POST refused with the
+cap's own text is the graded red. Inject transport only.
+
+A first line that opens with `[bench:` and names none of these directives is infrastructure: the
+harness does not send a directive it does not know to the agent as text. A pull request is graded
+with its base commit's `bench/` (`hack/ci-eval-pr.sh`, `pin_grader`), so a case that uses a new
+directive lands after the harness change that reads it.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
 carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which
@@ -379,7 +393,7 @@ calls include one that may hold more than one line, which the row joins with a s
 with a clipped code-tool call, and a card whose calls did not reach the trajectory is read from its
 rows alone); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
-it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make (a logged row joins the lines of one call with a space, so a word of a later line counts for the command of the first), such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
+it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make (a logged row joins the lines of one call with a space, so a word of a later line counts for the command of the first), such as a `kubectl get` of the objects a script grades, read on each card log row and in a logged card's `terminal` calls as typed, so a run behind a chain or on a later line of a call is read, except in a call whose text holds `<<` (a heredoc), which stays on its row; `refused_result_pattern`, set with `forbidden_runs`, is a regular expression for the result of a refused call, and the forbidden runs do not read a typed call of one command whose result matches it, nor one row equal to it; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden patterns apply only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out, while the forbidden runs read every typed call; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
@@ -525,9 +539,9 @@ filed is read from the trajectory, as far as the capture reached it) — a route
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
 pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
 log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
-arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a forbidden pattern or
-run never sees a command chained behind another (a required pattern or run also reads that
-card's tagged calls as typed, so it does), and the quotes stay, so a listed word the command
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a forbidden pattern
+never sees a command chained behind another (a required pattern or run also reads that
+card's tagged calls as typed, and a forbidden run its `terminal` calls that hold no heredoc, so they do), and the quotes stay, so a listed word the command
 splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second

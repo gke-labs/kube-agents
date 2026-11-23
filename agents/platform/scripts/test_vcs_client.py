@@ -1126,6 +1126,73 @@ class WorkingCopyTest(unittest.TestCase):
         # `--force` is still the way past it.
         vcs_client.clone("acme/infra", key="work", force=True)
 
+    #: Stands for a key that the answer does not have.
+    ABSENT_FROM_THE_ANSWER = object()
+
+    def call_with_one_value_of_the_answer(self, field, value):
+        """The stand-in `call` of this class, with one value of its answer replaced or taken out."""
+        good_call = self.call
+
+        def call(verb, payload):
+            answer = good_call(verb, payload)
+            if value is self.ABSENT_FROM_THE_ANSWER:
+                del answer[field]
+            else:
+                answer[field] = value
+            return answer
+
+        return call
+
+    def test_a_forced_clone_with_an_answer_it_cannot_use_leaves_the_copy_as_it_was(self):
+        """A `--force` clone removes the existing copy. The answer's `branch`, `revision` and
+        bundle are used after that, so a value that fails there left a record with no tree. The
+        clone reads them first, and the copy with its work is still there after the error."""
+        cloned = vcs_client.clone("acme/infra", key="work")
+        tree = Path(cloned["path"])
+        (tree / "kept.txt").write_text("work that is not published\n")
+        record_files = sorted(vcs_client.SESSIONS.iterdir())
+        before = {path: path.read_bytes() for path in record_files}
+        absent = self.ABSENT_FROM_THE_ANSWER
+        broken = [("branch", value) for value in (["main"], {"name": "main"}, 7, None, "", absent)]
+        broken += [("revision", value) for value in (["abc"], {"sha": "abc"}, 7, None, "", absent)]
+        broken += [("bundleBase64", value) for value in (["QUJD"], {"data": "QUJD"}, 7, None, "", absent)]
+        # Texts that are not base64: a wrong count of characters; characters that a decoder
+        # with no `validate` drops, which leaves no bytes, or the bytes of "ABC"; not ASCII.
+        broken += [("bundleBase64", value) for value in ("QUJ", "!!!!", "====", "QU JD\n", "éééé")]
+        for field, value in broken:
+            with self.subTest(field=field, value=value):
+                call = self.call_with_one_value_of_the_answer(field, value)
+                with mock.patch.object(vcs_client, "call", call), self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.clone("acme/infra", key="work", force=True)
+                self.assertEqual(
+                    f"the broker's answer has no usable `{field}`; the working copy is as it was", str(caught.exception)
+                )
+                self.assertEqual("work that is not published\n", (tree / "kept.txt").read_text())
+                self.assertEqual(before, {path: path.read_bytes() for path in sorted(vcs_client.SESSIONS.iterdir())})
+                self.assertEqual(list(vcs_client.ROOT.glob("*.bundle")), [])
+        # The control: with the answer as the broker sends it, the forced clone replaces the copy.
+        vcs_client.clone("acme/infra", key="work", force=True)
+        self.assertFalse((tree / "kept.txt").exists())
+        self.assertTrue((tree / "a.txt").exists())
+
+    def test_a_first_clone_with_an_answer_it_cannot_use_makes_no_copy(self):
+        absent = self.ABSENT_FROM_THE_ANSWER
+        # Without the check, an answer with no `revision` left a tree with no record, and a
+        # `revision` of None made a record that lets a later clone replace unpublished work.
+        broken = (("branch", ["main"]), ("branch", absent), ("revision", absent), ("revision", None), ("bundleBase64", "QUJ"))
+        for field, value in broken:
+            with self.subTest(field=field, value=value):
+                call = self.call_with_one_value_of_the_answer(field, value)
+                with mock.patch.object(vcs_client, "call", call), self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.clone("acme/infra")
+                self.assertEqual(
+                    f"the broker's answer has no usable `{field}`; the working copy is as it was", str(caught.exception)
+                )
+                self.assertFalse(vcs_client.SESSIONS.exists() and any(vcs_client.SESSIONS.iterdir()))
+                self.assertFalse(
+                    vcs_client.ROOT.exists() and any(p for p in vcs_client.ROOT.iterdir() if p.name != ".sessions")
+                )
+
     def test_a_second_clone_of_a_copy_with_everything_published_is_not_refused(self):
         cloned = vcs_client.clone("acme/infra", key="work")
         tree = Path(cloned["path"])

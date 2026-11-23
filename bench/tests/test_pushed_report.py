@@ -370,6 +370,7 @@ def test_a_follow_up_reuses_the_conversation_and_suffixes_the_message_id(monkeyp
             self.unanswered_post = False
             self.inject_only = False
             self.backend = ""
+            self.refusal = ""
 
         def preflight(self):
             raise inject.InjectUnavailable("stop here", retryable=False)
@@ -605,6 +606,11 @@ def test_a_follow_up_the_door_absorbed_records_the_refusal(monkeypatch):
             self.refusal = ""
             self.note = ""
             self.cancel_sent = False
+
+        @property
+        def refusal_text(self):
+            # InjectTask.refusal_text with no queued line to quote.
+            return inject.refusal_detail(self.refusal)
 
         def preflight(self):
             return inject.Probe(grace_seconds=1.0)
