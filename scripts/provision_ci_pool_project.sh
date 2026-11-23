@@ -723,9 +723,6 @@ seed_gitops_file() {
 }
 seed_gitops_file "${GITOPS_INTENT_NOTE_PATH}" "${GITOPS_INTENT_NOTE_MESSAGE}" "${GITOPS_INTENT_NOTE_CONTENT}" "the declared-intent note"
 seed_gitops_file "${GITOPS_WORKLOAD_MANIFEST_PATH}" "${GITOPS_WORKLOAD_MANIFEST_MESSAGE}" "${GITOPS_WORKLOAD_MANIFEST_CONTENT}" "checkout-gateway's declaration"
-# The post-merge sync's declaration and its read-only deploy key (docs/ci-pool-projects.md 5.13).
-# bench/tf/fleet reads the key's secret, so it runs before Step 2.2's fleet apply.
-"${SCRIPT_DIR}/provision_ci_pool_post_merge_sync.sh" "${PROJECT_ID}" "${GITOPS_REPO}"
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then
@@ -758,6 +755,13 @@ echo "  (reader App ${LEDGER_READER_NUMBER} of ${LEDGER_SHARD_COUNT}: ${LEDGER_R
 echo "  except that until the Prow job mounts this App's key the eval reads through reader App 1, so keep the repository on that installation too)."
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
+
+# ─── Step 1.4b: The post-merge sync's repository side ─────────────────────────
+echo -e "\n==> [Step 1.4b] Seeding the post-merge fixture and its read-only deploy key..."
+# The declaration, the budget and the deploy key's secret (docs/ci-pool-projects.md
+# 5.13). A step of its own, after the GitOps repository exists and before Step
+# 2.2's fleet apply, which reads the secret on a project the fleet lists.
+"${SCRIPT_DIR}/provision_ci_pool_post_merge_sync.sh" "${PROJECT_ID}" "${GITOPS_REPO}"
 
 # ─── Step 1.5: The self-managed forges' pieces ────────────────────────────────
 echo -e "\n==> [Step 1.5] Reserving the self-managed forges' zone, addresses, firewall rule and VM identity..."

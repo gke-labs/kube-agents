@@ -5619,7 +5619,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # run_checks and verify_project used to each compute "every check", and
         # differed by the KMS half, so a --report's key set depended on whether
         # the toolchain check passed.
-        self.assertEqual(set(checker.DEFAULT_CHECKS), set(checker.CHECK_IDS) - {checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST})
+        self.assertEqual(set(checker.DEFAULT_CHECKS), set(checker.CHECK_IDS) - {checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.CHECK_POST_MERGE_SYNC})
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
             with mock.patch.object(checker, "check_toolchain", return_value=["gcloud has no active credential"]), mock.patch("builtins.print"):
@@ -5649,7 +5649,7 @@ class ChecksSelectionTest(unittest.TestCase):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
             everything = checker.run_checks("kube-agents-evals-3")
-            self.assertEqual([r.check_id for r in everything], [c for c in checker.CHECK_IDS if c not in (checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST)])
+            self.assertEqual([r.check_id for r in everything], [c for c in checker.CHECK_IDS if c not in (checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.CHECK_POST_MERGE_SYNC)])
             self.assertEqual(minter.call_args_list[-1], mock.call("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1"))
             # iam alone still needs the project number, and reports only iam.
             alone = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
@@ -6750,10 +6750,35 @@ class PostMergeSyncCheckTest(unittest.TestCase):
                 self.assertFalse(result.passed)
                 self.assertIn(path, result.message)
 
-    def test_an_unread_file_leaves_the_check_unverified_not_failed(self):
+    def test_a_partial_read_passes_with_warnings_not_unchecked(self):
         result, _ = self._run(paths={self._BUDGET: (checker.GITHUB_PATH_UNREAD, "HTTP 403")})
         self.assertTrue(result.passed)
+        self.assertIs(result.read, True)
+        self.assertNotEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
+
+    def test_nothing_read_is_unchecked(self):
+        refused = _fail("ERROR: PERMISSION_DENIED: Permission 'secretmanager.versions.list' denied")
+        unread = (checker.GITHUB_PATH_UNREAD, "HTTP 403")
+        result, _ = self._run(versions=refused, policy=refused, paths={self._DECL: unread, self._BUDGET: unread})
+        self.assertTrue(result.passed)
         self.assertIs(result.read, False)
+
+    def test_a_policy_read_error_is_unverified_not_a_missing_grant(self):
+        result, _ = self._run(policy=_fail("ERROR: (gcloud.secrets.get-iam-policy) INVALID_ARGUMENT: unexpected"))
+        self.assertTrue(result.passed, result.message)
+        self.assertTrue(any("grant is unverified" in w for w in result.warnings))
+
+    def test_a_refused_version_read_still_reads_the_grant(self):
+        result, calls = self._run(versions=_fail("ERROR: PERMISSION_DENIED: Permission 'secretmanager.versions.list' denied"))
+        self.assertTrue(any(cmd[2] == "get-iam-policy" for cmd in calls))
+
+    def test_a_missing_secret_is_reported_once(self):
+        result, _ = self._run(versions=_fail("ERROR: NOT_FOUND: Secret not found"))
+        self.assertEqual(sum(f"secret {checker.POST_MERGE_SYNC_SECRET}" in line for line in result.details), 1)
+
+    def test_a_404_names_both_readings(self):
+        result, _ = self._run(paths={self._BUDGET: (checker.GITHUB_PATH_ABSENT, "")})
+        self.assertIn("or this token cannot read the repository", result.message)
 
     def test_the_constants_are_the_provisioning_scripts(self):
         script = (checker._ROOT / checker.POST_MERGE_SYNC_SCRIPT).read_text()
@@ -6762,8 +6787,9 @@ class PostMergeSyncCheckTest(unittest.TestCase):
         self.assertIn(f'readonly DECLARATION_PATH="{self._DECL}"', script)
         self.assertIn(f'readonly BUDGET_PATH="{self._BUDGET}"', script)
 
-    def test_it_runs_by_default_and_needs_gh(self):
-        self.assertIn(checker.CHECK_POST_MERGE_SYNC, checker.DEFAULT_CHECKS)
+    def test_it_is_opt_in_and_needs_gh(self):
+        self.assertNotIn(checker.CHECK_POST_MERGE_SYNC, checker.DEFAULT_CHECKS)
+        self.assertIn(checker.CHECK_POST_MERGE_SYNC, checker.CHECK_IDS)
         self.assertIn(checker.CHECK_POST_MERGE_SYNC, checker.GITHUB_CHECKS)
 
 

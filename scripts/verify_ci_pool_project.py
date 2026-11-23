@@ -210,7 +210,11 @@ CHECK_IDS = (
 # is onboarded after provisioning (docs/ci-pool-projects.md 5.6, 8), so a
 # default run during provisioning would fail or go unverified over a project
 # nobody has created yet.
-DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c not in (CHECK_TOKEN_MINTER_KMS, CHECK_GITLAB_WORKLOAD_MANIFEST))
+# The post-merge sync's check is opt-in (`--checks post_merge_sync`) until the
+# fleet stack lists the pool's projects in post_merge_sync_projects: before
+# then nothing reads its secret or syncs its seeds, so a default run must not
+# fail a project that has not had the step yet.
+DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c not in (CHECK_TOKEN_MINTER_KMS, CHECK_GITLAB_WORKLOAD_MANIFEST, CHECK_POST_MERGE_SYNC))
 # The console name each check reports under, for a result written on its
 # behalf before it ran (a deadline that passed, a blocked toolchain).
 CHECK_DISPLAY_NAMES = {
@@ -4689,7 +4693,8 @@ def check_post_merge_sync(project_id: str) -> CheckResult:
     deploy key's secret, the fleet reconciler's accessor grant on it, and the
     order-ledger declaration and budget in the GitOps repository. Metadata and
     presence only: no read returns the key or a file's body. A read that is
-    refused or times out leaves its part unverified, as elsewhere.
+    refused or times out leaves its part unverified, as check_gemini_api_key
+    does, and a check that read some parts and not others passes with warnings.
     """
     name = CHECK_DISPLAY_NAMES[CHECK_POST_MERGE_SYNC]
     repair = f"{POST_MERGE_SYNC_SCRIPT} {project_id}"
@@ -4697,36 +4702,47 @@ def check_post_merge_sync(project_id: str) -> CheckResult:
     details: List[str] = []
     warnings: List[str] = []
     problems: List[str] = []
+    read_any = False
 
     def gcloud_json(cmd: List[str], what: str) -> Tuple[Optional[object], bool]:
-        """(parsed JSON or None when absent, read)."""
+        """(parsed JSON, read): None with read True when the resource is absent."""
+        nonlocal read_any
         rc, out, err = run_cmd(cmd)
         if rc != 0:
-            if _record_unreadable(err, f"{what} absent", f"Could not read {what} in {project_id}", details, warnings):
+            # The absent line is not recorded here: the caller's problem says it once.
+            if _record_unreadable(err, "", f"Could not read {what} in {project_id}", [], warnings):
                 return None, False
+            read_any = True
             return None, True
         try:
-            return json.loads(out or "null"), True
+            parsed = json.loads(out or "null")
         except ValueError as exc:
             warnings.append(Unread(f"Could not read {what} in {project_id}: gcloud printed no JSON ({exc})"))
             return None, False
+        read_any = True
+        return parsed, True
 
     versions, versions_read = gcloud_json(
         ["gcloud", "secrets", "versions", "list", secret, f"--project={project_id}", "--limit=1", "--format=json"],
         f"the latest version of secret {secret}",
     )
+    secret_exists = versions_read and versions is not None
     if versions_read:
         latest = (versions or [{}])[0].get("state", "") if versions is not None else ""
         if latest == GEMINI_KEY_VERSION_ENABLED:
             details.append(f"✓ Secret {secret} has an enabled latest version")
         else:
             problems.append(f"secret {secret} has no enabled latest version ({latest or 'absent'})")
-    if versions_read and versions is not None:
+    # As check_gemini_api_key: the grant is read when the secret exists or its
+    # versions could not be read, and a policy that does not come back is unread.
+    if secret_exists or not versions_read:
         policy, policy_read = gcloud_json(
             ["gcloud", "secrets", "get-iam-policy", secret, f"--project={project_id}", "--format=json"],
             f"the IAM policy of secret {secret}",
         )
-        if policy_read:
+        if policy_read and policy is None:
+            warnings.append(Unread(f"Could not read the IAM policy of secret {secret} in {project_id}, so the reconciler's grant is unverified"))
+        elif policy_read:
             held = {
                 member
                 for binding in (policy or {}).get("bindings", [])
@@ -4741,19 +4757,28 @@ def check_post_merge_sync(project_id: str) -> CheckResult:
     for path in POST_MERGE_SYNC_SEEDED_PATHS:
         state, out = _gitops_path_state(repo_slug, path)
         if state == GITHUB_PATH_PRESENT:
+            read_any = True
             details.append(f"✓ {repo_slug} carries {path}")
         elif state == GITHUB_PATH_ABSENT:
-            problems.append(f"{repo_slug} has no {path}")
+            # gh answers 404 for an absent file and for a repository the token
+            # cannot see; both readings are named, as the sibling checks do.
+            read_any = True
+            problems.append(
+                f"{repo_slug} has no {path}, or this token cannot read the repository "
+                "(gh answers 404 to both; the github_repo_and_app check says which)"
+            )
         elif state == GITHUB_PATH_FAILED:
+            read_any = True
             problems.append(f"could not read {path} in {repo_slug}: {out}")
         else:
             warnings.append(Unread(f"Not checked: {path} in {repo_slug} could not be read: {out}"))
     if problems:
         details.extend(problems)
-        return CheckResult(name, False, f"{'; '.join(problems)} (run {repair})", details, warnings)
-    if warnings:
-        return CheckResult(name, True, "Partly unverified", details, warnings, read=False)
-    return CheckResult(name, True, "Deploy key secret, reconciler grant, declaration and budget in place", details, warnings, read=True)
+        return CheckResult(name, False, f"{'; '.join(problems)} (run {repair})", details, warnings, read=read_any)
+    if not read_any:
+        return CheckResult(name, True, "Not checked", details, warnings, read=False)
+    message = "Partly unverified" if warnings else "Deploy key secret, reconciler grant, declaration and budget in place"
+    return CheckResult(name, True, message, details, warnings, read=True)
 
 
 def _probe_github_app_identity(
