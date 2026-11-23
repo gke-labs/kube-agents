@@ -536,8 +536,16 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertEqual(
             checker.LEASE_SILENT_FINDINGS,
             frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API})
-            | checker.FORGE_FINDINGS,
+            | checker.FORGE_FINDINGS
+            | {checker.FINDING_CONFIG_MANAGEMENT_API, checker.FINDING_FLEET_RECONCILER_GKEHUB},
         )
+        # The seeded fleet's Config Sync needs the API and the reconciler's
+        # gkehub grant; only the reconcile reads them, so a leased run passes
+        # without them. The ids are the ones the API and IAM checks emit.
+        self.assertEqual(checker.FINDING_CONFIG_MANAGEMENT_API, "apis/anthosconfigmanagement.googleapis.com")
+        self.assertIn("anthosconfigmanagement.googleapis.com", checker.REQUIRED_APIS)
+        self.assertEqual(checker.FINDING_FLEET_RECONCILER_GKEHUB, "iam/fleet-reconciler/missing/roles/gkehub.editor")
+        self.assertIn("roles/gkehub.editor", checker.FLEET_RECONCILER_ROLES)
         # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
         # public lanes read none of them, so a leased run passes with any of them.
         # The Gemini key findings red runs (GeminiApiKeyCheckTest).

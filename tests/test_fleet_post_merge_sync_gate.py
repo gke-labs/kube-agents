@@ -34,10 +34,14 @@ def _blocks(name):
 
 
 class PostMergeSyncGateTest(unittest.TestCase):
-    def test_the_project_list_defaults_to_empty_and_drives_the_switch(self):
+    def test_the_project_list_holds_project_ids_and_drives_the_switch(self):
+        # The list may name projects once their pool steps are done; it never
+        # holds anything but literal project IDs, so the switch stays per project.
         variables = (_FLEET / "variables.tf").read_text()
         block = re.search(r'variable "post_merge_sync_projects" \{(.*?)\n\}', variables, re.DOTALL).group(1)
-        self.assertRegex(block, r"default\s+= \[\]")
+        default = re.search(r"default\s+= \[(.*?)\]", block, re.DOTALL).group(1)
+        for item in re.findall(r"[^,\s][^,]*", default):
+            self.assertRegex(item.strip(), r'^"[a-z][a-z0-9-]{4,28}[a-z0-9]"$')
         self.assertIn(
             "post_merge_sync_enabled = contains(var.post_merge_sync_projects, var.project_id)",
             (_FLEET / "config-sync.tf").read_text(),
