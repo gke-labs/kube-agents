@@ -5039,11 +5039,6 @@ unit_cost_hint() {
     # priced in that band so a deadline cut does not take it first.
     # Unmeasured until its first nights.
     chat-stop-halts-delegated-remediation) echo 1100 ;;
-    # Nightly only. The harness waits idle_seconds=480 between the opening
-    # and the reply (idle_reply.py), so a repetition is never under 480s,
-    # plus two turns. Priced above that so a deadline cut does not take it
-    # first.
-    session-recalls-context-after-idle-reap) echo 700 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
