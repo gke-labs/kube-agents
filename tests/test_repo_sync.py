@@ -81,6 +81,23 @@ class RepoSyncApplyTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("Config Sync did not install it", err)
 
+    def test_a_reply_cut_short_is_tried_again(self):
+        import http.client
+
+        api = _Api()
+        calls = []
+
+        def flaky(request, context=None, timeout=None):
+            calls.append(request)
+            if len(calls) == 1:
+                raise http.client.IncompleteRead(b"")
+            return api(request, context, timeout)
+
+        code, err = _run(flaky)
+        self.assertEqual(0, code, err)
+        self.assertEqual(2, len(calls))
+        self.assertIn("got no answer", err)
+
     def test_any_other_refusal_fails_the_apply_at_once(self):
         api = _Api(403)
         with self.assertRaises(SystemExit):

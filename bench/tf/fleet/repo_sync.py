@@ -13,6 +13,7 @@ config_connector.access_token. Standard library only, as there.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import ssl
@@ -74,7 +75,8 @@ def apply(host: str, token: str, context: ssl.SSLContext, path: str, body: dict)
         if exc.code >= SERVER_ERROR_FLOOR or exc.code == TOO_MANY_REQUESTS:
             return f"PATCH {path} answered {exc.code}"
         raise SystemExit(f"{LOG_PREFIX}: PATCH {path} answered {exc.code}: {exc.read().decode(errors='replace')}")
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # A reply cut short (IncompleteRead) or malformed is no answer either.
         return f"PATCH {path} got no answer: {exc}"
 
 
