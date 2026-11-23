@@ -254,6 +254,60 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	}
 }
 
+// A watcher body serving watch_set_ready=0 is still building its watch set, so
+// Clusters and DataVolume read as nil (missing reading) while counters and start
+// time still parse. At watch_set_ready=1, 0 cluster_up series reads as a
+// genuine empty fleet.
+func TestPodUsageSource_WatchSetReadyGatesClusterAndDataVolumeReadings(t *testing.T) {
+	starting := strings.Join([]string{
+		"# TYPE k8s_event_watcher_events_injected_total counter",
+		`k8s_event_watcher_events_injected_total{cluster="a",location="l",namespace="n",project="p",reason="BackOff"} 7`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 100",
+		"# TYPE k8s_event_watcher_watch_set_ready gauge",
+		"k8s_event_watcher_watch_set_ready 0",
+		"# TYPE kubeagents_data_volume_bytes gauge",
+		`kubeagents_data_volume_bytes{kind="free"} 100`,
+		`kubeagents_data_volume_bytes{kind="total"} 1000`,
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, starting)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+	if err != nil {
+		t.Fatalf("Scrape starting watcher: %v", err)
+	}
+	if reading.Clusters != nil {
+		t.Errorf("watch_set_ready=0 yielded Clusters = %+v, want nil (no reading)", reading.Clusters)
+	}
+	if reading.DataVolume != nil {
+		t.Errorf("watch_set_ready=0 yielded DataVolume = %+v, want nil (no reading)", reading.DataVolume)
+	}
+	if reading.sample() != 7 || reading.StartTime == nil || *reading.StartTime != 100 {
+		t.Errorf("watch_set_ready=0 lost sample or start time: sample=%d, start=%v", reading.sample(), reading.StartTime)
+	}
+
+	emptyReady := strings.Join([]string{
+		"# TYPE k8s_event_watcher_events_injected_total counter",
+		"# TYPE k8s_event_watcher_watch_set_ready gauge",
+		"k8s_event_watcher_watch_set_ready 1",
+		"# TYPE kubeagents_data_volume_bytes gauge",
+		`kubeagents_data_volume_bytes{kind="free"} 100`,
+		`kubeagents_data_volume_bytes{kind="total"} 1000`,
+		"",
+	}, "\n")
+	addr = serveBody(t, http.StatusOK, emptyReady)
+	reading, err = newPodUsageSource().Scrape(context.Background(), addr, usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+	if err != nil {
+		t.Fatalf("Scrape ready empty watcher: %v", err)
+	}
+	if reading.Clusters == nil || reading.Clusters.Registered != 0 || reading.Clusters.Monitored != 0 {
+		t.Fatalf("watch_set_ready=1 with 0 clusters = %+v, want known zero fleet", reading.Clusters)
+	}
+	if reading.DataVolume == nil || reading.DataVolume.Free != 100 || reading.DataVolume.Total != 1000 {
+		t.Fatalf("watch_set_ready=1 DataVolume = %+v, want 100/1000", reading.DataVolume)
+	}
+}
+
 // A watcher body with more cluster_up series than any fleet has is refused
 // whole, so a body on the port cannot set the gauges past the ceiling.
 func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {

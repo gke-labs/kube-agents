@@ -377,7 +377,7 @@ echo '{"type":"result","subtype":"success","result":"audited"}'
 		t.Error("no final status event on the profile's subject")
 	}
 	for _, n := range consumerNames(t, h) {
-		if !strings.HasPrefix(n, auditorPod1+"-") && n != "test-reader" {
+		if !strings.HasPrefix(n, auditorPod1+"-") && n != testReaderName {
 			t.Errorf("consumer %q is not named for the pod; a profile pod created something outside its naming contract", n)
 		}
 	}

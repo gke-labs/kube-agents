@@ -49,6 +49,33 @@ import (
 // cache entirely — Pods through ManagerClientOptions below, Secrets and the
 // A2A bookkeeping objects through APIReader — and to hold less of what
 // remains, below.
+//
+// Measured live-heap cost per 1,000 cached objects of the twelve
+// cluster-scaling watched kinds (TestManagerCachePerObjectMemoryCost and
+// TestSoak_ManagerCacheClusterScale in manager_cache_test.go):
+//
+//   - Deployment: ~8.5 MiB/1k (raw ~11.2 MiB/1k; without last-applied ~6.2 MiB/1k)
+//   - StatefulSet: ~7.9 MiB/1k (raw ~9.5 MiB/1k; without last-applied ~6.2 MiB/1k)
+//   - PersistentVolumeClaim: ~3.7 MiB/1k (raw ~4.6 MiB/1k; without last-applied ~3.0 MiB/1k)
+//   - NetworkPolicy: ~3.5 MiB/1k (raw ~3.9 MiB/1k; without last-applied ~2.4 MiB/1k)
+//   - ConfigMap (~0.6 KiB data): ~3.2 MiB/1k (raw ~3.6 MiB/1k; without last-applied ~1.9 MiB/1k)
+//   - Service: ~3.0 MiB/1k (raw ~3.7 MiB/1k; without last-applied ~1.9 MiB/1k)
+//   - ClusterRole: ~3.0 MiB/1k (raw ~3.4 MiB/1k; without last-applied ~2.0 MiB/1k)
+//   - Role: ~2.9 MiB/1k (raw ~3.2 MiB/1k; without last-applied ~1.9 MiB/1k)
+//   - PodDisruptionBudget: ~2.4 MiB/1k (raw ~3.3 MiB/1k; without last-applied ~1.5 MiB/1k)
+//   - ClusterRoleBinding: ~2.0 MiB/1k (raw ~2.4 MiB/1k; without last-applied ~1.1 MiB/1k)
+//   - RoleBinding: ~2.0 MiB/1k (raw ~2.4 MiB/1k; without last-applied ~1.1 MiB/1k)
+//   - ServiceAccount: ~1.8 MiB/1k (raw ~2.2 MiB/1k; without last-applied ~1.3 MiB/1k)
+//
+// Across an even mix of all twelve kinds (~3.77 KiB/object, ~3.68 MiB per 1,000
+// objects), stripping managedFields saves ~17.5% of raw live heap and retaining
+// kubectl.kubernetes.io/last-applied-configuration accounts for ~29.9% of the
+// remaining cache heap (~1.13 KiB/object). At the 512 MiB container floor
+// (460.8 MiB Go soft memory limit at 0.9), once base runtime and reconcile peak
+// overhead are reserved, raise operator.resources.limits.memory above 512 MiB
+// when the cached kinds exceed roughly 180 MiB of steady-state live heap
+// (about 50,000 watched objects in a balanced mix, or ~20,000 Deployments and
+// StatefulSets).
 func ManagerCacheOptions() cache.Options {
 	return cache.Options{
 		// managedFields is the largest part of most cached objects and

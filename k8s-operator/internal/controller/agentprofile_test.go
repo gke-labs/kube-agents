@@ -176,6 +176,7 @@ func agentProfileSpecPaths() []string {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "cluster", Required: true}}
 		p.Spec.YieldToPinned = true
 		p.Spec.Delegates = true
+		p.Spec.Harness.Type = agentv1alpha1.AgentProfileHarnessClaudeCode
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage

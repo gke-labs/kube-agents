@@ -493,3 +493,65 @@ func TestAnActivityTitleFailsClosedOnUnplainAssignments(t *testing.T) {
 		}
 	}
 }
+
+// Every tool_result on one user message feeds the seen set, not only the
+// first: a value only the second result carried is redacted from the
+// progress and the result.
+func TestEveryToolResultOnAMessageFeedsTheSeenSet(t *testing.T) {
+	line := eventLine(t, map[string]any{
+		"type": "user",
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "toolu_a", "content": "nothing secret here"},
+			map[string]any{"type": "tool_result", "tool_use_id": "toolu_b", "content": secretManifest(t, synthSeenValue)},
+		}},
+	})
+	task, _, res := runLines(t, "chat-heron-s9c9", "task-scrub-two-results",
+		line,
+		assistantTextLine(t, "the stored value is "+synthSeenValue),
+		resultLine(t, "The database secret decodes to "+synthSeenValue+"."),
+	)
+	if res.State != lib.StateCompleted {
+		t.Fatalf("state %q", res.State)
+	}
+	for _, artifact := range []string{lib.ArtifactResult, lib.ArtifactProgress} {
+		got := artifactText(task, artifact)
+		if strings.Contains(got, synthSeenValue) || !strings.Contains(got, answerscrub.Redacted) {
+			t.Errorf("%s artifact = %q, want the seen value redacted", artifact, got)
+		}
+	}
+}
+
+// The seen set is fed from the driver's EventToolResult, whatever the
+// harness: a tool result another dialect reports is redacted from what the
+// task publishes, as Claude's is.
+func TestAnotherDriversToolResultFeedsTheSeenSet(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-toy-scrub-a1", "task-toy-scrub-1"
+	submit(t, c, session, taskID, "show me the app's database secret")
+	resultPath := filepath.Join(t.TempDir(), "result.json")
+	if err := os.WriteFile(resultPath, []byte(eventLine(t, secretManifest(t, synthSeenValue))), 0o600); err != nil {
+		t.Fatalf("write result: %v", err)
+	}
+	harness := stub(t, `
+echo 'S toy-1'
+read first || exit 1
+printf 'R %s\n' "$(cat '`+resultPath+`')"
+echo 'T it decodes to `+synthSeenValue+`'
+echo 'P the stored value is `+synthSeenValue+`'
+echo 'OK The database secret decodes to `+synthSeenValue+`.'
+`)
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.Driver = &toyDriver{}
+	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	task := foldTask(t, c, session, taskID)
+	for _, artifact := range []string{lib.ArtifactResult, lib.ArtifactProgress, lib.ArtifactThinking} {
+		got := artifactText(task, artifact)
+		if strings.Contains(got, synthSeenValue) || !strings.Contains(got, answerscrub.Redacted) {
+			t.Errorf("%s artifact = %q, want the seen value redacted", artifact, got)
+		}
+	}
+}

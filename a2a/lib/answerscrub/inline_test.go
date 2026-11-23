@@ -3,6 +3,7 @@ package answerscrub
 import (
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -657,28 +658,138 @@ func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
 
 // One long line (minified JSON, a fetched page) full of scheme words is
 // scrubbed in linear time: the authorization lead is read from a bounded
-// tail before each match, not from the line's start (#5311 review). 256 KiB
-// took about two minutes before; it must stay far inside the hook's 10s.
+// tail before each match, not from the line's start (#5311 review). Read
+// from the line's start, 256 KiB took about two minutes.
+//
+// Two bounds, both on CPU time, because a wall-clock budget cannot tell a
+// slow scrub from a starved runner (under -race this scrub takes 13s to 20s
+// of CPU for 256 KiB, and a 30s wall-clock budget failed on a loaded host):
+//
+//   - how the cost grows: a line four times as long costs four times as
+//     much when the scrub is linear and sixteen times when it is quadratic,
+//     on any machine and under -race alike. It is read on a short pair of
+//     lines, so that a quadratic scrub fails in seconds;
+//   - what 256 KiB costs: no more than the hook's timeout. A scrub that is
+//     linear and many times slower passes the first bound and fails this one.
 func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
-	var b strings.Builder
-	for b.Len() < 256*1024 {
-		b.WriteString(`{"reason":"token basic digest refresh","message":"bearer token rotated"},`)
-	}
-	// CI runs go test -race, which slows this loop about 20x (0.2s becomes
-	// 4s); the quadratic version took minutes, so 10x still separates them.
-	budget := 3 * time.Second
+	const (
+		// The pair the growth is read on. The longer line is sizeRatio
+		// times the shorter: linear growth is sizeRatio, quadratic is its
+		// square.
+		shortSize = 16 * 1024
+		sizeRatio = 4
+		// Between the two. A scrub with a linear and a quadratic part goes
+		// over it once the quadratic part is twice the linear one on the
+		// longer line.
+		maxGrowth = 8
+		// A growth over maxGrowth and up to this is read again, up to
+		// maxRounds rounds: contention only ever adds CPU time (a shared
+		// core, a cold cache; under load one reading in ten came out 1.6x
+		// to 1.8x the others), so a line's cost is the lowest of its
+		// readings. A growth over this fails at once: no reading of a
+		// linear scrub came near it, and a quadratic scrub's rounds are
+		// the slow ones.
+		retryGrowth = 12
+		maxRounds   = 3
+		// A reading shorter than this is repeated until it adds up to it.
+		minReading = 200 * time.Millisecond
+		// The line the ceiling is read on.
+		ceilingSize = 256 * 1024
+		// What -race multiplies this scrub's CPU time by, at most: 17x to
+		// 20x measured.
+		raceSlowdown = 20
+		// hookTimeoutSeconds is the hermes-bridge hook's timeout
+		// (a2a/hermes-bridge/activity.go), the call the scrub runs inside;
+		// this package can't import it.
+		hookTimeoutSeconds = 10
+	)
+	// The ceiling: the hook this scrub runs under gives up after
+	// hookTimeoutSeconds. The line takes 0.6s to 1.2s of CPU, twice that at
+	// worst on a contended core, so the ceiling is four times clear of a
+	// correct scrub and fails one many times slower.
+	ceiling := hookTimeoutSeconds * time.Second
 	if raceEnabled {
-		budget *= 10
+		ceiling *= raceSlowdown
 	}
-	start := time.Now()
-	ScrubInline(b.String())
-	if took := time.Since(start); took > budget {
-		t.Errorf("a 256 KiB line took %s to scrub", took)
+	line := func(size int) string {
+		var b strings.Builder
+		for b.Len() < size {
+			b.WriteString(`{"reason":"token basic digest refresh","message":"bearer token rotated"},`)
+		}
+		return b.String()
+	}
+	short, long := line(shortSize), line(shortSize*sizeRatio)
+	// One scrub is discarded: the first one in a process also pays for the
+	// patterns' first use, which would count against the short line alone
+	// and hide growth.
+	ScrubInline(short)
+	var shortCost, longCost time.Duration
+	growth := 0.0
+	rounds := 0
+	for rounds < maxRounds {
+		rounds++
+		// The short line is read on both sides of the long one, and the
+		// lower reading kept, so that one slow short reading cannot pass a
+		// scrub whose growth is over the bound.
+		shortBefore := scrubCPUTime(t, short, minReading)
+		longRead := scrubCPUTime(t, long, minReading)
+		shortRead := min(shortBefore, scrubCPUTime(t, short, minReading))
+		if rounds == 1 {
+			shortCost, longCost = shortRead, longRead
+		}
+		shortCost, longCost = min(shortCost, shortRead), min(longCost, longRead)
+		growth = float64(longCost) / float64(shortCost)
+		t.Logf("round %d: scrub CPU time %s for %d KiB, %s for %d KiB; lowest so far %s and %s, growth %.1fx for %dx the line", rounds, shortRead, len(short)/1024, longRead, len(long)/1024, shortCost, longCost, growth, sizeRatio)
+		if growth <= maxGrowth || growth > retryGrowth {
+			break
+		}
+	}
+	if growth > maxGrowth {
+		// Fatal: the ceiling's line is the long one to scrub, and a scrub
+		// that has already failed should not spend the test's timeout on it.
+		t.Fatalf("a line %dx as long cost %.1fx the CPU time (%s, then %s, each the lowest reading; rounds read: %d): linear is %dx, quadratic %dx, the bound %dx", sizeRatio, growth, shortCost, longCost, rounds, sizeRatio, sizeRatio*sizeRatio, maxGrowth)
+	}
+	ceilingLine := line(ceilingSize)
+	ceilingCost := scrubCPUTime(t, ceilingLine, minReading)
+	t.Logf("scrub CPU time %s for %d KiB, the ceiling %s", ceilingCost, len(ceilingLine)/1024, ceiling)
+	if ceilingCost > ceiling {
+		t.Errorf("a %d KiB line took %s of CPU to scrub, over the %s ceiling: the hook's %ds timeout, times %d when the build is -race", len(ceilingLine)/1024, ceilingCost, ceiling, hookTimeoutSeconds, raceSlowdown)
 	}
 	// The lead is still honoured inside the window.
 	if got := ScrubInline(`"authorization": "Bearer abcdEFGH1234ijkl5678"`); strings.Contains(got, "abcdEFGH1234ijkl5678") {
 		t.Errorf("the authorization value leaked: %q", got)
 	}
+}
+
+// scrubCPUTime is the CPU time one ScrubInline(s) takes: the scrub is
+// repeated until the readings add up to atLeast, and their mean returned.
+// CPU time, not wall time, so that the time the scrub waits for a core on a
+// shared runner does not count against it.
+func scrubCPUTime(t *testing.T, s string, atLeast time.Duration) time.Duration {
+	t.Helper()
+	start := processCPUTime(t)
+	for runs := 1; ; runs++ {
+		ScrubInline(s)
+		if spent := processCPUTime(t) - start; spent >= atLeast {
+			return spent / time.Duration(runs)
+		}
+	}
+}
+
+// processCPUTime is the user and system CPU time this process has used, on
+// every thread. The gateway's threadCPU reads one locked thread instead,
+// which only Linux can and which skips elsewhere; this clock also reads on
+// macOS, so the test runs there. The price is that it counts the garbage
+// collector and the race detector's own threads, about a quarter on top of
+// the scrub; both grow with the line as the scrub does, and this package's
+// tests do not run in parallel, so no other test's work is in a reading.
+func processCPUTime(t *testing.T) time.Duration {
+	t.Helper()
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		t.Fatalf("getrusage: %v", err)
+	}
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }
 
 // `kubectl get secrets` as a markdown table lists Secrets, never their

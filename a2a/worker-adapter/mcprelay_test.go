@@ -340,7 +340,7 @@ func TestTheClusterPersonaRendersItsServerThroughTheBridge(t *testing.T) {
 		Harness:    persona.ClaudeCode,
 		Relay:      ProfileRelay("/usr/local/bin/worker-adapter", func(k string) string { return env[k] }),
 	}
-	out, err := renderPersona(pw, persona.Delegate{})
+	out, err := renderPersona(pw, persona.Delegate{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +379,7 @@ func TestTheClusterPersonaRendersItsServerThroughTheBridge(t *testing.T) {
 	}
 
 	pw.Relay = persona.Relay{}
-	bare, err := renderPersona(pw, persona.Delegate{})
+	bare, err := renderPersona(pw, persona.Delegate{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

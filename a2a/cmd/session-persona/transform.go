@@ -40,7 +40,7 @@ const (
 	// proposeOnlyNote precedes a code block that changes a cluster or a
 	// project. The session's broker refuses writes anyway; the note is what
 	// keeps the model from trying, and from presenting the step as done.
-	proposeOnlyNote = "> **Propose this to the operator; do not run it.** It changes a cluster or a project, and this session is read-only. Write it out as a proposal, or delegate it to `platform` if the person wants it done."
+	proposeOnlyNote = "> **Propose this to the operator; do not run it.** It changes a cluster or a project, and this session is read-only. Write it out as a proposal, or, if the person wants it done, delegate the whole ask to `platform` when the delegate tool lists it, in the turn it is asked and with the reads it depends on."
 	// unavailableNote precedes a code block that runs a program the
 	// session can't: Bash is limited to kubectl and gcloud, and the scripts
 	// the skills name are not shipped.
@@ -112,8 +112,7 @@ var (
 	skillNameRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 	// headingRE matches an ATX heading.
 	headingRE = regexp.MustCompile(`^(#{1,6})\s`)
-	// shellLangs are the info strings whose blocks are all commands, the
-	// same set as deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+	// shellLangs are the info strings whose blocks are all commands.
 	// transcriptLangs are the ones whose blocks are a transcript: only a
 	// shellPrompt line is a command, and the rest is what it printed. Any
 	// other info string (yaml, json, text) marks an inert block.

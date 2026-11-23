@@ -1,0 +1,509 @@
+{
+  "source": "Six Deployments planted on a GKE Standard cluster on Kubernetes 1.35.8 (2026-11-20) and read 12 minutes 40 seconds later: four causes of a failed image pull, one pod whose init container ran two minutes before its main image was refused, and one rollout whose two old replicas serve while a surge pod cannot pull. `pods` is the answer to the collector's own read (pods that have a node and have not started), `deployments` the same Deployments as the dump holds them, both cut to what the collector reads. Node names are replaced, and of the pod conditions only Initialized is kept.",
+  "read_at": "2026-11-20T19:19:47Z",
+  "deployments": [
+    {
+      "kind": "Deployment",
+      "metadata": {
+        "name": "image-not-found",
+        "namespace": "pull-audit-std-read"
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app": "image-not-found"
+          }
+        },
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "app",
+                "image": "registry.k8s.io/pause:0.0.0-no-such-tag"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "replicas": 1,
+        "unavailableReplicas": 1,
+        "updatedReplicas": 1
+      }
+    },
+    {
+      "kind": "Deployment",
+      "metadata": {
+        "name": "init-then-refused",
+        "namespace": "pull-audit-std-read"
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app": "init-then-refused"
+          }
+        },
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "app",
+                "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "replicas": 1,
+        "unavailableReplicas": 1,
+        "updatedReplicas": 1
+      }
+    },
+    {
+      "kind": "Deployment",
+      "metadata": {
+        "name": "refused-node-identity",
+        "namespace": "pull-audit-std-read"
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app": "refused-node-identity"
+          }
+        },
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "app",
+                "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "replicas": 1,
+        "unavailableReplicas": 1,
+        "updatedReplicas": 1
+      }
+    },
+    {
+      "kind": "Deployment",
+      "metadata": {
+        "name": "refused-pull-secret",
+        "namespace": "pull-audit-std-read"
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app": "refused-pull-secret"
+          }
+        },
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "app",
+                "image": "us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "replicas": 1,
+        "unavailableReplicas": 1,
+        "updatedReplicas": 1
+      }
+    },
+    {
+      "kind": "Deployment",
+      "metadata": {
+        "name": "registry-not-reached",
+        "namespace": "pull-audit-std-read"
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app": "registry-not-reached"
+          }
+        },
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "app",
+                "image": "registry.invalid/apps/unreachable:1.0"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "replicas": 1,
+        "unavailableReplicas": 1,
+        "updatedReplicas": 1
+      }
+    },
+    {
+      "kind": "Deployment",
+      "metadata": {
+        "name": "surge-stuck",
+        "namespace": "pull-audit-std-read"
+      },
+      "spec": {
+        "replicas": 2,
+        "selector": {
+          "matchLabels": {
+            "app": "surge-stuck"
+          }
+        },
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "app",
+                "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "availableReplicas": 2,
+        "readyReplicas": 2,
+        "replicas": 3,
+        "unavailableReplicas": 1,
+        "updatedReplicas": 1
+      }
+    }
+  ],
+  "pods": [
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "image-not-found-bb4c97689-6gc7n",
+        "namespace": "pull-audit-std-read",
+        "labels": {
+          "app": "image-not-found",
+          "pod-template-hash": "bb4c97689"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "image-not-found-bb4c97689",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "registry.k8s.io/pause:0.0.0-no-such-tag"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-20T19:07:09Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-20T19:07:09Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image \"registry.k8s.io/pause:0.0.0-no-such-tag\": ErrImagePull: rpc error: code = NotFound desc = failed to pull and unpack image \"registry.k8s.io/pause:0.0.0-no-such-tag\": failed to resolve reference \"registry.k8s.io/pause:0.0.0-no-such-tag\": registry.k8s.io/pause:0.0.0-no-such-tag: not found"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "init-then-refused-75d7f84c44-vchlp",
+        "namespace": "pull-audit-std-read",
+        "labels": {
+          "app": "init-then-refused",
+          "pod-template-hash": "75d7f84c44"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "init-then-refused-75d7f84c44",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+          }
+        ],
+        "initContainers": [
+          {
+            "name": "warm-up",
+            "image": "registry.k8s.io/e2e-test-images/busybox:1.36.1-1"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-20T19:07:09Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-20T19:09:12Z"
+          }
+        ],
+        "initContainerStatuses": [
+          {
+            "name": "warm-up",
+            "state": {
+              "terminated": {
+                "exitCode": 0,
+                "reason": "Completed",
+                "startedAt": "2026-11-20T19:07:12Z",
+                "finishedAt": "2026-11-20T19:09:12Z",
+                "containerID": "containerd://09563e6defe15d85478dc66abbb6f53510012b52be703c88484bee05c3faf0e9"
+              }
+            }
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": ErrImagePull: failed to pull and unpack image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to resolve reference \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Abench-no-such-streaming-registry-project%2Fapps%2Fstreamed-image-service%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "refused-node-identity-7978cc7bdb-k5ddd",
+        "namespace": "pull-audit-std-read",
+        "labels": {
+          "app": "refused-node-identity",
+          "pod-template-hash": "7978cc7bdb"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "refused-node-identity-7978cc7bdb",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-20T19:07:08Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-20T19:07:08Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": ErrImagePull: failed to pull and unpack image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to resolve reference \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Abench-no-such-streaming-registry-project%2Fapps%2Fstreamed-image-service%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "refused-pull-secret-79f74c88f4-lmtb4",
+        "namespace": "pull-audit-std-read",
+        "labels": {
+          "app": "refused-pull-secret",
+          "pod-template-hash": "79f74c88f4"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "refused-pull-secret-79f74c88f4",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2"
+          }
+        ],
+        "imagePullSecrets": [
+          {
+            "name": "private-reg-creds"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-20T19:07:08Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-20T19:07:08Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": ErrImagePull: [failed to pull and unpack image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to resolve reference \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Aprivate-registry-project%2Fapps%2Fprivate-image-worker%3Apull&service=us-east4-docker.pkg.dev: 401 Unauthorized, failed to pull and unpack image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to resolve reference \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Aprivate-registry-project%2Fapps%2Fprivate-image-worker%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "registry-not-reached-5b87b98dcf-l92sj",
+        "namespace": "pull-audit-std-read",
+        "labels": {
+          "app": "registry-not-reached",
+          "pod-template-hash": "5b87b98dcf"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "registry-not-reached-5b87b98dcf",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "registry.invalid/apps/unreachable:1.0"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-20T19:07:09Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-20T19:07:09Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image \"registry.invalid/apps/unreachable:1.0\": ErrImagePull: failed to pull and unpack image \"registry.invalid/apps/unreachable:1.0\": failed to resolve reference \"registry.invalid/apps/unreachable:1.0\": failed to do request: Head \"https://registry.invalid/v2/apps/unreachable/manifests/1.0\": dial tcp: lookup registry.invalid on 169.254.169.254:53: no such host"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "surge-stuck-64545b4c5c-mlxgm",
+        "namespace": "pull-audit-std-read",
+        "labels": {
+          "app": "surge-stuck",
+          "pod-template-hash": "64545b4c5c"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "surge-stuck-64545b4c5c",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-20T19:07:13Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-20T19:07:13Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": ErrImagePull: failed to pull and unpack image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to resolve reference \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Abench-no-such-streaming-registry-project%2Fapps%2Fstreamed-image-service%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

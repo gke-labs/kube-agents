@@ -34,9 +34,9 @@ spec:
       schema:
         openAPIV3Schema:
           description: |-
-            AgentSchedule runs a prompt on an AgentProfile on a cron schedule, each run
-            an Unattended task submitted through the A2A gateway
-            (docs/designs/scheduling-on-profiles.md).
+            AgentSchedule runs a prompt, or a built-in schedule's helper script, on an
+            AgentProfile on a cron schedule, each run an Unattended task submitted
+            through the A2A gateway (docs/designs/scheduling-on-profiles.md).
           properties:
             apiVersion:
               description: |-
@@ -58,7 +58,8 @@ spec:
             spec:
               description: |-
                 AgentScheduleSpec is a recurring task: when it runs, which profile runs
-                it, and what it asks (docs/designs/scheduling-on-profiles.md, section 1).
+                it, and what it asks or which script it runs
+                (docs/designs/scheduling-on-profiles.md, section 1).
                 Each run is submitted through the A2A gateway as an Unattended task.
               properties:
                 activeDeadlineSeconds:
@@ -109,7 +110,9 @@ spec:
                       type: boolean
                   type: object
                 maxTurns:
-                  description: MaxTurns caps the run's model turns.
+                  description: |-
+                    MaxTurns caps the run's model turns. A script run takes none: set it
+                    only with prompt.
                   format: int32
                   maximum: 1000
                   minimum: 1
@@ -139,7 +142,9 @@ spec:
                     - name
                   type: object
                 prompt:
-                  description: Prompt is what each run asks.
+                  description: |-
+                    Prompt is what each run asks. Exactly one of prompt and script is
+                    set.
                   maxLength: 16384
                   minLength: 1
                   type: string
@@ -152,8 +157,22 @@ spec:
                         schedule must be a 5-field cron expression (minute hour
                         day-of-month month day-of-week)
                       rule: self.trim().split(' ').filter(f, f != '').size() == 5
+                script:
+                  description: |-
+                    Script names a helper script each run executes in place of a model
+                    turn: one of the profile's spec.scripts, by name, never a path. It is a
+                    DNS-1123 label (no dots), as the run's trigger carries it. Exactly one
+                    of prompt and script is set. Only a built-in schedule, one the
+                    PlatformAgent renders, may name a script: any other schedule that does
+                    is not accepted, and never runs.
+                  maxLength: 63
+                  minLength: 1
+                  pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
+                  type: string
                 skills:
-                  description: Skills the run asks the profile to use.
+                  description: |-
+                    Skills the run asks the profile to use. A script run takes none: set
+                    it only with prompt.
                   items:
                     type: string
                   maxItems: 16
@@ -176,9 +195,15 @@ spec:
                   type: boolean
               required:
                 - profileRef
-                - prompt
                 - schedule
               type: object
+              x-kubernetes-validations:
+                - message: exactly one of spec.prompt and spec.script must be set
+                  rule: has(self.prompt) != has(self.script)
+                - message:
+                    spec.skills and spec.maxTurns apply to a model run; a script
+                    run takes neither
+                  rule: "!has(self.script) || (!has(self.skills) && !has(self.maxTurns))"
             status:
               description: |-
                 AgentScheduleStatus is the schedule's run state. It is the run ledger: no
@@ -258,6 +283,9 @@ spec:
                   type: string
                 lastHandledRunNow:
                   description: LastHandledRunNow is the last run-now token acted on.
+                  type: string
+                lastHandledStop:
+                  description: LastHandledStop is the last stop token acted on.
                   type: string
                 lastOutcome:
                   description: LastOutcome is how the most recent run ended.
@@ -407,6 +435,12 @@ spec:
                     - rateLimited
                     - suspended
                   type: object
+                stoppedTaskID:
+                  description: |-
+                    StoppedTaskID is the run in flight a stop was sent for, until it
+                    settles: a run-now asked for meanwhile waits for it to end rather than
+                    adopting it.
+                  type: string
               type: object
           type: object
       served: true
