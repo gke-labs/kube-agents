@@ -77,7 +77,7 @@ class PlantTest(unittest.TestCase):
         self.addCleanup(env.stop)
         self.plant = _load_plant()
         self.audit_report = self.plant.load(str(_SCRIPTS))
-        resolve = mock.patch.object(self.audit_report, "resolve_repo", lambda **_: _REPO)
+        resolve = mock.patch.object(self.audit_report, "resolve_repo_or_no_forge", lambda *_args, **_kwargs: _REPO)
         resolve.start()
         self.addCleanup(resolve.stop)
 
@@ -134,15 +134,32 @@ class PlantTest(unittest.TestCase):
             self.assertEqual(self.audit_report.carry_unchanged_findings([finding], document), [])
             self.assertEqual(json.dumps(finding, sort_keys=True), before)
 
-    def test_a_same_evidence_gcloud_plant_is_carried_over_this_runs_command(self):
-        """The negative control: `finish` keeps the planted command, range and all."""
+    def test_a_same_evidence_gcloud_plant_gives_way_to_this_runs_remediation(self):
+        """The control case's plant: a command with a literal range, on equal
+        evidence. `finish` does not keep it, because the procedure leaves that
+        value to the cluster's owner, so this run's own remediation stands."""
         self.assertEqual(self.run_plant(_MANIFEST, self.plant.REMEDIATION_SAME), 0)
         document = self.audit_report.previous_run_document(self.plant.AUDIT, _REPO)
         for finding in (self.worker_finding(), self.worker_gcloud_finding()):
-            self.assertEqual(self.audit_report.carry_unchanged_findings([finding], document), [finding["id"]])
-            self.assertEqual(finding["remediation"]["kind"], "gcloud")
-            self.assertIn("203.0.113.0/24", finding["remediation"]["note"])
-            self.assertIn(_MARK, finding["remediation"]["note"])
+            own = json.dumps([finding["recommendation"], finding["remediation"]], sort_keys=True)
+            self.audit_report.carry_unchanged_findings([finding], document)
+            published = json.dumps([finding["recommendation"], finding["remediation"]], sort_keys=True)
+            self.assertEqual(published, own)
+            self.assertNotIn("203.0.113.0/24", published)
+            self.assertNotIn(_MARK, published)
+
+    def test_without_the_carry_rules_the_same_evidence_plant_is_kept(self):
+        """What the control case reads on a build without the rules: the
+        planted command, range and mark, in place of this run's own. That is
+        the state the case is red on."""
+        self.assertEqual(self.run_plant(_MANIFEST, self.plant.REMEDIATION_SAME), 0)
+        document = self.audit_report.previous_run_document(self.plant.AUDIT, _REPO)
+        with mock.patch.object(self.audit_report, "CARRY_RULES", ()):
+            for finding in (self.worker_finding(), self.worker_gcloud_finding()):
+                self.assertEqual(self.audit_report.carry_unchanged_findings([finding], document), [finding["id"]])
+                self.assertEqual(finding["remediation"]["kind"], "gcloud")
+                self.assertIn("203.0.113.0/24", finding["remediation"]["note"])
+                self.assertIn(_MARK, finding["remediation"]["note"])
 
     def test_the_collector_gets_the_stacks_arguments(self):
         collected = subprocess.CompletedProcess([], 0, stdout=json.dumps(_MANIFEST), stderr="")

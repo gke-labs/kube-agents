@@ -158,7 +158,7 @@ def plant(audit_report, mark: str, scripts: str, remediation: str = MANUAL_KIND)
     if not findings:
         print(f"{COLLECTOR} gave no candidate; nothing to plant.", file=sys.stderr)
         return 1
-    repo = audit_report.resolve_repo(audit_id=AUDIT)
+    repo = audit_report.resolve_repo_or_no_forge(AUDIT)
     now = datetime.now(timezone.utc) - PLANTED_RUN_AGE
     envelope = audit_report.report_envelope(
         AUDIT,
@@ -187,7 +187,7 @@ def plant(audit_report, mark: str, scripts: str, remediation: str = MANUAL_KIND)
 
 
 def teardown(audit_report, mark: str) -> int:
-    repo = audit_report.resolve_repo(audit_id=AUDIT)
+    repo = audit_report.resolve_repo_or_no_forge(AUDIT)
     directory = audit_report.reports_dir_for(AUDIT, repo)
     candidates = [directory / audit_report.REPORT_LATEST_NAME]
     candidates += sorted((directory / audit_report.REPORT_RUNS_DIR).glob("*.json"))

@@ -28,12 +28,12 @@
 # later run with equal evidence and severity, and the checks would read old
 # text. A plant lost before grading is an error, never a pass.
 #
-# THE NEGATIVE CONTROL, by hand: the same stack with `planted_remediation:
-# gcloud-same` plants the command on equal evidence. `finish` carries it, and
-# the range check and the mark check both fail. That carry is `main` as
-# designed: a wrong `gcloud` remediation one run published stays on every
-# later run until the evidence or the severity changes
-# (gke-labs/kube-agents#5880).
+# THE CONTROL is a case of its own, fleet-audit-wrong-kept-remediation-gives-way:
+# the same stack with `planted_remediation: gcloud-same` plants the command on
+# equal evidence. `finish` kept that command, range and mark, until it got its
+# two content rules for a kept remediation (gke-labs/kube-agents#5880); the
+# same four checks then failed on the range and on the mark. With the rules
+# the planted command gives way to this run's own.
 #
 # Planted defect required: drift-outlier (bench/tf/fleet/fixtures.json).
 # Isolation class: cluster-read-only, GitOps-repo write, as for

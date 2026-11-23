@@ -1290,6 +1290,16 @@
 # sandbox. No fixture.
 ./tasks/fleet-audit-unread-target-keeps-finding/task.yaml
 
+# A wrong remediation that a previous run published does not stay (#5880):
+# prebuilt/unchanged-finding-wording (planted_remediation: gcloud-same) plants
+# a previous run with this run's evidence and a marked gcloud command that
+# gives a literal range. finish judges the kept command by its two content
+# rules and publishes this run's own; the four checks of
+# fleet-audit-remediation-right-and-not-stale read the stored finding as
+# data. Fixture: drift-outlier. A tofu case, so it holds the infra lock, and
+# its run is a full drift audit.
+./tasks/fleet-audit-wrong-kept-remediation-gives-way/task.yaml
+
 # The GCE compute stream's chat route (#2386): a plain question about the
 # fleet's VMs runs the collector once and answers in chat, with no ledger run.
 # Reads the startup-fail-vm role (#2483), a VM whose startup script exits 1 on
