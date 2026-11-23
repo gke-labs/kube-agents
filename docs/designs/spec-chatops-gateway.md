@@ -994,7 +994,7 @@ conversation needs a pod, the gateway evicts the one idle longest - a live pod w
 has no task at all, oldest last user message first - and posts one line in that conversation: its
 session was paused to make room, and its next message starts fresh with the conversation so far.
 Over the cap (after the cap is lowered, say), it evicts the idle surplus too, so the count comes back
-to the cap rather than staying over it. Only with too few idle pods to get under the cap is the turn refused, with the notice it always had, naming the count left. The check is serialized, and a slot
+to the cap rather than staying over it. With too few idle pods to get under the cap, a chat turn waits in line instead (#6882): a bounded first-in, first-out line of up to 20 conversations, kept in the gateway's memory. It gets one post, `⏳ queued — every session worker is busy and yours is next in line` (or how many conversations are ahead of it), which is edited as the line moves and makes no promise about time. The turn returns as a refused one does, leaving the record as it was, so no inbound worker waits. When a slot may have freed (a task ends, a pod is deleted, a granted slot ends without a pod) and every 15 seconds anyway, the oldest waiter's message goes back on its conversation's inbox and through the same check, count and eviction as any turn, and on to the same pod a fresh turn would get. A conversation arriving while the line is not empty queues behind it rather than taking a slot or evicting for itself. A later message in a waiting conversation waits behind its turn and reaches the task that turn starts as a steer; a status question is answered with the place in line; a `stop`, typed or as a programmatic cancel, takes the turn out of the line and says so. After five minutes in line, or with the line full, the turn is refused with the notice it always had, naming the count left. A door's turn (inject, A2A) never waits: its caller holds the turn to a bound and keeps the refusal. A gateway that stops tells each waiting turn it was not started; one that dies loses them, as it loses a turn in flight. The check is serialized, and a slot
 granted counts as live until its pod is created (or for two minutes), so conversations arriving
 together can't all pass on one count: before that, a burst of 10 on 9 live pods reached 19 (#6033). A conversation running
 anything (a task, a stopped task finishing, a delegated child whose wake will need the pod) is
@@ -2358,7 +2358,7 @@ and its reply says to send it in the question's thread instead; the adapter mark
 a message top-level (`InboundMessage.TopLevel`, set for a top-level Slack or Google Chat
 DM), and the gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
 nothing running gets "nothing is running": the plain reply when the conversation has
-never run a task (a question refused at the session cap, say), and otherwise one that
+never run a task (a question refused at the session cap, or taken out of its line, say), and otherwise one that
 adds that if the agent filed a card, that card keeps working until it finishes, since
 `stop` cannot reach a card (gke-labs#3263). With `A2A_CARD_STOP=true` the second case
 stops the conversation's cards instead (Stop, above). A top-level status question matches the exact
