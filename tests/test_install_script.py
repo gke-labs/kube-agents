@@ -10312,6 +10312,96 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertTrue(log_file.exists())
         self.assertIn("Apply complete", log_file.read_text())
 
+    def _wait_for(self, condition, what, proc):
+        deadline = time.monotonic() + _INSTALLER_RUN_TIMEOUT_SECONDS
+        while not condition():
+            if time.monotonic() > deadline:
+                os.killpg(proc.pid, signal.SIGKILL)
+                raise AssertionError(f"{what} within {_INSTALLER_RUN_TIMEOUT_SECONDS}s")
+            time.sleep(0.05)
+
+    def test_one_ctrl_c_lets_the_apply_shut_down_and_log_it(self):
+        """Ctrl-C reaches every process in the foreground group. The tee that
+        copies the apply to the log must outlive it, or the next line
+        lifecycle.sh prints meets a closed pipe and SIGPIPE ends the apply
+        before Terraform has saved state and released the lock (#6902).
+
+        The stub lifecycle.sh stands in for that shutdown: it holds a lock
+        file, traps INT, and after the signal prints, removes the lock and
+        prints again. It writes nothing after the signal until the test lets
+        it, so on a tee that dies of SIGINT the pipe is closed by then."""
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lock = self._tmp_path / "state.lock"
+        trapped = self._tmp_path / "trapped"
+        release = self._tmp_path / "release"
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text(f"""#!/bin/bash
+interrupted=""
+trap 'interrupted=1' INT
+: > "{lock}"
+echo "apply started"
+while [ -z "$interrupted" ]; do sleep 0.1; done
+: > "{trapped}"
+while [ ! -e "{release}" ]; do sleep 0.1; done
+echo "Interrupt received. Gracefully shutting down..."
+rm -f "{lock}"
+echo "state saved, lock released"
+exit 1
+""")
+        lifecycle_sh.chmod(0o755)
+        log_file = self._tmp_path / "provision.log"
+        script = f"""
+source "{_INSTALLER_COMMON}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        env = get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._report_file),
+        })
+        out_path = self._tmp_path / "stdout"
+        err_path = self._tmp_path / "stderr"
+        with open(out_path, "w") as out, open(err_path, "w") as err:
+            # A process group of its own, so the signal reaches what a
+            # terminal's Ctrl-C reaches and not the test runner. SIGINT at its
+            # default: a runner started with it ignored (a `&` job of a
+            # non-interactive shell) would hand that on, and nothing here
+            # would then see the signal.
+            proc = subprocess.Popen(
+                ["bash", "-c", script], stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                env=env, cwd=str(_REPO_ROOT), start_new_session=True,
+                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+            )
+            try:
+                self._wait_for(
+                    lambda: log_file.exists() and "apply started" in log_file.read_text(),
+                    "the apply's first line never reached the log", proc)
+                os.killpg(proc.pid, signal.SIGINT)
+                self._wait_for(trapped.exists, "the stub never saw SIGINT", proc)
+                # Only how surely an unfixed tee is gone before the stub's next
+                # write depends on this pause; a tee that ignores SIGINT is
+                # there however long it is.
+                time.sleep(0.5)
+                release.write_text("")
+                returncode = proc.wait(timeout=_INSTALLER_RUN_TIMEOUT_SECONDS)
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+        log = log_file.read_text()
+        stderr = err_path.read_text()
+        self.assertFalse(lock.exists(), f"the apply died holding the lock; log:\n{log}\nstderr:\n{stderr}")
+        self.assertIn("Gracefully shutting down", log)
+        self.assertIn("state saved, lock released", log)
+        self.assertIn("state saved, lock released", out_path.read_text())
+        # The interrupted apply is reported as the failed command, as any
+        # other apply that exits non-zero is.
+        self.assertEqual(returncode, 1, stderr)
+        self.assertIn("(exit code 1): ./lifecycle.sh apply -auto-approve -input=false", stderr)
+        self.assertNotIn("tee ", stderr)
+
     def test_a_failure_inside_a_sourced_library_names_its_file_and_function(self):
         """The abort banner points at the frame that failed.
 
