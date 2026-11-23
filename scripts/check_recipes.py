@@ -6,7 +6,10 @@ For every agents/platform/scripts/fix_recipes/<kind>/:
 - the registry loads it (fields, values, directory named after its kind);
 - its `eval_case` names a bench/tasks/<case>/task.yaml whose
   `post_merge_outcome` check carries `recipe: <kind>` (the one place a case
-  names its recipe; bench/tests/test_recipe_eval_cases.py holds the reverse);
+  names its recipe). Other cases may grade the same recipe, but every case's
+  `recipe` must be a recipe that exists, so renaming or deleting a recipe
+  cannot strand its cases (bench/tests/test_recipe_eval_cases.py holds the
+  same link for the bench suite);
 - no file in it still carries the scaffold's RECIPE-TEMPLATE marker, and a
   `fix.py` or `checks.py` defines what the scaffold says it must.
 
@@ -96,6 +99,17 @@ def recipe_problems(recipes_dir: Path = RECIPES, tasks_dir: Path = TASKS) -> lis
                 missing = [n for n in REQUIRED_NAMES[path.name] if n not in defined]
                 if missing:
                     problems.append(f"{where}/{path.name}: does not define {', '.join(missing)}")
+    kinds = {recipe.kind for recipe in recipes}
+    for task in sorted(tasks_dir.glob("*/task.yaml")):
+        try:
+            graded = case_recipes(task)
+        except yaml.YAMLError:
+            continue  # bench-case-check reports a case that does not parse
+        for kind in sorted(graded - kinds):
+            problems.append(
+                f"bench/tasks/{task.parent.name}/task.yaml: its post_merge_outcome check grades recipe {kind!r}, "
+                f"which has no fix_recipes/{kind}/recipe.yaml"
+            )
     return problems
 
 

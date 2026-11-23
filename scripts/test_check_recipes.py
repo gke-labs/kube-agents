@@ -61,6 +61,23 @@ class RecipeCheckTest(unittest.TestCase):
         self.tree.case("case-a", "no-pdb")
         self.assertEqual(self.tree.problems(), [])
 
+    def test_several_cases_may_grade_one_recipe(self):
+        # The eval case is the recipe's primary case; others grade other outcomes.
+        self.tree.recipe("no-pdb")
+        self.tree.case("case-a", "no-pdb")
+        self.tree.case("case-b", "no-pdb")
+        self.tree.case("case-c", None)
+        self.assertEqual(self.tree.problems(), [])
+
+    def test_a_case_may_not_grade_a_recipe_that_does_not_exist(self):
+        self.tree.recipe("no-pdb")
+        self.tree.case("case-a", "no-pdb")
+        self.tree.case("case-b", "renamed-away")
+        self.assertEqual(self.tree.problems(), [
+            "bench/tasks/case-b/task.yaml: its post_merge_outcome check grades recipe 'renamed-away', "
+            "which has no fix_recipes/renamed-away/recipe.yaml"
+        ])
+
     def test_the_eval_case_must_exist_and_name_the_recipe(self):
         self.tree.recipe("no-pdb", case="")
         self.tree.recipe("blocking-pdb", case="missing-case")
