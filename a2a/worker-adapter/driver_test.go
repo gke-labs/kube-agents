@@ -640,6 +640,26 @@ var productionDriverToolSteps = []struct {
 		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2"},{"type":"tool_result","tool_use_id":"t3"}]}}`,
 		`{"type":"result","subtype":"success","result":"done"}`,
 	}, 3},
+	// agy 1.5.13 as recorded: one shell step that ends DONE, across two
+	// turns, and one that ends ERROR when headless approval was refused.
+	{"agy done", agyDriver{}, agyFixtureLines("tool"), 1},
+	{"agy error", agyDriver{}, agyFixtureLines("deny"), 1},
+}
+
+// agyFixtureLines is testdata/agy/<name>.jsonl's lines, read when the table
+// is built.
+func agyFixtureLines(name string) []string {
+	raw, err := os.ReadFile(filepath.Join("testdata", "agy", name+".jsonl"))
+	if err != nil {
+		panic(err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
 }
 
 // TestEveryDriverEmitsOneToolResultPerToolStep: the write-refusal stop reads
