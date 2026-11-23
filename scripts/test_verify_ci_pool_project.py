@@ -4939,6 +4939,11 @@ FLEET_RESOURCE_ROLES = {
     "google_gke_hub_membership": {"roles/gkehub.editor", "roles/container.admin"},
     "google_gke_hub_feature": {"roles/gkehub.editor"},
     "google_gke_hub_feature_membership": {"roles/gkehub.editor"},
+    # The post-merge sync's deploy key: no project role. The provisioning
+    # script grants secretAccessor on that one secret
+    # (scripts/provision_ci_pool_post_merge_sync.sh), so the reconciler reads
+    # no other secret in the project.
+    "google_secret_manager_secret_version": set(),
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
@@ -5006,7 +5011,7 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # config_connector.py and orphan_snapshot.py the ones the terraform_data
     # local-execs run, not something tofu loads; their calls are accounted for
     # on the external and terraform_data types above.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py"}
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py", "repo_sync.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.

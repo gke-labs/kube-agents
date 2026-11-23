@@ -93,3 +93,15 @@ variable "post_merge_sync_projects" {
   type        = list(string)
   default     = []
 }
+
+variable "post_merge_gitops_repo" {
+  description = "The `<owner>/<repo>` GitHub repository seeded-a's Config Sync reads the seeded-post-merge namespace from (post-merge-sync.tf). Empty is the pool convention, `gke-agentic/<project_id>-infra`; a dev project names the GitOps repository its install writes to, which scripts/provision_ci_pool_post_merge_sync.sh takes as its second argument."
+  type        = string
+  default     = ""
+}
+
+variable "post_merge_gitops_branch" {
+  description = "The branch of post_merge_gitops_repo Config Sync reads: the default branch, the one a merged remediation pull request lands on."
+  type        = string
+  default     = "main"
+}

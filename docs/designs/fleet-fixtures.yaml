@@ -74,6 +74,20 @@ fixtures:
       Two replicas with no PodDisruptionBudget. Two rather than one because the
       reliability SOP flags spec.replicas >= 2 only.
 
+  - role: post-merge-sync-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/order-ledger
+      - reposync/repo-sync
+    namespace: seeded-post-merge
+    defect: >-
+      None at steady state: two replicas whose budget is merged in the pool
+      project's GitOps repository and applied by Config Sync. The defect, a
+      missing budget, exists only while post-merge-verified-fixed runs: its
+      setup removes the file, the agent's fix is merged and applied, and the
+      setup's teardown puts the file back.
+
   - role: declared-no-pdb-workload
     slot: a
     available_from_day: 0
