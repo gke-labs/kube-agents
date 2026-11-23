@@ -134,7 +134,7 @@ and rejects `--allowed-callers`, `CREDENTIAL_PROXY_SESSION_AUDIENCE`, and
 bridge. `--upstream-url=<url>` (`KUBE_PROXY_UPSTREAM_URL`) forwards
 `in-cluster` requests to one static `http://` or `https://` endpoint through `upstream.NewStatic`
 (`StaticConfig`, `StaticTransport`) without cloud credentials. It rejects `--host-cluster-id`,
-`--container-api-url`, `--scope-file`, `--exclude-host-cluster-id`, and
+`--container-api-url`, `--scope-file`, `--hold-file`, `--exclude-host-cluster-id`, and
 `CREDENTIAL_PROXY_SCOPED_SA_POOL`, and sets `Config.DefaultClusterID` to `in-cluster` so bare
 `/api/...` and `/clusters/in-cluster/...` paths both work (`SplitClusterPathWithDefault`).
 `--deny-streaming` (`KUBE_PROXY_DENY_STREAMING`, `Policy.DenyStreaming`) refuses `watch` requests,
