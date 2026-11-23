@@ -5,7 +5,8 @@ Run: cd scripts && python3 -m unittest test_reconcile_skill_upstream
 
 Nothing reaches the network: each test gives the client an opener that answers from a
 small model of GitHub in memory. The model keeps its state between calls, so a test can
-run the script two times and read what the second run sends.
+run the script two times and read what the second run sends. The workflow file is read
+as YAML, because a wrong trigger, gate or permission shows only on a runner.
 """
 
 import contextlib
@@ -30,6 +31,7 @@ if str(_HERE) not in sys.path:
 import reconcile_skill_upstream as reconciler
 import skill_overlay as overlay
 
+WORKFLOW_FILE = _HERE.parent / ".github" / "workflows" / "skill-upstream-tracking.yml"
 REPO = "o/r"
 NOW = datetime.datetime(2026, 12, 1, 12, 0, tzinfo=datetime.timezone.utc)
 OLD = "2026-10-01T00:00:00Z"
@@ -778,6 +780,84 @@ class RealTreeTest(unittest.TestCase):
         listed = sorted(line.split()[1] for line in out.getvalue().splitlines() if line.startswith("open     "))
         self.assertEqual(listed, general)
         self.assertEqual({method for method, _ in github.calls}, {"GET"})
+
+
+class WorkflowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.document = yaml.safe_load(WORKFLOW_FILE.read_text())
+        # A bare `on:` key reads as the boolean True (YAML 1.1).
+        cls.on = cls.document.get("on") or cls.document.get(True)
+        cls.jobs = cls.document["jobs"]
+
+    def test_the_three_triggers(self):
+        self.assertEqual(set(self.on), {"push", "schedule", "workflow_dispatch"})
+        self.assertEqual(self.on["push"], {"branches": ["main"], "paths": ["agents/platform/skill-overlays/**"]})
+        self.assertEqual(len(self.on["schedule"]), 1)
+        dry_run = self.on["workflow_dispatch"]["inputs"]["dry_run"]
+        self.assertEqual((dry_run["type"], dry_run["default"]), ("boolean", True))
+
+    def test_the_push_paths_are_the_folder_that_the_script_reads(self):
+        with mock.patch.object(overlay, "REPO_ROOT", _HERE.parent):
+            root = overlay.rel(_HERE.parent.joinpath(*OVERLAY_PARTS))
+        self.assertEqual(self.on["push"]["paths"], [f"{root}/**"])
+        self.assertEqual(overlay.OVERLAY_ROOT, _HERE.parent.joinpath(*OVERLAY_PARTS))
+
+    def test_each_job_has_the_repository_guard(self):
+        for name, job in self.jobs.items():
+            self.assertIn("github.repository == 'gke-labs/kube-agents' &&", job["if"], name)
+
+    def test_the_gate_holds_the_push_run_and_the_daily_run(self):
+        condition = " ".join(self.jobs["reconcile"]["if"].split())
+        self.assertIn(
+            "((github.event_name == 'workflow_dispatch' && !inputs.dry_run) || "
+            "(github.event_name != 'workflow_dispatch' && vars.SKILL_UPSTREAM_TRACKING == 'on'))",
+            condition,
+        )
+        dry = " ".join(self.jobs["dry-run"]["if"].split())
+        self.assertTrue(dry.endswith("github.event_name == 'workflow_dispatch' && inputs.dry_run"), dry)
+
+    def test_the_permissions_are_the_least_that_each_job_needs(self):
+        self.assertEqual(self.document["permissions"], {})
+        self.assertEqual(self.jobs["reconcile"]["permissions"], {"contents": "read", "issues": "write"})
+        self.assertEqual(self.jobs["dry-run"]["permissions"], {"contents": "read", "issues": "read"})
+
+    def test_the_runs_that_write_share_one_group_and_a_dry_run_has_its_own(self):
+        concurrency = self.document["concurrency"]
+        self.assertEqual(
+            concurrency["group"],
+            "${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.dry_run "
+            "&& github.run_id || 'write' }}",
+        )
+        self.assertIs(concurrency["cancel-in-progress"], False)
+
+    def test_only_the_dry_run_job_passes_the_dry_run_flag(self):
+        def commands(job):
+            return [step["run"] for step in self.jobs[job]["steps"] if "run" in step]
+
+        self.assertEqual(commands("dry-run"), ["python3 scripts/reconcile_skill_upstream.py --dry-run"])
+        self.assertEqual(commands("reconcile"), ["python3 scripts/reconcile_skill_upstream.py"])
+
+    def test_no_expression_goes_into_a_shell_line(self):
+        for name, job in self.jobs.items():
+            for step in job["steps"]:
+                self.assertNotIn("${{", step.get("run", ""), name)
+
+    def test_the_checkout_keeps_no_credential(self):
+        for name, job in self.jobs.items():
+            (checkout,) = [step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+            self.assertIs(checkout["with"]["persist-credentials"], False, name)
+
+    def test_the_job_that_writes_checks_out_main_and_the_dry_run_its_own_ref(self):
+        def checkout(job):
+            (step,) = [step for step in self.jobs[job]["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+            return step["with"]
+
+        self.assertEqual(checkout("reconcile").get("ref"), "main")
+        self.assertNotIn("ref", checkout("dry-run"))
+
+    def test_the_body_links_this_workflow_file(self):
+        self.assertTrue((_HERE.parent / reconciler.WORKFLOW_PATH).samefile(WORKFLOW_FILE))
 
 
 if __name__ == "__main__":
