@@ -3929,7 +3929,7 @@ class PlainStatusAndDryRunTests(unittest.TestCase):
                 )
 
     def test_announce_failed_targets_translates_unresolved_scope_row_in_chat(self) -> None:
-        announced: dict[str, Any] = {}
+        announced: dict = {}
         failures = {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW: "resolved-scope.json is missing"}
         lines = watch.announce_failed_targets(
             announced,
