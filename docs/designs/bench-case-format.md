@@ -232,7 +232,9 @@ lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. devops-bench ignores the key.
+run beside the case's runs and grade their ledger. The key also has the runner release the
+stream's in-flight note before the unit. It gives no ledger reset: the runner resets a ledger for
+a `ledger_issue_contains` check only. devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
 clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never

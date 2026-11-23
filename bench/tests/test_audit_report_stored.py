@@ -608,3 +608,29 @@ def test_the_remediation_cases_safeguard_tells_a_written_command_from_a_run(case
         assert WorkerCommandsVerifier(**check).verify(5.0).status == status
     finally:
         transcript.clear()
+
+
+STORE = "/opt/data/fleet-audit/reports"
+
+
+@pytest.mark.parametrize(
+    ("command", "status"),
+    [
+        (f"ls {STORE}/", "fail"),
+        (f"cat {STORE}/acme/infra/fleet-consistency-drift/latest.json", "fail"),
+        ("python3 /opt/data/skills/fleet-audit-reports/scripts/report_query.py --audit fleet-consistency-drift", "fail"),
+        (f"python3 {SCRIPTS}/audit_report.py start --audit fleet-consistency-drift", "pass"),
+        (f"python3 {SCRIPTS}/audit_report.py finish --audit fleet-consistency-drift --findings-file {DRAFT}", "pass"),
+        # The reach of the three patterns, held as it is: a read that spells the store another way is not seen.
+        ("ls $FLEET_AUDIT_REPORTS_DIR/acme/infra/fleet-consistency-drift/runs/", "pass"),
+    ],
+    ids=["the-store-path", "latest-json", "the-query-script", "start", "finish", "the-store-by-its-variable"],
+)
+def test_the_controls_guard_on_the_store_sees_a_read_by_its_three_spellings(command, status):
+    spec = yaml.safe_load((REPO / "bench" / "tasks" / REMEDIATION_CASES[1] / "task.yaml").read_text())["verification_spec"]
+    (check,) = [entry["check"] for entry in spec if entry["name"] == "the-store-was-not-read"]
+    transcript.set(output="", trajectory=[], worker_commands=[{"task": "t_1", "command": command}])
+    try:
+        assert WorkerCommandsVerifier(**check).verify(5.0).status == status
+    finally:
+        transcript.clear()

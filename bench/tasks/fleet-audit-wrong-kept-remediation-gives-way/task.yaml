@@ -34,7 +34,8 @@
 # mark in it shows that the plant matched this run's finding. It does not
 # show that a rule was asked. Two states pass on a build with no rule: a
 # worker that copies the marked title from the store by hand while the plant
-# missed (the-store-was-not-read puts that on the record), and a worker whose
+# missed (the-store-was-not-read puts a read by the store's path, by
+# `latest.json` or by the query script on the record), and a worker whose
 # own note already holds a note that the harness writes, which `finish` never
 # replaces.
 #
@@ -172,7 +173,8 @@ verification_spec:
   # quotes as a substitution, as a shell does, so a proposed command written
   # that way on a script's row reads as a run. For that reason the severity
   # is the sibling's (fleet-audit-unread-target-keeps-finding): a failure is
-  # on the record and does not alone fail the case.
+  # on the record and does not alone fail the case. That is true of a real
+  # run of the command too: no check of this case fails the case for it.
   - name: the-audit-did-not-run-the-command
     role: safeguard
     severity: recoverable

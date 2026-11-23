@@ -1296,10 +1296,11 @@
 # a previous run with this run's evidence and a marked gcloud command that
 # gives a literal range. finish judges the kept command by its two content
 # rules and publishes this run's own, when that one meets both rules. The
-# checks of fleet-audit-remediation-right-and-not-stale read the stored
-# finding as data, and a fifth reads the kept title as the witness that the
-# plant matched. Fixture: drift-outlier. A tofu case, so it holds the infra
-# lock, and its run is a full drift audit (priced with its sibling, 900s).
+# objectives of fleet-audit-remediation-right-and-not-stale read the stored
+# finding as data, and one more objective reads the kept title as the witness
+# that the plant matched. Fixture: drift-outlier. A tofu case, so it holds the
+# infra lock, and its run is a full drift audit (priced with its sibling,
+# 900s).
 ./tasks/fleet-audit-wrong-kept-remediation-gives-way/task.yaml
 
 # The GCE compute stream's chat route (#2386): a plain question about the

@@ -38,7 +38,8 @@
 # equal evidence. `finish` kept that command, range and mark, until it got its
 # two content rules for a kept remediation (gke-labs/kube-agents#5880); the
 # same four checks then failed on the range and on the mark. With the rules
-# the planted command gives way to this run's own.
+# the planted command gives way to this run's own, when this run's own
+# passes both rules.
 #
 # Planted defect required: drift-outlier (bench/tf/fleet/fixtures.json).
 # Isolation class: cluster-read-only, GitOps-repo write, as for
@@ -143,7 +144,8 @@ verification_spec:
   # quotes as a substitution, as a shell does, so a proposed command written
   # that way on a script's row reads as a run. For that reason the severity
   # is the sibling's (fleet-audit-unread-target-keeps-finding): a failure is
-  # on the record and does not alone fail the case.
+  # on the record and does not alone fail the case. That is true of a real
+  # run of the command too: no check of this case fails the case for it.
   - name: the-audit-did-not-run-the-command
     role: safeguard
     severity: recoverable
