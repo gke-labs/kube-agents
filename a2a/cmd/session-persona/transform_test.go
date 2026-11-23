@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	personafmt "github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // The real sources, relative to this package: the tests build the shipped
@@ -393,6 +395,7 @@ func TestWorkerImageShipsTheTreeWhereTheHarnessReadsIt(t *testing.T) {
 	for _, want := range []string{
 		"COPY --from=build " + run[1] + "/" + personaFile + " " + home[1] + "/" + personaFile,
 		"COPY --from=build " + run[1] + "/" + skillsDir + "/ " + home[1] + "/" + skillsDir + "/",
+		"COPY --from=build " + run[1] + "/" + personafmt.IntegrityManifestFile + " " + home[1] + "/" + personafmt.IntegrityManifestFile,
 	} {
 		if !strings.Contains(df, want) {
 			t.Errorf("Dockerfile lacks %q", want)
