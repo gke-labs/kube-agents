@@ -123,8 +123,14 @@ def _token(fake):
     return fake.object["metadata"]["annotations"][run_now.RUN_NOW_ANNOTATION]
 
 
+NONCE = "apply-nonce-1"
+# The operator's stamp of a run accepted just after the fire (POD_NOW).
+AFTER_FIRE = "2026-11-23T17:00:05Z"
+BEFORE_FIRE = "2026-11-23T16:40:00Z"
+
+
 def _fired(fake):
-    run_now.fire(fake, NAME, STATE)
+    run_now.fire(fake, NAME, STATE, NONCE)
     return json.loads(fake.files[STATE])
 
 
@@ -136,7 +142,7 @@ def test_idle_refuses_a_schedule_that_is_not_built_in():
     with pytest.raises(SystemExit, match="not built-in"):
         run_now.idle(fake, NAME, 60)
     with pytest.raises(SystemExit, match="not built-in"):
-        run_now.fire(FakeKubectl(labels={}), NAME, STATE)
+        run_now.fire(FakeKubectl(labels={}), NAME, STATE, NONCE)
 
 
 def test_idle_waits_for_the_run_in_flight_to_settle():
@@ -160,6 +166,7 @@ def test_fire_records_the_pods_clock_before_it_sets_a_fresh_token():
     assert [entry[0] for entry in fake.log] == ["findings_snapshot", "pod_now", "write_state", "annotate"]
     assert state["findings_snapshot"] == fake.snapshot
     assert state["fired_at"] == POD_NOW
+    assert state["nonce"] == NONCE
     assert datetime.fromisoformat(state["fired_at"]).tzinfo is not None
     assert state["schedule"] == NAME
     assert state["known_tasks"] == ["t0", "t1"]
@@ -172,7 +179,7 @@ def test_a_snapshot_that_failed_stops_the_fire():
     fake = FakeKubectl()
     fake.snapshot = {"rows": None, "count": 0, "error": "SESSION_KV_API_KEY is not set in the agent container"}
     with pytest.raises(SystemExit, match="could not be read before the fire"):
-        run_now.fire(fake, NAME, STATE)
+        run_now.fire(fake, NAME, STATE, NONCE)
     assert ("annotate", ) not in [entry[:1] for entry in fake.log if entry[0] == "annotate"]
     assert run_now.RUN_NOW_ANNOTATION not in fake.object["metadata"]["annotations"]
 
@@ -182,7 +189,7 @@ def test_a_schedule_that_is_not_a_name_never_reaches_kubectl(bad):
     fake = FakeKubectl()
     for step in (
         lambda: run_now.idle(fake, bad, 60),
-        lambda: run_now.fire(fake, bad, STATE),
+        lambda: run_now.fire(fake, bad, STATE, NONCE),
         lambda: run_now.wait(fake, bad, STATE, 60, 60),
         lambda: run_now.clean(fake, bad, STATE),
     ):
@@ -198,7 +205,7 @@ def test_two_fires_set_two_tokens():
 def test_fire_refuses_a_run_claimed_since_idle():
     fake = FakeKubectl(status={"pendingSlot": {"idempotencyKey": "schedule/x"}})
     with pytest.raises(SystemExit, match="not firing over it"):
-        run_now.fire(fake, NAME, STATE)
+        run_now.fire(fake, NAME, STATE, NONCE)
     assert fake.log == []
 
 
@@ -208,7 +215,7 @@ def test_fire_refuses_a_run_claimed_since_idle():
 def _accept(task):
     def step(obj):
         token = obj["metadata"]["annotations"][run_now.RUN_NOW_ANNOTATION]
-        _status(obj, lastHandledRunNow=token, activeTaskID=task, pendingSlot=None)
+        _status(obj, lastHandledRunNow=token, activeTaskID=task, activeTaskStartedAt=AFTER_FIRE, pendingSlot=None)
 
     return step
 
@@ -382,50 +389,134 @@ def test_clean_leaves_a_token_someone_else_set():
     assert ("annotate", None) not in fake.log
 
 
+def _stops(fake):
+    return [entry for entry in fake.log if entry[:2] == ("annotate", run_now.STOP_ANNOTATION)]
+
+
+def _stop_clean(fake, nonce=NONCE):
+    run_now.clean(fake, NAME, STATE, stop_run=True, nonce=nonce)
+
+
 def test_a_failed_apply_stops_the_fired_run_in_flight():
     fake = FakeKubectl()
     _fired(fake)
     fake.script = [_accept("t-slow")]
     with pytest.raises(SystemExit):
         run_now.wait(fake, NAME, STATE, 60, 660)
-    run_now.clean(fake, NAME, STATE, stop_run=True)
-    stops = [entry for entry in fake.log if entry[:2] == ("annotate", run_now.STOP_ANNOTATION)]
+    _stop_clean(fake)
+    stops = _stops(fake)
     assert len(stops) == 1 and stops[0][2].startswith(run_now.TOKEN_PREFIX)
     assert fake.object["metadata"]["annotations"][run_now.STOP_ANNOTATION] == stops[0][2]
+    assert run_now.RUN_NOW_ANNOTATION not in fake.object["metadata"]["annotations"]
     assert STATE not in fake.files
 
 
-def test_a_failed_apply_before_the_task_was_seen_still_stops_it():
-    """A SIGTERM between the fire and the first poll that named the task."""
+def test_the_run_now_annotation_goes_before_any_stop():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [_accept("t-slow")]
+    _stop_clean(fake)
+    order = [entry for entry in fake.log if entry[0] == "annotate"]
+    assert order[-2] == ("annotate", None)
+    assert order[-1][:2] == ("annotate", run_now.STOP_ANNOTATION)
+
+
+def test_a_failed_apply_before_the_task_was_seen_stops_a_new_task_started_after_the_fire():
+    """SIGTERM between the fire and the first poll that named the task: handled, new, started after the fire."""
     fake = FakeKubectl()
     _fired(fake)
     fake.script = [_accept("t-new")]
-    run_now.clean(fake, NAME, STATE, stop_run=True)
-    assert run_now.STOP_ANNOTATION in fake.object["metadata"]["annotations"]
+    _stop_clean(fake)
+    assert len(_stops(fake)) == 1
 
 
-def test_a_failed_apply_while_the_claim_is_pending_stops_it():
-    """SIGTERM just after the fire: the claim is pending with no task; a stop set now waits for it, then stops it."""
+def test_a_handled_token_with_an_active_task_from_before_the_fire_is_not_stopped():
     fake = FakeKubectl()
     _fired(fake)
-    fake.script = [lambda o: _status(o, pendingSlot={"runNow": _token(fake), "idempotencyKey": "run-now/x"})]
-    run_now.clean(fake, NAME, STATE, stop_run=True)
-    assert run_now.STOP_ANNOTATION in fake.object["metadata"]["annotations"]
+    fake.script = [
+        lambda o: _status(o, lastHandledRunNow=_token(fake), activeTaskID="t-adopted", activeTaskStartedAt=BEFORE_FIRE)
+    ]
+    _stop_clean(fake)
+    assert _stops(fake) == []
 
 
-def test_a_failed_apply_before_the_token_is_handled_stops_too():
+def test_our_pending_claim_is_stopped():
+    """The claim names our token (pendingSlot.runNow); a stop set now waits for it, then stops that run."""
     fake = FakeKubectl()
     _fired(fake)
-    run_now.clean(fake, NAME, STATE, stop_run=True)
-    assert run_now.STOP_ANNOTATION in fake.object["metadata"]["annotations"]
+    claim = lambda o: _status(o, pendingSlot={"runNow": _token(fake), "idempotencyKey": "run-now/x"})  # noqa: E731
+    token = _token(fake)
+    fake.script = [claim, lambda o: None]
+    _stop_clean(fake)
+    assert len(_stops(fake)) == 1
+    assert fake.object["status"]["pendingSlot"]["runNow"] == token
 
 
-def test_a_run_now_the_gateway_refused_is_not_stopped():
+def test_a_failure_after_the_fire_before_the_claim_removes_the_token_and_stops_nothing():
+    """Unclaimed: removing the run-now annotation is what keeps it from running; a stop would be consumed at once."""
     fake = FakeKubectl()
     _fired(fake)
-    fake.script = [lambda o: _status(o, lastHandledRunNow=_token(fake), pendingSlot=None)]
-    run_now.clean(fake, NAME, STATE, stop_run=True)
-    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
+    _stop_clean(fake)
+    assert run_now.RUN_NOW_ANNOTATION not in fake.object["metadata"]["annotations"]
+    assert _stops(fake) == []
+
+
+def test_a_claim_that_raced_the_removal_is_the_only_thing_stopped():
+    fake = FakeKubectl()
+    state = _fired(fake)
+    # The first read sees nothing claimed; by the re-read after the removal, the claim landed.
+    fake.script = [lambda o: None, lambda o: _status(o, pendingSlot={"runNow": state["token"], "idempotencyKey": "run-now/x"})]
+    _stop_clean(fake)
+    assert run_now.RUN_NOW_ANNOTATION not in fake.object["metadata"]["annotations"]
+    assert len(_stops(fake)) == 1
+
+
+def test_a_refused_run_now_while_a_cadence_run_is_active_is_not_stopped():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [
+        lambda o: _status(o, lastHandledRunNow=_token(fake), pendingSlot=None, activeTaskID="", activeTaskStartedAt=None),
+        lambda o: _status(o, activeTaskID="t-cadence", activeTaskStartedAt=BEFORE_FIRE),
+    ]
+    _stop_clean(fake)
+    assert _stops(fake) == []
+
+
+def test_with_a_recorded_task_a_different_task_is_never_stopped():
+    """Once the wait has named the fired task, only that task is stopped, even under our handled token."""
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.files[STATE] = json.dumps(json.loads(fake.files[STATE]) | {"task_id": "t-fired"})
+    fake.script = [lambda o: _status(o, lastHandledRunNow=_token(fake), activeTaskID="t-cadence", activeTaskStartedAt=AFTER_FIRE)]
+    _stop_clean(fake)
+    assert _stops(fake) == []
+
+
+def test_a_pre_fire_failure_with_a_leftover_state_file_stops_nothing():
+    """An earlier apply's state file (old token, no task) and this apply failing in idle: not this apply's."""
+    fake = FakeKubectl()
+    old = _fired(fake)
+    old["nonce"] = "an-earlier-apply"
+    fake.files[STATE] = json.dumps(old)
+    fake.object["metadata"]["annotations"].pop(run_now.RUN_NOW_ANNOTATION)
+    fake.script = [lambda o: _status(o, activeTaskID="t-cadence", activeTaskStartedAt=AFTER_FIRE, lastHandledRunNow=old["token"])]
+    _stop_clean(fake)
+    assert _stops(fake) == []
+
+
+def test_a_state_file_without_a_nonce_stops_nothing():
+    fake = FakeKubectl()
+    _fired(fake)
+    fake.script = [_accept("t-slow")]
+    run_now.clean(fake, NAME, STATE, stop_run=True, nonce=None)
+    assert _stops(fake) == []
+
+
+def test_reset_removes_a_leftover_state_file():
+    fake = FakeKubectl()
+    fake.files[STATE] = json.dumps({"token": "bench-run-now-0-old"})
+    run_now.reset(fake, STATE)
+    assert STATE not in fake.files
 
 
 def test_the_fixtures_use_only_the_status_fields_the_crd_has():
@@ -447,8 +538,8 @@ def test_a_run_that_already_ended_is_not_stopped():
     _fired(fake)
     fake.script = [_accept("t-done"), _settle("t-done", delivery="local")]
     run_now.wait(fake, NAME, STATE, 3600, 660)
-    run_now.clean(fake, NAME, STATE, stop_run=True)
-    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
+    _stop_clean(fake)
+    assert _stops(fake) == []
 
 
 def test_another_run_in_flight_is_not_stopped():
@@ -456,8 +547,8 @@ def test_another_run_in_flight_is_not_stopped():
     _fired(fake)
     fake.files[STATE] = json.dumps(json.loads(fake.files[STATE]) | {"task_id": "t-fired"})
     fake.script = [lambda o: _status(o, activeTaskID="t-cadence", lastHandledRunNow="x")]
-    run_now.clean(fake, NAME, STATE, stop_run=True)
-    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
+    _stop_clean(fake)
+    assert _stops(fake) == []
 
 
 def test_the_destroys_clean_stops_nothing():
@@ -465,7 +556,7 @@ def test_the_destroys_clean_stops_nothing():
     _fired(fake)
     fake.script = [_accept("t-slow")]
     run_now.clean(fake, NAME, STATE)
-    assert run_now.STOP_ANNOTATION not in fake.object["metadata"]["annotations"]
+    assert _stops(fake) == []
 
 
 def test_clean_with_an_unreadable_schedule_still_removes_the_state_file():
@@ -555,22 +646,26 @@ def test_a_kubectl_failure_stops_the_step(monkeypatch):
 def test_the_command_line_routes_each_step(monkeypatch):
     seen: list[tuple] = []
     stops: list[bool] = []
-    for verb in ("idle", "fire", "wait", "clean"):
-        monkeypatch.setattr(run_now, verb, lambda kubectl, *args, verb=verb, **kw: (seen.append((verb, kubectl.namespace, kubectl.deployment, kubectl.container, args)), stops.append(kw.get("stop_run"))))
+    nonces: list[str | None] = []
+    for verb in ("idle", "reset", "fire", "wait", "clean"):
+        monkeypatch.setattr(run_now, verb, lambda kubectl, *args, verb=verb, **kw: (seen.append((verb, kubectl.namespace, kubectl.deployment, kubectl.container, args)), stops.append(kw.get("stop_run")), nonces.append(kw.get("nonce"))))
     flags = ["--namespace", "ns", "--deployment", "dep", "--container", "ctr"]
     run_now.main([*flags, "idle", NAME, "1800"])
-    run_now.main([*flags, "fire", NAME, STATE])
+    run_now.main([*flags, "reset", STATE])
+    run_now.main([*flags, "fire", "--nonce", NONCE, NAME, STATE])
     run_now.main([*flags, "wait", NAME, STATE, "2700", "660"])
     run_now.main([*flags, "clean", NAME, STATE])
-    run_now.main([*flags, "clean", "--stop-run", NAME, STATE])
+    run_now.main([*flags, "clean", "--stop-run", "--nonce", NONCE, NAME, STATE])
     assert seen == [
         ("idle", "ns", "dep", "ctr", (NAME, "1800")),
-        ("fire", "ns", "dep", "ctr", (NAME, STATE)),
+        ("reset", "ns", "dep", "ctr", (STATE,)),
+        ("fire", "ns", "dep", "ctr", (NAME, STATE, NONCE)),
         ("wait", "ns", "dep", "ctr", (NAME, STATE, "2700", "660")),
         ("clean", "ns", "dep", "ctr", (NAME, STATE)),
         ("clean", "ns", "dep", "ctr", (NAME, STATE)),
     ]
     assert stops[-2:] == [False, True]
+    assert nonces[-2:] == [None, NONCE]
 
 
 # ---------------------------------------------------------------- the stack's parameters
@@ -602,9 +697,10 @@ def test_main_runs_every_step_with_the_schedule_and_the_waits():
     main = (STACK / "main.tf").read_text()
     for step in (
         'run_now idle "${var.schedule}" "${var.idle_wait}"',
-        'run_now fire "${var.schedule}" "${local.state_file}"',
         'run_now wait "${var.schedule}" "${local.state_file}" "${var.run_wait}" "${var.delivery_wait}"',
-        'run_now clean --stop-run "${var.schedule}" "${local.state_file}"',
+        'run_now reset "${local.state_file}"',
+        'run_now fire --nonce "$nonce" "${var.schedule}" "${local.state_file}"',
+        'run_now clean --stop-run --nonce "$nonce" "${var.schedule}" "${local.state_file}"',
         'clean "${self.triggers.schedule}" "${self.triggers.state_file}"',
     ):
         assert step in main, step
@@ -644,3 +740,11 @@ def test_the_install_names_are_checked(name):
     assert re.fullmatch(pattern, "platform-agent-gateway")
     for bad in ("Has-Caps", "a b", "-x", "x;rm", "x" * 64):
         assert not re.fullmatch(pattern, bad), bad
+
+
+def test_main_resets_before_idle_and_marks_the_fire_before_it():
+    main = (STACK / "main.tf").read_text()
+    order = [main.index(step) for step in ('run_now reset "', 'run_now idle "', "fired=1", 'run_now fire --nonce')]
+    assert order == sorted(order)
+    # Before the fire the failure path stops nothing.
+    assert 'if [ -n "$fired" ]; then' in main

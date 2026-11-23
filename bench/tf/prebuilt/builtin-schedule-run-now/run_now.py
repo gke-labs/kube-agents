@@ -18,10 +18,12 @@ Runs on the runner, with kubectl pointed at the install's cluster (main.tf
 fetches the credentials). Four commands, each after the global flags
 ``--namespace``, ``--deployment`` and ``--container``:
 
+  reset <state>                remove a state file an earlier apply left
   idle <schedule> <seconds>    refuse a schedule that is not built-in, then wait until
                                it has no run in flight or claimed, so the run-now
                                starts a run rather than adopting one
-  fire <schedule> <state>      record when, and a snapshot of the findings queue (each
+  fire --nonce <n> <schedule> <state>
+                               record this apply's nonce, when, and a snapshot of the findings queue (each
                                row's id, source, check and hash), in the state file
                                <state> in the gateway's agent container, then set the
                                run-now annotation to a token the schedule has not
@@ -30,11 +32,12 @@ fetches the credentials). Four commands, each after the global flags
                                wait until the fired run has ended, then until the
                                gateway has said how its report was delivered, and
                                record both in the state file
-  clean [--stop-run] <schedule> <state>
-                               remove the state file, and the annotation when it still
-                               holds a token this script set; with --stop-run (a failed
-                               apply), first stop the fired run unless it is known to have
-                               ended, with the schedule's stop annotation
+  clean [--stop-run --nonce <n>] <schedule> <state>
+                               remove the run-now annotation when it still holds a token
+                               this script set, and the state file; with --stop-run (a
+                               failed apply) and a state file this apply's nonce wrote,
+                               also stop a run provably the fire's, with the schedule's
+                               stop annotation
 
 The annotation (``kubeagents.x-k8s.io/run-now``, AgentScheduleRunNowAnnotation)
 asks for one run: a value that differs from ``status.lastHandledRunNow`` claims a
@@ -54,6 +57,7 @@ audit-chat-report and unchanged-manifest-digest stacks write).
 
 import argparse
 import json
+from datetime import datetime
 import re
 import secrets
 import subprocess
@@ -242,7 +246,7 @@ def new_token():
     return f"{TOKEN_PREFIX}{int(time.time())}-{secrets.token_hex(TOKEN_RANDOM_BYTES)}"
 
 
-def fire(kubectl, name, state_path):
+def fire(kubectl, name, state_path, nonce):
     _require_name(name)
     schedule = kubectl.schedule(name)
     _require_builtin(schedule, name)
@@ -262,6 +266,7 @@ def fire(kubectl, name, state_path):
         state_path,
         {
             "schedule": name,
+            "nonce": nonce,
             "token": token,
             "fired_at": fired_at,
             "known_tasks": _known_tasks(status),
@@ -330,9 +335,9 @@ def wait(kubectl, name, state_path, run_seconds, delivery_seconds):
             if task is not None:
                 state["task_id"] = task
                 kubectl.write_state(state_path, state)
+                print(f"AgentSchedule {name}: the fired run is task {task}")
             elif _claim_pending(status, state["token"]):
                 print(f"AgentSchedule {name}: the run is claimed; waiting for the gateway to accept it")
-                print(f"AgentSchedule {name}: the fired run is task {task}")
         if task is not None and status.get("activeTaskID") != task:
             ended = _run(status, task)
         elif (
@@ -358,59 +363,89 @@ def wait(kubectl, name, state_path, run_seconds, delivery_seconds):
     print(f"AgentSchedule {name}: task {task} ended {state['outcome']}, delivery {state['delivery'] or 'not reported'}")
 
 
-def _fired_run_ended(status, state):
-    """Whether the fired run is known to have ended, or known never to have started."""
-    task = state.get("task_id") or _fired_task(status, state)
-    if task:
-        return status.get("activeTaskID") != task
-    # Handled, with no claim left and no new task: the gateway refused it.
-    return (
-        status.get("lastHandledRunNow") == state["token"]
-        and not _claim_pending(status, state["token"])
-        and not status.get("pendingSlot")
-    )
+def _parse_time(value):
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else None
 
 
-def _stop_fired_run(kubectl, name, state, schedule):
-    """Ask the schedule to stop the fired run unless it is known to have ended.
+def _provably_ours(status, state):
+    """The run in flight or claimed that the fire started, or None when none provably is.
 
-    A stop set while the claim is still pending waits for it and then stops
-    that run (docs/designs/scheduling-on-profiles.md, stop), so a failed apply
-    just after the fire still ends the run it started.
+    Ours is: the task the wait recorded, while it is still activeTaskID; a
+    claim whose pendingSlot.runNow is our token (the token is recorded as
+    handled only once the claim is accepted or dropped); or, with our token
+    handled, an activeTaskID the schedule did not have before the fire whose
+    activeTaskStartedAt is at or after the fire. Anything else (a cadence run,
+    someone else's run-now, a run-now the gateway refused) is not ours.
     """
-    status = _status(schedule)
-    if _fired_run_ended(status, state):
-        return
-    token = new_token()
-    kubectl.annotate(name, token, key=STOP_ANNOTATION)
-    what = state.get("task_id") or status.get("activeTaskID") or "the claimed run"
-    print(f"set {STOP_ANNOTATION}={token} on AgentSchedule {name}: stopping {what}", file=sys.stderr)
+    task = state.get("task_id")
+    active = status.get("activeTaskID")
+    if task and active == task:
+        return task
+    if _claim_pending(status, state["token"]):
+        return "the pending claim"
+    if task or status.get("lastHandledRunNow") != state["token"] or not active:
+        return None
+    started, fired = _parse_time(status.get("activeTaskStartedAt")), _parse_time(state.get("fired_at"))
+    if active not in set(state.get("known_tasks") or []) and started and fired and started >= fired:
+        return active
+    return None
 
 
-def clean(kubectl, name, state_path, stop_run=False):
+def reset(kubectl, state_path):
+    """Remove any state file an earlier apply left, before this one starts."""
+    kubectl.remove_state(state_path)
+
+
+def clean(kubectl, name, state_path, stop_run=False, nonce=None):
+    """Undo the fire: the run-now annotation, then, with stop_run, a run provably ours, then the state file.
+
+    With ``stop_run`` (a failed apply), only a state file whose ``nonce`` is
+    this apply's is acted on: a file an earlier apply left, or none at all
+    (the apply failed before it fired), stops nothing. Our run-now
+    annotation goes first, so the token can no longer be claimed; the status
+    is then read again and the stop annotation set only for a run
+    :func:`_provably_ours` names. A stop set while nothing is claimed or in
+    flight is consumed at once and the claim that follows would run anyway,
+    so the removal, not a stop, is what keeps an unclaimed fire from running.
+    """
     _require_name(name)
     state = None
     if stop_run:
         try:
-            state = kubectl.read_state(state_path)
+            read = kubectl.read_state(state_path)
         except (SystemExit, ValueError) as exc:
-            print(f"could not read the state file; no run to stop: {exc}", file=sys.stderr)
+            print(f"no state file to act on; no run to stop: {exc}", file=sys.stderr)
+            read = None
+        if isinstance(read, dict) and read.get("token") and nonce and read.get("nonce") == nonce:
+            state = read
+        elif read is not None:
+            print("the state file is not this apply's; no run to stop", file=sys.stderr)
     try:
         schedule = kubectl.schedule(name)
     except SystemExit as exc:
         kubectl.remove_state(state_path)
         print(f"could not read AgentSchedule {name}; its annotation stays: {exc}", file=sys.stderr)
         return
-    if isinstance(state, dict) and state.get("token"):
-        # Left set: a stop token removed before it is handled is a stop lost,
-        # and a handled one is inert.
-        _stop_fired_run(kubectl, name, state, schedule)
-    kubectl.remove_state(state_path)
     value = ((schedule.get("metadata") or {}).get("annotations") or {}).get(RUN_NOW_ANNOTATION, "")
-    # A handled token is inert; it goes only so the schedule is left as found,
-    # and only when it is this script's.
-    if value.startswith(TOKEN_PREFIX):
+    # Only a token this script set: ours when there is a state, else any of
+    # this script's prefix (a handled token is inert; it goes so the schedule
+    # is left as found).
+    if (state is not None and value == state["token"]) or (state is None and value.startswith(TOKEN_PREFIX)):
         kubectl.annotate(name, None)
+    if state is not None:
+        status = _status(kubectl.schedule(name))
+        ours = _provably_ours(status, state)
+        if ours is not None:
+            token = new_token()
+            # Left set: a stop removed before it is handled is a stop lost,
+            # and a handled one is inert.
+            kubectl.annotate(name, token, key=STOP_ANNOTATION)
+            print(f"set {STOP_ANNOTATION}={token} on AgentSchedule {name}: stopping {ours}", file=sys.stderr)
+    kubectl.remove_state(state_path)
 
 
 def main(argv=None):
@@ -422,11 +457,15 @@ def main(argv=None):
     command = commands.add_parser("idle")
     command.add_argument("schedule")
     command.add_argument("seconds")
+    command = commands.add_parser("reset")
+    command.add_argument("state")
     command = commands.add_parser("fire")
+    command.add_argument("--nonce", required=True)
     command.add_argument("schedule")
     command.add_argument("state")
     command = commands.add_parser("clean")
     command.add_argument("--stop-run", action="store_true")
+    command.add_argument("--nonce")
     command.add_argument("schedule")
     command.add_argument("state")
     command = commands.add_parser("wait")
@@ -438,12 +477,14 @@ def main(argv=None):
     kubectl = Kubectl(args.namespace, args.deployment, args.container)
     if args.command == "idle":
         idle(kubectl, args.schedule, args.seconds)
+    elif args.command == "reset":
+        reset(kubectl, args.state)
     elif args.command == "fire":
-        fire(kubectl, args.schedule, args.state)
+        fire(kubectl, args.schedule, args.state, args.nonce)
     elif args.command == "wait":
         wait(kubectl, args.schedule, args.state, args.run_seconds, args.delivery_seconds)
     else:
-        clean(kubectl, args.schedule, args.state, stop_run=args.stop_run)
+        clean(kubectl, args.schedule, args.state, stop_run=args.stop_run, nonce=args.nonce)
 
 
 if __name__ == "__main__":

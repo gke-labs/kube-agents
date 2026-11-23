@@ -85,7 +85,8 @@ from kube_agents_bench.verifiers import (
     AuditId,
     _OnboardingPollVerifier,
     _StoredReportVerifier,
-    read_fired_at,
+    fired_at_of,
+    read_state_file,
 )
 from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 
@@ -262,17 +263,17 @@ QUIET_DELIVERIES = frozenset({"no_delivery", "local"})
 
 
 def _window_start(
-    state_file: str | None, skew_sec: float, timeout: float
+    state_file: str | None, state: dict[str, Any] | None, skew_sec: float
 ) -> tuple[datetime | None, str | None]:
     """The window's lower bound, or the reason there is none.
 
-    The stack's ``fired_at`` in ``state_file`` (in the gateway's agent
-    container, where the stack writes it), with no skew: the fire and what the
-    run writes are stamped by the same install. Without a state file, the run's
-    start less ``skew_sec``.
+    The stack's ``fired_at`` in ``state`` (``state_file`` as read once for the
+    poll, in the gateway's agent container), with no skew: the fire and what
+    the run writes are stamped by the same install. Without a state file, the
+    run's start less ``skew_sec``.
     """
     if state_file:
-        fired = read_fired_at(oobe.agent_shell, state_file, timeout)
+        fired = fired_at_of(state)
         if fired is None:
             return None, f"there is no fired run in {state_file}: the stack did not fire the run"
         return fired, None
@@ -286,12 +287,7 @@ def _window_start(
 
 def read_state(shell: Callable[[str, float], str], path: str, timeout: float) -> dict[str, Any] | None:
     """The JSON object the stack recorded at ``path``, or None when there is none."""
-    reply = shell(f"cat {shlex.quote(path)}", timeout)
-    try:
-        state = json.loads(reply.strip().splitlines()[-1])
-    except (IndexError, ValueError):
-        return None
-    return state if isinstance(state, dict) else None
+    return read_state_file(shell, path, timeout)
 
 
 def shadow_read_command(stream: str, keys: tuple[str, ...], phrases: list[str] | None, task: str | None = None) -> str:
@@ -421,11 +417,16 @@ class ShadowReportStoredVerifier(_StoredReportVerifier):
         return {SHADOW_KEY: True, SHADOW_STREAM_KEY: self._stream(), ENVELOPE_AUDIT_KEY: self.audit}
 
     def _read_listing(
-        self, shell: Callable[[str, float], str], stream: str, timeout: float, keys: tuple[str, ...], excerpts: bool
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
     ) -> tuple[list[dict[str, Any]] | None, str | None]:
         task = None
         if self.since_state_file:
-            state = read_state(oobe.agent_shell, self.since_state_file, timeout)
             task = (state or {}).get("task_id")
             if not task:
                 return None, f"{self.since_state_file} names no fired task, so the run's own ring entry cannot be found"
@@ -583,11 +584,9 @@ class ScheduleReportNotPostedVerifier(_OnboardingPollVerifier):
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        task = None
-        if self.since_state_file:
-            state = read_state(oobe.agent_shell, self.since_state_file, read_timeout)
-            task = (state or {}).get("task_id")
-        since, why = _window_start(self.since_state_file, self.max_clock_skew_sec, read_timeout)
+        state = read_state(oobe.agent_shell, self.since_state_file, read_timeout) if self.since_state_file else None
+        task = (state or {}).get("task_id")
+        since, why = _window_start(self.since_state_file, state, self.max_clock_skew_sec)
         if since is None:
             return "error", str(why), None
         schedule = read_schedule(self.schedule, read_timeout)

@@ -9760,21 +9760,32 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_state_file(shell: Callable[[str, float], str], path: str, timeout: float) -> dict[str, Any] | None:
+    """The JSON object a stack recorded at ``path`` in the pod ``shell`` reaches, or None when there is none."""
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def fired_at_of(state: dict[str, Any] | None) -> datetime | None:
+    """A stack state's ``fired_at``, or None when it has none that is an aware ISO-8601 stamp."""
+    try:
+        fired = datetime.fromisoformat(str((state or {})["fired_at"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+    return fired if fired.tzinfo is not None else None
+
+
 def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
     """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
 
     Missing file, not JSON, no ``fired_at``, or one that is not an aware
     ISO-8601 stamp all read as None: the stack did not fire the run.
     """
-    reply = shell(f"cat {shlex.quote(path)}", timeout)
-    try:
-        state = json.loads(reply.strip().splitlines()[-1])
-        fired = datetime.fromisoformat(str(state["fired_at"]))
-    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if fired.tzinfo is None:
-        return None
-    return fired
+    return fired_at_of(read_state_file(shell, path, timeout))
 
 
 def read_report_store(
@@ -9841,9 +9852,18 @@ class _StoredReportVerifier(_OnboardingPollVerifier):
         return {}
 
     def _read_listing(
-        self, shell: Callable[[str, float], str], stream: str, timeout: float, keys: tuple[str, ...], excerpts: bool
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
     ) -> tuple[list[dict[str, Any]] | None, str | None]:
-        """One pod's envelopes of ``stream``, or None and why not: the store tree, read directly."""
+        """One pod's envelopes of ``stream``, or None and why not: the store tree, read directly.
+
+        ``state`` is the stack's state file, read once for the poll (None without one).
+        """
         return read_report_store(shell, stream, timeout, keys, excerpts), None
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
@@ -9855,8 +9875,11 @@ class _StoredReportVerifier(_OnboardingPollVerifier):
         since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
             seconds=self.max_clock_skew_sec
         )
+        state = None
         if self.since_state_file:
-            fired = read_fired_at(self._state_shell(), self.since_state_file, read_timeout)
+            # Read once per poll; _read_listing gets the same object.
+            state = read_state_file(self._state_shell(), self.since_state_file, read_timeout)
+            fired = fired_at_of(state)
             if fired is None:
                 return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
             # No skew: the fire and the envelope are stamped by the same install.
@@ -9868,7 +9891,7 @@ class _StoredReportVerifier(_OnboardingPollVerifier):
         unread: list[str] = []
         for shell in self._store_shells():
             listing, why = self._read_listing(
-                shell, stream, read_timeout, tuple(expected), bool(self.required_evidence_phrases)
+                shell, stream, read_timeout, tuple(expected), bool(self.required_evidence_phrases), state
             )
             if listing is not None:
                 read_any = True

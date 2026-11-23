@@ -1050,3 +1050,34 @@ def test_each_check_parses_from_a_spec():
     ):
         assert isinstance(parse_node(spec), cls)
     assert typing.get_args(ShadowReportStoredVerifier.model_fields["audit"].annotation) == typing.get_args(verifiers.AuditId)
+
+
+def test_the_shadow_check_reads_the_state_file_once_per_poll(root, monkeypatch):
+    reads: list[str] = []
+    inner = _gateway(_fired_state(task_id=TASK_ID))
+
+    def shell(script: str, timeout: float) -> str:
+        if script.startswith("cat "):
+            reads.append(script)
+        return inner(script, timeout)
+
+    monkeypatch.setattr(oobe, "agent_shell", shell)
+    _store(root, CANARY, _shadow_envelope(CANARY))
+    assert _shadow().status == "pass"
+    assert len(reads) == 1
+
+
+def test_the_schedule_check_reads_the_state_file_once_per_poll(root, monkeypatch):
+    reads: list[str] = []
+    inner = _gateway(_fired_state(task_id=TASK_ID))
+
+    def shell(script: str, timeout: float) -> str:
+        if script.startswith("cat "):
+            reads.append(script)
+        return inner(script, timeout)
+
+    monkeypatch.setattr(oobe, "agent_shell", shell)
+    monkeypatch.setattr(shadow_run, "read_schedule", lambda name, timeout: _schedule(_run(TASK_ID, "local")))
+    check = {"type": "schedule_report_not_posted", "schedule": CANARY, "since_state_file": STATE_FILE}
+    assert ScheduleReportNotPostedVerifier(**check).verify(1.0).status == "pass"
+    assert len(reads) == 1

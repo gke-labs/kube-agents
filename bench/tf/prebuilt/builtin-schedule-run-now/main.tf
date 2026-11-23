@@ -38,10 +38,14 @@
 # findings checks read it), with the runner's credentials for the host
 # cluster. No Secret is read.
 #
-# Teardown: a failed apply (a wait that timed out, a SIGTERM) first stops the
-# fired run if it is still in flight, with the schedule's
-# `kubeagents.x-k8s.io/stop` annotation, then removes the state file and the
-# run-now annotation before it exits (Terraform taints the resource and skips
+# Teardown: the apply first removes any state file an earlier apply left. A
+# failed apply (a wait that timed out, a SIGTERM) removes the run-now
+# annotation while it still holds this apply's token, so it can no longer be
+# claimed; once it reached the fire, it then stops a run provably the fire's
+# (the recorded task in flight, the claim for its token, or a new task started
+# after the fire under its handled token), with the schedule's
+# `kubeagents.x-k8s.io/stop` annotation, and only for a state file carrying
+# this apply's nonce; then it removes the state file before it exits (Terraform taints the resource and skips
 # its destroy provisioner); the destroy removes both on the success path. The
 # run-now annotation is removed only while it holds a token run_now.py set.
 
@@ -82,6 +86,10 @@ resource "null_resource" "run_now" {
       set -euo pipefail
       kubeconfig_dir="$(mktemp -d)"
       printf '%s' '${local.run_now_b64}' | base64 -d > "$kubeconfig_dir/run_now.py"
+      # This apply's own mark: fire writes it into the state file, and the
+      # failure path stops a run only for a state file that carries it.
+      nonce="$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
+      fired=""
       run_now() {
         python3 "$kubeconfig_dir/run_now.py" --namespace "${var.agent_namespace}" \
           --deployment "${var.agent_deployment}" --container "${var.agent_container}" "$@"
@@ -92,8 +100,13 @@ resource "null_resource" "run_now" {
         set +e
         if [ "$status" -ne 0 ]; then
           echo "Apply failed (exit $status); undoing what it did." >&2
-          run_now clean --stop-run "${var.schedule}" "${local.state_file}" >&2 \
-            || echo "Could not clean up; the next apply's fire overwrites the state file and the annotation." >&2
+          if [ -n "$fired" ]; then
+            run_now clean --stop-run --nonce "$nonce" "${var.schedule}" "${local.state_file}" >&2 \
+              || echo "Could not clean up; the next apply's reset removes the state file." >&2
+          else
+            run_now clean "${var.schedule}" "${local.state_file}" >&2 \
+              || echo "Could not clean up; the next apply's reset removes the state file." >&2
+          fi
         fi
         rm -rf "$kubeconfig_dir"
       }
@@ -113,8 +126,11 @@ resource "null_resource" "run_now" {
       gcloud container clusters get-credentials "${var.host_cluster_name}" \
         --location "${var.host_cluster_location}" --project "$project" --quiet
 
+      # A state file an earlier apply left is never this apply's.
+      run_now reset "${local.state_file}"
       run_now idle "${var.schedule}" "${var.idle_wait}"
-      run_now fire "${var.schedule}" "${local.state_file}"
+      fired=1
+      run_now fire --nonce "$nonce" "${var.schedule}" "${local.state_file}"
       run_now wait "${var.schedule}" "${local.state_file}" "${var.run_wait}" "${var.delivery_wait}"
     EOT
   }
