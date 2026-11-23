@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -92,12 +93,7 @@ func (d *profileDirectory) sortedCards() []lib.AgentCard {
 // pinned profile's cluster, an ambiguous name) is the delegation's step, not
 // the list's.
 func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, authorsUnknown bool, profiles profileLister) lib.DelegateTargets {
-	out := lib.DelegateTargets{Targets: []lib.DelegateTarget{}}
-	// The width rides the part only when it offers a batch, so at one the
-	// part is the shape a session pod built before batches reads.
-	if g.cfg != nil && g.cfg.DelegationWidthMax > 1 {
-		out.WidthMax = g.cfg.DelegationWidthMax
-	}
+	out := lib.DelegateTargets{Targets: []lib.DelegateTarget{}, WidthMax: g.advertisedWidth()}
 	if authorsUnknown {
 		return out
 	}
@@ -139,6 +135,121 @@ func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, auth
 		out.Targets = append(out.Targets, next)
 	}
 	return out
+}
+
+// advertisedWidth is the batch width a delegateTargets part offers: the
+// setting the delegation refuses a wider batch under (DelegationWidthMax, in
+// handleDelegateRequest), for a session parent and a profile parent alike.
+// It rides the part only when it offers a batch, so at one the part is the
+// shape a pod built before batches reads.
+func (g *Gateway) advertisedWidth() int {
+	if g.cfg != nil && g.cfg.DelegationWidthMax > 1 {
+		return g.cfg.DelegationWidthMax
+	}
+	return 0
+}
+
+// probeParameterValue fills a required parameter in the probe
+// profileDelegateTargets checks a profile with: the parent's worker supplies
+// the real value, and the gateway reads no value but a target's.
+const probeParameterValue = "probe"
+
+// probeTargetToken names every part of the cluster in the probe of a profile
+// whose cluster the parent's worker chooses. An underscore is in no GCP
+// project, location or cluster name, so the probe never matches a pin.
+const probeTargetToken = "probe_target"
+
+// profileDelegateTargets is the delegateTargets part a delegating profile
+// parent's submission carries (#6789): every profile the delegation would
+// accept from parent, in name order, and the batch width it would accept.
+// It is not a second copy of the rules: the parent-wide refusals
+// (profileParentRefusal, the depth cap) and each profile's
+// (delegateEntryCheck) are the delegation's own, run on a probe entry
+// addressed to the profile. Platform is never listed: a profile parent's
+// platform child is refused. A parent below a scheduled run is offered only
+// profiles that run at read and list unattended, as delegateEntryCheck holds
+// its children to (#6744). A parent the delegation refuses outright, such as
+// one at the depth cap, gets an empty list, which its tool reads as nobody.
+//
+// The probe gives the profile what a delegation that can be accepted would:
+// each required parameter, and a target. Under a parent scoped to a cluster
+// that is the parent's own cluster, for a profile not pinned elsewhere, since
+// a child outside it is refused; so the list never offers a profile that
+// can't run there. Under a parent with the install's scope, a profile that
+// takes a target gets one the worker will choose, and only that cluster's
+// own checks (in scope, pinned profiles' tiers, the profile it yields to) are
+// left to the delegation (profileRouteWith). The parent's chain and the
+// requester's lists are checked as they stand at submission; a steer during
+// the task is checked only when the delegation arrives.
+func (g *Gateway) profileDelegateTargets(rec *SessionRecord, parent TaskRef) lib.DelegateTargets {
+	out := lib.DelegateTargets{Targets: []lib.DelegateTarget{}, WidthMax: g.advertisedWidth()}
+	if parent.Requester == nil || parent.Depth >= g.cfg.DelegationDepthMax {
+		return out
+	}
+	if rule, _ := profileParentRefusal(parent); rule != "" {
+		return out
+	}
+	parentCluster, clusterScoped := scopeCluster(capability.Scope(parent.Scope))
+	for _, c := range g.profiles.sortedCards() {
+		if c.Name == targetPlatform || !lib.ValidSubjectToken(c.Name) {
+			continue
+		}
+		params := map[string]string{}
+		for _, p := range c.Parameters {
+			if p.Required {
+				params[p.Name] = probeParameterValue
+			}
+		}
+		delete(params, paramProject)
+		delete(params, paramLocation)
+		delete(params, paramCluster)
+		scopeChecked := true
+		switch {
+		case c.ClusterRef != nil:
+			// Its target is its pin, which the delegation checks as given.
+		case clusterScoped:
+			params[paramProject], params[paramLocation], params[paramCluster] = parentCluster.Project, parentCluster.Location, parentCluster.Cluster
+		case takesTarget(c):
+			params[paramProject], params[paramLocation], params[paramCluster] = probeTargetToken, probeTargetToken, probeTargetToken
+			scopeChecked = false
+		}
+		if len(params) == 0 {
+			params = nil
+		}
+		if _, no := g.delegateEntryCheck(rec, parent, true, lib.DelegateTask{Addressee: c.Name, Parameters: params}, scopeChecked); no != nil {
+			continue
+		}
+		next := lib.DelegateTarget{Name: c.Name, Description: lib.DelegateTargetDescription(c.Description), Parameters: offeredParameters(c)}
+		if !fits(lib.DelegateTargets{}, next) {
+			continue
+		}
+		if len(out.Targets) == lib.DelegateTargetsMax || !fits(out, next) {
+			out.Truncated = true
+			break
+		}
+		out.Targets = append(out.Targets, next)
+	}
+	return out
+}
+
+// profileTargetsParts is the delegateTargets part a profile task submitted
+// on its own carries (#6789), parent being the entry its submitter records
+// for it: one part when parent's profile's card says it delegates
+// (profileDelegates), none otherwise, so a non-delegating profile's
+// submission is unchanged. A part that can't be built is left off and
+// logged; the worker's delegate tool then falls back to platform. Both a
+// task started from a turn (startTaskWith) and a scheduled run
+// (publishTriggerRun) read it, so they carry the same list.
+func (g *Gateway) profileTargetsParts(rec *SessionRecord, parent TaskRef, taskID string) []lib.Part {
+	if !g.profileDelegates(parent.Addressee) {
+		return nil
+	}
+	part, err := lib.DelegateTargetsPart(g.profileDelegateTargets(rec, parent))
+	if err != nil {
+		g.log.Warn("delegate targets not attached to a profile task; its delegate tool falls back to platform", "taskId", taskID, "err", err)
+		return nil
+	}
+	return []lib.Part{part}
 }
 
 // fits reports whether t with next added is still a valid part: inside the

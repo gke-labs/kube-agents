@@ -852,13 +852,26 @@ checks the delegation again when it arrives. It rides every turn, so a reused po
 profiles added and removed, and its presence is the marker: a turn with one has exactly the agents
 listed, and a turn with none reads as `platform` only.
 
+A profile task carries one too (#6789), when it is submitted on its own (neither a child nor a wake:
+no `via`) to a profile whose card says it delegates (`delegates`, from AgentProfile
+`spec.delegates`): the profiles that task may delegate to, by the delegation's own checks
+(`delegation.go`, `delegateEntryCheck`), and the width. It never lists `platform`, which a profile
+parent may not reach. Under a parent scoped to a cluster it lists only what can run on that cluster;
+below a scheduled run it lists only profiles that run at `read` and list `unattended`, as the
+delegation holds it to; a parent the delegation refuses outright (at the depth cap, or with no scope
+on its record) gets an empty list. A scheduled run of a delegating profile carries the part too, built
+the same way when the trigger ingress submits it, so a run can fan out to what it lists. The
+checks that read a cluster the worker will choose for a target-taking profile (in scope, pinned
+profiles' tiers) wait for the delegation. Every other profile submission carries no part and is
+unchanged, and a worker that predates the part ignores it.
+
 - A name is an addressee (a subject token). A description is one line of at most 200 bytes, cut by
   the gateway. A parameter is named like a task parameter, at most 16 a target.
 - A list has at most 32 targets, and its object encodes to at most 16 KiB, so the session pod can hand it to its
   tool server in one environment variable. The gateway stops before either bound and sets
   `truncated`; a card whose parameters break the rules is left out.
 - `widthMax` is how many children one `delegate` request from the turn may ask for, the gateway's
-  `A2A_DELEGATION_WIDTH_MAX`. The gateway sets it only when it is over one; absent means one, the
+  `A2A_DELEGATION_WIDTH_MAX`, for a session turn and a profile task alike. The gateway sets it only when it is over one; absent means one, the
   single shape, so the tool offers `tasks` only when it is present. The gateway's default is 10, and
   it accepts no wider setting. It is at most 16
   (`lib.DelegateBatchMax`), the ceiling every reader holds a batch to; each entry's text has the

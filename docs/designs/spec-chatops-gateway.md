@@ -868,7 +868,15 @@ queued runs when a slot frees, or is refused at its queue timeout. The cards are
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
-cards, for the delegate tool the worker adapter serves to name in its addressee description. The
+cards, for the delegate tool the worker adapter serves to name in its addressee description. So
+does a delegating profile's own task (#6789): a submission to a profile whose card says it
+delegates, that is neither a child nor a wake, carries the profiles the delegation would accept from
+it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refused under). The list
+runs the delegation's own checks on each profile, so it never offers one the delegation refuses:
+not `platform`, not a profile outside a cluster-scoped parent's cluster, only profiles that run at
+`read` and list `unattended` for a parent below a scheduled run, and nobody for a parent refused
+outright, such as one at the depth cap. A scheduled run of a delegating profile carries the list too, built
+the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is

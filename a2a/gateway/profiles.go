@@ -588,6 +588,16 @@ func fnmatchRegexp(pattern string) string {
 // parameters, so the submission names its target either way. A task with no
 // target is scoped to the install's namespace.
 func (g *Gateway) profileRouteFor(addressee string, params map[string]string, tier capability.Tier, kind string) (*profileRoute, error) {
+	return g.profileRouteWith(addressee, params, tier, kind, true)
+}
+
+// profileRouteWith is profileRouteFor, with the target's install-scope check
+// (checkScope) left out when scopeChecked is false. Only the probe behind a
+// profile parent's delegate list does that (profileDelegateTargets), for a
+// profile whose cluster the parent's worker will choose: whether that cluster
+// is in scope is checked when the delegation arrives, through
+// profileRouteFor. Every route a task is minted on is checked.
+func (g *Gateway) profileRouteWith(addressee string, params map[string]string, tier capability.Tier, kind string, scopeChecked bool) (*profileRoute, error) {
 	profile, target, err := resolveProfile(g.profiles, addressee, params)
 	if err != nil {
 		return nil, err
@@ -613,13 +623,15 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 		}
 		return route, nil
 	}
-	decl, err := loadScope(g.cfg.ScopeFile)
-	if err != nil {
-		g.log.Warn("scope file unreadable; refusing the target", "path", g.cfg.ScopeFile, "err", err)
-		decl = nil
-	}
-	if err := g.checkScope(decl, *target); err != nil {
-		return nil, err
+	if scopeChecked {
+		decl, err := loadScope(g.cfg.ScopeFile)
+		if err != nil {
+			g.log.Warn("scope file unreadable; refusing the target", "path", g.cfg.ScopeFile, "err", err)
+			decl = nil
+		}
+		if err := g.checkScope(decl, *target); err != nil {
+			return nil, err
+		}
 	}
 	if route.Params == nil {
 		route.Params = map[string]string{}
