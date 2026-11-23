@@ -32023,23 +32023,48 @@ class TestReportStore(HarnessTestCase):
         self.reports_dir.parent.mkdir(parents=True, exist_ok=True)
         owner = self.reports_dir.parent.stat()
         chowned = []
+        fchowned = []
         with (
             patch.object(audit_report.os, "geteuid", return_value=0),
             patch.object(
-                audit_report.os, "chown", side_effect=lambda path, uid, gid: chowned.append(
-                    (Path(path), uid, gid)
+                audit_report.os, "chown", side_effect=lambda path, uid, gid, **kw: chowned.append(
+                    (Path(path), uid, gid, kw.get("follow_symlinks", True))
                 )
+            ),
+            patch.object(
+                audit_report.os, "fchown", side_effect=lambda fd, uid, gid: fchowned.append((fd, uid, gid))
             ),
         ):
             audit_report.write_report(AUDIT, self.envelope(), NOW)
-        self.assertEqual({(uid, gid) for _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
+        ids = {(uid, gid) for _, uid, gid, _ in chowned} | {(uid, gid) for _, uid, gid in fchowned}
+        self.assertEqual(ids, {(owner.st_uid, owner.st_gid)})
         directory = self.store_dir()
-        paths = {path for path, _, _ in chowned}
+        paths = {path for path, _, _, _ in chowned}
         for created in (self.reports_dir, directory, directory / "runs"):
             with self.subTest(created=created):
                 self.assertIn(created, paths)
-        # One temp file per write: the ring entry and latest.json.
-        self.assertEqual(len([path for path in paths if path.suffix == ".tmp"]), 2)
+        # One temp file per write, the ring entry and latest.json, each
+        # chowned through its descriptor, never by name.
+        self.assertEqual(len(fchowned), 2)
+        self.assertEqual([path for path in paths if path.suffix == ".tmp"], [])
+
+    def test_a_root_run_never_chowns_through_a_link(self):
+        """The store's directories are its owner's, so an entry root just made
+        can be swapped for a link before the chown; the chown must land on
+        the link itself, never on what it points at."""
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "elsewhere"
+        target.write_text("not the store's", encoding="utf-8")
+        link = Path(self.enterContext(tempfile.TemporaryDirectory())) / "swapped"
+        link.symlink_to(target)
+        calls = []
+        with (
+            patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(
+                audit_report.os, "chown", side_effect=lambda path, uid, gid, **kw: calls.append((Path(path), kw))
+            ),
+        ):
+            audit_report._adopt_owner(link, link.parent.stat())
+        self.assertEqual(calls, [(link, {"follow_symlinks": False})])
 
     def test_another_uids_store_is_named_when_it_is_denied(self):
         """What a root hand-run from before the handover left behind: the

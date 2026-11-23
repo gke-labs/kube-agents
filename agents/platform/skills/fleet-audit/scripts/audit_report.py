@@ -4817,9 +4817,13 @@ def _adopt_owner(path: Path, owner: os.stat_result) -> None:
     it, so every later run would lose its memory and fail its write. Root is
     the one writer that can hand what it creates to the store's owner, and
     any other uid creates what it owns.
+
+    Never through a link: the store's directories are the store owner's, so
+    the entry just made can be swapped for a link before this runs, and a
+    root chown that followed it would hand the link's target to that owner.
     """
     if os.geteuid() == ROOT_UID:
-        os.chown(path, owner.st_uid, owner.st_gid)
+        os.chown(path, owner.st_uid, owner.st_gid, follow_symlinks=False)
 
 
 def _make_store_dirs(path: Path) -> None:
@@ -4874,9 +4878,13 @@ def _atomic_write(path: Path, text: str) -> None:
     )
     try:
         with handle:
+            # Mode and owner through the open descriptor, not the name, which
+            # can be swapped for a link before the rename.
+            os.fchmod(handle.fileno(), REPORT_FILE_MODE)
+            if os.geteuid() == ROOT_UID:
+                owner = path.parent.stat()
+                os.fchown(handle.fileno(), owner.st_uid, owner.st_gid)
             handle.write(text)
-        os.chmod(handle.name, REPORT_FILE_MODE)
-        _adopt_owner(Path(handle.name), path.parent.stat())
         os.replace(handle.name, path)
     except BaseException:
         # Anything that leaves the temp file behind leaves it in the store,
