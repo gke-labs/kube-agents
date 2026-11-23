@@ -232,9 +232,9 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 	}
 	if probing {
 		if sessionCap == nil || !r.probeSessionCapStored(ctx, agent, instance, *sessionCap) {
-			// Nothing to probe with (the bus unreadable, or the cluster
-			// view on), or the CRD still drops the field: platform, and
-			// the next probe after the reprobe.
+			// Nothing to probe with (the bus unreadable), or the CRD
+			// still drops the field: platform, and the next probe after
+			// the reprobe.
 			r.sessionCapPruned.Store(key, time.Now())
 			r.holdSessionCapPruned(ctx, agent, instance)
 			return
