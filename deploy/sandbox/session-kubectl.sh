@@ -130,9 +130,25 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
     fi
     ;;
   esac
+  # twin-only timing (do not merge): the wrapper's overhead from here, per call, on pid 1's stderr.
+  KUBECTL_TWIN_T1=$(date +%s%N 2>/dev/null) || KUBECTL_TWIN_T1=''
   if uncharged "$@"; then
+    case $KUBECTL_TWIN_T1 in
+    '' | *[!0-9]*) ;;
+    *)
+      t2=$(date +%s%N 2>/dev/null) || t2=''
+      case $t2 in
+      '' | *[!0-9]*) ;;
+      *)
+        d=$((t2 - KUBECTL_TWIN_T1))
+        { printf '{"kubectl_wrapper_timing":1,"path":"fast","overhead_ms":%d.%02d}\n' $((d / 1000000)) $((d / 10000 % 100)) >>/proc/1/fd/2; } 2>/dev/null || true
+        ;;
+      esac
+      ;;
+    esac
     exec "$REAL_KUBECTL" "$@"
   fi
+  export KUBECTL_TWIN_T1
   export KUBECTL_ADMIT_RUN_DIR=/tmp/kube-agents-session KUBECTL_ADMIT_GUARD_PATH=/usr/local/libexec/shell-memory-guard KUBECTL_ADMIT_ON_BUSY=run
   exec python3 -I /usr/local/libexec/kubectl-admit "$@"
 fi

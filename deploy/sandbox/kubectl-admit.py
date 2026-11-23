@@ -438,8 +438,30 @@ def log(record: dict) -> None:
         pass
 
 
+# twin-only timing (do not merge): which pass_through site ran, for the per-call overhead line.
+TWIN_WHY = "unslotted"
+
+
+def twin_timing(path: str) -> None:
+    """Twin-only (do not merge): one JSON line on pid 1's stderr with the wrapper's overhead since
+    the shell's KUBECTL_TWIN_T1 stamp. A no-op without the stamp; never raises."""
+    try:
+        t1 = os.environ.get("KUBECTL_TWIN_T1", "")
+        if not t1.isdecimal():
+            return
+        ms = (time.time_ns() - int(t1)) / 1e6
+        line = '{"kubectl_wrapper_timing":1,"path":"%s","overhead_ms":%.2f}\n' % (path, ms)
+        if path == "charged-passthrough":
+            line = line[:-2] + ',"via":"%s"}\n' % TWIN_WHY
+        with open("/proc/1/fd/2", "a", encoding="utf-8") as f:
+            f.write(line)
+    except BaseException:  # noqa: BLE001 -- timing must never change the command
+        pass
+
+
 def pass_through(argv: list[str]) -> None:
     """Run kubectl in this process as if the admission were not there."""
+    twin_timing("charged-passthrough")
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # Python ignores it; a pipe reader closing must end kubectl
     os.execv(KUBECTL_NEXT, [KUBECTL_NEXT, *argv])
 
@@ -456,6 +478,7 @@ def advice(cmd: dict) -> str:
 def run(argv: list[str], reservation: dict, cmd: dict) -> int:
     """Run kubectl as a child under the reservation. Nothing after the spawn may raise: the
     caller's fail-open path would run the command a second time."""
+    twin_timing("charged")
     child = subprocess.Popen([KUBECTL_NEXT, *argv])
     path = os.path.join(LEDGER_DIR, str(os.getpid()))
     try:
@@ -544,9 +567,11 @@ def unslotted(cmd: dict, argv: list[str]) -> bool:
 
 def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> int:
     """Run the command if a slot is free and its charge fits, else refuse with a capacity reason."""
+    global TWIN_WHY
     cmd = parse(argv)
     used = guard.memory_in_use()
     if unslotted(cmd, argv) or limit is None or used is None:
+        TWIN_WHY = "unslotted" if unslotted(cmd, argv) else "no-limit"
         pass_through(argv)
     kinds = kinds_of(cmd)
     charged = bool(kinds) and scope_of(cmd, kinds) == CLUSTER_SCOPE
@@ -625,6 +650,7 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
     if busy:
         run_busy(argv, busy, tier, key, slots=len(slots), need=need, free=free)
     if not charged:
+        TWIN_WHY = "uncharged-slot"
         pass_through(argv)  # the same pid, so the slot lasts exactly as long as kubectl
     log({"event": "admitted", "tier": tier, "key": key, "need": book, "free": free})
     try:
@@ -648,7 +674,9 @@ def run_busy(argv: list[str], reason: str, tier: str, key, **detail) -> None:
     """Under ON_BUSY=run, what a command the sandbox would refuse as busy does instead: it runs
     unslotted and unbooked, in this process, as kubectl ran before the admission. The event log
     records it; the session sees nothing."""
+    global TWIN_WHY
     log({"event": "ran-busy", "reason": reason, "tier": tier, "key": key, **detail})
+    TWIN_WHY = "ran-busy:" + reason
     pass_through(argv)
 
 
@@ -699,6 +727,8 @@ def main(argv: list[str]) -> int:
         return admit(argv, guard, table, tier, limit)
     except Exception as exc:  # noqa: BLE001 -- an admission failure must not block the command
         sys.stderr.write(f"kubectl admission skipped ({type(exc).__name__}: {exc})\n")
+        global TWIN_WHY
+        TWIN_WHY = "fail-open"
         pass_through(argv)
 
 
