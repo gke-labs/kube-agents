@@ -261,9 +261,9 @@ type Dispatcher struct {
 	bg sync.WaitGroup
 	// droppedAnswers counts answers dropped over a pod's budget.
 	droppedAnswers atomic.Int64
-	// supervisorFallbacks counts terminals written on the five-token
-	// supervisor form because the six-token one was refused (#5301).
-	supervisorFallbacks atomic.Int64
+	// supervisorGiveUps counts profile tasks settled without a terminal on a
+	// latched install (terminalGivenUp, #5301).
+	supervisorGiveUps atomic.Int64
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
 	// breakers hold back a (profile, tier) whose tasks keep losing their
@@ -1000,9 +1000,13 @@ func (d *Dispatcher) endUnstarted(ctx context.Context, log *slog.Logger, del lib
 	defer cancel()
 	// A stop leaves the terminal reportAfterStop more to land.
 	defer context.AfterFunc(ctx, func() { time.AfterFunc(reportAfterStop, cancel) })()
+	var refused terminalRefusal
 	for {
 		err := d.publishTerminal(pctx, hk, del.Envelope(), state, ref.reason, ref.detail)
 		if err == nil {
+			break
+		}
+		if d.terminalGivenUp(log, &refused, err, state, ref.reason) {
 			break
 		}
 		log.Warn("publish the rejection terminal; retrying", "err", err)
@@ -1634,14 +1638,17 @@ func (d *Dispatcher) failAs(ctx context.Context, log *slog.Logger, del lib.Deliv
 }
 
 // publishTerminalRetry publishes a held task's terminal until it lands or
-// ctx ends, and says whether the task may be settled: it landed, or its
-// profile has been gone from the install config for DroppedTerminalGiveUp.
-// A dropped profile's .supervisor grant goes at the next reconnect, so its
-// terminal could be refused for good; it is given up on, logged as an
-// error, and the task settled anyway, rather than hold its slot until a
-// restart. A profile still listed is retried for as long as it takes.
+// ctx ends, and says whether the task may be settled: it landed, its profile
+// has been gone from the install config for DroppedTerminalGiveUp, or, on a
+// latched install, the terminal has been refused for DroppedTerminalGiveUp
+// (terminalGivenUp). A dropped profile's .supervisor grant goes at the next
+// reconnect, so its terminal could be refused for good; it is given up on,
+// logged as an error, and the task settled anyway, rather than hold its slot
+// until a restart. On an unlatched install a profile still listed is retried
+// for as long as it takes, as before the six-token form.
 func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, state lib.TaskState, reason, detail string) bool {
 	var droppedAt time.Time
+	var refused terminalRefusal
 	for {
 		// Each attempt is bounded on its own: a refused publish is never
 		// acked, and the caller's context may have no deadline at all.
@@ -1649,6 +1656,9 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 		err := d.publishTerminal(actx, h.key(), del.Envelope(), state, reason, detail)
 		cancel()
 		if err == nil {
+			return true
+		}
+		if d.terminalGivenUp(log, &refused, err, state, reason) {
 			return true
 		}
 		if _, listed := profileOf(d.src.Config(), h.profile); listed {
@@ -1665,6 +1675,55 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 			return false
 		}
 	}
+}
+
+// terminalRefusal is one terminal's run of failed publishes, for
+// terminalGivenUp's bound.
+type terminalRefusal struct {
+	since time.Time
+}
+
+// terminalGivenUp decides, after a failed terminal publish, whether to stop
+// retrying and settle the task without a terminal (#5301). Only a latched
+// install (the dispatch config's six-token profileSupervisorForm) gives up:
+// there the five-token form is no profile task's terminal past the readers'
+// cutoff, so there is nothing to fall back to, and a refusal that outlasts
+// DroppedTerminalGiveUp (a grant that never reached the connection) would
+// otherwise hold the task's slot until a restart. A duplicate that isn't the
+// task's terminal (errTerminalUnpublished) gives up at once. An unlatched
+// install keeps retrying, as it always has.
+//
+// Giving up is loud: the Error log names ReasonTerminalUnpublished, and the
+// health line counts it (supervisorGiveUps). The requester sees no terminal;
+// the gateway ends a task with no events as never started, and holds one with
+// executor events until the user's stop.
+func (d *Dispatcher) terminalGivenUp(log *slog.Logger, r *terminalRefusal, err error, state lib.TaskState, reason string) bool {
+	if errors.Is(err, errTerminalUnpublished) {
+		d.giveUpTerminal(log, state, reason, 0, err)
+		return true
+	}
+	if d.src.Config().ProfileSupervisorForm != lib.ProfileSupervisorFormProfile {
+		r.since = time.Time{}
+		return false
+	}
+	now := d.now()
+	if r.since.IsZero() {
+		r.since = now
+		return false
+	}
+	if now.Sub(r.since) < d.cfg.DroppedTerminalGiveUp {
+		return false
+	}
+	d.giveUpTerminal(log, state, reason, d.cfg.DroppedTerminalGiveUp, err)
+	return true
+}
+
+// giveUpTerminal records a task settled without its terminal: counted and
+// logged at Error under ReasonTerminalUnpublished.
+func (d *Dispatcher) giveUpTerminal(log *slog.Logger, state lib.TaskState, reason string, after time.Duration, err error) {
+	d.supervisorGiveUps.Add(1)
+	log.Error("gave up on a profile task's terminal on the six-token supervisor subject; settling it without one, and the requester sees no end until a stop",
+		"settle", ReasonTerminalUnpublished, "state", state, "reason", reason, "after", after, "err", err)
 }
 
 // settle ends a task whose outcome is decided (its final renewal came, or

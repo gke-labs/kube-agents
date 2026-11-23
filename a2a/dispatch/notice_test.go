@@ -1,7 +1,7 @@
 package dispatch
 
 import (
-	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -132,75 +132,207 @@ func TestTheTerminalTakesTheConfiguredSupervisorForm(t *testing.T) {
 	}
 }
 
-// A dispatcher switched to the six-token form whose connection is refused it
-// (a grant that hasn't reached it, or a partial rollback, #5301) writes the
-// terminal on the five-token form instead, which readers also watch, and
-// counts it, rather than retrying without end while the task holds its slot.
-func TestARefusedSixTokenTerminalFallsBackToTheFiveTokenForm(t *testing.T) {
-	b := newBusWith(t, []*natsserver.User{{Username: "disp-nosix", Password: dispPass, Permissions: &natsserver.Permissions{
-		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"a2a.tasks." + lib.TaskProfileSupervisorToken + ".>"}}}}}, "tse-0")
-	b.ensure("tse", 2, 0, "read")
-	got := make(chan *nats.Msg, 8)
-	sub, err := b.admin.ChanSubscribe("a2a.tasks.>", got)
+// noSixTokenUser is a dispatcher user refused the six-token supervisor form
+// (a grant that hasn't reached its connection, #5301) and allowed the rest,
+// the five-token form included.
+func noSixTokenUser() []*natsserver.User {
+	return []*natsserver.User{{Username: "disp-nosix", Password: dispPass, Permissions: &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"a2a.tasks." + lib.TaskProfileSupervisorToken + ".>"}}}}}
+}
+
+// storedOn counts the TASKS messages on subject.
+func (b *bus) storedOn(subject string) uint64 {
+	b.t.Helper()
+	info, err := b.js.Stream(b.ctx, "TASKS")
 	if err != nil {
-		t.Fatal(err)
+		b.t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	si, err := info.Info(b.ctx, jetstream.WithSubjectFilter(subject))
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	return si.State.Subjects[subject]
+}
+
+// A latched dispatcher (the six-token form) whose connection is refused that
+// form never writes the terminal on the five-token one, which readers past
+// the cutoff don't take as a profile task's (#5301). A refusal at admission
+// (endUnstarted, which used to retry without end) retries until
+// DroppedTerminalGiveUp, then settles without a terminal: the tombstone
+// written, the submission terminated, the give-up counted.
+func TestARefusedSixTokenTerminalIsBoundedAndNeverFallsBack(t *testing.T) {
+	b := newBusWith(t, noSixTokenUser(), "tse-0")
+	b.ensure("tse", 2, 0, "read")
 	var g grantSwitch
 	g.set("disp-nosix")
 	ti := oneProfile("tse", 2, "tse-0")
 	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
-	d, _ := b.runPrepared(b.connectAs(&g), testConfig(), ti, &fakeVerifier{}, nil)
-	b.submitWith("tse", "read", lib.SubmitKindTop, "task-fallback", "", map[string]string{})
-	deadline := time.After(30 * time.Second)
-	for {
-		select {
-		case msg := <-got:
-			if !lib.IsTaskSupervisorSubject(msg.Subject, "tse", "task-fallback") {
-				continue
-			}
-			if msg.Subject != lib.TaskSupervisorSubject("tse", "task-fallback") {
-				t.Fatalf("terminal on %q, want the five-token fallback", msg.Subject)
-			}
-			if n := d.Health().SupervisorFallbacks; n < 1 {
-				t.Errorf("SupervisorFallbacks = %d, want the fallback counted", n)
-			}
-			return
-		case <-deadline:
-			t.Fatal("no terminal: the refused six-token write was not fallen back from")
-		}
+	cfg := testConfig()
+	cfg.DroppedTerminalGiveUp = time.Second
+	d, _ := b.runPrepared(b.connectAs(&g), cfg, ti, &fakeVerifier{}, nil)
+	// No capability key: refused at admission.
+	b.submitWith("tse", "read", lib.SubmitKindTop, "task-refused", "", map[string]string{})
+	durable := lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)
+	waitFor(t, 60*time.Second, "the refused task settled without a terminal", func() bool {
+		ack, num := b.pending(durable)
+		return d.Health().SupervisorGiveUps == 1 && ack == 0 && num == 0
+	})
+	if n := b.storedOn(lib.TaskSupervisorSubject("tse", "task-refused")); n != 0 {
+		t.Errorf("%d terminals on the five-token subject, want none: the refusal fell back", n)
+	}
+	if ts := b.terminalsOf("task-refused"); len(ts) != 0 {
+		t.Errorf("terminals %+v, want none", ts)
+	}
+	key := lib.ProfileLeaseKey("tse", "read", lib.ProfileLeaseRefusedPod, "task-refused")
+	if rec, ok := b.tombstones()[key]; !ok || !rec.Finished() {
+		t.Errorf("no tombstone under %s: %v", key, b.records())
 	}
 }
 
-// The held-task path (publishTerminalRetry) gives a terminal a short deadline.
-// A refused six-token publish draws no ack and waits that deadline out, so the
-// five-token fallback must not inherit it, or it fails at once and the task is
-// retried without end (#5301).
-func TestTheFallbackDoesNotInheritAnExpiredDeadline(t *testing.T) {
-	b := newBusWith(t, []*natsserver.User{{Username: "disp-nosix", Password: dispPass, Permissions: &natsserver.Permissions{
-		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"a2a.tasks." + lib.TaskProfileSupervisorToken + ".>"}}}}}, "tse-0")
+// The held-task path (publishTerminalRetry) is bounded the same way on a
+// latched install: a task whose worker is lost, with its six-token terminal
+// refused, is settled after DroppedTerminalGiveUp: its slot freed, its
+// tombstone written, the give-up counted, and nothing on either form.
+func TestAHeldTasksRefusedTerminalSettlesAfterTheBound(t *testing.T) {
+	b := newBusWith(t, noSixTokenUser(), "tse-0")
 	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
 	var g grantSwitch
 	g.set("disp-nosix")
 	ti := oneProfile("tse", 2, "tse-0")
 	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
-	d, _ := b.runPrepared(b.connectAs(&g), testConfig(), ti, &fakeVerifier{}, nil)
-	ctx, cancel := context.WithTimeout(b.ctx, 2*time.Second)
-	defer cancel()
-	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-held"}
-	sub := submissionEnv(t, "tse", "task-held", "", map[string]string{})
-	if err := d.publishTerminal(ctx, hk, sub, lib.StateFailed, ReasonNoWorker, ""); err != nil {
-		t.Fatalf("a held task's terminal under a short deadline: %v; the fallback inherited the expired context", err)
+	cfg := testConfig()
+	cfg.DroppedTerminalGiveUp = time.Second
+	d, _ := b.runPrepared(b.connectAs(&g), cfg, ti, &fakeVerifier{}, nil)
+	b.submit("tse", "read", lib.SubmitKindTop, "task-held")
+	waitFor(t, 10*time.Second, "the task running", func() bool { return d.Health().Running["tse"] == 1 })
+	w.kill()
+	waitFor(t, 60*time.Second, "the held task settled without a terminal", func() bool {
+		return d.Health().SupervisorGiveUps == 1 && d.Health().Running["tse"] == 0 && len(b.leases()) == 0
+	})
+	for _, subject := range []string{lib.TaskSupervisorSubject("tse", "task-held"), lib.ProfileSupervisorSubject("tse", "task-held")} {
+		if n := b.storedOn(subject); n != 0 {
+			t.Errorf("%d messages on %s, want none", n, subject)
+		}
 	}
-	info, err := b.js.Stream(b.ctx, "TASKS")
+	if len(b.tombstones()) != 1 {
+		t.Errorf("tombstones %v, want the settled task's", b.tombstones())
+	}
+}
+
+// Only a latched install gives up: an unlatched one (the five-token form)
+// keeps retrying a refused terminal for as long as it takes, as it did before
+// the six-token form, and a duplicate that isn't the task's terminal gives up
+// at once whatever the bound.
+func TestOnlyALatchedInstallGivesUpOnARefusedTerminal(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name string
+		form string
+		err  error
+		want []bool // one decision per attempt, an hour apart
+	}{
+		{"unlatched", "", errors.New("refused"), []bool{false, false, false}},
+		{"latched", lib.ProfileSupervisorFormProfile, errors.New("refused"), []bool{false, true}},
+		{"planted duplicate", lib.ProfileSupervisorFormProfile, errTerminalUnpublished, []bool{true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testDispatchConfig(6, testProfile("tse", 2))
+			cfg.ProfileSupervisorForm = tc.form
+			clock := now
+			d := &Dispatcher{cfg: testConfig(), src: NewStaticSource(cfg), log: quietLog(), now: func() time.Time { return clock }}
+			var r terminalRefusal
+			for i, want := range tc.want {
+				if got := d.terminalGivenUp(d.log, &r, tc.err, lib.StateFailed, ReasonNoWorker); got != want {
+					t.Fatalf("attempt %d: gave up = %v, want %v", i, got, want)
+				}
+				clock = clock.Add(time.Hour)
+			}
+			wantGiveUps := int64(0)
+			if tc.want[len(tc.want)-1] {
+				wantGiveUps = 1
+			}
+			if n := d.supervisorGiveUps.Load(); n != wantGiveUps {
+				t.Errorf("supervisorGiveUps = %d, want %d", n, wantGiveUps)
+			}
+		})
+	}
+}
+
+// allowDirect turns on direct gets on TASKS, as the provision Job creates it
+// (--allow-direct).
+func (b *bus) allowDirect() {
+	b.t.Helper()
+	s, err := b.js.Stream(b.ctx, "TASKS")
 	if err != nil {
+		b.t.Fatal(err)
+	}
+	c := s.CachedInfo().Config
+	c.AllowDirect = true
+	if _, err := b.js.UpdateStream(b.ctx, c); err != nil {
+		b.t.Fatal(err)
+	}
+}
+
+// The terminal's envelope id is predictable, and the TASKS duplicate window
+// is keyed on the id alone, whatever the subject. A message stored first
+// under that id on the five-token subject, which readers past the cutoff
+// don't take as a profile task's terminal, must not swallow the real one: the
+// duplicate ack is checked against the six-token subject, and with no
+// terminal there the terminal is published again under a fresh id.
+func TestAPlantedTerminalIDDoesNotSwallowTheSixTokenTerminal(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	b.allowDirect()
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-planted"}
+	sub := submissionEnv(t, "tse", "task-planted", "", map[string]string{})
+	plant := nats.NewMsg(lib.TaskSupervisorSubject("tse", "task-planted"))
+	plant.Header.Set(jetstream.MsgIDHeader, terminalEnvelopeID(hk))
+	plant.Data = []byte(`{}`)
+	if _, err := b.js.PublishMsg(b.ctx, plant); err != nil {
 		t.Fatal(err)
 	}
-	si, err := info.Info(b.ctx, jetstream.WithSubjectFilter(lib.TaskSupervisorSubject("tse", "task-held")))
-	if err != nil {
+	if err := d.publishTerminal(b.ctx, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
+		t.Fatalf("the terminal after a planted id: %v", err)
+	}
+	six := lib.ProfileSupervisorSubject("tse", "task-planted")
+	if n := b.storedOn(six); n != 1 {
+		t.Fatalf("%d terminals on %s, want the real one", n, six)
+	}
+	stored, err := d.storedTerminal(b.ctx, "tse", six, "task-planted")
+	if err != nil || !stored {
+		t.Errorf("the six-token subject holds no dispatcher terminal: stored %v, err %v", stored, err)
+	}
+	// The terminal published again (a retry after a lost ack) is the
+	// dispatcher's own duplicate: confirmed on the subject, not stored twice.
+	if err := d.publishTerminal(b.ctx, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
 		t.Fatal(err)
 	}
-	if si.State.Subjects[lib.TaskSupervisorSubject("tse", "task-held")] != 1 {
-		t.Errorf("the five-token fallback terminal wasn't stored: %v", si.State.Subjects)
+	if n := b.storedOn(six); n != 1 {
+		t.Errorf("%d terminals on %s after a repeat, want 1", n, six)
+	}
+}
+
+// An ordinary repeat of a six-token terminal (a retry after a lost ack) is
+// confirmed by the direct get and stores nothing more.
+func TestARepeatSixTokenTerminalIsConfirmedNotRepublished(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	b.allowDirect()
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-repeat"}
+	sub := submissionEnv(t, "tse", "task-repeat", "", map[string]string{})
+	for range 2 {
+		if err := d.publishTerminal(b.ctx, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-repeat")); n != 1 {
+		t.Errorf("%d terminals stored, want 1", n)
 	}
 }

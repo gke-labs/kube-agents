@@ -111,6 +111,10 @@ var reasonSentences = map[string]string{
 	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
 	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A profile task the dispatcher settled with no terminal on the bus
+	// (#5301): its result could not be recorded, so whether the work ran is
+	// unknown here.
+	"terminal-unpublished": "this request's result could not be delivered, so check whether the work was done before you ask again",
 	// A script-run task's worker (#5622): refused before the script ran,
 	// the script failed, or it ran past its bound.
 	"script-refused": "the worker refused to run this scheduled script, and its log says why",

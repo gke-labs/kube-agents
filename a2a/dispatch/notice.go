@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/nats-io/nuid"
@@ -49,6 +50,15 @@ const (
 	// ReasonScriptNotAllowed: the submission's trigger names a script its
 	// profile's spec.scripts doesn't list (#5622).
 	ReasonScriptNotAllowed = "script-not-allowed"
+	// ReasonTerminalUnpublished names a profile task settled with no
+	// terminal on the bus, on a latched install (#5301): its six-token
+	// terminal was refused until DroppedTerminalGiveUp, or taken as a
+	// duplicate of a message that isn't it and refused again under a fresh
+	// id (giveUpTerminal). The dispatcher can't write it on the task (the
+	// write is what failed); it keys the Error log and the health line's
+	// supervisorGiveUps, and the gateway reads it as one plain line wherever
+	// a settle names it.
+	ReasonTerminalUnpublished = "terminal-unpublished"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.
@@ -104,7 +114,35 @@ func terminalEnvelopeID(hk holdKey) string {
 // ran) or `failed` once a worker had it. `.supervisor`, not `.events`, so
 // `.events` stays the executor's alone and replay can tell the two apart.
 // Every terminal the dispatcher writes goes through here.
+//
+// A refused write is returned as it is: there is no second form to fall back
+// to. On a latched install (the six-token form) readers past the install's
+// cutoff don't take a five-token terminal as a profile task's, so a terminal
+// written there would free the slot while the requester never sees the end.
+// The callers retry it, bounded on a latched install, and then settle the task
+// loudly without one (giveUpTerminal).
+//
+// On the six-token form a duplicate ack is checked rather than taken as the
+// write landing (confirmDuplicateTerminal): the envelope id is fixed per task,
+// and the stream's duplicate window is keyed on the id alone, whatever the
+// subject, so a message stored first under the same id on another subject
+// would otherwise swallow the real terminal.
 func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.Envelope, state lib.TaskState, reason, detail string) error {
+	env, err := terminalEnvelope(sub, state, reason, detail, lib.WithEnvelopeID(terminalEnvelopeID(hk)))
+	if err != nil {
+		return fmt.Errorf("build the %s terminal: %w", reason, err)
+	}
+	subject := d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID)
+	_, duplicate, err := d.busFor(hk.profile).PublishAck(ctx, subject, env)
+	if err != nil || !duplicate || subject == lib.TaskSupervisorSubject(hk.profile, sub.TaskID) {
+		return err
+	}
+	return d.confirmDuplicateTerminal(ctx, hk, sub, subject, state, reason, detail)
+}
+
+// terminalEnvelope is the terminal publishTerminal writes, in state, with
+// reason and detail as its one text part.
+func terminalEnvelope(sub *lib.Envelope, state lib.TaskState, reason, detail string, opts ...lib.EnvelopeOption) (*lib.Envelope, error) {
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID:    sub.TaskID,
 		ContextID: sub.ContextID,
@@ -116,42 +154,86 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 		Final: true,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: selfSession, AgentType: selfAgentType},
-		sub.TaskID, sub.ContextID, sub.CorrelationID, payload,
-		lib.WithEnvelopeID(terminalEnvelopeID(hk)))
+	return lib.NewStatusUpdateEnvelope(lib.Party{Session: selfSession, AgentType: selfAgentType},
+		sub.TaskID, sub.ContextID, sub.CorrelationID, payload, opts...)
+}
+
+// errTerminalUnpublished is a terminal the stream took as a duplicate of a
+// message that is not this task's terminal, whose one re-publish under a
+// fresh id did not land either. The callers settle the task without a
+// terminal at once (giveUpTerminal): retrying the fixed id meets the same
+// duplicate for as long as the window lasts.
+var errTerminalUnpublished = errors.New("the terminal was taken as a duplicate and no terminal is stored on the six-token supervisor subject")
+
+// confirmDuplicateTerminal answers a duplicate ack for a six-token terminal.
+// A duplicate is usually this dispatcher's own earlier write (a retry after an
+// ack that never arrived, a redelivery after a restart), and then the
+// six-token subject holds a final status from the dispatcher. The terminal's
+// envelope id is predictable, though, and the duplicate window is keyed on
+// the id alone, so another writer could have stored a message under it first
+// on a subject readers don't take as this task's terminal. So the subject is
+// read with a direct get: a final status from the dispatcher there is the
+// write landing. With none, the terminal is published once more under a fresh
+// id, which no earlier message can hold; if that fails too, or is again a
+// duplicate, errTerminalUnpublished.
+//
+// A read that fails (no grant for the direct get, a connection mid-reconnect)
+// can't tell the two apart, and takes the duplicate as the write landing, as
+// every terminal did before this check: re-publishing on every unreadable
+// duplicate would write a second terminal for each ordinary retry.
+func (d *Dispatcher) confirmDuplicateTerminal(ctx context.Context, hk holdKey, sub *lib.Envelope, subject string, state lib.TaskState, reason, detail string) error {
+	log := d.log.With("profile", hk.profile, "tier", hk.tier, "kind", hk.kind, "task", hk.taskID, "subject", subject)
+	stored, err := d.storedTerminal(ctx, hk.profile, subject, sub.TaskID)
+	if err != nil {
+		log.Warn("a profile task's terminal was taken as a duplicate and the six-token subject can't be read to confirm it; taking it as landed", "err", err)
+		return nil
+	}
+	if stored {
+		return nil
+	}
+	log.Warn("a profile task's terminal was taken as a duplicate, but no terminal is stored on the six-token supervisor subject; publishing it once under a fresh id")
+	env, err := terminalEnvelope(sub, state, reason, detail)
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	// The five- or six-token form, as the operator's config says (#5301):
-	// readers read the five-token form as a profile task's fallback only
-	// until the install's cutoff, and past it that terminal isn't read. The
-	// operator moves the dispatcher to the six-token form only once every
-	// reader that can run watches both.
-	subject := d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID)
-	err = d.busFor(hk.profile).Publish(ctx, subject, env)
-	five := lib.TaskSupervisorSubject(hk.profile, sub.TaskID)
-	if err == nil || subject == five {
-		return err
-	}
-	// The six-token write failed: most likely a grant that hasn't reached
-	// this connection (a callout restart, a partial rollback) or was taken
-	// away. Both forms are granted, and readers read the five-token one
-	// until the install's cutoff (past it, this fallback terminal isn't
-	// read), so the terminal goes on the five-token one now rather than
-	// being retried without end while the task holds its slot. The envelope id is the
-	// same, so a six-token write that did land is deduplicated onto it.
-	//
-	// The fallback gets its own deadline. A refused publish draws no
-	// JetStream ack, so the first one waits out the caller's context, and a
-	// caller that gave both one deadline (publishTerminalRetry's kvOpTimeout)
-	// would hand the fallback an expired one: it would fail at once and the
-	// held task would be retried without end anyway.
-	d.supervisorFallbacks.Add(1)
-	d.log.Warn("profile task terminal refused on the six-token supervisor subject; writing it on the five-token one",
-		"profile", hk.profile, "task", sub.TaskID, "subject", subject, "err", err)
-	fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kvOpTimeout)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kvOpTimeout)
 	defer cancel()
-	return d.busFor(hk.profile).Publish(fallbackCtx, five, env)
+	_, duplicate, err := d.busFor(hk.profile).PublishAck(pctx, subject, env)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%w; the re-publish under a fresh id failed: %v", errTerminalUnpublished, err)
+	case duplicate:
+		return fmt.Errorf("%w; the re-publish under a fresh id was a duplicate too", errTerminalUnpublished)
+	}
+	return nil
+}
+
+// storedTerminal reports whether the newest message on a task's six-token
+// supervisor subject is the dispatcher's final status for the task, by a
+// direct get on TASKS (no consumer, no stream info). Nothing stored is false;
+// an error is the read failing.
+func (d *Dispatcher) storedTerminal(ctx context.Context, profile, subject, taskID string) (bool, error) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopCheckTimeout)
+	defer cancel()
+	msg, err := d.busFor(profile).Conn().RequestWithContext(rctx, directGetPrefix+lib.TasksStream+"."+subject, nil)
+	if err != nil {
+		return false, err
+	}
+	switch s := msg.Header.Get("Status"); s {
+	case "":
+	case "404":
+		return false, nil
+	default:
+		return false, fmt.Errorf("direct get on %s: status %s %s", lib.TasksStream, s, msg.Header.Get("Description"))
+	}
+	if got := msg.Header.Get("Nats-Subject"); got != subject {
+		return false, nil
+	}
+	env, err := lib.ParseEnvelope(msg.Data)
+	if err != nil {
+		return false, nil
+	}
+	return env.TaskID == taskID && env.From.Session == selfSession && lib.IsFinalStatus(env), nil
 }
