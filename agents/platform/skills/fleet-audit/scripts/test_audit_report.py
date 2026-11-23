@@ -38351,6 +38351,46 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         """The record `start` leaves on an install whose harness search read the GitOps repository."""
         audit_report.write_run_record(AUDIT, "acme/fleet", [], searched=["acme/fleet@abc123"])
 
+    def test_a_shadow_task_closes_nothing_from_the_live_stream(self):
+        # The same unchanged run as below, but the task is a shadow run: the
+        # stored document is the live stream's, so precheck closes nothing and
+        # the live store is left as the live run wrote it.
+        a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
+        body = published_body(make_doc(findings=[a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        candidate = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a", "severity": "major", "excerpt": "e"}
+        rc = self.run_finish(make_doc(findings=[a]), ["--manifest-file", self.manifest_file("day1", [candidate])])
+        self.assertEqual(rc, 0, self.err)
+        before = (self.store_dir() / "latest.json").read_text(encoding="utf-8")
+
+        self.searched_this_run()
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "true"}):
+            rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertIs(out[audit_report.PRECHECK_CLOSED_KEY], False)
+        self.assertIn(audit_report.PRECHECK_SHADOW_REASON, out[audit_report.PRECHECK_REASON_KEY])
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), before)
+
+    def test_finish_refuses_a_live_publish_in_a_shadow_task_from_any_caller(self):
+        # The gate is in `_finish`, which precheck's close calls directly.
+        close = argparse.Namespace(audit=AUDIT, findings_file="unused.json", repo=None, dry_run=False, scheduled=True)
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "true"}):
+            with self.assertRaises(audit_report.ValidationError) as raised:
+                audit_report._finish(close, AUDIT)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, str(raised.exception))
+
     def test_an_unchanged_scheduled_run_closes_with_the_ledger_untouched(self):
         a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
         body = published_body(make_doc(findings=[a]), generated_at=NOW)

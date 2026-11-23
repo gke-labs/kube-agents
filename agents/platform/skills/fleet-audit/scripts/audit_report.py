@@ -3852,6 +3852,8 @@ SHADOW_STREAM_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 SHADOW_KEY = "shadow"
 SHADOW_STREAM_KEY = "shadow_stream"
 SHADOW_SUMMARY_KEY = "shadow_summary"
+# Why `precheck` closes nothing in a shadow run.
+PRECHECK_SHADOW_REASON = "a shadow run closes nothing from the live stream's stored document"
 
 
 def task_is_shadow() -> bool | None:
@@ -25960,6 +25962,10 @@ def handle_precheck(args: argparse.Namespace) -> None:
         line[PRECHECK_REASON_KEY] = PRECHECK_NOT_SCHEDULED_REASON
     elif run_llm:
         line[PRECHECK_REASON_KEY] = reasons.get(verdict, verdict)
+    elif task_is_shadow():
+        # The stored document is the live stream's; a shadow run publishes
+        # only through its own `finish --store-only`.
+        line[PRECHECK_REASON_KEY] = PRECHECK_SHADOW_REASON + PRECHECK_CONTINUES_SUFFIX
     else:
         document, source = stored_scheduled_document(
             audit_id, getattr(args, "repo", None), delta.read_record(audit_id, SCRATCH_DIR)
@@ -26041,6 +26047,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
     # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
+    # The shadow gate, here and not only in `handle_finish`: `precheck`'s
+    # close calls this directly, and a shadow task must not publish live by
+    # any path.
+    if task_is_shadow() and not args.dry_run and not getattr(args, "store_only", False):
+        raise ValidationError(
+            f"this task is a shadow run ({SHADOW_TASK_ENV}=true): it publishes only with "
+            f"{STORE_ONLY_FLAG}, which keeps the report in the store and nothing else."
+        )
     set_sweep_waived(getattr(args, "no_promote", False))
     # Read before the checks below tie this run to its `start`: a later
     # `start` can rewrite the run record while this run publishes.
