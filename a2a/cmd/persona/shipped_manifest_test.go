@@ -11,9 +11,14 @@ import (
 )
 
 const (
-	// shippedPersonas are the persona directories the repository ships as
-	// images, relative to this package.
+	// shippedPersonas are the persona directories under agents/, relative to
+	// this package. shippedPersonaDirs adds every persona image's build
+	// context from the publish workflow, wherever it lives.
 	shippedPersonas = "../../../agents/*/persona"
+	// publishWorkflow builds and pushes every released image.
+	publishWorkflow = "../../../.github/workflows/docker-publish-ghcr.yml"
+	// repoRoot is the repository root, relative to this package.
+	repoRoot = "../../.."
 	// personaDockerfiles are their images' Dockerfiles.
 	personaDockerfiles = "../../Dockerfile.persona-*"
 	// regenerate is what a failure tells the reader to run, from a2a/.
@@ -25,10 +30,7 @@ const (
 // start. A persona edited without regenerating its manifest fails here, not
 // in a pod.
 func TestShippedPersonasCarryAMatchingManifest(t *testing.T) {
-	dirs, err := filepath.Glob(shippedPersonas)
-	if err != nil || len(dirs) == 0 {
-		t.Fatalf("no shipped personas at %s: %v", shippedPersonas, err)
-	}
+	dirs := shippedPersonaDirs(t)
 	for _, dir := range dirs {
 		p, err := persona.LoadWithOptions(dir, persona.Options{RequireIntegrity: true})
 		if err != nil {
@@ -77,7 +79,7 @@ func TestPersonaImagesShipTheCommittedManifest(t *testing.T) {
 			}
 		}
 	}
-	dirs, _ := filepath.Glob(shippedPersonas)
+	dirs := shippedPersonaDirs(t)
 	if images != len(dirs) {
 		t.Errorf("%d persona Dockerfiles for %d shipped personas (%v)", images, len(dirs), dirs)
 	}
@@ -137,4 +139,51 @@ func TestManifestCommand(t *testing.T) {
 	if code := run([]string{"manifest", "--in", dir}, &out, &errb); code != 1 || !strings.Contains(errb.String(), "not a regular file") {
 		t.Errorf("manifest over a symlink = %d (%s), want 1 naming it", code, errb.String())
 	}
+}
+
+// publishedPersonaRE is one build step in the publish workflow whose
+// Dockerfile is a persona image's: its context, then its file.
+var publishedPersonaRE = regexp.MustCompile(`(?m)^\s+context: (\S+)\n\s+file: (a2a/Dockerfile\.persona-\S+)$`)
+
+// shippedPersonaDirs finds every shipped persona directory on its own: the
+// persona directories under agents/, plus each persona image's build
+// context in the publish workflow. Every persona Dockerfile must appear in
+// that workflow, so a new persona image can't be left out of the check by
+// living somewhere else.
+func shippedPersonaDirs(t *testing.T) []string {
+	t.Helper()
+	seen := map[string]bool{}
+	globbed, err := filepath.Glob(shippedPersonas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range globbed {
+		seen[filepath.Clean(d)] = true
+	}
+	raw, err := os.ReadFile(publishWorkflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := map[string]bool{}
+	for _, m := range publishedPersonaRE.FindAllStringSubmatch(string(raw), -1) {
+		seen[filepath.Clean(filepath.Join(repoRoot, m[1]))] = true
+		published[filepath.Base(m[2])] = true
+	}
+	dockerfiles, err := filepath.Glob(personaDockerfiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, df := range dockerfiles {
+		if !strings.HasSuffix(df, ".dockerignore") && !published[filepath.Base(df)] {
+			t.Errorf("%s is not built by %s, so its persona directory isn't known here", df, publishWorkflow)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no shipped personas found")
+	}
+	dirs := make([]string, 0, len(seen))
+	for d := range seen {
+		dirs = append(dirs, d)
+	}
+	return dirs
 }

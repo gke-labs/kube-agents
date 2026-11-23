@@ -46,6 +46,9 @@ const (
 	// integrityManifestMode is the manifest's file mode: readable by all,
 	// like the files it describes.
 	integrityManifestMode = 0o644
+	// manifestLineBreaks can't appear in a manifest path: each entry is one
+	// line.
+	manifestLineBreaks = "\r\n"
 	// manifestFieldSeparators split a manifest line's digest from its path.
 	manifestFieldSeparators = " \t"
 )
@@ -323,6 +326,8 @@ func WriteIntegrityManifest(dir string) error {
 			return nil
 		case !d.Type().IsRegular():
 			return fmt.Errorf("%s: not a regular file; %s covers regular files only", rel, IntegrityManifestFile)
+		case strings.ContainsAny(rel, manifestLineBreaks):
+			return fmt.Errorf("%q: a line break in a name can't be written as one manifest line", rel)
 		}
 		f, err := openNoFollow(full)
 		if err != nil {
@@ -339,5 +344,22 @@ func WriteIntegrityManifest(dir string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, IntegrityManifestFile), FormatIntegrityManifest(files), integrityManifestMode) // #nosec G306 -- a build input committed beside the persona; read by everyone by design
+	// Written beside it and renamed over it, so a symlink planted at the
+	// manifest's path is replaced rather than followed.
+	tmp, err := os.CreateTemp(dir, IntegrityManifestFile+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(FormatIntegrityManifest(files)); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), integrityManifestMode); err != nil { // #nosec G302 -- a build input committed beside the persona; read by everyone by design
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, IntegrityManifestFile))
 }
