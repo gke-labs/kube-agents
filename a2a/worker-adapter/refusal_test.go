@@ -233,7 +233,8 @@ func TestWriteRefusalRecordStopsTheHarness(t *testing.T) {
 	if _, err := os.Stat(markerFile); err == nil {
 		t.Fatal("the harness ran on past the refusal")
 	}
-	if !strings.HasPrefix(text, "reason: write-refused - ") || !strings.Contains(text, "kubernetes.read-only rule refused the verb scale.") {
+	if !strings.HasPrefix(text, "reason: write-refused - ") || !strings.Contains(text, "credential broker's kubernetes.read-only rule refused the verb scale; the change was not made.") ||
+		strings.Contains(text, "pull request") || strings.Contains(text, "retried") {
 		t.Fatalf("terminal %q", text)
 	}
 	for _, leaked := range []string{"kube-dns", "partial output", "finished the task"} {
@@ -265,7 +266,7 @@ func TestWriteRefusalFirstRecordIsTheOneReported(t *testing.T) {
 	if _, err := os.Stat(markerFile); err == nil {
 		t.Fatal("the harness reached its next call")
 	}
-	if !strings.Contains(text, "credential broker's caller.kubectl-flag rule refused the verb scale.") || strings.Contains(text, "delete") || strings.Contains(text, "pull request") {
+	if !strings.Contains(text, "credential broker's caller.kubectl-flag rule refused the verb scale;") || strings.Contains(text, "delete") || strings.Contains(text, "pull request") {
 		t.Fatalf("terminal %q, want the first record's rule and verb only", text)
 	}
 }

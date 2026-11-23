@@ -223,17 +223,15 @@ func makeTurnWriteRefusalFile(dir string) (string, error) {
 // writeRefusedReason is the terminal message of a task stopped at a write
 // refusal, in the `reason: <token> - <detail>` shape.
 func writeRefusedReason(r *writeRefusal) string {
+	// Facts only: the rule or the attempt, the verb, and that the change was
+	// not made. The reason reaches a delegating parent model or the chat, so
+	// it carries no advice.
 	if r.rule == writeAttemptRule {
 		return "reason: write-refused" + reasonDetailSeparator +
 			"the turn stopped after it attempted a change: kubectl " + r.verb +
-			" was not made; writes are refused here. It was not retried another way; it can be proposed as a pull request."
-	}
-	if r.rule == kubernetesReadOnlyRule {
-		return "reason: write-refused" + reasonDetailSeparator +
-			"the task stopped after a write refusal: the command policy's " + r.rule + " rule refused the verb " + r.verb +
-			". The change was not made and was not retried another way; it can be proposed as a pull request."
+			" was not made; writes are refused here."
 	}
 	return "reason: write-refused" + reasonDetailSeparator +
 		"the task stopped after a write refusal: the credential broker's " + r.rule + " rule refused the verb " + r.verb +
-		". The change was not made and was not retried another way."
+		"; the change was not made."
 }
