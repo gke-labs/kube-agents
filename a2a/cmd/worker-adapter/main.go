@@ -681,9 +681,11 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	// it needs (#6710), so only a pod that says it accepts that may select
 	// it: a test, or a deliberate dev run. Nothing in the operator or chart
 	// sets either variable today, so only the pod spec or the worker
-	// image's own ENV can. When the operator-side selector (#6716) renders
-	// A2A_HARNESS, it renders this one empty beside it, so an image's ENV
-	// can't set it there.
+	// image's own ENV can. Where the operator renders A2A_HARNESS, it
+	// renders this one empty beside it, so the image's ENV can't set it
+	// there: on a profile worker whose profile names spec.harness.type
+	// (#6832), and on session pods (#6716). A profile with no type gets
+	// neither, by design: its image is already trusted code.
 	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
 		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
 			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
