@@ -117,7 +117,11 @@ Sources:
               last segment. nightly.py files a run as the writers part only
               under DEFAULT_NIGHTLY_WRITERS_JOB, so a prefix ending in any
               other job is collected but reported as the main part, and is
-              warned about.
+              warned about. Each job and each prefix is listed once, under
+              the first flag that names it, --nightly-prefix first: a part
+              flag naming a job or a prefix an earlier flag already lists is
+              warned about and not read (a trailing `/` does not make a
+              prefix another one).
   --nightly-main-b-prefix  the same, for the periodic that runs the
               main part's main-b shard (EVAL_NIGHTLY_PART=main-b; the main
               job runs main-a). Given without a value it is
@@ -2604,11 +2608,13 @@ def collect(
     # twice and take that job's runs out of its own watermark: list each
     # job once, under the first flag that names it, and drop the later one.
     # --nightly-job renames the main flag's job, so a part flag can name the
-    # main flag's prefix under another job: list each prefix once as well,
-    # or its runs are read twice and filed under the later flag's job.
+    # main flag's prefix under another job: list that prefix once as well,
+    # or its runs are read twice and filed under the part flag's job. Only
+    # the main flag can collide this way: a part flag's job is its prefix's
+    # last segment, so two part flags naming one prefix name one job.
     main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
+    main_prefix_key = _prefix_key(nightly_prefix) if nightly_prefix else None
     listed_by: dict[str, str] = {main_job: "--nightly-prefix"} if main_job is not None else {}
-    prefix_listed_by: dict[str, str] = {_prefix_key(nightly_prefix): "--nightly-prefix"} if nightly_prefix else {}
     for source in part_sources:
         flag, prefix, job, default = source
         if not prefix:
@@ -2616,12 +2622,11 @@ def collect(
         if job in listed_by:
             print(f"warning: {flag} names job {job}, as {listed_by[job]} does; listing it once", file=sys.stderr)
             source[1], source[2] = None, default
-        elif _prefix_key(prefix) in prefix_listed_by:
-            print(f"warning: {flag} names prefix {prefix}, as {prefix_listed_by[_prefix_key(prefix)]} does; listing it once", file=sys.stderr)
+        elif _prefix_key(prefix) == main_prefix_key:
+            print(f"warning: {flag} names prefix {prefix}, as --nightly-prefix does; listing it once", file=sys.stderr)
             source[1], source[2] = None, default
         else:
             listed_by[job] = flag
-            prefix_listed_by[_prefix_key(prefix)] = flag
     (_, nightly_writers_prefix, writers_job, _), (_, nightly_main_b_prefix, main_b_job, _), (_, nightly_main_c_prefix, main_c_job, _), (_, nightly_main_d_prefix, main_d_job, _), (_, nightly_main_e_prefix, main_e_job, _), (_, nightly_writers_b_prefix, writers_b_job, _), (_, nightly_writers_c_prefix, writers_c_job, _) = part_sources
     # The mirror case: --nightly-prefix itself naming a part's job. Its runs
     # are the main source here, so only the part jobs it does not name are
