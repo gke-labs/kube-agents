@@ -18,7 +18,8 @@ const (
 	// taskReadTimeout bounds one plain read of a task.
 	taskReadTimeout = 10 * time.Second
 	// taskConsumerIdle is how long the server keeps a read's consumer once
-	// it goes idle; every read or watch here ends well inside it.
+	// it goes idle; the gap between one pull and the next has to stay well
+	// inside it.
 	taskConsumerIdle = 5 * time.Second
 	taskFetchBatch   = 256
 	taskFetchWait    = 2 * time.Second
@@ -232,8 +233,7 @@ func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 		return nil, ErrTaskNotFound
 	}
 	for {
-		t, ferr := w.fold()
-		if ferr == nil && t.Final {
+		if t, final := w.ended(); final {
 			return t, nil
 		}
 		if err := w.next(ctx); err != nil {
@@ -264,6 +264,8 @@ type taskWatch struct {
 	seen    int
 	pending uint64
 	release func(created bool)
+	// finalUnfolded is a final status-update taken since ended last folded.
+	finalUnfolded bool
 	// screen is the cutoff screen, nil on an unlatched install; dropped
 	// counts what it refused, and doubted holds what it could not decide yet.
 	screen  *cutoffScreen
@@ -425,6 +427,7 @@ type doubtedEvent struct {
 func (w *taskWatch) admit(ctx context.Context, subject string, storedAt time.Time, env *lib.Envelope) {
 	if !w.screen.inQuestion(subject, storedAt) {
 		w.events = append(w.events, env)
+		w.noteTaken(env)
 		return
 	}
 	if !w.screen.settle(ctx) {
@@ -433,9 +436,17 @@ func (w *taskWatch) admit(ctx context.Context, subject string, storedAt time.Tim
 	}
 	if w.screen.b.client.AcceptSupervisorEvent(subject, storedAt, w.screen.profile) {
 		w.events = append(w.events, env)
+		w.noteTaken(env)
 	} else {
 		w.dropped++
 	}
+}
+
+// noteTaken records, for ended, that an event the watch took is a final
+// status-update. A held event is noted when resolveDoubts takes it, not when
+// it is read: until then it is not among the events a fold sees.
+func (w *taskWatch) noteTaken(env *lib.Envelope) {
+	w.finalUnfolded = w.finalUnfolded || lib.IsFinalStatus(env)
 }
 
 // resolveDoubts settles the task's kind if events are held for it, and puts
@@ -451,6 +462,7 @@ func (w *taskWatch) resolveDoubts(ctx context.Context) {
 		prev = d.at
 		if w.screen.b.client.AcceptSupervisorEvent(d.subject, d.storedAt, w.screen.profile) {
 			events = append(events, d.env)
+			w.noteTaken(d.env)
 		} else {
 			w.dropped++
 		}
@@ -535,6 +547,26 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 }
 
 func (w *taskWatch) fold() (*lib.Task, error) { return lib.FoldTask(w.ref.TaskID, w.events) }
+
+// ended reports a final task, one time for each final status-update taken: it
+// folds only when one has been taken since the last fold, because nothing
+// else ends a task (FoldTask sets Final from a status-update's final field
+// alone). A fold parses every payload read so far, so folding after each
+// artifact or progress status of a task near readMaxBytes costs the whole
+// task again between one pull and the next. On a loaded test runner that took
+// the gap between pulls past taskConsumerIdle, the server reaped the consumer
+// under the read, and the next pull failed with "no responders".
+func (w *taskWatch) ended() (*lib.Task, bool) {
+	if !w.finalUnfolded {
+		return nil, false
+	}
+	w.finalUnfolded = false
+	t, err := w.fold()
+	if err != nil || !t.Final {
+		return nil, false
+	}
+	return t, true
+}
 
 // taskAgreement is the supervisor check agreedEnvelope applies, the same
 // writers gateway.SupervisorAgreement accepts.
