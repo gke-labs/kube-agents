@@ -1194,7 +1194,10 @@ Lifecycle:
     violation counter has to know it: per-subject CAS cannot span two subjects, so the
     janitor's terminal on `…supervisor` is no longer serialized against the executor's own
     terminal on `…events`. A genuine race produces exactly one counted post-final drop, and
-    the counter does not distinguish it from a forged one.
+    the counter does not distinguish it from a forged one. The one exception to "exactly
+    one" is a profile task on a latched install settled with the reason
+    `terminal-unpublished` (#5301): the dispatcher's six-token terminal was refused for its
+    whole retry bound, so no terminal is written.
 11. A `tasks/get` materialized by replay of both subjects yields the same terminal state
     and artifact set a live subscriber of both saw, and a task whose supervisor terminal
     predates the split (stored on `…events`) still replays to that terminal.

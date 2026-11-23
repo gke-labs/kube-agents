@@ -541,27 +541,36 @@ leave open:
   admission, and `lease-expired`
   and `deadline-exceeded` while it holds, and on a `canceled` terminal `stopped` (the
   conversation's stop) and `tier-ended` (an administrator ended its tier's drain, #5850). A terminal is retried until it lands, except for a
-  profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
+  profile that has left the install config, and on a latched install a refused terminal (below). A dropped profile's `.supervisor` grant goes at the next reconnect,
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
   task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as
   an error (#5074).
   On a latched install (`profileSupervisorForm: profile`) a refused six-token terminal is never
   written on the five-token form instead: readers past the cutoff don't take that form as a
   profile task's terminal, so it would free the slot while the requester never saw the end. The
-  terminal is retried, a refusal at admission as well as a held task's, for
-  `DroppedTerminalGiveUp`, and then the task is settled without one: tombstoned, its slot freed,
+  terminal is retried, a refusal at admission as well as a held task's. Only a permission refusal
+  counts toward the bound: an attempt during which the server refused the six-token publish for
+  the connection's permissions (nats.go's async `Permissions Violation for Publish to` that
+  subject). Any other failure, such as a disconnect, no responders, a timeout with no refusal or a
+  JetStream API error, restarts the bound, so a NATS or `TASKS` outage of any length is retried and
+  the terminal lands after it. Once refusals have run for `DroppedTerminalGiveUp`, the task is
+  settled without one: tombstoned, its slot freed,
   its submission settled, an error logged under the reason `terminal-unpublished`, and the
   dispatcher health line's `supervisorGiveUps` counted. The requester sees no terminal: the
   gateway ends a task with no events as never started, and holds one with executor events until
   the user's stop. A refusal needs a grant that never reached the dispatcher's connection; the
-  regrant normally clears that in seconds, well inside the bound. An unlatched install keeps
-  retrying, as before.
+  regrant normally clears that in seconds, well inside the bound. A profile that has left the
+  install config keeps its own give-up and log line above, not `terminal-unpublished`. An
+  unlatched install keeps retrying, as before.
   A terminal's envelope id is fixed per task, so a retry after a lost ack is a duplicate the stream
   drops. The duplicate window is keyed on the id alone, whatever the subject, so on the six-token
   form a duplicate ack is checked: a direct get of the task's six-token subject must find the
-  dispatcher's final status. With none there, the terminal is published once more under a fresh
-  id, and if that fails or is a duplicate too, the task takes the `terminal-unpublished` settle
-  at once. A direct get that fails is not taken as the write landing: the terminal is re-published
+  dispatcher's final status under the terminal's own envelope id, so another tier's or kind's
+  terminal for the same task id doesn't confirm it. With none there, the terminal is published
+  again under a fresh id, kept for the rest of that retry loop so its re-publishes dedupe onto
+  each other. A re-publish that fails is an ordinary failure, retried under the bound above. Only
+  a fresh id taken as a duplicate on its first send takes the `terminal-unpublished` settle at
+  once. A direct get that fails is not taken as the write landing: the terminal is re-published
   under a fresh id the same way, so a retry whose first write did land can leave two identical
   terminals, and readers fold past the second.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one

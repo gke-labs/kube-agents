@@ -73,7 +73,7 @@ A message sent through `send_message` reaches the A2A gateway through its consol
 
 The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards by profile. Otherwise the turn is answered from the profile's task, which the gateway names on its status line. A turn still running when the wait ends returns the task as `<profile>/<task-id>`, and `task_control` reads it under that reference, which always resolves. A bare id resolves only while this server still holds the task.
 
-On an install with `A2A_PROFILE_SUPERVISOR_CUTOFF` set, a task is read as a profile task when its addressee has a live agent card, unless one of this server's turns learned its kind. That covers any typed `<addressee>/<task-id>` reference to a task no turn learned, so an old session task whose name a profile has since taken reads as still running if its gateway terminal was stored after the cutoff.
+On an install with `A2A_PROFILE_SUPERVISOR_CUTOFF` set (the operator sets it once `ProfileSupervisorForm` latches), a task is read as a profile task when its addressee has a live agent card, unless one of this server's turns learned its kind. That covers any typed `<addressee>/<task-id>` reference to a task no turn learned, so an old session task whose name a profile has since taken reads as still running if its gateway terminal was stored after the cutoff.
 
 Two known limits:
 
