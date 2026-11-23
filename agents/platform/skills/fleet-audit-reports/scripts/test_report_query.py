@@ -449,6 +449,41 @@ class TestStreams(StoreTestCase):
         self.assertEqual(rows[AUDIT]["liveness"], "error")
 
 
+class TestShadowStreams(StoreTestCase):
+    """A shadow run's stream (#5623) is a canary's: hidden unless --include-shadow asks for it."""
+
+    SHADOW = "compliance-audit-canary"
+
+    def setUp(self):
+        super().setUp()
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        self.write_run(self.SHADOW, "20260826T064100.000000Z", [finding("b")], shadow=True)
+
+    def test_streams_leaves_it_out_and_counts_it(self):
+        payload = self.ok("streams")
+        self.assertEqual([row["audit_id"] for row in payload["streams"]], [AUDIT])
+        self.assertEqual(payload["shadow_hidden"], 1)
+
+    def test_streams_lists_it_with_the_opt_in(self):
+        payload = self.ok("streams", report_query.INCLUDE_SHADOW_FLAG)
+        self.assertEqual(sorted(row["audit_id"] for row in payload["streams"]), sorted([AUDIT, self.SHADOW]))
+        self.assertEqual(payload["shadow_hidden"], 0)
+
+    def test_a_question_about_it_is_refused_without_the_opt_in(self):
+        for argv in (("show", self.SHADOW), ("findings", self.SHADOW), ("finding", self.SHADOW, "b"), ("checks", self.SHADOW)):
+            with self.subTest(argv=argv):
+                payload = self.refused(*argv)
+                self.assertIs(payload["shadow"], True)
+                self.assertIn("shadow run", payload["error"])
+
+    def test_a_question_about_it_is_answered_with_the_opt_in(self):
+        payload = self.ok("findings", self.SHADOW, report_query.INCLUDE_SHADOW_FLAG)
+        self.assertEqual([row["id"] for row in payload["findings"]], ["b"])
+
+    def test_a_live_stream_is_answered_as_before(self):
+        self.assertEqual([row["id"] for row in self.ok("findings", AUDIT)["findings"]], ["a"])
+
+
 class TestShow(StoreTestCase):
     def setUp(self):
         super().setUp()
