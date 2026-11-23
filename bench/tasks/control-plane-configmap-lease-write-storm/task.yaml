@@ -40,7 +40,13 @@
 # lands in the pull request that adds the check, which rebinds this case to
 # its role and flips the marker in the same diff. A zero is not the shape:
 # by the source above a QPS of 0 is the default limit of 5, so a check that
-# names `--kube-api-qps=0` names a limited client. The flag is spelled as
+# names `--kube-api-qps=0` names a limited client.
+# #5412 spells the planned arguments `--qps=0 --burst=0`. A negative QPS alone
+# is not the fault: controller-runtime sets it for each controller built on it
+# ("Disable client-side ratelimer by default, we can rely on API priority and
+# fairness", `pkg/client/config/config.go`, v0.25.2), with no argument for a
+# check to read; the fault is the write rate.
+# The flag is spelled as
 # kube-controller-manager spells it ("--kube-api-qps float Default: 20 QPS to
 # use while talking with kubernetes apiserver",
 # https://kubernetes.io/docs/reference/command-line-tools-reference/kube-controller-manager/);
