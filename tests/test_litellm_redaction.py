@@ -489,6 +489,71 @@ class TestCallback(unittest.TestCase):
             with self.assertRaises(self.module.UnwalkableRequestError, msg=mime):
                 self._run(text, "agenerate_content")
 
+    # Provider-opaque fields a provider checks byte for byte: kept as they came
+    # at their API positions, even when a rule matches inside them, and
+    # redacted anywhere else.
+    _OPAQUE = "blob-prod-eu-1-my-proj-12-AbCd"
+
+    def test_a_responses_reasoning_items_encrypted_content_is_kept(self) -> None:
+        data = {"input": [
+            {"type": "reasoning", "id": "r1", "encrypted_content": self._OPAQUE, "summary": []},
+            {"type": "message", "role": "user", "content": "on prod-eu-1", "encrypted_content": self._OPAQUE},
+        ]}
+        out = self._run(data, "aresponses")
+        self.assertEqual(out["input"][0]["encrypted_content"], self._OPAQUE)
+        self.assertNotIn("prod-eu-1", out["input"][1]["content"])
+        self.assertNotEqual(out["input"][1]["encrypted_content"], self._OPAQUE, "only a reasoning item's is opaque")
+
+    def test_an_anthropic_web_search_results_encrypted_content_is_kept_in_the_assistants_turn(self) -> None:
+        def block():
+            return {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [
+                {"type": "web_search_result", "url": "https://example.com", "title": "prod-eu-1", "encrypted_content": self._OPAQUE}]}
+        data = {"messages": [
+            {"role": "assistant", "content": [block()]},
+            {"role": "user", "content": [block()]},
+        ]}
+        out = self._run(data)
+        kept = out["messages"][0]["content"][0]["content"][0]
+        self.assertEqual(kept["encrypted_content"], self._OPAQUE)
+        self.assertNotIn("prod-eu-1", kept["title"], "only the encrypted content is opaque")
+        self.assertNotEqual(out["messages"][1]["content"][0]["content"][0]["encrypted_content"], self._OPAQUE, "not in a user's turn")
+
+    def test_an_assistants_reasoning_details_data_and_signature_are_kept(self) -> None:
+        def details():
+            return [{"type": "reasoning.encrypted", "data": self._OPAQUE, "signature": self._OPAQUE, "text": "prod-eu-1"}]
+        data = {"messages": [
+            {"role": "assistant", "content": "ok", "reasoning_details": details()},
+            {"role": "user", "content": "hi", "reasoning_details": details()},
+        ]}
+        out = self._run(data)
+        kept = out["messages"][0]["reasoning_details"][0]
+        self.assertEqual((kept["data"], kept["signature"]), (self._OPAQUE, self._OPAQUE))
+        self.assertNotIn("prod-eu-1", kept["text"], "only data and signature are opaque")
+        self.assertNotEqual(out["messages"][1]["reasoning_details"][0]["data"], self._OPAQUE, "not on a user's message")
+
+    def test_the_chat_shapes_thought_signature_is_kept_on_the_message_and_its_tool_calls(self) -> None:
+        call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"},
+                "provider_specific_fields": {"thought_signature": self._OPAQUE}}
+        data = {"messages": [
+            {"role": "assistant", "content": "ok", "tool_calls": [call], "provider_specific_fields": {"thought_signature": self._OPAQUE}},
+            {"role": "user", "content": "hi", "provider_specific_fields": {"thought_signature": self._OPAQUE}},
+        ]}
+        out = self._run(data)
+        assistant = out["messages"][0]
+        self.assertEqual(assistant["provider_specific_fields"]["thought_signature"], self._OPAQUE)
+        self.assertEqual(assistant["tool_calls"][0]["provider_specific_fields"]["thought_signature"], self._OPAQUE)
+        self.assertNotEqual(out["messages"][1]["provider_specific_fields"]["thought_signature"], self._OPAQUE, "not on a user's message")
+
+    def test_a_refusal_names_a_media_type_only_when_it_is_a_media_type_name(self) -> None:
+        def part(media):
+            return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:{media};base64,AAAA"}}]}]}
+        with self.assertRaises(self.module.UnwalkableRequestError) as named:
+            self._run(part("text/plain"))
+        self.assertIn("text/plain", str(named.exception))
+        with self.assertRaises(self.module.UnwalkableRequestError) as unnamed:
+            self._run(part("deploy key is hunter2-example-pw"))
+        self.assertNotIn("hunter2", str(unnamed.exception))
+
     def test_top_level_text_outside_the_known_shapes_is_redacted_and_controls_are_not(self) -> None:
         tools = [{"name": "login", "description": "logs in to prod-eu-1", "input_schema": {"type": "object", "properties": {"password": {"type": "string"}}}}]
         data = {

@@ -126,6 +126,24 @@ THINKING_KEPT_KEYS = ("thinking", "signature")
 REDACTED_THINKING_TYPE = "redacted_thinking"
 TOOL_RESULT_TYPE = "tool_result"
 GEMINI_OPAQUE_PART_KEYS = ("thoughtSignature", "thought_signature")
+# Provider-opaque fields a provider checks byte for byte, kept as they came at
+# the positions their APIs define, and only as strings: a Responses reasoning
+# item's encrypted content, an Anthropic web search result's encrypted
+# content, an assistant's reasoning details, and the thought signature LiteLLM
+# carries in the chat shape. A text rule that matched inside one would make
+# the provider reject the item on every later turn.
+ENCRYPTED_CONTENT_KEY = "encrypted_content"
+REASONING_ITEM_TYPE = "reasoning"
+WEB_SEARCH_RESULT_BLOCK_TYPE = "web_search_tool_result"
+REASONING_DETAILS_KEY = "reasoning_details"
+REASONING_DETAIL_KEPT_KEYS = ("data", "signature")
+PROVIDER_FIELDS_KEY = "provider_specific_fields"
+PROVIDER_THOUGHT_SIGNATURE_KEY = "thought_signature"
+TOOL_CALLS_KEY = "tool_calls"
+RESPONSES_INPUT_KEY = "input"
+# A media type the refusal message may name: anything else is reported in
+# fixed words, since the value comes from the request.
+NAMEABLE_MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}$")
 GEMINI_INLINE_KEYS = ("inlineData", "inline_data")
 GEMINI_MIME_KEYS = ("mimeType", "mime_type")
 GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
@@ -272,7 +290,9 @@ class KubeAgentsRedactionCallback(CustomLogger):
         media = media.strip().lower() if isinstance(media, str) else media
         starts = MEDIA_SIGNATURES.get(media) if isinstance(media, str) else None
         if starts is None:
-            raise self._refuse(f"a payload of media type {media!r}")
+            if isinstance(media, str) and NAMEABLE_MEDIA_TYPE.match(media):
+                raise self._refuse(f"a payload of media type {media!r}")
+            raise self._refuse("a payload whose media type is not a media type name")
         if not isinstance(data, str):
             raise self._refuse(f"a {media} payload that is not a string")
         try:
@@ -305,6 +325,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
             if isinstance(part.get(DATA_KEY), str):
                 kept.append((path + (DATA_KEY,), part[DATA_KEY]))
             return
+        if kind == WEB_SEARCH_RESULT_BLOCK_TYPE and assistant and not nested and isinstance(part.get(CONTENT_KEY), list):
+            for j, result in enumerate(part[CONTENT_KEY]):
+                if isinstance(result, dict) and isinstance(result.get(ENCRYPTED_CONTENT_KEY), str):
+                    kept.append((path + (CONTENT_KEY, j, ENCRYPTED_CONTENT_KEY), result[ENCRYPTED_CONTENT_KEY]))
         source = part.get(SOURCE_KEY)
         if isinstance(source, dict) and source.get(TYPE_KEY) == BASE64_SOURCE_TYPE:
             self._keep_payload(source.get(MEDIA_TYPE_KEY), source.get(DATA_KEY), path + (SOURCE_KEY, DATA_KEY), kept)
@@ -323,6 +347,24 @@ class KubeAgentsRedactionCallback(CustomLogger):
         # returned); one level only, since deeper is the tool's own output.
         if kind == TOOL_RESULT_TYPE and not nested and isinstance(part.get(CONTENT_KEY), list):
             self._carve_parts(part[CONTENT_KEY], path + (CONTENT_KEY,), kept, nested=True, assistant=False)
+
+    @staticmethod
+    def _carve_assistant_opaque(message: Dict[str, Any], path: tuple, kept: List[tuple]) -> None:
+        """An assistant message's reasoning details and the thought signature
+        LiteLLM carries on the message and on each tool call."""
+        details = message.get(REASONING_DETAILS_KEY)
+        for j, detail in enumerate(details if isinstance(details, list) else []):
+            if isinstance(detail, dict):
+                for key in REASONING_DETAIL_KEPT_KEYS:
+                    if isinstance(detail.get(key), str):
+                        kept.append((path + (REASONING_DETAILS_KEY, j, key), detail[key]))
+        holders = [(path, message)]
+        calls = message.get(TOOL_CALLS_KEY)
+        holders += [(path + (TOOL_CALLS_KEY, k), call) for k, call in enumerate(calls if isinstance(calls, list) else []) if isinstance(call, dict)]
+        for where, holder in holders:
+            fields = holder.get(PROVIDER_FIELDS_KEY)
+            if isinstance(fields, dict) and isinstance(fields.get(PROVIDER_THOUGHT_SIGNATURE_KEY), str):
+                kept.append((where + (PROVIDER_FIELDS_KEY, PROVIDER_THOUGHT_SIGNATURE_KEY), fields[PROVIDER_THOUGHT_SIGNATURE_KEY]))
 
     def _carve_parts(self, parts: List[Any], path: tuple, kept: List[tuple], nested: bool = False, assistant: bool = False) -> None:
         for i, part in enumerate(parts):
@@ -354,6 +396,11 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 self._carve_parts(message[CONTENT_KEY], (MESSAGES_KEY, i, CONTENT_KEY), kept, assistant=assistant)
             if assistant and isinstance(message.get(THINKING_BLOCKS_KEY), list):
                 self._carve_parts(message[THINKING_BLOCKS_KEY], (MESSAGES_KEY, i, THINKING_BLOCKS_KEY), kept, assistant=True)
+            if assistant:
+                self._carve_assistant_opaque(message, (MESSAGES_KEY, i), kept)
+        for i, item in enumerate(data.get(RESPONSES_INPUT_KEY) if isinstance(data.get(RESPONSES_INPUT_KEY), list) else []):
+            if isinstance(item, dict) and item.get(TYPE_KEY) == REASONING_ITEM_TYPE and isinstance(item.get(ENCRYPTED_CONTENT_KEY), str):
+                kept.append(((RESPONSES_INPUT_KEY, i, ENCRYPTED_CONTENT_KEY), item[ENCRYPTED_CONTENT_KEY]))
         if isinstance(data.get(SYSTEM_KEY), list):
             self._carve_parts(data[SYSTEM_KEY], (SYSTEM_KEY,), kept)
         for i, content in enumerate(data.get(CONTENTS_KEY) or []):
