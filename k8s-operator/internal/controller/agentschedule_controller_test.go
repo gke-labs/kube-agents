@@ -27,7 +27,7 @@ import (
 )
 
 // triggerScriptNamesPath is the script-name case list a2a/lib's trigger test
-// reads too.
+// and the AgentProfile CRD's spec.scripts test read too.
 const triggerScriptNamesPath = "../../../a2a/lib/testdata/trigger-script-names.json"
 
 // fakeScheduleGateway is the gateway as the reconciler sees it: the same
@@ -187,6 +187,25 @@ func (f *scheduleFixture) get(t *testing.T) *agentv1alpha1.AgentSchedule {
 		t.Fatal(err)
 	}
 	return &s
+}
+
+// listScripts sets the fixture profile's spec.scripts to names, the
+// allowlist a script schedule's script must be on.
+func (f *scheduleFixture) listScripts(t *testing.T, names ...string) {
+	t.Helper()
+	var p agentv1alpha1.AgentProfile
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.key.Namespace, Name: "fleet-audit"}, &p); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Scripts = nil
+	for _, n := range names {
+		p.Spec.Scripts = append(p.Spec.Scripts, agentv1alpha1.AgentProfileScript{
+			Name: n, Path: agentv1alpha1.AgentProfileScriptRoot + n + ".py", TimeoutSeconds: 300,
+		})
+	}
+	if err := f.c.Update(context.Background(), &p); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func hourAt(h, m int) time.Time { return time.Date(2026, 11, 11, h, m, 0, 0, time.UTC) }
@@ -761,10 +780,14 @@ func TestAgentScheduleABuiltinScriptIsForwarded(t *testing.T) {
 	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
 		s.Spec.Prompt, s.Spec.Script = "", "stall-watch"
 	})
+	f.listScripts(t, "stall-watch")
 	f.at(t, hourAt(0, 45))
 	f.at(t, hourAt(1, 0))
 	if len(f.gw.subs) != 1 {
 		t.Fatalf("submitted %d runs, want 1", len(f.gw.subs))
+	}
+	if sub := f.gw.subs[0]; sub.Skills != nil || sub.MaxTurns != 0 {
+		t.Errorf("a script run's submission carries skills %v and maxTurns %d", sub.Skills, sub.MaxTurns)
 	}
 	got := f.gw.subs[0].Trigger
 	if got != (triggerClaimWire{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "stall-watch"}) {
@@ -799,9 +822,21 @@ func TestAgentScheduleAScriptOffABuiltinIsNotAccepted(t *testing.T) {
 		{"controlled and labelled, not one the install renders", script, true},
 		{"a prompt and a script", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Script = "stall-watch" }, false},
 		{"neither", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "" }, false},
+		// The fake client stores what the CRD's CEL rule would refuse: a
+		// script beside skills or maxTurns, on a built-in schedule whose
+		// profile lists the script.
+		{"a script with skills", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Spec.Skills = []string{"fleet-audit"}
+		}, false},
+		{"a script with maxTurns", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Spec.MaxTurns = ptr.To[int32](5)
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newScheduleFixture(t, tc.mutate)
+			f.listScripts(t, "stall-watch")
 			if tc.notIn {
 				f.r.BuiltinNames = func(*agentv1alpha1.PlatformAgent) []string { return nil }
 			}
@@ -815,6 +850,30 @@ func TestAgentScheduleAScriptOffABuiltinIsNotAccepted(t *testing.T) {
 				t.Fatalf("Accepted = %+v, want False/%s", c, agentScheduleReasonInvalidSchedule)
 			}
 		})
+	}
+}
+
+// A built-in schedule's script must be on its profile's spec.scripts: one the
+// profile doesn't list reads Accepted=False, ProfileScriptUnknown, and
+// nothing is submitted.
+func TestAgentScheduleAScriptTheProfileDoesNotListIsNotAccepted(t *testing.T) {
+	for _, listed := range [][]string{nil, {"other-script"}} {
+		f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+			s.Spec.Prompt, s.Spec.Script = "", "stall-watch"
+		})
+		if listed != nil {
+			f.listScripts(t, listed...)
+		}
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		if len(f.gw.sends) != 0 {
+			t.Fatalf("listed %v: submitted %v", listed, f.gw.sends)
+		}
+		c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonProfileScriptUnknown ||
+			!strings.Contains(c.Message, `"stall-watch"`) {
+			t.Fatalf("listed %v: Accepted = %+v, want False/%s naming the script", listed, c, agentScheduleReasonProfileScriptUnknown)
+		}
 	}
 }
 

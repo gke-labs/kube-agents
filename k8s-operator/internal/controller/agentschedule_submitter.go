@@ -58,8 +58,9 @@ const (
 	// scriptRunTaskTextFormat is a script run's task text: the gateway
 	// requires one on every submission (lib.ValidateTriggerSubmit), and a
 	// script run's schedule has no prompt. No model reads it; it is what
-	// the run's task shows as its ask.
-	scriptRunTaskTextFormat = "Run the helper script %s."
+	// the run's task shows as its ask, worded as a record, not an
+	// instruction, should anything ever hand it to a model.
+	scriptRunTaskTextFormat = "Scheduled script run: %s (no model turn)."
 )
 
 // triggerSubmitWire is lib.TriggerSubmit.
@@ -306,6 +307,12 @@ func triggerSubmitFor(sub ScheduleSubmission) triggerSubmitWire {
 	}
 	if t := sched.Spec.MaxTurns; t != nil {
 		w.MaxTurns = *t
+	}
+	// A script run has no model turn, so skills and a turn cap mean nothing
+	// to it: they stay off the wire even if a schedule stored without the
+	// CRD's rule set them (accept() refuses that schedule too).
+	if w.Trigger.Script != "" {
+		w.Skills, w.MaxTurns = nil, 0
 	}
 	return w
 }

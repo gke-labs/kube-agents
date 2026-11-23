@@ -11,15 +11,11 @@
     "name": "compliance-audit"
   },
   "profile": "fleet-audit",
-  "prompt": "Run the helper script compliance-audit.",
-  "skills": [
-    "fleet-audit"
-  ],
+  "prompt": "Scheduled script run: compliance-audit (no model turn).",
   "parameters": {
     "schedule_mode": "scheduled"
   },
   "activeDeadlineSeconds": 3600,
-  "maxTurns": 250,
   "delivery": {
     "mode": "chat",
     "silentWhenClean": true,

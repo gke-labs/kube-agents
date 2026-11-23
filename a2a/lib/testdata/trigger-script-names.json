@@ -1,5 +1,5 @@
 {
-  "_comment": "Script names for AgentSchedule.spec.script and lib.ValidateTrigger's script: the operator's CRD test (agentschedule_controller_test.go) and a2a/lib's trigger test read this one list, so the CRD rule and lib's can't disagree.",
+  "_comment": "Script names for AgentSchedule.spec.script, AgentProfile.spec.scripts[].name and lib.ValidateTrigger's script: the operator's CRD tests (agentschedule_controller_test.go, agentprofile_envtest_test.go) and a2a/lib's trigger test read this one list, so the CRD rules and lib's can't disagree.",
   "accepted": [
     "a",
     "0",

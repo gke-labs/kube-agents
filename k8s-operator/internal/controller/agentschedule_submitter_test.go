@@ -30,11 +30,14 @@ const triggerSubmitFixturePath = "../../../a2a/lib/testdata/rendered-trigger-sub
 const triggerSubmitScriptFixturePath = "../../../a2a/lib/testdata/rendered-trigger-submit-script.json"
 
 // scriptSubmission is submitterSubmission's schedule turned into a script
-// run: a script in place of its prompt.
+// run: a script in place of its prompt, and no skills or maxTurns, which
+// shape a model run (the CRD refuses them beside a script).
 func scriptSubmission() ScheduleSubmission {
 	sub := submitterSubmission()
 	sub.Schedule.Spec.Prompt = ""
 	sub.Schedule.Spec.Script = "compliance-audit"
+	sub.Schedule.Spec.Skills = nil
+	sub.Schedule.Spec.MaxTurns = nil
 	return sub
 }
 
@@ -94,8 +97,20 @@ func TestAScriptRunsSubmissionCarriesItsScriptOnTheTrigger(t *testing.T) {
 	if w.Trigger != (triggerClaimWire{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}) {
 		t.Errorf("trigger = %+v, want the script beside the stream", w.Trigger)
 	}
-	if w.Prompt != "Run the helper script compliance-audit." {
+	if w.Prompt != "Scheduled script run: compliance-audit (no model turn)." {
 		t.Errorf("task text = %q", w.Prompt)
+	}
+	// A schedule stored without the CRD's rule may still carry skills and
+	// maxTurns beside its script: they stay off the wire.
+	stray := scriptSubmission()
+	stray.Schedule.Spec.Skills = []string{"fleet-audit"}
+	stray.Schedule.Spec.MaxTurns = ptr.To[int32](250)
+	body, err := json.Marshal(triggerSubmitFor(stray))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"skills"`) || strings.Contains(string(body), `"maxTurns"`) {
+		t.Errorf("a script run's submission carries skills or maxTurns: %s", body)
 	}
 	user := scriptSubmission()
 	user.Origin = agentv1alpha1.AgentScheduleOriginUser
