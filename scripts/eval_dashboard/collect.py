@@ -117,11 +117,11 @@ Sources:
               last segment. nightly.py files a run as the writers part only
               under DEFAULT_NIGHTLY_WRITERS_JOB, so a prefix ending in any
               other job is collected but reported as the main part, and is
-              warned about. Each job and each prefix is listed once, under
-              the first flag that names it, --nightly-prefix first: a part
-              flag naming a job or a prefix an earlier flag already lists is
-              warned about and not read (a trailing `/` does not make a
-              prefix another one).
+              warned about. Among --nightly-prefix and the part flags, each
+              job and each prefix is listed once, under the first flag that
+              names it, --nightly-prefix first: a part flag naming a job or
+              a prefix an earlier flag already lists is warned about and not
+              read (a trailing `/` does not make a prefix another one).
   --nightly-main-b-prefix  the same, for the periodic that runs the
               main part's main-b shard (EVAL_NIGHTLY_PART=main-b; the main
               job runs main-a). Given without a value it is
@@ -2594,15 +2594,6 @@ def collect(
         ["--nightly-writers-b-prefix", nightly_writers_b_prefix, writers_b_job, DEFAULT_NIGHTLY_WRITERS_B_JOB],
         ["--nightly-writers-c-prefix", nightly_writers_c_prefix, writers_c_job, DEFAULT_NIGHTLY_WRITERS_C_JOB],
     ]
-    for flag, prefix, job, expected in part_sources:
-        if job != expected:
-            # nightly.py tells the part by this job name alone.
-            part = nightly.night_part({"job": job})
-            print(
-                f"warning: {flag} {prefix} names job {job}, not {expected};"
-                f" the report files its runs as the {part} part",
-                file=sys.stderr,
-            )
     # A part flag naming a job an earlier flag already lists (the main
     # job, or the writers job under --nightly-main-b-prefix) would list it
     # twice and take that job's runs out of its own watermark: list each
@@ -2611,7 +2602,10 @@ def collect(
     # main flag's prefix under another job: list that prefix once as well,
     # or its runs are read twice and filed under the part flag's job. Only
     # the main flag can collide this way: a part flag's job is its prefix's
-    # last segment, so two part flags naming one prefix name one job.
+    # last segment, so two part flags naming one prefix name one job. The
+    # runs of a flag dropped for its prefix are the main flag's, under the
+    # main flag's job, so the warning about the part they file as is for
+    # every other flag.
     main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
     main_prefix_key = _prefix_key(nightly_prefix) if nightly_prefix else None
     listed_by: dict[str, str] = {main_job: "--nightly-prefix"} if main_job is not None else {}
@@ -2619,10 +2613,19 @@ def collect(
         flag, prefix, job, default = source
         if not prefix:
             continue
+        names_main_prefix = job not in listed_by and _prefix_key(prefix) == main_prefix_key
+        if job != default and not names_main_prefix:
+            # nightly.py tells the part by this job name alone.
+            part = nightly.night_part({"job": job})
+            print(
+                f"warning: {flag} {prefix} names job {job}, not {default};"
+                f" the report files its runs as the {part} part",
+                file=sys.stderr,
+            )
         if job in listed_by:
             print(f"warning: {flag} names job {job}, as {listed_by[job]} does; listing it once", file=sys.stderr)
             source[1], source[2] = None, default
-        elif _prefix_key(prefix) == main_prefix_key:
+        elif names_main_prefix:
             print(f"warning: {flag} names prefix {prefix}, as --nightly-prefix does; listing it once", file=sys.stderr)
             source[1], source[2] = None, default
         else:

@@ -1573,6 +1573,16 @@ class TestNightlySource(_MergeBase):
                 self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {main_b_prefix}"])
                 self.assertEqual({r["build_id"]: r["job"] for r in data["runs"]}, {BUILD_101_TRUNCATED: FAKE_NIGHTLY_JOB})
                 self.assertEqual(nightly.night_part(data["runs"][0]), nightly.PART_MAIN)
+        # Under a flag whose own job the prefix does not name, the flag is
+        # not read, so nothing says where "its runs" file: they are the main
+        # flag's, and file as the main part.
+        data, stderr = self.quiet_collect(
+            nightly_prefix=main_b_prefix, nightly_job=FAKE_NIGHTLY_JOB, nightly_writers_prefix=main_b_prefix,
+            gcloud=gcloud, since_days=10000,
+        )
+        self.assertIn(f"warning: --nightly-writers-prefix names prefix {main_b_prefix}, as --nightly-prefix does; listing it once", stderr)
+        self.assertNotIn("the report files its runs as", stderr)
+        self.assertEqual({r["build_id"]: nightly.night_part(r) for r in data["runs"]}, {BUILD_101_TRUNCATED: nightly.PART_MAIN})
 
     def test_the_main_flag_naming_the_main_b_job_keeps_its_own_watermark(self):
         """--nightly-prefix pointed at the main-b periodic: its runs are the
