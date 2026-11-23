@@ -423,17 +423,18 @@ def _peer(*, block: dict | None = _OPEN_BLOCK, created: str | None = None) -> di
     return doc
 
 
-def _cluster_c(*, disk: int = 50, cfs_quota: bool | None = False, created: str | None = None) -> dict:
+def _cluster_c(*, disk: int = 50, pids_limit: str | None = "4096", created: str | None = None) -> dict:
     """Slot c's cluster document: no authorized-networks block, and the
     default pool bench/tf/fleet/main.tf plants as the pool-level outlier, a
-    50 GB disk with cpuCfsQuota false. `cfs_quota=None` leaves the pool with
-    no kubeletConfig at all, as every peer pool reads."""
+    50 GB disk with podPidsLimit 4096 (a string, as gcloud prints an int64).
+    `pids_limit=None` leaves the pool with no kubeletConfig at all, as every
+    peer pool reads."""
     # Since the ComputeClass fixtures (defects-c.tf): the pool carries the
     # class label and the NodeLocal DNSCache add-on is off (GKE omits the
     # false boolean, so the block is empty).
     config: dict = {"diskSizeGb": disk, "labels": {"cloud.google.com/compute-class": "general-ccc"}}
-    if cfs_quota is not None:
-        config["kubeletConfig"] = {"cpuCfsQuota": cfs_quota}
+    if pids_limit is not None:
+        config["kubeletConfig"] = {"podPidsLimit": pids_limit}
     return {
         "currentMasterVersion": "1.34.1-gke.1",
         "createTime": created or _created(),
@@ -1741,12 +1742,12 @@ class PassTest(_Harness):
     def test_a_default_pool_matching_its_peers_is_drift(self):
         # The pool-level outlier is a separate role from drift-outlier: a
         # default pool back at the peers' 20 GB, or with the kubelet key
-        # unset or at its default, drifts drift-pool-outlier alone, so the
+        # unset or at another value, drifts drift-pool-outlier alone, so the
         # case that lists drift-outlier is excused nothing by it.
         for doc, observed in (
             (_cluster_c(disk=20), "nodePools[?(@.name=='default-pool')].config.diskSizeGb eq 50: observed 20"),
-            (_cluster_c(cfs_quota=None), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.cpuCfsQuota eq false: observed nothing"),
-            (_cluster_c(cfs_quota=True), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.cpuCfsQuota eq false: observed true"),
+            (_cluster_c(pids_limit=None), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit eq 4096: observed nothing"),
+            (_cluster_c(pids_limit="1024"), "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit eq 4096: observed \"1024\""),
         ):
             with self.subTest(observed=observed):
                 world = _healthy_world()

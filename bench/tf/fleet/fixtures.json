@@ -6,7 +6,7 @@
   "cluster_slots": {
     "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the declared zonal pool and the pool that names a missing reservation (both at zero nodes), the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
-    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with cpuCfsQuota off where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
+    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with podPidsLimit 4096 where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
   },
   "roles": {
@@ -365,7 +365,7 @@
       "cluster_slot": "c",
       "namespace": null,
       "probes": [],
-      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota false, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
+      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.podPidsLimit 4096, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
       "state": [
         {
           "subject": "cluster",
@@ -376,10 +376,10 @@
         },
         {
           "subject": "cluster",
-          "path": "nodePools[?(@.name=='default-pool')].config.kubeletConfig.cpuCfsQuota",
+          "path": "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit",
           "op": "eq",
-          "value": false,
-          "why": "the kubelet-config half. False, not the default true, so the facet reads a difference whether it treats an absent key as unset or as the default; a key removed, or flipped to true by hand, reads here as drift and as a 4/4 agreement to the facet. GKE serializes an explicit false (the field is a wrapped bool), so `observed nothing` means the key was never set, which is what every project shows until the reconcile rolls it; the same re-apply restores it in place"
+          "value": 4096,
+          "why": "the kubelet-config half. GKE sets no pod PID limit unless asked, so the facet reads a difference whether it treats an absent key as unset or as the default; a key removed, or changed by hand, reads here as drift and as a 4/4 agreement to the facet. An integer on purpose: the pinned provider sends a non-zero integer on an update as on a create, where the explicit false this half first asserted (cpuCfsQuota) was sent only at pool creation and never reached a pool that already existed. `observed nothing` means the key is not set; a re-apply restores it in place"
         }
       ]
     },
