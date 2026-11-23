@@ -66,9 +66,10 @@ file it doesn't list, or a symlink or other non-regular file anywhere. A
 file of that name below the root is an ordinary file and must be listed.
 A persona without one loads, and `Persona.Integrity` says it was not
 checked; `Options.RequireIntegrity` refuses it instead. A profile worker
-sets that from `A2A_PERSONA_INTEGRITY=required` (nothing in the operator
-or chart renders it yet), and logs whether its
-persona loaded verified or unverified.
+sets that from `A2A_PERSONA_INTEGRITY=required`, and logs whether its
+persona loaded verified or unverified. Neither the operator nor the chart
+sets that variable, and an AgentProfile has no field for it: it is a
+worker-level setting, off by default.
 
 The check shows that the persona's files are the ones its build recorded:
 it catches a bad build, a corrupted layer or a staging copy that went
