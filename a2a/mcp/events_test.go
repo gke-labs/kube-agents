@@ -1144,30 +1144,37 @@ func TestAResultWithoutCardsEndsGatheringAtOnce(t *testing.T) {
 	if elapsed := time.Since(start); elapsed >= 4*time.Second {
 		t.Errorf("the turn took %s; a result without cards pending should end gathering at once", elapsed)
 	}
-	mustContain(t, text, answerText, "the gateway's result for task `task-root1` said no cards were left pending, so gathering stopped at once")
+	mustContain(t, text, answerText, stoppedAtOnceLine)
 }
 
 // Gathering reads the buffer after it reads what ends it: a report the
 // listener kept before the root's result was noted, before the wait ran
-// out, or as the quiet period passed, is in the turn's reports. Each case
-// places the report between the two reads, where a buffer read first
-// missed it.
+// out, or as the quiet period passed, is in the turn's reports.
+//
+// The result and wait cases keep the report between the two reads of one
+// pass, where a buffer read first missed it. The quiet case guards two
+// things no single pass shows: that the quiet period's end takes one more
+// pass, which reads a report kept as it passed, and that such a report
+// starts the quiet period again, so a second report kept as that one passes
+// is returned too. Only the quiet timer wakes a pass there, so the passes
+// are counted, not timed.
 func TestGatheringReturnsAReportKeptBeforeItsEnd(t *testing.T) {
 	const root = "task-root1"
 	for _, tc := range []struct {
 		name  string
 		quiet time.Duration
-		// at is the pass of the gathering loop the report is kept on.
-		at int
-		// then is what ends the gathering, just after the report is kept.
+		// at is the passes of the gathering loop a report is kept on.
+		at []int
+		// then is what ends the gathering, just after the last report is
+		// kept.
 		then func(w *turnWatch, cancel context.CancelFunc)
 		want reportsEnd
 	}{
-		{"the root's result", time.Hour, 1, func(w *turnWatch, _ context.CancelFunc) { w.noteResult(resultFrame(root, false)) }, reportsNoCards},
-		{"the wait running out", time.Hour, 1, func(_ *turnWatch, cancel context.CancelFunc) { cancel() }, reportsWaitOver},
-		// Nothing but the quiet period wakes the first pass, so the second
-		// is the one that follows it.
-		{"the quiet period", 20 * time.Millisecond, 2, func(*turnWatch, context.CancelFunc) {}, reportsQuiet},
+		{"the root's result", time.Hour, []int{1}, func(w *turnWatch, _ context.CancelFunc) { w.noteResult(resultFrame(root, false)) }, reportsNoCards},
+		{"the wait running out", time.Hour, []int{1}, func(_ *turnWatch, cancel context.CancelFunc) { cancel() }, reportsWaitOver},
+		// Pass 2 follows the first quiet period, and pass 3 the one the
+		// report kept on pass 2 started.
+		{"the quiet period", 20 * time.Millisecond, []int{2, 3}, func(*turnWatch, context.CancelFunc) {}, reportsQuiet},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setReportQuiet(t, tc.quiet)
@@ -1179,19 +1186,26 @@ func TestGatheringReturnsAReportKeptBeforeItsEnd(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), gatherTestWait)
 			defer cancel()
 			w := &turnWatch{token: "tok", known: map[string]bool{root: true}, results: map[string]bool{}, resultSeen: make(chan struct{}, 1)}
-			report := mustJSON(t, notifyFrame("n-real", root, cardReport))
+			reports := map[int]json.RawMessage{}
+			for _, at := range tc.at {
+				reports[at] = mustJSON(t, notifyFrame(fmt.Sprintf("n-pass-%d", at), root, cardReport))
+			}
 			pass := 0
 			w.beforeSnapshot = func() {
-				if pass++; pass != tc.at {
+				pass++
+				report, ok := reports[pass]
+				if !ok {
 					return
 				}
 				e.receive(e.logs["tok"], report)
-				tc.then(w, cancel)
+				if pass == tc.at[len(tc.at)-1] {
+					tc.then(w, cancel)
+				}
 			}
 			out := TurnOutcome{Root: TaskRef{Addressee: fakeAddressee, TaskID: root}}
 			b.gatherReports(ctx, w, &out, true)
-			if len(out.Reports) != 1 || out.Reports[0].Text != cardReport {
-				t.Errorf("gathering returned %d reports, want the one kept before it ended", len(out.Reports))
+			if len(out.Reports) != len(tc.at) {
+				t.Errorf("gathering returned %d reports, want the %d kept before it ended", len(out.Reports), len(tc.at))
 			}
 			if out.ReportsEnd != tc.want {
 				t.Errorf("ReportsEnd %d, want %d", out.ReportsEnd, tc.want)
@@ -1226,7 +1240,7 @@ func TestAStreamedTurnNamesTheGatewaysResultOnlyWhenHeard(t *testing.T) {
 	}
 	sb.Reset()
 	writeReports(&sb, out, "tok")
-	mustContain(t, sb.String(), "the gateway's result for task `task-root1` said no cards were left pending, so gathering stopped at once")
+	mustContain(t, sb.String(), stoppedAtOnceLine)
 }
 
 // The root's result with cardsPending gathers the card's report that comes
