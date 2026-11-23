@@ -3,7 +3,6 @@ Subject: Point Workload Identity at gke-workload-identity
 Why: upstream's Workload Identity split moved WI routing out of gke-workload-security in the skills' descriptions only; the bodies an agent reads after routing still sent it there and taught GSA impersonation as the recommended path, which gke-workload-identity calls legacy. The patch points the bodies at gke-workload-identity.
 Local-Issue: none (#2357)
 Eval-Case: none (came with the migration to overlays, a byte-identical move)
-Upstream-Issue: none filed yet
 Retire-When: upstream's skill bodies route Workload Identity to gke-workload-identity
 
 diff --git a/SKILL.md b/SKILL.md

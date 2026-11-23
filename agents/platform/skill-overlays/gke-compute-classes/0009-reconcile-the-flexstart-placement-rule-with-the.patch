@@ -3,8 +3,7 @@ Subject: Reconcile the `flexStart` placement rule with the AI/ML ladder
 Why: The synced rule said to put `flexStart: true` at the very end of `priorities[]`, while the CRITICAL AI/ML RULE, the Inference pattern and its asset put Spot after DWS; the rule now says to make Flex the last non-preemptible tier, which keeps its queue-wait reason and agrees with the ladder, and names Prod Training as the case that accepts the wait above On-Demand; the Prod Training row's rationale now says the same instead of calling its DWS-above-OD order "Flex at bottom".
 Local-Issue: #2692
 Eval-Case: compute-class-canary-active-migration-pdb-probe
-Upstream-Issue: none filed yet
-Retire-When: when upstream states one `flexStart` placement across SKILL.md and the prioritization reference
+Retire-When: upstream states one `flexStart` placement across SKILL.md and the prioritization reference
 
 diff --git a/SKILL.md b/SKILL.md
 --- a/SKILL.md
