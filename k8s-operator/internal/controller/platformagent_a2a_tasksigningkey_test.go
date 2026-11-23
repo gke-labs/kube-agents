@@ -172,8 +172,6 @@ func TestAnUnownedTaskSigningSecretIsRefused(t *testing.T) {
 // task-signing Secret or carries the seed, except the dispatcher, which runs
 // by default and is the one workload that mounts it.
 func TestTheTaskSigningKeyReachesTheCalloutAsItsPublicHalfOnly(t *testing.T) {
-	// The MCP door renders only with its env var set.
-	t.Setenv(a2aMCPDoorEnvVar, "true")
 	r, cl, agent := taskSigningTestReconciler(t)
 	ctx := context.Background()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}

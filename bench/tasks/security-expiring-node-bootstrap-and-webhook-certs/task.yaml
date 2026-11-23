@@ -1,7 +1,10 @@
 # Security, Workload Identity, RBAC and CVEs (compliance-audit): the planted
-# admission webhook's CA bundle is an expired certificate, and no compliance
-# check reads a CA bundle's notAfter. A declared gap: expected_fail until the
-# check lands (gke-labs/kube-agents#4960). The id keeps the scenario's
+# admission webhook's CA bundle is an expired certificate. Check 2.20
+# (`webhook-ca-bundle-expired`) names it: the collector lists it as a candidate,
+# the audit's document carries it, and the ledger names it in the issue body
+# (`major` here: `failurePolicy: Ignore` with an already-expired CA bundle,
+# rendered either with full detail or under `### Listed without detail` when
+# higher-severity findings fill the detail budget). The id keeps the scenario's
 # node-certificate half in its name; the agent's read role reaches no node
 # certificate or Secret, so the webhook CA bundle is the half a fixture can
 # plant and an audit can read.
@@ -9,7 +12,6 @@ id: security-expiring-node-bootstrap-and-webhook-certs
 name: "Admission Webhook CA Bundle Certificate Expired (webhook CA bundle check)"
 domain: security
 suite: validated-capabilities
-expected_fail: true
 audit_streams:
   - compliance-audit
 fixtures: []
@@ -34,8 +36,8 @@ validated: false
 
 verification_spec:
   # One finding, read as the renderer writes it: the phrase must sit in the
-  # object on the Where: line under a heading whose id starts with one of the
-  # accepted check slugs. A body phrase for the object would match every
+  # object on the Where: line under a heading (or on its row under Listed
+  # without detail) whose id starts with one of the accepted check slugs. A body phrase for the object would match every
   # finding on it and an id phrase for the check every object, and nothing in
   # that pair requires one finding to carry both; the id's object segment is
   # clipped per host, so it cannot carry the pair either.

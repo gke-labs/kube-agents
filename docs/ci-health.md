@@ -40,7 +40,7 @@ describes it. When the section cannot be built, the digest carries one line on
 the night instead (the cases recorded, how many passed all reps, partial and
 failed, what is newly failing against the night before, the opening chat
 turn's p50 and p95 as advice beside the p95 < 10 s target
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
+([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the nightly
 grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
 the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
@@ -195,8 +195,8 @@ harness wrote them and after the same scrub as the periodics' quoted log line,
 commonest first, so a batch that said `hermes-rate-limited` reads as that and
 not as the bot's guess), a forge outage (6+ forge repetitions,
 below, across 2+ pull requests among the runs that finished in the last 2
-hours: the evals repositories share one GitHub App installation and its
-hourly REST budget, so a second pull request already shows the fleet's
+hours: the evals repositories share one GitHub App installation per shard of ten projects (`hack/eval/ledger-reader-apps.txt`) and its
+hourly REST budget, so a second pull request already shows a shard's
 budget rather than one branch; it ranks below the storm and the ceiling,
 which lose the agent's run rather than its grading), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
@@ -269,8 +269,8 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the forge lanes' runs too, one tier
 each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
 forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
-GitLab repository, with its next-mode nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
-`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
+GitLab repository, with its nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a
 weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
 section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
 "Self-managed lanes" section, a table of their pull-request runs and one of their weekly runs, each row naming its forge.
@@ -547,8 +547,7 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. Two more, `ci-kube-agents-validated-capabilities-1` and `-2`, are
 not pool jobs but the validated-capabilities lane's weekly slices, one a suite part, watched here because
-their record is their logs bucket and nothing else reads a failed build of them. The first slice is
-also watched as `ci-kube-agents-certification-1`, the name its job has until `oss-test-infra` renames it. Another,
+their record is their logs bucket and nothing else reads a failed build of them. Another,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
 and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
 `ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
@@ -1090,9 +1089,11 @@ with two identities:
   from GitHub; and the candidate fixes, open pull requests touching the same
   files and commits on those files merged since the first red night. It writes
   only to the runner's disk.
-- **Route**, as the publisher (`CI_HEALTH_SA`): one call to Gemini on Vertex AI
-  through the job's Workload Identity, model `NIGHTLY_TRIAGE_MODEL`
-  (`gemini-4-argon` unless the repository variable names another), billed to
+- **Route**, as the publisher (`CI_HEALTH_SA`): one call on Vertex AI through
+  the job's Workload Identity to the model the repository secret
+  `NIGHTLY_TRIAGE_MODEL` names (a secret, not a variable, so the public job
+  log prints it as `***`; no default: the workflow file is public and names
+  no model), billed to
   `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
   capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
   then grading lines) and the answer at 16,384, thinking included. The model returns a
@@ -1138,13 +1139,18 @@ meanwhile stays. The filer files for triage only into a separate issues
 repository, the route step writes to no other, and the job's own token holds
 no issue write.
 
-Unarmed, the job dry-runs on the issues the filer filed that tick (which the
-filer assigned as before) and prints what it would assign; a manual run of the
+Unarmed, with a model named, the job dry-runs on the issues the filer filed
+that tick (which the filer assigned as before) and prints what it would assign; a manual run of the
 workflow with `triage_issues` set to issue numbers of the issues repository
 does the same for those issues. Setting the repository variable
-`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true`;
-`CI_HEALTH_MUTE=true` disarms both. Switched off while issues still wait,
-the tick routes each by the rule without a model call. The call needs
+`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true` and
+a model named in the `NIGHTLY_TRIAGE_MODEL` secret; without the name the
+filer keeps assigning by its rule, the job dry-runs by the rule, and the
+comment each waiting issue gets names the switch when it is off and the
+missing model name when the switch is on;
+`CI_HEALTH_MUTE=true` disarms the filer and the triage alike. Switched off, or with no model named,
+while issues still wait, the tick routes each by the rule without a model
+call. The call needs
 `roles/aiplatform.user` for `CI_HEALTH_SA` on `NIGHTLY_TRIAGE_PROJECT`, with
 the Vertex AI API enabled there; until then every call fails and every issue
 goes by the rule.
@@ -1287,7 +1293,7 @@ bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 bar, and who clears it"), and, when the tick read the evidence store (not the
 last published copy written back after a failed read, nor a read stopped at its
 deadline), what the
-store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
+store says at the current version key (`next`; the dashboard falls back to the today-keyed records only when the store holds no `next` record, `coverage_gaps.store_records` and `trend.py`): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
 bar, then by pass rate. The issue's table names the candidates in that order
@@ -1574,7 +1580,7 @@ roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours`
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). One assertion this job never makes: the five `declared-*` roles
+read failed). One assertion this job never makes: the `declared-*` roles
 assert the pool repository's declared-intent note, and the job holds no
 credential for the pool repositories by design, so the state script leaves
 that assertion out, judges those roles on their cluster assertions (healthy,
@@ -1600,7 +1606,8 @@ firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots 
 reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress`,
 `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
-`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
+`compute.instances.getSerialPortOutput`), and the `gcloud compute reservations list` read of the
+cluster role `missing-reservation-pool` (`compute.reservations.list`, in the same role), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the

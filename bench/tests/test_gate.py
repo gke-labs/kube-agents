@@ -537,7 +537,7 @@ def test_report_excerpt_collapses_strips_and_truncates(raw, expected):
 def test_a_report_with_a_lone_surrogate_still_grades_and_writes_the_hand_off(
     kanban_task, make_run, tmp_path, capsys
 ):
-    """results.json can carry `\ud83d` as a JSON escape; json.loads keeps it
+    """results.json can carry `\\ud83d` as a JSON escape; json.loads keeps it
     as a lone surrogate, and printing that raises under a UTF-8 stdout. The
     gate must still print its lines and write the case JSON."""
     def broken(rec):
@@ -570,6 +570,17 @@ def test_the_version_key_rides_in_the_hand_off(kanban_task, tmp_path, monkeypatc
     out = tmp_path / "case.json"
     run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], out)
     assert payload(out)["version_key"] == NEXT_KEY
+
+
+def test_a_session_front_door_run_keys_apart_from_next(kanban_task, tmp_path, monkeypatch):
+    """A run that deployed the default session as its front door
+    (EVAL_FRONT_DOOR=session, #6539) files under next-session, so a
+    front-door A/B run never moves the main nightly's bar."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("EVAL_FRONT_DOOR", "session")
+    out = tmp_path / "case.json"
+    run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], out)
+    assert payload(out)["version_key"] == {**NEXT_KEY, "mode": "next-session"}
 
 
 def test_no_judge_model_means_no_key(kanban_task, tmp_path):

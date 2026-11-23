@@ -8,9 +8,19 @@ attribution (``github_writes``) both read calls through it, so the two
 cannot disagree on where a command starts. It lives in its own module
 because ``verifiers`` imports ``github_writes``.
 
+A NUL character in a line stays in its word. The worker's terminal tool
+passes the line inside one argument of a shell's ``-c`` flag (read in
+hermes-agent v2026.9.14), and an argument cannot hold a NUL character, so no
+shell reads such a line. The reader does not model a shell that drops the
+character.
+
 The agent images copy this one file beside
 ``agents/platform/scripts/worker_transcript.py``, which loads it by path. So
-it imports only the standard library and nothing from this package.
+it imports only the standard library and nothing from this package. That
+module's secret-read detector reads command lines with
+``_shell_words_and_spans``, ``_ShellOperator``, ``_is_redirect`` and
+``_substitution_commands``, so a change to one of them also changes which
+tool results the detector withholds.
 """
 
 from __future__ import annotations
@@ -30,11 +40,32 @@ _SHELL_OPERATOR_CHARS = frozenset("&|;()")
 # `>&`, `|&`); `(` and `)` are operators of one character each.
 _SHELL_OPERATOR_RUN_CHARS = frozenset("&|;<>")
 _SHELL_PARENS = frozenset("()")
+# The reader puts its marks inside the line's own text, between two of this character. A mark
+# character that the line itself holds is written as the literal mark, so each mark character
+# in the marked text opens or closes a mark that the reader wrote, and no text of the line reads
+# as an operator mark or a substitution mark.
+_MARK_CHAR = "\x00"
+_LITERAL_MARK = "\x00N\x00"
 _OPERATOR_MARK = "\x00O{index}\x00"
 _OPERATOR_MARK_RE = re.compile(r"^\x00O(\d+)\x00$")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
 # `eval` runs its words, joined by spaces, as a command line of its own (`eval "git push ..."`).
 _SHELL_EVAL = "eval"
+# `eval` joins its words with one space before the shell reads them again.
+_SHELL_EVAL_WORD_SEPARATOR = " "
+# The limits of :func:`_shell_argvs` for one typed line. They are the numbers of the secret-read
+# detector in agents/platform/scripts/worker_transcript.py, which reads the same lines. A command
+# line inside a line (after an `eval`, behind a shell's `-c` flag, in a substitution) is one
+# level; the typed line is level 0, and a command line that a person types nests a few levels.
+# The budget is in characters: each command line that the reader reads costs its length and
+# `_READ_COST_CHARS` more. Without it, a substitution inside an `eval` word, which is read as a
+# span of the line and again in the line that `eval` runs, doubles the reading at each level.
+_MAX_COMMAND_LINE_NESTING = 16
+_MAX_READ_CHARS_FACTOR = 6
+_MAX_READ_CHARS_FLOOR = 65536
+_READ_COST_CHARS = 16
+_NESTING_LIMIT_TEXT = f"more than {_MAX_COMMAND_LINE_NESTING} levels of command lines inside the line"
+_READ_LIMIT_TEXT = f"more reading than {_MAX_READ_CHARS_FACTOR} x the line's length + {_MAX_READ_CHARS_FLOOR} characters"
 # A shell program is unwrapped only where the shell would run it: as the segment's command word,
 # or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
@@ -75,7 +106,8 @@ _SHELL_QUOTED_SUBSTITUTION_OPENERS = ("$((", "$(")
 _SHELL_ARITHMETIC_OPENER = "$(("
 _SHELL_BACKTICK = "`"
 _SUBSTITUTION_MARK = "\x00S{index}\x00"
-_SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
+# The marks a word can hold: a literal mark, or a substitution mark with its index.
+_WORD_MARK_RE = re.compile(r"\x00(?:N|S(\d+))\x00")
 # After an exec wrapper, only the wrapper's own words are transparent: a flag, the word after a
 # flag (its value, as in `-u hermes` or `-s KILL`, unless that word is a flag itself; which flags take one is not tabled), a
 # duration or count (`timeout 600`, `timeout infinity`), an expansion the reader never resolves
@@ -120,6 +152,12 @@ _BRACED_EXPANSION_OPEN = "${"
 _PLAIN_BRACED_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\}|:?-)")
 
 
+class ShellReadLimitError(ValueError):
+    """A command line is past a limit of :func:`_shell_argvs`: its command lines nest deeper than
+    ``_MAX_COMMAND_LINE_NESTING``, or they need more reading than the line's budget. The reader
+    gives no argvs for such a line, so a check that reads argvs cannot be evaluated on it."""
+
+
 def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
     """The command line with its comments removed, every substitution span the shell would run
     replaced by a marker inside its word, and every bare operator token replaced by a marker of
@@ -139,7 +177,8 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
     command as ``;`` does) is one only outside quotes, which is
     known here and not after the quotes come off: a quoted ``">"`` or ``';'`` stays a word of
     text. A span left open at the line's end is kept as it stands. Read before the quotes come
-    off, because afterwards a quoted ``#1.json`` and a bare one look the same."""
+    off, because afterwards a quoted ``#1.json`` and a bare one look the same. A mark character
+    of the line itself is written as the literal mark (:func:`_with_literal_marks`)."""
     spans: list[str] = []
     operators: list[str] = []
     out: list[str] = []
@@ -164,7 +203,7 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 # command typed across continued lines is the same line.
                 i += 2
                 continue
-            out.append(command[i:i + 2])
+            out.append(_with_literal_marks(command[i:i + 2]))
             previous = _SHELL_ESCAPE_CHAR
             i += 2
             continue
@@ -182,7 +221,7 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 close = _backtick_end(command, i + 1)
             if opener is not None or (char == _SHELL_BACKTICK and quote != _SHELL_SINGLE_QUOTE):
                 if close is None:
-                    out.append(command[i:])
+                    out.append(_with_literal_marks(command[i:]))
                     break
                 spans.append(command[i:close])
                 out.append(_SUBSTITUTION_MARK.format(index=len(spans) - 1))
@@ -200,10 +239,16 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 previous = command[end - 1]
                 i = end
                 continue
-        out.append(char)
+        out.append(_with_literal_marks(char))
         previous = char
         i += 1
     return "".join(out), spans, operators
+
+
+def _with_literal_marks(text: str) -> str:
+    """``text`` as :func:`_read_shell_line` keeps the line's own text: each mark character is
+    the literal mark."""
+    return text.replace(_MARK_CHAR, _LITERAL_MARK)
 
 
 def _backtick_end(command: str, start: int) -> int | None:
@@ -254,8 +299,10 @@ def _substitution_end(command: str, start: int, depth: int) -> int | None:
     return None if depth > 0 else j
 
 
-def _unfold_substitutions(word: str, spans: list[str]) -> str:
-    return _SUBSTITUTION_MARK_RE.sub(lambda m: spans[int(m.group(1))], word)
+def _unfold_marks(word: str, spans: list[str]) -> str:
+    """``word`` with each substitution mark replaced by its span and each literal mark by the
+    mark character. One pass from the left, so the text of a span is not read for marks."""
+    return _WORD_MARK_RE.sub(lambda m: _MARK_CHAR if m.group(1) is None else spans[int(m.group(1))], word)
 
 
 class _ShellOperator(str):
@@ -284,7 +331,7 @@ def _shell_words_and_spans(command: str) -> tuple[list[str], list[str]]:
     words: list[str] = []
     for word in raw:
         mark = _OPERATOR_MARK_RE.match(word)
-        words.append(_ShellOperator(operators[int(mark.group(1))]) if mark else _unfold_substitutions(word, spans))
+        words.append(_ShellOperator(operators[int(mark.group(1))]) if mark else _unfold_marks(word, spans))
     # A redirect that ends a segment with no target (`>#log` once its comment is off) is a line
     # bash refuses, so nothing on it runs.
     for index, word in enumerate(words):
@@ -301,7 +348,7 @@ def _is_control_operator(word: str) -> bool:
     return isinstance(word, _ShellOperator) and (word == _SHELL_LINE_END or set(word) <= _SHELL_OPERATOR_CHARS)
 
 
-def _shell_argvs(command: str) -> list[list[str]]:
+def _shell_argvs(command: str, _nesting: int = 0, _budget: list[int] | None = None) -> list[list[str]]:
     """Each segment of a command line as an argv: comments come off and the line is tokenised
     first, so a quoted path is one word and a quoted sentence one word whatever it contains,
     then split where the shell starts a new command. A shell program anywhere on a segment
@@ -309,7 +356,16 @@ def _shell_argvs(command: str) -> list[list[str]]:
     after its ``-c``-style flag, which is read the same way and yields its own argvs; so does
     each command or process substitution and each backtick pair on the line (``OUT=$(python3
     ... --readiness)``, ``cat <(...)``), whose commands the shell runs, and the words after an
-    ``eval``, joined by spaces as ``eval`` joins them."""
+    ``eval``, joined by spaces as ``eval`` joins them. A line whose command lines nest deeper
+    than ``_MAX_COMMAND_LINE_NESTING`` levels, or need more reading than the line's budget,
+    raises :class:`ShellReadLimitError`; ``_nesting`` and ``_budget`` are the reader's own."""
+    if _budget is None:
+        _budget = [_MAX_READ_CHARS_FACTOR * len(command) + _MAX_READ_CHARS_FLOOR]
+    if _nesting > _MAX_COMMAND_LINE_NESTING:
+        raise ShellReadLimitError(_NESTING_LIMIT_TEXT)
+    _budget[0] -= len(command) + _READ_COST_CHARS
+    if _budget[0] < 0:
+        raise ShellReadLimitError(_READ_LIMIT_TEXT)
     words, spans = _shell_words_and_spans(command)
     argvs: list[list[str]] = []
     argv: list[str] = []
@@ -323,19 +379,19 @@ def _shell_argvs(command: str) -> list[list[str]]:
     for argv in list(argvs):
         index = _command_word_index(argv)
         if index is not None and argv[index] == _SHELL_EVAL:
-            argvs.extend(_shell_argvs(" ".join(argv[index + 1:])))
+            argvs.extend(_shell_argvs(_SHELL_EVAL_WORD_SEPARATOR.join(argv[index + 1:]), _nesting + 1, _budget))
             continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
         for flag_index in range(index + 1, len(argv) - 1):
             flag = argv[flag_index]
             if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                argvs.extend(_shell_argvs(argv[flag_index + 1]))
+                argvs.extend(_shell_argvs(argv[flag_index + 1], _nesting + 1, _budget))
                 break
     for span in spans:
         inner = _substitution_commands(span)
         if inner is not None:
-            argvs.extend(_shell_argvs(inner))
+            argvs.extend(_shell_argvs(inner, _nesting + 1, _budget))
     return argvs
 
 

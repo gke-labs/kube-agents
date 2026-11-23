@@ -61,10 +61,11 @@ const DefaultPort = 10250
 // agentv1alpha1.BusCredentialRoutes. Each names the thing matched, so the
 // author reading the field error knows which line to change and why.
 const (
-	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone" // #nosec G101 -- Error message format, not a credential
-	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"                                 // #nosec G101 -- Error message format, not a credential
-	forgeCredsSecretForbiddenFmt = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"                         // #nosec G101 -- Error message format, not a credential
-	forgeCredsEnvForbiddenFmt    = "container %q references Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be referenced by the CR"               // #nosec G101 -- Error message format, not a credential
+	busTokenAudienceForbiddenFmt     = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone"                    // #nosec G101 -- Error message format, not a credential
+	watcherTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the credential proxy's watcher token audience; the operator projects that token for the agent-api-auth container alone" // #nosec G101 -- Error message format, not a credential
+	busCredsSecretForbiddenFmt       = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"                                                    // #nosec G101 -- Error message format, not a credential
+	forgeCredsSecretForbiddenFmt     = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"                                            // #nosec G101 -- Error message format, not a credential
+	forgeCredsEnvForbiddenFmt        = "container %q references Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be referenced by the CR"                                  // #nosec G101 -- Error message format, not a credential
 )
 
 // The data volume size checks on spec.storage.size. A PersistentVolumeClaim
@@ -400,6 +401,21 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	// 7. Leaving next while a bus migration holds the bus: the run's
 	// staging claim can hold the only copy of the bus's data.
 
+	// 8. Effective kanban.admission memoryBudgetMiB >= workerRssCapMiB so a
+	// single worker's RSS cap never exceeds the pod's memory admission budget.
+	admissionErrs, admissionWarnings := validateKanbanAdmission(oldObj, platformAgent)
+	allErrs = append(allErrs, admissionErrs...)
+	warnings = append(warnings, admissionWarnings...)
+
+	// 9. Tier membership (#3659): no unattended or legacy tier for a person,
+	// and no person listed twice. A tier nothing defines yet is let through:
+	// the gateway refuses that member's profile tasks until it exists.
+	memberErrs, err := controller.ValidateTierMembership(ctx, v.Client, oldObj, platformAgent, field.NewPath("spec", "tiers", "membership"))
+	if err != nil {
+		return nil, err
+	}
+	allErrs = append(allErrs, memberErrs...)
+
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -510,6 +526,23 @@ func storageSize(platformAgent *agentv1alpha1.PlatformAgent) *resource.Quantity 
 		return nil
 	}
 	return platformAgent.Spec.Storage.Size
+}
+
+// validateKanbanAdmission rejects creates or updates whose resolved
+// kanban.admission block sets memoryBudgetMiB below workerRssCapMiB. When
+// oldObj already carried a mismatched configuration and neither
+// spec.deployment.resources nor spec.harness.tuning.admission changed, the
+// update passes with a warning so unrelated edits to an existing CR are not
+// deadlocked.
+func validateKanbanAdmission(oldObj, platformAgent *agentv1alpha1.PlatformAgent) (field.ErrorList, admission.Warnings) {
+	errs := controller.ValidateKanbanAdmission(platformAgent)
+	if len(errs) == 0 {
+		return nil, nil
+	}
+	if oldObj != nil && controller.KanbanAdmissionInputsEqual(oldObj, platformAgent) && len(controller.ValidateKanbanAdmission(oldObj)) > 0 {
+		return nil, admission.Warnings{fmt.Sprintf("%s: %s", errs[0].Field, errs[0].Detail)}
+	}
+	return errs, nil
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a
@@ -629,6 +662,11 @@ func validateBusCredentialSource(vol corev1.Volume, agentName string, path *fiel
 			errs = append(errs, field.Forbidden(
 				path.Child("projected", "sources").Index(route.Source).Child("serviceAccountToken", "audience"),
 				fmt.Sprintf(busTokenAudienceForbiddenFmt, vol.Name, agentv1alpha1.A2ABusTokenAudience),
+			))
+		case agentv1alpha1.BusCredentialRouteWatcherAudience:
+			errs = append(errs, field.Forbidden(
+				path.Child("projected", "sources").Index(route.Source).Child("serviceAccountToken", "audience"),
+				fmt.Sprintf(watcherTokenAudienceForbiddenFmt, vol.Name, agentv1alpha1.WatcherTokenAudience),
 			))
 		case agentv1alpha1.BusCredentialRouteSecret:
 			at := path.Child("secret", "secretName")

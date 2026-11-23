@@ -339,7 +339,10 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "submit-suggestion",
     ],
     "Meta": [
+        "alert-history",
+        "chat-delivery",
         "decision-memory",
+        "first-run-report",
         "fleet-audit",
         "fleet-audit-reports",
         "github-issue-resolver",
@@ -387,6 +390,7 @@ CRON_CADENCE = {
     "0 * * * *": "Hourly",
     "11 * * * *": "Hourly at :11",
     "25 * * * *": "Hourly at :25",
+    "*/5 * * * *": "Every 5 minutes",
     "*/10 * * * *": "Every 10 minutes",
     "7,22,37,52 * * * *": "Four times an hour (:07, :22, :37, :52)",
     "*/30 * * * *": "Every 30 minutes",

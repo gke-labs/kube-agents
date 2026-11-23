@@ -398,7 +398,9 @@ calls and become properties of the stream:
   `kind: message` with the same `taskId` to `…in`. Executor resumes and publishes
   `working`.
 - Steering (added 8/24; refusal posture recorded 8/31): a follow-up `message` on `…in`
-  while the task is `working` is legal. It is steering input - delivered to the
+  while the task is `working` is legal, except into a task that holds `changeRequested`: the
+  gateway sends no steer into one, and so no `input-required` answer or choice click either
+  (#5884). It is steering input - delivered to the
   executor, incorporated at its next turn boundary, no state transition implied. The
   hard interrupt is `cancel`, not a steer. An executor that cannot absorb input mid-turn
   may queue it instead (the standing front door, 10/8): it answers each follow-up with a
@@ -610,9 +612,9 @@ envelope's to make decision-grade.
 ## Chat messages (added 10/8)
 
 A task's answer is not always prose. A report has a headline and rows, a question has
-choices, and a running task has a plan. Under `today` the Slack presenter lays these out
-from the agent's text at post time. Under `next` the chat gateway posts what comes off the
-bus, and it holds no model and does not parse prose (#2149). So the executor states the
+choices, and a running task has a plan. The Hermes Slack presenter laid these out from the agent's text at post time. The A2A chat
+gateway, which serves Slack now, posts what comes off the bus, and it holds no model and
+does not parse prose (#2149). So the executor states the
 structure, and every adapter renders it: Block Kit, a card, an embed, or plain text.
 
 The mechanism is the one topics already use. A **chat message** is one DataPart whose
@@ -638,7 +640,7 @@ consumer that missed an event renders the next one correctly.
 A click on a choice arrives like any message in the conversation: a new turn once the task
 has ended, a steer while it runs, under the steering rules above (so on the fixed route,
 which refuses steers, a click on a mid-task `notice` gets the refusal). (The Hermes bridge emits
-no `input-required` today, so under `next` choices live on `result` and `notice` for now.)
+no `input-required` today, so choices live on `result` and `notice` for now.)
 
 ### The object
 
@@ -719,14 +721,14 @@ A choice may also carry `next: true`, which marks a finished answer's optional n
 Block order is fixed so every renderer agrees: headline and note, detail, rows, after, fold,
 then the buttons, choices before links. In `progress` the `plan` follows the headline and
 takes the place of the rows. The caps on headline, row text and row detail, button
-labels, the url rule and the plan are the `today` presenter's (`slack_presenter.py`,
+labels, the url rule and the plan are the Hermes Slack presenter's (`slack_presenter.py`,
 `slack_status.py`), and fold text is #2360's. The rest are chosen here and sit inside Slack's own
-limits. The `today` path clips where this spec refuses, so the emitter applies windows:
+limits. The presenter clips where this spec refuses, so the emitter applies windows:
 the presenter's newest 20 plan items (settled ones first to go) and last 6 steps of each,
 and the first 5 `after` lines, which the presenter leaves uncapped.
 
 **The emitter composes, the renderer lays out.** A plan item's `title` arrives finished
-(`today`'s `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
+(the presenter's `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
 choice's `reply` names whatever the answer needs to reach (a card, an option). The
 renderer adds only what is its backend's own: a "✓ name: choice" rewrite of an answered
 question (#2346), a "waiting on you" context line under an open one, which emoji a mark
@@ -761,24 +763,29 @@ Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and use
 delegation to profiles onward. The gateway carries a `delegate` request's `parameters` into the
 child's submission once their names pass the target profile's declared ones. These are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
-`taskParameters` parts.
+`taskParameters` parts. Of the task parameters' fields, `changeRequested` is set true only for a
+turn that arrived as a structured confirm.
 
 **Task parameters.** A profile task's submission carries
 `{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
 declares, such as the cluster persona's `project`, `location` and `cluster`. The gateway sets them
 from what the client or the parent task asked. They never ride the authority block. The dispatcher
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
-to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
+to the worker as `PROFILE_TASK_<NAME>`, or to a script-run task's script as `KA_PARAM_<NAME>`
+(`spec-profiles-dispatch.md`, #5622), whose name may be at most 32 characters. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
 
 The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
 request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
 and only for a turn that arrived as a structured confirm action, never from free text or a
-delegation's arguments. A child task carries its parent's value from the gateway's own record and
-cannot raise it. The gateway's half is #4457, which owns both rules; until it lands, nothing sets
-the field and every profile write is refused. Absent means false, so a
-submission that asks for no change is byte-identical to one written before the field existed. The
-dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
+delegation's arguments. A child task or a wake carries its parent's value from the gateway's own
+record and cannot raise it. No steer reaches a running task that holds it, from any door: a typed
+message there is refused with a notice to stop the task and confirm again, since the gateway can't
+tell which client on a door sent it and a change-permitted task's instructions must not change
+mid-run (a confirm is already refused while a task runs). When it is true the gateway attaches the part even with no parameters.
+Absent means false, so a submission that asks for no change is byte-identical to one written before
+the field existed. The dispatcher turns it into the `vcs:proposal-create` permit on the task's
+credential-proxy token.
 
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
@@ -806,8 +813,9 @@ finished turn's `…in`. A session's request may mint a batch of children (`task
 side and queue at the dispatcher like any child, and wake the session once, when the last of them
 has ended, with every child's result or end (`spec-chatops-gateway.md`, "A fan-out's wake"). A
 child of such a batch that reaches `input-required` ends there, with its question as its result,
-rather than pausing the conversation. A stop that cancels every child is the next step of fan-out,
-which is why the gateway accepts no width but one for now.
+rather than pausing the conversation. One stop cancels every child, each on its own `…in`, with a
+stop record for a profile task, and nothing a canceled task writes afterwards reaches the room
+(`spec-chatops-gateway.md`, "Stop").
 
 **Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
 `{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?, "widthMax"?}}`: the
@@ -828,8 +836,8 @@ listed, and a turn with none reads as `platform` only.
   `truncated`; a card whose parameters break the rules is left out.
 - `widthMax` is how many children one `delegate` request from the turn may ask for, the gateway's
   `A2A_DELEGATION_WIDTH_MAX`. The gateway sets it only when it is over one; absent means one, the
-  single shape, so the tool offers `tasks` only when it is present. The gateway accepts no width but
-  one until a stop cancels a batch's every child, so no part carries it yet. It is at most 16
+  single shape, so the tool offers `tasks` only when it is present. The gateway's default is 10, and
+  it accepts no wider setting. It is at most 16
   (`lib.DelegateBatchMax`), the ceiling every reader holds a batch to; each entry's text has the
   single shape's 16 KiB cap.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
@@ -850,10 +858,13 @@ report up by the conversation alone.
 **Pushed report.** A turn under a report the gateway's notify route posted into the conversation
 carries `{"pushedReport": {"taskId"?, "text"}}`: the report's text, kept by the gateway from the
 report it posted (a post the kanban notifier marks as a card's report, `report`, naming its task
-with `reply_to`; `spec-chatops-gateway.md`, "Proactive posts"), and the root of the task it reported on. The gateway
+with `reply_to` on a console post; `spec-chatops-gateway.md`, "Proactive posts"), and, for a console
+report, the root of the task it reported on. The gateway
 attaches it to a human turn, on any route, that names the task (`replyTo`, read as its chain's
-root): a console or MCP turn, since only console posts name their task today; a chat thread reply
-keeps the executor's lookup. The hermes-bridge (the platform route, the install's default) frames
+root), a console or MCP turn, and to the next human turn that opens in a chat thread (a Slack or
+Google Chat thread key, `lib.ThreadKeyedConversation`), which names no task and carries the newest
+report kept for the thread's key, after which the gateway forgets the reports that turn read
+(`taskId` absent; `spec-chatops-gateway.md`, "Proactive posts"). The hermes-bridge (the platform route, the install's default) frames
 the text as it frames a report it looked up, untrusted and ahead of the words, and skips the lookup
 (`a2a/docs/hermes-bridge.md`). `text` is at most 64 KiB (`lib.PushedReportTextCap`), cut by the
 gateway with a note; a part with no text, text past the cap, a task id that is not a subject
@@ -867,7 +878,7 @@ through the delegation primitive and the profile dispatcher), at which point car
 ride the carriers above. The plan is on #2149
 ([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
 
-Under `next` on chat platforms (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
+On the chat platforms the gateway holds (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
 its task ends (whereas on console, MCP and A2A door origins only, `waitsForCardsInTurn`, the `api` executor holds the turn open while polling `kanban.db`, emits `subtask` steps as cards settle, and synthesizes multi-card results into the task's `result` artifact; see `a2a/docs/hermes-bridge.md`). Where the task ends at the acknowledgement, the cards keep going outside that A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
 addressed to the asking conversation and checked against the gateway's session record
@@ -907,13 +918,13 @@ then carry the plan (under one `update` key per plan), ⏸️ (`settle: blocked`
 and the folded answer, and the final settle. The task is not held open for its cards:
 that would turn every follow-up into a steer queued behind hours of idle.
 
-**The emitter.** Two halves, each a port of the `today` presenter run on the shared
+**The emitter.** Two halves, each a port of the Hermes Slack presenter run on the shared
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
 first sentence as `headline`, cut at a clause when it runs past the headline's cap, or at a
 word with an ellipsis when no clause fits, the rest as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
 to five listed options to take carries them as `choices`, its opening paragraph, each
 option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
-by the rule `slack_moments.answer_choices` applies under `today`; an answer that instead
+by the rule `slack_moments.answer_choices` applied on the Hermes Slack platform; an answer that instead
 declares its one next step on a last line of its own, `[next: <label>]`, carries that
 step as its only choice, `next` and not `primary`, and leaves the line out of `headline`, `detail`
 and `fold`, by `slack_moments.next_step`'s rule; the line is plumbing, so the text fallback
@@ -1021,8 +1032,8 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   a group or a channel. A markdown link renders only when its url passes the `links` rule,
   label check included. The fallback keeps the gateway's existing escaping.
 - **The gateway renders, it doesn't compose.** It neither invents fields nor reads the text
-  to fill one. Under `next` the Hermes bridge emits the chat message, as a port of the
-  `today` presenter's rules with the same fixtures (#2149).
+  to fill one. The Hermes bridge emits the chat message, as a port of the
+  Hermes Slack presenter's rules with the same fixtures (#2149).
 - **Size.** The part counts against the envelope's max message size like any other. A
   carrier too large with it is published without it: the text is the deliverable.
 - **A backend that can't hold it.** The caps fit Slack. A valid chat message may still be
@@ -1043,7 +1054,7 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
 the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
-cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
+cases in `tests/conformance/chat/` pair inputs from the Hermes Slack presenters' tests with the chat
 messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
 `tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.
@@ -1076,7 +1087,7 @@ Worked examples:
 | Subject                                       | Class   | Writer                          | Content                                                                                         |
 | --------------------------------------------- | ------- | ------------------------------- | ----------------------------------------------------------------------------------------------- |
 | `a2a.topics.agent.platform.upgrade-readiness` | state   | platform agent                  | DataPart: current per-cluster readiness verdicts                                                |
-| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent                  | DataPart: the latest `leeway.report/v1alpha1` document (per-cluster topology and rank findings) |
+| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent                  | DataPart: the latest `leeway.report/v1alpha1` document; capped when over the message limit      |
 | `a2a.topics.agent.platform.version-skew`      | state   | platform agent                  | DataPart: skew summary across the fleet                                                         |
 | `a2a.topics.shared.blueprint`                 | state   | OKF Curator (`a2a/cmd/curator`) | DataPart: active OKF digest (`kube-agents.memory.blueprint/v1`)                                 |
 | `a2a.topics.shared.annotations`               | journal | any agent                       | TextPart/DataPart: dated observations and candidate proposals (`kube-agents.memory.outcome/v1`) |
@@ -1084,11 +1095,24 @@ Worked examples:
 ### Payload
 
 A `topic-update` envelope carries an A2A `Artifact`: `name` is the topic, parts are
-typically one DataPart (the structured state) with an optional TextPart summary. When the
+typically one DataPart (the structured state) with an optional TextPart summary. The
+`topology-skew` document adds a `coverage` object to the leeway report: `clusters_swept`,
+`clusters_read`, and the projects `not_reached` or with `scan_errors` in that run, each
+mapped to its summary. A cluster absent from `clusters` was not read that run; it is not
+clean. When the
 update happened in the course of a task, the envelope carries that task's `taskId` and
 `correlationId` - which is the audit thread from a user's question to the standing state it
 changed. Updates published on an agent's own schedule carry a `correlationId` minted for
 that run.
+
+`topology-skew` is one artifact, so its report must fit one bus message (NATS's 1 MiB
+`max_payload`, less 64 KiB held back for the envelope and encoding slack). A larger report
+is published capped: the fleet's most severe findings in order, up to the first that does
+not fit, each kept in its cluster; the full report's
+`summary`; and a `truncated` block counting what was left out and giving the full report's
+path on the Platform Agent's disk. When even the clusters without findings do not fit,
+`clusters` is empty and `truncated.clusters_omitted` counts them. The TextPart summary
+gains a suffix naming the cap.
 
 ### Retention classes
 

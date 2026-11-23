@@ -88,6 +88,37 @@ describe("console frames", () => {
     expect(decoded).toEqual({ messageId: "m-1", text: "hi" });
   });
 
+  it("names the report a reply answers, and only then", () => {
+    const decode = (frame: Parameters<typeof encodeInFrame>[0]) =>
+      JSON.parse(new TextDecoder().decode(encodeInFrame(frame)));
+    expect(decode({ messageId: "m-2", text: "and the second pod?", replyTo: "task-root" })).toEqual({
+      messageId: "m-2",
+      text: "and the second pod?",
+      replyTo: "task-root",
+    });
+    // An empty id is no reply: the gateway would read it as one and warn.
+    expect(decode({ messageId: "m-3", text: "hi", replyTo: "" })).toEqual({ messageId: "m-3", text: "hi" });
+  });
+
+  it("keeps a notify frame's replyTo and drops one that is not a task id", () => {
+    expect(
+      parseOutFrame('{"messageId":"n-1","text":"the card reported","kind":"notify","replyTo":"task-root","report":true}'),
+    ).toEqual({ messageId: "n-1", text: "the card reported", edit: false, kind: "notify", replyTo: "task-root", report: true });
+    // A progress note names the same task without the report mark; the mark is read as a strict true.
+    expect(parseOutFrame('{"messageId":"n-5","text":"⏳ working","kind":"notify","replyTo":"task-root"}')).toEqual({
+      messageId: "n-5", text: "⏳ working", edit: false, kind: "notify", replyTo: "task-root",
+    });
+    expect(parseOutFrame('{"messageId":"n-6","text":"x","kind":"notify","replyTo":"task-root","report":"yes"}')?.report).toBeUndefined();
+    expect(parseOutFrame('{"messageId":"t-3","text":"x","kind":"status","report":true}')?.report).toBeUndefined();
+    expect(parseOutFrame('{"messageId":"n-2","text":"x","kind":"notify","replyTo":""}')?.replyTo).toBeUndefined();
+    expect(parseOutFrame('{"messageId":"n-3","text":"x","kind":"notify","replyTo":7}')?.replyTo).toBeUndefined();
+    expect(parseOutFrame('{"messageId":"n-4","text":"x","kind":"notify","replyTo":"not a task"}')?.replyTo).toBeUndefined();
+    // The gateway sets replyTo on notify frames only; on any other kind it is not a reply target.
+    expect(parseOutFrame('{"messageId":"t-1","text":"x","kind":"status","replyTo":"task-root"}')?.replyTo).toBeUndefined();
+    expect(parseOutFrame('{"messageId":"t-2","text":"x","replyTo":"task-root"}')?.replyTo).toBeUndefined();
+    expect(parseOutFrame('{"messageId":"c-1","text":"⏳ submitted…"}')?.replyTo).toBeUndefined();
+  });
+
   it("parses an outbound frame and normalizes edit", () => {
     expect(parseOutFrame('{"messageId":"c-1","text":"⏳ submitted…"}')).toEqual({
       messageId: "c-1",

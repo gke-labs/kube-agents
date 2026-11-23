@@ -610,6 +610,14 @@ class PromotionPipelineWiringTest(unittest.TestCase):
             f"gchat must run before agent-plugin in optional_suites, got: {optional_suites!r}",
         )
 
+    def test_the_rollback_leg_forwards_platform_agent_sizing_profile(self):
+        steps = self.jobs[_ROLLBACK_LEG_JOB]["steps"]
+        run_step = next(step for step in steps if "rollback_environment.sh" in str(step.get("run", "")))
+        self.assertEqual(
+            run_step["env"].get("PLATFORM_AGENT_SIZING_PROFILE"),
+            "${{ vars.PLATFORM_AGENT_SIZING_PROFILE }}",
+        )
+
 
 class ConcurrencyGroupTest(unittest.TestCase):
     def test_no_workflow_hardcodes_the_rc_environment_lock(self):

@@ -1,7 +1,7 @@
 // The a2a MCP server: a Model Context Protocol endpoint for one `next`
 // install, as a console client of its bus. The operator renders it in its own
-// Deployment only when the install opts in, behind a ClusterIP Service, and a
-// person reaches it with kubectl port-forward. See package mcp.
+// Deployment unless the install switches it off, behind a ClusterIP Service,
+// and a person reaches it with kubectl port-forward. See package mcp.
 package main
 
 import (

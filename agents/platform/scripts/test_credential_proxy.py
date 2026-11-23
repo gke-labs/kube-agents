@@ -10,6 +10,7 @@ import os
 from dataclasses import replace
 import queue
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -111,6 +112,27 @@ _STATE_DB_FD_SUFFIXES = ("state.db", "state.db-wal", "state.db-shm")
 
 # The process's own descriptor table, one symlink per open descriptor.
 _SELF_FD_DIR = Path("/proc/self/fd")
+
+
+def _a_half_closed_peer_reports_a_hang_up() -> bool:
+    """Whether this kernel reports POLLHUP on a socket whose peer shut only its
+    writing half. Linux does not; macOS does."""
+    ours, theirs = socket.socketpair()
+    try:
+        theirs.shutdown(socket.SHUT_WR)
+        poller = select.poll()
+        poller.register(ours, select.POLLIN)
+        return any(events & select.POLLHUP for _, events in poller.poll(0))
+    finally:
+        ours.close()
+        theirs.close()
+
+
+_NEEDS_NO_HANG_UP_FOR_A_HALF_CLOSED_PEER = (
+    "needs a kernel that reports no POLLHUP for a peer that shut only its writing half, as "
+    "Linux does: the broker reads POLLHUP as a caller that is gone, and the test shows that "
+    "the command of a half-closed caller runs to its end"
+)
 
 # A state.db busy timeout short enough to wait out inside a test, in seconds.
 # The lookup reads it from the module at call time, so patching it reaches the
@@ -2419,7 +2441,13 @@ class GitHardeningTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(seed_work), "push", "origin", "release-trunk"], check=True, capture_output=True)
 
         clone_dir = Path(executor.workspace_dir) / "clone_trunk"
-        subprocess.run(["git", "clone", str(bare_remote), str(clone_dir)], check=True, capture_output=True)
+        # The files ref format: the broker reads refs/remotes/origin/HEAD as a file, and a
+        # git whose default is reftable keeps no such file (#6593 is the broker's gap).
+        # The variable wins over the host's config and environment; an older git ignores it.
+        subprocess.run(
+            ["git", "clone", str(bare_remote), str(clone_dir)],
+            check=True, capture_output=True, env={**os.environ, "GIT_DEFAULT_REF_FORMAT": "files"},
+        )
         # Push to release-trunk is detected and refused as a protected rollout/base branch even without lease checks
         executor.require_git_lease = False
         v = executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
@@ -5502,7 +5530,7 @@ class CommandExecutorTest(unittest.TestCase):
         # bytes captured, so it never exceeds the cap.
         executor = self.fake_kubectl(
             self.executor(max_output_bytes=4096),
-            body="head -c 100000 /dev/zero | tr '\\0' '\\377'",
+            body="head -c 100000 /dev/zero | LC_ALL=C tr '\\0' '\\377'",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
@@ -5545,7 +5573,9 @@ class CommandExecutorTest(unittest.TestCase):
         # decoded text's UTF-8 size, not only on the bytes captured.
         executor = self.fake_kubectl(
             self.executor(max_output_bytes=64 << 10),
-            body="head -c 200000 /dev/zero | tr '\\0' '\\377'",
+            # LC_ALL=C: in a UTF-8 locale the tr of macOS writes \377 as the two bytes of
+            # U+00FF, which is valid UTF-8.
+            body="head -c 200000 /dev/zero | LC_ALL=C tr '\\0' '\\377'",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
@@ -6037,10 +6067,15 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertEqual("done\n", result.stdout)
 
+    # Never on Linux, where the broker runs: there the test must run.
+    @unittest.skipIf(
+        sys.platform != "linux" and _a_half_closed_peer_reports_a_hang_up(),
+        _NEEDS_NO_HANG_UP_FOR_A_HALF_CLOSED_PEER,
+    )
     def test_a_half_closed_caller_is_not_taken_for_a_hang_up(self):
         # A peer that shut its writing half after the request is still there,
         # waiting for the response; it reads as EOF, and EOF alone must not
-        # end its command. Only a peer that closed for good reports POLLHUP.
+        # end its command. On Linux only a peer that closed for good reports POLLHUP.
         executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
         ours, theirs = socket.socketpair()
         self.addCleanup(ours.close)
@@ -7795,6 +7830,22 @@ class CurrentContextTest(unittest.TestCase):
             ("empty document", ""),
             ("syntax error", "current-context: [unterminated\n"),
             ("several documents", "current-context: gke_a_l_c\n---\ncurrent-context: gke_b_l_c\n"),
+        ):
+            with self.subTest(label):
+                self.assertIsNone(read_current_context(document))
+
+    def test_returns_none_for_text_that_the_yaml_reader_refuses_with_a_plain_exception(self):
+        # PyYAML builds a tagged or dated scalar with int(), datetime, a lookup
+        # table and a pattern match. For text that does not fit, those raise a
+        # ValueError, a KeyError, an IndexError or an AttributeError, and not a
+        # yaml.YAMLError.
+        for label, document in (
+            ("a date that does not exist (ValueError)", "current-context: gke_p_l_c\na: 2001-13-45\n"),
+            ("an int tag on text (ValueError)", "current-context: gke_p_l_c\na: !!int x\n"),
+            ("a bool tag on text (KeyError)", "current-context: gke_p_l_c\na: !!bool x\n"),
+            ("an int tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!int ''\n"),
+            ("a float tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!float ''\n"),
+            ("a timestamp tag on text (AttributeError)", "current-context: gke_p_l_c\na: !!timestamp x\n"),
         ):
             with self.subTest(label):
                 self.assertIsNone(read_current_context(document))
@@ -10716,7 +10767,10 @@ class SlackRelayTest(unittest.TestCase):
         retried = relay.pull(timeout_seconds=1)
         self.assertEqual("events_api", retried["type"])
 
-    def test_nack_does_not_block_or_lose_receipt_when_queue_is_full(self):
+    def test_nack_against_a_full_queue_drops_the_event_and_spends_the_receipt(self):
+        # Nothing retries a failed nack, so an event kept back here would
+        # never be delivered and the receipt table would grow; the event is
+        # dropped, with a warning, and the queue's own entries are untouched.
         relay = self.relay()
         relay._events = queue.Queue(maxsize=1)
         relay._receipts["receipt"] = {
@@ -10725,11 +10779,14 @@ class SlackRelayTest(unittest.TestCase):
         }
         relay._events.put_nowait({"type": "existing", "payload": {}})
 
-        with self.assertLogs("credential-proxy", level="WARNING"):
-            self.assertFalse(relay.settle("receipt", acknowledge=False))
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.assertTrue(relay.settle("receipt", acknowledge=False))
 
-        self.assertIn("receipt", relay._receipts)
+        self.assertIn("dropped, not requeued", logs.output[0])
+        self.assertNotIn("receipt", relay._receipts)
+        self.assertFalse(relay.settle("receipt", acknowledge=False))
         self.assertEqual("existing", relay._events.get_nowait()["type"])
+        self.assertTrue(relay._events.empty())
 
     def test_incoming_event_is_acknowledged_and_dropped_when_queue_is_full(self):
         relay = self.relay()
@@ -12027,6 +12084,21 @@ class VcsGitPathTest(unittest.TestCase):
             ["git", "rev-parse", "--show-toplevel"], scratch
         )
         self.assertEqual(str(scratch.resolve()), result.stdout.strip())
+
+    def test_a_call_that_names_its_bare_working_directory_runs(self):
+        # The broker names its own bare repositories (`vcs_broker.GIT_DIR_IS_CWD`):
+        # under `safe.bareRepository=explicit` git does not take one from the
+        # working directory. The door reads the subcommand behind the argument.
+        executor = self.executor()
+        bare = executor.vcs_root / "bare.git"
+        bare.mkdir(parents=True)
+        executor.execute_vcs_git(["git", "init", "--quiet", "--bare"], bare)
+        explicit = (("safe.bareRepository", "explicit"),)
+        argv = ["git", "rev-parse", "--is-bare-repository"]
+        unnamed = executor.execute_vcs_git(argv, bare, check=False, config=explicit)
+        self.assertNotEqual(0, unnamed.returncode)
+        named = executor.execute_vcs_git([argv[0], vcs_broker.GIT_DIR_IS_CWD, *argv[1:]], bare, config=explicit)
+        self.assertEqual("true", named.stdout.strip())
 
     def test_it_cannot_run_outside_its_own_root(self):
         executor = self.executor()
@@ -13605,6 +13677,29 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
             with self.assertRaises(credential_proxy.AuthenticationError):
                 authenticator.authenticate(self._headers("Bearer agent-token"))
 
+    def test_an_answer_that_is_not_http_is_a_rejection_not_a_dropped_connection(self):
+        # An error of `http.client` is not an `OSError`. One that leaves `_review`
+        # ends the caller's request with no answer, where the caller is owed a 401.
+        class CutShort(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"status":')
+
+        for label, answer in (
+            ("a status line that is not HTTP", http.client.BadStatusLine("garbage")),
+            ("a body that ends early", [CutShort()]),
+        ):
+            with self.subTest(label):
+                # `urlopen` goes through an opener's `open` too, so this stands in for both.
+                with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=answer):
+                    with self.assertRaises(credential_proxy.AuthenticationError):
+                        self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
         captured = {}
@@ -13900,16 +13995,14 @@ class A2AChatCallerBindingTest(unittest.TestCase):
                     self._authenticator()._principal_from(self._review(caller, self.A2A_CHAT))
 
     def test_the_a2a_gateway_presenting_another_audience_is_refused(self):
-        # The intent the a2a-reports role (#6098) must keep when it lands
-        # beside this: the A2A gateway's ServiceAccount is admitted on the
-        # a2a-chat audience (and, with #6098, a2a-reports) and refused on every
-        # other one. Whichever change merges second widens this binding's
-        # reverse rule to both roles; #6098's "gateway presenting a2a-reports
-        # is admitted" test fails until it does.
+        # The A2A gateway's ServiceAccount is admitted on the a2a-chat
+        # audience and the a2a-reports one (#6098), and refused on every
+        # other one.
         for audience in (self.SHELL, self.CHAT):
             with self.subTest(audience=audience):
                 with self.assertRaisesRegex(
-                    credential_proxy.AuthenticationError, "only the a2a-chat audience"
+                    credential_proxy.AuthenticationError,
+                    "only the a2a-chat or a2a-reports audience",
                 ):
                     self._authenticator()._principal_from(
                         self._review(self.A2A_GATEWAY_SA, audience)
@@ -14059,6 +14152,40 @@ class RequiredRoleTest(unittest.TestCase):
             (credential_proxy.CALLER_ROLE_A2A_CHAT,),
             credential_proxy.required_roles("/v1/chat/a2a/events"),
         )
+
+    def test_the_teams_routes_admit_the_a2a_gateway_only_when_the_operator_says_so(self):
+        """The Teams relay has one consumer per install, Hermes or the A2A
+        gateway's teams backend (the operator's A2A_TEAMS_BACKEND switch). The
+        broker learns which from CREDENTIAL_PROXY_TEAMS_A2A_CALLER: without it
+        the routes are the chat role's alone, so a Chat-armed gateway's token
+        cannot reach a Hermes-served Teams queue; with it both roles are
+        admitted. The Slack and legacy Chat event routes stay the chat role's."""
+        teams_paths = (
+            "/v1/chat/teams/events",
+            "/v1/chat/teams/events/ack",
+            "/v1/chat/teams/events/nack",
+            "/v1/chat/teams/api",
+        )
+        self.assertEqual((credential_proxy.CALLER_ROLE_CHAT,), credential_proxy._teams_route_roles(False))
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_A2A_CHAT),
+            credential_proxy._teams_route_roles(True),
+        )
+        for armed in (False, True):
+            table = tuple(
+                (prefix, credential_proxy._teams_route_roles(armed)) if prefix == "/v1/chat/teams/" else (prefix, roles)
+                for prefix, roles in credential_proxy.ROUTE_ROLES
+            )
+            credential_proxy._validate_route_roles(table)
+            with mock.patch.object(credential_proxy, "ROUTE_ROLES", table):
+                for path in teams_paths:
+                    self.assertEqual(
+                        credential_proxy._teams_route_roles(armed), credential_proxy.required_roles(path), (armed, path)
+                    )
+                self.assertEqual(
+                    (credential_proxy.CALLER_ROLE_CHAT,),
+                    credential_proxy.required_roles("/v1/chat/slack/events"),
+                )
 
     def test_a_route_belonging_to_neither(self):
         self.assertEqual((), credential_proxy.required_roles("/healthz"))
@@ -20042,6 +20169,110 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertNotIn("k8s_cluster", "\n".join(r.getMessage() for r in logs.records))
         self.assertNotIn("k8s_cluster", json.dumps(self._audits(logs)))
 
+    def test_a_forwarded_entries_list_names_its_project_in_the_forwarded_line(self):
+        # The path of this read is `v2/entries:list` for every project, so the line that
+        # says the read was forwarded carries the one resource the body check passed.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertTrue(forwarded.endswith(" resource=projects/kagents-dev"), forwarded)
+        # Beside the line at the check, no other line names it, and the audit fields
+        # stay identifiers and outcomes.
+        named = ("api forwarded request_id=", "api body checked request_id=")
+        others = [r.getMessage() for r in logs.records if not r.getMessage().startswith(named)]
+        self.assertNotIn("kagents-dev", "\n".join(others))
+        self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_checked_body_names_its_project_before_each_verdict(self):
+        # A read whose body passed the check and then failed still asked Google for
+        # that project's entries, and over the cap Google served them. So the project
+        # is on a line of its own at the check, and the verdict of the request follows
+        # it under the same request id, whatever the verdict is.
+        cap = 4096
+
+        def forwarded():
+            pass
+
+        def over_the_cap():
+            self.reply.update(body=b"x" * (cap + 1))
+
+        def no_relay():
+            CredentialProxyHandler.api_relay = None
+
+        def no_credential():
+            def failing():
+                raise RuntimeError("no credential")
+
+            self.relay.authorization_header = failing
+
+        def unreachable():
+            spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            self.relay.port = spare.server_address[1]
+            spare.server_close()
+
+        cases = (
+            ("forwarded", forwarded, 200, "api forwarded"),
+            ("over the cap", over_the_cap, 502, "api response too large"),
+            ("no relay", no_relay, 503, "api disabled"),
+            ("no credential", no_credential, 503, "api credential unavailable"),
+            ("unreachable", unreachable, 502, "api upstream unreachable"),
+        )
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            for name, arrange, expected, verdict in cases:
+                with self.subTest(name):
+                    arrange()
+                    try:
+                        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+                    finally:
+                        # Each case leaves the handler as the next one expects it.
+                        CredentialProxyHandler.api_relay = self.relay
+                        self.relay.__dict__.pop("authorization_header", None)
+                        self.relay.port = self.upstream.server_address[1]
+                        self.reply.update(status=200, content_type="application/json; charset=UTF-8",
+                                          body=b'{"timeSeries":[]}', headers={})
+                    self.assertEqual(expected, status)
+                    lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+                    [checked] = [line for line in lines if line.startswith("api body checked request_id=")]
+                    self.assertTrue(checked.endswith(" resource=projects/kagents-dev"), checked)
+                    request_id = checked.split("request_id=")[1].split(" ")[0]
+                    # The verdict is the last line of the request, after the check line.
+                    self.assertGreater(len(lines) - 1, lines.index(checked))
+                    self.assertTrue(lines[-1].startswith(f"{verdict} request_id={request_id}"), lines[-1])
+                    # The check line carries no audit mapping: the audit fields stay identifiers and outcomes.
+                    self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_forwarded_get_names_no_resource_in_the_forwarded_line(self):
+        # A GET's project is in its path, which the first line of the request carries.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertNotIn("resource=", forwarded)
+
+    def test_a_refused_body_leaves_its_project_out_of_every_log_line(self):
+        # A project the check did not pass is caller text. No line carried it before
+        # the forwarded line named a project, and this holds that. Each body here
+        # names the project and is refused.
+        project = "refused-project-1"
+        cases = (
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}", "projects/kagents-dev"]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "projectIds": [project]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "orderBy": "severity desc"},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "pageSize": 100000},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}/logs/syslog"]},
+            {**self.ENTRIES_BODY, "resourceNames": f"projects/{project}"},
+        )
+        for body in cases:
+            with self.subTest(body=body), self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                status, _, payload = self._entries_list(body)
+                self.assertEqual(403, status)
+                self.assertEqual("gcp.api.body", payload["rule"])
+                self.assertNotIn(project, "\n".join(r.getMessage() for r in logs.records))
+                self.assertNotIn(project, json.dumps(self._audits(logs)))
+        self.assertEqual([], self.upstream_requests)
+
     def test_the_upstream_gets_the_brokers_serialisation_not_the_callers_bytes(self):
         # A duplicate key: the parser keeps the last, the check reads the last,
         # and the upstream is sent one key with that value. Nothing of the
@@ -21241,6 +21472,60 @@ class TeamsRelayTest(unittest.TestCase):
         # Settle again is False because receipt is deleted
         self.assertFalse(relay.settle(receipt, acknowledge=True))
 
+    def test_teams_pull_failure_is_counted_and_answers_503(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/chat/teams/events"
+        handler._authenticated = lambda: object()
+        handler.metrics = mock.Mock()
+        captured = {}
+        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+
+        def pull():
+            raise RuntimeError("queue gone")
+
+        handler.teams_relay = types.SimpleNamespace(pull=pull)
+        with self.assertLogs("credential-proxy", level="WARNING"):
+            handler.do_GET()
+
+        self.assertEqual(captured["status"], HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(captured["payload"], {"error": "Teams event pull failed"})
+        handler.metrics.record_failure.assert_called_once_with(
+            credential_proxy.BROKER_FAILURE_CHAT_PULL_FAILED
+        )
+
+    def test_teams_upstream_error_reads_a_json_null_as_absent(self):
+        import io
+
+        def converted(status, answer):
+            body = json.dumps(answer).encode("utf-8")
+            err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/", status, "x", {}, io.BytesIO(body))
+            return credential_proxy._teams_upstream_error(err)
+
+        bot = converted(400, {"error": {"code": None, "message": "boom"}})
+        self.assertEqual(str(bot), "HTTP 400: boom")
+        self.assertEqual(bot.fields, {"status": 400, "code": "", "message": "boom"})
+        entra = converted(401, {"error": "invalid_client", "error_description": None})
+        self.assertEqual(str(entra), "HTTP 401: invalid_client")
+        self.assertEqual(entra.fields["message"], "")
+
+    def test_teams_nack_against_a_full_queue_drops_the_activity_and_its_attempts(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._events = queue.Queue(maxsize=1)
+        activity = {"type": "message", "text": "first"}
+        relay._receipts["receipt"] = activity
+        relay._attempts[id(activity)] = 2
+        relay._events.put_nowait({"type": "message", "text": "existing"})
+
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.assertTrue(relay.settle("receipt", acknowledge=False))
+
+        self.assertIn("dropped, not requeued", logs.output[0])
+        self.assertEqual(relay._receipts, {})
+        self.assertEqual(relay._attempts, {})
+        self.assertFalse(relay.settle("receipt", acknowledge=False))
+        self.assertEqual(relay._events.get_nowait()["text"], "existing")
+        self.assertTrue(relay._events.empty())
+
     def test_teams_relay_token_acquisition_and_caching(self):
         relay = TeamsRelay(
             app_id="app-id-123",
@@ -21396,6 +21681,39 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertEqual(result, {"id": "act-1"})
         posted = opened.call_args.args[0].data.decode("utf-8")
         self.assertIn("ok ? done", posted)
+
+    def test_teams_relay_admits_put_on_one_activity_only(self):
+        """The gateway's status line edits its own activity: a PUT at the
+        activity's id goes through with its method kept; a PUT on the
+        collection, on history, or any other verb is refused before the
+        token is minted."""
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+            relay._get_access_token()
+            mock_resp.read.return_value = json.dumps({"id": "act-1"}).encode("utf-8")
+            res = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/19:abc@thread.tacv2;messageid=1/activities/act-1",
+                method="put",
+                payload={"type": "message", "id": "act-1", "text": "done"},
+            )
+            self.assertEqual(res, {"id": "act-1"})
+            sent = mock_open.call_args[0][0]
+            self.assertEqual(sent.get_method(), "PUT")
+            self.assertTrue(sent.full_url.endswith("/activities/act-1"))
+        for path, method in (
+            ("v3/conversations/19:abc/activities", "PUT"),
+            ("v3/conversations/19:abc/activities/history", "PUT"),
+            ("v3/conversations/19:abc/activities/act-1", "DELETE"),
+            ("v3/conversations/19:abc/activities/act-1", "PATCH"),
+        ):
+            with self.subTest(path=path, method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path=path, method=method, payload={})
 
     def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
         class RedirectingHandler(http.server.BaseHTTPRequestHandler):

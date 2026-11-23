@@ -62,7 +62,7 @@ _verifier = importlib.util.module_from_spec(_verifier_spec)
 _verifier_spec.loader.exec_module(_verifier)
 NOTE_PATH = _verifier.GITOPS_INTENT_NOTE_PATH
 SEEDED_NOTE_SHA = _verifier.gitops_seeded_blob_sha(NOTE_PATH)
-NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
+NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering", "declared-orphan-snapshot"}
 
 
 def pool_repo(project: str) -> str:
@@ -275,9 +275,22 @@ _DECLARED_ZONAL_POOL = {
     "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "declared-zonal", "effect": "NO_SCHEDULE"}]},
 }
 
+# seeded-a's missing-reservation-pool as `clusters describe` reports it
+# (main.tf): no autoscaling, tainted, no node, bound to one reservation name.
+_MISSING_RESERVATION_POOL = {
+    "name": "missing-reservation-pool",
+    "status": "RUNNING",
+    "locations": ["us-central1-a"],
+    "config": {
+        "machineType": "n2-standard-2",
+        "taints": [{"key": "seeded-role", "value": "missing-reservation", "effect": "NO_SCHEDULE"}],
+        "reservationAffinity": {"consumeReservationType": "SPECIFIC_RESERVATION", "key": "compute.googleapis.com/reservation-name", "values": ["seeded-absent-reservation"]},
+    },
+}
+
 
 def _peer():
-    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK, "nodePools": [_DECLARED_ZONAL_POOL]}
+    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK, "nodePools": [_DECLARED_ZONAL_POOL, _MISSING_RESERVATION_POOL]}
 
 
 def _cluster_c():
@@ -375,6 +388,9 @@ def healthy_world(*projects):
         # audit's 90-day gate, of a source disk the planter deleted.
         "snapshots": [_snapshot("declared-orphan-snap-seeded"), _snapshot("orphan-snap-seeded")],
         "disks": [],
+        # The reservation that missing-reservation-pool names is not there: that is
+        # the fixture. The reader can list the collection (roles/compute.viewer).
+        "reservations": [],
     }
     return {
         "clusters": {project: fleet for project in projects},
@@ -407,8 +423,12 @@ def healthy_world(*projects):
             "deployment/token-sidecar": {"status": {"readyReplicas": 1, "replicas": 1}},
             "serviceaccount/default": {"automountServiceAccountToken": True},
             "namespace/seeded-headroom": {"metadata": {"name": "seeded-headroom"}},
+            "namespace/seeded-family": {"metadata": {"name": "seeded-family"}},
             "namespace/seeded-qos": {"metadata": {"name": "seeded-qos"}},
             "deployment/burst-ingest": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132": {"metadata": {"labels": {"app.kubernetes.io/part-of": "calibration"}}, "status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
             "deployment/ledger-writer": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "10m", "memory": "32Mi"}}}]}}}},
             "poddisruptionbudget?": {"items": []},
             "networkpolicy?": {"items": []},
@@ -676,10 +696,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 53, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 55, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 53, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 55, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -727,13 +747,26 @@ class Drift(ScanHarness):
         self.assertEqual(doc["summary"]["drifted_projects"], 1)
         self.assertIn(f"{PROJECT}: drifted: no-pdb-workload", err)
 
+    def test_a_reservation_with_the_fixtures_name_is_drifted_and_named(self):
+        """Someone created the reservation that the pool names: the defect is
+        gone, and nothing on the cluster shows it until the pool's first node."""
+        world = healthy_world(PROJECT)
+        world["compute"][PROJECT] = {**world["compute"][PROJECT], "reservations": [{"name": "seeded-absent-reservation"}]}
+        doc, err = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["missing-reservation-pool"], "drifted")
+        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
+        self.assertTrue(detail[0].startswith('reservation/seeded-absent-reservation* name none_eq "seeded-absent-reservation": observed "seeded-absent-reservation"'), detail)
+        self.assertIn(f"{PROJECT}: drifted: missing-reservation-pool", err)
+
     def test_two_projects_scan_independently(self):
         world = healthy_world(PROJECT, OTHER)
         world["kubectl_overrides"] = {OTHER: {"pod?app=payments-api": _pods(_pod(restarts=0, last_reason=None))}}
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 105, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 109, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
 
 
     def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
@@ -752,7 +785,7 @@ class Drift(ScanHarness):
         self.assertEqual(len(detail), 1, detail)
         self.assertIn("ready_after_hours 2184", detail[0])
         self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 52, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 54, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
         self.assertEqual(doc["summary"]["not_ready"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 0)
         self.assertEqual(fixture_state.drift_map(doc), {})
@@ -789,6 +822,19 @@ class NotChecked(ScanHarness):
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
         self.assertIn("could not list clusters", detail[0])
         self.assertNotIn("error", doc["projects"][PROJECT], "the runner ran and said why; that is not a scan error")
+
+    def test_a_reader_that_cannot_list_reservations_leaves_the_pool_role_not_checked(self):
+        """The scan's reader has `compute.reservations.list` through
+        roles/compute.viewer. Without it the role is not checked, never
+        drifted and never healthy, as a refused list is for the project roles."""
+        world = healthy_world(PROJECT)
+        world["compute"][PROJECT] = {k: v for k, v in world["compute"][PROJECT].items() if k != "reservations"}
+        doc, _ = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["missing-reservation-pool"], "not_checked")
+        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
+        self.assertIn("compute reservations list failed", detail[0])
 
     def test_an_unplanted_role_is_absent_with_the_runners_warning_naming_it(self):
         # Absent is a rollout state, not a failed read: the stack has not put
@@ -955,6 +1001,32 @@ class NotChecked(ScanHarness):
         self.assertIn("kubectl is not on PATH", err.getvalue())
         self.assertEqual(fixture_state.checked_projects(doc), 0)
         self.assertEqual(fixture_state.read_map(doc), {})
+
+    def test_a_tool_that_cannot_be_started_is_not_checked_with_the_reason(self):
+        # There and not executable, or the wrong binary format: the call fails before the tool runs.
+        def cannot_start(cmd, **kwargs):
+            raise PermissionError(13, "Permission denied", cmd[0])
+
+        def wrong_format(cmd, **kwargs):
+            raise OSError(8, "Exec format error", cmd[0])
+
+        def missing(cmd, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+        self.assertEqual(
+            fixture_state._run(["bash", "x"], {}, 5, cannot_start),
+            (126, "", "PermissionError: [Errno 13] Permission denied: 'bash'"),
+        )
+        self.assertEqual(fixture_state._run(["bash", "x"], {}, 5, wrong_format)[0], 126)
+        self.assertEqual(fixture_state._run(["bash", "x"], {}, 5, missing)[0], 127, "a missing tool keeps its own status")
+        self.world_path.write_text(json.dumps(healthy_world(PROJECT)))
+        entry = fixture_state.scan_project(
+            PROJECT, self.roles, self.workdir, 60, impersonate=False, environ=self.environ(), runner=cannot_start
+        )
+        self.assertEqual({role["state"] for role in entry["roles"].values()}, {"not_checked"})
+        self.assertEqual(
+            entry["error"], "hack/fleet-kubeconfigs.sh failed (126): PermissionError: [Errno 13] Permission denied: 'bash'"
+        )
 
     def test_a_runner_that_hangs_is_not_checked_within_the_ceiling(self):
         doc, _ = self.scan(healthy_world(PROJECT), timeout=2, STUB_LIST_SLEEP="10")

@@ -55,9 +55,13 @@ const (
 	// when the home is a DM space, stored either way as (spaces/<s>, the
 	// thread name). A Slack DM, a whole Google Chat DM or a bare space has no
 	// stored report of this shape. The DM and thread shapes are lib's
-	// (SlackDMKeyPrefix, GchatDMKeyPrefix, GchatThreadsSep).
+	// (SlackDMKeyPrefix, GchatDMKeyPrefix, GchatThreadsSep). A Teams key is
+	// the conversation id, and only a channel thread carries ";messageid="
+	// (lib.TeamsThreadToken), so a key without it is shared by every message
+	// in that conversation (lib.WholeConversationKey).
 	incidentSlackPrefix = "slack:"
 	incidentGchatPrefix = "gchat:"
+	incidentTeamsPrefix = lib.TeamsKeyPrefix
 	// incidentReplyTaskSep joins a console conversation's key and the task
 	// of the turn that filed a card in the row the notifier stores for the
 	// card's report (kanban_event_routing.CONSOLE_THREAD_TASK_SEP).
@@ -114,12 +118,13 @@ type incidentAddress struct {
 // conversation; the thread the key names, where the relay stores a
 // scheduled report and the notifier the triage card's report under an
 // alert; then (sessionID, key), the notifier's key for a card's report
-// posted into a Slack or Google Chat conversation. A console reply naming
+// posted into a Slack, Google Chat or Teams conversation. A console reply naming
 // no task does not reach the console row, whose key carries the task.
 //
 // A key that names a whole conversation rather than a thread takes none:
-// a Google Chat space with no thread, a thread-less Slack DM, and the
-// thread-less Google Chat DM key, which is the legacy and openDirect shape
+// a Google Chat space with no thread, a thread-less Slack DM, a Teams
+// personal or group chat (any Teams key without a channel thread's
+// ;messageid= suffix), and the thread-less Google Chat DM key, which is the legacy and openDirect shape
 // (a Google Chat DM ask keys its own thread). Every later message
 // under such a key shares it and the session, so a row stored under it
 // would be spliced ahead of every question for the row's life, and the
@@ -169,6 +174,15 @@ func incidentThread(key string) (incidentAddress, bool) {
 			return incidentAddress{}, false
 		}
 		return incidentAddress{chatID: space, threadID: thread}, true
+	case strings.HasPrefix(key, incidentTeamsPrefix):
+		// A Teams channel thread is its own conversation id; the relay
+		// stores the row under (thread, thread), since _thread_chat_id has
+		// no chat to split off a Teams id.
+		thread := key[len(incidentTeamsPrefix):]
+		if !strings.Contains(strings.ToLower(thread), lib.TeamsThreadToken) {
+			return incidentAddress{}, false
+		}
+		return incidentAddress{chatID: thread, threadID: thread}, true
 	}
 	return incidentAddress{}, false
 }

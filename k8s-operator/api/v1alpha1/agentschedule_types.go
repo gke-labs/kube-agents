@@ -34,9 +34,20 @@ const (
 	// in flight (docs/designs/scheduling-on-profiles.md, section 7).
 	AgentScheduleRunNowAnnotation = "kubeagents.x-k8s.io/run-now"
 
+	// AgentScheduleStopAnnotation asks to stop the run in flight: setting it
+	// to a token the status has not handled yet ends status.activeTaskID
+	// through the gateway, which cancels a running task and removes the Job
+	// of one still starting. With no run in flight, the token is handled and
+	// nothing else happens.
+	AgentScheduleStopAnnotation = "kubeagents.x-k8s.io/stop"
+
 	// AgentScheduleConditionAccepted reports whether the schedule parses and
 	// its profile allows the unattended tier.
 	AgentScheduleConditionAccepted = "Accepted"
+	// AgentScheduleConditionSubmitted reports how the gateway answered the
+	// schedule's last submission: True once it took a run, False when it
+	// refused one (the reason and the gateway's detail in the message).
+	AgentScheduleConditionSubmitted = "Submitted"
 
 	// AgentScheduleConcurrencyForbid is the one concurrency policy: a run
 	// never starts while the last one is still going.
@@ -56,6 +67,19 @@ const (
 	// AgentScheduleOutcomeLost is a run whose task vanished or outlived its
 	// deadline, so the schedule moved on without its terminal.
 	AgentScheduleOutcomeLost = "Lost"
+)
+
+// How a run's report was delivered, as the gateway's scheduled-reports store
+// records it (Track 3). Every value but posting is final.
+const (
+	AgentScheduleReportNone         = "no_delivery"
+	AgentScheduleReportLocal        = "local"
+	AgentScheduleReportSilent       = "silent"
+	AgentScheduleReportStoredNoHome = "stored_no_home"
+	AgentScheduleReportPosting      = "posting"
+	AgentScheduleReportPosted       = "posted"
+	AgentScheduleReportPostFailed   = "post_failed"
+	AgentScheduleReportPostUnknown  = "post_unknown"
 )
 
 // AgentScheduleProfileRef names the AgentProfile a schedule's runs go to.
@@ -79,16 +103,21 @@ type AgentScheduleDelivery struct {
 	// +optional
 	SilentWhenClean bool `json:"silentWhenClean,omitempty"`
 
-	// JobKey groups a schedule's posts into one thread per UTC day. It
-	// defaults to the schedule's name.
+	// JobKey groups a schedule's posts into one thread per UTC day. It keys
+	// stored reports, so it is a DNS-1123 label. It defaults to the
+	// schedule's name, which a schedule that runs already has to be.
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +optional
 	JobKey string `json:"jobKey,omitempty"`
 }
 
 // AgentScheduleSpec is a recurring task: when it runs, which profile runs
-// it, and what it asks (docs/designs/scheduling-on-profiles.md, section 1).
+// it, and what it asks or which script it runs
+// (docs/designs/scheduling-on-profiles.md, section 1).
 // Each run is submitted through the A2A gateway as an Unattended task.
+// +kubebuilder:validation:XValidation:rule="has(self.prompt) != has(self.script)",message="exactly one of spec.prompt and spec.script must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.script) || (!has(self.skills) && !has(self.maxTurns))",message="spec.skills and spec.maxTurns apply to a model run; a script run takes neither"
 type AgentScheduleSpec struct {
 	// Schedule is a 5-field cron expression, read in UTC.
 	// +kubebuilder:validation:XValidation:rule="self.trim().split(' ').filter(f, f != '').size() == 5",message="schedule must be a 5-field cron expression (minute hour day-of-month month day-of-week)"
@@ -106,19 +135,34 @@ type AgentScheduleSpec struct {
 	// +required
 	ProfileRef AgentScheduleProfileRef `json:"profileRef"`
 
-	// Prompt is what each run asks.
+	// Prompt is what each run asks. Exactly one of prompt and script is
+	// set.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=16384
-	// +required
-	Prompt string `json:"prompt"`
+	// +optional
+	Prompt string `json:"prompt,omitempty"`
 
-	// Parameters are passed to each run as task parameters. `stream` names
-	// the run's audit report stream.
-	// +kubebuilder:validation:MaxProperties=32
+	// Script names a helper script each run executes in place of a model
+	// turn: one of the profile's spec.scripts, by name, never a path. It is a
+	// DNS-1123 label (no dots), as the run's trigger carries it. Exactly one
+	// of prompt and script is set. Only a built-in schedule, one the
+	// PlatformAgent renders, may name a script: any other schedule that does
+	// is not accepted, and never runs.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`
+	// +optional
+	Script string `json:"script,omitempty"`
+
+	// Parameters are passed to each run as task parameters, at most 16, the
+	// bound every task submission has. A built-in schedule's report stream
+	// is its own name, carried on its trigger, not a parameter.
+	// +kubebuilder:validation:MaxProperties=16
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty"`
 
-	// Skills the run asks the profile to use.
+	// Skills the run asks the profile to use. A script run takes none: set
+	// it only with prompt.
 	// +kubebuilder:validation:MaxItems=16
 	// +listType=set
 	// +optional
@@ -155,7 +199,8 @@ type AgentScheduleSpec struct {
 	// +optional
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
 
-	// MaxTurns caps the run's model turns.
+	// MaxTurns caps the run's model turns. A script run takes none: set it
+	// only with prompt.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
@@ -204,6 +249,15 @@ type AgentScheduleRun struct {
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// Outcome is how it ended.
 	Outcome string `json:"outcome"`
+	// Delivery is how its report was delivered, once that is final: posted,
+	// stored for want of a home channel, kept local, silent when clean, not
+	// delivered, post_failed when the gateway gave up posting it, or
+	// post_unknown when a post started or timed out with no outcome, so it
+	// may be in the channel and is never retried. Empty until the gateway
+	// reports a final value, and on a run it never does.
+	// +kubebuilder:validation:Enum=no_delivery;local;silent;stored_no_home;posted;post_failed;post_unknown
+	// +optional
+	Delivery string `json:"delivery,omitempty"`
 }
 
 // AgentScheduleStatus is the schedule's run state. It is the run ledger: no
@@ -244,9 +298,26 @@ type AgentScheduleStatus struct {
 	// LastHandledRunNow is the last run-now token acted on.
 	// +optional
 	LastHandledRunNow string `json:"lastHandledRunNow,omitempty"`
+	// LastHandledStop is the last stop token acted on.
+	// +optional
+	LastHandledStop string `json:"lastHandledStop,omitempty"`
+	// StoppedTaskID is the run in flight a stop was sent for, until it
+	// settles: a run-now asked for meanwhile waits for it to end rather than
+	// adopting it.
+	// +optional
+	StoppedTaskID string `json:"stoppedTaskID,omitempty"`
 	// SkipCounts counts slots that did not run.
 	// +optional
 	SkipCounts AgentScheduleSkipCounts `json:"skipCounts,omitempty"`
+	// PostFailed counts runs whose report the gateway couldn't post to chat
+	// after its redeliveries (Delivery post_failed).
+	// +optional
+	PostFailed int64 `json:"postFailed,omitempty"`
+	// PostUnknown counts runs whose report post started or timed out with no
+	// outcome (Delivery post_unknown): it may be in the channel, and the
+	// gateway never posts it again.
+	// +optional
+	PostUnknown int64 `json:"postUnknown,omitempty"`
 	// RecentRuns are the last ten runs, newest first.
 	// +kubebuilder:validation:MaxItems=10
 	// +optional
@@ -266,9 +337,9 @@ type AgentScheduleStatus struct {
 // +kubebuilder:printcolumn:name="Next",type=date,JSONPath=`.status.nextScheduleTime`
 // +kubebuilder:printcolumn:name="Last",type=string,JSONPath=`.status.lastOutcome`
 
-// AgentSchedule runs a prompt on an AgentProfile on a cron schedule, each run
-// an Unattended task submitted through the A2A gateway
-// (docs/designs/scheduling-on-profiles.md).
+// AgentSchedule runs a prompt, or a built-in schedule's helper script, on an
+// AgentProfile on a cron schedule, each run an Unattended task submitted
+// through the A2A gateway (docs/designs/scheduling-on-profiles.md).
 type AgentSchedule struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

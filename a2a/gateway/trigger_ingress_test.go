@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -566,5 +568,611 @@ func TestATriggerKeyAnUnrecordedAttemptMintedTakesTheNextTask(t *testing.T) {
 	}
 	if reply.TaskID != triggerTaskID(s.IdempotencyKey, 1) {
 		t.Fatalf("task = %s, want the second attempt's", reply.TaskID)
+	}
+}
+
+// status asks after taskID for the schedule s names, as the operator will.
+func (tr *triggerRig) status(t *testing.T, s lib.TriggerSubmit, taskID string) lib.TriggerStatusReply {
+	t.Helper()
+	data, err := json.Marshal(lib.TriggerStatus{Schedule: s.Schedule, TaskID: taskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := lib.TriggerReplySubject("schedule", nats.NewInbox()[len("_INBOX."):])
+	sub, err := tr.nc.SubscribeSync(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := tr.nc.PublishRequest(lib.TriggerStatusSubject("schedule"), reply, data); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatalf("status reply: %v", err)
+	}
+	var out lib.TriggerStatusReply
+	if err := json.Unmarshal(msg.Data, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestATriggersStatusIsAnsweredForItsOwnTasksOnly: the gateway answers what
+// state a schedule's run is in, from its fold of TASKS, through to the
+// terminal; a task it never started for that schedule is not found, so a
+// source reads only its own runs.
+func TestATriggersStatusIsAnsweredForItsOwnTasksOnly(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	if got := tr.status(t, s, reply.TaskID); !got.Found || got.Terminal {
+		t.Fatalf("a running task's status = %+v", got)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, tr.execFor(t, &origin, "fleet-audit"), "No findings.")
+	var got lib.TriggerStatusReply
+	waitFor(t, "the terminal in the status", func() bool {
+		got = tr.status(t, s, reply.TaskID)
+		return got.Terminal
+	})
+	if !got.Found || got.State != lib.StateCompleted {
+		t.Fatalf("the ended task's status = %+v", got)
+	}
+	if got := tr.status(t, s, "task-not-this-schedules"); got.Found || got.Refused != nil {
+		t.Fatalf("an unknown task = %+v, want not found", got)
+	}
+	other := s
+	other.Schedule.Name = "stockout-prevention"
+	if got := tr.status(t, other, reply.TaskID); got.Found {
+		t.Fatalf("another schedule read this run: %+v", got)
+	}
+}
+
+// The ingress resubscribes on the server's refusal of its own subjects only:
+// the error text nats.go hands for a refused SUB names the subject, and
+// nothing else (another subscription's refusal, a publish refusal, a
+// disconnect) restarts it.
+func TestTheIngressResubscribesOnlyOnItsOwnSubscriptionsRefusal(t *testing.T) {
+	for text, want := range map[string]bool{
+		`nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.submit"`:    true,
+		`nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.status"`:    true,
+		`nats: permissions violation: Permissions Violation for Subscription to "chat.console.*.in"`:       false,
+		`nats: permissions violation: Permissions Violation for Publish to "a2a.trigger.reply.schedule.x"`: false,
+		`nats: connection closed`: false,
+	} {
+		if got := isTriggerSubscriptionRefusal(errors.New(text)); got != want {
+			t.Errorf("%q: %v, want %v", text, got, want)
+		}
+	}
+	if isTriggerSubscriptionRefusal(nil) {
+		t.Error("nil is a refusal")
+	}
+}
+
+// A status query whose reply names anything but the source's own reply
+// namespace is dropped, as a submission's is.
+func TestATriggerStatusWithAReplyOutsideItsNamespaceIsNotAnswered(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	data, err := json.Marshal(lib.TriggerStatus{Schedule: lib.ScheduleRef{Namespace: "kubeagents-system", Name: "compliance-audit"}, TaskID: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.nc.Request(lib.TriggerStatusSubject("schedule"), data, 500*time.Millisecond); err == nil {
+		t.Fatal("a status query with an inbox reply was answered")
+	}
+}
+
+// Every trigger run the record keeps still has its task in the record's
+// Tasks, where a status query reads its addressee.
+func TestATriggersKeptRunsNeverOutliveTheirTasks(t *testing.T) {
+	if triggerRunsKept > taskHistoryCap {
+		t.Fatalf("triggerRunsKept %d > taskHistoryCap %d: a kept run could lose its task and answer submitted forever", triggerRunsKept, taskHistoryCap)
+	}
+}
+
+// A published run's retry is answered with its task even when the profile has
+// left the directory since (a new leader before its first DIRECTORY read, or a
+// deleted profile): it needs nothing from the directory. A new key for the
+// same missing profile is still refused.
+func TestAPublishedRunsRetryNeedsNoDirectory(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	first := tr.submit(t, "schedule", s)
+	if first.Refused != nil || first.TaskID == "" {
+		t.Fatalf("first = %+v", first)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	tr.g.profiles.put(s.Profile, nil)
+	if again := tr.submit(t, "schedule", s); again.TaskID != first.TaskID || again.Refused != nil {
+		t.Fatalf("retry with the profile gone = %+v, want task %s", again, first.TaskID)
+	}
+	next := s
+	next.IdempotencyKey = "schedule/kubeagents-system/compliance-audit/1763100300"
+	if r := tr.submit(t, "schedule", next); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedProfileUnknown {
+		t.Fatalf("a new key with the profile gone = %+v, want profile_unknown", r)
+	}
+}
+
+// stop asks the gateway to stop taskID of s's schedule, on the source's own
+// reply namespace, as the operator will. The stop subscription runs on its
+// own loop, so the first ask waits for it.
+func (tr *triggerRig) stop(t *testing.T, s lib.TriggerSubmit, taskID string) lib.TriggerStopReply {
+	t.Helper()
+	data, err := json.Marshal(lib.TriggerStop{Schedule: s.Schedule, TaskID: taskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out lib.TriggerStopReply
+	waitFor(t, "the stop's answer", func() bool {
+		reply := lib.TriggerReplySubject("schedule", nats.NewInbox()[len("_INBOX."):])
+		sub, err := tr.nc.SubscribeSync(reply)
+		if err != nil {
+			return false
+		}
+		defer func() { _ = sub.Unsubscribe() }()
+		if err := tr.nc.PublishRequest(lib.TriggerStopSubject("schedule"), reply, data); err != nil {
+			return false
+		}
+		msg, err := sub.NextMsg(time.Second)
+		if err != nil {
+			return false
+		}
+		return json.Unmarshal(msg.Data, &out) == nil
+	})
+	return out
+}
+
+// A schedule's stop ends its own run and no other (#6052): the gateway writes
+// the run's cancel on its .in subject, under the run's own trigger authority,
+// and its dispatcher stop record, so a run still starting has its Job removed.
+// A second stop writes nothing again. A task the schedule's record doesn't
+// hold, or another schedule's run, is an unknown run, and nothing is written.
+func TestATriggerStopEndsItsOwnRunOnly(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	var mu sync.Mutex
+	var cancels, stops []*nats.Msg
+	if _, err := tr.nc.Subscribe("a2a.tasks.fleet-audit.*.in", func(m *nats.Msg) {
+		mu.Lock()
+		cancels = append(cancels, m)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.nc.Subscribe(lib.DispatchStopPrefix+">", func(m *nats.Msg) {
+		mu.Lock()
+		stops = append(stops, m)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	count := func() (int, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(cancels), len(stops)
+	}
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+
+	// Another schedule with a run of its own still can't stop this one.
+	other := s
+	other.Schedule.Name = "stockout-prevention"
+	other.Trigger = lib.TriggerClaim{Name: "schedule/stockout-prevention", Origin: lib.TriggerOriginBuiltin, Stream: "stockout-prevention"}
+	other.IdempotencyKey = "schedule/kubeagents-system/stockout-prevention/1763100000"
+	other.Delivery.JobKey = "stockout-prevention"
+	if r := tr.submit(t, "schedule", other); r.Refused != nil {
+		t.Fatalf("the other schedule's run was refused: %+v", r.Refused)
+	}
+	waitFor(t, "both submissions", func() bool { return len(tr.submissions()) == 2 })
+	if got := tr.stop(t, other, reply.TaskID); got.Result != lib.TriggerStopUnknownRun {
+		t.Fatalf("another schedule's stop of this run = %+v, want unknown_run", got)
+	}
+	if got := tr.stop(t, s, "task-not-this-schedules"); got.Result != lib.TriggerStopUnknownRun {
+		t.Fatalf("a task the record doesn't hold = %+v, want unknown_run", got)
+	}
+	if c, st := count(); c != 0 || st != 0 {
+		t.Fatalf("an unknown run's stop wrote %d cancels and %d stop records", c, st)
+	}
+
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopStopped {
+		t.Fatalf("the schedule's own stop = %+v, want stopped", got)
+	}
+	waitFor(t, "the cancel and the stop record", func() bool { c, st := count(); return c == 1 && st == 1 })
+	mu.Lock()
+	cancel, stopRec := cancels[0], stops[0]
+	mu.Unlock()
+	if want := lib.TaskInSubject("fleet-audit", reply.TaskID); cancel.Subject != want {
+		t.Errorf("cancel on %s, want %s", cancel.Subject, want)
+	}
+	if want := lib.DispatchStopSubject("fleet-audit", reply.TaskID); stopRec.Subject != want {
+		t.Errorf("stop record on %s, want %s", stopRec.Subject, want)
+	}
+	var env lib.Envelope
+	if err := json.Unmarshal(cancel.Data, &env); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := capability.TriggerFromAuthority(env.Authority)
+	if err != nil || claimed == nil || claimed.Name != s.Trigger.Name {
+		t.Errorf("the cancel's authority trigger = %+v, %v; want the run's", claimed, err)
+	}
+	// The run's own authority: the trigger as requester, its conversation as
+	// the audience, and the run's grant.
+	auth := string(env.Authority)
+	for _, want := range []string{triggerRequesterBackend, triggerConversationKey("schedule", s.Schedule), s.Trigger.Name} {
+		if !strings.Contains(auth, want) {
+			t.Errorf("the cancel's authority lacks %q: %s", want, auth)
+		}
+	}
+	if ref, present, err := capability.RefFromAuthority(env.Authority); err != nil || !present || ref.Key == "" {
+		t.Errorf("the cancel's authority carries no grant: %+v, %v, %v", ref, present, err)
+	}
+
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopStopped {
+		t.Fatalf("a second stop = %+v, want stopped", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if c, st := count(); c != 1 || st != 1 {
+		t.Fatalf("a second stop wrote again: %d cancels, %d stop records", c, st)
+	}
+}
+
+// A stop for a run that has already ended writes nothing and says so.
+func TestATriggerStopOfAnEndedRunWritesNothing(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, tr.execFor(t, &origin, "fleet-audit"), "No findings.")
+	waitFor(t, "the terminal", func() bool { return tr.status(t, s, reply.TaskID).Terminal })
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopAlreadyFinal {
+		t.Fatalf("an ended run's stop = %+v, want already_final", got)
+	}
+}
+
+// A stop whose reply names anything but the source's own reply namespace is
+// dropped, as a submission's is.
+func TestATriggerStopWithAReplyOutsideItsNamespaceIsNotAnswered(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	_ = tr.stop(t, s, "t") // the stop subscription is up
+	data, err := json.Marshal(lib.TriggerStop{Schedule: s.Schedule, TaskID: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.nc.Request(lib.TriggerStopSubject("schedule"), data, 500*time.Millisecond); err == nil {
+		t.Fatal("a stop with an inbox reply was answered")
+	}
+}
+
+// The stop subscription's refusal restarts the stop loop alone, and the
+// ingress's own refusals don't count the stop's: a bus that hasn't loaded the
+// newer stop grant leaves submissions and status queries running.
+func TestTheStopSubscriptionsRefusalIsItsOwn(t *testing.T) {
+	stop := `nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.stop"`
+	submit := `nats: permissions violation: Permissions Violation for Subscription to "a2a.trigger.*.submit"`
+	if isTriggerSubscriptionRefusal(errors.New(stop)) {
+		t.Error("the stop's refusal restarts the ingress")
+	}
+	if !isTriggerStopSubscriptionRefusal(errors.New(stop)) {
+		t.Error("the stop's refusal doesn't restart the stop loop")
+	}
+	if isTriggerStopSubscriptionRefusal(errors.New(submit)) || isTriggerStopSubscriptionRefusal(nil) {
+		t.Error("another refusal restarts the stop loop")
+	}
+}
+
+// A stop whose stop record can't be published is refused unavailable and
+// marks nothing, so the operator asks again and the retry sends the record:
+// the record is what removes a run still starting, and a stop answered
+// stopped without it could never be sent again.
+func TestATriggerStopWhoseRecordFailsIsRefusedAndSentOnRetry(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	ctx := context.Background()
+	js, err := jetstream.New(tr.nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.DeleteStream(ctx, lib.DispatchStopStream); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.stop(t, s, reply.TaskID); got.Refused == nil || got.Refused.Reason != lib.TriggerRefusedUnavailable {
+		t.Fatalf("a stop with no stop record = %+v, want unavailable", got)
+	}
+	rec, err := tr.g.reg.Get(ctx, "trigger:schedule/kubeagents-system/compliance-audit")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if ref, _ := rec.TaskRefFor(reply.TaskID); ref.Canceled {
+		t.Fatal("the task was marked canceled though its stop record never went out")
+	}
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name: lib.DispatchStopStream, Subjects: []string{lib.DispatchStopPrefix + ">"},
+		Retention: jetstream.LimitsPolicy, MaxMsgsPerSubject: 1, AllowDirect: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tr.stop(t, s, reply.TaskID); got.Result != lib.TriggerStopStopped {
+		t.Fatalf("the retry = %+v, want stopped", got)
+	}
+	if _, err := js.Stream(ctx, lib.DispatchStopStream); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := js.Stream(ctx, lib.DispatchStopStream)
+	if _, err := stream.GetLastMsgForSubject(ctx, lib.DispatchStopSubject("fleet-audit", reply.TaskID)); err != nil {
+		t.Fatalf("the retry wrote no stop record: %v", err)
+	}
+}
+
+// failingMint makes the gateway's trigger mints fail with err while fail is
+// above zero, counting each down, and mint for real after.
+func failingMint(tr *triggerRig, fail *int, err error) {
+	tr.g.triggerMint = func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error) {
+		if *fail > 0 {
+			*fail--
+			return capability.Ref{}, err
+		}
+		return capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, taskID, e)
+	}
+}
+
+// A mint that fails hands its rate token back (#5923): more failed retries
+// of one slot than the hourly cap admits are each refused unavailable, never
+// rate_limited, and the slot then runs.
+func TestAFailedMintSpendsNoRateToken(t *testing.T) {
+	tr := startTriggerRig(t, func(c *Config) { c.TriggerRatePerHour = 3 })
+	s := goodScheduleSubmit()
+	fail := 5
+	failingMint(tr, &fail, errors.New("cap bucket unavailable"))
+	for i := 0; i < 5; i++ {
+		if r := tr.submit(t, "schedule", s); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedUnavailable {
+			t.Fatalf("failed attempt %d = %+v, want unavailable", i+1, r)
+		}
+	}
+	r := tr.submit(t, "schedule", s)
+	if r.Refused != nil || r.TaskID != triggerTaskID(s.IdempotencyKey, 0) {
+		t.Fatalf("after the failures = %+v, want the first attempt's task", r)
+	}
+}
+
+// A record write that fails after the mint costs exactly one attempt, and
+// the attempt survives a restart (a fresh rate limiter, the same record): the
+// retry resumes at the next task id instead of walking from the first, and
+// still runs after more failures than the old cap of four allowed.
+func TestARecordWriteFailureCostsOneAttemptAcrossARestart(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	failRuns := 6
+	tr.g.reg.beforePut = func(rec *SessionRecord) error {
+		if failRuns > 0 && rec.triggerRun(s.IdempotencyKey) != nil && !rec.TriggerRuns[len(rec.TriggerRuns)-1].Published {
+			failRuns--
+			return errors.New("kv write failed")
+		}
+		return nil
+	}
+	mints := 0
+	tr.g.triggerMint = func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error) {
+		mints++
+		return capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, taskID, e)
+	}
+	for i := 0; i < 6; i++ {
+		if r := tr.submit(t, "schedule", s); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedUnavailable {
+			t.Fatalf("failed attempt %d = %+v, want unavailable", i+1, r)
+		}
+		// A restart between retries: the limiter is new, the record isn't.
+		tr.g.triggerLimits = newTriggerRateLimiter(DefaultTriggerRatePerHour)
+	}
+	r := tr.submit(t, "schedule", s)
+	if r.Refused != nil || r.TaskID != triggerTaskID(s.IdempotencyKey, 6) {
+		t.Fatalf("after six failed record writes = %+v, want attempt 6's task %s", r, triggerTaskID(s.IdempotencyKey, 6))
+	}
+	// Each retry mints the recorded attempt (refused: minted already) and
+	// then the next one; none walks from the first again.
+	if want := 1 + 2*6; mints != want {
+		t.Fatalf("%d mints, want %d: a retry walked from an earlier attempt", mints, want)
+	}
+	rec, err := tr.g.reg.Get(context.Background(), "trigger:schedule/kubeagents-system/compliance-audit")
+	if err != nil || rec == nil || len(rec.TriggerPending) != 0 {
+		t.Fatalf("the pending attempt outlived the recorded run: %+v, %v", rec, err)
+	}
+}
+
+// A pending attempt whose grant an earlier try minted moves to the next
+// attempt from where it was, never from the first.
+func TestAPendingAttemptMintedAlreadyMovesToTheNextFromWhereItWas(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	ctx := context.Background()
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	rec := &SessionRecord{Key: key, ContextID: "ctx-pending", Kind: triggerAudienceKind, LastActivity: time.Now().UTC(),
+		TriggerPending: map[string]TriggerPendingRun{s.IdempotencyKey: {Attempt: 9, Task: triggerTaskID(s.IdempotencyKey, 9)}}}
+	if err := tr.g.reg.Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, triggerTaskID(s.IdempotencyKey, 9), capability.Entry{
+		Tier: capability.TierUnattended, Scope: capability.NamespaceScope("kubeagents-system"), Profile: "fleet-audit", Delegate: profileGrantDelegate,
+		Trigger: &capability.Trigger{Name: s.Trigger.Name, Origin: "builtin", Stream: s.Trigger.Stream},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused != nil || r.TaskID != triggerTaskID(s.IdempotencyKey, 10) {
+		t.Fatalf("reply = %+v, want attempt 10's task", r)
+	}
+}
+
+// Every attempt counts toward the cap, refunded or not: with the first
+// sixteen task ids already minted, the run is refused unavailable without a
+// seventeenth mint.
+func TestARunIsRefusedOnceItsSixteenAttemptsAreSpent(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	ctx := context.Background()
+	for n := 0; n < triggerMintAttempts; n++ {
+		if _, err := capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, triggerTaskID(s.IdempotencyKey, n), capability.Entry{
+			Tier: capability.TierUnattended, Scope: capability.NamespaceScope("kubeagents-system"), Profile: "fleet-audit", Delegate: profileGrantDelegate,
+			Trigger: &capability.Trigger{Name: s.Trigger.Name, Origin: "builtin", Stream: s.Trigger.Stream},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mints int
+	tr.g.triggerMint = func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error) {
+		mints++
+		return capability.NewMinter(tr.g.client.JetStream()).Mint(ctx, taskID, e)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused == nil || r.Refused.Reason != lib.TriggerRefusedUnavailable {
+		t.Fatalf("reply = %+v, want unavailable", r)
+	}
+	if mints != triggerMintAttempts {
+		t.Fatalf("%d mints, want %d and none past the cap", mints, triggerMintAttempts)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused == nil || mints != triggerMintAttempts {
+		t.Fatalf("a retry past the cap = %+v after %d mints, want refused without minting", r, mints)
+	}
+}
+
+// A key whose run has left TriggerRuns is answered with its task from the
+// 24-hour key record; past 24 hours it is forgotten.
+func TestAKeyOlderThanTheKeptRunsIsStillItsTask(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	ctx := context.Background()
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	rec := &SessionRecord{Key: key, ContextID: "ctx-keys", Kind: triggerAudienceKind, LastActivity: time.Now().UTC(),
+		TriggerKeys: map[string]TriggerKeyRecord{s.IdempotencyKey: {Task: "task-from-yesterday", At: time.Now().Add(-23 * time.Hour)}}}
+	if err := tr.g.reg.Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if r := tr.submit(t, "schedule", s); r.Refused != nil || r.TaskID != "task-from-yesterday" {
+		t.Fatalf("reply = %+v, want the recorded task", r)
+	}
+	if len(tr.submissions()) != 0 {
+		t.Fatalf("the repeat started a task: %d submissions", len(tr.submissions()))
+	}
+	rec.TriggerKeys = map[string]TriggerKeyRecord{"old": {Task: "t-old", At: time.Now().Add(-25 * time.Hour)}}
+	rec.recordTriggerKey("new", "t-new", time.Now(), triggerKeysKeptMin)
+	if _, ok := rec.TriggerKeys["old"]; ok {
+		t.Error("a key past 24 hours wasn't pruned")
+	}
+	if _, ok := rec.triggerKeyTask("old", time.Now()); ok {
+		t.Error("a key past 24 hours was answered")
+	}
+}
+
+// A refund never fills a bucket past its size.
+func TestARefundNeverExceedsTheBucket(t *testing.T) {
+	l := newTriggerRateLimiter(2)
+	now := time.Now()
+	if !l.allow("t", now) {
+		t.Fatal("a full bucket refused")
+	}
+	l.refund("t", now)
+	l.refund("t", now)
+	l.refund("t", now)
+	for i := 0; i < 2; i++ {
+		if !l.allow("t", now) {
+			t.Fatalf("token %d refused", i+1)
+		}
+	}
+	if l.allow("t", now) {
+		t.Fatal("refunds filled the bucket past its size")
+	}
+}
+
+// End to end: a real run's key is recorded when the run is, even when the
+// write marking it published fails, and after more newer runs than
+// TriggerRuns keeps have pushed it out, a repeat of the key is still answered
+// with its task and starts nothing.
+func TestAPublishedKeyOutlivesTheKeptRuns(t *testing.T) {
+	tr := startTriggerRig(t, func(c *Config) { c.TriggerRatePerHour = 1000 })
+	first := goodScheduleSubmit()
+	// The first run's publish lands but the write marking it published
+	// fails, so only the key record written with the run can answer later.
+	failMark := 1
+	tr.g.reg.beforePut = func(rec *SessionRecord) error {
+		if run := rec.triggerRun(first.IdempotencyKey); failMark > 0 && run != nil && run.Published {
+			failMark--
+			return errors.New("kv write failed")
+		}
+		return nil
+	}
+	r := tr.submit(t, "schedule", first)
+	if r.Refused != nil {
+		t.Fatalf("refused: %+v", r.Refused)
+	}
+	for i := 1; i <= triggerRunsKept; i++ {
+		s := goodScheduleSubmit()
+		s.IdempotencyKey = fmt.Sprintf("schedule/kubeagents-system/compliance-audit/%d", 1763100000+i*3600)
+		if rr := tr.submit(t, "schedule", s); rr.Refused != nil {
+			t.Fatalf("run %d refused: %+v", i, rr.Refused)
+		}
+	}
+	rec, err := tr.g.reg.Get(context.Background(), "trigger:schedule/kubeagents-system/compliance-audit")
+	if err != nil || rec == nil || rec.triggerRun(first.IdempotencyKey) != nil {
+		t.Fatalf("the first run is still kept (%v); the test needs it pushed out", err)
+	}
+	before := len(tr.submissions())
+	again := tr.submit(t, "schedule", first)
+	if again.Refused != nil || again.TaskID != r.TaskID {
+		t.Fatalf("the repeat = %+v, want task %s", again, r.TaskID)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := len(tr.submissions()); n != before {
+		t.Fatalf("the repeat started a task: %d submissions, was %d", n, before)
+	}
+}
+
+// Pending attempts a reconciler gave up on are dropped a day later, and the
+// map never grows past triggerPendingKept; key records are capped too, with
+// the cap sized from the configured rate.
+func TestTriggerRecordMapsAreBounded(t *testing.T) {
+	rec := &SessionRecord{}
+	now := time.Now()
+	rec.setTriggerPending("stale", TriggerPendingRun{Attempt: 3, At: now.Add(-25 * time.Hour)})
+	rec.setTriggerPending("fresh", TriggerPendingRun{Attempt: 1, At: now})
+	if _, ok := rec.TriggerPending["stale"]; ok {
+		t.Error("a day-old pending attempt wasn't dropped")
+	}
+	for i := 0; i < triggerPendingKept+10; i++ {
+		rec.setTriggerPending(fmt.Sprintf("k%d", i), TriggerPendingRun{At: now.Add(time.Duration(i) * time.Second)})
+	}
+	if len(rec.TriggerPending) != triggerPendingKept {
+		t.Errorf("TriggerPending holds %d, want %d", len(rec.TriggerPending), triggerPendingKept)
+	}
+	for i := 0; i < 40; i++ {
+		rec.recordTriggerKey(fmt.Sprintf("key%d", i), "t", now.Add(time.Duration(i)*time.Second), 30)
+	}
+	if len(rec.TriggerKeys) != 30 {
+		t.Errorf("TriggerKeys holds %d, want 30", len(rec.TriggerKeys))
+	}
+	if _, ok := rec.TriggerKeys["key0"]; ok {
+		t.Error("the oldest key wasn't the one evicted")
+	}
+	g := &Gateway{cfg: &Config{TriggerRatePerHour: 60}}
+	if got := g.triggerKeysKept(); got < 60*24 {
+		t.Errorf("at 60 an hour the key cap is %d, under a day's runs", got)
 	}
 }

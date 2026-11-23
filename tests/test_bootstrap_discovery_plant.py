@@ -74,7 +74,9 @@ _INTERPOLATIONS = {
     "local.python": "/opt/hermes/.venv/bin/python3",
     "local.key_like": "bootstrap-inventory-%",
     "local.cluster_key_like": "bootstrap-inventory-cluster-%",
-    "local.file_wait": "600",
+    # Two passes of step 3, which waits in steps of 10: the stand-in gate files at the
+    # second read or never, and a run in which it never files costs each pass it makes.
+    "local.file_wait": "20",
     "local.run_wait": "900",
     "local.poll": "15",
     "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md",

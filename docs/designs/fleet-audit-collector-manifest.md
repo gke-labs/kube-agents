@@ -502,8 +502,8 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   named in the ledger's _Awaiting `/remediate`_ section under a paragraph that says to read it
   first, and reported on the JSON line.
 - **Needs triage:** a finding whose candidate carries a `needs_triage` value in `NO_SWEEP_TRIAGE`
-  (`service-fronted`, `new-computeclass`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
-  `default-deny`, `namespace-token`, `service-selector`, `hard-spread`, `serviceentry-owner`). The collector stands behind the finding; the _fix_ has a consequence
+  (`service-fronted`, `new-computeclass`, `class-status`, `reserved-pool`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
+  `default-deny`, `namespace-token`, `service-selector`, `hard-spread`, `serviceentry-owner`, `manual-pool-fallback`). The collector stands behind the finding; the _fix_ has a consequence
   it could not measure. Named in its own paragraph, worded differently from the one above because
   the two say opposite things about the collector, each row followed by the marker and the
   consequence it stands for (`TRIAGE_REASONS`).
@@ -691,7 +691,7 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
 and stockout streams declare a `cluster` and a `project` kind; the GCE compute stream, whose targets
 are all projects, declares `project` alone; the networking stream declares a `subnet` kind for
-`subnet-ip-exhaustion` and a `project` kind for its other five checks. A fleet that holds no cluster is not
+`subnet-ip-exhaustion` and a `project` kind for its other six checks. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs

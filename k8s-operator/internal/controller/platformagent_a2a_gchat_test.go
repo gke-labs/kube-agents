@@ -224,7 +224,7 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			}
 			want := []string{"NATS_URL", a2aNATSCAFileEnv, a2aNATSCAConfigMapEnv, "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", a2aConsoleDoorEnvVar, "A2A_MAX_SESSIONS",
 				"A2A_SESSION_CPU_REQUEST", "A2A_SESSION_MEMORY_REQUEST", "A2A_SESSION_CPU_LIMIT", "A2A_SESSION_MEMORY_LIMIT", a2aGatewayRelayPrecreatedEnvVar,
-				a2aBusyNoticeAtEnvVar, a2aGatewayMetricsPortEnvVar, "A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, a2aCardStopEnvVar, a2aCardStopTimeoutEnvVar, "POD_NAMESPACE",
+				a2aBusyNoticeAtEnvVar, a2aGatewayMetricsPortEnvVar, "A2A_SPAWN_SESSIONS", a2aDefaultAddresseeEnvVar, "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, a2aCardStopEnvVar, a2aCardStopTimeoutEnvVar, "POD_NAMESPACE",
 				"SESSION_KV_SALT", "A2A_OWNER_DEPLOYMENT", "A2A_SESSION_SERVICE_ACCOUNT", a2aGatewayScopeFileEnv, a2aGatewayManagementProjectEnv, a2aPrincipalMapEnvVar}
 			// The delegation target allowlists render from the CR's lists
 			// whether or not Chat is armed; they are not the Chat adapter's
@@ -237,14 +237,16 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			if scopePublisherRendered(tc.agent) {
 				want = append(want, a2aResolvedScopeConfigMapEnvVar)
 			}
+			// The report reader's pair, on every install (a2a_report_reader.go).
+			want = append(want, a2aReportStoreURLEnvVar, a2aReportStoreTokenFileEnvVar)
 			// The tiers file (#3659), appended after the gateway is built.
 			want = append(want, a2aTiersFileEnvVar)
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)
 			}
-			if len(c.VolumeMounts) != 4 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
-				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName || c.VolumeMounts[3].Name != a2aTiersVolume {
-				t.Errorf("unarmed mounts %v, want the principal map, the bus CA, the scope file and the tiers file alone", c.VolumeMounts)
+			if len(c.VolumeMounts) != 5 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
+				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName || c.VolumeMounts[3].Name != a2aReportsTokenVolume || c.VolumeMounts[4].Name != a2aTiersVolume {
+				t.Errorf("unarmed mounts %v, want the principal map, the bus CA, the scope file, the report reader's token and the tiers file alone", c.VolumeMounts)
 			}
 		})
 	}
@@ -274,8 +276,8 @@ func TestTheBrokerArmsTheA2ARelay(t *testing.T) {
 		t.Errorf("GOOGLE_CHAT_SUBSCRIPTION_NAME=%q rendered beside the A2A subscription: two relay instances would split one subscription, and the proxy refuses to start on the pair", value)
 	}
 	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
-	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
-		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third", callers)
+	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway,system:serviceaccount:test-ns:test-agent-a2a-mcp" {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third and the MCP server's fourth", callers)
 	}
 }
 
@@ -386,8 +388,8 @@ func TestNoRenderCarriesBothChatSubscriptions(t *testing.T) {
 func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 	armed := buildCredentialProxyNetworkPolicy(gchatTestAgent("next", true))
 	from := armed.Spec.Ingress[0].From
-	if len(from) != 3 {
-		t.Fatalf("armed: %d peers on the broker port, want 3 (sandbox, gateway, A2A gateway): %#v", len(from), from)
+	if len(from) != 4 {
+		t.Fatalf("armed: %d peers on the broker port, want 4 (sandbox, gateway, A2A gateway, MCP): %#v", len(from), from)
 	}
 	var found bool
 	for _, peer := range from {
@@ -401,9 +403,11 @@ func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 	if !found {
 		t.Error("the A2A gateway pod is not a peer; its relay pulls would be refused before TokenReview")
 	}
+	// Unarmed, the A2A gateway is still a peer: its report reader calls the
+	// store routes on every install (a2a_report_reader.go).
 	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("next", false), a2aTestAgent()} {
-		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
-			t.Errorf("unarmed: %d peers, want the two main renders", got)
+		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 4 {
+			t.Errorf("unarmed: %d peers, want the four default renders (sandbox, gateway, A2A gateway, MCP)", got)
 		}
 	}
 }

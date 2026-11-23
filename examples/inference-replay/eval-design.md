@@ -722,23 +722,43 @@ and the merge copy takes only the merged pull request's last passing presubmit.
 
 **Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
 15 cases, three times each) going at the same time on the same install, and a build can pass while
-some of those runs fail. Requests don't say which run they belong to, but we can work it out after
-the run with data we already have. A worker's request names the card it's working on (its first
+some of those runs fail. Most requests can be tied to their run after the fact with data we already
+have, and the rest carry a run tag (below). A worker's request names the card it's working on (its first
 message is "work kanban task t\_…"), and a front door's request names the cards it created (what
 its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
 and whether it passed. So the copy job can match each saved answer to its card, the card to its
 run, and the run to pass or fail, and copy only the passing ones. A front door's first request
 names no card at all, only the case's prompt, and the board reads before its first card name none
-either. Each is matched through the requests that came after it: an answer is copied when a chain
-of requests, each going on from exactly the answer before it, reaches a request naming a passing
-run's card.
+either. Those are matched by the run tag instead: on an eval install the agent stamps every model
+request with its run, case and repetition (`X-Kube-Agents-Eval-Run`), the proxy logs it, and the
+harness writes the same tag beside each run's `results.json`. The run part is new on every
+attempt, so a retried attempt's requests never count for the attempt that was graded. A request
+with a card must also agree with its tag; when they name different runs, its answer isn't copied.
+A request with neither a card nor a tag isn't copied at all.
 
-Each case runs three times. Ideally each of the three would replay its own recording, so we still
-get three different samples instead of one sample three times. That needs the proxy to know the run
-while it's happening, not afterwards. It could follow the same chain live: the harness tells the
-proxy which case and run each front-door task ID is, and every card after that was created by an
-answer the proxy already saw. That's more work, so it comes later. Until then all three runs of a
-case replay the same recording, which is also how our measurements were done.
+**Every passing answer is kept, and handed out in turn.** Each case runs three times, and the runs
+often answer the same request differently. If the cache kept only the first answer to each request,
+a failing run that happened to answer first would cost the request its passing answers, and every
+replayed run of the case would follow that one recording, so three runs would be one sample
+counted three times. So the cache keeps every distinct answer to a request, each under a name made
+of the request's fingerprint and a hash of the answer exactly as it is stored and served, written
+once like every other object; only those a passing run gave are published, decided answer by
+answer, so two runs that gave the same answer share one file and two that differed in any served
+word or action never do. The replay proxy hands a request's answers out in turn, each as often as
+passing runs gave it: a request whose passing runs answered one way nine times and another way once
+is served the second answer one time in ten, in a fixed order, rather than every other time.
+Identical answers share one file, so without the count a rare answer would be served as often as
+the common one. Once a run is served one answer, its next request holds that answer, so it only
+matches what followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
+once can take turns in either order, so this spreads runs across recordings rather than giving each
+run its own. Giving each run exactly one recording would mean serving by the run tag above, which
+the proxy logs but does not serve by yet.
+
+The lane loads only answers that a passing run of a night inside its 30-hour window produced
+(older-layout answers aside). A
+night's record lists the answers its passing runs gave, so an older object that a later night only
+found already in the bucket never comes in on that night's record. The record also counts how many
+requests from passing runs got each answer, and the lane adds the counts of the nights in its window.
 
 ### Prompts change often
 
@@ -885,8 +905,9 @@ before stage 3 of the rollout (turning replay on):
    set of cases with replay on, served from the nightly's recordings, on the commit the newest
    recording night ran. Its results
    don't block anything and aren't written to the evidence store. For this the nightly saves its
-   answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
-   only reads them. For each conversation it records
+   answers, every distinct answer to each fingerprint, as the trusted writer in "Who can write to
+   the cache"; the lane only reads them, and hands a request's answers out in turn ("Only save
+   answers from runs that passed"). For each conversation it records
    how many messages and tokens were replayed before the first miss, what caused that miss (the proxy has the cache, so it logs the closest saved request, which message first differed, and
    short cleaned-up snippets of both sides), and whether the run's verdict matched the live nightly's. Every miss here is real: a
    normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
@@ -900,14 +921,15 @@ before stage 3 of the rollout (turning replay on):
    ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane))
    and the bucket ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)). A nightly running
    as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
-   that account can write. It works out which run each answer came from after the fact, from the
-   cards each request and each run's results name ("Telling the runs in a build apart"). A
-   periodic at 06:00 UTC replays the previous nights' complete recordings plus tonight's partial
-   ones, gating nothing. It checks out the commit the newest recording night ran (each record names
+   that account can write. It works out which run each answer came from using the cards each
+   request and each run's results name, or, for a request with no card, from the run tag the agent
+   stamps on it, and a request whose tag and card name different runs is not published ("Telling
+   the runs in a build apart"). A periodic at 06:00 UTC replays the previous nights' complete
+   recordings plus tonight's partial ones, gating nothing. It checks out the commit the newest recording night ran (each record names
    it), or `main` when no record does, so what merged between 00:00 and 06:00 doesn't change what
    it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
    mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
-   served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
+   served before each first miss, the miss causes, and each case's verdicts beside the newest recording night's on the same commit.
    Only passing runs' answers are published, so replay could push a flaky case toward passing; the
    lane's safety cases (`hack/eval/replay-lane-safety-cases.txt`) therefore run live before the
    cache is seeded and then replayed, and the report sets the two pass rates side by side.
@@ -953,10 +975,10 @@ request, so the gate stays fair, and we add cases as each one's lane results hol
 
 ## Open questions
 
-- **Following runs live, for one recording per run.** Working out which run an answer came from
-  after the fact is covered above. Doing it live, so each of the three runs gets its own recording,
-  means the harness telling the proxy which case and run each front-door task is, and the proxy
-  following the cards from there. Worth doing only if shadow mode shows replay is worth turning on.
+- **Serving by run, for one recording per run.** Every request already carries its run tag, and
+  the proxy logs it. Serving each of the three runs its own recording means choosing among a key's
+  answers by that tag rather than in turn. Worth doing only if shadow mode shows replay is worth
+  turning on.
 - **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We

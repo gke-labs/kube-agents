@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"k8s.io/client-go/rest"
 
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/certreload"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/tokenreview"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/upstream"
@@ -33,9 +34,11 @@ const (
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
 	tlsCertFileEnv          = "KUBE_PROXY_TLS_CERT_FILE"
+	tlsCertFileFlag         = "tls-cert-file"
 	defaultTLSCertFile      = "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"
 	// #nosec G101 -- environment variable and mounted file path names, not credentials.
 	tlsKeyFileEnv     = "KUBE_PROXY_TLS_KEY_FILE"
+	tlsKeyFileFlag    = "tls-key-file"
 	defaultTLSKeyFile = "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"
 	modeEnv           = "KUBE_PROXY_MODE"
 	hostClusterIDEnv  = "KUBE_PROXY_HOST_CLUSTER_ID"
@@ -139,8 +142,8 @@ func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
 	fs.BoolVar(&cfg.showVersion, "version", false, "Print the release or commit this binary was built for and exit")
 	fs.StringVar(&cfg.listenAddr, "listen-addr", envOrDefault(listenAddrEnv, defaultListenAddr), "TCP address to listen on")
 	fs.IntVar(&cfg.metricsPort, metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
-	fs.StringVar(&cfg.tlsCertFile, "tls-cert-file", envOrDefault(tlsCertFileEnv, defaultTLSCertFile), "TLS server certificate PEM file (empty for plain HTTP)")
-	fs.StringVar(&cfg.tlsKeyFile, "tls-key-file", envOrDefault(tlsKeyFileEnv, defaultTLSKeyFile), "TLS server private key PEM file")
+	fs.StringVar(&cfg.tlsCertFile, tlsCertFileFlag, envOrDefault(tlsCertFileEnv, defaultTLSCertFile), "TLS server certificate chain PEM file, re-read when it changes; give the same path as --"+tlsKeyFileFlag+" for one PEM file holding the chain and its private key (empty for plain HTTP)")
+	fs.StringVar(&cfg.tlsKeyFile, tlsKeyFileFlag, envOrDefault(tlsKeyFileEnv, defaultTLSKeyFile), "TLS server private key PEM file, re-read when it changes; the --"+tlsCertFileFlag+" path when that file holds the key (empty for plain HTTP)")
 	fs.StringVar(&cfg.modeRaw, "mode", envOrDefault(modeEnv, string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
 	fs.StringVar(&cfg.authMode, "auth-mode", envOrDefault(authModeEnv, authModeTokenReview), "Caller authentication mode: token-review or none")
 	fs.StringVar(&cfg.upstreamURL, "upstream-url", envOrDefault(upstreamURLEnv, ""), "Static http:// or https:// upstream URL (skips cloud discovery and defaults bare paths to in-cluster)")
@@ -292,9 +295,6 @@ func buildHandler(
 ) (http.Handler, error) {
 	if cfg.denyStreaming && cfg.allowUpgradeSubresources {
 		return nil, errors.New("--deny-streaming cannot be combined with --allow-upgrade-subresources")
-	}
-	if cfg.tlsCertFile != "" && cfg.tlsKeyFile == "" {
-		return nil, errors.New("--tls-key-file is required when --tls-cert-file is set")
 	}
 
 	var authn k8sapiproxy.CallerAuthenticator
@@ -463,6 +463,13 @@ func main() {
 	}
 	loadEnvOnlyConfig(&cfg)
 
+	// TLS needs both paths; either one empty serves plain HTTP. The same path for both
+	// means one PEM file holds the certificate chain and its private key.
+	certFile, keyFile := cfg.tlsCertFile, cfg.tlsKeyFile
+	if certFile == "" || keyFile == "" {
+		certFile, keyFile = "", ""
+	}
+
 	mode, err := k8sapiproxy.ParseMode(cfg.modeRaw)
 	if err != nil {
 		log.Fatalf("invalid mode: %v", err)
@@ -500,9 +507,20 @@ func main() {
 	}
 
 	listen := srv.ListenAndServe
-	if cfg.tlsCertFile != "" && cfg.tlsKeyFile != "" {
+	if certFile != "" {
+		serverCert, err := certreload.NewServerCertificate(certFile, keyFile, certreload.Options{
+			OnReloadError: func(err error) {
+				logger.Warn("serving the previous TLS certificate: the changed certificate or key could not be loaded", "err", err)
+				metrics.RecordCertificateReloadFailure()
+			},
+		})
+		if err != nil {
+			log.Fatalf("failed to load the TLS server certificate: %v", err)
+		}
+		srv.TLSConfig.GetCertificate = serverCert.GetCertificate
 		log.Printf("starting %s (TLS) on %s (mode=%s, authMode=%s, redactSecrets=%v, denyStreaming=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), cfg.listenAddr, mode, cfg.authMode, cfg.redactSecrets, cfg.denyStreaming, cfg.metricsPort, cfg.cacheMaxBytes)
-		listen = func() error { return srv.ListenAndServeTLS(cfg.tlsCertFile, cfg.tlsKeyFile) }
+		// Empty file names make the server take certificates from TLSConfig.GetCertificate.
+		listen = func() error { return srv.ListenAndServeTLS("", "") }
 	} else {
 		log.Printf("starting %s (plain HTTP) on %s (mode=%s, authMode=%s, redactSecrets=%v, denyStreaming=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(), cfg.listenAddr, mode, cfg.authMode, cfg.redactSecrets, cfg.denyStreaming, cfg.metricsPort, cfg.cacheMaxBytes)
 	}

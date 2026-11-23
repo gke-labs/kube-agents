@@ -14,7 +14,8 @@ broker's auto-merge label use), ``""`` when the cluster declares none.
 first, and reads nothing while ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``. A
 read that fails is tried again next run until the outcome is
 :data:`GIVE_UP_AFTER` old, or at once when the outcome time will not parse;
-then the record is given ``""``, so a deleted cluster is not read forever. Nothing schedules it yet. No model is involved,
+then the record is given ``""``, so a deleted cluster is not read forever. The ``post-merge-check`` cron job runs it
+(``post_merge_outcome.tick``). No model is involved,
 and nothing here posts.
 """
 

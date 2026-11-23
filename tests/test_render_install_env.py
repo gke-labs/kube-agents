@@ -396,6 +396,15 @@ class RenderingTest(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertEqual(parse(text)["HELM_UPGRADE_INSTALL"], "true")
 
+    def test_card_stop_enabled_is_rendered_when_set_and_omitted_when_not(self):
+        """Opt-in per environment: unset leaves the key out, and the stop stays off."""
+        rc, log, text = render(dict(_COORDS))
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("CARD_STOP_ENABLED", parse(text))
+        rc, log, text = render({**_COORDS, "CARD_STOP_ENABLED": "true"})
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(parse(text)["CARD_STOP_ENABLED"], "true")
+
     def test_helm_upgrade_install_is_not_required_under_strict(self):
         """Absent keeps today's behaviour and destroys nothing, so a strict
         render must not ask for it."""
@@ -443,9 +452,19 @@ class RenderingTest(unittest.TestCase):
         _, _, text = render({**_COORDS, "GOOGLE_CHAT_HOME_CHANNEL": "spaces/TEST12345"})
         self.assertEqual(parse(text)["GOOGLE_CHAT_HOME_CHANNEL"], "spaces/TEST12345")
 
+    def test_google_chat_home_channel_policy_is_mapped(self):
+        _, _, text = render({**_COORDS, "GOOGLE_CHAT_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(parse(text)["GOOGLE_CHAT_HOME_CHANNEL_POLICY"], "manual")
+
     def test_slack_home_channel_policy_is_mapped(self):
         _, _, text = render({**_COORDS, "SLACK_HOME_CHANNEL_POLICY": "manual"})
         self.assertEqual(parse(text)["SLACK_HOME_CHANNEL_POLICY"], "manual")
+
+    def test_platform_agent_sizing_profile_is_mapped_when_set(self):
+        _, _, omitted = render(dict(_COORDS))
+        self.assertNotIn("PLATFORM_AGENT_SIZING_PROFILE", parse(omitted))
+        _, _, explicit = render({**_COORDS, "PLATFORM_AGENT_SIZING_PROFILE": "fleet"})
+        self.assertEqual(parse(explicit)["PLATFORM_AGENT_SIZING_PROFILE"], "fleet")
 
     def test_the_file_is_not_readable_by_anyone_else(self):
         """It carries the model provider's API key and the Slack tokens."""

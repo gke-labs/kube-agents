@@ -220,8 +220,8 @@ CLIPPED_TAIL = (
 
 
 # The platform names as a subscription and the gateway's env carry them. The platforms whose cards get laid-out chat
-# messages (chat_ux_on) are Slack, and Google Chat where the gateway serves
-# it, which lays a ``kube-agents.chat/v1``
+# messages (chat_ux_on) are Slack, and Google Chat and Microsoft Teams where the
+# gateway serves them, which lays a ``kube-agents.chat/v1``
 # message out as text with buttons; the other patch modules read this tuple
 # rather than keep their own. The gateway's served platform is read from the
 # operator's env (kanban_chat_notify.NOTIFY_PLATFORM_ENV and
@@ -229,7 +229,10 @@ CLIPPED_TAIL = (
 # read needs no import of that module, which the unit tests load flat.
 SLACK_PLATFORM = "slack"
 GOOGLE_CHAT_PLATFORM = "google_chat"
-CHAT_UX_PLATFORMS = (SLACK_PLATFORM, GOOGLE_CHAT_PLATFORM)
+# Microsoft Teams is a card platform only where the gateway serves it (the
+# operator's A2A_TEAMS_BACKEND switch; the Hermes Teams adapter takes text).
+TEAMS_PLATFORM = "teams"
+CHAT_UX_PLATFORMS = (SLACK_PLATFORM, GOOGLE_CHAT_PLATFORM, TEAMS_PLATFORM)
 GATEWAY_PLATFORM_ENVS = ("A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")
 # What separates the platform names in either variable
 # (kanban_chat_notify.PLATFORM_LIST_SEPARATOR).
@@ -1609,7 +1612,9 @@ def slack_ux_on(platform: object) -> bool:
 
 def chat_ux_on(platform: object) -> bool:
     """Whether ``platform``'s cards get laid-out chat messages: :func:`slack_ux_on`, or
-    Google Chat with the flag on when the gateway serves it.
+    Google Chat or Microsoft Teams with the flag on when the gateway serves it (for
+    Teams the operator's ``A2A_TEAMS_BACKEND`` switch, which names ``teams`` in the
+    same two variables).
 
     The A2A gateway lays a ``kube-agents.chat/v1`` message out on
     Google Chat as text with buttons, so the plan, the moments, the answer and
@@ -1622,7 +1627,7 @@ def chat_ux_on(platform: object) -> bool:
     name = str(platform or "").strip().lower()
     if name == SLACK_PLATFORM:
         return slack_ux_on(platform)
-    if name != GOOGLE_CHAT_PLATFORM or not gateway_serves(name):
+    if name not in (GOOGLE_CHAT_PLATFORM, TEAMS_PLATFORM) or not gateway_serves(name):
         return False
     return _ux_flag_on()
 
@@ -1657,7 +1662,7 @@ def completion_text(head: str, title: str, handoff: str, platform: object = None
     """Return the completion message: upstream's, or on a card platform the handoff alone.
 
     Flag off, or a platform the cards are not drawn for (:func:`chat_ux_on`), this
-    is upstream's f-string exactly. On a card platform (Slack, or Google Chat where
+    is upstream's f-string exactly. On a card platform (Slack, or Google Chat or Microsoft Teams where
     the gateway serves it) it drops the head line and
     leads with the worker's report, or
     its summary when there is no report (:func:`handoff_with_result`); a card
@@ -1686,7 +1691,7 @@ def explained_by_wake(
 ) -> bool:
     """Whether the creator's wake will narrate this failure, so the ping can go.
 
-    True only on a card platform (Slack, or Google Chat where the gateway serves
+    True only on a card platform (Slack, or Google Chat or Microsoft Teams where the gateway serves
     it) with the flag on, for a failure kind, on a subscription
     that asked to be woken, when ``kanban.wake_on_events`` wakes for the kind.
     Those are the conditions under which ``wake_kinds_for`` on a push adapter

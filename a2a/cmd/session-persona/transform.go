@@ -112,8 +112,7 @@ var (
 	skillNameRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 	// headingRE matches an ATX heading.
 	headingRE = regexp.MustCompile(`^(#{1,6})\s`)
-	// shellLangs are the info strings whose blocks are all commands, the
-	// same set as deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+	// shellLangs are the info strings whose blocks are all commands.
 	// transcriptLangs are the ones whose blocks are a transcript: only a
 	// shellPrompt line is a command, and the rest is what it printed. Any
 	// other info string (yaml, json, text) marks an inert block.

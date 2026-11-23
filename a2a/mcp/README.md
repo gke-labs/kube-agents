@@ -4,9 +4,9 @@ A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one ins
 
 It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
-## Turn it on
+## Turning it off
 
-The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's, which the chart sets from `operator.mcpServer.enabled`. With it set, the operator renders, beside the console server:
+The server runs by default beside the console server:
 
 - `<agent>-a2a-mcp`: a Deployment running `/mcp` from the `a2a-console` image, and a ClusterIP Service on port 8089;
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;
@@ -14,11 +14,11 @@ The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator
 
 The operator also renders the server's ServiceAccount, `<agent>-a2a-mcp`, and its token Secret, `<agent>-a2a-mcp-token`. If either name is already taken by an object the operator does not control, the server is not rendered and the PlatformAgent carries the `A2AMCPServer` condition ([conditions](../../docs/site/src/content/docs/operator/platformagent-crd.md)).
 
-Unset the flag and all of it is removed, the token included.
+Set `operator.mcpServer.enabled: false` in the chart (or `A2A_MCP_DOOR=false` on the operator) to turn it off; all of its objects are removed, the token included.
 
 ## Connect a client
 
-For a step-by-step setup of the workstation bridge in Antigravity, which reads the token and opens the port-forward itself, see [Using kube-agents from Antigravity](../../docs/site/src/content/docs/install/antigravity-mcp.md).
+For a step-by-step setup of the workstation bridge in Claude Code, the Antigravity CLI or the Antigravity editor, which reads the token and opens the port-forward itself, see [Using kube-agents over MCP](../../docs/site/src/content/docs/install/mcp.md).
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
@@ -38,7 +38,7 @@ The match fails closed. The bridge renames a deployment to `<kube-context>/<name
 
 The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
 
-When a turn call carries `_meta.conversation_id` or `stream_steps: true` (which the workstation bridge sets automatically when its host passes `_meta.conversation_id`), `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact, with `result` starting ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running`` while the task is still running, so the workstation bridge surfaces each step's plan title, tool activity, any `thinking` parts a worker adapter publishes, and card subtask outcomes before the final answer. Tool activity carries tool names, statuses, card ids, durations, error types and worker labels, and an activity title that the Hermes bridge builds from the call's arguments: file paths, cluster names, card titles, tool-search queries and a summary of a shell command. The Hermes bridge publishes no raw arguments, results, error text (outside a maintainer's debugging switch) or model reasoning. `task_control` takes `task_id` as an alias for `task` and `wait_timeout_seconds` as an alias for `wait_seconds`. A streamed `get` of a finished turn that delegated, read with no live watch of its chain (a re-read, not the stream that sent it), settles at once with the root's own answer and a note that its delegated tasks were not followed. Without step streaming, each call waits for the turn to finish (or the wait window to end) and returns one plain-text answer.
+When a turn call carries `_meta.conversation_id` or `stream_steps: true` (which the workstation bridge sets automatically when its host passes `_meta.conversation_id`, unless its `KUBE_AGENTS_MCP_STREAM_STEPS` setting is `off`, which sends `stream_steps: false`, or `on`, which sets it for every host), `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact, with `result` starting ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running`` while the task is still running, so the workstation bridge surfaces each step's plan title, tool activity, any `thinking` parts a worker adapter publishes, and card subtask outcomes before the final answer. Tool activity carries tool names, statuses, card ids, durations, error types and worker labels, and an activity title that the Hermes bridge builds from the call's arguments: file paths, cluster names, card titles, tool-search queries and a summary of a shell command. The Hermes bridge publishes no raw arguments, results, error text (outside a maintainer's debugging switch) or model reasoning. `task_control` takes `task_id` as an alias for `task` and `wait_timeout_seconds` as an alias for `wait_seconds`. A streamed `get` of a finished turn that delegated, read with no live watch of its chain (a re-read, not the stream that sent it), settles at once with the root's own answer and a note that its delegated tasks were not followed. Without step streaming, each call waits for the turn to finish (or the wait window to end) and returns one plain-text answer.
 
 Point an MCP client at `http://localhost:8089/mcp` with the header `Authorization: Bearer <token>`. The endpoint takes JSON-RPC 2.0 over `POST`, one JSON answer per request. It refuses any request that carries an `Origin` header, so a browser page cannot use it. `GET /healthz` answers without a token.
 

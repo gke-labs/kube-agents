@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2596,6 +2596,15 @@ _PARTIAL_REQUIRED_CAPTURE_REASON = (
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
 _SHOWN_COMMAND_CHARS = 120
+#: A worker command past a limit of the shell reader (:class:`kube_agents_bench.shell_words.ShellReadLimitError`)
+#: has no argvs. When it can hold the run that decides a check, the check cannot be evaluated:
+#: not a pass and not a fail.
+_SHELL_READ_LIMIT_REASON = (
+    "worker command {shown!r} is past the shell reader's limit ({limit}), so its runs cannot be "
+    "read and this check could not be evaluated"
+)
+#: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
+_UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2654,6 +2663,20 @@ class WorkerRun(BaseModel):
             if not flag or any(char.isspace() for char in flag):
                 raise ValueError(f"each flag must be one word, not {flag!r}")
         return flags
+
+
+def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
+    """The argvs of each line that the shell reader reads, and the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
+    Each line is read by itself, so one unread line does not take the others' argvs."""
+    argvs: list[list[str]] = []
+    first_unread = None
+    for line in lines:
+        try:
+            argvs.extend(_shell_argvs(line))
+        except ShellReadLimitError as limit:
+            first_unread = first_unread or (line, limit)
+    return argvs, first_unread
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -3006,7 +3029,15 @@ class WorkerCommandsVerifier(BaseVerifier):
     and the card log's rows join its typed set, so a command the trajectory
     missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
     read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
-    worker commands is ``status="error"``, not a pass.
+    worker commands is ``status="error"``, not a pass. A command past the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`: command lines nested deeper
+    than the reader's limit, or more reading than the line's budget) has no argvs. It is a gap
+    for the runs, graded by the rule for a capture with gaps with one difference: a pattern
+    reads the text of that line too, so a missing required pattern is conclusive, as a forbidden
+    pattern or run that was read is. A required run that is still missing is
+    ``status="error"`` when a line of the commands was not read, and a clean read of the
+    forbidden runs is when a typed line was not read. A check with patterns alone reads no
+    argv and is graded as before the limit.
     """
 
     type: Literal["worker_commands"]
@@ -3224,14 +3255,31 @@ class WorkerCommandsVerifier(BaseVerifier):
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
-        argvs = [argv for c in commands for argv in _shell_argvs(c)]
-        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
+        # The argvs serve the runs only: the commands' for the required runs, the typed calls'
+        # for the forbidden runs. A check with patterns alone reads none. Each line is read by
+        # itself; a line past the reader's limit has no argvs.
+        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
+        typed_argvs, typed_unread = _argvs_and_first_unread(typed if self.forbidden_runs else [])
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
         partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        # A line past the reader's limit is a gap of the same kind for the runs, with one
+        # difference: a pattern reads the text of that line, so a missing required pattern is
+        # conclusive. A required run that is still missing is not when a line of the commands
+        # was not read; with each of them read it is a fail whatever a typed line holds. A clean
+        # read of the forbidden runs is not when a typed line was not read. Not a pass and not a
+        # fail; a capture with gaps keeps its own error, below.
+        past_limit = None if hits or ran or missing else (unread if unrun else typed_unread)
+        if past_limit is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
             if missing:
@@ -3241,7 +3289,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             if unrun:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                parts.append(
+                    f"no worker command ran {named} across {len(commands)} command(s){sources}"
+                    + (_UNREAD_COMMAND_NOTE if unread is not None else "")
+                )
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -4453,10 +4504,10 @@ def _rate_limit_reason(status: int, payload: Any, what: str) -> str | None:
     if not is_rate_limit_answer(status, payload, _last_forge_error_headers.get()):
         return None
     if forges.forge_name() != forges.FORGE_GITHUB:
-        # Only GitHub's evals repositories share one installation's budget.
+        # Only GitHub's evals repositories share an installation's budget (one per shard).
         return f"GitLab rate-limited {what} (answered {status}), so this check could not be evaluated"
     return (
-        f"GitHub rate-limited {what} (answered {status}); the evals repositories share one App "
+        f"GitHub rate-limited {what} (answered {status}); the evals repositories of a shard share one App "
         "installation's hourly budget, so this check could not be evaluated"
     )
 
@@ -7411,7 +7462,7 @@ def _strings_in(value: Any) -> list[str]:
     return []
 
 
-def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
+def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> tuple[str, ShellReadLimitError | None]:
     """What one repetition said and wrote with, for charging a write to it:
     its reply, and the calls that create a branch or a pull request -- the
     front agent's and its delegated workers' tool calls (the worker
@@ -7422,8 +7473,19 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
     easily as this one's
     (:func:`kube_agents_bench.github_writes.writing_segments`), and a card's
     body, a comment or a file's content is prose, whose backticked ``git
-    push <branch>`` quotes a command rather than runs one."""
+    push <branch>`` quotes a command rather than runs one. A command past the
+    shell reader's limit has no segments; the second value is that error for
+    the first such command, or None."""
     parts = [snap.final_message, snap.output]
+    unread: list[ShellReadLimitError] = []
+
+    def segments(command: str) -> list[str]:
+        try:
+            return github_writes.writing_segments(command)
+        except ShellReadLimitError as limit:
+            unread.append(limit)
+            return []
+
     for call in snap.trajectory:
         if not isinstance(call, dict):
             continue
@@ -7433,12 +7495,18 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
         elif command is not None:
             # A terminal or execute_code call, clipped arguments decoded as the worker_commands
             # verifier decodes them (:func:`_code_call_text`).
-            parts.extend(github_writes.writing_segments(command))
+            parts.extend(segments(command))
     for row in snap.worker_commands or []:
         if isinstance(row, dict):
-            parts.extend(github_writes.writing_segments(str(row.get("command") or "")))
-    return "\n".join(parts)
+            parts.extend(segments(str(row.get("command") or "")))
+    return "\n".join(parts), unread[0] if unread else None
 
+
+_WRITES_SHELL_READ_LIMIT_REASON = (
+    "a command of this repetition is past the shell reader's limit ({limit}), so the calls in it "
+    "that create a branch or a pull request cannot be read, and a write in the window that "
+    "nothing else of this repetition names may be its own; this check could not be evaluated"
+)
 
 _NO_GITOPS_REPO_REASON = (
     f"no GitOps repository in the environment: set {github_writes.GITOPS_REPO_ENV_VAR} to "
@@ -7509,7 +7577,14 @@ class GitHubWritesVerifier(BaseVerifier):
     own tool calls, its delegated workers' tool calls, and their terminal
     commands. A read's arguments and every tool result are left out:
     ``gh pr view <url>``, ``vcs.py clone --branch <branch>`` and a listing
-    name another case's pull request as easily as this one's. On the inject
+    name another case's pull request as easily as this one's. A command past
+    the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) has no argvs
+    to read those calls from. The check is then ``status="error"`` when a
+    write that must be attributed by name (each write in a shared window, and
+    a sweep-branch write in an exclusive one) is named by nothing that was
+    read, and no charged write that the case did not request decides the
+    result without it. On the inject
     lane the front agent's arguments arrive as shapes (the bridge sends no
     string value off the pod), so what names a write there is the reply and
     the workers' calls, which the harness reads back from the pod's session
@@ -7658,7 +7733,7 @@ class GitHubWritesVerifier(BaseVerifier):
             )
 
         requested = github_writes.proposal_numbers_named(snap.final_message, repo, forge)
-        own = _own_words_and_calls(snap)
+        own, own_unread = _own_words_and_calls(snap)
         allowance = self.requested_pull_requests
         unrequested = []
         excused = []
@@ -7674,6 +7749,12 @@ class GitHubWritesVerifier(BaseVerifier):
                 excused.append(write.describe())
                 continue
             unrequested.append(write)
+        # A command past the shell reader's limit was not read, and it can name a write that
+        # nothing else of this repetition names. A charged write that the case did not request
+        # is conclusive without it; with none, the check cannot say that the repetition has
+        # nothing to answer for.
+        if own_unread is not None and unattributed and not unrequested:
+            return done(False, _WRITES_SHELL_READ_LIMIT_REASON.format(limit=own_unread), status="error")
         raw = report.as_dict()
         raw.update(
             {
@@ -8586,7 +8667,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
-        "webhook-backend-unreachable", "serviceentry-host-collision",
+        "webhook-backend-unreachable", "serviceentry-host-collision", "webhook-ca-bundle-expired",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -8595,12 +8676,13 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
+        "ingress-gateway-healthcheck-mismatch",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
-        "autoscaler-out-of-resources", "dangling-compute-class",
+        "autoscaler-out-of-resources", "dangling-compute-class", "ccc-unbacked-manual-fallback",
     ),
     "upgrade-retrospective": (
         "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
@@ -9168,6 +9250,279 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
         )
 
 
+# deploy/shared/docker-entrypoint.sh: DEFAULTS_PLUGINS_DIR, the plugins the
+# image ships for the front door, and the volume copy step 2b refreshes
+# from it, `$TARGET_DIR/plugins` with TARGET_DIR the agent home.
+GATEWAY_PLUGINS_IMAGE = "/opt/defaults/plugins"
+GATEWAY_PLUGINS_COPY = "/opt/data/plugins"
+# docker-entrypoint.sh: PINNED_EXTERNAL_PLUGINS, the plugins step 2b leaves
+# alone because the directory holds the plugin's own state (hermes_otel's
+# config.yaml carries the collector endpoint step 4 writes). Step 2's bulk
+# copy still has to put them on the volume, so they are read for presence
+# and owner, not diffed. Change both together.
+GATEWAY_PLUGINS_PINNED = ("hermes_otel",)
+# The states the plugin script reports: the diff states above, plus
+# `present` for a pinned plugin that is there and is not diffed.
+_PLUGIN_STATES = _SANDBOX_TREE_STATES + ("present",)
+# How `diff -rq` names an entry one side lacks: "Only in <dir>: <name>".
+_DIFF_ONLY_IN_PREFIX = "Only in "
+
+# Runs in the gateway's agent container as `sh -c`, with the paths and the
+# pinned names as positionals. One begin/end unit per plugin directory the
+# image ships, against the same name under the volume's plugins directory,
+# and, inside the unit, an `owner` line with the copy's numeric owner when
+# the copy is a directory (`ls -ldn`: `stat` takes different flags on GNU
+# and BSD, and the tests run this script on both); `uid` is the user the
+# script runs as, which is the agent's. A pinned plugin ends `present` rather than being diffed.
+# `count` is an independent tally of the image's plugin directories, which
+# the parser holds the units to. `LC_ALL=C` pins diff's message grammar
+# ("Only in <dir>: <name>"), which the parser reads for the copy's extras.
+# The copy's parent is deliberately not
+# created or touched: the state this reads is the parent being root-owned
+# so that no copy could be made (gke-labs/kube-agents#6279).
+_GATEWAY_PLUGINS_SCRIPT = r"""
+img=$1 copy=$2 pinned=$3
+[ -d "$img" ] || echo "ref_missing $img"
+echo "uid $(id -u)"
+n=$(find "$img" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l)
+for s in "$img"/*/; do
+  s=${s%/}; b=${s##*/}; d="$copy/$b"
+  echo "begin $d"
+  if [ -L "$d" ]; then st=symlink
+  elif [ ! -d "$d" ]; then st=missing
+  else
+    o=$(ls -ldn "$d" 2>/dev/null | awk '{print $3}') && [ -n "$o" ] && echo "owner $o"
+    case " $pinned " in
+      *" $b "*) st=present ;;
+      *)
+        out=$(LC_ALL=C diff -rq --no-dereference "$s" "$d" 2>&1)
+        case $? in 0) st=same ;; 1) st=differ ;; *) st=trouble ;; esac
+        [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/| /'
+        ;;
+    esac
+  fi
+  echo "end $d $st"
+done
+echo "count $(( n ))"
+echo done
+"""
+
+
+@VERIFIERS.register("gateway_plugins_as_shipped")
+class GatewayPluginsAsShippedVerifier(_OnboardingPollVerifier):
+    """The front door is running the plugins its image ships.
+
+    WHY THIS EXISTS. The entrypoint copies every plugin directory under
+    ``/opt/defaults/plugins`` onto the agent's data volume at
+    ``/opt/data/plugins`` (step 2b of ``deploy/shared/docker-entrypoint.sh``)
+    and Hermes loads the ``default`` profile's plugins from there: the
+    specialist roster, the onboarding hooks, the session store, the
+    tool-call audit. When the volume's ``plugins`` directory was created by
+    the container runtime as the parent of a plugin mounted beneath it, it
+    is root-owned, the copy fails for every plugin, and on a new volume the
+    front door starts with none of them (gke-labs/kube-agents#6279). Nothing
+    graded over chat is certain to notice: the agent still answers, and it
+    may still route correctly without its roster. This reads the volume.
+
+    WHAT IT ASSERTS. After the run it execs into the agent container
+    (``AGENT_CONTAINER``, default ``platform-agent``) of the agent Service
+    (``svc/<AGENT_SERVICE_NAME>``; a resolved ``pod/<name>`` is used as
+    given), in ``AGENT_NAMESPACE`` on ``AGENT_CLUSTER_CONTEXT``, and for each
+    directory under the image's plugins directory requires its namesake
+    under the volume's to be a real directory owned by the user the agent
+    runs as, and, for every plugin but the pinned ones
+    (``GATEWAY_PLUGINS_PINNED``, which the entrypoint does not refresh
+    because the directory carries the plugin's own state), ``diff -rq``
+    clean against the image's copy. A missing plugin, one swapped for a
+    symlink, one that differs, and one another user owns each fail; the
+    reason names them. "Differs" is a file the image ships that is missing
+    from the copy or has other content; an entry beside them that the image
+    does not ship is reported in ``raw["extra"]`` and decides nothing,
+    because the entrypoint copies the plugins over the volume without
+    pruning, so an image change that drops a file leaves it on every
+    volume that predates the change, and a case that failed on it would
+    read red on a long-lived install with every plugin loaded. The script
+    prints its own count of the image's plugin
+    directories, and the units it reported must match it, so a loop that
+    compared nothing cannot pass. An install that has rolled since the state
+    arose may read clean: each new Pod's ``fsGroup`` pass adds group write to
+    the directory and that Pod's entrypoint copies the plugins, so what this
+    reads is the serving Pod's boot, which on a fresh install is the first.
+
+    Fails closed: a kubectl that cannot run, exits non-zero or times out,
+    output that stops before the script's last line, an image with no
+    plugins directory, a count the units do not meet, and a ``diff`` that
+    could not compare are all ``status="error"``, never a pass. A definite
+    difference outranks a comparison that could not be made, and a ``fail``
+    seen on an earlier poll outranks a final poll that errors
+    (``_OnboardingPollVerifier``).
+
+    The reference is writable by the agent: the image keeps
+    ``/opt/defaults/plugins`` hermes-owned by design (the Dockerfile's caution
+    about a directory with several live readers), so a clean diff proves that
+    the two copies agree, no more. The state this reads for is a copy that is
+    missing or stale, which no edit to the reference produces.
+
+    No field: the comparison is the whole assertion.
+    """
+
+    type: Literal["gateway_plugins_as_shipped"]
+
+    def _kubectl(self) -> tuple[list[str], str, str, str]:
+        namespace = os.environ.get("AGENT_NAMESPACE", onboarding.DEFAULT_AGENT_NAMESPACE)
+        agent = os.environ.get("AGENT_SERVICE_NAME", onboarding.DEFAULT_AGENT_SERVICE)
+        pod = agent if "/" in agent else f"svc/{agent}"
+        container = os.environ.get("AGENT_CONTAINER", onboarding.DEFAULT_AGENT_CONTAINER)
+        cmd = ["kubectl"]
+        if self.kubeconfig:
+            cmd += ["--kubeconfig", self.kubeconfig]
+        context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+        if context:
+            cmd += ["--context", context]
+        cmd += [
+            "-n", namespace, "exec", pod, "-c", container, "--", "sh", "-c",
+            _GATEWAY_PLUGINS_SCRIPT, "sh",
+            GATEWAY_PLUGINS_IMAGE, GATEWAY_PLUGINS_COPY, " ".join(GATEWAY_PLUGINS_PINNED),
+        ]
+        return cmd, pod, namespace, container
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        cmd, pod, namespace, container = self._kubectl()
+        where = f"{namespace}/{pod} container {container}"
+        raw: dict[str, Any] = {"pod": pod, "namespace": namespace}
+        try:
+            # Bytes, split on "\n" alone, for the reason SandboxTreeMatchesImageVerifier gives.
+            proc = subprocess.run(cmd, capture_output=True, timeout=read_timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "error", f"could not exec into {where}: {exc}", raw
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            return (
+                "error",
+                f"kubectl exec into {where} exited {proc.returncode}: "
+                f"{stderr.strip()[-_REASON_TAIL_CHARS:] or '(no stderr)'}",
+                raw,
+            )
+        lines = stdout.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if "done" not in lines:
+            return (
+                "error",
+                f"the plugin script in {where} stopped before its last line: "
+                f"{stdout.strip()[-_REASON_TAIL_CHARS:] or '(no output)'}",
+                raw,
+            )
+
+        ref_missing: str | None = None
+        uid: int | None = None
+        count: int | None = None
+        plugins: dict[str, str] = {}
+        owners: dict[str, int] = {}
+        diffs: dict[str, list[str]] = {}
+        current: str | None = None
+        unexpected: list[str] = []
+        for line in lines:
+            word, _, rest = line.partition(" ")
+            if current is not None and line.startswith(_SANDBOX_DIFF_LINE_PREFIX):
+                diffs[current].append(line[len(_SANDBOX_DIFF_LINE_PREFIX) :])
+            elif current is not None and word == "owner" and rest.isdigit():
+                owners[current] = int(rest)
+            elif current is None and word == "ref_missing":
+                ref_missing = rest
+            elif current is None and word == "uid" and rest.isdigit():
+                uid = int(rest)
+            elif current is None and word == "count" and rest.isdigit():
+                count = int(rest)
+            elif current is None and word == "begin":
+                current, diffs[rest] = rest, []
+            elif (
+                current is not None
+                and word == "end"
+                and rest.startswith(current + " ")
+                and rest[len(current) + 1 :] in _PLUGIN_STATES
+            ):
+                plugins[current] = rest[len(current) + 1 :]
+                current = None
+            elif line != "done" or current is not None:
+                unexpected.append(line)
+        raw.update(plugins=plugins, owners=owners, diffs=diffs, uid=uid, count=count)
+        if unexpected:
+            return (
+                "error",
+                f"the plugin script in {where} printed lines it does not print: "
+                f"{'; '.join(unexpected)[:_REASON_TAIL_CHARS]}",
+                raw,
+            )
+        if ref_missing:
+            return "error", f"the image in {where} has no plugins directory at {ref_missing}.", raw
+        if uid is None:
+            return "error", f"the plugin script in {where} did not report the user it ran as.", raw
+        if count is None:
+            return (
+                "error",
+                f"the plugin script in {where} did not report its count of the image's plugin "
+                f"directories: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                raw,
+            )
+        if count < 1 or count != len(plugins):
+            return (
+                "error",
+                f"the plugin script in {where} read {len(plugins)} plugin directories against a "
+                f"count of {count}: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                raw,
+            )
+
+        # A `differ` unit whose every diff line is an entry only the copy has is
+        # a copy with extras, not a stale one: `diff -rq` prints "Only in
+        # <dir>: <name>" for such an entry, and <dir> is the copy's own path or
+        # one beneath it. A line about the image side ("Only in <image dir>")
+        # or about content ("Files ... differ") keeps the unit a difference.
+        extras: list[str] = []
+        for path, state in list(plugins.items()):
+            if state != "differ":
+                continue
+            only_in_copy = [
+                line for line in diffs[path]
+                if line.startswith(_DIFF_ONLY_IN_PREFIX + path)
+                and line[len(_DIFF_ONLY_IN_PREFIX) + len(path) :][:1] in (":", "/")
+            ]
+            if diffs[path] and len(only_in_copy) == len(diffs[path]):
+                extras.extend(only_in_copy)
+                plugins[path] = "same"
+                diffs[path] = []
+        raw["extra"] = extras
+
+        def detail(path: str) -> str:
+            shown = diffs[path][:_MAX_DIFF_LINES]
+            more = len(diffs[path]) - len(shown)
+            return "; ".join(shown) + (f"; and {more} more" if more > 0 else "")
+
+        wrong = []
+        for path, state in plugins.items():
+            if state == "differ":
+                wrong.append(f"{path} differs from the image: {detail(path)}")
+            elif state == "missing":
+                wrong.append(f"{path} is missing")
+            elif state == "symlink":
+                wrong.append(f"{path} has been replaced by a symlink")
+            elif path in owners and owners[path] != uid:
+                wrong.append(f"{path} is owned by uid {owners[path]}, not the agent's {uid}")
+        if wrong:
+            return "fail", "; ".join(wrong) + ".", raw
+        broken = [f"{p}: {detail(p) or s}" for p, s in plugins.items() if s not in ("same", "present")]
+        broken += [f"{p}: owner unread" for p in plugins if p not in owners]
+        if broken:
+            return "error", f"diff could not compare every plugin in {where}: {'; '.join(broken)}.", raw
+        beside = f" ({len(extras)} {'entry' if len(extras) == 1 else 'entries'} beside them that the image does not ship, reported in raw)" if extras else ""
+        return (
+            "pass",
+            f"all {count} plugin directories the image ships are on the volume in {where}, "
+            f"owned by the agent and matching the image{beside}.",
+            raw,
+        )
+
 
 # findings_queue.py: STATES, every state a row can be in.
 FindingState = Literal["queued", "surfaced", "snoozed", "accepted", "dismissed", "resolved", "stale"]
@@ -9272,7 +9627,7 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
+def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool = False) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
@@ -9280,7 +9635,9 @@ def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
     it has one (absent stays absent), each further top-level
     key named in ``keys`` (a ``required_envelope`` key; absent reads ``null``),
     and the ids of the findings in its ``document`` (this run's own, never ids it
-    only carried), or the ``error`` that kept it unread. The rest stays in the pod.
+    only carried), or the ``error`` that kept it unread. With ``excerpts``, also
+    each finding's ``evidence.excerpt`` as ``finding_excerpts`` (id -> excerpt),
+    which ``finish`` takes from the collector. The rest stays in the pod.
     """
     wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
@@ -9295,6 +9652,11 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
             entry[{_ENVELOPE_STARTED_KEY!r}] = envelope[{_ENVELOPE_STARTED_KEY!r}]
         findings = (envelope.get("document") or {{}}).get("findings") or []
         entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
+        if {excerpts!r}:
+            entry["finding_excerpts"] = {{
+                str(f.get("id", "")): str((f.get("evidence") or {{}}).get("excerpt") or "")
+                for f in findings if isinstance(f, dict)
+            }}
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
@@ -9321,10 +9683,10 @@ def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float)
 
 
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = ()
+    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = (), excerpts: bool = False
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit, keys), timeout)
+    reply = shell(report_store_command(audit, keys, excerpts), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -9356,7 +9718,11 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     and fails), has, for each ``required_finding_phrases`` entry, a finding
     in its ``document`` whose id contains it, and has no finding whose id
     contains a ``forbidden_finding_phrases`` entry (the silent half of a case
-    that plants a look-alike the check must leave alone). ``current_ids`` is not read: it
+    that plants a look-alike the check must leave alone), and, for each
+    ``required_evidence_phrases`` entry, a finding whose id contains a
+    ``required_finding_phrases`` entry and whose ``evidence.excerpt`` contains
+    it: what the collector observed and ``finish`` published, read where it was
+    stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
     also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
@@ -9369,6 +9735,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
     forbidden_finding_phrases: list[str] = Field(default_factory=list)
+    required_evidence_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
     # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
@@ -9379,6 +9746,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @model_validator(mode="after")
+    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
+        if self.required_evidence_phrases and not self.required_finding_phrases:
+            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
+        return self
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         snap = transcript.get()
@@ -9398,7 +9771,9 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         envelopes: list[dict[str, Any]] = []
         read_any = False
         for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(shell, self.audit, read_timeout, tuple(self.required_envelope))
+            listing = read_report_store(
+                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
+            )
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
@@ -9454,6 +9829,9 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
             present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
+            excerpts = envelope.get("finding_excerpts") or {}
+            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
+            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
             wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
@@ -9466,6 +9844,8 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
             elif present:
                 failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
+            elif unevidenced:
+                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw

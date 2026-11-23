@@ -2274,9 +2274,11 @@ class GitopsSeededFileStateTest(unittest.TestCase):
                 self.assertEqual(data.decode(), checker.GITOPS_SEEDED_FILES[path] + "\n")
                 hashed = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True)
                 self.assertEqual(hashed.stdout.decode().strip(), checker.gitops_seeded_blob_sha(path))
-        # The six-item note, as the forty repositories carry it since the
-        # 2026-11-13 repair (blob cd9d2500 in the issue's record).
-        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("cd9d2500"))
+        # The eight-item note (the compute snapshot item made seven on 2026-11-19,
+        # the networking peering item eight); the repositories carry the seven-item
+        # blob 3d3a1388, or the six-item cd9d2500, until the pre-merge re-seed
+        # replaces it with this one.
+        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("b53da76d"))
         with self.assertRaises(KeyError):
             checker.gitops_seeded_bytes("knowledge/other.md")
 
@@ -3726,6 +3728,66 @@ class LedgerTokenMintTest(unittest.TestCase):
 class LedgerReadCredentialTest(unittest.TestCase):
     """The grading credential, which is not the minter App and not the operator's own login."""
 
+    def test_reads_through_the_projects_own_shard(self):
+        """#6240: the key, the mint and the 404's advice are the shard's the
+        project's number maps to, not shard 0's. A repository ticked into
+        another shard's App is exactly the 404 the lease would hit."""
+        readers = tuple(checker.LedgerReader(1000 + k, 5000 + k, f"secret-{k}") for k in range(3))
+        read = mock.Mock(return_value=("PEM", ""))
+        minted = mock.Mock(return_value=("ghs_fake", "ok", ""))
+
+        def not_found(*a, **kw):
+            raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+
+        with mock.patch.object(checker, "LEDGER_READERS", readers), \
+             mock.patch.object(checker, "_read_ledger_app_key", read), \
+             mock.patch.object(checker, "_mint_ledger_token", minted), \
+             mock.patch.object(checker.urllib.request, "urlopen", not_found):
+            result = checker.check_ledger_read_credential("kube-agents-evals-25")
+        self.assertEqual("secret-2", read.call_args.kwargs["key_holder"])
+        self.assertEqual(readers[2], minted.call_args.kwargs["reader"])
+        self.assertFalse(result.passed)
+        detail = " ".join(result.details)
+        self.assertIn("App 1002 (reader App 3 of 3, by the project's number) cannot see gke-agentic/kube-agents-evals-25-infra", detail)
+        self.assertIn("installation 5002", detail)
+        self.assertIn("keep it on reader App 1's installation as well", detail)
+
+    def test_a_project_past_the_tables_last_row_keeps_its_warning_when_the_check_is_not_checked(self):
+        """An operator without the build cluster's kubectl still has to be
+        told the App to register: the rollout warning rides on the
+        "Not checked" result beside the unread reason."""
+        readers = tuple(checker.LedgerReader(1000 + k, 5000 + k, f"secret-{k}") for k in range(3))
+        with mock.patch.object(checker, "LEDGER_READERS", readers), \
+             mock.patch.object(checker, "_read_ledger_app_key", return_value=(None, "kubectl is not on PATH")):
+            result = checker.check_ledger_read_credential("kube-agents-evals-31")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        warning = " ".join(str(w) for w in result.warnings)
+        self.assertIn("kube-agents-evals-31 is on reader App 4", warning)
+        self.assertIn("Register App 4", warning)
+        self.assertIn("kubectl is not on PATH", warning)
+
+    def test_a_project_past_the_tables_last_row_is_checked_through_the_first_app_with_a_warning(self):
+        """The rollout state: hack/ci-eval-pr.sh reads such a project through
+        the first App, so that is what is attested, and the warning names the
+        App still to register."""
+        readers = tuple(checker.LedgerReader(1000 + k, 5000 + k, f"secret-{k}") for k in range(3))
+        read = mock.Mock(return_value=("PEM", ""))
+        minted = mock.Mock(return_value=("ghs_fake", "ok", ""))
+        with mock.patch.object(checker, "LEDGER_READERS", readers), \
+             mock.patch.object(checker, "_read_ledger_app_key", read), \
+             mock.patch.object(checker, "_mint_ledger_token", minted), \
+             mock.patch.object(checker.urllib.request, "urlopen", lambda *a, **kw: _Response([])):
+            result = checker.check_ledger_read_credential("kube-agents-evals-31")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual("secret-0", read.call_args.kwargs["key_holder"])
+        self.assertEqual(readers[0], minted.call_args.kwargs["reader"])
+        self.assertIn("App 1000 (reader App 1 of 3, by the project's number) can read", result.message)
+        warning = " ".join(str(w) for w in result.warnings)
+        self.assertIn("kube-agents-evals-31 is on reader App 4", warning)
+        self.assertIn("has 3 row(s)", warning)
+        self.assertIn("Register App 4", warning)
+
     def _check(self, urlopen, pem=_FAKE_PEM, key_reason="kubectl is not on PATH",
                mint=("ghs_fake", "ok", ""), project="kube-agents-evals-7"):
         with mock.patch.object(checker, "_read_ledger_app_key",
@@ -3860,16 +3922,125 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         self.assertIsNotNone(m, f"could not find {name} in hack/ledger_token_mint.py")
         return m.group(1)
 
-    def _default(self, name):
-        m = re.search(rf'^export {name}="\$\{{{name}:-([^}}]+)\}}"', self.script, re.M)
-        self.assertIsNotNone(m, f"could not find the {name} default in hack/ci-eval-pr.sh")
-        return m.group(1)
+    def _table(self):
+        """hack/eval/ledger-reader-apps.txt parsed here, apart from the verifier's own parse."""
+        rows = []
+        for line in (checker._ROOT / "hack" / "eval" / "ledger-reader-apps.txt").read_text(encoding="utf-8").splitlines():
+            fields = line.split("#", 1)[0].split()
+            if fields:
+                rows.append(tuple(fields))
+        return rows
 
-    def test_the_app_and_installation_match_the_script(self):
-        self.assertEqual(str(checker.LEDGER_APP_ID), self._default("EVAL_LEDGER_APP_ID"))
+    def test_the_apps_are_the_scripts_table(self):
+        """Both read hack/eval/ledger-reader-apps.txt (#6240): the script names
+        the file in EVAL_LEDGER_READER_APPS_FILE and the verifier parses the
+        same rows, shard 0 first. Shard 0 is the App of before the split,
+        pinned as a literal so the table cannot drift under both at once."""
+        m = re.search(r'^readonly EVAL_LEDGER_READER_APPS_FILE="([^"]+)"$', self.script, re.M)
+        self.assertIsNotNone(m, "could not find EVAL_LEDGER_READER_APPS_FILE in hack/ci-eval-pr.sh")
         self.assertEqual(
-            str(checker.LEDGER_INSTALLATION_ID), self._default("EVAL_LEDGER_INSTALLATION_ID")
+            (checker._ROOT / "hack" / m.group(1)).resolve(), checker._LEDGER_READER_APPS_FILE.resolve()
         )
+        self.assertEqual(
+            [(str(r.app_id), str(r.installation_id), r.key_holder) for r in checker.LEDGER_READERS],
+            self._table(),
+        )
+        self.assertEqual(("4739812", "157029058", "kube-agents-evals-ledger-app-key"), self._table()[0])
+        self.assertEqual(checker.LEDGER_READERS[0].app_id, checker.LEDGER_APP_ID)
+        self.assertEqual(checker.LEDGER_READERS[0].installation_id, checker.LEDGER_INSTALLATION_ID)
+        self.assertEqual(checker.LEDGER_READERS[0].key_holder, checker.LEDGER_KEY_SECRET)
+        for row in self._table():
+            self.assertEqual(3, len(row), row)
+            self.assertTrue(row[0].isdigit() and row[1].isdigit(), row)
+
+    def test_a_malformed_row_names_its_line(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as table:
+            table.write("# ok\n4739812 157029058 kube-agents-evals-ledger-app-key\n1 2\n")
+        self.addCleanup(os.unlink, table.name)
+        with self.assertRaises(ValueError) as caught:
+            checker._parse_ledger_readers(Path(table.name))
+        self.assertIn(":3: expected `<App id> <installation id> <Secret holding its key>`", str(caught.exception))
+
+    def test_every_pool_project_in_the_mapping_has_a_row(self):
+        """The ten-per-App discipline, enforced where it is cheap: a project
+        mapped in hack/ci-deploy.sh whose shard has no row would be read
+        through the first App with a warning on every lease. Register the
+        App and append its row in the pull request that maps the project."""
+        mapping = re.findall(r'^\s*(kube-agents-evals(?:-\d+)?)\) echo "gke-agentic/', (checker._ROOT / "hack" / "ci-deploy.sh").read_text(encoding="utf-8"), re.M)
+        self.assertGreaterEqual(len(mapping), 50, "the GitHub mapping in hack/ci-deploy.sh was not found")
+        missing = sorted({project for project in mapping if checker.ledger_reader_for(project)[1] is None}, key=checker.pool_project_number)
+        self.assertEqual([], missing, f"these projects' shards have no row in hack/eval/ledger-reader-apps.txt: {missing}")
+
+    def test_the_shard_size_is_the_scripts(self):
+        """Ten projects per App, written in three files: the size here, in
+        hack/ci-eval-pr.sh and in scripts/provision_ci_pool_project.sh, held
+        equal and pinned as the literal the pool was split by."""
+        script = re.search(r"^readonly LEDGER_READER_SHARD_SIZE=(\d+)$", self.script, re.M)
+        self.assertIsNotNone(script, "could not find LEDGER_READER_SHARD_SIZE in hack/ci-eval-pr.sh")
+        provisioner = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text(encoding="utf-8")
+        provision = re.search(r"^LEDGER_READER_SHARD_SIZE=(\d+)$", provisioner, re.M)
+        self.assertIsNotNone(provision, "could not find LEDGER_READER_SHARD_SIZE in scripts/provision_ci_pool_project.sh")
+        self.assertEqual(10, checker.LEDGER_READER_SHARD_SIZE)
+        self.assertEqual(checker.LEDGER_READER_SHARD_SIZE, int(script.group(1)))
+        self.assertEqual(checker.LEDGER_READER_SHARD_SIZE, int(provision.group(1)))
+
+    def test_the_shard_rule_is_the_scripts(self):
+        """ledger_reader_shard in hack/ci-eval-pr.sh, ledger_reader_for_project
+        in scripts/provision_ci_pool_project.sh and ledger_reader_for here send
+        a project to the same shard, or the verifier passes a repository the
+        lease will 404 on. Ten per App in number order: the bare project is
+        1, the boundaries at 10/11 and 20/21 are the cases, and a project
+        past the table's last row has no App."""
+        shard_fn = re.search(r"^ledger_reader_shard\(\) \{.*?^\}", self.script, re.S | re.M)
+        self.assertIsNotNone(shard_fn, "could not find ledger_reader_shard in hack/ci-eval-pr.sh")
+        # The provisioner's own copy (it names the App a new project's
+        # repository goes to) is held to the same answers over a three-row
+        # table of its own.
+        provisioner = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text(encoding="utf-8")
+        provision_fn = re.search(r"^ledger_reader_for_project\(\) \{.*?^\}", provisioner, re.S | re.M)
+        self.assertIsNotNone(provision_fn, "could not find ledger_reader_for_project in scripts/provision_ci_pool_project.sh")
+        table = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        self.addCleanup(os.unlink, table.name)
+        table.write("# three shards\n1000 5000 secret-0\n\n1001 5001 secret-1  # one\n1002 5002 secret-2\n")
+        table.close()
+        readers = tuple(checker.LedgerReader(1000 + k, 5000 + k, f"secret-{k}") for k in range(3))
+        size = f"LEDGER_READER_SHARD_SIZE={checker.LEDGER_READER_SHARD_SIZE}\n"
+        for project, expected in (
+            ("kube-agents-evals", 0),
+            ("kube-agents-evals-0", 0),
+            ("kube-agents-evals-2", 0),
+            ("kube-agents-evals-10", 0),
+            ("kube-agents-evals-11", 1),
+            ("kube-agents-evals-20", 1),
+            ("kube-agents-evals-21", 2),
+            ("kube-agents-evals-30", 2),
+            ("kube-agents-evals-31", 3),
+        ):
+            with self.subTest(project=project):
+                with mock.patch.object(checker, "LEDGER_READERS", readers):
+                    shard, reader = checker.ledger_reader_for(project)
+                self.assertEqual(expected, shard)
+                self.assertEqual(readers[expected] if expected < 3 else None, reader)
+                shell = subprocess.run(
+                    ["bash", "-c", size + shard_fn.group(0) + f'\nledger_reader_shard "{project}"'],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(0, shell.returncode, shell.stderr)
+                self.assertEqual(expected, int(shell.stdout.strip()))
+                provision = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + f'LEDGER_READER_APPS_FILE="{table.name}"\n' + size + provision_fn.group(0)
+                     + f'\nledger_reader_for_project "{project}"\necho "${{LEDGER_SHARD}} ${{LEDGER_SHARD_COUNT}} ${{LEDGER_APP_ID}} ${{LEDGER_INSTALLATION_ID}}"'],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(0, provision.returncode, provision.stderr)
+                if expected < 3:
+                    self.assertEqual(f"{expected} 3 {1000 + expected} {5000 + expected}", provision.stdout.strip())
+                    self.assertNotIn("WARNING", provision.stderr)
+                else:
+                    # Past the table: the provisioner names the first App and warns.
+                    self.assertEqual("0 3 1000 5000", provision.stdout.strip())
+                    self.assertIn(f"WARNING: {project} is on reader App 4", provision.stderr)
+                    self.assertIn("has 3 row(s)", provision.stderr)
 
     def test_the_app_and_installation_match_the_mint_modules_defaults(self):
         self.assertEqual(str(checker.LEDGER_APP_ID), self._module_default("DEFAULT_LEDGER_APP_ID"))

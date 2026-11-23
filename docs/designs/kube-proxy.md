@@ -20,7 +20,9 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 | Core HTTP handler and L7 policy          | [`k8s-api-proxy/pkg/k8sapiproxy/`](../../k8s-api-proxy/pkg/k8sapiproxy/)                                                             |
 | Pluggable upstream transport interface   | [`k8s-api-proxy/pkg/k8sapiproxy/transport.go`](../../k8s-api-proxy/pkg/k8sapiproxy/transport.go)                                     |
 | Caller authentication (TokenReview)      | [`k8s-api-proxy/pkg/tokenreview/`](../../k8s-api-proxy/pkg/tokenreview/)                                                             |
+| Caller authentication (signed JWT)       | [`k8s-api-proxy/pkg/jwtauth/`](../../k8s-api-proxy/pkg/jwtauth/)                                                                     |
 | GKE HTTPS upstream transport             | [`k8s-api-proxy/pkg/upstream/`](../../k8s-api-proxy/pkg/upstream/)                                                                   |
+| Rotated TLS certificate and CA reload    | [`k8s-api-proxy/pkg/certreload/`](../../k8s-api-proxy/pkg/certreload/)                                                               |
 | Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
 | Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
 | Sandbox `kubectl` and `kubeconfig` setup | [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile), [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh) |
@@ -126,7 +128,7 @@ k8s-api-proxy/
 ├── go.sum
 ├── cmd/
 │   └── k8s-api-proxy/
-│       ├── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream
+│       ├── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream + pkg/certreload
 │       └── tokens.go             # Workload Identity Federation and Application Default Credentials token source
 └── pkg/
     ├── k8sapiproxy/
@@ -141,6 +143,10 @@ k8s-api-proxy/
     │   └── transport.go          # CallerAuthenticator and UpstreamTransport interfaces, ErrAuthenticationUnavailable
     ├── tokenreview/
     │   └── tokenreview.go        # TokenReview CallerAuthenticator with TTL cache (the binary's)
+    ├── certreload/
+    │   └── certreload.go         # Server certificate and CA bundle PEM files reloaded when rotated on disk
+    ├── jwtauth/
+    │   └── jwtauth.go            # Signed-JWT CallerAuthenticator against an issuer's JSON Web Key Set
     └── upstream/
         ├── upstream.go           # GKE HTTPS UpstreamTransport for in-cluster and fleet GKE clusters
         └── gke.go                # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com
@@ -278,7 +284,7 @@ contexts:
       user: kube-proxy-caller
 ```
 
-(`client-go` sends `tokenFile` bearer tokens only over `https://` connections. The operator generates an ECDSA CA and server certificate in the `<agent>-kube-proxy-tls` Secret, mounts `tls.crt` and `tls.key` into `<agent>-kube-proxy`, mounts `ca.crt` read-only into `<agent>-shell`, and publishes `ca.crt` in the `<agent>-kube-proxy-ca-bundle` ConfigMap, which session pods mount under `mode: next` when `A2A_SESSION_CLUSTER_VIEW=true`.)
+(`client-go` sends `tokenFile` bearer tokens only over `https://` connections. The operator generates an ECDSA CA and server certificate in the `<agent>-kube-proxy-tls` Secret, mounts `tls.crt` and `tls.key` into `<agent>-kube-proxy`, mounts `ca.crt` read-only into `<agent>-shell`, and publishes `ca.crt` in the `<agent>-kube-proxy-ca-bundle` ConfigMap, which session pods mount when `A2A_SESSION_CLUSTER_VIEW=true`.)
 
 How multi-cluster context switching works:
 
@@ -302,6 +308,7 @@ The token mounted at `/var/run/secrets/kubeagents/credential-proxy/token` is a s
 Because `Config.Authenticator` is an interface (`CallerAuthenticator`), deployments can choose the caller authentication mechanism that matches their sandbox boundary:
 
 - **Projected `ServiceAccount` JWT (`TokenReview`)**: Default for multi-pod Kubernetes sandboxes (`kube-agents`).
+- **Signed JWT from the sandbox platform (`pkg/jwtauth`)**: The platform mints a per-sandbox token (for example an agent runtime's actor token, injected at its egress gateway); the proxy verifies it against the issuer's key set, issuer, audience and expiry, with no call back to the issuer per request.
 - **Workload mTLS (`client-certificate` / `client-key` or SPIFFE X.509 SVID)**: The sandbox authenticates to `kube-proxy` with a client TLS certificate without reading a bearer token file.
 - **Host-local network isolation (`veth` pair or Unix domain socket)**: When `kube-proxy` runs on the host or hypervisor boundary for a single local sandbox (such as a local VM or NVIDIA OpenShell supervisor), binding `kube-proxy` to the dedicated host-side interface or socket authenticates the caller by transport endpoint (`StaticAuthenticator`).
 
@@ -320,8 +327,8 @@ Every request is classified as either a **resource request** (`info.IsResourceRe
 **Dry-run query enforcement**:
 When `Mode == ModeReadOnlyWithDryRun` and `info.Verb` is `create`, `update`, or `patch`:
 
-- The proxy checks `req.URL.Query()["dryRun"]`.
-- It admits the request only if `len(values) == 1 && values[0] == "All"`, and it explicitly sets `q.Set("dryRun", "All")` on the outbound query string so no duplicate parameter can override it.
+- The proxy parses the raw query with `url.ParseQuery` (`HasStrictDryRunAll`) and refuses a query that does not parse or that contains `;`.
+- It admits the request only when `dryRun` has exactly one value and that value is `All`. It does not rewrite the outbound query: the query that passed the check is the query that `kube-apiserver` receives.
 
 **Native Kubernetes refusal responses**:
 When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body:
@@ -364,7 +371,7 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 - `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*`
 - `Connection` and `Upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled and `Upgrade` is non-empty, in which case `Connection: Upgrade` is set)
 
-It also appends `kproxy/<caller-username>` to the outbound `User-Agent` header so `kube-apiserver` audit logs record the originating sandbox identity alongside `kubectl`'s own `User-Agent`.
+Today the proxy does not change `User-Agent`: the header reaches `kube-apiserver` as the caller sent it, with no `kproxy/<caller-username>` suffix. The target cluster's audit log therefore shows the proxy's upstream identity and `kubectl`'s own `User-Agent`, and does not name the sandbox caller. The record of the caller is the proxy's own audit record (`caller_username`, `caller_uid`, `caller_groups`; see section 10). A request that the proxy forwarded is matched to the cluster's audit log by its `cluster`, its time (the record is written when the request ends, and `duration_ms` gives the start) and its request fields (`verb`, `api_group`, `resource`, `namespace`, `name`). A record whose `cache` is `hit` or `coalesced` has no entry of its own in the cluster's audit log. The two logs share no request ID.
 
 For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering.
 
@@ -388,7 +395,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - A coalesced fetch, including the leader's streamed body of a response over `MaxEntryBytes`, is bounded by a 60-second upstream deadline independent of any one caller.
    - Responses set `Cache-Status` (`k8s-api-proxy; hit`, `k8s-api-proxy; hit; coalesced`, `k8s-api-proxy; miss`, or `k8s-api-proxy; bypass`) and `Age`. A hit or a coalesced response carries no `Audit-Id`, because the API server's ID names the request that filled the entry.
 5. **Write and auth-failure scope invalidation**:
-   - Non-dry-run mutating requests (`create`, `update`, `patch`, `delete`, `deletecollection`) that return `2xx` or `401`/`403`, and read requests that return `401`/`403`, invalidate cached entries for that cluster, API group and resource (every served version), and namespace (plus cluster-wide list entries).
+   - Non-dry-run mutating requests (`create`, `update`, `patch`, `delete`, `deletecollection`) that return `2xx` or `401`/`403`, and read requests that return `401`/`403`, invalidate cached entries for that cluster, API group and resource (every served version), and namespace (plus cluster-wide list entries). A `2xx` write invalidates them in every `Config.CallerPartition` partition; a `401` or `403` only in the caller's partition, whose credential's access changed.
    - A request arriving after an invalidation never joins a fetch that started before it, and such a fetch does not keep its result: it skips the store, or evicts what it stored if the invalidation landed while it was storing.
    - Invalidation is per replica: the scope index lives in the process, and `CacheStore` has no prefix delete. A shared `CacheStore` across replicas keeps entries another replica stored after a write it did not see, so resource TTLs above `0s` stay correct only with `sessionAffinity` routing a caller to one replica.
 
@@ -402,7 +409,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - Validates `<project>`, `<location>`, and `<cluster>` against `^[a-z0-9][a-z0-9-]*\z`.
    - Calls `GET https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}` using the proxy pod's `GCPTokenSource` (Workload Identity Federation via `CREDENTIAL_PROXY_WIF_AUDIENCE`, `CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT`, and `CREDENTIAL_PROXY_WIF_TOKEN_FILE`, or the GCE metadata server).
    - Dials `https://<endpoint>` verified against the cluster's `masterAuth.clusterCaCertificate` root CA.
-   - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 5-minute TTL and automatic invalidation on connection failure.
+   - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 10-minute TTL and automatic invalidation on connection failure.
    - Injects `Authorization: Bearer <gcp-access-token>` on every upstream request and refuses `3xx` upstream redirects (`502 Bad Gateway`) so the bearer token is never followed to a redirect target.
    - When `spec.security.scopedServiceAccountPool.enabled` (`CREDENTIAL_PROXY_SCOPED_SA_POOL=1`) is armed, `kube-proxy` loads `/etc/credential-proxy/scoped-sa-pool.json`, constructs a per-project `upstream.Transport` that exchanges the base credential for that project's scoped service account token via `iamcredentials.googleapis.com`, and refuses any cluster whose project has no entry in the pool without falling back to the ambient credential.
 
@@ -421,13 +428,14 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - `kubeagents_kube_proxy_cache_entries`: Gauge of the current number of serialized responses stored in the `kube-proxy` cache.
    - `kubeagents_kube_proxy_request_duration_seconds` (`verb`, `resource`, `outcome`): Histogram of request durations in seconds.
    - `kubeagents_kube_proxy_in_flight_requests`: Gauge of requests currently in flight.
+   - `kubeagents_kube_proxy_certificate_reload_failures_total`: Total changed TLS server certificate or key files that could not be loaded, each time keeping the previous certificate.
    - `process_start_time_seconds`: Gauge of the process start timestamp since the Unix epoch in seconds.
 2. **OpenTelemetry distributed tracing**:
    - The operator injects `OTEL_SERVICE_NAME=<agent>-kube-proxy`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and `OTEL_RESOURCE_ATTRIBUTES` (or `OTEL_SDK_DISABLED=true` when the cluster has no collector).
    - For every Kubernetes API request, `kube-proxy` extracts incoming W3C `traceparent`/`tracestate` headers before header sanitization, starts a server span (`k8s.api.proxy <verb> <resource>`), records structured attributes (`k8s.cluster.id`, `k8s.verb`, `k8s.resource`, `k8s.subresource`, `k8s.namespace`, `k8s.dry_run`, `kube_proxy.mode`, `kube_proxy.outcome`, `kube_proxy.rejection_reason`, `kube_proxy.secret_redacted`, `http.response.status_code`), and wraps the upstream round trip in a child client span (`k8s.api.upstream`).
 3. **Pluggable audit sink and structured JSON audit logging (`pkg/k8sapiproxy/audit.go`)**:
    - `pkg/k8sapiproxy` defines the `AuditSink` interface (`Record(ctx context.Context, event AuditEvent)`), `AuditSinkFunc`, and `NewSlogAuditSink(logger)` so OSS deployments and hosted services can route typed `AuditEvent` records to different backends.
-   - By default (`NewSlogAuditSink(logger)`), `kube-proxy` emits a structured audit record (`msg: "k8s-api-proxy audit"`) via `log/slog` for every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes) with `outcome`, `cluster_id`, `caller`, `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `reason`, `status_code`, `duration`, `user_agent`, `err`, and `cache` (the response cache's result when it handled the request; `hit` and `coalesced` never reached the cluster).
+   - By default (`NewSlogAuditSink(logger)`), `kube-proxy` emits a structured audit record (`msg: "k8s-api-proxy request"`) via `log/slog` for every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes) with `outcome`, `cluster`, `caller_username` (with `caller_uid` and `caller_groups`), `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `rejection_reason`, `status_code`, `duration_ms`, `user_agent`, `error`, and `cache` (the response cache's result when it handled the request; `hit` and `coalesced` never reached the cluster).
    - Request and response bodies and authentication credentials are never written to the audit log.
 
 ### 11. Deployment topology in `kube-agents`
@@ -436,7 +444,7 @@ The operator reconciles a dedicated **`<agent>-kube-proxy` Deployment and Cluste
 
 - **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment of two replicas, rolled one at a time with no surge (`maxSurge: 0`, `maxUnavailable: 1`) and covered by a `maxUnavailable: 1` PodDisruptionBudget, with a 5-second `preStop` sleep so a terminating replica keeps listening until its endpoint removal propagates, and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` pod (plus session pods when `A2A_SESSION_CLUSTER_VIEW=true` under `mode: next`), and admits `gmp-system` on port `8444`.
 - **In-flight cap**: each replica forwards at most 24 requests at once (`--max-in-flight`, `KUBE_PROXY_MAX_IN_FLIGHT`; `0` turns the cap off) and answers the next with `429 Too Many Requests` and `Retry-After: 1`, which client-go, and so `kubectl`, waits out and retries up to 10 times; a caller that is not client-go sees the 429 unless it retries on its own. Every forwarded list holds upstream response buffers in the proxy, and with no cap concurrent lists drove a replica past its memory limit; 24 keeps one under 512Mi at the roughly 9.5 MiB that a 500-object page held in flight (a redacted Secret response can buffer up to 16 MiB, but Secret lists carry metadata only). Watches and the `log`, `exec`, `attach`, `portforward` and `proxy` subresources stay open as long as the caller follows them, so, as in kube-apiserver's own max-in-flight limit, they take no slot. A request the policy refuses is answered before the cap. A throttled request is audited and counted with outcome `throttled`.
-- **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, `<agent>-kube-proxy.<namespace>.svc`, and `<agent>-kube-proxy.<namespace>.svc.cluster.local`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and the operator publishes `ca.crt` in `<agent>-kube-proxy-ca-bundle` (mounted into session pods under `mode: next` when `A2A_SESSION_CLUSTER_VIEW=true`).
+- **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, `<agent>-kube-proxy.<namespace>.svc`, and `<agent>-kube-proxy.<namespace>.svc.cluster.local`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`; the proxy reloads them when the volume updates (`pkg/certreload`), and the operator also rolls the Deployment when the certificate's hash changes. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and the operator publishes `ca.crt` in `<agent>-kube-proxy-ca-bundle` (mounted into session pods under `mode: next` when `A2A_SESSION_CLUSTER_VIEW=true`).
 - **Upstream identity**: `<agent>-kube-proxy` runs as `agentServiceAccountName(agent)` in its own isolated pod, using the same Workload Identity / Workload Identity Federation configuration, `scopedServiceAccountPool` mapping (`<agent>-credential-proxy-policy`), and `kubeagents:tokenreview:<namespace>:<agent>` / host-cluster reader RBAC bindings as `<agent>-credential-proxy` while restricting network ingress to authorized callers on `:8443` and `gmp-system` on `:8444`.
 - **Clean split of responsibilities**: `<agent>-credential-proxy` continues serving `/v1/vcs/*`, `/v1/gcp/*`, and `gcloud` `/v1/exec` on port `8765` (plus `kubectl` `/v1/exec` for `AgentProfile` workers). `<agent>-shell` and A2A session pods (with `A2A_SESSION_CLUSTER_VIEW=true`) receive `KUBE_PROXY_URL=https://<agent>-kube-proxy.<namespace>.svc.cluster.local:8443` and route all `kubectl` operations through `<agent>-kube-proxy`. The gateway's agent container gets the same URL as `KUBE_PROXY_IN_USE_URL`, a sign only: it runs no `kubectl` through the proxy, and its scripts read the variable to skip choosing `get-credentials` endpoint flags the sandbox would not use.
 

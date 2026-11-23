@@ -351,14 +351,6 @@ func TestBuildHandlerRejectsConflictingOrInvalidFlags(t *testing.T) {
 			wantMsg: "--upstream-url cannot be combined with --scope-file or --exclude-host-cluster-id",
 		},
 		{
-			name: "tls-cert-file without tls-key-file",
-			mutate: func(c *proxyConfig) {
-				c.tlsCertFile = "/etc/tls.crt"
-				c.tlsKeyFile = ""
-			},
-			wantMsg: "--tls-key-file is required when --tls-cert-file is set",
-		},
-		{
 			name:    "invalid upstream-url",
 			mutate:  func(c *proxyConfig) { c.upstreamURL = "ftp://127.0.0.1:21" },
 			wantMsg: "static upstream transport",

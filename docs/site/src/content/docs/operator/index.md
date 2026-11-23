@@ -29,8 +29,8 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
 - **`AgentProfile`** — declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
-- **`Tier`** — names what a task may do at a tier. The operator renders every `Tier` into the tiers file the capability verifier, the gateway and the auth callout load, and an `AgentProfile` lists the tiers it runs at in `allowedTiers`; people aren't mapped to tiers yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
-- **`AgentSchedule`** — runs a prompt on an `AgentProfile` on a cron schedule, each run an `Unattended` task. Off by default, and nothing fires yet. See [AgentSchedule CRD](/kube-agents/operator/agentschedule-crd/).
+- **`Tier`** — names what a task may do at a tier. The operator renders every `Tier` into the tiers file the capability verifier, the gateway and the auth callout load, and an `AgentProfile` lists the tiers it runs at in `allowedTiers`; the PlatformAgent's `spec.tiers.membership` maps people to them. See [Tier CRD](/kube-agents/operator/tier-crd/).
+- **`AgentSchedule`** — runs a prompt, or a built-in schedule's helper script, on an `AgentProfile` on a cron schedule, each run an `Unattended` task. Off by default, and nothing fires yet. See [AgentSchedule CRD](/kube-agents/operator/agentschedule-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
@@ -206,6 +206,50 @@ triggers no reconcile, so the condition follows the next reconcile after the pro
 five minutes while the condition stands and the reconcile completes, or, while the reconcile itself
 is failing on the missing verb, on controller-runtime's retry backoff, which caps at about seventeen
 minutes.
+
+## Manager cache and memory sizing
+
+Every informer the manager starts is cluster-wide (`PlatformAgent` is namespaced, and the RBAC prune and foreign-`ServiceAccount` checks have to see unlabelled objects in the cluster). Pods, Secrets and the A2A bookkeeping objects are read live without informers, and `Coordination/v1` `Lease` watches are filtered by the A2A gateway label. The manager caches the twelve cluster-scaling resource kinds below across all namespaces, stripping `metadata.managedFields` on ingest and keeping `kubectl.kubernetes.io/last-applied-configuration` so cached `Update` calls do not strip that annotation from live objects.
+
+The chart's default memory limit for the manager is `512Mi` (and the chart refuses a lower limit). At startup the manager sets its Go soft memory limit (`GOMEMLIMIT`) to nine tenths of `OPERATOR_MEMORY_LIMIT_BYTES` (`460.8 MiB` at `512Mi`). On GKE Autopilot without Pod bursting, the cluster clamps a container's limit to its request (`256Mi` by default), so an Autopilot install on a large host cluster must raise `operator.resources.requests.memory` alongside `limits.memory`.
+
+| Cached kind              | Raw live heap per 1,000 objects | Cached live heap per 1,000 objects (`managedFields` stripped) | Without `last-applied-configuration` per 1,000 objects | `managedFields` saved | `last-applied-configuration` share of cached heap |
+| ------------------------ | ------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------ | --------------------- | ------------------------------------------------- |
+| `Deployment`             | 11.2 MiB                        | 8.5 MiB                                                       | 6.2 MiB                                                | 23.8%                 | 27.3%                                             |
+| `StatefulSet`            | 9.5 MiB                         | 7.9 MiB                                                       | 6.2 MiB                                                | 16.5%                 | 21.0%                                             |
+| `PersistentVolumeClaim`  | 4.6 MiB                         | 3.7 MiB                                                       | 3.0 MiB                                                | 19.2%                 | 19.0%                                             |
+| `NetworkPolicy`          | 3.9 MiB                         | 3.5 MiB                                                       | 2.4 MiB                                                | 9.9%                  | 30.9%                                             |
+| `ConfigMap` (~0.6 KiB)   | 3.6 MiB                         | 3.2 MiB                                                       | 1.9 MiB                                                | 11.2%                 | 41.9%                                             |
+| `Service`                | 3.7 MiB                         | 3.0 MiB                                                       | 1.9 MiB                                                | 18.5%                 | 36.2%                                             |
+| `ClusterRole`            | 3.4 MiB                         | 3.0 MiB                                                       | 2.0 MiB                                                | 10.8%                 | 34.3%                                             |
+| `Role`                   | 3.2 MiB                         | 2.9 MiB                                                       | 1.9 MiB                                                | 11.3%                 | 32.6%                                             |
+| `PodDisruptionBudget`    | 3.3 MiB                         | 2.4 MiB                                                       | 1.5 MiB                                                | 27.4%                 | 35.7%                                             |
+| `ClusterRoleBinding`     | 2.4 MiB                         | 2.0 MiB                                                       | 1.1 MiB                                                | 16.5%                 | 45.1%                                             |
+| `RoleBinding`            | 2.4 MiB                         | 2.0 MiB                                                       | 1.1 MiB                                                | 16.8%                 | 43.7%                                             |
+| `ServiceAccount`         | 2.2 MiB                         | 1.8 MiB                                                       | 1.3 MiB                                                | 18.4%                 | 24.1%                                             |
+| **Balanced 12-kind mix** | **4.5 MiB**                     | **3.7 MiB**                                                   | **2.6 MiB**                                            | **17.5%**             | **29.9%**                                         |
+
+`ConfigMap` cache cost grows linearly with payload size above the 0.6 KiB baseline in the table (and doubles when `kubectl.kubernetes.io/last-applied-configuration` mirrors the `data` map).
+
+To size `operator.resources.limits.memory` (and `requests.memory` on Autopilot), sum the host cluster's object counts across the twelve kinds using the cached column above:
+
+```text
+cache_live_heap_mib =
+  8.5 * (Deployments / 1000) +
+  7.9 * (StatefulSets / 1000) +
+  3.7 * (PersistentVolumeClaims / 1000) +
+  3.5 * (NetworkPolicies / 1000) +
+  3.2 * (ConfigMaps / 1000) +
+  3.0 * ((Services + ClusterRoles + Roles) / 1000) +
+  2.4 * (PodDisruptionBudgets / 1000) +
+  2.0 * ((ClusterRoleBindings + RoleBindings) / 1000) +
+  1.8 * (ServiceAccounts / 1000)
+```
+
+Reserve at least 2.5 times `cache_live_heap_mib` (plus 64 MiB for the base runtime, goroutine stacks and webhook TLS state) so initial list decoding and periodic relists stay below the 0.9 Go soft limit without GC thrashing or OOM kills:
+
+- **Raise above `512Mi` (`1Gi` request and limit, as in `examples/values-fleet.yaml`)** when `cache_live_heap_mib` exceeds **180 MiB**. That threshold is reached at roughly **50,000 watched objects** in a balanced cluster mix, or at roughly **20,000 `Deployment` and `StatefulSet` objects** (or 15,000 workloads alongside 20,000 `ConfigMap`, `Service` and RBAC objects).
+- **On GKE Autopilot without bursting**, the default `256Mi` request clamps the container limit to `256Mi` (`230.4 MiB` soft limit). Raise `operator.resources.requests.memory` to `512Mi` once `cache_live_heap_mib` exceeds **75 MiB** (roughly **20,000 watched objects** in a balanced mix, or **9,000 `Deployment` and `StatefulSet` objects**), and to `1Gi` past 50,000 watched objects. See [Fleet and host-cluster sizing](/kube-agents/deploy/fleet-sizing/).
 
 ## Related resources
 

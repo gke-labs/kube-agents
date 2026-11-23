@@ -8835,6 +8835,212 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
             WorkerRun(**bad)
 
 
+def test_shell_argvs_reads_a_substitution_mark_text_on_a_line_with_no_substitution():
+    """The reader marks a substitution inside the line with NUL, ``S``, an index, NUL. A line
+    that holds that text and no substitution raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00S0\x00") == [["echo", "\x00S0\x00"]]
+    # the same text in quotes, inside a word, behind an escape, and with an index that fits no list
+    assert _shell_argvs("echo '\x00S0\x00' \"\x00S1\x00\" a\x00S2\x00b") == [["echo", "\x00S0\x00", "\x00S1\x00", "a\x00S2\x00b"]]
+    assert _shell_argvs("echo \\\x00S0\x00") == [["echo", "\x00S0\x00"]]
+    assert _shell_argvs("echo \x00S9999999999999999999999\x00") == [["echo", "\x00S9999999999999999999999\x00"]]
+    # in a span that the line leaves open, and in the command line that a substitution or a shell runs
+    assert _shell_argvs("echo $(date \x00S0\x00") == [["echo", "$(date", "\x00S0\x00"]]
+    assert _shell_argvs("echo $(echo \x00S0\x00)") == [["echo", "$(echo \x00S0\x00)"], ["echo", "\x00S0\x00"]]
+    assert _shell_argvs("bash -c 'echo \x00S0\x00'")[-1] == ["echo", "\x00S0\x00"]
+
+
+def test_shell_argvs_reads_an_operator_mark_text_on_a_line_with_no_operator():
+    """The operator mark is NUL, ``O``, an index, NUL, as a word of its own. A line that holds
+    that word and no operator raised IndexError."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("echo \x00O0\x00 x") == [["echo", "\x00O0\x00", "x"]]
+    assert _shell_argvs("eval echo \x00O0\x00 x")[-1] == ["echo", "\x00O0\x00", "x"]
+    # a NUL character alone, and the text of the reader's own literal mark, stay as they are
+    assert _shell_argvs("echo \x00 \x00N\x00") == [["echo", "\x00", "\x00N\x00"]]
+
+
+def test_shell_argvs_reads_a_mark_text_with_a_valid_index_as_text():
+    """With a substitution or an operator on the line, the same text has an index that exists.
+    It read as that substitution or that operator, so the words were not the words of the line."""
+    from kube_agents_bench.shell_words import _ShellOperator, _shell_argvs, _shell_words_and_spans
+
+    # was: the second `$(date)` in the place of the text
+    assert _shell_argvs("echo $(date) \x00S0\x00") == [["echo", "$(date)", "\x00S0\x00"], ["date"]]
+    # was: a `;` in the place of the text, so `echo` and `x` were two commands
+    assert _shell_argvs("echo a; echo \x00O0\x00 x") == [["echo", "a"], ["echo", "\x00O0\x00", "x"]]
+    # was: a second `>` with no target, which is a line that the reader refuses
+    words, _ = _shell_words_and_spans("ls > out \x00O0\x00")
+    assert words == ["ls", ">", "out", "\x00O0\x00"]
+    assert [isinstance(word, _ShellOperator) for word in words] == [False, True, False, False]
+
+
+def test_shell_argvs_refuses_command_lines_nested_past_the_limit():
+    """The reader calls itself for each command line inside a line (after an `eval`, behind a
+    shell's `-c` flag, in a substitution). About 1,000 levels raised RecursionError, and a
+    verifier that read such a line ended with a traceback. The reader now raises its own error
+    at a limit, after 17 reads at most: the 17th level, or the budget of a long line (#6552)."""
+    from kube_agents_bench.shell_words import _MAX_COMMAND_LINE_NESTING, ShellReadLimitError, _shell_argvs
+
+    assert _MAX_COMMAND_LINE_NESTING == 16
+    depth = sys.getrecursionlimit() + 200
+    for line in (
+        "eval " * depth + "python3 f.py --readiness",
+        "echo " + "$(echo " * depth + "$(python3 f.py --readiness)" + ")" * depth,
+        "cat " + "<(cat " * depth + "f" + ")" * depth,
+        "bash -c '" + "eval " * depth + "x'",
+    ):
+        with pytest.raises(ShellReadLimitError, match="more than 16 levels|more reading than"):
+            _shell_argvs(line)
+
+
+def test_shell_argvs_reads_sixteen_levels_and_refuses_the_next_one():
+    from kube_agents_bench.shell_words import ShellReadLimitError, _shell_argvs
+
+    argvs = _shell_argvs("eval " * 16 + "python3 f.py --readiness")
+    assert len(argvs) == 17 and argvs[-1] == ["python3", "f.py", "--readiness"]
+    argvs = _shell_argvs("echo " + "$(echo " * 15 + "$(python3 f.py --readiness)" + ")" * 15)
+    assert argvs[-1] == ["python3", "f.py", "--readiness"]
+    with pytest.raises(ShellReadLimitError, match="more than 16 levels"):
+        _shell_argvs("eval " * 17 + "python3 f.py --readiness")
+    with pytest.raises(ShellReadLimitError, match="more than 16 levels"):
+        _shell_argvs("echo " + "$(echo " * 16 + "$(python3 f.py --readiness)" + ")" * 16)
+
+
+def test_shell_argvs_refuses_a_short_line_whose_reading_doubles_at_each_level():
+    """A substitution inside an `eval` word is read two times: as a span of the line and again in
+    the line that `eval` runs. Twenty such levels are a line of 166 characters, and the reader
+    worked on it for about half a minute and gave four million argvs. It now stops at a limit."""
+    from kube_agents_bench.shell_words import ShellReadLimitError, _shell_argvs
+
+    line = "eval " + "$(eval " * 20 + "x" + ")" * 20
+    assert len(line) == 166
+    with pytest.raises(ShellReadLimitError):
+        _shell_argvs(line)
+
+
+def test_shell_argvs_refuses_a_line_that_needs_more_reading_than_its_budget():
+    """Inside 16 levels the same doubling still multiplies the reading. The reader has a budget
+    of characters for one typed line (6 times its length and 65,536 more); each command line
+    that it reads costs its length and 16 more."""
+    from kube_agents_bench.shell_words import ShellReadLimitError, _shell_argvs
+
+    payload = "python3 f.py --readiness " + "x" * 2000
+    line = "eval " + "$(eval " * 7 + payload + ")" * 7
+    with pytest.raises(ShellReadLimitError, match="more reading than"):
+        _shell_argvs(line)
+    # the same shape with a short payload stays inside the budget and is read
+    argvs = _shell_argvs("eval " + "$(eval " * 7 + "python3 f.py --readiness" + ")" * 7)
+    assert ["python3", "f.py", "--readiness"] in argvs
+
+
+def test_worker_commands_is_an_error_when_a_line_past_the_readers_limit_can_hold_the_run():
+    """A line past the shell reader's limit has no argvs. A required run that no readable line
+    made, or a forbidden run that no readable line made, can be on that line: not a pass and not
+    a fail. The rule is the one for a capture with gaps."""
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    for nested in ("eval " * (sys.getrecursionlimit() + 200) + "python3 f.py --readiness", "eval " * 17 + "python3 f.py --readiness"):
+        # the first line is the one that gave RecursionError and a traceback before
+        _stash_commands([nested, "cat README.md"])
+        for runs in ({"required_runs": [f_py]}, {"forbidden_runs": [f_py]}, {"required_runs": [{"script": "g.py"}], "forbidden_runs": [f_py]}):
+            res = WorkerCommandsVerifier(type="worker_commands", **runs).verify(5.0)
+            assert res.status == "error" and not res.success, res.reason
+            assert "past the shell reader's limit (more " in res.reason and "eval eval" in res.reason, res.reason
+            assert "could not be evaluated" in res.reason, res.reason
+        # a check with patterns only reads no argv, so it stays evaluable on the same line
+        res = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"cat README"], forbidden_patterns=[r"kubectl delete"]).verify(5.0)
+        assert res.status == "pass", res.reason
+        res = WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"f\.py --readiness"]).verify(5.0)
+        assert res.status == "fail", res.reason
+    # the unread line alone: the required run was not read, so the check cannot pass
+    _stash_commands(["eval " * 17 + "python3 f.py --readiness"])
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0).status == "error"
+
+
+def test_worker_commands_keeps_a_conclusive_result_beside_a_line_past_the_readers_limit():
+    """What was read is conclusive, whatever a line past the limit holds."""
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    nested = "eval " * 17 + "echo x"
+    _stash_commands([nested, "kubectl delete pod x", "python3 f.py --readiness"])
+    # a forbidden pattern that a readable line matched: a fail, as before the limit
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], forbidden_patterns=[r"kubectl delete"]).verify(5.0)
+    assert res.status == "fail" and "forbidden pattern(s) matched" in res.reason, res.reason
+    # a required run that a readable line made: a pass
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+    assert res.status == "pass", res.reason
+    # a forbidden run that a readable line made: a fail
+    res = WorkerCommandsVerifier(type="worker_commands", forbidden_runs=[f_py]).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # a missing required pattern is read from the text, so it is a fail beside the unread line
+    res = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py clone"], required_runs=[{"script": "g.py"}]).verify(5.0)
+    assert res.status == "fail" and "required pattern(s)" in res.reason, res.reason
+    # a line that an exemption takes out of the required list is not read for the required runs
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], exempt_patterns=[r"eval eval"]).verify(5.0)
+    assert res.status == "fail" and "no worker command ran g.py" in res.reason, res.reason
+    # with each command of the required list read, the missing run is a fail whatever the typed
+    # line past the limit holds: a forbidden run there would be a fail too
+    _stash_commands([nested, "cat README.md"])
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], forbidden_runs=[f_py], exempt_patterns=[r"eval eval"]).verify(5.0)
+    assert res.status == "fail" and "no worker command ran g.py across 1 command(s)" in res.reason, res.reason
+    # beside a conclusive failure, the reason does not say for sure that the run was not made
+    _stash_commands(["eval " * 17 + "python3 g.py", "kubectl delete pod x"])
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "g.py"}], forbidden_patterns=[r"kubectl delete"]).verify(5.0)
+    assert res.status == "fail" and "forbidden pattern(s) matched" in res.reason, res.reason
+    assert "no worker command ran g.py across 2 command(s) (a command past the shell reader's limit was not read)" in res.reason, res.reason
+
+
+def test_worker_commands_a_capture_with_gaps_keeps_its_own_error_beside_a_line_past_the_limit():
+    """With `after_result_pattern` and a capture that recorded gaps, the check is an error for
+    the gaps whatever the line past the limit holds, and the reason names the gaps."""
+    entries = [_terminal("eval " * 17 + "echo x", at=1), _terminal("kubectl get deploy kube-dns", at=2)]
+    transcript.set("ok", _TRAJECTORY + entries, worker_capture_gaps=["card t_9: locked"])
+    check = WorkerCommandsVerifier(
+        type="worker_commands", after_result_pattern=r"kubernetes\.read-only", required_runs=[{"script": "g.py"}], forbidden_patterns=[r"kubectl delete"]
+    )
+    res = check.verify(5.0)
+    assert res.status == "error" and "card t_9: locked" in res.reason and "shell reader's limit" not in res.reason, res.reason
+    # the same capture with no gaps: the line past the limit is the reason
+    transcript.set("ok", _TRAJECTORY + entries)
+    res = check.verify(5.0)
+    assert res.status == "error" and "past the shell reader's limit" in res.reason, res.reason
+
+
+def test_shell_argvs_keeps_the_order_of_the_commands_inside_a_line():
+    """A pin of the order of the commands inside a line (after an `eval`, behind a shell's `-c`
+    flag, in a substitution): a line's own segments first, then the commands inside each inner
+    line in turn, each inner line to its end before the next one. A substitution inside an
+    `eval` word or a `-c` word is read two times, so its commands are in the list two times."""
+    from kube_agents_bench.shell_words import _shell_argvs
+
+    assert _shell_argvs("a 1; eval \"b $(c 2)\" 'x; y'; bash -c 'd; eval e \"$(f)\"' $(g `h 3`) <(i | j)") == [
+        ["a", "1"], ["eval", "b $(c 2)", "x; y"], ["bash", "-c", 'd; eval e "$(f)"', "$(g `h 3`)", "<(i | j)"],
+        ["b", "$(c 2)", "x"], ["y"], ["c", "2"], ["d"], ["eval", "e", "$(f)"], ["e", "$(f)"], ["f"], ["f"],
+        ["c", "2"], ["g", "`h 3`"], ["h", "3"], ["i"], ["j"]]  # fmt: skip
+    assert _shell_argvs("eval eval 'k; bash -c \"l && m\"'; n $(o $(p; q) `r`)") == [
+        ["eval", "eval", 'k; bash -c "l && m"'], ["n", "$(o $(p; q) `r`)"], ["eval", "k"], ["bash", "-c", "l && m"],
+        ["k"], ["l"], ["m"], ["o", "$(p; q)", "`r`"], ["p"], ["q"], ["r"]]  # fmt: skip
+    assert _shell_argvs("timeout 5 bash -lc 'eval \"s $(t)\"; u' && v \"$(w; eval x $(y))\"") == [
+        ["timeout", "5", "bash", "-lc", 'eval "s $(t)"; u'], ["v", "$(w; eval x $(y))"], ["eval", "s $(t)"], ["u"],
+        ["s", "$(t)"], ["t"], ["t"], ["w"], ["eval", "x", "$(y)"], ["x", "$(y)"], ["y"], ["y"]]  # fmt: skip
+
+
+def test_shell_argvs_keeps_a_nul_character_in_its_word():
+    """A pin of the reader's rule, not of a shell's: the worker's terminal tool passes the line
+    inside one argument of a shell's `-c` flag, and an argument cannot hold a NUL character, so
+    no shell reads such a line. The reader keeps the character in its word (#6552)."""
+    from kube_agents_bench.verifiers import WorkerRun, _argv_runs, _shell_argvs
+
+    assert _shell_argvs("ec\x00ho hi") == [["ec\x00ho", "hi"]]
+    run = WorkerRun(script="f.py", flags=["--readiness"])
+    # the character in the script's name or in the flag: the word is another word, so no run
+    assert not any(_argv_runs(argv, run) for argv in _shell_argvs("python3 f\x00.py --readiness"))
+    assert not any(_argv_runs(argv, run) for argv in _shell_argvs("python3 f.py --readiness\x00"))
+    # the character in another word: the run is still read, toward a finding for a forbidden run
+    assert any(_argv_runs(argv, run) for argv in _shell_argvs('python3 f.py --readiness --note "a\x00b"'))
+
+
 def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
     # The forbid, not the run reader, is what refuses a survey that stands beside the dictated
     # run: with the survey the rows member fails and names the pattern; without it, it passes.

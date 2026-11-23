@@ -19,17 +19,18 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `suspend` | `boolean` | no |  |  | Suspend skips every run while true. A slot that passes while suspended is counted, not run later. |
 | `profileRef` | `object` | yes |  |  | ProfileRef is the AgentProfile the runs go to. It must allow the unattended tier. |
 | `profileRef.name` | `string` | yes |  | min length `1`; max length `63` | Name is the AgentProfile's name, in the schedule's namespace. |
-| `prompt` | `string` | yes |  | min length `1`; max length `16384` | Prompt is what each run asks. |
-| `parameters` | `map[string]string` | no |  | max properties `32` | Parameters are passed to each run as task parameters. `stream` names the run's audit report stream. |
-| `skills` | `[]string` | no |  | max items `16` | Skills the run asks the profile to use. |
+| `prompt` | `string` | no |  | min length `1`; max length `16384` | Prompt is what each run asks. Exactly one of prompt and script is set. |
+| `script` | `string` | no |  | min length `1`; max length `63`; pattern `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$` | Script names a helper script each run executes in place of a model turn: one of the profile's spec.scripts, by name, never a path. It is a DNS-1123 label (no dots), as the run's trigger carries it. Exactly one of prompt and script is set. Only a built-in schedule, one the PlatformAgent renders, may name a script: any other schedule that does is not accepted, and never runs. |
+| `parameters` | `map[string]string` | no |  | max properties `16` | Parameters are passed to each run as task parameters, at most 16, the bound every task submission has. A built-in schedule's report stream is its own name, carried on its trigger, not a parameter. |
+| `skills` | `[]string` | no |  | max items `16` | Skills the run asks the profile to use. A script run takes none: set it only with prompt. |
 | `delivery` | `object` | no | `{}` |  | Delivery is where each run's report goes. Omitted, it is the home channel (chat). |
 | `delivery.mode` | `string` | no | `chat` | one of `chat`, `local` | Mode is chat (the home channel) or local (kept, not posted). |
 | `delivery.silentWhenClean` | `boolean` | no |  |  | SilentWhenClean posts nothing for a run that found nothing. |
-| `delivery.jobKey` | `string` | no |  | max length `63` | JobKey groups a schedule's posts into one thread per UTC day. It defaults to the schedule's name. |
+| `delivery.jobKey` | `string` | no |  | max length `63`; pattern `^[a-z0-9]([-a-z0-9]*[a-z0-9])?$` | JobKey groups a schedule's posts into one thread per UTC day. It keys stored reports, so it is a DNS-1123 label. It defaults to the schedule's name, which a schedule that runs already has to be. |
 | `concurrencyPolicy` | `string` | no | `Forbid` | one of `Forbid` | ConcurrencyPolicy is Forbid, the one policy: a slot that comes due while a run is still going is skipped and counted. |
 | `startingDeadlineSeconds` | `integer` | no | `900` | min `60`; max `86400` | StartingDeadlineSeconds is how late a slot may still start. A slot missed by more (an operator outage, a gateway that stayed down) is counted and skipped. Defaults to 900. |
 | `activeDeadlineSeconds` | `integer` | no |  | min `60`; max `86400` | ActiveDeadlineSeconds bounds a run. Past it, plus a grace, a run that never reported a terminal is recorded Lost and the schedule moves on. Unset, it is the profile's lifecycle.activeDeadlineSeconds, the ceiling its Job runs under. |
-| `maxTurns` | `integer` | no |  | min `1`; max `1000` | MaxTurns caps the run's model turns. |
+| `maxTurns` | `integer` | no |  | min `1`; max `1000` | MaxTurns caps the run's model turns. A script run takes none: set it only with prompt. |
 
 ## Status
 
@@ -50,17 +51,22 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `lastCompletionTime` | `metav1.Time` | no |  |  | LastCompletionTime is when the most recent run ended. |
 | `lastOutcome` | `string` | no |  | one of `Succeeded`, `Failed`, `Cancelled`, `Lost` | LastOutcome is how the most recent run ended. |
 | `lastHandledRunNow` | `string` | no |  |  | LastHandledRunNow is the last run-now token acted on. |
+| `lastHandledStop` | `string` | no |  |  | LastHandledStop is the last stop token acted on. |
+| `stoppedTaskID` | `string` | no |  |  | StoppedTaskID is the run in flight a stop was sent for, until it settles: a run-now asked for meanwhile waits for it to end rather than adopting it. |
 | `skipCounts` | `object` | no |  |  | SkipCounts counts slots that did not run. |
 | `skipCounts.alreadyRunning` | `integer` | yes |  |  | AlreadyRunning: the last run was still going (Forbid). |
 | `skipCounts.missedWindow` | `integer` | yes |  |  | MissedWindow: the slot was more than the starting deadline late. |
 | `skipCounts.suspended` | `integer` | yes |  |  | Suspended: the schedule was suspended. |
 | `skipCounts.gatewayUnavailable` | `integer` | yes |  |  | GatewayUnavailable: the gateway did not accept the run within the starting deadline. |
 | `skipCounts.rateLimited` | `integer` | yes |  |  | RateLimited: the gateway refused the run under the trigger's cap. |
+| `postFailed` | `integer` | no |  |  | PostFailed counts runs whose report the gateway couldn't post to chat after its redeliveries (Delivery post_failed). |
+| `postUnknown` | `integer` | no |  |  | PostUnknown counts runs whose report post started or timed out with no outcome (Delivery post_unknown): it may be in the channel, and the gateway never posts it again. |
 | `recentRuns` | `[]object` | no |  | max items `10` | RecentRuns are the last ten runs, newest first. |
 | `recentRuns[].taskID` | `string` | yes |  |  | TaskID is the run's task. |
 | `recentRuns[].slotTime` | `metav1.Time` | yes |  |  | SlotTime is the slot it ran for. |
 | `recentRuns[].completionTime` | `metav1.Time` | no |  |  | CompletionTime is when it ended. |
 | `recentRuns[].outcome` | `string` | yes |  |  | Outcome is how it ended. |
+| `recentRuns[].delivery` | `string` | no |  | one of `no_delivery`, `local`, `silent`, `stored_no_home`, `posted`, `post_failed`, `post_unknown` | Delivery is how its report was delivered, once that is final: posted, stored for want of a home channel, kept local, silent when clean, not delivered, post_failed when the gateway gave up posting it, or post_unknown when a post started or timed out with no outcome, so it may be in the channel and is never retried. Empty until the gateway reports a final value, and on a run it never does. |
 | `conditions` | `[]metav1.Condition` | no |  |  | Conditions are the latest observations of the schedule. |
 
 <!-- prettier-ignore-end -->

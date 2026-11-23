@@ -39,6 +39,13 @@ const (
 	// that reservation key on.
 	A2ABusTokenAudience = "a2a-bus"
 
+	// WatcherTokenAudience is the audience the gateway's watchers present to
+	// the credential proxy for the watcher role.
+	WatcherTokenAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	// WatcherTokenVolumeName is the reserved volume name the operator projects
+	// the watcher token under for the agent-api-auth container alone.
+	WatcherTokenVolumeName = "watcher-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
+
 	// The suffixes that build the names of the bus objects the operator
 	// renders off the PlatformAgent's own name. Here for the same reason as
 	// the audience: the webhook has to recognise the Secrets that carry bus
@@ -229,8 +236,9 @@ var SensitiveEnvVars = map[string]struct{}{
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
 	// the gateway's chat.notify route. It holds every platform whose route is
 	// armed under the next stack with a home channel set on the CR,
-	// comma-separated, Chat first; the agent adds a learned Slack channel and
-	// sends home posts to every armed route when no platform has a home. An
+	// comma-separated, Chat first; the agent adds a learned Slack channel or
+	// Chat space after those and sends home posts to every armed route when
+	// no platform has a home. An
 	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,
@@ -332,12 +340,12 @@ func IsSensitiveEnvVar(name string) bool {
 // The watchers' broker token is the second member, in either mode: it is
 // projected into the gateway's agent-api-auth container alone, and any other
 // container holding it holds the broker's watcher role (every fleet cluster's
-// events and named objects). The controller's watcherTokenSourceNames strips
-// it, and any volume projecting its audience under another name, at render;
-// this is the name half's admission message. The source half is render-only.
+// events and named objects). BusCredentialRoutes below is the source half of
+// both reservations, and the controller's watcherTokenSourceNames strips both
+// halves at render and reports them on VolumesDropped.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token":                  {},
-	"watcher-credential-proxy-token": {},
+	"a2a-bus-token":        {},
+	WatcherTokenVolumeName: {},
 }
 
 // ReservedVolumePrefixes lists volume name prefixes reserved for operator-managed
@@ -348,7 +356,7 @@ var ReservedVolumePrefixes = []string{
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
-// used to reach the bus credential without naming the reserved volume.
+// used to reach the bus or watcher credential without naming the reserved volume.
 type BusCredentialRouteKind string
 
 const (
@@ -356,6 +364,10 @@ const (
 	// audience is A2ABusTokenAudience: a valid bus token for the pod's
 	// ServiceAccount, under whatever volume name the CR chose.
 	BusCredentialRouteAudience BusCredentialRouteKind = "audience"
+	// BusCredentialRouteWatcherAudience is a projected serviceAccountToken source
+	// whose audience is WatcherTokenAudience: a valid watcher-role token for the
+	// credential proxy, under whatever volume name the CR chose.
+	BusCredentialRouteWatcherAudience BusCredentialRouteKind = "watcher-audience"
 	// BusCredentialRouteSecret is a volume that mounts one of the Secrets the
 	// operator renders with a bus credential in it (A2ACredentialSecretNames),
 	// either as a `secret` volume or as a projected `secret` source.
@@ -435,8 +447,13 @@ func BusCredentialRoutes(v corev1.Volume, agentName string) []BusCredentialRoute
 	}
 	if v.Projected != nil {
 		for i, src := range v.Projected.Sources {
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == A2ABusTokenAudience {
-				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+			if src.ServiceAccountToken != nil {
+				switch src.ServiceAccountToken.Audience {
+				case A2ABusTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+				case WatcherTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteWatcherAudience, Source: i})
+				}
 			}
 			if src.Secret != nil && isCredential(src.Secret.Name) {
 				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i, Secret: src.Secret.Name})
@@ -1123,6 +1140,26 @@ type TuningSpec struct {
 	// +optional
 	SessionResources *corev1.ResourceRequirements `json:"sessionResources,omitempty"`
 
+	// DefaultRoute is the addressee the A2A gateway sends a plain
+	// conversation's first message to: `session` opens a session pod of the
+	// conversation's own, `platform` hands it to the platform agent. Unset
+	// means `platform` for now; a later change flips the default to
+	// `session`. `platform` stays reachable by handle either way, and a
+	// `delegate:` still opens a session pod on either route. The operator
+	// renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
+	// on the platform agent container (which the hermes-bridge sidecar
+	// copies), so a change rolls the gateway and the platform agent pod.
+	//
+	// `session` widens the TASKS consumer budget: each session also counts
+	// the replays of its conversation's task, 7 consumers rather than 3, so
+	// 40 more at the default 10 sessions. TASKS cannot be widened once it
+	// exists, so on an install whose stream was created narrower the
+	// provision Job refuses until maxSessions is lowered to fit or TASKS is
+	// recreated; its message names both.
+	// +kubebuilder:validation:Enum=session;platform
+	// +optional
+	DefaultRoute *string `json:"defaultRoute,omitempty"`
+
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
 	// runs a cluster with R3 streams, which keeps the bus up through a node
@@ -1245,6 +1282,16 @@ type ProfileTuning struct {
 // streams. An existing bus keeps its own count.
 const DefaultBusReplicas = 3
 
+// The values spec.harness.tuning.defaultRoute takes. DefaultRouteSession is
+// the A2A gateway's session-route sentinel (RouteSession in a2a/gateway),
+// DefaultRoutePlatform the Hermes bridge's addressee. The Enum marker on
+// DefaultRoute spells the same two by hand, since a marker cannot name a
+// constant.
+const (
+	DefaultRouteSession  = "session"
+	DefaultRoutePlatform = "platform"
+)
+
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
 const MaxProfileCeiling = 1000
@@ -1281,7 +1328,10 @@ type AdmissionSpec struct {
 	// the inactive file cache, the figure the kubelet evicts on) and counts it
 	// against this figure. Absent means the agent container's resolved memory request
 	// in MiB (4096 at the operator's default resources), so a CR that raises
-	// the request raises the budget with it.
+	// the request raises the budget with it. Effective memoryBudgetMiB must
+	// be at least workerRssCapMiB regardless of failClosed (refused where the
+	// validating webhook is enabled, or reported as Degraded with reason
+	// InvalidKanbanAdmission).
 	//
 	// Two bounds act on the budget. Each tick admits one new worker per
 	// 512 MiB of headroom under it, so with the container's working set at W
@@ -1292,8 +1342,9 @@ type AdmissionSpec struct {
 	// 64 MiB. At the default budget the headroom bound acts first. A budget
 	// under the container's idle working set plus 512 MiB therefore admits
 	// no worker and refuses every card after QueueBoundSeconds; the schema's
-	// minimum of 512 is left there for a test install that wants exactly
-	// that, and a derived budget under it is clamped to it. A card the tick
+	// minimum of 512 is left there for a test install that sets memoryBudgetMiB
+	// to 512 and workerRssCapMiB to 512 or below, and a derived budget
+	// under it is clamped to it. A card the tick
 	// cannot spawn waits, and is refused after QueueBoundSeconds. Set the
 	// budget below the request to keep headroom for the gateway's own growth,
 	// or above it, up to the limit, on a node pool where eviction is not the
@@ -1555,7 +1606,10 @@ type DeploymentSpec struct {
 
 	// Resources specifies resource requests and limits for the main container.
 	// The memory request is also the dispatcher's default admission budget
-	// (spec.harness.tuning.admission.memoryBudgetMiB).
+	// (spec.harness.tuning.admission.memoryBudgetMiB), so setting it below
+	// workerRssCapMiB without raising memoryBudgetMiB or lowering
+	// workerRssCapMiB is refused where the validating webhook is enabled, or
+	// reported as Degraded (InvalidKanbanAdmission).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
@@ -2784,12 +2838,13 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
-// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
-// config states it.
+// InferenceStatus reports the Platform Agent's default model, and the reasoning effort
+// configured on it, as the install's LiteLLM config states them.
 //
 // A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
-// only, so a project id, a region or an account id never appears here. Both fields are
-// absent when the config states no default model.
+// only, so a project id, a region or an account id never appears here. The provider and
+// model are absent when the config states no default model; the reasoning effort is
+// absent whenever the entry states none.
 type InferenceStatus struct {
 	// Provider is the LiteLLM provider slug, the text before the first "/" of the
 	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
@@ -2800,6 +2855,13 @@ type InferenceStatus struct {
 	// for a resource reference.
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+	// the default model's entry, as typed: low, medium or high from the chart, or
+	// whatever a hand-edited config says. Absent when the entry states none, so the
+	// model thinks at its own default, and absent while the served CRD predates it.
+	// +optional
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
@@ -3004,8 +3066,13 @@ type BusMigrationRetry struct {
 // and three.
 type BusMigrationStatus struct {
 	// Leg is the direction: OneToThree (snapshot and restore, behind a write
-	// freeze) or ThreeToOne (in place).
-	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	// freeze), ThreeToOne (in place), or Reshape (TASKS alone recreated at
+	// the width the CR renders, at the count the bus runs, behind a write
+	// freeze; started only by the kubeagents.x-k8s.io/bus-reshape
+	// annotation). A run of a leg this operator does not run is held
+	// (A2ABusMigrationLegUnknown) until the operator that started it carries
+	// it on or a person abandons it.
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne;Reshape
 	Leg string `json:"leg"`
 
 	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
@@ -3035,6 +3102,14 @@ type BusMigrationStatus struct {
 	// Message is the manual step a Failed migration names.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// SettleTime is how long the one to three restore waited, from raising
+	// the last restored stream to three replicas, for every stream's replicas
+	// to be current and every restored durable consumer to answer from its
+	// leader, as a Go duration ("1.2s"). Set when a restore that succeeded
+	// reports it.
+	// +optional
+	SettleTime string `json:"settleTime,omitempty"`
 
 	// Cause is why the run turned back: the phase that failed, and whether
 	// it was still running at Deadline. Set at the first failure and kept
@@ -3437,7 +3512,8 @@ type AgentUsageStatus struct {
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
 	// chat platform the install enables is served through Hermes (Microsoft
-	// Teams), and while the served CRD
+	// Teams, unless the operator arms the gateway's Teams backend), and
+	// while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional
