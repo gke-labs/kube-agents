@@ -34,7 +34,10 @@ import (
 // under one lock.
 const (
 	// sessionCapWaitMax is how long a turn waits in line before it gets the
-	// cap's refusal after all. A slot frees when any running conversation's
+	// cap's refusal after all, wherever it is in the line: the head is told
+	// when its next try finds no room (capKeepOrGiveUp), a waiter behind it
+	// on the line's next pass (expireCapWaiters), so within
+	// sessionCapQueuePoll of the bound. A slot frees when any running conversation's
 	// task ends (its pod idles and the cap evicts it) or its pod exits, so
 	// at the default cap of 10 the wait is the shortest of ten tasks still
 	// running. Five minutes outlasts a typical chat task, so most waits end
@@ -271,7 +274,7 @@ func (g *Gateway) capAdmit(w *capWaiter) func() {
 // capKeepOrGiveUp is the check's answer to a waiter's retry that found no
 // room: back in line at its place, or, past the wait bound, out of it with
 // its notice closed (the refusal itself is the caller's). Reports whether
-// it stays.
+// it stays. The waiters behind the head meet the bound in expireCapWaiters.
 func (g *Gateway) capKeepOrGiveUp(w *capWaiter, after *[]func()) bool {
 	g.capMu.Lock()
 	defer g.capMu.Unlock()
@@ -474,9 +477,50 @@ func (g *Gateway) routeParked(rec *SessionRecord, msg InboundMessage, backend st
 	return true
 }
 
+// expireCapWaiters refuses every waiter behind the head whose wait has passed
+// sessionCapWaitMax: out of the line, the cap's refusal posted and its notice
+// closed as capKeepOrGiveUp and the check do for the head, so no waiter
+// outlasts the bound because it never reached the front. The head is left to
+// its own try, which meets the bound under the cap check (capKeepOrGiveUp);
+// the head is the oldest waiter, so it is never kept past the bound by this.
+// Its later messages wait on nothing now and are dropped, as at a stop; the
+// refusal tells the person to send again. Only the line's loop calls it.
+func (g *Gateway) expireCapWaiters(ctx context.Context) {
+	bound := g.capWaitMax()
+	var expired []*capWaiter
+	g.capMu.Lock()
+	if len(g.capQueue) > 1 {
+		rest := slices.DeleteFunc(g.capQueue[1:], func(w *capWaiter) bool {
+			if w.retrying || time.Since(w.parkedAt) < bound {
+				return false
+			}
+			w.closed.Store(true)
+			expired = append(expired, w)
+			return true
+		})
+		g.capQueue = g.capQueue[:1+len(rest)]
+	}
+	g.capMu.Unlock()
+	if len(expired) == 0 {
+		return
+	}
+	// The refusal names the count as the check would; with the count
+	// unreadable, the cap stands in, as the line only holds turns at it.
+	live := g.cfg.MaxSessions
+	if pods, err := g.spawner.SessionPods(ctx); err == nil {
+		live = liveSessionCount(pods, g.capHoldSnapshot("", time.Now()))
+	}
+	for _, w := range expired {
+		g.log.Warn("session cap: queued turn waited out its bound", "conversation", w.key, "waited", time.Since(w.parkedAt).Round(time.Second))
+		g.post(w.key, sessionCapRefusal(live, g.cfg.MaxSessions))
+		g.closeCapNotice(w, sessionQueuedGaveUp)
+	}
+}
+
 // capQueueLoop moves the line: on a nudge from a path that may have freed a
-// slot (kickCapQueue), or every sessionCapQueuePoll, it brings every notice
-// up to date and sends the head to try again. It ends with ctx; the turns
+// slot (kickCapQueue), or every sessionCapQueuePoll, it refuses the waiters
+// behind the head that waited out their bound, brings every notice up to
+// date and sends the head to try again. It ends with ctx; the turns
 // still in line are refused by the stop (refuseParkedAtStop).
 func (g *Gateway) capQueueLoop(ctx context.Context) {
 	g.initCap()
@@ -490,6 +534,7 @@ func (g *Gateway) capQueueLoop(ctx context.Context) {
 			t.Stop()
 		case <-t.C:
 		}
+		g.expireCapWaiters(ctx)
 		g.refreshCapNotices()
 		g.retryCapHead()
 	}

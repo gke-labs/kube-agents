@@ -902,16 +902,7 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 		notices = append(notices, capNotice{rec.Key, "⚠️ not started: can't count the running session workers right now — try again in a moment"})
 		return true
 	}
-	running := make(map[string]bool, len(pods))
-	for _, p := range pods {
-		running[p.PodName] = true
-	}
-	live := len(pods)
-	for _, h := range holds {
-		if h.replaces == "" || !running[h.replaces] {
-			live++
-		}
-	}
+	live := liveSessionCount(pods, holds)
 	limit := g.cfg.MaxSessions
 	replaces := ""
 	if replacing {
@@ -955,15 +946,37 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	case parkable && g.capPark(rec.Key, parked, &after):
 		return true
 	}
+	g.log.Warn("session cap: delegation refused", "conversation", rec.Key, "live", live, "cap", g.cfg.MaxSessions)
+	notices = append(notices, capNotice{rec.Key, sessionCapRefusal(live, g.cfg.MaxSessions)})
+	return true
+}
+
+// liveSessionCount is the count the cap is checked against: the session pods
+// listed, plus each granted slot whose pod isn't created yet, unless it
+// replaces a pod still listed.
+func liveSessionCount(pods []sessionPod, holds []capHold) int {
+	running := make(map[string]bool, len(pods))
+	for _, p := range pods {
+		running[p.PodName] = true
+	}
+	live := len(pods)
+	for _, h := range holds {
+		if h.replaces == "" || !running[h.replaces] {
+			live++
+		}
+	}
+	return live
+}
+
+// sessionCapRefusal is the cap's refusal, naming live against the cap.
+func sessionCapRefusal(live, limit int) string {
 	workers := fmt.Sprintf("%d session workers are", live)
 	if live == 1 {
 		workers = "1 session worker is"
 	}
-	g.log.Warn("session cap: delegation refused", "conversation", rec.Key, "live", live, "cap", g.cfg.MaxSessions)
-	notices = append(notices, capNotice{rec.Key, fmt.Sprintf(
+	return fmt.Sprintf(
 		"🚦 not started: %s already running (cap %d). Wait for one to finish or `stop` one you started; an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
-		workers, g.cfg.MaxSessions)})
-	return true
+		workers, limit)
 }
 
 // sessionCapHoldTTL is how long a slot refuseAtSessionCap granted counts

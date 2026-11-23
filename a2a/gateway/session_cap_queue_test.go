@@ -192,6 +192,89 @@ func TestAWaitPastTheBoundGetsTheCapRefusal(t *testing.T) {
 	}
 }
 
+// The bound holds wherever a waiter is in line, not only at the head. With
+// the head's try still in flight, a pass of the line refuses every waiter
+// behind it that has waited past the bound, today's text and notice, and
+// takes it out of the line; the waiters behind move up, and the head stays,
+// as its own try meets the bound. When that try comes, the head is refused
+// as before.
+func TestAWaiterBehindTheHeadIsRefusedPastTheBound(t *testing.T) {
+	t.Parallel()
+	r, spawn, _ := queueRig(t, 1)
+	r.g.capPollOverride.Store(int64(time.Hour))
+	r.g.kickCapQueue()
+	time.Sleep(50 * time.Millisecond)
+
+	// The line built by hand, so each waiter's time in line is exact: the
+	// head and the waiters at places 2 and 3 parked past the bound, those
+	// at places 4 and 5 just now. The head's try is in flight (retrying),
+	// so the pass leaves it to that try.
+	convs := []string{"discord:g1/t-expire-head", "discord:g1/t-expire-2", "discord:g1/t-expire-3", "discord:g1/t-expire-4", "discord:g1/t-expire-5"}
+	long := time.Now().Add(-sessionCapWaitMax - time.Minute)
+	var line []*capWaiter
+	r.g.capMu.Lock()
+	for i, conv := range convs {
+		at := time.Now()
+		if i < 3 {
+			at = long
+		}
+		r.g.capTicket++
+		w := &capWaiter{
+			ticket: r.g.capTicket, key: conv, parkedAt: at, shownAhead: -1,
+			msg: InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("m%d", i), Text: "check the fleet"},
+		}
+		line = append(line, w)
+		r.g.capQueue = append(r.g.capQueue, w)
+	}
+	line[0].retrying = true
+	r.g.capMu.Unlock()
+	for _, w := range line {
+		r.g.postCapNotice(w)
+	}
+	for i, conv := range convs {
+		if got := noticeNow(r, conv); got != sessionQueuedNotice(i) {
+			t.Fatalf("%s's notice %q, want %q", conv, got, sessionQueuedNotice(i))
+		}
+	}
+
+	r.g.kickCapQueue()
+	refusal := sessionCapRefusal(1, 1)
+	for _, conv := range convs[1:3] {
+		waitFor(t, conv+"'s refusal", func() bool { return slices.Contains(r.adapter.postTextsFor(conv), refusal) })
+		waitFor(t, conv+"'s notice closed", noticeReads(r, conv, sessionQueuedGaveUp))
+	}
+	waitFor(t, "place 4 moved up to 2", noticeReads(r, convs[3], sessionQueuedOne))
+	waitFor(t, "place 5 moved up to 3", noticeReads(r, convs[4], fmt.Sprintf(sessionQueuedMany, 2)))
+	r.g.capMu.Lock()
+	var keys []string
+	for _, w := range r.g.capQueue {
+		keys = append(keys, w.key)
+	}
+	r.g.capMu.Unlock()
+	if want := []string{convs[0], convs[3], convs[4]}; !slices.Equal(keys, want) {
+		t.Fatalf("line %q, want %q", keys, want)
+	}
+	if got := noticeNow(r, convs[0]); got != sessionQueuedNext {
+		t.Fatalf("the head's notice %q while its try is in flight, want it still next", got)
+	}
+	if slices.Contains(r.adapter.postTextsFor(convs[0]), refusal) {
+		t.Fatal("the head was refused by the pass, not by its own try")
+	}
+
+	// The head's try comes back through the cap check, finds no room, and
+	// meets the bound there as before.
+	r.g.capMu.Lock()
+	line[0].retrying = false
+	r.g.capMu.Unlock()
+	r.g.kickCapQueue()
+	waitFor(t, "the head's refusal", func() bool { return slices.Contains(r.adapter.postTextsFor(convs[0]), refusal) })
+	waitFor(t, "the head's notice closed", noticeReads(r, convs[0], sessionQueuedGaveUp))
+	waitFor(t, "the waiters behind moved up again", noticeReads(r, convs[3], sessionQueuedNext))
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d spawns", n)
+	}
+}
+
 // With the line full, a new conversation gets the cap's refusal and no
 // notice.
 func TestAFullLineRefusesWithTheCapText(t *testing.T) {
