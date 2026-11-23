@@ -3,11 +3,14 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,11 +19,13 @@ import (
 )
 
 // The gate-2 pair (#5301): a profile named like a session token, and a
-// session task addressed to a name that is a live profile's. Profile-ness is
-// the record's (TaskRef.Tier), never the name's shape.
+// session task addressed to a profile-shaped name with a live card. Profile-ness
+// is the operator's profile names (lib.WithProfileNames), never the name's
+// shape, the directory or anything the gateway writes: the rig's records say
+// the opposite of the truth (cutoffRecord), and the reads follow the names.
 const (
-	cutoffProfileAddressee = "cto-otter-1a2b" // session-shaped, a profile's name
-	cutoffSessionAddressee = "fleet-audit"    // profile-shaped, with a live card, a session task's addressee
+	cutoffProfileAddressee = "cto-otter-1a2b" // session-shaped, in the operator's profile names
+	cutoffSessionAddressee = "fleet-audit"    // profile-shaped, with a live card, not in the names
 	cutoffProfileTask      = "task-cut-profile"
 	cutoffSessionTask      = "task-cut-session"
 )
@@ -46,7 +51,7 @@ func startCutoffRig(t *testing.T, cutoff time.Time) *cutoffRig {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)),
-		lib.WithProfileSupervisorCutoff(cutoff))
+		lib.WithProfileSupervisorCutoff(cutoff), lib.WithProfileNames(lib.NewProfileNames(cutoffProfileAddressee)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,17 +73,20 @@ func startCutoffRig(t *testing.T, cutoff time.Time) *cutoffRig {
 	go func() { _ = g.Run(ctx) }()
 	r := &cutoffRig{rig: &rig{g: g, adapter: obs.fakeAdapter, client: client, bus: bus, url: url, logs: text}, obs: obs, logs: logs, cutoff: cutoff}
 	waitRunning(t, r.rig)
-	// The session task's addressee is a live profile's name: a name-based
-	// rule would take its task for a profile's.
+	// The session task's addressee has a live card: a rule reading the
+	// directory would take its task for a profile's.
 	g.profiles.put(cutoffSessionAddressee, &lib.AgentCard{Name: cutoffSessionAddressee})
 	return r
 }
 
-// cutoffRecord is a conversation holding one task as its active task:
-// a profile task (Tier set) or a session task.
+// cutoffRecord is a conversation holding one task as its active task. The
+// record is the gateway's own write, so it is made to lie: the task under the
+// profile's name has no Tier (the record says session), and one under any
+// other name has one (the record says profile). A read that took
+// profile-ness from the record would read each pair backwards.
 func cutoffRecord(conv, addressee, taskID string, profile bool) *SessionRecord {
 	ref := TaskRef{ID: taskID, Addressee: addressee, CorrelationID: "corr-" + taskID, StartedAt: time.Now()}
-	if profile {
+	if !profile {
 		ref.Tier = "read"
 	}
 	return &SessionRecord{Key: conv, Addressee: addressee, ContextID: "ctx-" + taskID, LastActivity: time.Now(),
@@ -139,9 +147,9 @@ func (r *cutoffRig) putRecord(t *testing.T, rec *SessionRecord) {
 // On a latched gateway the relay settles a five-token supervisor event on a
 // profile task stored after the cutoff without rendering it, counts it and
 // logs it; the same event on a session task renders as the supervisor's
-// terminal (#5301, gate 2). The profile's name is session-shaped and the
-// session's addressee is a live profile's, so only the record can tell them
-// apart.
+// terminal (#5301, gate 2). The profile's name is session-shaped, the
+// session's addressee has a live card, and each record says the opposite of
+// the truth: only the operator's profile names tell them apart.
 func TestTheRelayDropsAFiveTokenTerminalOnAProfileTaskAfterTheCutoff(t *testing.T) {
 	t.Parallel()
 	r := startCutoffRig(t, time.Now().Add(-time.Minute))
@@ -275,33 +283,6 @@ func TestTheFanOutHealIgnoresAFiveTokenTerminalOnAProfileChildAfterTheCutoff(t *
 	}
 }
 
-// taskIsProfile answers from the record, not the name: a TaskRef with a Tier
-// is a profile task whatever its addressee looks like, one without is not
-// even when its addressee has a live card, the card-stop control is never
-// one, and only a task the record doesn't hold falls back to the directory.
-func TestTaskIsProfileReadsTheRecordNotTheName(t *testing.T) {
-	g := &Gateway{profiles: newProfileDirectory()}
-	g.profiles.put(cutoffSessionAddressee, &lib.AgentCard{Name: cutoffSessionAddressee})
-	rec := &SessionRecord{Tasks: []TaskRef{
-		{ID: cutoffProfileTask, Addressee: cutoffProfileAddressee, Tier: "read"},
-		{ID: cutoffSessionTask, Addressee: cutoffSessionAddressee},
-	}, CardStop: &CardStopRun{TaskID: "task-card-stop", Addressee: cutoffSessionAddressee}}
-	for _, c := range []struct {
-		taskID, addressee string
-		want              bool
-	}{
-		{cutoffProfileTask, cutoffProfileAddressee, true},
-		{cutoffSessionTask, cutoffSessionAddressee, false},
-		{"task-card-stop", cutoffSessionAddressee, false},
-		{"task-unknown", cutoffSessionAddressee, true},
-		{"task-unknown", cutoffProfileAddressee, false},
-	} {
-		if got := g.taskIsProfile(rec, c.taskID, c.addressee); got != c.want {
-			t.Errorf("taskIsProfile(%s under %s) = %v, want %v", c.taskID, c.addressee, got, c.want)
-		}
-	}
-}
-
 // cutoffWorking publishes the executor's working status for taskID, so the
 // task has a first event whatever its supervisor terminal does.
 func (r *cutoffRig) cutoffWorking(t *testing.T, addressee, taskID string) {
@@ -319,13 +300,13 @@ func (r *cutoffRig) cutoffWorking(t *testing.T, addressee, taskID string) {
 	}
 }
 
-// Every other gateway read that takes taskIsProfile's answer reads the
-// profile/session pair as the relay and the heals do: under a cutoff, a
-// five-token supervisor terminal stored after it is not a profile task's
-// terminal and is a session task's. Each row's read would take the profile
-// task's terminal if it were handed false, and the drop count is checked
-// beside what the read shows. Records are written without the task index, so
-// the relay never routes these events itself.
+// Every other gateway read reads the profile/session pair as the relay and
+// the heals do: under a cutoff, a five-token supervisor terminal stored after
+// it is not a profile task's terminal and is a session task's. Each row's
+// read would take the profile task's terminal if the gate were not applied
+// or took the record's word, and the drop count is checked beside what the
+// read shows. Records are written without the task index, so the relay never
+// routes these events itself.
 func TestEveryGatewayReadTakesTheCutoffForAProfileTask(t *testing.T) {
 	r := startCutoffRig(t, time.Now().Add(-time.Minute))
 	ctx := context.Background()
@@ -398,10 +379,10 @@ func TestEveryGatewayReadTakesTheCutoffForAProfileTask(t *testing.T) {
 		}},
 		{name: "busy readTask", read: func(rec *SessionRecord, taskID string) (bool, bool) {
 			active := &ActiveTask{TaskID: taskID, SubmittedAt: time.Now().Add(-2 * r.g.cfg.FirstEventGrace)}
-			return r.g.busyTaskLeftOut(ctx, &busyTasksStream{g: r.g}, rec, active, rec.Addressee, time.Now()), true
+			return r.g.busyTaskLeftOut(ctx, &busyTasksStream{g: r.g}, active, rec.Addressee, time.Now()), true
 		}},
 		{name: "taskStreamEmpty", noWorking: true, read: func(rec *SessionRecord, taskID string) (bool, bool) {
-			empty, err := r.g.taskStreamEmpty(ctx, rec, taskID)
+			empty, err := r.g.taskStreamEmpty(ctx, rec.AddresseeFor(taskID), taskID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -458,4 +439,197 @@ func TestEveryGatewayReadTakesTheCutoffForAProfileTask(t *testing.T) {
 			}
 		}
 	}
+}
+
+// cutoffPair is the profile and session variants of one row: the addressee,
+// a task id unique to the row, and whether the operator's names call it a
+// profile.
+func cutoffPair(row string) [2]struct {
+	addressee, taskID string
+	profile           bool
+} {
+	return [2]struct {
+		addressee, taskID string
+		profile           bool
+	}{
+		{cutoffProfileAddressee, "task-" + row + "-profile", true},
+		{cutoffSessionAddressee, "task-" + row + "-session", false},
+	}
+}
+
+// publishGatewayFiveToken is a five-token supervisor terminal on taskID, as
+// the gateway's grant can write it on any addressee.
+func (r *cutoffRig) publishGatewayFiveToken(t *testing.T, addressee, taskID string) {
+	t.Helper()
+	if err := r.bus.Publish(context.Background(), lib.TaskSupervisorSubject(addressee, taskID), supervisorTerminalEnvelope(t, taskID)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The fan-out heal's read of the parent (healFanOut): a parent whose line is
+// open is closed when its terminal is on the stream. A five-token terminal
+// after the cutoff closes a session parent's line and not a profile parent's.
+func TestTheFanOutParentReadTakesTheCutoff(t *testing.T) {
+	t.Parallel()
+	r := startCutoffRig(t, time.Now().Add(-time.Minute))
+	ctx := context.Background()
+	for _, v := range cutoffPair("fanout-parent") {
+		r.cutoffWorking(t, v.addressee, v.taskID)
+		r.publishGatewayFiveToken(t, v.addressee, v.taskID)
+		rec := cutoffRecord("discord:fanout-parent/"+v.taskID, v.addressee, v.taskID, v.profile)
+		rec.Tasks[0].BatchSize = 1
+		rec.ActiveTask.StatusMsgID = "line-" + v.taskID
+		r.putRecord(t, rec)
+		before := r.client.ProfileSupervisorDrops()
+		r.g.healFanOut(ctx, rec, rec.ActiveTask, rec.Tasks[0])
+		closed := rec.ActiveTask.StatusMsgID == ""
+		dropped := r.client.ProfileSupervisorDrops() - before
+		if v.profile && (closed || dropped == 0) {
+			t.Errorf("profile parent: line closed %v, drops %d; want the five-token terminal refused", closed, dropped)
+		}
+		if !v.profile && (!closed || dropped != 0) {
+			t.Errorf("session parent: line closed %v, drops %d; want its supervisor's terminal read", closed, dropped)
+		}
+	}
+}
+
+// The fan-out status's read of each running child (answerFanOutStatus): a
+// session child with a five-token terminal after the cutoff reads failed; a
+// profile child reads as its executor left it, working.
+func TestTheFanOutStatusReadTakesTheCutoff(t *testing.T) {
+	t.Parallel()
+	r := startCutoffRig(t, time.Now().Add(-time.Minute))
+	ctx := context.Background()
+	parent := TaskRef{ID: "task-status-parent", Addressee: "platform", CorrelationID: "corr-status-parent", BatchSize: 2, StartedAt: time.Now()}
+	rec := &SessionRecord{Key: "discord:fanout/status", Addressee: "platform", ContextID: "ctx-status", LastActivity: time.Now(),
+		ActiveTask: &ActiveTask{TaskID: parent.ID, CorrelationID: parent.CorrelationID, SubmittedAt: time.Now()}}
+	pair := cutoffPair("fanout-status")
+	for i, v := range pair {
+		r.cutoffWorking(t, v.addressee, v.taskID)
+		r.publishGatewayFiveToken(t, v.addressee, v.taskID)
+		kid := TaskRef{ID: v.taskID, Addressee: v.addressee, Role: taskRoleChild, ParentTaskID: parent.ID, BatchIndex: i + 1,
+			CorrelationID: "corr-" + v.taskID, StartedAt: time.Now()}
+		if !v.profile {
+			kid.Tier = "read" // the record lies, as cutoffRecord's do
+		}
+		parent.Children = append(parent.Children, kid.ID)
+		rec.Tasks = append(rec.Tasks, kid)
+	}
+	rec.Tasks = append([]TaskRef{parent}, rec.Tasks...)
+	r.putRecord(t, rec)
+	r.g.answerFanOutStatus(ctx, rec, parent)
+	var status string
+	r.adapter.mu.Lock()
+	for _, p := range r.adapter.posts {
+		if p.Conversation == rec.Key {
+			status = p.Text
+		}
+	}
+	r.adapter.mu.Unlock()
+	for _, v := range pair {
+		want := string(lib.StateFailed)
+		if v.profile {
+			want = string(lib.StateWorking)
+		}
+		if line := fmt.Sprintf(noticeFanOutStatusLine, v.addressee, want); !strings.Contains(status, line) {
+			t.Errorf("status %q: want the line %q", status, line)
+		}
+	}
+	if r.client.ProfileSupervisorDrops() == 0 {
+		t.Error("no drop counted for the profile child")
+	}
+}
+
+// The relay's terminal replay (relayTerminal): a completed terminal whose
+// result the render state lost reads the result back from the stream. Ahead
+// of the result on the stream is a five-token failed terminal stored after
+// the cutoff. On a profile task the replay leaves it out and reads the
+// result; on a session task it is the task's end, and the result behind it
+// is the post-final drop.
+func TestTheRelaysTerminalReplayTakesTheCutoff(t *testing.T) {
+	t.Parallel()
+	r := startCutoffRig(t, time.Now().Add(-time.Minute))
+	ctx := context.Background()
+	for _, v := range cutoffPair("relay-replay") {
+		r.cutoffWorking(t, v.addressee, v.taskID)
+		r.publishGatewayFiveToken(t, v.addressee, v.taskID)
+		from := lib.Party{Session: v.addressee, AgentType: "test-executor"}
+		art, err := json.Marshal(lib.ArtifactUpdate{TaskID: v.taskID, ContextID: "ctx-" + v.taskID,
+			Artifact:  lib.Artifact{ArtifactID: "a-" + v.taskID, Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "the answer"}}},
+			LastChunk: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := lib.NewArtifactUpdateEnvelope(from, v.taskID, "ctx-"+v.taskID, "corr-"+v.taskID, art)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.bus.Publish(ctx, lib.TaskEventsSubject(v.addressee, v.taskID), env); err != nil {
+			t.Fatal(err)
+		}
+		rec := cutoffRecord("discord:relay-replay/"+v.taskID, v.addressee, v.taskID, v.profile)
+		r.putRecord(t, rec)
+		rs := &relayState{state: lib.StateWorking}
+		r.g.mu.Lock()
+		r.g.relays[v.taskID] = rs
+		r.g.mu.Unlock()
+		replays := 0
+		r.g.terminalReplayHook = func(string) error { replays++; return nil }
+		status := lib.StatusUpdate{TaskID: v.taskID, ContextID: "ctx-" + v.taskID, Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}
+		before := r.client.ProfileSupervisorDrops()
+		r.g.relayTerminal(ctx, rec, rs, v.taskID, status, TerminalFromExecutor)
+		r.g.terminalReplayHook = nil
+		if replays != 1 {
+			t.Fatalf("%s: the terminal replay ran %d times, want once", v.taskID, replays)
+		}
+		delivered := ""
+		for _, o := range r.obs.events() {
+			if o.kind == "delivered" && o.task == v.taskID {
+				delivered = o.text
+			}
+		}
+		dropped := r.client.ProfileSupervisorDrops() - before
+		if v.profile && (delivered != "the answer" || dropped == 0) {
+			t.Errorf("profile task: delivered %q, drops %d; want the result read past the refused terminal", delivered, dropped)
+		}
+		if !v.profile && (delivered == "the answer" || dropped != 0) {
+			t.Errorf("session task: delivered %q, drops %d; want its supervisor's terminal to end the fold first", delivered, dropped)
+		}
+	}
+}
+
+// The gate a gateway runs with shows on its metrics listener, not only in a
+// log line: the cutoff as a timestamp by its source, whether the profile
+// names are loaded, and the drops. A malformed value shows as the malformed
+// source, at the process's start; an unset one as 0 under unset.
+func TestTheProfileSupervisorGateShowsOnTheMetricsListener(t *testing.T) {
+	start := time.Date(2026, 11, 23, 15, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		value, source, cutoff string
+		names                 *lib.ProfileNames
+		loaded                string
+	}{
+		{"", lib.CutoffSourceUnset, "0", nil, "0"},
+		{"2026-11-23T12:10:00Z", lib.CutoffSourceEnv, unixText(time.Date(2026, 11, 23, 12, 10, 0, 0, time.UTC)), lib.NewProfileNames("fleet-audit"), "1"},
+		{"not a time", lib.CutoffSourceMalformed, unixText(start), &lib.ProfileNames{}, "0"},
+	} {
+		setting := lib.ProfileSupervisorCutoffFromEnv(func(string) string { return c.value }, start, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		m := NewMetrics()
+		m.SetProfileSupervisorGate(lib.ProfileSupervisorGate{ProfileSupervisorCutoffSetting: setting, Names: c.names}, func() int64 { return 7 })
+		_, body := scrape(t, http.MethodGet, startMetricsServer(t, m)+MetricsPath)
+		for _, want := range []string{
+			fmt.Sprintf(`kubeagents_a2a_gateway_profile_supervisor_cutoff_timestamp_seconds{source=%q} %s`, c.source, c.cutoff),
+			"kubeagents_a2a_gateway_profile_names_loaded " + c.loaded,
+			"kubeagents_a2a_gateway_profile_supervisor_drops_total 7",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%q: metrics lack %q:\n%s", c.value, want, body)
+			}
+		}
+	}
+}
+
+// unixText is at in seconds as the metrics listener writes a gauge.
+func unixText(at time.Time) string {
+	return strconv.FormatFloat(float64(at.UnixNano())/float64(time.Second), 'g', -1, 64)
 }

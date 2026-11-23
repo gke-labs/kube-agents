@@ -360,7 +360,7 @@ const noticeBatchChildNeverStarted = "⚠️ delegated task `%s` has produced no
 func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *ActiveTask, parent TaskRef) {
 	changed := false
 	if active.StatusMsgID != "" {
-		if task, _, _, err := g.client.TasksGetTerminal(ctx, rec.AddresseeFor(parent.ID), parent.ID, g.profileRead(rec, parent.ID, rec.AddresseeFor(parent.ID))); err == nil && task.Final {
+		if task, _, _, err := g.client.TasksGetTerminal(ctx, rec.AddresseeFor(parent.ID), parent.ID); err == nil && task.Final {
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(task.State, ""), active.LineNote), "")
 			active.StatusMsgID = ""
 			changed = true
@@ -389,7 +389,7 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 // record for a profile task. A profile child's grace allows for the
 // dispatcher's queue first (batchChildGrace). It reports whether it healed.
 func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid TaskRef) bool {
-	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, kid.Addressee, kid.ID, g.profileRead(rec, kid.ID, kid.Addressee))
+	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, kid.Addressee, kid.ID)
 	switch {
 	case err == nil && task.Final:
 		// Either supervisor form (#5301), read as the relay reads it, so a
@@ -485,7 +485,7 @@ func (g *Gateway) answerFanOutStatus(ctx context.Context, rec *SessionRecord, pa
 			continue
 		}
 		state := fanOutStateUnknown
-		task, err := g.client.TasksGet(ctx, k.Addressee, k.ID, g.profileRead(rec, k.ID, k.Addressee))
+		task, err := g.client.TasksGet(ctx, k.Addressee, k.ID)
 		switch {
 		case err == nil:
 			state = string(task.State)

@@ -1897,7 +1897,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// switch's default branch, which only a nil or detached active task
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
-	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID, g.profileRead(rec, active.TaskID, addressee))
+	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID)
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
@@ -2355,7 +2355,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			}
 		}
 	}
-	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read, g.profileRead(rec, read, addressee))
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read)
 	// What the fold shows about a delegate request, for the hand-off rule
 	// below; nil when the read found nothing to fold.
 	var foldEvidence *delegateEvidence
@@ -2482,7 +2482,7 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 	for i, link := range links {
 		folded := readTask
 		if link.ID != read {
-			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID, g.profileRead(rec, link.ID, link.Addressee))
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
 			switch {
 			case err == nil:
 				folded = t
@@ -3809,7 +3809,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// is promised. A read that fails keeps the route's line. The read is
 	// direct gets (taskStreamEmpty), not a replay, so a steer opens no
 	// consumer.
-	empty, emptyErr := g.taskStreamEmpty(ctx, rec, active.TaskID)
+	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
 	noFirstEvent := emptyErr == nil && empty
 	if noFirstEvent {
 		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
@@ -3959,7 +3959,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 // payoff the payload spec's replay rule promises.
 func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) {
 	active := rec.ActiveTask
-	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID, g.profileRead(rec, active.TaskID, rec.Addressee))
+	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
 	if err != nil {
 		if _, ok := err.(*lib.A2AError); ok {
 			g.post(rec.Key, "📭 no events on the stream for this task yet")

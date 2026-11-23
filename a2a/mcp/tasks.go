@@ -60,76 +60,6 @@ type TaskRef struct {
 	TaskID    string
 }
 
-// TaskKind says whether a task is a profile task, whose supervisor is the
-// dispatcher, or a session or platform task, whose supervisor is the gateway.
-// It decides how a read takes a five-token supervisor terminal once the
-// install has a cutoff (gke-labs/kube-agents#5301). It is how this server
-// learned the task, never the addressee's name, which a session and a profile
-// can share, and it is kept beside the reference (taskKinds), not in it, so a
-// reference names the same task however it was learned.
-type TaskKind uint8
-
-const (
-	// TaskKindUnknown is a task this server learned nothing of: a reference
-	// a caller typed, one read off the stream, or a turn's own submission,
-	// which may be a steer into a running profile task. An addressee with a
-	// live agent card on DIRECTORY is read as a profile (refIsProfile).
-	TaskKindUnknown TaskKind = iota
-	// TaskKindProfile is a task the gateway's status line named, which it
-	// does only for a profile task (noticedTask).
-	TaskKindProfile
-	// TaskKindSession is a task delegated within a turn's chain whose
-	// submission this server saw on .in (follow): a new task there is a
-	// session's or the platform agent's, since a profile takes its new tasks
-	// on a2a.submit.
-	TaskKindSession
-)
-
-// maxTaskKinds bounds the kinds a server remembers. Past it the oldest is
-// forgotten, and its task is read as TaskKindUnknown: the directory decides.
-const maxTaskKinds = 4096
-
-// taskKinds is what this server learned of its turns' tasks' kinds, by
-// reference. The zero value is ready; a nil one remembers nothing. Safe for
-// concurrent use.
-type taskKinds struct {
-	mu    sync.Mutex
-	kinds map[TaskRef]TaskKind
-	order []TaskRef
-}
-
-// note records ref's kind. An unknown kind records nothing, and a known one
-// is never overwritten by another: the first way a task was learned stands.
-func (k *taskKinds) note(ref TaskRef, kind TaskKind) {
-	if k == nil || kind == TaskKindUnknown {
-		return
-	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.kinds == nil {
-		k.kinds = map[TaskRef]TaskKind{}
-	}
-	if _, ok := k.kinds[ref]; ok {
-		return
-	}
-	for len(k.order) >= maxTaskKinds {
-		delete(k.kinds, k.order[0])
-		k.order = k.order[1:]
-	}
-	k.kinds[ref] = kind
-	k.order = append(k.order, ref)
-}
-
-// of is ref's kind, TaskKindUnknown when nothing was learned of it.
-func (k *taskKinds) of(ref TaskRef) TaskKind {
-	if k == nil {
-		return TaskKindUnknown
-	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.kinds[ref]
-}
-
 func (r TaskRef) String() string { return r.Addressee + taskRefSep + r.TaskID }
 
 // ParseTaskRef reads "<addressee>/<task-id>", or a bare task id with the
@@ -196,9 +126,9 @@ func (b *NATSBus) ReadTask(ctx context.Context, ref TaskRef) (*lib.Task, error) 
 			return nil, err
 		}
 	}
-	if len(w.events) == 0 && (w.dropped > 0 || len(w.doubted) > 0) {
-		// Nothing on the task but what the cutoff refused, or holds until
-		// the directory answers: no events, as lib's replay answers it.
+	if len(w.events) == 0 && w.dropped > 0 {
+		// Nothing on the task but what the cutoff refused: no events, as
+		// lib's replay answers it.
 		return nil, ErrTaskNotFound
 	}
 	return w.fold()
@@ -245,10 +175,12 @@ func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 			}
 			return nil, err
 		}
-		if !submitted && w.pending == 0 && len(w.events) == 0 && (w.dropped > 0 || len(w.doubted) > 0) {
-			// Everything the task had was refused by the cutoff or is held
-			// undecided: not found at once, as ReadTask answers it, rather
-			// than holding a reader for the rest of the wait.
+		if !submitted && w.pending == 0 && len(w.events) == 0 && w.dropped > 0 {
+			// Everything the task had was refused by the cutoff: not found
+			// at once, as ReadTask answers it, rather than holding a reader
+			// for the rest of the wait. The refusal is decided from the
+			// operator's inputs and the stored time alone, so it never
+			// waits on a read that could still fail and later succeed.
 			return nil, ErrTaskNotFound
 		}
 	}
@@ -264,11 +196,10 @@ type taskWatch struct {
 	seen    int
 	pending uint64
 	release func(created bool)
-	// screen is the cutoff screen, nil on an unlatched install; dropped
-	// counts what it refused, and doubted holds what it could not decide yet.
-	screen  *cutoffScreen
+	// accept is the supervisor cutoff (lib.Client.AcceptSupervisorEvent);
+	// dropped counts what it refused.
+	accept  func(subject string, storedAt time.Time) bool
 	dropped int
-	doubted []doubtedEvent
 }
 
 func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error) {
@@ -300,163 +231,19 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 		release(true)
 		return nil, err
 	}
-	// The screen settles the task's kind now, on this call's ctx, which the
-	// watch may outlive.
-	return &taskWatch{ref: ref, r: r, pending: pending, release: release, screen: b.newCutoffScreen(ctx, ref)}, nil
+	return &taskWatch{ref: ref, r: r, pending: pending, release: release, accept: b.client.AcceptSupervisorEvent}, nil
 }
 
-// cutoffScreen is the cutoff filter for one task's read
-// (lib.AcceptsSupervisorEvent), nil on an unlatched install, where every
-// message passes. With a cutoff, only a five-token supervisor message stored
-// at or after it is in question, and whether it is taken turns on the task's
-// kind (refIsProfile). The kind is settled when the watch is made, on the
-// ctx of the call that makes it, and never later on that ctx: a step poll
-// keeps its task watches across tool calls, long after the call that made
-// one has ended. A settle that failed is not kept; the watch's next read
-// tries it again on its own ctx (taskWatch.resolveDoubts). Not safe for
-// concurrent use, as the watch it belongs to isn't.
-type cutoffScreen struct {
-	b       *NATSBus
-	cutoff  time.Time
-	ref     TaskRef
-	kind    TaskKind
-	settled bool
-	profile bool
-}
-
-func (b *NATSBus) newCutoffScreen(ctx context.Context, ref TaskRef) *cutoffScreen {
-	cutoff := b.client.ProfileSupervisorCutoff()
-	if cutoff.IsZero() {
-		return nil
-	}
-	sc := &cutoffScreen{b: b, cutoff: cutoff, ref: ref, kind: b.kinds.of(ref)}
-	sc.settle(ctx)
-	return sc
-}
-
-// inQuestion reports whether the message is one the task's kind decides.
-func (sc *cutoffScreen) inQuestion(subject string, storedAt time.Time) bool {
-	return sc != nil && !lib.AcceptsSupervisorEvent(sc.cutoff, subject, storedAt, true)
-}
-
-// settle decides the task's kind if it is not decided yet, and reports
-// whether it now is. A directory read that failed decides nothing.
-func (sc *cutoffScreen) settle(ctx context.Context) bool {
-	if sc.settled {
-		return true
-	}
-	profile, err := sc.b.refIsProfile(ctx, sc.ref, sc.kind)
-	if err != nil {
-		sc.b.logger().Warn("agent directory read failed; holding the task's five-token supervisor messages after the cutoff unread until a read succeeds",
-			"task", sc.ref.String(), "err", err)
-		return false
-	}
-	sc.settled, sc.profile = true, profile
-	return true
-}
-
-// refIsProfile settles whether ref is a profile task: by how this server
-// learned it (kind, from taskKinds), and for a task it learned nothing of, by
-// the directory: an addressee with a live agent card is a profile. That rule
-// reads an old session task whose name a profile has since taken as a profile
-// task, so a gateway terminal on it stored after the cutoff is not read.
-//
-// A directory that can't be read decides nothing, and the error says so; the
-// screen then holds the messages in question unread (fail closed, the same
-// way as a profile), and asks again on the next read. Fail closed here, where
-// the gateway fails open (gateway's taskIsProfile): the gateway's record
-// names each profile task it started by its tier, so its fallback meets
-// only a task the record doesn't hold, while here an unknown kind is the common case
-// (every typed reference, every turn's own submission), and a task wrongly
-// shown unfinished is seen and corrected by a later read, while one wrongly
-// shown final on a terminal its supervisor never wrote is the read the
-// cutoff exists to refuse.
-func (b *NATSBus) refIsProfile(ctx context.Context, ref TaskRef, kind TaskKind) (bool, error) {
-	switch kind {
-	case TaskKindProfile:
-		return true, nil
-	case TaskKindSession:
-		return false, nil
-	}
-	cards, err := b.agentCards(ctx)
-	if err != nil {
-		return true, err
-	}
-	_, ok := cards[ref.Addressee]
-	return ok, nil
-}
-
-// directoryProfiles reads DIRECTORY once, on the first call of what it
-// returns, and answers whether an addressee has a live agent card there. A
-// read that failed counts every addressee it did not return as a profile:
-// one swarm read, on its own live ctx, fails closed for the reason
-// refIsProfile gives, and the next swarm read asks again. Not safe for
-// concurrent use.
-func (b *NATSBus) directoryProfiles(ctx context.Context) func(addressee string) bool {
-	var (
-		read  bool
-		cards map[string]AgentCard
-		err   error
-	)
-	return func(addressee string) bool {
-		if !read {
-			read = true
-			if cards, err = b.agentCards(ctx); err != nil {
-				b.logger().Warn("agent directory read failed; reading tasks as profile tasks for the supervisor cutoff", "err", err)
-			}
-		}
-		_, ok := cards[addressee]
-		return ok || err != nil
-	}
-}
-
-// doubtedEvent is a message the cutoff screen could not yet decide, held
-// with its place among the watch's events.
-type doubtedEvent struct {
-	at       int
-	subject  string
-	storedAt time.Time
-	env      *lib.Envelope
-}
-
-// admit adds one event read off the stream to the watch, as the cutoff
-// screen decides: taken, dropped (counted), or held until the task's kind is
-// settled.
-func (w *taskWatch) admit(ctx context.Context, subject string, storedAt time.Time, env *lib.Envelope) {
-	if !w.screen.inQuestion(subject, storedAt) {
-		w.events = append(w.events, env)
-		return
-	}
-	if !w.screen.settle(ctx) {
-		w.doubted = append(w.doubted, doubtedEvent{at: len(w.events), subject: subject, storedAt: storedAt, env: env})
-		return
-	}
-	if w.screen.b.client.AcceptSupervisorEvent(subject, storedAt, w.screen.profile) {
-		w.events = append(w.events, env)
-	} else {
+// admit adds one event read off the stream to the watch, unless the
+// supervisor cutoff refuses it (lib.Client.AcceptSupervisorEvent: a
+// five-token supervisor message on a profile's addressee, as the operator's
+// profile names say, stored after the install's cutoff), which is counted.
+func (w *taskWatch) admit(subject string, storedAt time.Time, env *lib.Envelope) {
+	if w.accept != nil && !w.accept(subject, storedAt) {
 		w.dropped++
-	}
-}
-
-// resolveDoubts settles the task's kind if events are held for it, and puts
-// each held event back where it was read, or drops it.
-func (w *taskWatch) resolveDoubts(ctx context.Context) {
-	if len(w.doubted) == 0 || !w.screen.settle(ctx) {
 		return
 	}
-	events := make([]*lib.Envelope, 0, len(w.events)+len(w.doubted))
-	prev := 0
-	for _, d := range w.doubted {
-		events = append(events, w.events[prev:d.at]...)
-		prev = d.at
-		if w.screen.b.client.AcceptSupervisorEvent(d.subject, d.storedAt, w.screen.profile) {
-			events = append(events, d.env)
-		} else {
-			w.dropped++
-		}
-	}
-	w.events = append(events, w.events[prev:]...)
-	w.doubted = nil
+	w.events = append(w.events, env)
 }
 
 // errTooManyEvents is a task with more than maxTaskEvents events.
@@ -488,9 +275,6 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 	// folded. Refusing the fetch instead would end the read on an error
 	// with ctx not yet done, and drop the fold.
 	wait = max(wait, minFetchWait)
-	// Events held for the task's kind are settled after this read, on its
-	// ctx.
-	defer w.resolveDoubts(ctx)
 	got := 0
 	for got < taskFetchBatch {
 		msg, err := w.r.next(wait)
@@ -511,7 +295,7 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 			storedAt = md.Timestamp
 		}
 		if env := agreedEnvelope(msg.Subject(), msg.Data()); env != nil {
-			w.admit(ctx, msg.Subject(), storedAt, env)
+			w.admit(msg.Subject(), storedAt, env)
 		}
 		if mdErr == nil {
 			w.pending = md.NumPending

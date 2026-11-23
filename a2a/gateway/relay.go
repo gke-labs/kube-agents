@@ -568,11 +568,13 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			g.settle(item)
 			continue
 		}
-		if !g.client.AcceptSupervisorEvent(item.subject, item.storedAt(), g.taskIsProfile(rec, item.env.TaskID, taskAddressee(rec, item.env.TaskID))) {
-			// A five-token supervisor message on a profile task, stored
-			// after the install's cutoff (#5301): the dispatcher writes a
-			// profile task's terminal on the six-token form by then, so
-			// this one is not the task's. Settled, never rendered and
+		if !g.client.AcceptSupervisorEvent(item.subject, item.storedAt()) {
+			// A five-token supervisor message on a profile's addressee,
+			// stored after the install's cutoff or at a time the server's
+			// metadata didn't give (#5301): the dispatcher writes a profile
+			// task's terminal on the six-token form by then, so this one
+			// is not the task's. Profile-ness is the operator's profile
+			// names, never this record. Settled, never rendered and
 			// never a wake; the client counts it.
 			g.log.Warn("relay: five-token supervisor event on a profile task, stored after the cutoff, dropped",
 				"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
@@ -1050,7 +1052,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
 		addressee := rec.AddresseeFor(taskID)
-		if task, err := g.replayForTerminal(ctx, addressee, taskID, g.taskIsProfile(rec, taskID, addressee)); err == nil {
+		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
 				replayedResult = art.Parts
@@ -1490,15 +1492,14 @@ func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID 
 	}
 }
 
-// replayForTerminal is relayTerminal's read of the task's stream. profile is
-// taskIsProfile's answer for the task.
-func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string, profile bool) (*lib.Task, error) {
+// replayForTerminal is relayTerminal's read of the task's stream.
+func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
 	if g.terminalReplayHook != nil {
 		if err := g.terminalReplayHook(taskID); err != nil {
 			return nil, err
 		}
 	}
-	return g.client.TasksGet(ctx, addressee, taskID, lib.ProfileTaskIf(profile))
+	return g.client.TasksGet(ctx, addressee, taskID)
 }
 
 // reasonToken is the token of an executor's `reason: <token>[ - detail]`

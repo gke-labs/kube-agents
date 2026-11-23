@@ -284,6 +284,8 @@ type clientOptions struct {
 	// profileSupervisorCutoff is WithProfileSupervisorCutoff's, zero when
 	// unlatched.
 	profileSupervisorCutoff time.Time
+	// profileNames is WithProfileNames's, nil when none was given.
+	profileNames *ProfileNames
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come

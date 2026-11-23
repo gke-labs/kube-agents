@@ -2,8 +2,12 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,20 +18,32 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// The gate-2 names (#5301): a session-shaped token a profile is named, and a
-// profile-shaped token, with a live card, that a session task is addressed to.
+// The gate-2 names (#5301): a session-shaped token that is a profile's name
+// in the operator's profile names, and a profile-shaped token, with a live
+// card, that is not. Profile-ness is the operator's names and nothing else:
+// not the name's shape, not the directory, not how this server learned the
+// task.
 const (
-	cutoffSessionShaped = "cto-otter-1a2b"
-	cutoffProfileShaped = "fleet-audit"
+	cutoffSessionShaped = "cto-otter-1a2b" // a profile, by the names
+	cutoffProfileShaped = "fleet-audit"    // not a profile, card or not
 )
 
-// dialCutoff is dial with the install's profile supervisor cutoff.
+// dialCutoff is dial with the install's profile supervisor cutoff and the
+// operator's profile names, which name cutoffSessionShaped alone.
 func dialCutoff(t *testing.T, url string, cutoff time.Time) *NATSBus {
+	t.Helper()
+	return dialGate(t, url, lib.ProfileSupervisorGate{
+		ProfileSupervisorCutoffSetting: lib.ProfileSupervisorCutoffSetting{Cutoff: cutoff, Source: lib.CutoffSourceEnv},
+		Names:                          lib.NewProfileNames(cutoffSessionShaped),
+	})
+}
+
+func dialGate(t *testing.T, url string, gate lib.ProfileSupervisorGate) *NATSBus {
 	t.Helper()
 	b, err := DialBus(context.Background(), BusConfig{
 		URL: url, User: testUser, Password: testPass,
-		Deployment:              Deployment{Agent: "platform-agent", Namespace: "kubeagents-system"},
-		ProfileSupervisorCutoff: cutoff,
+		Deployment:            Deployment{Agent: "platform-agent", Namespace: "kubeagents-system"},
+		ProfileSupervisorGate: gate,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -50,54 +66,51 @@ func publishGatewayTerminal(t *testing.T, js jetstream.JetStream, addressee, tas
 	pub(t, js, lib.TaskSupervisorSubject(addressee, taskID), env)
 }
 
-// A noticed profile task's read doesn't end on a five-token supervisor
-// terminal stored after the cutoff; an .in-submitted session task's does,
-// under the same token. Each token is tried with both kinds, and the
-// profile-shaped one has a live card, so it is how the task was learned that
-// decides, not the name.
-func TestAFiveTokenTerminalAfterTheCutoffDoesNotEndANoticedProfileTask(t *testing.T) {
+// A profile's task doesn't end on a five-token supervisor terminal stored
+// after the cutoff; a task under a name that is no profile does. The profile
+// is named like a session and has no card; the other name is profile-shaped
+// and has one; so neither the name's shape nor the directory decides.
+func TestAFiveTokenTerminalAfterTheCutoffDoesNotEndAProfileTask(t *testing.T) {
 	url, js := testBus(t)
 	publishCard(t, js, cutoffProfileShaped, map[string]any{"name": cutoffProfileShaped})
 	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
 	ctx := context.Background()
-	for _, addressee := range []string{cutoffSessionShaped, cutoffProfileShaped} {
-		profTask, sessTask := "task-prof", "task-sess"
-		publishRun(t, js, addressee, profTask, "", false)
-		publishGatewayTerminal(t, js, addressee, profTask)
-		publishSubmission(t, js, addressee, sessTask, "console:x", "q", "")
-		publishRun(t, js, addressee, sessTask, "", false)
-		publishGatewayTerminal(t, js, addressee, sessTask)
 
-		prof := TaskRef{Addressee: addressee, TaskID: profTask}
-		b.kinds.note(prof, TaskKindProfile)
-		task, err := b.ReadTask(ctx, prof)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if task.Final || task.State != lib.StateWorking {
-			t.Errorf("%s: the profile task ended on a five-token terminal after the cutoff: %s final=%v", prof, task.State, task.Final)
-		}
-		// A wait doesn't end on it either: it runs out with the task working.
-		task, err = b.WaitForTask(ctx, prof, time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if task.Final {
-			t.Errorf("%s: a wait ended on the five-token terminal", prof)
-		}
+	prof := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-prof"}
+	publishRun(t, js, prof.Addressee, prof.TaskID, "", false)
+	publishGatewayTerminal(t, js, prof.Addressee, prof.TaskID)
+	task, err := b.ReadTask(ctx, prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Final || task.State != lib.StateWorking {
+		t.Errorf("%s: the profile task ended on a five-token terminal after the cutoff: %s final=%v", prof, task.State, task.Final)
+	}
+	// A wait doesn't end on it either: it runs out with the task working.
+	task, err = b.WaitForTask(ctx, prof, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Final {
+		t.Errorf("%s: a wait ended on the five-token terminal", prof)
+	}
 
-		sess := TaskRef{Addressee: addressee, TaskID: sessTask}
-		b.kinds.note(sess, TaskKindSession)
-		task, err = b.WaitForTask(ctx, sess, 5*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !task.Final || task.State != lib.StateFailed {
-			t.Errorf("%s: the session task's supervisor terminal was not read: %s final=%v", sess, task.State, task.Final)
-		}
+	sess := TaskRef{Addressee: cutoffProfileShaped, TaskID: "task-sess"}
+	publishSubmission(t, js, sess.Addressee, sess.TaskID, "console:x", "q", "")
+	publishRun(t, js, sess.Addressee, sess.TaskID, "", false)
+	publishGatewayTerminal(t, js, sess.Addressee, sess.TaskID)
+	task, err = b.WaitForTask(ctx, sess, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.Final || task.State != lib.StateFailed {
+		t.Errorf("%s: the session task's supervisor terminal was not read: %s final=%v", sess, task.State, task.Final)
 	}
 	if b.client.ProfileSupervisorDrops() == 0 {
 		t.Error("no drop counted")
+	}
+	if n := directoryConsumers(t, js); n != 0 {
+		t.Errorf("a latched read opened %d DIRECTORY consumers; profile-ness is not the directory's", n)
 	}
 }
 
@@ -114,198 +127,134 @@ func steerOrSubmission(t *testing.T, addressee, taskID, conversation, text, viaT
 	return &nats.Msg{Subject: lib.TaskInSubject(addressee, taskID), Data: mustJSON(t, env)}
 }
 
-// How the MCP server learns a task sets its kind, kept beside the reference:
-// the gateway's status line names only a profile task, and a task delegated
-// in the chain and submitted on .in is a session's or the platform agent's.
-// A turn's own submission says nothing, since it can be a steer into a
-// profile task, and neither does a typed reference.
-func TestHowATaskIsLearnedSetsItsKind(t *testing.T) {
-	kinds := &taskKinds{}
+// Nothing the gateway writes moves a task across the gate. The gateway
+// writes .in, the console's status lines and the profile directory's
+// readers' inputs: a turn that takes an .in message on a profile's task as
+// its own, a chain that follows a delegated .in submission there, and a
+// status line naming the task, all leave a five-token terminal after the
+// cutoff unread on it, and none of them makes a task under another name read
+// as a profile's.
+func TestNothingTheGatewayWritesMovesATaskAcrossTheGate(t *testing.T) {
+	url, js := testBus(t)
+	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
+	ctx := context.Background()
 	const conv = "console:x"
 	w := &turnWatch{addressed: true, messageID: "frame-1", conversation: conv, texts: []string{"q"},
-		known: map[string]bool{}, subs: make(chan *nats.Msg, 1), stop: make(chan struct{}), kinds: kinds}
-	noticed, ok := w.noticedTask(&nats.Msg{Data: mustJSON(t, ConsoleOutFrame{Text: "⏳ submitted", TaskID: "task-n",
-		Addressee: cutoffSessionShaped, InReplyTo: "frame-1"})})
-	if !ok || kinds.of(noticed) != TaskKindProfile {
-		t.Errorf("noticed task = %+v, %v, kind %d; want a profile task", noticed, ok, kinds.of(noticed))
-	}
-	own, ok := w.ownSubmission(steerOrSubmission(t, cutoffProfileShaped, "task-s", conv, "q", "", "corr-turn"))
-	if !ok || kinds.of(own) != TaskKindUnknown || own.Addressee != cutoffProfileShaped {
-		t.Errorf("own submission = %+v, %v, kind %d; want its kind unknown", own, ok, kinds.of(own))
-	}
-	done := make(chan struct{})
-	go func() { w.follow(); close(done) }()
-	w.subs <- steerOrSubmission(t, cutoffProfileShaped, "task-child", conv, "go", "task-s", "corr-turn")
-	deadline := time.Now().Add(2 * time.Second)
-	for len(w.followedTasks()) < 1 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	close(w.stop)
-	<-done
-	if got := w.followedTasks(); len(got) != 1 || kinds.of(got[0]) != TaskKindSession {
-		t.Errorf("followed %v; want task-child as a session task", got)
-	}
-	if typed, err := ParseTaskRef(cutoffProfileShaped+"/task-t", ""); err != nil || kinds.of(typed) != TaskKindUnknown {
-		t.Errorf("a typed reference = %+v, %v; want its kind unknown", typed, err)
-	}
-}
+		known: map[string]bool{}, subs: make(chan *nats.Msg, 1), stop: make(chan struct{})}
 
-// A reference names the same task however it was learned: a typed reference
-// to the turn's root is the step state's root, on an unlatched install with
-// the root's kind known, so the root's watch and branches are the same.
-func TestATypedReferenceMatchesTheStoredStepReference(t *testing.T) {
-	kinds := &taskKinds{}
-	w := &turnWatch{addressed: true, messageID: "frame-1", known: map[string]bool{}, stop: make(chan struct{}), kinds: kinds}
-	root, ok := w.noticedTask(&nats.Msg{Data: mustJSON(t, ConsoleOutFrame{Text: "⏳ submitted", TaskID: "task-root",
-		Addressee: cutoffProfileShaped, InReplyTo: "frame-1"})})
-	if !ok || kinds.of(root) != TaskKindProfile {
-		t.Fatalf("noticed task = %+v, %v", root, ok)
-	}
-	typed, err := ParseTaskRef(root.String(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if typed != root {
-		t.Errorf("typed %+v != stored %+v", typed, root)
-	}
-	convs := NewConversations()
-	st := convs.initTaskStepState(root, "tok", DefaultConversation, false, nil, nil)
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if !st.isUnsubmittedRootLocked(typed) {
-		t.Error("a typed reference to the root is not the state's unsubmitted root")
-	}
-	st.followedRefs = []TaskRef{root}
-	if !slices.Contains(st.syncFollowedTasksLocked(), typed) {
-		t.Error("a typed reference does not match the followed reference")
-	}
-}
-
-// A message the gateway steers into a running profile task arrives on the
-// task's .in like a new session task's submission, and a turn takes it as its
-// own. Under a profile with a session-shaped name and a live card, that task
-// is read as the profile's after the cutoff: its five-token terminal is not
-// taken.
-func TestASteerIntoAProfileTaskDoesNotTakeAFiveTokenTerminal(t *testing.T) {
-	url, js := testBus(t)
-	publishCard(t, js, cutoffSessionShaped, map[string]any{"name": cutoffSessionShaped})
-	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
-	const conv, taskID = "console:x", "task-steered"
-	w := &turnWatch{conversation: conv, texts: []string{"and also this"}, known: map[string]bool{}, kinds: &b.kinds}
-	ref, ok := w.ownSubmission(steerOrSubmission(t, cutoffSessionShaped, taskID, conv, "and also this", "", "corr-"+taskID))
-	if !ok {
-		t.Fatal("the turn did not take the steer as its own")
-	}
-	publishRun(t, js, cutoffSessionShaped, taskID, "", false)
-	publishGatewayTerminal(t, js, cutoffSessionShaped, taskID)
-	task, err := b.ReadTask(context.Background(), ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if task.Final || task.State != lib.StateWorking {
-		t.Errorf("the steered profile task ended on a five-token terminal after the cutoff: %s final=%v", task.State, task.Final)
-	}
-}
-
-// A watch settles its task's kind on the ctx of the call that made it, so a
-// watch kept past that call (a step poll's) reads a session task's terminal,
-// not a cancelled directory read's "profile".
-func TestAWatchKeptPastItsCallReadsASessionTasksTerminal(t *testing.T) {
-	url, js := testBus(t)
-	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
-	const taskID = "task-kept"
-	publishRun(t, js, cutoffSessionShaped, taskID, "", false)
-	publishGatewayTerminal(t, js, cutoffSessionShaped, taskID)
-	ref := TaskRef{Addressee: cutoffSessionShaped, TaskID: taskID}
-	made, cancel := context.WithCancel(context.Background())
-	w, err := b.watchTask(made, ref)
-	cancel()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.close()
-	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
-	defer stop()
-	for w.pending > 0 {
-		if err := w.next(ctx); err != nil {
-			t.Fatal(err)
+	// A turn's own .in message, a delegated .in submission with a via, and
+	// a status line, each on a profile's task and on a session's.
+	for _, addressee := range []string{cutoffSessionShaped, cutoffProfileShaped} {
+		own, ok := w.ownSubmission(steerOrSubmission(t, addressee, "task-own", conv, "q", "", "corr-turn"))
+		if !ok {
+			t.Fatalf("%s: the turn did not take its .in message", addressee)
+		}
+		pub(t, js, lib.TaskInSubject(addressee, "task-child"), mustJSONEnv(t, steerOrSubmission(t, addressee, "task-child", conv, "go", "task-own", "corr-turn")))
+		noticed, ok := w.noticedTask(&nats.Msg{Data: mustJSON(t, ConsoleOutFrame{Text: "⏳ submitted", TaskID: "task-noticed",
+			Addressee: addressee, InReplyTo: "frame-1"})})
+		if !ok {
+			t.Fatalf("%s: the status line was not taken", addressee)
+		}
+		child := TaskRef{Addressee: addressee, TaskID: "task-child"}
+		for _, ref := range []TaskRef{own, child, noticed} {
+			publishRun(t, js, ref.Addressee, ref.TaskID, "", false)
+			publishGatewayTerminal(t, js, ref.Addressee, ref.TaskID)
+			task, err := b.ReadTask(ctx, ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantFinal := addressee != cutoffSessionShaped
+			if task.Final != wantFinal {
+				t.Errorf("%s: final = %v, want %v: profile-ness follows the operator's names alone", ref, task.Final, wantFinal)
+			}
 		}
 	}
-	task, err := w.fold()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !task.Final || task.State != lib.StateFailed {
-		t.Errorf("the session task read through a kept watch: %s final=%v, want its supervisor's terminal", task.State, task.Final)
-	}
 }
 
-// A directory read that fails decides nothing: the five-token terminal is held
-// unread, and once the directory answers, the same watch's next read places
-// it, so a session task's terminal is read.
-func TestAFailedDirectoryReadIsNotKept(t *testing.T) {
-	url, js := testBus(t)
-	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
-	ctx, stop := context.WithTimeout(context.Background(), 10*time.Second)
-	defer stop()
-	dir, err := js.Stream(ctx, streamDirectory)
-	if err != nil {
+// mustJSONEnv is the envelope a steerOrSubmission message carries.
+func mustJSONEnv(t *testing.T, m *nats.Msg) *lib.Envelope {
+	t.Helper()
+	var env lib.Envelope
+	if err := json.Unmarshal(m.Data, &env); err != nil {
 		t.Fatal(err)
 	}
-	cfg := dir.CachedInfo().Config
+	return &env
+}
+
+// A profile whose card was withdrawn, or whose directory can't be read at
+// all, is still a profile: the read decides at once from the operator's names
+// and the stored time. A task whose only message the cutoff refused is not
+// found at once; a session task's supervisor terminal is read at once; and a
+// profile's task with a working event and a refused terminal reads working.
+// Before the names, the directory decided, and with it unreadable a held
+// message waited for it.
+func TestAnUnreadableDirectoryDecidesNothing(t *testing.T) {
+	url, js := testBus(t)
+	ctx, stop := context.WithTimeout(context.Background(), 20*time.Second)
+	defer stop()
 	if err := js.DeleteStream(ctx, streamDirectory); err != nil {
 		t.Fatal(err)
 	}
-	const taskID = "task-doubted"
-	publishRun(t, js, cutoffSessionShaped, taskID, "", false)
-	publishGatewayTerminal(t, js, cutoffSessionShaped, taskID)
-	ref := TaskRef{Addressee: cutoffSessionShaped, TaskID: taskID}
+	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
 
-	if _, err := b.ReadTask(ctx, ref); err != nil {
-		t.Fatal(err)
+	refused := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-only-refused"}
+	publishGatewayTerminal(t, js, refused.Addressee, refused.TaskID)
+	start := time.Now()
+	if _, err := b.WaitForTask(ctx, refused, 10*time.Second); err != ErrTaskNotFound {
+		t.Errorf("a wait on a task with only a refused terminal = %v, want ErrTaskNotFound", err)
 	}
-	w, err := b.watchTask(ctx, ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.close()
-	for w.pending > 0 {
-		if err := w.next(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if task, err := w.fold(); err != nil || task.Final {
-		t.Fatalf("with no directory, the read = %+v, %v; want the terminal held unread", task, err)
-	}
-	if len(w.doubted) != 1 || w.dropped != 0 {
-		t.Fatalf("held %d, dropped %d; want the terminal held, not dropped", len(w.doubted), w.dropped)
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("the wait took %s; it should answer at once", took)
 	}
 
-	if _, err := js.CreateStream(ctx, cfg); err != nil {
-		t.Fatal(err)
+	sess := TaskRef{Addressee: cutoffProfileShaped, TaskID: "task-sess"}
+	publishGatewayTerminal(t, js, sess.Addressee, sess.TaskID)
+	start = time.Now()
+	task, err := b.WaitForTask(ctx, sess, 10*time.Second)
+	if err != nil || !task.Final || task.State != lib.StateFailed {
+		t.Errorf("a session task's terminal with no directory = %+v, %v; want it read", task, err)
 	}
-	if err := w.nextWait(ctx, minFetchWait); err != nil && ctx.Err() != nil {
-		t.Fatal(err)
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("the session read took %s; it should answer at once", took)
 	}
-	task, err := w.fold()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !task.Final || task.State != lib.StateFailed {
-		t.Errorf("once the directory answered: %s final=%v, want the session task's terminal", task.State, task.Final)
-	}
-	if b.client.ProfileSupervisorDrops() != 0 {
-		t.Errorf("%d drops counted for a session task", b.client.ProfileSupervisorDrops())
+
+	prof := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-prof"}
+	publishRun(t, js, prof.Addressee, prof.TaskID, "", false)
+	publishGatewayTerminal(t, js, prof.Addressee, prof.TaskID)
+	task, err = b.ReadTask(ctx, prof)
+	if err != nil || task.Final || task.State != lib.StateWorking {
+		t.Errorf("a profile's task with no directory = %+v, %v; want it working", task, err)
 	}
 }
 
-// Planner call A (#5301): a reference typed into task_control get, to a task
-// this server learned nothing of, has no kind, so an addressee with a live
-// agent card is read as a profile. The
-// residue, pinned here: an old session task whose name a profile has since
-// taken reads as unfinished once the cutoff is set and its gateway terminal
-// is stored after it. Without the card it reads as ended, as before.
-func TestAnOldSessionTaskNamedLikeANewProfileReadsAsUnfinishedInGet(t *testing.T) {
+// A message held for an undecided kind used to read as "no such task" when
+// the directory was unreadable (the review's point 4). Nothing is held now:
+// a wait on a submitted task whose first event has not landed still waits
+// for it rather than answering not found, and the refused-only answer is
+// given only when the stream has nothing else.
+func TestAWaitOnASubmittedTaskStillWaitsForItsFirstEvent(t *testing.T) {
+	url, js := testBus(t)
+	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
+	ref := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-late"}
+	publishGatewayTerminal(t, js, ref.Addressee, ref.TaskID)
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		publishRun(t, js, ref.Addressee, ref.TaskID, "the answer", true)
+	}()
+	task, err := b.waitForSubmittedTask(context.Background(), ref, 10*time.Second)
+	if err != nil || !task.Final || task.State != lib.StateCompleted {
+		t.Errorf("a submitted task's wait = %+v, %v; want its executor's terminal", task, err)
+	}
+}
+
+// Planner call A (#5301) as the names have it: a session task whose
+// addressee is in the operator's profile names reads as a profile's, so its
+// gateway terminal stored after the cutoff is not read, and get shows it
+// unfinished. The bus refuses the gateway that write on a profile's name
+// already (nats.conf's per-profile deny, from the same names), so the reading
+// and the permission agree. Under a name the names don't hold it reads as
+// ended, card or not.
+func TestASessionTaskUnderAProfilesNameReadsAsUnfinishedInGet(t *testing.T) {
 	url, js := testBus(t)
 	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
 	convs := NewConversations()
@@ -318,26 +267,19 @@ func TestAnOldSessionTaskNamedLikeANewProfileReadsAsUnfinishedInGet(t *testing.T
 	}
 	publishCard(t, js, cutoffProfileShaped, map[string]any{"name": cutoffProfileShaped})
 
-	got := callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task": cutoffProfileShaped + "/task-old"})
+	got := callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task": cutoffSessionShaped + "/task-old"})
 	if got.IsError || !strings.Contains(got.Content[0].Text, "**working** (still running") {
-		t.Errorf("get of the old session task under a profile's name = %+v, want it unfinished", got)
+		t.Errorf("get of a session task under a profile's name = %+v, want it unfinished", got)
 	}
-	got = callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task": cutoffSessionShaped + "/task-old"})
-	if got.IsError || !strings.Contains(got.Content[0].Text, "**failed**") || strings.Contains(got.Content[0].Text, "still running") {
-		t.Errorf("get of a session task with no card under its name = %+v, want it ended", got)
-	}
-	// The session-kind row: a task this server learned as a session's (a
-	// turn's delegated task) reads as one when typed, card or not.
-	b.kinds.note(TaskRef{Addressee: cutoffProfileShaped, TaskID: "task-old"}, TaskKindSession)
 	got = callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task": cutoffProfileShaped + "/task-old"})
 	if got.IsError || !strings.Contains(got.Content[0].Text, "**failed**") || strings.Contains(got.Content[0].Text, "still running") {
-		t.Errorf("get of a typed reference to a task learned as a session's = %+v, want it ended", got)
+		t.Errorf("get of a session task under a name with a card and not in the names = %+v, want it ended", got)
 	}
 }
 
 // The swarm read applies the same rule: a task it knows only from the stream
-// is a profile's when its addressee has a live card, and its five-token
-// terminal after the cutoff is not folded.
+// is a profile's when its addressee is in the operator's names, and its
+// five-token terminal after the cutoff is not folded.
 func TestTheSwarmReadDropsAFiveTokenTerminalAfterTheCutoffForAProfile(t *testing.T) {
 	url, js := testBus(t)
 	publishCard(t, js, cutoffProfileShaped, map[string]any{"name": cutoffProfileShaped})
@@ -357,62 +299,56 @@ func TestTheSwarmReadDropsAFiveTokenTerminalAfterTheCutoffForAProfile(t *testing
 			final[task.Addressee] = task.Task.Final
 		}
 	}
-	if f, ok := final[cutoffProfileShaped]; !ok || f {
+	if f, ok := final[cutoffSessionShaped]; !ok || f {
 		t.Errorf("the profile's task folded final=%v (seen %v), want unfinished", f, ok)
 	}
-	if f, ok := final[cutoffSessionShaped]; !ok || !f {
+	if f, ok := final[cutoffProfileShaped]; !ok || !f {
 		t.Errorf("the session's task folded final=%v (seen %v), want ended", f, ok)
 	}
-	// The session row drops nothing: the one drop is the profile's.
 	if n := b.client.ProfileSupervisorDrops(); n != 1 {
 		t.Errorf("the swarm read counted %d drops, want the profile's one", n)
 	}
 }
 
-// forget drops every kind recorded, for a test that tries one reference
-// under each kind.
-func (k *taskKinds) forget() {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.kinds, k.order = nil, nil
-}
-
 // Unlatched, every read is what it was before the cutoff existed: the same
-// fold whatever kind the reference carries and whether or not the addressee
-// has a card, with no directory read and nothing counted.
+// fold whatever the profile names hold, with no directory read and nothing
+// counted.
 func TestAnUnlatchedServerReadsBothFormsAsBefore(t *testing.T) {
 	url, js := testBus(t)
 	publishCard(t, js, cutoffProfileShaped, map[string]any{"name": cutoffProfileShaped})
-	b := dial(t, url)
+	plain := dial(t, url)
+	named := dialGate(t, url, lib.ProfileSupervisorGate{Names: lib.NewProfileNames(cutoffSessionShaped, cutoffProfileShaped)})
+	unloaded := dialGate(t, url, lib.ProfileSupervisorGate{Names: &lib.ProfileNames{}})
 	ctx := context.Background()
 	for _, addressee := range []string{cutoffProfileShaped, cutoffSessionShaped} {
 		publishSubmission(t, js, addressee, "task-u", "console:x", "q", "")
 		publishRun(t, js, addressee, "task-u", "", false)
 		publishGatewayTerminal(t, js, addressee, "task-u")
-		var first *lib.Task
-		for _, kind := range []TaskKind{TaskKindUnknown, TaskKindProfile, TaskKindSession} {
-			ref := TaskRef{Addressee: addressee, TaskID: "task-u"}
-			b.kinds.forget()
-			b.kinds.note(ref, kind)
-			task, err := b.ReadTask(ctx, ref)
+		ref := TaskRef{Addressee: addressee, TaskID: "task-u"}
+		want, err := plain.ReadTask(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !want.Final || want.State != lib.StateFailed {
+			t.Errorf("%s: %s final=%v, want the supervisor's terminal", addressee, want.State, want.Final)
+		}
+		for label, b := range map[string]*NATSBus{"names": named, "names never loaded": unloaded} {
+			got, err := b.ReadTask(ctx, ref)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !task.Final || task.State != lib.StateFailed {
-				t.Errorf("%s kind %d: %s final=%v, want the supervisor's terminal", addressee, kind, task.State, task.Final)
-			}
-			if first == nil {
-				first = task
-			} else if !reflect.DeepEqual(task, first) {
-				t.Errorf("%s kind %d: the fold differs by kind:\n got %+v\nwant %+v", addressee, kind, task, first)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("%s, %s: the fold differs:\n got %+v\nwant %+v", addressee, label, got, want)
 			}
 		}
 	}
 	if n := directoryConsumers(t, js); n != 0 {
 		t.Errorf("an unlatched read opened %d DIRECTORY consumers", n)
 	}
-	if b.client.ProfileSupervisorDrops() != 0 {
-		t.Errorf("an unlatched server counted %d drops", b.client.ProfileSupervisorDrops())
+	for _, b := range []*NATSBus{plain, named, unloaded} {
+		if b.client.ProfileSupervisorDrops() != 0 {
+			t.Errorf("an unlatched server counted %d drops", b.client.ProfileSupervisorDrops())
+		}
 	}
 }
 
@@ -424,7 +360,6 @@ func TestAWaitOnATaskWithOnlyARefusedTerminalIsNotFoundAtOnce(t *testing.T) {
 	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
 	ref := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-only-refused"}
 	publishGatewayTerminal(t, js, ref.Addressee, ref.TaskID)
-	b.kinds.note(ref, TaskKindProfile)
 	ctx := context.Background()
 	if _, err := b.ReadTask(ctx, ref); err != ErrTaskNotFound {
 		t.Fatalf("ReadTask = %v, want ErrTaskNotFound", err)
@@ -436,5 +371,44 @@ func TestAWaitOnATaskWithOnlyARefusedTerminalIsNotFoundAtOnce(t *testing.T) {
 	}
 	if took := time.Since(start); took > 3*time.Second {
 		t.Errorf("WaitForTask took %s; it should answer at once, not wait out the 10s", took)
+	}
+}
+
+// The health probe says which gate the server runs with, so a malformed
+// cutoff or names that never loaded show outside the log: the cutoff, its
+// source, whether the names are loaded, and the drops.
+func TestTheHealthProbeShowsTheProfileSupervisorGate(t *testing.T) {
+	url, _ := testBus(t)
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte("tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 11, 23, 15, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		value string
+		names *lib.ProfileNames
+		want  ProfileSupervisorHealth
+	}{
+		{"", nil, ProfileSupervisorHealth{Source: lib.CutoffSourceUnset}},
+		{"2026-11-23T12:10:00Z", lib.NewProfileNames("fleet-audit"), ProfileSupervisorHealth{Cutoff: "2026-11-23T12:10:00Z", Source: lib.CutoffSourceEnv, NamesLoaded: true}},
+		{"garbled", &lib.ProfileNames{}, ProfileSupervisorHealth{Cutoff: "2026-11-23T15:00:00Z", Source: lib.CutoffSourceMalformed}},
+	} {
+		setting := lib.ProfileSupervisorCutoffFromEnv(func(string) string { return c.value }, start, nil)
+		b := dialGate(t, url, lib.ProfileSupervisorGate{ProfileSupervisorCutoffSetting: setting, Names: c.names})
+		srv := mustServer(t)
+		h := Handler(srv, tokenFile, nil, WithProfileSupervisorHealth(b.ProfileSupervisorHealth))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, HealthPath, nil))
+		var body struct {
+			Status string                  `json:"status"`
+			Gate   ProfileSupervisorHealth `json:"profileSupervisorGate"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%q: %v (%s)", c.value, err, rec.Body.String())
+		}
+		if body.Status != "ok" || body.Gate != c.want {
+			t.Errorf("%q: health = %+v, want gate %+v", c.value, body, c.want)
+		}
 	}
 }
