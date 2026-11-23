@@ -62,7 +62,7 @@ spec:
     limits: { cpu: "1", memory: 2Gi }
 ```
 
-`harness.type` names the harness the worker image runs. Absent is `claude-code`, which is also the only value the CRD accepts today. Leave it out for Claude Code. The operator passes it to the worker as `A2A_HARNESS` only when it is set, so a profile without it keeps the pods it had. A manifest that sets it can't be applied to an older CRD that lacks the field.
+`harness.type` names the harness the worker image runs. Absent is `claude-code`, which is also the only value the CRD accepts today. Leave it out for Claude Code. The operator passes it to the worker as `A2A_HARNESS` only when it is set, so a profile without it keeps the pods it had. On an older CRD that lacks the field, a client that validates fields strictly, as kubectl does by default, refuses a manifest that sets it. A client that doesn't applies it with the field dropped, so the profile runs as Claude Code.
 
 The type is pod configuration only. It isn't on the profile's card, and no bus subject or permission depends on it. If a profile's type is one this operator doesn't render (an older, newer or edited CRD let it in), the operator refuses the profile: `IdentityReady` is False with reason `HarnessNotSupported`, and nothing is rendered for it.
 
