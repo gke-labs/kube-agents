@@ -579,6 +579,98 @@ func TestChildWaitReserve(t *testing.T) {
 	}
 }
 
+// Under a driver that holds steers, the delivery turn is a turn like a held
+// steer's: PrepareTurn runs before it is written, and children that end
+// while the hand-off turn is still running get their turn at that turn's
+// result, not mid-turn. Ends that arrive once the harness is between turns
+// are written at once, after PrepareTurn. Either way the next result is the
+// deliverable.
+func TestADriverThatHoldsSteersGetsTheDeliveryAfterPrepareTurn(t *testing.T) {
+	for _, midTurn := range []bool{true, false} {
+		t.Run(fmt.Sprintf("midTurn=%v", midTurn), func(t *testing.T) {
+			url := startServer(t)
+			c := testClient(t, url)
+			addressee, taskID := "auditor-toy", fmt.Sprintf("task-wait-toy-%v", midTurn)
+			submit(t, c, addressee, taskID, "audit prod")
+			dir, err := os.MkdirTemp("", "p")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(dir) })
+			argv := stub(t, `
+dir='`+dir+`'
+echo 'S toy-parent'
+read -r first || exit 1
+touch "$dir/armed"
+i=0
+while [ ! -f "$dir/go" ] && [ "$i" -lt 1800 ]; do sleep 0.05; i=$((i+1)); done
+if read -r -t 1 early; then
+  echo 'OK handed the audit out'
+  echo 'OK during=early'
+  exit 0
+fi
+echo 'OK handed the audit out'
+read -r -t 60 delivery || exit 1
+printf '%s\n' "$delivery" > "$dir/delivery.txt"
+[ -e "$dir/prepared" ] && prep=yes || prep=no
+echo "OK during=none prepared=$prep"
+cat > /dev/null
+`)
+			d := &toyDriver{hold: true, prepare: func(n int, _ TurnDirs) error {
+				if n == 2 {
+					return os.WriteFile(filepath.Join(dir, "prepared"), nil, 0o600)
+				}
+				return nil
+			}}
+			cfg := adapterConfig(url, taskID, addressee, argv)
+			cfg.DelegateSocket = filepath.Join(dir, "d.sock")
+			cfg.TaskDeadline = 2 * time.Minute
+			cfg.Driver = d
+			done := runDispatched(context.Background(), cfg)
+			waitPath(t, filepath.Join(dir, "armed"), "the parent stub never started")
+
+			if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+				t.Fatalf("delegate reply = %+v", reply)
+			}
+			end := childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes."})
+			goFile := filepath.Join(dir, "go")
+			if midTurn {
+				sendChildEnd(t, c, addressee, taskID, end)
+				time.Sleep(childWaitPause)
+				if err := os.WriteFile(goFile, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.WriteFile(goFile, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				waitWorkingNote(t, url, addressee, taskID, "waiting on 1 delegated task")
+				sendChildEnd(t, c, addressee, taskID, end)
+			}
+
+			out := waitOutcome(t, done, 45*time.Second)
+			if out.err != nil || out.res.State != lib.StateCompleted {
+				t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+			}
+			if r := artifactText(foldTask(t, c, addressee, taskID), lib.ArtifactResult); r != "during=none prepared=yes" {
+				t.Fatalf("result %q: the delivery should be written after the hand-off turn's result and PrepareTurn", r)
+			}
+			if calls, _ := d.prepared(); calls != 2 {
+				t.Errorf("PrepareTurn ran %d times, want 2 (spawn, delivery)", calls)
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, "delivery.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The toy's encoding is the raw text, so its first line is all
+			// the stub reads: the wrapper's lead, in the toy's encoding.
+			if got := string(raw); !strings.HasPrefix(got, "TOY "+childDeliveryLead) {
+				t.Errorf("delivery line %q", got)
+			}
+		})
+	}
+}
+
 // Through the profile worker: a profile that delegates runs its harness with
 // the delegate tool rendered into the persona's flags, and a task with via
 // (a child, or a wake) runs without it. A profile without the opt-in never

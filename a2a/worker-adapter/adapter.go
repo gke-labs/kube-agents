@@ -1002,6 +1002,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// refused visibly if none does.
 		holdSteers = a.cfg.driver().HoldsSteers()
 		held       []string
+		// heldDelivery is a settled wait's delivery turn under a driver
+		// that holds steers, when it settled mid-turn: written at that
+		// turn's result, after PrepareTurn.
+		heldDelivery string
 	)
 
 	// refuseHeld refuses, on the stream and before the terminal, every steer
@@ -1034,10 +1038,33 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		return true
 	}
 
-	// deliver writes the wait's ends to the harness as one user turn, once:
-	// all of them, or what has arrived when the request was refused or the
-	// reserve fired. The turn is counted like a steer, so the result that
-	// settles it is the deliverable.
+	// writeDelivery writes the children's ends onto stdin as one user turn,
+	// counted like a steer, so the result that settles it is the
+	// deliverable. A driver that holds steers prepares the turn first, as it
+	// does for a held steer; its failure ends the task.
+	writeDelivery := func(text string) {
+		if holdSteers {
+			if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
+				log.Warn("preparing the delivery turn failed; ending the task", "task", a.taskID, "err", err)
+				sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+				proc.closeStdin()
+				return
+			}
+		}
+		if err := proc.writeUser(text); err != nil {
+			log.Warn("delivering the delegated tasks' results failed", "task", a.taskID, "err", err)
+			return
+		}
+		pendingTurns++
+		log.Info("delegated tasks' results delivered as one turn", "task", a.taskID)
+	}
+
+	// deliver settles the wait once: all of its ends, or what has arrived
+	// when the request was refused or the reserve fired, scrubbed (a.scrub,
+	// which reads the seen-values set and never feeds it). Written at once
+	// when the harness is between turns or queues a mid-turn message; a
+	// driver that holds steers gets it at the running turn's result
+	// (heldDelivery).
 	deliver := func(why string) {
 		if wait == nil || wait.delivered {
 			return
@@ -1047,13 +1074,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			reserve.Stop()
 			reserveC = nil
 		}
-		if err := proc.writeUser(wait.childDelivery(a.scrub)); err != nil {
-			log.Warn("delivering the delegated tasks' results failed", "task", a.taskID, "err", err)
+		log.Info("delegated tasks' wait settled", "task", a.taskID, "why", why,
+			"results", len(wait.got), "asked", len(wait.asked), "refused", wait.refusal != nil)
+		text := wait.childDelivery(a.scrub)
+		if holdSteers && pendingTurns > 0 {
+			heldDelivery = text
+			log.Info("delivery held until the turn boundary", "task", a.taskID)
 			return
 		}
-		pendingTurns++
-		log.Info("delegated tasks' results delivered as one turn", "task", a.taskID, "why", why,
-			"results", len(wait.got), "asked", len(wait.asked), "refused", wait.refusal != nil)
+		writeDelivery(text)
 	}
 	defer func() {
 		if reserve != nil {
@@ -1174,6 +1203,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						log.Info("turn result absorbed; waiting on delegated tasks",
 							"task", a.taskID, "outstanding", wait.outstanding())
 						a.publishWorkingNote(waitingText(wait.outstanding()))
+						continue
+					} else if pendingTurns <= 0 && heldDelivery != "" && !canceled && !deadlineHit {
+						// The children's ends arrived mid-turn under a driver
+						// that holds steers: this boundary is the delivery
+						// turn's, and its result is the deliverable.
+						text := heldDelivery
+						heldDelivery = ""
+						writeDelivery(text)
 						continue
 					} else if pendingTurns <= 0 {
 						sawResult = true
