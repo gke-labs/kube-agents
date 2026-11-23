@@ -1497,7 +1497,7 @@
 # It needs a session cap of at most 2, which the nightly install does not
 # have, so here it reports infrastructure naming the cap; its evidence runs
 # come from twins that set the cap to 2. deployer: noop, read-only.
-./tasks/session-front-door-cap-busy-notice/task.yaml
+# twin: ./tasks/session-front-door-cap-busy-notice/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
