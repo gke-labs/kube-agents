@@ -821,9 +821,10 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 // before any route mutation that will need a fresh pod. At the cap the pods
 // idle longest make room (evictIdleSessions): one, or over the cap the idle
 // surplus too, and each conversation is told. With too few idle pods to get
-// under the cap, a chat turn waits in line for a slot with a queued notice
-// (session_cap_queue.go); past the line's bounds, or from a door, it is
-// refused with a reply naming the count left - never dropped. replacing marks a turn that retires its previous incarnation in
+// under the cap, a chat, console or inject turn waits in line for a slot
+// with a queued notice (session_cap_queue.go); past the line's bounds, or
+// from an A2A door, it is refused with a reply naming the count left - never
+// dropped. replacing marks a turn that retires its previous incarnation in
 // the same breath: the doomed pod is usually still live at count time, so
 // it hands its slot to its successor rather than double-counting - and if
 // it already went terminal or is already being deleted (SessionPods lists
@@ -855,8 +856,9 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	// check makes (eviction notices, the refusal) go out after it ends, so a
 	// slow chat backend doesn't hold up every other conversation.
 	//
-	// At the cap with nothing to evict, a chat turn waits in line rather
-	// than being refused (session_cap_queue.go): parked, it returns true
+	// At the cap with nothing to evict, a turn that may park (parksAtCap:
+	// chat, console, inject) waits in line rather than being refused
+	// (session_cap_queue.go): parked, it returns true
 	// as a refusal does, its queued notice posted after the check. A fresh
 	// arrival queues behind a line that is not empty, before any eviction,
 	// so a slot that frees goes to the oldest waiter, whose retry comes
