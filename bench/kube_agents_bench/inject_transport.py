@@ -1669,6 +1669,39 @@ class InjectTask:
             )
         return self.task_id
 
+    def await_working(self, task_id: str, deadline: float) -> Fold:
+        """Read ``task_id``'s lifecycle until an executor has it working,
+        it ends, or ``deadline`` (``time.monotonic()``) passes.
+
+        Returns the fold of what the reads showed, whose trajectory carries
+        the task's ``a2a.status-update`` entries as any exchange's does:
+        :attr:`Fold.started` says whether it reached working (or ended), and
+        :attr:`Fold.final` whether it ended. Nothing is sent but reads.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        fold = Fold(task_id)
+        while True:
+            probe = Probe.from_body(self._poll(task_id, 0, 0))
+            if probe is not None:
+                self._note(fold, task_id, probe)
+                if probe.could_look and probe.task_id == task_id and probe.final:
+                    fold.mark_terminal(probe.executor_state, probe.terminal_source, probe.reason)
+            if fold.started or time.monotonic() >= deadline:
+                return fold
+            time.sleep(POLL_PAUSE_SECONDS)
+
+    @property
+    def refusal_text(self) -> str:
+        """Why this task started nothing, for a record: the gateway's own
+        post when it refused a queued turn (:attr:`line_refusal`), otherwise
+        the reason behind the refusal code (:func:`refusal_detail`), which
+        for a queued turn with no post is the line's bound running out."""
+        if self.refusal == REFUSAL_QUEUED and self.line_refusal:
+            return f"the gateway did not start the turn it had queued, and said so: {self.line_refusal!r}"
+        return refusal_detail(self.refusal)
+
     def await_queued_start(self, deadline: float) -> str:
         """The task a queued turn starts, or ``""`` when it never does.
 
