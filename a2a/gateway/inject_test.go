@@ -38,8 +38,6 @@ var (
 	_ Adapter         = (*InjectAdapter)(nil)
 	_ TaskObserver    = (*InjectAdapter)(nil)
 	_ InboundObserver = (*InjectAdapter)(nil)
-	_ CapLineObserver = (*InjectAdapter)(nil)
-	_ CapLineObserver = (*sideDoorAdapter)(nil)
 )
 
 const (
@@ -80,13 +78,6 @@ func startInjectRig(t *testing.T) *injectRig {
 // startInjectRigWith is startInjectRig with a hook into the Config before
 // New sees it.
 func startInjectRigWith(t *testing.T, tweak func(*Config)) *injectRig {
-	t.Helper()
-	return startInjectRigSpawning(t, tweak, nil)
-}
-
-// startInjectRigSpawning is startInjectRigWith with session pods armed on
-// spawn when it is not nil, for the door's turns on the session route.
-func startInjectRigSpawning(t *testing.T, tweak func(*Config), spawn *fakeSpawner) *injectRig {
 	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
@@ -146,11 +137,7 @@ func startInjectRigSpawning(t *testing.T, tweak func(*Config), spawn *fakeSpawne
 	if cfg.InjectConfirm {
 		adapter.AllowConfirm()
 	}
-	opts := Options{Client: client, Adapter: adapter, Config: cfg, Backend: injectBackend}
-	if spawn != nil {
-		opts.Spawner = spawn
-	}
-	g, err := New(opts)
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: injectBackend})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -241,7 +241,6 @@ func (g *Gateway) retireOverdue(ctx context.Context, key string) {
 		g.log.Warn("overdue check: closed a wedged task and retired its pod", "task", active.TaskID, "pod", rec.PodName,
 			"age", time.Since(active.SubmittedAt).Round(time.Second))
 		rec.PodName = ""
-		g.kickCapQueue()
 	}
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("overdue check: record write failed", "conversation", rec.Key, "err", err)
