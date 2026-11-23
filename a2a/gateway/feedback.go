@@ -236,7 +236,7 @@ func (d *feedbackDesk) lockKey(key string) func() {
 // calls retryFeedback after the bind when it did not.
 func (g *Gateway) startFeedback(ctx context.Context) bool {
 	if g.cfg.AnswerFeedbackOff {
-		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback or googleChat.answerFeedback)")
+		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback, googleChat.answerFeedback or A2A_TEAMS_ANSWER_FEEDBACK)")
 		return true
 	}
 	return g.tryFeedback(ctx, false)

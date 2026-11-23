@@ -166,10 +166,13 @@ const (
 // off when "false" (feedback.go); the operator renders each only from its
 // backend's answerFeedback=false. The gateway keeps one switch for every
 // backend it holds, so either name turns feedback off on Chat and Slack
-// alike.
+// alike. envTeamsAnswerFeedback is the same switch under Teams's name; no
+// CRD field renders it yet, so an install sets it on the gateway through
+// the operator's extra environment.
 const (
 	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
 	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
+	envTeamsAnswerFeedback = "A2A_TEAMS_ANSWER_FEEDBACK"
 )
 
 // envPeopleSeen turns the people bucket's records off when "false"
@@ -386,8 +389,9 @@ type Config struct {
 	GatewayLease string
 	PodName      string
 	// AnswerFeedbackOff is the install's slack.answerFeedback=false or
-	// googleChat.answerFeedback=false: no rating controls are drawn on any
-	// backend and nothing is kept, whatever the feedback bucket holds.
+	// googleChat.answerFeedback=false, or A2A_TEAMS_ANSWER_FEEDBACK=false:
+	// no rating controls are drawn on any backend and nothing is kept,
+	// whatever the feedback bucket holds.
 	AnswerFeedbackOff bool
 	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
 	// gateway records no one it sees in the people bucket.
@@ -1139,7 +1143,8 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
 	}
 	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false) ||
-		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false)
+		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false) ||
+		strings.TrimSpace(os.Getenv(envTeamsAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}

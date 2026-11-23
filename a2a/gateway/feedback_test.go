@@ -151,6 +151,21 @@ func TestAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
 	}
 }
 
+// Teams's name for the switch turns the same flag off.
+func TestTeamsAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
+	setBaseEnv(t)
+	for value, off := range map[string]bool{"": false, "true": false, "false": true, " false ": true} {
+		t.Setenv(envTeamsAnswerFeedback, value)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AnswerFeedbackOff != off {
+			t.Errorf("%q: AnswerFeedbackOff = %v, want %v", value, cfg.AnswerFeedbackOff, off)
+		}
+	}
+}
+
 // TestGchatAnswerFeedbackOffIsReadFromItsEnv: the gateway holds one chat
 // backend, so either backend's off switch turns the one flag off.
 func TestGchatAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
@@ -166,6 +181,7 @@ func TestGchatAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
 		{"true", "true", false},
 		{"", "true", false},
 	} {
+		t.Setenv(envTeamsAnswerFeedback, "")
 		t.Setenv(envSlackAnswerFeedback, tc.slack)
 		t.Setenv(envGchatAnswerFeedback, tc.gchat)
 		cfg, err := FromEnv()
