@@ -24,7 +24,10 @@ from pathlib import Path
 
 import patchlib
 
+DEFAULT_HERMES_ROOT = "/opt/hermes"
 LAZY_DEPS_FILE = "tools/lazy_deps.py"
+PATCH_PREFIX = "no_telegram_lazy_install"
+COMMIT_SUMMARY = "1 anchor"
 
 # Derived against v2026.9.14. The feature key is the anchor, with its opening
 # quote and the indent of a LAZY_DEPS entry, so a mention in a comment or a
@@ -42,11 +45,11 @@ TELEGRAM_ENTRY_PATCHED = (
 
 def apply(root: Path) -> None:
     """Remove the entry under ``root``, or raise SystemExit with the reason."""
-    patch = patchlib.Patch(root, LAZY_DEPS_FILE, prefix="no_telegram_lazy_install")
+    patch = patchlib.Patch(root, LAZY_DEPS_FILE, prefix=PATCH_PREFIX)
     patch.refuse_if_patched(PATCHED_MARKER)
     patch.substitute(TELEGRAM_ENTRY, TELEGRAM_ENTRY_PATCHED, expected=1)
-    patch.commit("1 anchor")
+    patch.commit(COMMIT_SUMMARY)
 
 
 if __name__ == "__main__":
-    apply(Path(sys.argv[1] if len(sys.argv) > 1 else "/opt/hermes"))
+    apply(Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HERMES_ROOT))

@@ -3102,8 +3102,12 @@ FROM proxy-tools AS credential-proxy
 # and no indication that the parent is the problem. Nothing below here is a
 # secret: it is the same scripts the agent image ships, world-readable one level
 # down. Ahead of the COPY so an agent source edit does not invalidate it.
-RUN chmod 0755 /opt/defaults && \
-    test -z "$(find / -xdev \( -iname 'python_telegram_bot*' -o -iname 'python-telegram-bot*' -o -path '*/telegram/ext/_application.py' \) -print -quit)" && \
+RUN chmod 0755 /opt/defaults
+
+# The package the Hermes copy leaves out has not come back through an install
+# in agent-base or proxy-tools (see the no-telegram block in agent-base). A RUN
+# of its own: one that also set a mode could not name `/`.
+RUN test -z "$(find / -xdev \( -iname 'python_telegram_bot*' -o -iname 'python-telegram-bot*' -o -path '*/telegram/ext/_application.py' \) -print -quit)" && \
     /opt/hermes/.venv/bin/python3 -c "import importlib.util; assert importlib.util.find_spec('telegram') is None, 'python-telegram-bot is importable'"
 
 # The same set the `platform` stage lays down at /opt/defaults/scripts, with the
