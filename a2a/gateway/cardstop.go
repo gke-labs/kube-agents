@@ -367,7 +367,7 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 		result, ok := cardStopResultOf(rs.result)
 		if !ok && !rs.local {
 			// A restart lost the render state; the stream has the result.
-			if task, err := g.replayForTerminal(ctx, run.Addressee, taskID); err == nil {
+			if task, err := g.replayForTerminal(ctx, run.Addressee, taskID, false); err == nil {
 				if art := task.Artifact(lib.ArtifactResult); art != nil {
 					result, ok = cardStopResultOf(art.Parts)
 				}

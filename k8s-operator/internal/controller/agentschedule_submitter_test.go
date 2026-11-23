@@ -25,6 +25,22 @@ import (
 // a2a/lib's contract test (TestTheOperatorsTriggerSubmissionIsALibTriggerSubmit).
 const triggerSubmitFixturePath = "../../../a2a/lib/testdata/rendered-trigger-submit.json"
 
+// triggerSubmitScriptFixturePath is the same for a built-in schedule's
+// script run.
+const triggerSubmitScriptFixturePath = "../../../a2a/lib/testdata/rendered-trigger-submit-script.json"
+
+// scriptSubmission is submitterSubmission's schedule turned into a script
+// run: a script in place of its prompt, and no skills or maxTurns, which
+// shape a model run (the CRD refuses them beside a script).
+func scriptSubmission() ScheduleSubmission {
+	sub := submitterSubmission()
+	sub.Schedule.Spec.Prompt = ""
+	sub.Schedule.Spec.Script = "compliance-audit"
+	sub.Schedule.Spec.Skills = nil
+	sub.Schedule.Spec.MaxTurns = nil
+	return sub
+}
+
 func submitterSchedule() *agentv1alpha1.AgentSchedule {
 	return &agentv1alpha1.AgentSchedule{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "kubeagents-system", Name: "compliance-audit"},
@@ -60,6 +76,59 @@ func TestTheTriggerSubmitFixtureIsWhatTheOperatorSends(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkFixture(t, triggerSubmitFixturePath, string(body)+"\n")
+}
+
+// TestTheScriptTriggerSubmitFixtureIsWhatTheOperatorSends is the fixture
+// for a built-in schedule's script run, which a2a/lib decodes and validates
+// as it does the prompt run's.
+func TestTheScriptTriggerSubmitFixtureIsWhatTheOperatorSends(t *testing.T) {
+	body, err := json.MarshalIndent(triggerSubmitFor(scriptSubmission()), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, triggerSubmitScriptFixturePath, string(body)+"\n")
+}
+
+// A built-in schedule's script rides on its trigger, beside its stream, with
+// a task text the gateway requires and no model reads. A user schedule's
+// submission never carries one, even if one reached it.
+func TestAScriptRunsSubmissionCarriesItsScriptOnTheTrigger(t *testing.T) {
+	w := triggerSubmitFor(scriptSubmission())
+	if w.Trigger != (triggerClaimWire{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}) {
+		t.Errorf("trigger = %+v, want the script beside the stream", w.Trigger)
+	}
+	if w.Prompt != "Scheduled script run: compliance-audit (no model turn)." {
+		t.Errorf("task text = %q", w.Prompt)
+	}
+	// A schedule stored without the CRD's rule may still carry skills and
+	// maxTurns beside its script: they stay off the wire.
+	stray := scriptSubmission()
+	stray.Schedule.Spec.Skills = []string{"fleet-audit"}
+	stray.Schedule.Spec.MaxTurns = ptr.To[int32](250)
+	body, err := json.Marshal(triggerSubmitFor(stray))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"skills"`) || strings.Contains(string(body), `"maxTurns"`) {
+		t.Errorf("a script run's submission carries skills or maxTurns: %s", body)
+	}
+	user := scriptSubmission()
+	user.Origin = agentv1alpha1.AgentScheduleOriginUser
+	if got := triggerSubmitFor(user); got.Trigger.Script != "" || got.Prompt != "" {
+		t.Errorf("a user schedule's submission carries script %q and task text %q", got.Trigger.Script, got.Prompt)
+	}
+}
+
+// With no script, the submission is what it was before spec.script existed,
+// byte for byte: the script field is omitted, not sent empty.
+func TestAPromptRunsSubmissionHasNoScriptField(t *testing.T) {
+	body, err := json.Marshal(triggerSubmitFor(submitterSubmission()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"script"`) {
+		t.Errorf("a prompt run's submission names a script field: %s", body)
+	}
 }
 
 func TestAScheduleRunsSubmissionCarriesItsTriggerAndDefaults(t *testing.T) {

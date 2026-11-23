@@ -980,11 +980,6 @@ var (
 		"credential-proxy-policy":    true,
 		"credential-proxy-runtime":   true,
 		"credential-proxy-ksa-token": true,
-		// The watcher-audience token confers the broker's `watcher` role: every
-		// fleet cluster's events and named objects, and the drift subscription.
-		// It is projected into agent-api-auth alone, and that geometry is the
-		// whole of what keeps it from the model's container.
-		watcherTokenVolume: true,
 	}
 	credentialProxyRuntimeVolumeNames = map[string]bool{
 		"credential-proxy-policy":    true,

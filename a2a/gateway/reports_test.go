@@ -105,7 +105,7 @@ func TestRelayedReportIsReadByTheChainsRoot(t *testing.T) {
 	}
 }
 
-func TestPushedReportsLatestAndForgetUpTo(t *testing.T) {
+func TestPushedReportsLatestAndForgetThrough(t *testing.T) {
 	var p pushedReports
 	if _, _, ok := p.latest("slack:C1/1699.1"); ok {
 		t.Fatal("an empty cache had a latest report")
@@ -113,20 +113,20 @@ func TestPushedReportsLatestAndForgetUpTo(t *testing.T) {
 	p.put("slack:C1/1699.1", "", "the first card's report")
 	p.put("slack:C1/1699.1", "task-x", "the second card's report")
 	p.put("console:tab-k", "task-root", "a console report")
-	got, n, ok := p.latest("slack:C1/1699.1")
-	if !ok || got != "the second card's report" || n != 2 {
-		t.Fatalf("latest = %q %d %v, want the second card's report and a count of 2", got, n, ok)
+	got, seq, ok := p.latest("slack:C1/1699.1")
+	if !ok || got != "the second card's report" || seq != 2 {
+		t.Fatalf("latest = %q %d %v, want the second card's report, numbered 2", got, seq, ok)
 	}
 	if got, _, ok := p.latest("slack:C1/1699.1"); !ok || got != "the second card's report" {
 		t.Fatalf("latest read twice = %q %v, want the same report (a read forgets nothing)", got, ok)
 	}
 	// A report kept between the read and the forget stays for the next turn.
 	p.put("slack:C1/1699.1", "", "the third card's report")
-	p.forgetUpTo("slack:C1/1699.1", n)
-	if got, n, ok := p.latest("slack:C1/1699.1"); !ok || got != "the third card's report" || n != 1 {
-		t.Fatalf("after forgetUpTo: %q %d %v, want the third card's report alone", got, n, ok)
+	p.forgetThrough("slack:C1/1699.1", seq)
+	if got, seq, ok := p.latest("slack:C1/1699.1"); !ok || got != "the third card's report" || seq != 4 {
+		t.Fatalf("after forgetThrough: %q %d %v, want the third card's report alone, numbered 4", got, seq, ok)
 	}
-	p.forgetUpTo("slack:C1/1699.1", 1)
+	p.forgetThrough("slack:C1/1699.1", 4)
 	if _, _, ok := p.latest("slack:C1/1699.1"); ok {
 		t.Fatal("the thread's reports were kept after forgetting them all")
 	}
@@ -137,11 +137,35 @@ func TestPushedReportsLatestAndForgetUpTo(t *testing.T) {
 		t.Fatalf("the console report was touched: %q %v", got, ok)
 	}
 	p.forget("slack:C1/never-kept")
-	p.forgetUpTo("slack:C1/never-kept", 3)
+	p.forgetThrough("slack:C1/never-kept", 3)
+}
+
+// At the per-conversation cap a put evicts the oldest report, so a count
+// of the reports read would name a report kept since the read; the number
+// does not. Eight kept, the newest read, one more kept, the read ones
+// forgotten: the ninth stays, and the bytes follow.
+func TestForgetThroughAtTheCapKeepsTheReportKeptDuringThePublish(t *testing.T) {
+	var p pushedReports
+	for i := 1; i <= pushedReportsPerConversation; i++ {
+		p.put("slack:C1/1699.1", "", fmt.Sprintf("report %d", i))
+	}
+	_, seq, ok := p.latest("slack:C1/1699.1")
+	if !ok || seq != pushedReportsPerConversation {
+		t.Fatalf("latest numbered %d %v, want %d", seq, ok, pushedReportsPerConversation)
+	}
+	p.put("slack:C1/1699.1", "", "the report kept during the publish")
+	p.forgetThrough("slack:C1/1699.1", seq)
+	got, _, ok := p.latest("slack:C1/1699.1")
+	if !ok || got != "the report kept during the publish" || len(p.byConversation["slack:C1/1699.1"]) != 1 {
+		t.Fatalf("after the forget: %q %v, %d kept; want the ninth report alone", got, ok, len(p.byConversation["slack:C1/1699.1"]))
+	}
+	if p.bytes != len("the report kept during the publish") {
+		t.Fatalf("bytes %d, want the ninth report's %d", p.bytes, len("the report kept during the publish"))
+	}
 }
 
 // A reply in a chat thread names no task; it is under the newest report
-// kept for the thread's key, with the count the caller forgets once the
+// kept for the thread's key, with the number the caller forgets through once the
 // turn is on the bus. A key every top-level message shares (a whole space,
 // a thread-less DM) is no thread, and a console turn naming no task is
 // under nothing.
@@ -152,9 +176,9 @@ func TestRelayedReportForAThreadKeyIsTheNewestKept(t *testing.T) {
 		g.reports.put(key, "", "the newest card's report")
 	}
 	for _, key := range []string{"slack:C1/1699.1", "gchat:spaces/A/threads/B"} {
-		got, n, ok := g.relayedReport(&SessionRecord{Key: key}, "")
-		if !ok || n != 2 || got != (lib.PushedReport{Text: "the newest card's report"}) {
-			t.Fatalf("%s: %+v %d %v, want the newest report under the thread and a count of 2", key, got, n, ok)
+		got, seq, ok := g.relayedReport(&SessionRecord{Key: key}, "")
+		if !ok || seq == 0 || got != (lib.PushedReport{Text: "the newest card's report"}) {
+			t.Fatalf("%s: %+v %d %v, want the newest report under the thread with its number", key, got, seq, ok)
 		}
 	}
 	for _, key := range []string{"gchat:space/spaces/A", "slack:dm/D1", "console:tab-k"} {
@@ -171,6 +195,7 @@ func TestAFailedPublishLeavesTheThreadsReportForTheRetry(t *testing.T) {
 	r := startRig(t)
 	const thread = "slack:C1/1701.1"
 	r.g.reports.put(thread, "", "card report: np-quartz-7 is at 92%")
+	_, before, _ := r.g.reports.latest(thread)
 	deleteTasksStream(t, r.url)
 	// busyTurn runs the turn to its end before returning: with the stream
 	// gone, PublishSeq fails and the turn is dropped (noticeBusUnreachable).
@@ -179,8 +204,8 @@ func TestAFailedPublishLeavesTheThreadsReportForTheRetry(t *testing.T) {
 	if err != nil || rec == nil || rec.ActiveTask != nil {
 		t.Fatalf("after the failed publish the turn is still active: %+v %v", rec, err)
 	}
-	if got, n, ok := r.g.reports.latest(thread); !ok || n != 1 || got != "card report: np-quartz-7 is at 92%" {
-		t.Fatalf("after the failed publish: %q %d %v, want the report still kept", got, n, ok)
+	if got, after, ok := r.g.reports.latest(thread); !ok || after != before || got != "card report: np-quartz-7 is at 92%" {
+		t.Fatalf("after the failed publish: %q %d %v, want the same report still kept (numbered %d)", got, after, ok, before)
 	}
 }
 

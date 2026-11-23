@@ -67,6 +67,10 @@ install without the interview.
   sandbox's. A raise grows both claims where the StorageClass allows it, and a
   lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
   in `install.env`.
+  `platform_agent_sizing_profile` (default `"auto"`, or `""` to omit
+  `spec.deployment.sizingProfile`) sets the runtime sizing profile (`small`,
+  `medium`, `fleet`, or `auto`); `install.sh` and `upgrade.sh` wire it from
+  `PLATFORM_AGENT_SIZING_PROFILE` in `install.env`.
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
   A key that is not set keeps the default in the agent image. Each apply that
@@ -378,10 +382,17 @@ front door: it renders the tfvars an upgrade would apply and then calls this.
 
 ### Recovering from an interrupted apply
 
-An apply killed part-way — Ctrl-C, a dropped connection, a laptop lid — leaves
-state locked, and the next command fails with `Error acquiring the state lock`.
-`terraform force-unlock` is the release, and it works here; what trips people up
-is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
+An apply that stops before Terraform can shut down — a second Ctrl-C, a dropped
+SSH session, a `kill -9`, a lost machine — leaves remote state locked, and the
+next command fails with `Error acquiring the state lock`.
+
+One Ctrl-C at `lifecycle.sh apply`, run directly or through `upgrade.sh`, is a
+graceful stop: Terraform shuts down in order, saves state and releases the lock,
+which can take minutes, so wait for it. Through `install.sh` the same Ctrl-C ends
+the pipe the apply prints to, and the lock can stay.
+
+For a lock that was left, `terraform force-unlock` is the release, and it works
+here; what trips people up is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
 generation number** of the lock object, not a UUID, and it is the `ID:` in the
 error Terraform just printed:
 

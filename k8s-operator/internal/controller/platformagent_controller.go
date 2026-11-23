@@ -360,6 +360,7 @@ const (
 	// say True where the property does not hold. See workloadRenderState.
 	hostPathDroppedConditionType = "VolumesDropped"
 	hostPathDroppedReason        = "HostPathVolumeDropped"
+	watcherTokenDroppedReason    = "WatcherTokenVolumeDropped" // #nosec G101 -- Condition reason, not a credential
 	// hostPathDroppedEntryFormat renders one dropped entry as the author would
 	// find it in the spec: field, index, name, and the host path it asked for.
 	hostPathDroppedEntryFormat = "%s[%d] %q (hostPath %s)"
@@ -404,8 +405,12 @@ const (
 	// projection of the watcher audience under another name, so without this a
 	// sidecar would lose a mount its author wrote with nothing in status to say
 	// why.
-	watcherAudienceDroppedEntryFormat   = "%s[%d] %q"
-	watcherAudienceDroppedMessageFormat = "Volumes that would deliver the credential proxy's watcher token are left out " +
+	watcherAudienceDroppedEntryFormat       = "%s[%d] %q"
+	watcherContainerMountDroppedEntryFormat = "%s[%d].volumeMounts[%d] %q"
+	extraVolumeMountsField                  = "spec.deployment.extraVolumeMounts"
+	initContainersField                     = "spec.deployment.initContainers"
+	sidecarsField                           = "spec.deployment.sidecars"
+	watcherAudienceDroppedMessageFormat     = "Volumes that would deliver the credential proxy's watcher token are left out " +
 		"of the Pod template the operator renders, along with every volumeMount naming them: %s. That token belongs " +
 		"to the gateway's agent-api-auth container alone; any other container holding it would hold the broker's " +
 		"watcher role on every fleet cluster. Remove the entries from the spec to clear this condition."
@@ -5997,6 +6002,17 @@ func setHomeChannelUnsetCondition(agent *agentv1alpha1.PlatformAgent, msg string
 	})
 }
 
+// volumesDroppedReason returns the VolumesDropped condition's Reason for the
+// entries the render strips: HostPathVolumeDropped whenever a hostPath volume
+// is among them, and WatcherTokenVolumeDropped when only watcher-token volumes
+// or mounts are dropped.
+func volumesDroppedReason(agent *agentv1alpha1.PlatformAgent) string {
+	if len(hostPathVolumes(agent)) > 0 {
+		return hostPathDroppedReason
+	}
+	return watcherTokenDroppedReason
+}
+
 // hostPathDroppedConditionCurrent reports whether the VolumesDropped condition
 // on the CR already says msg, where "" means the condition is to be absent.
 // Both status writers gate their write on this -- the Degraded one only on the
@@ -6009,12 +6025,12 @@ func hostPathDroppedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg str
 		return existing == nil
 	}
 	return existing != nil && existing.Status == metav1.ConditionTrue &&
-		existing.Reason == hostPathDroppedReason && existing.Message == msg
+		existing.Reason == volumesDroppedReason(agent) && existing.Message == msg
 }
 
 // setHostPathDroppedCondition writes the VolumesDropped condition, or removes
-// it when msg is "" because the spec carries no hostPath any more. The caller
-// does the API write.
+// it when msg is "" because the spec carries no dropped volumes or mounts any
+// more. The caller does the API write.
 func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
 	if msg == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, hostPathDroppedConditionType)
@@ -6023,7 +6039,7 @@ func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string,
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type:               hostPathDroppedConditionType,
 		Status:             metav1.ConditionTrue,
-		Reason:             hostPathDroppedReason,
+		Reason:             volumesDroppedReason(agent),
 		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -6155,9 +6171,11 @@ func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsP
 	return strings.Join(parts, " ")
 }
 
-// watcherTokenDroppedEntries names, field and index, each user volume the
-// render strips for delivering the watcher token: the set
-// watcherTokenSourceNames builds, read back against the two volume lists.
+// watcherTokenDroppedEntries names, field and index, each user volume and bare
+// reserved-volume mount the render strips for delivering the watcher token: the
+// set watcherTokenSourceNames builds, read back against the two volume lists,
+// plus any mount on the three user-authored mount lists that names the reserved
+// watcher-token volume directly.
 func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
 	if agent.Spec.Deployment == nil {
 		return nil
@@ -6174,6 +6192,26 @@ func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
 		for i, v := range list.volumes {
 			if sources[v.Name] {
 				entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, list.field, i, v.Name))
+			}
+		}
+	}
+	for i, m := range agent.Spec.Deployment.ExtraVolumeMounts {
+		if m.Name == watcherTokenVolume {
+			entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, extraVolumeMountsField, i, m.Name))
+		}
+	}
+	for _, list := range []struct {
+		field      string
+		containers []corev1.Container
+	}{
+		{initContainersField, agent.Spec.Deployment.InitContainers},
+		{sidecarsField, agent.Spec.Deployment.Sidecars},
+	} {
+		for ci, c := range list.containers {
+			for mi, m := range c.VolumeMounts {
+				if m.Name == watcherTokenVolume {
+					entries = append(entries, fmt.Sprintf(watcherContainerMountDroppedEntryFormat, list.field, ci, mi, m.Name))
+				}
 			}
 		}
 	}
