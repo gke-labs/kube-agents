@@ -67,6 +67,10 @@ install without the interview.
   sandbox's. A raise grows both claims where the StorageClass allows it, and a
   lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
   in `install.env`.
+  `platform_agent_sizing_profile` (default `"auto"`, or `""` to omit
+  `spec.deployment.sizingProfile`) sets the runtime sizing profile (`small`,
+  `medium`, `fleet`, or `auto`); `install.sh` and `upgrade.sh` wire it from
+  `PLATFORM_AGENT_SIZING_PROFILE` in `install.env`.
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
   A key that is not set keeps the default in the agent image. Each apply that
