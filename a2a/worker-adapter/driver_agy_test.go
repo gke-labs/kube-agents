@@ -430,3 +430,48 @@ func TestAnAgyToolStepThatSucceedsIsOneActivityInTwoTurns(t *testing.T) {
 		t.Errorf("%d turn results for %d user messages", turnResults, userMessages)
 	}
 }
+
+// TestAnAgyResultWithNullFiguresKeepsTheBaseline: a null duration_seconds or
+// usage is no figure, not a zero. It reports nothing, drops nothing, and the
+// next result still counts from the last real total.
+func TestAnAgyResultWithNullFiguresKeepsTheBaseline(t *testing.T) {
+	results := decodeLines(t,
+		`{"event":"result","result":{"status":"SUCCESS","response":"a","duration_seconds":10,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":0}}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"b","duration_seconds":null,"usage":null}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"c","duration_seconds":25,"usage":{"input_tokens":150,"output_tokens":25,"cache_read_tokens":20}}}`,
+	)
+	if tel := results[1].Telemetry; len(tel.dropped) != 0 || tel.usage.InputTokens != 0 || tel.usage.DurationMs != 0 {
+		t.Errorf("a result with null figures reported %+v, dropped %q", tel.usage, tel.dropped)
+	}
+	if u := results[2].Telemetry.usage; u.InputTokens != 70 || u.OutputTokens != 15 || u.DurationMs != 15000 {
+		t.Errorf("turn three %+v, want its difference from turn one's (70 in, 15 out, 15000 ms)", u)
+	}
+}
+
+// TestAnAgyFigureThatGoesBackwardsIsDroppedAndKeepsTheBaseline: a total
+// below the last one is dropped, as a decode warning, and does not become the
+// baseline the next result counts from.
+func TestAnAgyFigureThatGoesBackwardsIsDroppedAndKeepsTheBaseline(t *testing.T) {
+	results := decodeLines(t,
+		`{"event":"result","result":{"status":"SUCCESS","response":"a","duration_seconds":10,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":0}}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"b","duration_seconds":5,"usage":{"input_tokens":50,"output_tokens":5,"cache_read_tokens":0}}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"c","duration_seconds":25,"usage":{"input_tokens":150,"output_tokens":25,"cache_read_tokens":20}}}`,
+	)
+	got := results[1].Telemetry.dropped
+	for _, want := range []string{"duration_seconds", "usage.input_tokens", "usage.output_tokens"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("turn two dropped %q, want %s among them", got, want)
+		}
+	}
+	if u := results[2].Telemetry.usage; u.InputTokens != 70 || u.OutputTokens != 15 || u.DurationMs != 15000 {
+		t.Errorf("turn three %+v, want its difference from turn one's (70 in, 15 out, 15000 ms)", u)
+	}
+}
+
+// TestAnAgyDeniedActionWithNoNameIsStillCounted: a denied action with
+// neither an action nor a display name still says something after the colon.
+func TestAnAgyDeniedActionWithNoNameIsStillCounted(t *testing.T) {
+	if got := deniedDetail([]agyDeniedAction{{}, {}}); got != "skipped for want of approval: 2 unnamed action(s)" {
+		t.Errorf("deniedDetail = %q", got)
+	}
+}
