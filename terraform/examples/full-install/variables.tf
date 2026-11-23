@@ -1114,6 +1114,18 @@ variable "platform_agent_storage_size" {
   }
 }
 
+variable "platform_agent_sizing_profile" {
+  description = "The PlatformAgent's spec.deployment.sizingProfile preset: \"small\", \"medium\", \"fleet\", \"auto\" (promotes at 10 and 25 clusters under namespace ResourceQuota and LimitRange admission checks), or \"\" (passes nothing, which leaves small in effect). Default is \"auto\" so Terraform- and installer-managed installs scale runtime pods automatically as clusters grow. Separate from var.sizing_profile, which sizes Standard node pools. Mirrors PLATFORM_AGENT_SIZING_PROFILE in install.env, and its default is DEFAULT_PLATFORM_AGENT_SIZING_PROFILE in install.defaults.env."
+  type        = string
+  default     = "auto"
+  nullable    = false
+
+  validation {
+    condition     = var.platform_agent_sizing_profile == "" || contains(["small", "medium", "fleet", "auto"], var.platform_agent_sizing_profile)
+    error_message = "platform_agent_sizing_profile must be \"\", \"small\", \"medium\", \"fleet\", or \"auto\"."
+  }
+}
+
 variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any

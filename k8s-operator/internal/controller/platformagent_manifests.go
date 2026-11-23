@@ -974,7 +974,7 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// consumer, so the Hermes google_chat and slack platforms never run
 	// (a2aChatArmed, a2aSlackArmed), and a pin would pin a platform that
 	// does not run.
-	if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+	if teams := integration.Teams; teams != nil && teamsOnHermes(agent) {
 		add("TEAMS_RELAY_URL", credentialProxyBaseURL(agent))
 		add("TEAMS_ALLOWED_USERS", strings.Join(teams.AllowedUsers, ","))
 		allowAll := false
@@ -2473,8 +2473,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			cfg.Platforms.Slack.Enabled = false
 		}
 		if teams := agent.Spec.Integration.Teams; teams != nil && teams.Enabled != nil {
-			cfg.Platforms.Teams.Enabled = *teams.Enabled
-			if *teams.Enabled {
+			// Off whenever the A2A gateway's teams backend is the consumer
+			// (a2aTeamsArmed): an enabled platform with no TEAMS_RELAY_URL
+			// would start and find nothing to pull.
+			cfg.Platforms.Teams.Enabled = teamsOnHermes(agent)
+			if cfg.Platforms.Teams.Enabled {
 				cfg.Platforms.Teams.TypingStatusText = "Kage is thinking…"
 				if teams.AdaptiveCards != nil {
 					cfg.Platforms.Teams.Extra["adaptive_cards"] = *teams.AdaptiveCards
@@ -3319,7 +3322,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: org,
 			})
 		}
-		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+		if teams := integration.Teams; teams != nil && teamsOnHermes(agent) {
 			allowAll := false
 			if teams.AllowAllUsers != nil {
 				allowAll = *teams.AllowAllUsers
@@ -5082,6 +5085,27 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 		// across every connection it has open, so the broker's own relay
 		// (credential_proxy.py, serve: SlackRelay) is never armed; see
 		// a2aSlackArmed.
+		// The a2a-chat audience and its binding when the Teams backend is the
+		// gateway's only relay caller: the Chat block above renders both
+		// beside the subscription, and a Teams-only install has no such
+		// block. The callers go with the audience here as there: with the
+		// binding the broker confers the a2a-chat role on the gateway's
+		// ServiceAccount alone (#6276); without it any allowed caller that
+		// presents the audience would get the role, which is the reach the
+		// binding exists to close, and the exec tier reads the same value.
+		if a2aTeamsArmed(agent) && !a2aChatArmed(agent) {
+			envVars = append(envVars,
+				corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+				corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},
+			)
+		}
+		// The broker opens its Teams routes to the a2a-chat role only on this
+		// word, so a Chat-armed gateway on an install whose Teams stays on
+		// Hermes cannot reach that queue (credential_proxy.py,
+		// _teams_route_roles).
+		if a2aTeamsArmed(agent) {
+			envVars = append(envVars, corev1.EnvVar{Name: credentialProxyTeamsA2ACallerEnvVar, Value: strconv.FormatBool(true)})
+		}
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			envVars = append(envVars,
 				corev1.EnvVar{Name: "TEAMS_APP_ID", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(teams.AppIdSecretRef, defaultPlatformAgentSecrets, "TEAMS_APP_ID")}},
@@ -5185,7 +5209,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
 		// And its callers: one that could set them would choose who holds
-		// the a2a-chat role. Rendered only while Chat is armed, so reserved
+		// the a2a-chat role. Rendered only while a relay is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
@@ -5194,6 +5218,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyA2AReportsCallersEnvVar,
 		a2aReportStoreURLEnvVar,
 		a2aReportStoreTokenFileEnvVar,
+		// One that could set the Teams caller word would open the broker's
+		// Teams routes to the a2a-chat role on an install whose Teams stays
+		// on Hermes, which is the reach the word exists to close.
+		credentialProxyTeamsA2ACallerEnvVar,
 		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
 		// shell's audience would hand the session the shell's role.
 		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
@@ -7444,25 +7472,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
 	// so domain-level filtering is strictly enforced by FQDNNetworkPolicy.
 	if !fqdnEnabled {
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
-			},
-			To: []networkingv1.NetworkPolicyPeer{
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "0.0.0.0/0",
-						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"},
-					},
-				},
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "::/0",
-						Except: []string{"fc00::/7", "fe80::/10", "ff00::/8"},
-					},
-				},
-			},
-		})
+		egressRules = append(egressRules, publicHTTPSEgressRule())
 	}
 
 	// 8. GKE Managed OpenTelemetry Collector (Trace Export). Skipped when the agent is

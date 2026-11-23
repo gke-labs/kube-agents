@@ -224,7 +224,8 @@ verification_spec:
   # The check has two members, and both must pass. The first reads the card log's rows. A row is
   # the call on one line, so a survey on a later line of a multi-line call (a `for` loop over
   # kubeconfigs) reads there as words of the command before it, and a survey behind `;` or `&&`
-  # is not on the row at all. The second member reads each worker `terminal` and `execute_code`
+  # is not on the row at all; for those the first member also reads a logged card's `terminal`
+  # call as typed, when the call holds no heredoc. The second member reads each worker `terminal` and `execute_code`
   # call as typed (`after_result_pattern: "(?!)"` opens no window; it only selects that read), so
   # each line and each chained command is an argv of its own, and the survey is seen. The first
   # member stays for the required run and for a command that only the card log has. What the

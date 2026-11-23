@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -31,11 +32,12 @@ const attributionSaltInfo = "a2a-attribution-salt"
 const attributionSaltLen = 32
 
 // The mux keys and conversation prefixes, exported for cmd/gateway, which
-// builds one adapter per backend: Backends returns the first three, and the
+// builds one adapter per backend: Backends returns the first four, and the
 // console is the essential backend beside them.
 const (
 	BackendGchat   = gchatBackend
 	BackendSlack   = slackBackend
+	BackendTeams   = teamsBackend
 	BackendDiscord = discordBackend
 	BackendConsole = consoleBackend
 )
@@ -53,6 +55,7 @@ type backendArm struct {
 var backendArms = []backendArm{
 	{name: gchatBackend, armed: func(c *Config) bool { return c.GchatRelayURL != "" }},
 	{name: slackBackend, armed: func(c *Config) bool { return c.SlackBotToken != "" }},
+	{name: teamsBackend, armed: func(c *Config) bool { return c.TeamsRelayURL != "" }},
 	{name: discordBackend, armed: func(c *Config) bool { return c.DiscordToken != "" }},
 }
 
@@ -66,12 +69,12 @@ const defaultDelegationDepthMax = 3
 
 // defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
 // field's comment carries the rationale.
-const defaultDelegationWidthMax = 1
+const defaultDelegationWidthMax = 10
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
-// accepts: one, until a stop cancels a batch's every child, walking the
-// whole task tree (#5682). Raising it is what turns fan-out on.
-const delegationWidthBuiltMax = 1
+// accepts: ten, the fleet question's width (#5682). The children queue to
+// their profile's concurrency, which is what binds at once, not this.
+const delegationWidthBuiltMax = 10
 
 // defaultScopeFile is where the operator projects the install's rendered
 // spec.scope into the gateway pod: the same scope.json, at the same path, the
@@ -85,6 +88,22 @@ const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token" // #nosec 
 // envGchatHomeChannel carries the Chat home space the chat.notify route posts
 // to (notify.go); the operator renders it from googleChat.homeChannel.
 const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
+
+// The Teams backend's environment: the broker relay URL that arms it, the
+// projected token it presents (the a2a-chat audience, the Google Chat
+// backend's token by default), the allowlist and allow-all gates, the home
+// channel the chat.notify route posts to, the tenant it serves, and whether
+// replies render as Adaptive Cards. The operator renders them from
+// spec.integration.teams when it runs with A2A_TEAMS_BACKEND=true.
+const (
+	envTeamsRelayURL      = "A2A_TEAMS_RELAY_URL"
+	envTeamsTokenPath     = "A2A_TEAMS_TOKEN_PATH" // #nosec G101 -- an environment variable name, not a credential
+	envTeamsAllowedUsers  = "A2A_TEAMS_ALLOWED_USERS"
+	envTeamsAllowAllUsers = "A2A_TEAMS_ALLOW_ALL_USERS"
+	envTeamsHomeChannel   = "A2A_TEAMS_HOME_CHANNEL"
+	envTeamsTenantID      = "A2A_TEAMS_TENANT_ID"
+	envTeamsAdaptiveCards = "A2A_TEAMS_ADAPTIVE_CARDS"
+)
 
 // envSlackHomeChannel carries the Slack home channel's id the chat.notify
 // route posts to; the operator renders it from slack.homeChannel.
@@ -139,6 +158,23 @@ const (
 // spec.telemetry.peopleSeen=false.
 const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+
+// envKubectlCostTier is the variable the kubectl admission
+// (deploy/sandbox/kubectl-admit.py) reads its sizing tier from when no tier
+// file names one: the shell sandbox's name for it, on the session pod.
+const envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
+
+// defaultKubectlCostTier is the tier the admission charges when none is
+// named; spawn names it rather than leave the variable unset.
+const defaultKubectlCostTier = "default"
+
+// The A2A door's Microsoft Entra sign-in class (a2adoor_entra.go), set by
+// hand on the gateway as the Google class's variables are.
+const (
+	envA2ADoorEntraTenantID     = "A2A_DOOR_ENTRA_TENANT_ID"
+	envA2ADoorEntraClientID     = "A2A_DOOR_ENTRA_CLIENT_ID"
+	envA2ADoorEntraAllowedUsers = "A2A_DOOR_ENTRA_ALLOWED_USERS"
+)
 const (
 	envImagePullRefs = "A2A_IMAGE_PULL_REFS"
 	// envTriggerEventKinds lists the event triggers the trigger ingress
@@ -285,6 +321,30 @@ type Config struct {
 	// a chat.notify proactive post lands (notify.go). Empty leaves the route
 	// serving conversation requests only.
 	GchatHomeChannel string
+	// TeamsRelayURL is the credential proxy's relay base URL for the Teams
+	// backend; setting it arms the Teams adapter, which pulls Bot Framework
+	// activities from the broker's Teams queue and replies through its
+	// passthrough. TeamsTokenPath is the projected ServiceAccount token it
+	// presents (the a2a-chat audience, GchatTokenPath's default).
+	TeamsRelayURL  string
+	TeamsTokenPath string
+	// TeamsAllowedUsers is the Teams backend's ingress allowlist: Microsoft
+	// Entra object ids (from.aadObjectId), the immutable identity, or Bot
+	// Framework user ids, compared case-insensitively; the legacy path's
+	// TEAMS_ALLOWED_USERS gate. TeamsAllowAllUsers disables it, stated
+	// explicitly.
+	TeamsAllowedUsers  []string
+	TeamsAllowAllUsers bool
+	// TeamsHomeChannel is the install's Teams home conversation id, where a
+	// chat.notify proactive post lands; empty leaves the route serving
+	// conversation requests only.
+	TeamsHomeChannel string
+	// TeamsTenantID, when set, is the one Entra tenant the adapter serves; an
+	// activity from another tenant is acked away.
+	TeamsTenantID string
+	// TeamsAdaptiveCards renders Teams replies as Adaptive Cards; off, they
+	// post as plain text. On unless the env says false.
+	TeamsAdaptiveCards bool
 	// SlackHomeChannel is the install's Slack home channel id ("C0123"),
 	// the one place a Slack chat.notify home post may land (notify.go). Empty
 	// leaves the route serving conversation requests only.
@@ -425,8 +485,8 @@ type Config struct {
 	// A2ADoorPrincipalMapPath is the door's OWN principal map
 	// (A2A_DOOR_PRINCIPAL_MAP): keys prefixed a2a:, values eval-only
 	// identities, never a fallback to the chat map or the inject map. The
-	// developer identity class (ID tokens) arrives as a second resolver
-	// beside this file, not as an entry in it.
+	// Google and Entra sign-in classes resolve through verifiers beside
+	// this file, never as entries in it.
 	A2ADoorPrincipalMapPath string
 
 	// A2ADoorPublicURL is the URL the agent card advertises for the door's
@@ -448,6 +508,22 @@ type Config struct {
 	// posture: a door any Google account can sign in to is not a default
 	// anyone should get by leaving a list blank.
 	A2ADoorAllowedUsers []string
+	// A2ADoorEntraTenantID and A2ADoorEntraClientID arm the door's
+	// Microsoft Entra class (A2A_DOOR_ENTRA_TENANT_ID,
+	// A2A_DOOR_ENTRA_CLIENT_ID): a bearer without Google's ya29. prefix is checked,
+	// against the tenant's published signing keys, as a token the tenant
+	// issued for this application registration. Both empty leaves the
+	// class off; one without the other is refused, as is either without
+	// A2A_DOOR_LISTEN. Set by hand on the gateway, as the Google class's
+	// are; nothing renders them yet.
+	A2ADoorEntraTenantID string
+	A2ADoorEntraClientID string
+	// A2ADoorEntraAllowedUsers is the Entra class's allowlist
+	// (A2A_DOOR_ENTRA_ALLOWED_USERS, comma-separated object ids), held to
+	// the posture of A2ADoorAllowedUsers: the door refuses an object id off
+	// it (403) before it holds any state for the caller, the gateway checks
+	// the same list again, empty admits nobody, and there is no allow-all.
+	A2ADoorEntraAllowedUsers []string
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
@@ -647,12 +723,19 @@ type Config struct {
 	// New refuses the view without it. CredentialProxyExecURL is the
 	// broker's exec tier, empty while the operator renders none; the shim
 	// sends its commands there and falls back to CredentialProxyURL.
+	// KubectlCostTier is the sizing tier whose column of the kubectl cost
+	// table (deploy/sandbox/kubectl-costs.json) the session pod's kubectl
+	// admission charges; spawn passes it on as KUBEAGENTS_KUBECTL_COST_TIER
+	// beside KUBE_PROXY_URL. The operator forwards it normalised, as for the
+	// shell sandbox; anything but a plain lowercase name is dropped here too,
+	// and empty passes the admission's default tier by name.
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
 	KubeProxyURL           string
 	KubeProxyCAConfigMap   string
 	KubeProxyHostContext   string
+	KubectlCostTier        string
 	UniverseDomain         string
 	ImagePullRefs          []string
 
@@ -764,12 +847,13 @@ type Config struct {
 	// what runs at once: the dispatcher queues children to each profile's
 	// concurrency.
 	//
-	// Zero means 1, a single child. FromEnv accepts only 1 for now: a batch's
-	// results come back in one wake, but a stop doesn't yet cancel every
-	// child of the tree, so an operator can't turn fan-out on until that
-	// stop is built (delegationWidthBuiltMax, #5682). Tests and
-	// embedders that build Config directly may set more, to exercise the
-	// mint. FromEnv also refuses a value under 1, as it does the depth bound.
+	// Zero means 1, a single child. FromEnv defaults it to 10 and accepts 1
+	// to 10 (delegationWidthBuiltMax): a batch's results come back in one
+	// wake, and one stop cancels every child of the tree. At the `cluster`
+	// profile's default concurrency of 2, ten children run two at a time,
+	// about five rounds. Tests and embedders that build Config directly may
+	// set up to lib.DelegateBatchMax. FromEnv refuses a value under 1, as it
+	// does the depth bound, and one over 10.
 	DelegationWidthMax int
 
 	// ScopeFile is the rendered spec.scope a profile task's target is
@@ -809,7 +893,7 @@ type Config struct {
 }
 
 // Backends lists every REAL chat backend this config arms, in backendArms'
-// order (gchat, slack, discord: BackendGchat, BackendSlack, BackendDiscord),
+// order (gchat, slack, teams, discord: BackendGchat, BackendSlack, BackendTeams, BackendDiscord),
 // or nil when none is armed. The doors are not among the answers, for the
 // reason Backend gives.
 func (c *Config) Backends() []string {
@@ -823,7 +907,7 @@ func (c *Config) Backends() []string {
 }
 
 // Backend names the first REAL chat backend of Backends: "gchat", "slack",
-// "discord", or "" when a side door (inject, A2A, or both) or the console
+// "teams", "discord", or "" when a side door (inject, A2A, or both) or the console
 // door alone is the only way in. It is the authority default; the door
 // default (inject, a2a or console) is chosen in New, not here.
 //
@@ -921,6 +1005,7 @@ func FromEnv() (*Config, error) {
 		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
 		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
 		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
+		KubectlCostTier:        kubectlCostTier(os.Getenv("A2A_KUBECTL_COST_TIER")),
 		UniverseDomain:         strings.TrimSpace(os.Getenv(envGoogleCloudUniverseDomain)),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
@@ -955,6 +1040,17 @@ func FromEnv() (*Config, error) {
 		cfg.ImagePullRefs = append(cfg.ImagePullRefs, refName)
 	}
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
+	cfg.TeamsRelayURL = strings.TrimSpace(os.Getenv(envTeamsRelayURL))
+	cfg.TeamsTokenPath = envOr(envTeamsTokenPath, cfg.GchatTokenPath)
+	for _, u := range strings.Split(os.Getenv(envTeamsAllowedUsers), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.TeamsAllowedUsers = append(cfg.TeamsAllowedUsers, u)
+		}
+	}
+	cfg.TeamsAllowAllUsers = os.Getenv(envTeamsAllowAllUsers) == envTrue
+	cfg.TeamsHomeChannel = strings.TrimSpace(os.Getenv(envTeamsHomeChannel))
+	cfg.TeamsTenantID = strings.TrimSpace(os.Getenv(envTeamsTenantID))
+	cfg.TeamsAdaptiveCards = strings.TrimSpace(os.Getenv(envTeamsAdaptiveCards)) != strconv.FormatBool(false)
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
 	cfg.GchatHomePolicy = strings.TrimSpace(os.Getenv(envGchatHomePolicy))
@@ -980,6 +1076,9 @@ func FromEnv() (*Config, error) {
 	}
 	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersSlack); ok {
 		platformLists[slackBackend] = append([]string{}, splitList(raw)...)
+	}
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersTeams); ok {
+		platformLists[teamsBackend] = append([]string{}, splitList(raw)...)
 	}
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
@@ -1015,6 +1114,9 @@ func FromEnv() (*Config, error) {
 			cfg.A2ADoorAllowedUsers = append(cfg.A2ADoorAllowedUsers, u)
 		}
 	}
+	cfg.A2ADoorEntraTenantID = strings.TrimSpace(os.Getenv(envA2ADoorEntraTenantID))
+	cfg.A2ADoorEntraClientID = strings.TrimSpace(os.Getenv(envA2ADoorEntraClientID))
+	cfg.A2ADoorEntraAllowedUsers = splitList(os.Getenv(envA2ADoorEntraAllowedUsers))
 	metricsPort, err := metricsPortFromEnv(cfg)
 	if err != nil {
 		return nil, err
@@ -1066,7 +1168,7 @@ func FromEnv() (*Config, error) {
 		// same reason: a console client such as the MCP server needs a
 		// gateway on an install that configured no chat backend.
 		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" && !cfg.ConsoleDoor {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), A2A_TEAMS_RELAY_URL (its Teams relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
 		}
 	}
 	// Fail closed: a door with no token would be reachable by anything that
@@ -1079,6 +1181,29 @@ func FromEnv() (*Config, error) {
 	}
 	if cfg.A2ADoorGoogleClientID != "" && cfg.A2ADoorListen == "" {
 		return nil, fmt.Errorf("A2A_DOOR_GOOGLE_CLIENT_ID is set but A2A_DOOR_LISTEN is not: the Google sign-in class is part of the A2A door and has nothing to arm without it")
+	}
+	if (cfg.A2ADoorEntraTenantID == "") != (cfg.A2ADoorEntraClientID == "") {
+		return nil, fmt.Errorf("%s and %s are set together or not at all: the Microsoft Entra sign-in class checks a token against one tenant's keys for one application", envA2ADoorEntraTenantID, envA2ADoorEntraClientID)
+	}
+	// The token's tid claim is always the directory's GUID, and the door
+	// compares it to this value, so the tenant's domain name (which the
+	// Entra authority also accepts in a URL) would fetch the keys and then
+	// refuse every token as another tenant's. The client id is a GUID too.
+	for name, value := range map[string]string{envA2ADoorEntraTenantID: cfg.A2ADoorEntraTenantID, envA2ADoorEntraClientID: cfg.A2ADoorEntraClientID} {
+		if value != "" && !a2aEntraObjectIDPattern.MatchString(value) {
+			return nil, fmt.Errorf("%s is %q, not a GUID: use the portal's \"Directory (tenant) ID\" and \"Application (client) ID\" values, not a domain name", name, value)
+		}
+	}
+	// The allowlist names object ids; a UPN or an email can never match the
+	// GUID a token carries, so a list of them would admit nobody with no
+	// sign of why.
+	for _, u := range cfg.A2ADoorEntraAllowedUsers {
+		if !a2aEntraObjectIDPattern.MatchString(u) {
+			return nil, fmt.Errorf("%s entry %q is not an object id (a GUID): the Entra class lists people by object id, not by UPN or email", envA2ADoorEntraAllowedUsers, u)
+		}
+	}
+	if cfg.A2ADoorEntraTenantID != "" && cfg.A2ADoorListen == "" {
+		return nil, fmt.Errorf("%s is set but A2A_DOOR_LISTEN is not: the Microsoft Entra sign-in class is part of the A2A door and has nothing to arm without it", envA2ADoorEntraTenantID)
 	}
 	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
 		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")
@@ -1139,7 +1264,7 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: need an integer from 1 to %d", widthMax, lib.DelegateBatchMax)
 	}
 	if wm > delegationWidthBuiltMax {
-		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's tree-wide stop is not built yet (#5682)", widthMax, delegationWidthBuiltMax)
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
@@ -1324,6 +1449,19 @@ func pyStrip(s string) string {
 	return strings.TrimFunc(s, func(r rune) bool {
 		return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f)
 	})
+}
+
+// kubectlCostTierPattern is the tier name the operator forwards (its own
+// kubectlCostTierPattern) and the sandbox entrypoint accepts.
+var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+
+// kubectlCostTier is a forwarded tier name if it is a plain lowercase one,
+// else empty: the session pod's admission then charges its default tier.
+func kubectlCostTier(raw string) string {
+	if tier := strings.TrimSpace(raw); kubectlCostTierPattern.MatchString(tier) {
+		return tier
+	}
+	return ""
 }
 
 func envOr(key, def string) string {

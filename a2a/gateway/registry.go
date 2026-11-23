@@ -79,8 +79,8 @@ type ActiveTask struct {
 	Capability *capability.Ref `json:"capability,omitempty"`
 	// Detached means the user said stop but no terminal event has arrived
 	// (the executor may be dead and platform tasks have no janitor yet, W3
-	// retarget). A detached task no longer serializes the session; its events,
-	// if they ever arrive, still relay.
+	// retarget). A detached task no longer serializes the session, and
+	// nothing it writes afterwards reaches the room (applyCanceledEvent).
 	Detached bool `json:"detached,omitempty"`
 	// NoFirstEventNoticeAt is when the reap scan told the conversation that
 	// this task had produced nothing past FirstEventGrace. Zero until then.
@@ -355,7 +355,7 @@ type TaskRef struct {
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// Tier is the tier a task addressed to an AgentProfile runs at; empty
 	// for a task addressed to platform or a session. A profile task's child
-	// runs at its tier, and the child's end reaches it as a childResult on
+	// runs at its tier (at read below an unattended task, #6744), and the child's end reaches it as a childResult on
 	// its .in rather than as a wake (deliverChildResult).
 	Tier string `json:"tier,omitempty"`
 	// Scope is a profile task's scope, recorded at mint: its target's
@@ -371,6 +371,11 @@ type TaskRef struct {
 	// profile task waiting open. Carried rather than walked, because the
 	// bounded history can evict an ancestor and a walk would then miss it.
 	ProfileChain []string `json:"profileChain,omitempty"`
+	// Scheduled marks a profile task below a scheduled run (#6744): a child
+	// of an unattended task, or of one marked. Carried down the chain at
+	// mint, like ProfileChain, so a grandchild's profile is held to the
+	// same card check as a child's even though both run at read.
+	Scheduled bool `json:"scheduled,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -388,12 +393,29 @@ type TaskRef struct {
 	// False on entries written before it existed.
 	ChangeRequested bool `json:"changeRequested,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
-	// set only after the publish succeeded, so a true here means the cancel
-	// is on the stream. It is what lets a supervisor path reached long
+	// for the task holding the conversation, set only after the publish
+	// succeeded. It is what lets a supervisor path reached long
 	// after ActiveTask moved on (Sweep, routinely) tell "finishing a cancel
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
+	// Two writers set it whether or not the cancel went out: a withdrawn
+	// batch child (withdrawBatch) and a task the tree-wide stop reached
+	// (stopTree), so its writes are dropped either way; CancelUnsent says
+	// which. Either way the task counts as running until it ends.
 	Canceled bool `json:"canceled,omitempty"`
+	// CancelUnsent marks a task the gateway marked Canceled whose cancel
+	// never reached the bus (a withdrawn batch child, a task the tree-wide
+	// stop reached). Its writes are dropped as any canceled task's are, and
+	// a later stop (stopTree), or the next turn's heal (healStoppedTasks),
+	// re-sends its cancel, which clears the mark, as its terminal does. The
+	// history cap never evicts it (trimHistory).
+	CancelUnsent bool `json:"cancelUnsent,omitempty"`
+	// StopPending marks a task the tree-wide stop canceled (stopTree), or
+	// whose re-sent cancel went out, whose
+	// terminal the relay hasn't delivered: relayTerminal clears it, and the
+	// heal ends a task still marked once its terminal is on the stream or it
+	// has produced nothing past FirstEventGrace (healStoppedTasks).
+	StopPending bool `json:"stopPending,omitempty"`
 	// QuietCancel marks a cancel that answers for itself (cancelTaskVoiced):
 	// Slack's Stop button with one reply of its own, Google Chat's button
 	// and typed stop on the task's line (chat_stop_press.go), so the relay
@@ -439,6 +461,11 @@ type TaskRef struct {
 	// parent's line is kept here to close on the parent's terminal. A batch
 	// child, which never takes ActiveTask, keeps its own line here too.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// Lineless marks a task started with no rolling line at all: its
+	// backend shows task status itself (startTaskWith). A canceled one has
+	// no line to close at 🛑, so its terminal posts its one "🛑 canceled"
+	// (relayTerminal). Entries written before it read false, as before.
+	Lineless bool `json:"lineless,omitempty"`
 	// LineNote is a batch child's "(delegated to <addressee>)" note, kept
 	// with its line because the child never holds the active task, whose
 	// LineNote the single-child path reads.
@@ -537,7 +564,11 @@ type TaskRef struct {
 // that carries every sibling's (batchChildEnded). Text is the child's result
 // for completed, its question for input-required, and its reason otherwise,
 // already cut to the child's share of the wake (batchShare) and marked when
-// cut, so the record holds at most one wake's worth across the batch.
+// cut, so the record holds at most one wake's worth across the batch. Text
+// is a content copy: it is cleared once the wake is on the bus (wakeBatch),
+// or at AskTTL from the child's start for a wake that hasn't run
+// (boundAskCopyAt), since the record outlives the stream copy; the rest of
+// the end stays for the batch's accounting.
 // Stopped is a child the gateway had sent a cancel to before it ended, which
 // does not wake the session on its own. Unposted is a result the room was
 // not shown whole (the heal found it), and Cards a child that handed work to
@@ -609,6 +640,25 @@ func (rec *SessionRecord) setBatchEnd(taskID string, end *BatchEnd) {
 	}
 }
 
+// clearBatchText clears the result text from every ended child of the
+// fan-out parent parentID, keeping the rest of each end (BatchEnd).
+func (rec *SessionRecord) clearBatchText(parentID string) {
+	for i := range rec.Tasks {
+		ref := &rec.Tasks[i]
+		if ref.ParentTaskID == parentID && ref.BatchEnd != nil && ref.BatchEnd.Text != "" {
+			ref.clearBatchText()
+		}
+	}
+}
+
+// clearBatchText clears the entry's result text, on a copy of its end, so
+// an end shared with a caller's TaskRef is left as it was.
+func (ref *TaskRef) clearBatchText() {
+	end := *ref.BatchEnd
+	end.Text = ""
+	ref.BatchEnd = &end
+}
+
 // markCardsPending marks a console chain's root (CardsPending).
 func (rec *SessionRecord) markCardsPending(rootID string) {
 	for i := range rec.Tasks {
@@ -635,8 +685,10 @@ func (rec *SessionRecord) takeCardsPending(rootID string) bool {
 // not, while a child it counts (batchLeft) has yet to end: its parent, the
 // chain's root and every child, ended or not, since the wake reads each
 // child's end and the root carries the chain's mark. Nor the active task's
-// entry. A history whose live nodes alone pass the cap keeps them all; a
-// batch holds at most lib.DelegateBatchMax children, so that is bounded.
+// entry, nor a stopped task not yet seen to end (CancelUnsent, or Canceled
+// with StopPending), which may still run. A history whose live nodes alone
+// pass the cap keeps them all; a batch holds at most lib.DelegateBatchMax
+// children, so that is bounded.
 func (rec *SessionRecord) trimHistory() {
 	over := len(rec.Tasks) - taskHistoryCap
 	if over <= 0 {
@@ -647,6 +699,11 @@ func (rec *SessionRecord) trimHistory() {
 		live[rec.ActiveTask.TaskID] = true
 	}
 	for _, ref := range rec.Tasks {
+		// A stopped task not yet seen to end may still run: its cancel to
+		// re-send (CancelUnsent), or its end to heal (StopPending).
+		if ref.CancelUnsent || (ref.Canceled && ref.StopPending) {
+			live[ref.ID] = true
+		}
 		// Not fanOutPending: a withdrawn batch (DelegationEnd) whose kept
 		// child still runs is live too, since that child's end is the
 		// chain's (batchLeft counts it).

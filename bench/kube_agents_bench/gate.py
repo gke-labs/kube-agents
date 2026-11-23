@@ -74,7 +74,6 @@ from typing import Any
 from kube_agents_bench import chat_shape
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
-    MODE_NEXT,
     RECORD_WOULD_ADMIT,
     RECORD_WOULD_DEMOTE,
     AdmissionBar,
@@ -85,6 +84,7 @@ from kube_agents_bench.baselines import (
     admission_mode,
     append_record,
     load_versions,
+    run_mode,
     utc_now,
 )
 from kube_agents_bench.cases import CaseSpecError, load_case
@@ -459,7 +459,9 @@ def _cmd_case(args: argparse.Namespace) -> int:
         print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
         return 2
 
-    # Every install grades the A2A stack, so the key's mode is next.
+    # Every install grades the A2A stack, so the key's mode is next, or
+    # next-session on a run that deployed the default session as its front
+    # door (EVAL_FRONT_DOOR=session), whose records stay apart from next's.
     loaded = [load_run(d) if d else None for d in run_dirs]
     for record in loaded:
         if record is None or record.empty_record:
@@ -469,7 +471,7 @@ def _cmd_case(args: argparse.Namespace) -> int:
             scoring_version=record.scoring_version,
             judge_model=args.judge_model or os.environ.get("JUDGE_MODEL"),
             versions=versions,
-            mode=MODE_NEXT,
+            mode=run_mode(),
         )
         if key is not None:
             break

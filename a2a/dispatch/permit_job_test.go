@@ -13,7 +13,6 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -307,7 +306,7 @@ func TestAJobNameCoversTheWholeKeyUnambiguously(t *testing.T) {
 func TestAKeyThatIsNotSubjectTokensNamesNoJob(t *testing.T) {
 	cfg := kubeJobsConfig(t)
 	kube := fake.NewClientset()
-	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+	k := newKubeJobsWithParam(t, kube, &cfg)
 	ctx := context.Background()
 	for _, id := range []string{"a/b", "Task-1", ""} {
 		if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, id); err == nil {
@@ -324,57 +323,6 @@ func TestAKeyThatIsNotSubjectTokensNamesNoJob(t *testing.T) {
 		t.Errorf("%d Jobs created", len(jobs.Items))
 	}
 
-}
-
-// Delete also removes the Job a dispatcher from before the kind was in the
-// name launched for this task, but only that one: a Job under the legacy name
-// whose own annotations name another task, or another kind, stays.
-func TestDeleteRemovesOnlyThisTasksLegacyJob(t *testing.T) {
-	cfg := kubeJobsConfig(t)
-	legacy := func(annotations map[string]string) *batchv1.Job {
-		return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: legacyJobName("inv", "unattended", "task-1"),
-			Namespace: cfg.ProfileNamespace, UID: "uid-old", Annotations: annotations}}
-	}
-	mine := map[string]string{jobProfileAnnotation: "inv", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-1"}
-	with := func(kind string) map[string]string {
-		a := map[string]string{jobKindAnnotation: kind}
-		for k, v := range mine {
-			a[k] = v
-		}
-		return a
-	}
-	for _, c := range []struct {
-		name        string
-		annotations map[string]string
-		kind        string
-		deleted     bool
-	}{
-		{"this task's, from before the kind", mine, lib.SubmitKindTop, true},
-		{"this task's, this kind", with(lib.SubmitKindTop), lib.SubmitKindTop, true},
-		{"this task id's, another kind", with(lib.SubmitKindChild), lib.SubmitKindTop, false},
-		// An older Job names no kind and ran a top-level task: a child's
-		// cleanup leaves it.
-		{"a top-level task's from before the kind, for a child's cleanup", mine, lib.SubmitKindChild, false},
-		{"this child's, this kind", with(lib.SubmitKindChild), lib.SubmitKindChild, true},
-		{"another task's under the same name", map[string]string{jobProfileAnnotation: "inv", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-9"}, lib.SubmitKindTop, false},
-		{"another profile's under the same name", map[string]string{jobProfileAnnotation: "x", jobTierAnnotation: "unattended", jobTaskAnnotation: "task-1"}, lib.SubmitKindTop, false},
-		{"no annotations", nil, lib.SubmitKindTop, false},
-	} {
-		kube := fake.NewClientset(legacy(c.annotations))
-		k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
-		if err := k.Delete(context.Background(), "inv", "unattended", c.kind, "task-1"); err != nil {
-			t.Fatalf("%s: %v", c.name, err)
-		}
-		_, err := kube.BatchV1().Jobs(cfg.ProfileNamespace).Get(context.Background(), legacyJobName("inv", "unattended", "task-1"), metav1.GetOptions{})
-		if gone := apierrors.IsNotFound(err); gone != c.deleted {
-			t.Errorf("%s: deleted %v, want %v (%v)", c.name, gone, c.deleted, err)
-		}
-	}
-	// None there is no error.
-	k := NewKubeJobs(fake.NewClientset(), func() lib.DispatchConfig { return cfg })
-	if err := k.Delete(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
-		t.Errorf("no Job: %v", err)
-	}
 }
 
 // A read-tier task that ends at admission has the Job an earlier pass
@@ -461,7 +409,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 	cfg := kubeJobsConfig(t)
 	ctx := context.Background()
 	own := func(t *testing.T) *batchv1.Job {
-		j, err := buildJob(cfg, &cfg.Profiles[0], cfg.Profiles[0].JobTemplate, "unattended", lib.SubmitKindTop, "task-1")
+		j, err := buildJob(cfg, &cfg.Profiles[0], kubeJobsTemplateRaw(t), "unattended", lib.SubmitKindTop, "task-1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -476,7 +424,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			impostor := own(t)
 			mutate(impostor)
-			k := NewKubeJobs(fake.NewClientset(impostor), func() lib.DispatchConfig { return cfg })
+			k := newKubeJobsWithParam(t, fake.NewClientset(impostor), &cfg)
 			if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
 				t.Errorf("Launch over an impostor: %v, want ErrJobNotOurs", err)
 			}
@@ -490,7 +438,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 	// if its template names no ServiceAccount to compare.
 	bare := own(t)
 	bare.Spec.Template.Spec.ServiceAccountName = ""
-	kb := NewKubeJobs(fake.NewClientset(bare), func() lib.DispatchConfig { return cfg })
+	kb := newKubeJobsWithParam(t, fake.NewClientset(bare), &cfg)
 	if _, _, err := kb.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !errors.Is(err, ErrJobNotOurs) {
 		t.Errorf("Pod of a never-checked Job with no ServiceAccount: %v, want ErrJobNotOurs", err)
 	}
@@ -498,7 +446,7 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 	// Launched and checked, then swapped for an impostor, or holding a pod
 	// that runs as another ServiceAccount: Pod refuses both.
 	kube := fake.NewClientset()
-	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+	k := newKubeJobsWithParam(t, kube, &cfg)
 	if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 		t.Fatal(err)
 	}

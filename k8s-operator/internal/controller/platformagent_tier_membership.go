@@ -13,9 +13,13 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// gchatMemberBackend is the one membership backend whose ids are case-blind,
-// as the gateway matches them (a2a/gateway/allowlist.go requesterSubject).
-const gchatMemberBackend = "gchat"
+// gchatMemberBackend and entraMemberBackend are the membership backends
+// whose ids are case-blind: a Google Chat email, and an Entra object id (a
+// GUID). The gateway's parseTierMembership keys them the same way.
+const (
+	gchatMemberBackend = "gchat"
+	entraMemberBackend = "a2a-entra"
+)
 
 // ValidateTierMembership checks spec.tiers.membership at admission (#3659):
 //   - a member's tier mustn't be unattended, the built-in or a Tier of that
@@ -90,10 +94,10 @@ func ValidateTierMembership(ctx context.Context, c client.Reader, old, agent *ag
 }
 
 // tierMemberKey is the person a member names, as the gateway matches turns:
-// a Google Chat email without case.
+// a Google Chat email and an Entra object id without case.
 func tierMemberKey(m agentv1alpha1.TierMember) string {
 	key := m.Backend + ":" + strings.TrimSpace(m.User)
-	if m.Backend == gchatMemberBackend {
+	if m.Backend == gchatMemberBackend || m.Backend == entraMemberBackend {
 		key = strings.ToLower(key)
 	}
 	return key

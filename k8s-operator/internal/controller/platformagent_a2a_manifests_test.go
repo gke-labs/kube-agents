@@ -1148,15 +1148,20 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "bus-migration"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
 	}
-	// After the same-namespace pods, one namespace-crossing peer: every pod
-	// in the profile namespace (#3655). That namespace's own fence keeps
-	// its pods to the bus, LiteLLM and DNS, and the bus grants do the rest.
-	if len(rule.From) != len(wantPeers)+1 {
-		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+1, len(rule.From), rule.From)
+	// After the unconditional same-namespace pods, one namespace-crossing peer
+	// (every pod in the profile namespace, #3655, whose own fence keeps its
+	// pods to the bus, LiteLLM and DNS while the bus grants do the rest) and
+	// the MCP server's pod, rendered by default unless A2A_MCP_DOOR=false.
+	if len(rule.From) != len(wantPeers)+2 {
+		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+2, len(rule.From), rule.From)
 	}
 	if profile := rule.From[len(wantPeers)]; profile.PodSelector != nil || profile.IPBlock != nil || profile.NamespaceSelector == nil ||
 		!reflect.DeepEqual(profile.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: "test-ns-profiles", "app.kubernetes.io/component": "profiles"}) {
-		t.Errorf("the last 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
+		t.Errorf("profile-namespace 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
+	}
+	if mcp := rule.From[len(wantPeers)+1]; mcp.IPBlock != nil || mcp.NamespaceSelector != nil || mcp.PodSelector == nil ||
+		!reflect.DeepEqual(mcp.PodSelector.MatchLabels, map[string]string{"app": "test-agent-a2a-mcp"}) {
+		t.Errorf("MCP 4222 peer = %+v, want app=test-agent-a2a-mcp in the same namespace", mcp)
 	}
 	for i, want := range wantPeers {
 		peer := rule.From[i]
@@ -1383,6 +1388,49 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
 		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
+	}
+}
+
+// TestGatewayGetsTheKubectlCostTierNormalised: the session pods' kubectl
+// admission charges the same tier as the shell sandbox's, so the gateway
+// gets spec.deployment.env's tier normalised as the sandbox does, and only
+// under the cluster view, the only pods that run the admission.
+func TestGatewayGetsTheKubectlCostTierNormalised(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aKubectlCostTierEnv {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	withTier := func(env ...corev1.EnvVar) *agentv1alpha1.PlatformAgent {
+		agent := a2aTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: env}
+		return agent
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	if _, ok := read(a2aTestAgent()); ok {
+		t.Errorf("%s rendered with no spec.deployment.env entry; unset means the default tier", a2aKubectlCostTierEnv)
+	}
+	for value, want := range map[string]string{"fleet": "fleet", " Fleet ": "fleet", "large-2": "large-2"} {
+		if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: value})); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", a2aKubectlCostTierEnv, got, ok, value, want)
+		}
+	}
+	for _, value := range []string{"", "../etc", "fleet tier", "\"fleet\"", "9fleet"} {
+		if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: value})); ok {
+			t.Errorf("%s = %q reached the gateway for the CR value %q; only a plain tier name may", a2aKubectlCostTierEnv, got, value)
+		}
+	}
+	fromSecret := withTier(corev1.EnvVar{Name: envKubectlCostTier,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}})
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the gateway: only a literal value may", envKubectlCostTier)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: "fleet"})); ok {
+		t.Errorf("%s = %q rendered with the cluster view off", a2aKubectlCostTierEnv, got)
 	}
 }
 
@@ -1635,18 +1683,16 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	agent.Spec.Harness.Tuning.BusReplicas = nil
 
-	// The MCP server is one more standing pod, only while its flag is on (#3869).
-	without := pods.Value()
-	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
-		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
+	// The MCP server and the profile dispatcher are on by default (counted
+	// above), each one fewer when switched off.
+	withBoth := pods.Value()
+	t.Setenv(a2aMCPDoorEnvVar, "false")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != withBoth-1 {
+		t.Fatalf("tuned quota with the MCP server off = %d, want %d (one fewer than with it)", pods.Value(), withBoth-1)
 	}
-
-	// And the profile dispatcher, on by default (counted above), one fewer
-	// switched off.
 	t.Setenv(a2aProfileDispatcherEnvVar, "false")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without {
-		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), without)
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != withBoth-2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), withBoth-2)
 	}
 }
 
@@ -3575,7 +3621,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 		"a2a.topics.shared.annotations",
 	}
 	wantPublish = append(wantPublish, a2aAgentJetStreamGrants()...)
-	wantPublish = append(wantPublish, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console", "_INBOX."+a2aAgentBusUser+".>")
+	wantPublish = append(wantPublish, "chat.notify.gchat", "chat.notify.slack", "chat.notify.teams", "chat.notify.console", "_INBOX."+a2aAgentBusUser+".>")
 	if !reflect.DeepEqual(agent.Grants.Publish, wantPublish) {
 		t.Errorf("agent publish allow-list changed.\n got: %q\nwant: %q", agent.Grants.Publish, wantPublish)
 	}
@@ -3705,11 +3751,11 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.tasks.p.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
+		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.teams", "chat.notify.console",
 		"chat.board.reply.gateway.>",
 		// Attested trigger ingress (#5617): every source's submissions and
 		// status queries, read only.
-		"a2a.trigger.*.submit", "a2a.trigger.*.status",
+		"a2a.trigger.*.submit", "a2a.trigger.*.status", "a2a.trigger.*.stop",
 		"_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -4835,6 +4881,7 @@ const (
 const (
 	notifyRequest        = "chat.notify.gchat"
 	notifyRequestSlack   = "chat.notify.slack"
+	notifyRequestTeams   = "chat.notify.teams"
 	notifyRequestConsole = "chat.notify.console"
 	notifyReply          = "chat.notify.reply.agent.>"
 )
@@ -4847,7 +4894,7 @@ const (
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
+var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestTeams, notifyRequestConsole, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -4884,6 +4931,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{consoleOutbound, true},
 		{notifyRequest, true},
 		{notifyRequestSlack, true},
+		{notifyRequestTeams, true},
 		{notifyRequestConsole, true},
 		{notifyReply, true},
 		{"a2a.task.>", true},
@@ -6495,10 +6543,12 @@ func notifyDoorViolations(ids []a2aIdentity) []string {
 	}{
 		{"publish", notifyRequest, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"publish", notifyRequestSlack, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", notifyRequestTeams, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"publish", notifyRequestConsole, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"subscribe", notifyReply, a2aAgentBusUser, func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequest, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequestSlack, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequestTeams, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequestConsole, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"publish", notifyReply, "gateway", func(id a2aIdentity) []string { return id.publish }},
 	}
@@ -6547,10 +6597,12 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	for _, want := range []struct{ user, verb, pattern string }{
 		{a2aAgentBusUser, "publish", notifyRequest},
 		{a2aAgentBusUser, "publish", notifyRequestSlack},
+		{a2aAgentBusUser, "publish", notifyRequestTeams},
 		{a2aAgentBusUser, "publish", notifyRequestConsole},
 		{a2aAgentBusUser, "subscribe", notifyReply},
 		{"gateway", "subscribe", notifyRequest},
 		{"gateway", "subscribe", notifyRequestSlack},
+		{"gateway", "subscribe", notifyRequestTeams},
 		{"gateway", "subscribe", notifyRequestConsole},
 		{"gateway", "publish", notifyReply},
 	} {
@@ -6885,10 +6937,16 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with exec.replicas 3 = %d, want %d", got, base+3)
 		}
 	})
-	t.Run("the MCP door", func(t *testing.T) {
-		t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Run("the MCP door switched off", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "false")
+		if got := a2aStandingPods(a2aTestAgent()); got != base-1 {
+			t.Fatalf("standing pods with the MCP door off = %d, want %d", got, base-1)
+		}
+	})
+	t.Run("the curator", func(t *testing.T) {
+		t.Setenv(a2aCuratorEnvVar, "true")
 		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
-			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
+			t.Fatalf("standing pods with the curator = %d, want %d", got, base+1)
 		}
 	})
 	t.Run("the dispatcher switched off", func(t *testing.T) {

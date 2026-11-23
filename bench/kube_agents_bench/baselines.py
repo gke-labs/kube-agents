@@ -124,8 +124,10 @@ __all__ = [
     "ADMITTED_BY_BOOTSTRAP",
     "ADMITTED_BY_NEITHER",
     "ADMITTED_BY_RECORD",
+    "FRONT_DOOR_ENV",
     "MODES",
     "MODE_NEXT",
+    "MODE_NEXT_SESSION",
     "MODE_TODAY",
     "RECORD_COLLECTING",
     "RECORD_NONE",
@@ -146,6 +148,7 @@ __all__ = [
     "append_record",
     "is_gcs",
     "load_versions",
+    "run_mode",
     "utc_now",
 ]
 
@@ -191,7 +194,19 @@ RECORD_NONE = "none"
 #: and those of the retired today-mode nightly, stay readable and apart.
 MODE_TODAY = "today"
 MODE_NEXT = "next"
-MODES = (MODE_TODAY, MODE_NEXT)
+#: A run that deployed the default session as its front door
+#: (``EVAL_FRONT_DOOR=session``, #6539): the same stack, a different route
+#: for every conversation, so its records are kept apart from ``next``'s and
+#: a front-door A/B run never moves the main nightly's bar.
+MODE_NEXT_SESSION = "next-session"
+MODES = (MODE_TODAY, MODE_NEXT, MODE_NEXT_SESSION)
+FRONT_DOOR_ENV = "EVAL_FRONT_DOOR"
+
+
+def run_mode() -> str:
+    """The key mode this run records under: ``next``, or ``next-session``
+    when the deploy chose the default session as the front door."""
+    return MODE_NEXT_SESSION if os.environ.get(FRONT_DOOR_ENV, "").strip() == "session" else MODE_NEXT
 
 #: Which authority admits a case. ``roster``: ``BOOTSTRAP_ADMITTED`` decides,
 #: the record informs. ``record``: the record decides once it holds a full
