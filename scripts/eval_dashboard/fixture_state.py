@@ -198,6 +198,10 @@ RUNNER_SLOT_WARNING = "slot '{slot}'"
 # role's objects missing, no cluster for its slot, or no seeded cluster at
 # all. Any other explanation (no credentials, could not list) is a failed read.
 RUNNER_ABSENT_PHRASES = ("was never planted", "has no labelled seeded cluster for slot", "carries no clusters labelled")
+# hack/fleet-kubeconfigs.sh's words for a role the fleet stack plants only on
+# the projects its `projects_var` list names: not checked, and not a failed
+# read either, so no counter of unread roles counts it.
+RUNNER_BY_DESIGN_PHRASE = "by design: the project is not in"
 
 DEFAULT_WORKERS = 6
 DEFAULT_PROJECT_TIMEOUT_S = 600
@@ -488,8 +492,21 @@ def reapply_clears_nothing(lines) -> bool:
     return bool(lines) and all(no_reapply_op(line) for line in lines)
 
 
+def not_planted_by_design(verdict: object) -> bool:
+    """A not-checked role the project does not plant by design (`projects_var`):
+    no read was attempted, so none failed."""
+    detail = verdict.get(KEY_DETAIL) if isinstance(verdict, dict) else None
+    return (
+        isinstance(verdict, dict)
+        and verdict.get(KEY_STATE) == ROLE_NOT_CHECKED
+        and bool(detail)
+        and RUNNER_BY_DESIGN_PHRASE in str(detail[0])
+    )
+
+
 def unread_units(document: dict | None) -> int:
-    """How many roles went unread on projects the scan did check."""
+    """How many roles went unread on projects the scan did check; a role the
+    project does not plant by design was not a read, and is not counted."""
     count = 0
     projects = (document or {}).get(KEY_PROJECTS) if isinstance(document, dict) else None
     for entry in (projects or {}).values() if isinstance(projects, dict) else []:
@@ -500,7 +517,7 @@ def unread_units(document: dict | None) -> int:
         # The same "reached" test as checked_projects: a project seen only
         # through absent roles still reports the reads that failed there.
         if any(s in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_NOT_READY, ROLE_ABSENT) for s in states):
-            count += sum(1 for s in states if s == ROLE_NOT_CHECKED)
+            count += sum(1 for v in roles.values() if isinstance(v, dict) and v.get(KEY_STATE) == ROLE_NOT_CHECKED and not not_planted_by_design(v))
     return count
 
 
@@ -575,7 +592,7 @@ def not_checked_reason(document: dict | None) -> str | None:
             continue
         roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
         for verdict in (roles or {}).values():
-            if isinstance(verdict, dict) and verdict.get(KEY_STATE) == ROLE_NOT_CHECKED and verdict.get(KEY_DETAIL):
+            if isinstance(verdict, dict) and verdict.get(KEY_STATE) == ROLE_NOT_CHECKED and verdict.get(KEY_DETAIL) and not not_planted_by_design(verdict):
                 reasons[str(verdict[KEY_DETAIL][0])] += 1
     return reasons.most_common(1)[0][0] if reasons else None
 

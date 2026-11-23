@@ -897,6 +897,10 @@ class NotChecked(ScanHarness):
         self.assertIn("by design", entry["roles"]["post-merge-sync-workload"]["detail"][0])
         self.assertEqual(entry["summary"]["absent"], 0)
         self.assertEqual(doc["summary"]["absent_projects"], 0)
+        # Not a failed read either: the digest's unread count stays at zero, so
+        # a fleet in its designed state still reads clean.
+        self.assertEqual(fixture_state.unread_units(doc), 0)
+        self.assertIsNone(fixture_state.not_checked_reason(doc))
 
     def test_a_probe_the_cluster_refused_is_not_checked_not_absent(self):
         # A 403 or a 5xx on the presence probe says nothing about whether the
