@@ -2874,8 +2874,8 @@ def _shell_argvs_with_exit_propagation(
             post_paren_redirect_target = False
             continue
         if current_ops and current_ops[-1] == ")":
-            if _is_redirect(word) or (word.isdigit() and i + 1 < len(words) and _is_redirect(words[i + 1])):
-                post_paren_redirect_target = not word.isdigit()
+            if _is_redirect(word):
+                post_paren_redirect_target = True
                 continue
         if _is_control_operator(word):
             op_str = str(word)
