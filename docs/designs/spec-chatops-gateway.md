@@ -1668,9 +1668,10 @@ The paragraphs above are the history._
 
 ## Who may press Stop (added 11/9)
 
-Two backends have a Stop button: Slack's native Stop on an Agent Session's Working… line (the
-Slack adapter section) and the Stop button the Google Chat adapter draws under a task's line (the
-Google Chat adapter section, "The Stop button"). The rule is the same on both. Only a requester
+Three backends have a Stop button: Slack's native Stop on an Agent Session's Working… line (the
+Slack adapter section), the Stop button the Google Chat adapter draws under a task's line (the
+Google Chat adapter section, "The Stop button") and the one the Teams adapter draws on the line's
+card ("The Teams adapter"). The rule is the same on all three. Only a requester
 the conversation's record holds may press it: a task's requester or steer author, or a session
 author. Anyone else's press cancels nothing, and the gateway logs it; what the presser sees is
 below (added 11/11) (`mayStop` in `stopgate.go`, which holds the set of gated backends, `stopGatedBackends`). The
@@ -1700,6 +1701,14 @@ nothing, as before ("Unverified senders", in the Slack adapter section, which ho
 backend). A private thread reply Chat refuses is posted once more at the space's top level, still
 private, as the note card is; a second refusal, or any other failure, is logged and nothing more,
 since the typed `stop` the line names still works.
+
+On Teams the button is the adapter's drawing too, and a press arrives through the queue with no
+synchronous answer, so a silent refusal would read as a slow control there as well. Teams has no
+post only one member sees, so the refusal is said on the pressed line itself
+(`tellRefusedOnLine` in `chat_stop_press.go`): the line reads `✋` and `refusedPressNotice`, its
+button kept, until the task's next progress writes over it. It is visible to the conversation and
+names nobody; it is written only for a press on the running task's own line, and never in a direct
+message.
 
 A record that cannot tell who asked gates nobody: nothing ran, a requester was cleared past
 `AskTTL`, a steer or session author was dropped past its cap, or the history is at its cap
@@ -3130,6 +3139,19 @@ ask's own minute. What the
 passthrough does not serve the adapter says so about rather than guess: `OpenDirect` is refused
 (creating a conversation is outside the allowed paths), `Roster` is incomplete and empty,
 reactions are a nil no-op.
+
+A running task's line carries a Stop button on its card (`teams_press.go`): one Adaptive Card
+`Action.Submit` whose data names the task. Teams delivers its press as a message activity with no
+text, the button's data as its `value` and the pressed message as its `replyToId`, and asks the
+bot's endpoint for nothing in return, so a press travels the queue like any other activity.
+`Action.Execute` would not: Teams sends it as an `invoke` and shows the presser an error unless
+the endpoint answers at once, and the receiver in front of the queue answers every activity
+"accepted" before the gateway has read it. The adapter turns the press into what Google Chat's
+is, `IntentCancel` marked a click, naming the task and the pressed message, so the requester gate
+and the answer on the line are the ones "Who may press Stop" and "The Stop button" describe
+(`stopGatedBackends`, `lineStopBackends`). The button rides the card: a line that goes out as
+plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`,
+which keeps its posted replies on Teams, is the way to stop there.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
