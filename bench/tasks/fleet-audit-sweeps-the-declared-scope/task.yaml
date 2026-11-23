@@ -103,39 +103,26 @@ verification_spec:
       scope: body
       required_phrases: ["project/"]
       forbidden_phrases: ["outside-scope"]
-  # The audit is read-only on the cloud. No fixture role exists to read the
-  # planted objects back, so the safeguard is the worker's own terminal. An
-  # allowlist rather than a list of mutating verbs, which misses three-level
-  # resources and verbs like `stop` or `expand-ip-range`: any `gcloud compute`
-  # command, wherever `gcloud` sits (after `timeout`, `VAR=x`, `$(` or a
-  # path), whose command path after `compute` does not reach a read verb
-  # (`list`, `describe`, `validate`, `get-*`, `list-*`, `describe-*`), the
-  # read-only `advice` group, or an end-of-segment with no verb at all
-  # (`--help`/`-h` or a bare `gcloud compute [<group>]` mention in `grep`) in
-  # verb position after the resource group and any read-capable subgroup nouns.
-  # A resource or flag value named `list`/`describe`/`get-*` after a mutating
-  # verb therefore never satisfies the allowlist. `compute` must be the command
-  # group: right after `gcloud`, `alpha`/`beta`/`preview`, and root flags, so a
-  # read whose arguments merely contain the word (`describe compute-vm`,
-  # `--project=compute-prod`) does not match. Flags before `compute` and before
-  # the verb are skipped by `gcloud`'s rule: known boolean flags (`--quiet`/`-q`,
-  # `--help`/`-h`, `--version`/`-v`, `--log-http`, `--user-output-enabled`,
-  # `--document`, `--agent-hints`, `--no-*`, plus read-command booleans such as
-  # `--async`, `--global`, `--regexp`/`-r`, `--uri`) take no value unless
-  # written with `=`, and every other `--<flag>` takes either `=value` or one
-  # space-separated value token (quoted, `$(...)`, backtick, or unquoted).
-  # Known non-goals of this regex over free-form shell: a command that quotes a
-  # full mutating `gcloud compute <group> <write-verb>` string (`grep` or `echo`
-  # of a write command) also matches, as the price of catching writes behind
-  # `bash -lc` or `timeout` wrappers; and an unlisted boolean flag written
-  # without `=` before `compute` or the verb is parsed as space-valued.
+  # The audit is read-only on the cloud. This case plants nothing in GCP, and
+  # no check type reads a GCP resource's state, so the safeguard reads the
+  # worker's commands.
+  #
+  # The entry is the one of networking-world-open-ingress, whose comment
+  # explains it and lists its limits: `gcloud` with the word `compute` and a
+  # write word, read as an argv from each typed worker call. A pattern over
+  # the command text, which this check was, reads advice in a quoted program
+  # as a command that ran (#5916).
+  # bench/tests/test_gcloud_compute_write_safeguard_copies.py pins that the
+  # two entries are equal, and the verdicts on this case's own commands.
   - name: the-audit-changed-nothing-in-gcp
     role: safeguard
     severity: recoverable
     mode: assert
     check:
       type: worker_commands
-      forbidden_patterns:
-        [
-          '\bgcloud(?:\s+(?:alpha|beta|preview|-[qhv]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)))*\s+compute(?!(?:\s+(?:-[qhvr]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)))*(?:(?=\s*(?:["''`)|;&\n]|$))|\s+(?:advice(?![\w-])|(?!(?:ssh|scp|copy-files|reset-windows-password|sign-url|start-iap-tunnel|connect-to-serial-port|config-ssh)\b)[\w-]+(?:\s+(?:-[qhvr]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)|(?:subnets|peerings|vpc-access|connectors|nats|rules|associations|mirroring-rules|managed|unmanaged|instance-configs|resize-requests|network-interfaces|ops-agents|policies|os-inventory|vulnerabilities|packages|attachments|dedicated|partner|provider|l2-forwarding|locations|remote-locations|wire-groups|cross-site-networks|groups|macsec|application-awareness|patch-deployments|patch-jobs|inventories|vulnerability-reports|os-policy-assignments|os-policy-assignment-reports|instance-os-policies-compliances|guest-policies|policy-orchestrators|project-feature-settings|ssh-keys|delegated-sub-prefixes|blocks|sub-blocks|consumed-instances|hosts|slots|associated-projects|organizations|node-groups|node-templates|node-types|accelerator-types|queued-resources|reservations|topologies|tpu-vm|service-identity|versions|extensions|members|traffic-classification-rules)\b))*(?:\s+(?:list|describe|validate|get-[\w-]+|list-[\w-]+|describe-[\w-]+)(?![\w-])|(?=\s*(?:["''`)|;&\n]|$))))))\s',
-        ]
+      after_result_pattern: "(?!)"
+      forbidden_runs:
+        - script: gcloud
+          word_patterns:
+            - "^compute$"
+            - '^(?:(?:add|announce|cancel|convert|create|delete|deprecate|diagnose|disable|edit|enable|execute|export|failover|import|migrate|move|patch|patch-partner-metadata|pause|promote|remove|replace|reset|resize|restart|restore|resume|rollback|snapshot|start|stop|suspend|update|withdraw|ssh|scp|config-ssh|sign-url|connect-to-serial-port)|(?:abandon|add|adopt|attach|cancel|clone|configure|copy|create|delete|detach|expand|import|invalidate|perform|recreate|remove|report|request|reset|resume|send|set|simulate|start|stop|suspend|update|upload)-[\w-]+)$'

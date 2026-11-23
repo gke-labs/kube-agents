@@ -126,6 +126,14 @@ def test_the_declared_line_passes_its_objective(objective: str, tmp_path: Path) 
             "capacity-starved-worker: cause is capacity; primary evidence: domain_capacity_shortfall (3 Pending); blast-radius zone: europe-west10-b; running there: 1/1",
         ),
         (
+            "report-attributes-capacity-skew",
+            "capacity-starved-worker: cause is capacity; primary evidence: the first zone's node has 40m allocatable CPU left, short of one 500m replica; blast-radius zone: us-central1-b; running there: 2/2 (2 Pending)",
+        ),
+        (
+            "report-attributes-capacity-skew",
+            "capacity-starved-worker: cause is capacity; primary evidence: the first zone's node has 900m of 940m CPU allocated, too little free for a 500m replica; blast-radius zone: us-central1-b; running there: 2/2 (2 Pending)",
+        ),
+        (
             "report-attributes-node-pool-skew",
             "first-zone-sponge: cause is node-pool; primary evidence: single-zone node pool; blast-radius zone: europe-west10-a; running there: 6/6",
         ),
@@ -175,6 +183,36 @@ def test_a_partial_share_or_an_empty_evidence_field_fails_the_objective(objectiv
     rest = tail[tail.index("; blast-radius zone:") :]
     vague = f"{head}primary evidence: see above{rest}"
     assert not _grades(objective, _answer(**{objective: vague}), tmp_path), vague
+
+
+def test_capacity_evidence_that_names_cpu_but_no_shortage_fails(tmp_path: Path) -> None:
+    # CPU alone is not the mechanism; the shortage is. A request restates the
+    # spec, "free" can deny the shortage, and an allocation word after the
+    # evidence field (in the zone or the trailing note) does not count.
+    for line in (
+        "capacity-starved-worker: cause is capacity; primary evidence: the workers are CPU-bound; blast-radius zone: us-central1-b; running there: 2/2 (2 Pending)",
+        "capacity-starved-worker: cause is capacity; primary evidence: the workers use CPU; blast-radius zone: us-central1-b; running there: 2/2 (CPU allocated elsewhere, 2 Pending)",
+        "capacity-starved-worker: cause is capacity; primary evidence: each replica requests 500m CPU; blast-radius zone: us-central1-b; running there: 2/2 (2 Pending)",
+        "capacity-starved-worker: cause is capacity; primary evidence: the ScheduleAnyway spread places its 500m CPU requests in the second zone; blast-radius zone: us-central1-b; running there: 2/2 (2 Pending)",
+        "capacity-starved-worker: cause is capacity; primary evidence: CPU is free on both nodes, the spread blocks the first zone; blast-radius zone: us-central1-b; running there: 2/2 (2 Pending)",
+    ):
+        assert not _grades("report-attributes-capacity-skew", _answer(**{"report-attributes-capacity-skew": line}), tmp_path), line
+
+
+def test_capacity_evidence_in_vcpu_passes(tmp_path: Path) -> None:
+    line = (
+        "capacity-starved-worker: cause is capacity; primary evidence: 900m of 940m vCPU allocated on the first "
+        "zone's node; blast-radius zone: us-central1-b; running there: 2/2 (2 Pending)"
+    )
+    assert _grades("report-attributes-capacity-skew", _answer(**{"report-attributes-capacity-skew": line}), tmp_path)
+
+
+def test_a_sponge_with_no_replica_running_is_declared_as_0_of_0(tmp_path: Path) -> None:
+    line = (
+        "first-zone-sponge: cause is node-pool; primary evidence: nodeSelector targets default-pool, which has "
+        "nodes in one zone only; blast-radius zone: us-central1-a; running there: 0/0 (6 Pending)"
+    )
+    assert _grades("report-attributes-node-pool-skew", _answer(**{"report-attributes-node-pool-skew": line}), tmp_path)
 
 
 def test_a_line_about_another_workload_does_not_stand_in(tmp_path: Path) -> None:

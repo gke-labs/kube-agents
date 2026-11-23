@@ -1168,8 +1168,10 @@ func TestA2ACancelPublishesAKindCancel(t *testing.T) {
 // TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask: a cancel whose
 // response was lost is retried; by then the executor may have ended the task.
 // The retry gets the task back as it ended, not -32002 "already canceled" for
-// a cancel that took. A turn that finished before the cancel took ends
-// completed, and the retry says so rather than refusing.
+// a cancel that took. An executor that finishes the turn after the cancel is
+// on the bus still ends it canceled toward the door, since a canceled task's
+// late writes reach no one (relayTerminal), and the retry answers with that
+// rather than refusing.
 func TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask(t *testing.T) {
 	for _, terminal := range []lib.TaskState{lib.StateCanceled, lib.StateCompleted} {
 		t.Run(string(terminal), func(t *testing.T) {
@@ -1178,7 +1180,8 @@ func TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask(t *testing.T) {
 	}
 }
 
-func cancelRetriedAfterTheTerminal(t *testing.T, terminal lib.TaskState) {
+func cancelRetriedAfterTheTerminal(t *testing.T, executorEnd lib.TaskState) {
+	terminal := lib.StateCanceled
 	r := startA2ARig(t)
 	ctx := context.Background()
 
@@ -1194,7 +1197,7 @@ func cancelRetriedAfterTheTerminal(t *testing.T, terminal lib.TaskState) {
 	if first := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID}); first.Error != nil {
 		t.Fatalf("the first cancel was refused: %d %s", first.Error.Code, first.Error.Message)
 	}
-	if err := exec.PublishStatus(ctx, terminal, true); err != nil {
+	if err := exec.PublishStatus(ctx, executorEnd, true); err != nil {
 		t.Fatal(err)
 	}
 	r.getUntil(t, a2aTestCaller, task.ID, "the terminal to reach the door", func(task a2aTaskObject) bool {

@@ -229,8 +229,9 @@ var SensitiveEnvVars = map[string]struct{}{
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
 	// the gateway's chat.notify route. It holds every platform whose route is
 	// armed under the next stack with a home channel set on the CR,
-	// comma-separated, Chat first; the agent adds a learned Slack channel and
-	// sends home posts to every armed route when no platform has a home. An
+	// comma-separated, Chat first; the agent adds a learned Slack channel or
+	// Chat space after those and sends home posts to every armed route when
+	// no platform has a home. An
 	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,
@@ -1311,7 +1312,10 @@ type AdmissionSpec struct {
 	// the inactive file cache, the figure the kubelet evicts on) and counts it
 	// against this figure. Absent means the agent container's resolved memory request
 	// in MiB (4096 at the operator's default resources), so a CR that raises
-	// the request raises the budget with it.
+	// the request raises the budget with it. Effective memoryBudgetMiB must
+	// be at least workerRssCapMiB regardless of failClosed (refused where the
+	// validating webhook is enabled, or reported as Degraded with reason
+	// InvalidKanbanAdmission).
 	//
 	// Two bounds act on the budget. Each tick admits one new worker per
 	// 512 MiB of headroom under it, so with the container's working set at W
@@ -1322,8 +1326,9 @@ type AdmissionSpec struct {
 	// 64 MiB. At the default budget the headroom bound acts first. A budget
 	// under the container's idle working set plus 512 MiB therefore admits
 	// no worker and refuses every card after QueueBoundSeconds; the schema's
-	// minimum of 512 is left there for a test install that wants exactly
-	// that, and a derived budget under it is clamped to it. A card the tick
+	// minimum of 512 is left there for a test install that sets memoryBudgetMiB
+	// to 512 and workerRssCapMiB to 512 or below, and a derived budget
+	// under it is clamped to it. A card the tick
 	// cannot spawn waits, and is refused after QueueBoundSeconds. Set the
 	// budget below the request to keep headroom for the gateway's own growth,
 	// or above it, up to the limit, on a node pool where eviction is not the
@@ -1585,7 +1590,10 @@ type DeploymentSpec struct {
 
 	// Resources specifies resource requests and limits for the main container.
 	// The memory request is also the dispatcher's default admission budget
-	// (spec.harness.tuning.admission.memoryBudgetMiB).
+	// (spec.harness.tuning.admission.memoryBudgetMiB), so setting it below
+	// workerRssCapMiB without raising memoryBudgetMiB or lowering
+	// workerRssCapMiB is refused where the validating webhook is enabled, or
+	// reported as Degraded (InvalidKanbanAdmission).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
@@ -2814,12 +2822,13 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
-// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
-// config states it.
+// InferenceStatus reports the Platform Agent's default model, and the reasoning effort
+// configured on it, as the install's LiteLLM config states them.
 //
 // A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
-// only, so a project id, a region or an account id never appears here. Both fields are
-// absent when the config states no default model.
+// only, so a project id, a region or an account id never appears here. The provider and
+// model are absent when the config states no default model; the reasoning effort is
+// absent whenever the entry states none.
 type InferenceStatus struct {
 	// Provider is the LiteLLM provider slug, the text before the first "/" of the
 	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
@@ -2830,6 +2839,13 @@ type InferenceStatus struct {
 	// for a resource reference.
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+	// the default model's entry, as typed: low, medium or high from the chart, or
+	// whatever a hand-edited config says. Absent when the entry states none, so the
+	// model thinks at its own default, and absent while the served CRD predates it.
+	// +optional
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
@@ -3034,10 +3050,12 @@ type BusMigrationRetry struct {
 // and three.
 type BusMigrationStatus struct {
 	// Leg is the direction: OneToThree (snapshot and restore, behind a write
-	// freeze) or ThreeToOne (in place). Reshape is reserved for a later
-	// release's leg; nothing in this one starts it, and a run of a leg this
-	// operator does not run is held (A2ABusMigrationLegUnknown) until the
-	// operator that started it carries it on or a person abandons it.
+	// freeze), ThreeToOne (in place), or Reshape (TASKS alone recreated at
+	// the width the CR renders, at the count the bus runs, behind a write
+	// freeze; started only by the kubeagents.x-k8s.io/bus-reshape
+	// annotation). A run of a leg this operator does not run is held
+	// (A2ABusMigrationLegUnknown) until the operator that started it carries
+	// it on or a person abandons it.
 	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne;Reshape
 	Leg string `json:"leg"`
 
@@ -3478,7 +3496,8 @@ type AgentUsageStatus struct {
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
 	// chat platform the install enables is served through Hermes (Microsoft
-	// Teams), and while the served CRD
+	// Teams, unless the operator arms the gateway's Teams backend), and
+	// while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional

@@ -87,9 +87,11 @@ spec:
                   properties:
                     jobKey:
                       description: |-
-                        JobKey groups a schedule's posts into one thread per UTC day. It
-                        defaults to the schedule's name.
+                        JobKey groups a schedule's posts into one thread per UTC day. It keys
+                        stored reports, so it is a DNS-1123 label. It defaults to the
+                        schedule's name, which a schedule that runs already has to be.
                       maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     mode:
                       default: chat
@@ -116,9 +118,10 @@ spec:
                   additionalProperties:
                     type: string
                   description: |-
-                    Parameters are passed to each run as task parameters. `stream` names
-                    the run's audit report stream.
-                  maxProperties: 32
+                    Parameters are passed to each run as task parameters, at most 16, the
+                    bound every task submission has. A built-in schedule's report stream
+                    is its own name, carried on its trigger, not a parameter.
+                  maxProperties: 16
                   type: object
                 profileRef:
                   description: |-
@@ -256,6 +259,9 @@ spec:
                 lastHandledRunNow:
                   description: LastHandledRunNow is the last run-now token acted on.
                   type: string
+                lastHandledStop:
+                  description: LastHandledStop is the last stop token acted on.
+                  type: string
                 lastOutcome:
                   description: LastOutcome is how the most recent run ended.
                   enum:
@@ -307,6 +313,19 @@ spec:
                     - idempotencyKey
                     - slotTime
                   type: object
+                postFailed:
+                  description: |-
+                    PostFailed counts runs whose report the gateway couldn't post to chat
+                    after its redeliveries (Delivery post_failed).
+                  format: int64
+                  type: integer
+                postUnknown:
+                  description: |-
+                    PostUnknown counts runs whose report post started or timed out with no
+                    outcome (Delivery post_unknown): it may be in the channel, and the
+                    gateway never posts it again.
+                  format: int64
+                  type: integer
                 recentRuns:
                   description: RecentRuns are the last ten runs, newest first.
                   items:
@@ -315,6 +334,23 @@ spec:
                       completionTime:
                         description: CompletionTime is when it ended.
                         format: date-time
+                        type: string
+                      delivery:
+                        description: |-
+                          Delivery is how its report was delivered, once that is final: posted,
+                          stored for want of a home channel, kept local, silent when clean, not
+                          delivered, post_failed when the gateway gave up posting it, or
+                          post_unknown when a post started or timed out with no outcome, so it
+                          may be in the channel and is never retried. Empty until the gateway
+                          reports a final value, and on a run it never does.
+                        enum:
+                          - no_delivery
+                          - local
+                          - silent
+                          - stored_no_home
+                          - posted
+                          - post_failed
+                          - post_unknown
                         type: string
                       outcome:
                         description: Outcome is how it ended.
@@ -374,6 +410,12 @@ spec:
                     - rateLimited
                     - suspended
                   type: object
+                stoppedTaskID:
+                  description: |-
+                    StoppedTaskID is the run in flight a stop was sent for, until it
+                    settles: a run-now asked for meanwhile waits for it to end rather than
+                    adopting it.
+                  type: string
               type: object
           type: object
       served: true

@@ -16,6 +16,19 @@ that a TokenReview on the host cluster finds valid for any configured audience (
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
 
+`jwtauth.NewAuthenticator` (`pkg/jwtauth`) is for an embedder whose platform mints a signed token
+per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer
+JWT that names its key (`kid`), verifies against the issuer's JSON Web Key Set fetched over HTTPS
+(RS\*, PS\* or ES\*; never a symmetric algorithm), and carries the configured issuer, one of the
+configured audiences, and an expiry it has not passed by more than a minute of clock skew. The
+username and groups come from configurable claims (`sub` by default). An optional `Allow` func
+can refuse a caller; without one, every token the issuer mints for that audience is admitted. The
+key set is cached for an hour and fetched again when a token names a key it lacks, at most every
+ten seconds whether or not the fetch succeeds, so a rotated key works without a restart. Keys the
+library cannot use (an unsupported type, an encryption key) are skipped. A key set that cannot be
+fetched is a 503, except that a key already cached keeps verifying for up to six hours past the
+set's expiry.
+
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
@@ -85,9 +98,9 @@ transport picks a credential per caller or tenant sets `Config.CallerPartition`:
 authenticated caller is part of the cache and coalescing keys, so requests share a response or a
 fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
 the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
-partition needs the cache off (`Config.Cache` nil). Invalidation is not partitioned: a `401` or
-`403` in one partition evicts that resource's entries in every partition, which costs the others
-refetches but never serves one partition another's response.
+partition needs the cache off (`Config.Cache` nil). A write evicts the resource's entries
+in every partition, since the data changed for every caller; a `401` or `403` evicts them in the
+caller's partition only, since only that credential's access changed.
 
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an

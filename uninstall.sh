@@ -951,9 +951,13 @@ main() {
   # The Slack home channel policy, likewise: the generator refuses a value
   # outside the CRD's enum, and the destroy removes the release whatever it says.
   export SLACK_HOME_CHANNEL_POLICY=""
+  export GOOGLE_CHAT_HOME_CHANNEL_POLICY=""
   # The data volume size, likewise: the generator refuses a malformed size,
   # and a teardown must not stop on a typo in install.env.
   export PLATFORM_AGENT_STORAGE_SIZE=""
+  # The runtime sizing profile, likewise: the generator refuses an unknown
+  # value, and a teardown must not stop on a typo in install.env.
+  export PLATFORM_AGENT_SIZING_PROFILE=""
   # The daily alert ceilings, likewise: the generator refuses a value that is
   # not a whole number, and the ceilings go with the release. Each key is
   # named here, because an older installer_common.sh has no

@@ -366,6 +366,17 @@ class RecordModeResolveTest(unittest.TestCase):
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("no gcloud on PATH", err)
 
+    def test_a_session_front_door_nightly_never_records(self):
+        """The replay lanes replay the platform front door's recordings; a run
+        through the default session (EVAL_FRONT_DOOR=session, #6539) stays in
+        shadow even as the recorder, and asking it to record is refused."""
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session")
+        self.assertEqual((values["rc"], values["mode"], values["cache"]), ("0", "shadow", ""))
+        self.assertIn("EVAL_FRONT_DOOR=session runs never record", err)
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session", EVAL_REPLAY_RECORD="true")
+        self.assertEqual(values["rc"], "1")
+        self.assertIn("never records into the shared replay cache", err)
+
     def test_a_presubmit_never_records_whoever_it_runs_as(self):
         values, _ = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]), ("0", "presubmit", "shadow", ""))
@@ -888,13 +899,15 @@ class ModeCollectorTest(_LifecycleBase):
 
     def test_the_lane_collects_in_replay_mode_with_its_seed_and_report_inputs(self):
         body = ('REPLAY_KEEP_DIR=/k\nREPLAY_LANE_SEED_DIR=/s\nREPLAY_LANE_NIGHTLY_RUNS=/r.json\n'
+                'REPLAY_LANE_NEWEST_NIGHT=/n.json\n'
                 'start_replay_shadow_collector\n' + _AWAIT_ARGV + 'wait_replay_shadow_collector\n')
         self._fake_collector()
         proc = self._run(body, stop_wait=1, EVAL_REPLAY_LANE="true", ARGV=str(self.argv), FAKE_DEPLOYED="replay")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         _, pairs = self._argv_pairs()
         self.assertEqual((pairs["--mode"], pairs["--kind"], pairs["--keep-dir"], pairs["--seed-dir"],
-                          pairs["--nightly-runs"], pairs["--pr"]), ("replay", "replay-lane", "/k", "/s", "/r.json", ""))
+                          pairs["--nightly-runs"], pairs["--newest-night"], pairs["--pr"]),
+                         ("replay", "replay-lane", "/k", "/s", "/r.json", "/n.json", ""))
 
     def test_the_lane_names_the_commit_it_replays_and_where_it_came_from(self):
         head = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -939,6 +952,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         script += lift_function("seed_replay_lane_cache", text, _CI_ENV)
         script += f"REPLAY_CACHE_FETCH_SCRIPT={str(self.fetch)!r}\n"
         script += 'rc=0\nprepare_replay_lane_cache || rc=$?\necho "rc=${rc}"\n'
+        script += 'echo "newest-night=${REPLAY_LANE_NEWEST_NIGHT:-}"\n'
         if seed:
             script += '[ "${rc}" != 0 ] || { seed_replay_lane_cache || rc=$?; echo "seed rc=${rc}"; }\n'
         overrides.setdefault("PATH", f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin")
@@ -978,6 +992,10 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertIn(f"--max-bytes {512 * 1024 * 1024}", calls[0])
         self.assertIn("--forge gitlab", calls[0], "the lane's own forge picks the records")
         self.assertNotIn("--eval-mode-next", calls[0])
+        # The newest night's builds go where the collector's report reads them (--newest-night).
+        night = re.search(r"^newest-night=(\S+/newest-night\.json)$", proc.stdout, re.M)
+        self.assertIsNotNone(night, proc.stdout)
+        self.assertIn(f"--night-out {night.group(1)} ", calls[0])
         self.assertIn("--seed-once", calls[1])
         self.assertIn("--mode replay", calls[1])
 

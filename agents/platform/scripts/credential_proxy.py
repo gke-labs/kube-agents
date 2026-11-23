@@ -680,6 +680,19 @@ GCE_METADATA_FLAVOR_HEADER = "Metadata-Flavor"
 GCE_METADATA_FLAVOR_VALUE = "Google"
 GCE_METADATA_TIMEOUT_SECONDS = 0.5
 GCE_METADATA_MAX_BYTES = 512
+# The start check of a universe domain that the environment names, against the
+# metadata server's answer. No answer (a timeout, a connection error, a status
+# other than 200 and 404) is tried up to this many times in total, with this
+# pause between tries: at most about 15 seconds, which is longer than a
+# metadata server takes to answer a pod that has just started.
+UNIVERSE_CHECK_ATTEMPTS = 10
+UNIVERSE_CHECK_PAUSE_SECONDS = 1.0
+# What the broker does when the metadata server gives no answer in every try:
+# True starts with the value unchecked and says so in one WARNING record, False
+# does not start. A host with no metadata server, such as a harness on kind,
+# never gets an answer, so False stops it. The decision is here and nowhere
+# else.
+UNIVERSE_CHECK_UNANSWERED_STARTS = True
 _METADATA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _CACHED_METADATA_UNIVERSE_DOMAIN: str | None = None
 _METADATA_UNIVERSE_LOCK = threading.Lock()
@@ -1524,6 +1537,16 @@ PROFILE_QUERY_QUALIFIER_CODE = "PROFILE_QUERY_QUALIFIER"
 # repositories under this key (#6389): the names every profile verb is held to,
 # so a profile task that names no repository can find the one it may use.
 PROFILE_IDENTITY_MANAGED_KEY = "managedRepositories"
+# A profile caller's permitted write on a branch or proposal its own task did not
+# create (#6400), refused under RULE_CALLER_VCS_OWNERSHIP with this code.
+PROPOSAL_NOT_THIS_TASKS_CODE = "PROPOSAL_NOT_THIS_TASKS"
+# How long after its task credential expires a task's record is kept, so a write
+# racing the expiry is judged by the record rather than by its absence.
+PROFILE_TASK_RECORD_MARGIN_SECONDS = 300
+# The most branches and proposals the record holds at once. At the cap a new
+# claim or proposal is refused rather than any live entry dropped, so one task's
+# writes can never push out another's.
+PROFILE_TASK_RECORD_MAX_ENTRIES = 4096
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
 # The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
 DIAL_PATH = "/v1/dial"
@@ -1542,6 +1565,41 @@ LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 LOG_MSEC_FORMAT = "%s.%03dZ"
 
 
+def probe_gce_universe_domain_answer(
+    metadata_url: str = GCE_UNIVERSE_METADATA_URL,
+    timeout: float = GCE_METADATA_TIMEOUT_SECONDS,
+    opener: Any = None,
+) -> tuple[str | None, bool]:
+    """Ask the GCE/GKE metadata server for the universe domain: `(domain, answered)`.
+
+    `(domain, True)` for an HTTP 200 with a valid universe domain. `(None, True)`
+    for an HTTP 404: the host has no universe route (not GCE, or an older
+    emulator), which is an answer with nothing in it. `(None, False)` for no
+    answer: a timeout, a connection error, any other status, or a body that
+    is not a valid universe domain.
+    """
+    request = urllib.request.Request(
+        metadata_url,
+        headers={GCE_METADATA_FLAVOR_HEADER: GCE_METADATA_FLAVOR_VALUE},
+        method="GET",
+    )
+    active_opener = _METADATA_OPENER if opener is None else opener
+    try:
+        with active_opener.open(request, timeout=timeout) as response:
+            if response.status == HTTPStatus.NOT_FOUND:
+                return None, True
+            if response.status != HTTPStatus.OK:
+                return None, False
+            raw = response.read(GCE_METADATA_MAX_BYTES).decode("utf-8", "replace").strip()
+            if not raw:
+                return None, False
+            return credential_proxy_client.normalize_universe_domain(raw), True
+    except urllib.error.HTTPError as exc:
+        return None, exc.code == HTTPStatus.NOT_FOUND
+    except (OSError, ValueError, http.client.HTTPException):
+        return None, False
+
+
 def probe_gce_universe_domain_status(
     metadata_url: str = GCE_UNIVERSE_METADATA_URL,
     timeout: float = GCE_METADATA_TIMEOUT_SECONDS,
@@ -1554,28 +1612,57 @@ def probe_gce_universe_domain_status(
     and 5xx responses return `(googleapis.com, False)` so callers never cache a
     transient metadata blip as commercial Google Cloud.
     """
-    request = urllib.request.Request(
-        metadata_url,
-        headers={GCE_METADATA_FLAVOR_HEADER: GCE_METADATA_FLAVOR_VALUE},
-        method="GET",
+    domain, answered = probe_gce_universe_domain_answer(metadata_url, timeout, opener)
+    return domain or credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, answered
+
+
+def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time.sleep) -> None:
+    """Refuse a universe domain from the environment that the metadata server contradicts.
+
+    The environment's value otherwise goes unchecked: a value that names hosts
+    of another universe, or of the commercial one under other names, would send
+    this host's credential there. The metadata server says which universe the
+    host is in, so an answer that differs raises and the broker does not start.
+    An answer that agrees passes. A host with no universe route has nothing to
+    contradict the value: it passes, with a WARNING record that the value was
+    not checked. No answer in UNIVERSE_CHECK_ATTEMPTS tries is
+    UNIVERSE_CHECK_UNANSWERED_STARTS's case, with the same record.
+    """
+    reported, answered = None, False
+    for attempt in range(UNIVERSE_CHECK_ATTEMPTS):
+        if attempt:
+            sleep(UNIVERSE_CHECK_PAUSE_SECONDS)
+        reported, answered = probe_gce_universe_domain_answer()
+        if answered:
+            break
+    variables = (
+        f"{credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV} or "
+        f"{credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV}"
     )
-    active_opener = _METADATA_OPENER if opener is None else opener
-    try:
-        with active_opener.open(request, timeout=timeout) as response:
-            if response.status == HTTPStatus.NOT_FOUND:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
-            if response.status != HTTPStatus.OK:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-            raw = response.read(GCE_METADATA_MAX_BYTES).decode("utf-8", "replace").strip()
-            if not raw:
-                return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-            return credential_proxy_client.normalize_universe_domain(raw), True
-    except urllib.error.HTTPError as exc:
-        if exc.code == HTTPStatus.NOT_FOUND:
-            return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, True
-        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
-    except (OSError, ValueError, http.client.HTTPException):
-        return credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, False
+    if not answered:
+        if not UNIVERSE_CHECK_UNANSWERED_STARTS:
+            raise RuntimeError(
+                f"the environment ({variables}) names universe domain {configured!r}, and the "
+                f"metadata server gave no answer in {UNIVERSE_CHECK_ATTEMPTS} tries to check it against"
+            )
+        LOGGER.warning(
+            "universe domain %s from the environment was not checked: the metadata server gave no answer in %d tries",
+            configured,
+            UNIVERSE_CHECK_ATTEMPTS,
+        )
+        return
+    if reported is None:
+        LOGGER.warning(
+            "universe domain %s from the environment was not checked: the metadata server has no universe route",
+            configured,
+        )
+        return
+    if reported != configured:
+        raise RuntimeError(
+            f"the environment ({variables}) names universe domain {configured!r}, and the metadata "
+            f"server reports {reported!r}. One credential proxy serves one universe domain and sends "
+            f"no credential to another. Set the variable to {reported!r} or remove it."
+        )
 
 
 def _cached_metadata_universe_domain() -> tuple[str, bool]:
@@ -1593,12 +1680,8 @@ def _cached_metadata_universe_domain() -> tuple[str, bool]:
         return domain, determined
 
 
-def resolve_universe_domain(
-    *,
-    environ: Any = os.environ,
-    probe_metadata: bool = False,
-) -> str:
-    """Resolve the active Google Cloud universe domain (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` -> `CLOUDSDK_CORE_UNIVERSE_DOMAIN` -> optional GCE metadata -> `googleapis.com`)."""
+def configured_universe_domain(environ: Any = os.environ) -> str | None:
+    """The universe domain the environment names, normalised, or None when it names none."""
     for name in (
         credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV,
         credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV,
@@ -1606,6 +1689,18 @@ def resolve_universe_domain(
         raw = environ.get(name, "").strip()
         if raw:
             return credential_proxy_client.normalize_universe_domain(raw)
+    return None
+
+
+def resolve_universe_domain(
+    *,
+    environ: Any = os.environ,
+    probe_metadata: bool = False,
+) -> str:
+    """Resolve the active Google Cloud universe domain (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` -> `CLOUDSDK_CORE_UNIVERSE_DOMAIN` -> optional GCE metadata -> `googleapis.com`)."""
+    configured = configured_universe_domain(environ)
+    if configured is not None:
+        return configured
     if probe_metadata:
         domain, _ = _cached_metadata_universe_domain()
         return domain
@@ -2363,6 +2458,10 @@ DEFAULT_CREDENTIAL_PROXY_PROFILE_AUDIENCE = "kubeagents-credential-proxy-profile
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
+# The operator sets this to "true" on the broker when the A2A gateway's teams
+# backend is the Teams queue's consumer (A2A_TEAMS_BACKEND); only then does the
+# a2a-chat role reach the Teams routes (see _teams_route_roles).
+TEAMS_A2A_CALLER_ENV = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
 # The session pod the A2A gateway spawns, under the operator's
 # A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
 # (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
@@ -2910,6 +3009,21 @@ AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
 # 404 to the caller that may legitimately be probing for it —
 # `vcs_client` reads a codeless 404 as an older broker, and a 403 there would
 # read as "not permitted" rather than "not supported".
+def _teams_route_roles(a2a_caller: bool) -> tuple[str, ...]:
+    """The roles the Teams relay routes admit.
+
+    The Hermes consumer's chat role always; the A2A gateway's a2a-chat role
+    only when the operator renders ``TEAMS_A2A_CALLER_ENV`` beside the switch
+    that makes the gateway the consumer. The broker has no other view of that
+    switch, and without the gate a Chat-armed gateway's token could drain or
+    feed the Hermes consumer's queue and post as the Teams bot on an install
+    whose Teams stays on Hermes.
+    """
+    return (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT) if a2a_caller else (CALLER_ROLE_CHAT,)
+
+
+TEAMS_ROUTE_ROLES = _teams_route_roles(os.environ.get(TEAMS_A2A_CALLER_ENV, "").strip() == "true")
+
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
@@ -2920,6 +3034,13 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # No trailing slash: the passthrough is one exact path, and the handler
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
+    # The Teams relay serves whichever gateway the install arms on it: the
+    # Hermes consumer (chat role), or the A2A gateway's teams backend
+    # (a2a-chat role) when the operator runs with A2A_TEAMS_BACKEND=true and
+    # says so to the broker (TEAMS_A2A_CALLER_ENV, _teams_route_roles). One
+    # queue, one consumer per install; the prefix sits before the bare chat
+    # prefix so it is reachable.
+    ("/v1/chat/teams/", TEAMS_ROUTE_ROLES),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     # The admission report sits under /v1/exec and must be matched first: the
     # shell's fleet sweeps size their pools by it, so it is the shell's alone
@@ -3263,6 +3384,27 @@ RULE_REPORT_A2A_REPORTS_KEY = "audit-report.a2a-reports-key"
 # holds none.
 REPORT_A2A_PUBLISH_KEY = "publish"
 
+# Who wrote a stored run (docs/designs/fleet-audit-report-store.md §3). On the
+# PUT of a ring entry the broker relays, it sets REPORT_WRITER_HEADER from the
+# caller it verified (report_writer_for), and the listener keeps it beside the
+# envelope; GET latest and GET runs/<stamp> answer it back, and the broker
+# passes that one header on to the caller. A caller's own header of the name,
+# in any case, is stripped before anything is relayed and never sent on: the
+# relay builds the listener's headers itself. Mirrored from
+# audit_report_store.REPORT_WRITER_*, which a test holds equal.
+REPORT_WRITER_HEADER = "X-Report-Writer"
+REPORT_WRITER_SHELL = "shell"
+REPORT_WRITER_BUILTIN = "builtin-schedule"
+_REPORT_WRITER_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+# Matched whole (fullmatch): `shell`, or `builtin-schedule:<audit id>:<task id>`.
+REPORT_WRITER_RE = re.compile(
+    rf"(?:{REPORT_WRITER_SHELL}|{REPORT_WRITER_BUILTIN}:{_REPORT_WRITER_LABEL}:{_REPORT_WRITER_LABEL})"
+)
+# A write of a ring entry the broker cannot stamp: a profile task whose task id
+# makes no writer. The verifier admits only a DNS-1123 label, so this is a
+# stand-in's claim, refused rather than relayed unstamped.
+RULE_REPORT_WRITER = "audit-report.writer"
+
 # What a store path asks for, by its shape under REPORT_CREDENTIAL_ROUTES:
 # the stream list, one stream's latest, its run index, or one run.
 REPORT_ROUTE_LIST = "list"
@@ -3438,6 +3580,26 @@ def report_write_permitted(
     return RULE_REPORT_REPOSITORY_KEY
 
 
+def report_writer_for(role: Any, task: Any, audit_id: Any) -> str | None:
+    """The writer stamp for a permitted PUT of a ring entry, or None when none can be made.
+
+    From the verified caller alone, never the request's headers: the shell is
+    REPORT_WRITER_SHELL; a profile caller is
+    `builtin-schedule:<audit_id>:<task id>`, with the task id the verified task
+    credential's `task` claim (report_write_permitted has already held its
+    trigger to `audit_id`'s builtin schedule). Every other role is None.
+    """
+    if role == CALLER_ROLE_SHELL:
+        return REPORT_WRITER_SHELL
+    if role == CALLER_ROLE_PROFILE:
+        task_id = getattr(task, "task", None)
+        if isinstance(task_id, str) and isinstance(audit_id, str):
+            writer = f"{REPORT_WRITER_BUILTIN}:{audit_id}:{task_id}"
+            if REPORT_WRITER_RE.fullmatch(writer):
+                return writer
+    return None
+
+
 class ReportStoreUnavailable(Exception):
     """The store, or what a write is checked against, cannot be used now: a 503."""
 
@@ -3601,8 +3763,16 @@ class ReportStoreRelay:
             raise ReportStoreUnavailable("the store token file holds no token")
         return token
 
-    def relay(self, method: str, path: str, body: bytes | None) -> tuple[int, bytes]:
-        """Send one request on and return the listener's (status, body).
+    def relay(
+        self, method: str, path: str, body: bytes | None, writer: str | None = None
+    ) -> tuple[int, bytes, str | None]:
+        """Send one request on and return the listener's (status, body, writer).
+
+        ``writer``, when given, is sent as REPORT_WRITER_HEADER: the stamp the
+        handler made from the verified caller (report_writer_for). The headers
+        sent are built here, so nothing of the caller's request reaches the
+        listener. The writer returned is the listener's REPORT_WRITER_HEADER
+        answer when it is a well-formed writer, else None.
 
         Raises ReportStoreUnavailable when the token cannot be read;
         ReportStoreTimeout when a read times out or the whole exchange outlasts
@@ -3612,11 +3782,15 @@ class ReportStoreRelay:
         those are the listener refusing the broker, not the caller, and are not
         the caller's to read as its own.
         """
+        if writer is not None and not REPORT_WRITER_RE.fullmatch(writer):
+            raise ValueError("not a report writer")
         token = self._token()
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(body))
+        if writer is not None:
+            headers[REPORT_WRITER_HEADER] = writer
         connection_class = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
         connection = connection_class(self.host, self.port, timeout=min(self.timeout, self.deadline))
         expired = threading.Event()
@@ -3638,6 +3812,8 @@ class ReportStoreRelay:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             status = response.status
+            # getheader joins repeats with ", ", which is no writer.
+            answered = response.getheader(REPORT_WRITER_HEADER)
             while len(payload) <= AUDIT_REPORT_MAX_BYTES:
                 chunk = response.read1(65536)
                 if not chunk:
@@ -3663,7 +3839,10 @@ class ReportStoreRelay:
             raise ReportStoreCredentialRefused(f"status {status}")
         if not 200 <= status <= 599:
             raise ReportStoreFault(f"the store answered status {status}")
-        return status, payload
+        if answered is not None and not REPORT_WRITER_RE.fullmatch(answered):
+            LOGGER.warning("the audit-report store answered a %s that is not a writer; not passed on", REPORT_WRITER_HEADER)
+            answered = None
+        return status, payload, answered
 
 
 def report_store_from_env(role: str) -> ReportStoreRelay | None:
@@ -5455,6 +5634,145 @@ class ClaimTokens:
         return entry
 
 
+@dataclass
+class _TaskOwned:
+    task: str
+    expires_at: float
+    # A branch claim is pending until its remote lookup says the name is free;
+    # nothing, the claiming task included, may rely on it before then.
+    confirmed: bool = True
+
+
+def task_repository_key(forge: Any, repository: str) -> str:
+    """The record's key for a repository: the forge's provider and host as well as the path.
+
+    `registry.resolve` answers the path alone, and two forges this install serves
+    can each have an `acme/infra`; keyed by the path, a proposal number one task
+    opened on one forge would admit another task's on the other. Lowercased, as
+    the managed list compares names.
+    """
+    hosts = getattr(forge, "hosts", None)
+    host = hosts[0] if isinstance(hosts, (tuple, list)) and hosts else ""
+    return f"{getattr(forge, 'name', '')}:{host}/{repository}".lower()
+
+
+class ProfileTaskWrites:
+    """Which profile task created which branch and proposal, so a permit reaches only its own (#6400).
+
+    The permit is per task, and the ownership check (`VcsBroker.require_agent_
+    proposal`) admits anything that is the install's, so without this one
+    confirmed task could retitle or advance another open `platform-agent/`
+    proposal. This holds each permit-gated write to what the same task made:
+
+      * a branch is claimed by the first task that publishes it while it is
+        absent from the remote, under one lock, so of two tasks publishing the
+        same new name the first wins and the second is refused;
+      * a proposal is recorded for the task whose `proposal-create` opened it.
+
+    Process-local, which is only right because one broker pod serves
+    `/v1/vcs/`: the stateful broker renders one replica with the Recreate
+    strategy, so no second pod ever holds a different record (an operator test
+    pins both). If that route ever scales out, this record moves to shared
+    state first. Lost on a restart, which refuses rather than permits: a
+    branch on the remote with no claim, or a proposal with no record, is not
+    this task's. Entries expire with the task's credential plus
+    PROFILE_TASK_RECORD_MARGIN_SECONDS, on the wall clock the credential's own
+    expiry is stated in.
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.time,
+        max_entries: int = PROFILE_TASK_RECORD_MAX_ENTRIES,
+    ) -> None:
+        self._clock = clock
+        self._max_entries = max_entries
+        self._branches: dict[tuple[str, str], _TaskOwned] = {}
+        self._proposals: dict[tuple[str, int], _TaskOwned] = {}
+        self._lock = threading.Lock()
+
+    def _prune_locked(self) -> None:
+        """Drop expired entries, and only those: a live one is never evicted."""
+        now = self._clock()
+        for table in (self._branches, self._proposals):
+            for key in [key for key, owned in table.items() if owned.expires_at <= now]:
+                del table[key]
+
+    def _full_locked(self) -> bool:
+        return len(self._branches) + len(self._proposals) >= self._max_entries
+
+    def claim_branch(
+        self, task: str, expires_at: float, repository: str, branch: str, on_remote: Callable[[], bool]
+    ) -> tuple[bool, bool]:
+        """(allowed, fresh): may ``task`` publish ``branch``, and is the claim new to this call.
+
+        Allowed when the task already holds a confirmed claim on the branch, or
+        when nobody holds it and it is absent from the remote (``on_remote``,
+        asked outside the lock). A lookup that raises releases the pending claim
+        and raises on, so the caller answers the forge's own failure rather than
+        an ownership refusal; nothing is written either way. A fresh claim
+        is taken, pending, before the remote is asked, so a second request racing
+        the same new name finds it held -- refused whoever sent it, the claiming
+        task included, until the lookup confirms the name is free. At the cap a
+        new claim is refused.
+        """
+        key = (repository, branch)
+        with self._lock:
+            self._prune_locked()
+            owned = self._branches.get(key)
+            if owned is not None:
+                if owned.task != task or not owned.confirmed:
+                    return False, False
+                owned.expires_at = max(owned.expires_at, expires_at)
+                return True, False
+            if self._full_locked():
+                return False, False
+            claim = _TaskOwned(task, expires_at, confirmed=False)
+            self._branches[key] = claim
+        try:
+            present = on_remote()
+        except Exception:
+            self.release_branch(task, repository, branch)
+            raise
+        with self._lock:
+            # Only this call's own claim: if it expired and was replaced while
+            # the remote was asked, the replacement is not this lookup's to judge.
+            if self._branches.get(key) is not claim:
+                return False, False
+            if present:
+                del self._branches[key]
+                return False, False
+            claim.confirmed = True
+        return True, True
+
+    def release_branch(self, task: str, repository: str, branch: str) -> None:
+        """Drop ``task``'s claim on ``branch``, if it holds it (a publish that failed)."""
+        with self._lock:
+            owned = self._branches.get((repository, branch))
+            if owned is not None and owned.task == task:
+                del self._branches[(repository, branch)]
+
+    def owns_branch(self, task: str, repository: str, branch: str) -> bool:
+        with self._lock:
+            self._prune_locked()
+            owned = self._branches.get((repository, branch))
+            return owned is not None and owned.task == task and owned.confirmed
+
+    def record_proposal(self, task: str, expires_at: float, repository: str, number: int) -> None:
+        """Record ``task``'s proposal; at the cap it goes unrecorded, so its later updates are refused."""
+        with self._lock:
+            self._prune_locked()
+            if (repository, number) not in self._proposals and self._full_locked():
+                return
+            self._proposals[(repository, number)] = _TaskOwned(task, expires_at)
+
+    def owns_proposal(self, task: str, repository: str, number: int) -> bool:
+        with self._lock:
+            self._prune_locked()
+            owned = self._proposals.get((repository, number))
+            return owned is not None and owned.task == task
+
+
 class ServiceAccountAuthenticator:
     """Verify a projected ServiceAccount token with a Kubernetes TokenReview.
 
@@ -5633,9 +5951,11 @@ class ServiceAccountAuthenticator:
                 request, timeout=self.timeout_seconds, context=context
             ) as response:
                 review = json.load(response)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             # A TokenReview that cannot be completed is a rejection, not an
             # allow. An API server outage must not turn into an open broker.
+            # HTTPException: an answer that is not HTTP, or a body that ends
+            # early, is not an OSError.
             raise AuthenticationError(
                 f"TokenReview could not be completed: {type(exc).__name__}"
             ) from exc
@@ -7382,6 +7702,19 @@ class SlackRelay:
         return {"receipt": receipt, **event}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled event: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the event too, and spends the
+        receipt. Nothing retries a failed nack: the gateway nacks once and
+        moves on, and ``pull`` hands out queue entries only, so an event held
+        back here would sit in the receipt table until the pod restarts,
+        never delivered, and the table would grow by one each time. Dropping
+        it loses the same message and leaves nothing behind. The case needs
+        the slot the pull freed to be refilled before the nack: one arrival
+        if the queue was already full, SLACK_EVENT_QUEUE_MAXSIZE if it was
+        empty. A gateway that keeps pulling makes either rare; the warning
+        is the record when it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7390,8 +7723,9 @@ class SlackRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Slack event queue is full; cannot requeue event")
-                    return False
+                    LOGGER.warning(
+                        "Slack event queue is full; the nacked event is dropped, not requeued"
+                    )
             del self._receipts[receipt]
             return True
 
@@ -7528,6 +7862,14 @@ TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
     r"^v3/conversations/[^/?#%\\]+/activities(?:/(?!history$)[^/?#%\\]+)?$",
     re.IGNORECASE,
 )
+# The one path a PUT may take: an update of one activity the bot posted
+# (Bot Framework's updateActivity), never the activities collection. The
+# gateway's rolling status line edits its own message through it.
+TEAMS_UPDATE_ACTIVITY_PATH_RE = re.compile(
+    r"^v3/conversations/[^/?#%\\]+/activities/(?!history$)[^/?#%\\]+$",
+    re.IGNORECASE,
+)
+TEAMS_RELAY_METHODS = frozenset({"POST", "PUT"})
 
 
 def is_trusted_teams_service_url(service_url: str) -> bool:
@@ -7759,6 +8101,21 @@ class TeamsRelay:
         return {"event": event, "receipt": receipt}
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
+        """Finish one pulled activity: drop it on an ack, requeue it on a nack.
+
+        A nack that finds the queue full drops the activity and its attempt
+        count, and spends the receipt, as a nack past
+        TEAMS_MAX_DELIVERY_ATTEMPTS does. Nothing retries a failed nack: the
+        gateway nacks once and moves on, and ``pull`` hands out queue entries
+        only, so an activity held back here would sit in the receipt table
+        until the pod restarts, never delivered, and the table and the
+        attempt map would grow by one each time. Dropping it loses the same
+        message and leaves nothing behind. The case needs the slot the pull
+        freed to be refilled before the nack: one arrival if the queue was
+        already full, TEAMS_EVENT_QUEUE_MAXSIZE if it was empty. A gateway
+        that keeps pulling makes either rare; the warning is the record when
+        it happens.
+        """
         with self._lock:
             event = self._receipts.get(receipt)
             if event is None:
@@ -7777,9 +8134,12 @@ class TeamsRelay:
                 try:
                     self._events.put_nowait(event)
                 except queue.Full:
-                    LOGGER.warning("Teams event queue is full; cannot requeue activity")
-                    return False
-                self._attempts[event_key] = attempts + 1
+                    self._attempts.pop(event_key, None)
+                    LOGGER.warning(
+                        "Teams event queue is full; the nacked activity is dropped, not requeued"
+                    )
+                else:
+                    self._attempts[event_key] = attempts + 1
             else:
                 self._attempts.pop(event_key, None)
             del self._receipts[receipt]
@@ -7797,11 +8157,13 @@ class TeamsRelay:
         if not is_trusted_teams_service_url(service_url):
             raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
         upper_method = (method or "").strip().upper()
-        if upper_method != "POST":
+        if upper_method not in TEAMS_RELAY_METHODS:
             raise ValueError(f"Teams relay refuses HTTP method: {method}")
         clean_path = path.lstrip("/")
         if ".." in clean_path.split("/") or not TEAMS_ALLOWED_ACTIVITY_PATH_RE.match(clean_path):
             raise ValueError(f"Teams relay refuses endpoint: {path}")
+        if upper_method == "PUT" and not TEAMS_UPDATE_ACTIVITY_PATH_RE.match(clean_path):
+            raise ValueError(f"Teams relay refuses PUT on: {path}")
 
         token = self._get_access_token()
         url = f"{service_url.rstrip('/')}/{clean_path}"
@@ -7821,7 +8183,7 @@ class TeamsRelay:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
             },
-            method="POST",
+            method=upper_method,
         )
         with self._open_url(req, timeout=30) as resp:
             content = resp.read()
@@ -14602,6 +14964,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # The claim tokens `proposal-create` answers carry and `proposal-claim`
     # burns. One store per process, shared by every handler thread.
     claim_tokens: ClaimTokens = ClaimTokens()
+    # The branches and proposals each profile task made (#6400): one per process,
+    # which is one per /v1/vcs/ server -- see ProfileTaskWrites.
+    profile_task_writes: ProfileTaskWrites = ProfileTaskWrites()
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
@@ -15073,6 +15438,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         come back. Nothing is relayed on any refusal.
         """
         method, path = self.command, self.path
+        # A caller's own writer header, in any case, is never the stamp: it is
+        # dropped here, and the relay sends only the one made below.
+        caller_headers = getattr(self, "headers", None)
+        if caller_headers is not None:
+            del caller_headers[REPORT_WRITER_HEADER]
         if not report_credential_permits(method, path):
             self._log_audit_report(HTTPStatus.NOT_FOUND, "no-such-route")
             self._refuse_audit_report(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -15083,6 +15453,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         profile = getattr(task, "profile", None) if task is not None else None
         segments = path.split("/")
         write = method in ("PUT", "DELETE")
+        writer: str | None = None
         if write:
             # The install's key is read only for a caller that could pass: a
             # role refused anyway is refused without the ConfigMap read.
@@ -15112,6 +15483,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self.report_profiles,
                 registered,
             )
+            # The PUT of a ring entry carries the writer stamp, made from the
+            # verified caller and nothing the request says.
+            if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN:
+                writer = report_writer_for(role, task, segments[3])
+                if writer is None:
+                    rule = RULE_REPORT_WRITER
         else:
             route = report_route_kind(path)
             key = segments[REPORT_STORE_KEY_SEGMENT] if len(segments) > REPORT_STORE_KEY_SEGMENT else None
@@ -15162,7 +15539,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             if body is None:
                 return
         try:
-            status, payload = store.relay(method, path, body)
+            status, payload, answered_writer = store.relay(method, path, body, writer=writer)
         except ReportStoreUnavailable as exc:
             LOGGER.warning("audit-report store unavailable: %s", exc)
             self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "store-unavailable")
@@ -15204,7 +15581,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return
         self._log_audit_report(status, "relayed")
-        self._write_audit_report_answer(status, payload)
+        self._write_audit_report_answer(status, payload, answered_writer)
 
     def _read_audit_report_body(self) -> bytes | None:
         """A PUT's body, whole and within AUDIT_REPORT_MAX_BYTES, or None once answered."""
@@ -15231,11 +15608,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self._json(status, {"error": message, "code": "AUDIT_REPORT_BODY_REFUSED"})
         return None
 
-    def _write_audit_report_answer(self, status: int, payload: bytes) -> None:
-        """The listener's status and body, framed here: no header of the listener's is passed on."""
+    def _write_audit_report_answer(self, status: int, payload: bytes, writer: str | None = None) -> None:
+        """The listener's status and body, framed here.
+
+        Of the listener's headers only REPORT_WRITER_HEADER is passed on, as
+        ``writer`` (the relay has checked it is a writer); nothing else is.
+        """
         self.connection.settimeout(RESPONSE_WRITE_TIMEOUT_SECONDS)
         try:
             self.send_response(status)
+            if writer is not None:
+                self.send_header(REPORT_WRITER_HEADER, writer)
             # A 204 carries neither a body nor a Content-Length (RFC 9110 §8.6).
             if status != HTTPStatus.NO_CONTENT:
                 if payload:
@@ -17254,6 +17637,61 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         status = self._dispatch_vcs_post(verb)
         self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
 
+    def _profile_task_bar(
+        self, principal: Any, verb: str, payload: dict[str, Any], repository: str
+    ) -> tuple[str | None, tuple[str, str, str] | None]:
+        """(refusal, fresh claim): why this permitted profile write isn't its task's, or None.
+
+        The fresh claim is (task, repository, branch) when this call claimed a
+        new branch for a publish, so a failed publish can release it.
+        """
+        task = getattr(principal, "task", None)
+        task_id = str(getattr(task, "task", "") or "")
+        if not task_id:
+            return "this write needs the task its credential names, and the credential names none", None
+        expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
+        record = self.profile_task_writes
+        if verb == "publish":
+            branch = str(payload.get("branch") or "").strip()
+            allowed, fresh = record.claim_branch(
+                task_id, expires_at, repository, branch, lambda: self._remote_branch_exists(payload, branch)
+            )
+            if not allowed:
+                return (
+                    f"{branch} is not a branch this task created: it is on the remote already, or "
+                    "another task published it first, so this task does not publish to it."
+                ), None
+            return None, (task_id, repository, branch) if fresh else None
+        if verb == PROPOSAL_CREATE_VERB:
+            source = str(payload.get("source") or "").strip()
+            if not record.owns_branch(task_id, repository, source):
+                return (
+                    f"{source} is not a branch this task published, so this task does not open a "
+                    "proposal from it."
+                ), None
+            return None, None
+        if verb == "proposal-update":
+            number = payload.get("number")
+            if isinstance(number, bool) or not isinstance(number, int) or not record.owns_proposal(task_id, repository, number):
+                return f"proposal #{number} is not one this task opened, so this task does not update it.", None
+            return None, None
+        return f"{verb} is not a write the task bar knows, so it is refused", None
+
+    def _remote_branch_exists(self, payload: dict[str, Any], branch: str) -> bool:
+        """Whether ``branch`` is on the remote, through the broker's own branch-view."""
+        view = vcs_broker.route_table(self.vcs)["branch-view"]({"repository": payload.get("repository"), "branch": branch})
+        return bool((view or {}).get("branch", {}).get("exists"))
+
+    def _record_task_proposal(self, principal: Any, result: Any, repository: str) -> None:
+        """Record the proposal a profile task's `proposal-create` opened, for its later updates."""
+        proposal = result.get("proposal") if isinstance(result, dict) else None
+        number = proposal.get("number") if isinstance(proposal, dict) else None
+        task = getattr(principal, "task", None)
+        task_id = str(getattr(task, "task", "") or "")
+        if task_id and isinstance(number, int) and not isinstance(number, bool):
+            expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
+            self.profile_task_writes.record_proposal(task_id, expires_at, repository, number)
+
     def _mint_claim(self, result: Any, repository: Any) -> None:
         """Add a one-time claim token to a `proposal-create` answer that names its proposal.
 
@@ -17548,7 +17986,41 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                             },
                         )
                         return TOOL_STATUS_BLOCKED
-                result = route(payload)
+                # The task bar (#6400): under the permit, only what this task
+                # itself created. The ownership bar above admitted anything the
+                # install made; the permit names one task, so its writes reach
+                # that task's branches and proposals alone.
+                fresh_branch = None
+                task_key = task_repository_key(forge, repository) if resolves else ""
+                if role == CALLER_ROLE_PROFILE and verb in PROFILE_OWNERSHIP_GATED_VCS_VERBS:
+                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)
+                    if refusal is not None:
+                        LOGGER.warning(
+                            "vcs write refused for a profile caller verb=%s rule=%s reason=%s",
+                            _sanitize_for_logging(verb),
+                            RULE_CALLER_VCS_OWNERSHIP,
+                            refusal,
+                        )
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "status": "blocked",
+                                "error": refusal,
+                                "code": PROPOSAL_NOT_THIS_TASKS_CODE,
+                                "rule": RULE_CALLER_VCS_OWNERSHIP,
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
+                try:
+                    result = route(payload)
+                except BaseException:
+                    if fresh_branch is not None:
+                        # The publish that would have made the branch failed;
+                        # the name goes back to nobody.
+                        self.profile_task_writes.release_branch(*fresh_branch)
+                    raise
+                if role == CALLER_ROLE_PROFILE and verb == PROPOSAL_CREATE_VERB:
+                    self._record_task_proposal(principal, result, task_key)
                 if verb == PROPOSAL_CREATE_VERB:
                     self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)
@@ -18613,6 +19085,11 @@ def serve(args: argparse.Namespace) -> None:
 
     CredentialProxyHandler.policy = Policy.load(args.policy)
     CredentialProxyHandler.probe_metadata_universe = True
+    # Read before the resolve below, which can put a metadata answer into the
+    # environment: only a value the environment came with is checked.
+    configured_universe = configured_universe_domain()
+    if configured_universe is not None:
+        check_universe_domain_against_metadata(configured_universe)
     universe_domain = resolve_universe_domain(probe_metadata=True)
     if universe_domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
         os.environ.setdefault(
@@ -19087,7 +19564,8 @@ def main(stream: TextIO = sys.stdout) -> int:
 
     Every refusal `serve` makes before it opens a listener -- an unsupported
     role or authentication mode, a listener reachable off the Pod with no
-    authenticator, a failed bootstrap command -- would otherwise leave the
+    authenticator, a failed bootstrap command, a universe domain the metadata
+    server contradicts -- would otherwise leave the
     process through the interpreter's default hook as a plain-text traceback
     on the same container log the JSON records go to, on every restart of a
     crash-looping broker. Caught here, it is one ERROR record with the

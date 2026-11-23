@@ -503,6 +503,7 @@ func TestRecordOriginBeforeTheFirstTurnPerBackend(t *testing.T) {
 		{"gchat", "gchat", "gchat:spaces/S1", "chat", "googlechat", 0},
 		{"slack", "slack", "slack:dm/D1", "chat", "slack", 0},
 		{"discord", "discord", "discord:C1", "chat", "discord", 0},
+		{"teams", "teams", "teams:19:abc@thread.tacv2;messageid=1", "chat", "teams", 0},
 		{"console", "console", "console:tok-1", "console", "", 0},
 		{"a2a", "a2a", "a2a:ctx", "api", "", 0},
 		{"a2a-google", "a2a-google", "a2a-google:ctx", "api", "", 0},

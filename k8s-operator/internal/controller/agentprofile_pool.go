@@ -51,9 +51,11 @@ const (
 	profileWorkerScratchPath   = "/scratch"
 	// 2Gi: the session worker, the same image and harness, left its 1Gi
 	// scratch at 4 KiB over a week of dev-lane sessions (a2a/gateway/
-	// spawn.go), and the image has no git to clone with. Twice that floor
-	// keeps the worker's whole ephemeral request inside Autopilot's 10Gi
-	// per pod with up to profileWorkerAutopilotToolLimit tools.
+	// spawn.go). A persona's version-control skill keeps its working copies
+	// here too (KUBE_AGENTS_VCS_ROOT in a2a/Dockerfile.worker); the broker
+	// refuses a clone over 256 MiB by default. Twice that floor keeps
+	// the worker's whole ephemeral request inside Autopilot's 10Gi per pod
+	// with up to profileWorkerAutopilotToolLimit tools.
 	profileWorkerScratchSizeLimit = "2Gi"
 	// profileWorkerAutopilotToolLimit is how many tools a profile can carry
 	// before the worker's ephemeral-storage request passes Autopilot's 10Gi

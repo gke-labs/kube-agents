@@ -586,14 +586,14 @@ class A2AStackFootprintTest(unittest.TestCase):
         self.assertEqual(storage["dataClaims"], 2)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 1580m and 2896Mi,
+        """The A2A stack's standing requests, provisioning Job aside: 1680m and 3024Mi,
         with the default three NATS servers, each with the JetStream metrics exporter
-        beside it (#4477), and the profile dispatcher (960m and 1648Mi with one server)."""
+        beside it (#4477), the MCP server and the profile dispatcher (1060m and 1776Mi with one server)."""
         standing = [k for k in self.following if k.startswith("a2a") and k != "a2aProvision"]
         bridge = self.following["agentPod"]["hermesBridge"]
         cpu = sum(self.following[k]["cpuMillisRequest"] for k in standing) + bridge["cpuMillisRequest"]
         memory = sum(self.following[k]["memoryBytesRequest"] for k in standing) + bridge["memoryBytesRequest"]
-        self.assertEqual((cpu, memory), (1580, 2896 * _MIB))
+        self.assertEqual((cpu, memory), (1680, 3024 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _golden_with(_scale_callout_deployment):

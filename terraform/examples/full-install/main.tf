@@ -142,14 +142,16 @@ locals {
   # The CR's spec.integration, as one local so the tests can read it.
   platform_agent_integration = merge(
     var.enable_google_chat ? {
-      googleChat = {
+      googleChat = merge({
         enabled          = true
         topicName        = module.chat_pubsub[0].topic_name
         subscriptionName = module.chat_pubsub[0].subscription_name
         allowedUsers     = var.google_chat_allowed_users
         homeChannel      = var.google_chat_home_channel
         mode             = var.google_chat_mode
-      }
+        }, var.google_chat_home_channel_policy != "" ? {
+        homeChannelPolicy = var.google_chat_home_channel_policy
+      } : {})
     } : {},
     var.enable_slack ? {
       slack = merge({
@@ -1008,18 +1010,26 @@ locals {
         tag = var.image_tag
       }
     }
-    operator = {
-      image = {
-        tag = var.image_tag
-      }
-      # The composition installs cert-manager, so unlike a bare `helm install`
-      # it can turn the admission webhooks on. failurePolicy stays at the
-      # chart's Ignore: this release creates the PlatformAgent CR too, and Helm
-      # registers the webhooks before the operator holds a certificate.
-      webhooks = {
-        enabled = var.enable_webhooks
-      }
-    }
+    operator = merge(
+      {
+        image = {
+          tag = var.image_tag
+        }
+        # The composition installs cert-manager, so unlike a bare `helm install`
+        # it can turn the admission webhooks on. failurePolicy stays at the
+        # chart's Ignore: this release creates the PlatformAgent CR too, and Helm
+        # registers the webhooks before the operator holds a certificate.
+        webhooks = {
+          enabled = var.enable_webhooks
+        }
+      },
+      # Only while on, so an install that leaves it off renders the values it did.
+      var.card_stop_enabled ? {
+        cardStop = {
+          enabled = true
+        }
+      } : {},
+    )
     litellm = merge(
       {
         modelProvider    = var.model_provider
@@ -1143,6 +1153,12 @@ locals {
             # agent_runtime_class is what asks for the sandbox.
             runtimeClassName = var.agent_runtime_class != "" ? var.agent_runtime_class : (var.enable_gvisor_node_pool ? "gvisor" : "")
           }
+        },
+        # Empty leaves the chart/operator default (small) in effect cleanly; the
+        # composition defaults to "auto" so installs scale automatically unless
+        # explicitly overridden or cleared.
+        var.platform_agent_sizing_profile == "" ? {} : {
+          sizingProfile = var.platform_agent_sizing_profile
         },
         # Only when a ceiling is set. A default install then keeps the
         # release values that it had before, and a re-tag to a chart without

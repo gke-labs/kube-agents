@@ -156,7 +156,8 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # every gcloud read as this account, so the presence probe and the state pass
 # list instances, firewall rules, networks and snapshots as it (#2483, #2682),
 # and the state pass reads the startup-fail VM's serial port output and lists
-# the snapshots' source disks as it.
+# the snapshots' source disks as it. It also lists the project's reservations
+# as it, for the missing-reservation-pool role (compute.reservations.list).
 # roles/compute.viewer is get and list on Compute Engine resources, with no
 # create, update or delete. It does show instance metadata and serial port
 # output (compute.instances.getSerialPortOutput), so no secret goes in this
@@ -1157,8 +1158,10 @@ resource "google_compute_firewall" "world_open_deny_remote" {
 # `NetworkPeering/default--mtu-peer-declared`. Both one-way halves are
 # needed: a peering with one half is INACTIVE, which the check skips. No
 # `labels`: a VPC network and a peering take none, so neither carries
-# fleet_labels. Until the stream's declared-intent slice lands, the finding
-# publishes and no case grades it. Catalogue role: declared-mtu-peering.
+# fleet_labels. The pool project's GitOps repository declares the pair on
+# purpose in knowledge/notification-relay-no-pdb.md, so the networking audit
+# lists it under Declared intent, not as a finding. Catalogue role:
+# declared-mtu-peering.
 resource "google_compute_network" "mtu_peer_declared" {
   name                    = "mtu-peer-declared"
   auto_create_subnetworks = false
@@ -1230,9 +1233,10 @@ resource "google_compute_instance" "startup_fail" {
 #
 # Zonal control plane with `node_locations` across two zones, not a regional
 # cluster: the fleet is standing, and a regional control plane would triple
-# the node floor for a property nothing here needs. Two e2-small nodes, one
-# per zone, is the minimum shape on which "the pods are all in one zone" is a
-# true statement about a real cluster.
+# the node floor for a property nothing here needs. Two nodes, one per zone
+# (an e2-small and an e2-standard-2; see the pool comment below), is the
+# minimum shape on which "the pods are all in one zone" is a true statement
+# about a real cluster.
 # ---------------------------------------------------------------------------
 
 resource "google_container_cluster" "seeded_d" {

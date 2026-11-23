@@ -156,10 +156,10 @@ verification_spec:
         - '(^|&&|;|\|)\s*gh\s'
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
   # The commit step runs `git` and `submit_suggestion.py` as the programs
-  # themselves. A worker runs as `hermes chat -q`, where the command scanner refuses
-  # a command whose program is a shell variable (`$G add`, `"$S" prepare`) and
-  # the refusal is final; a skill that teaches the variable form costs every
-  # pull-request-opening worker its first attempts at the step.
+  # themselves. The check dates from a command scanner that refused a command
+  # whose program is a shell variable (`$G add`, `"$S" prepare`), which cost
+  # every pull-request-opening worker its first attempts at the step. The image
+  # no longer runs that scanner; the plain form stays the skills' convention.
   - name: the-commit-step-called-its-programs-by-path
     role: objective
     mode: assert
@@ -197,11 +197,8 @@ verification_spec:
       # wrapper or a `!` (`cd ws nohup $G push`), or behind a listed wrapper
       # given an option argument or an assignment (`xargs -n 1 $G add`,
       # `env A=b $G add`). The
-      # patterns show whether this case's worker hit the refusal. What keeps
-      # the skills from teaching the variable form again is the image build's
-      # check_skill_commands.py, which runs the shell blocks of every document
-      # of the agent image's skills (deploy/docker/skill_documents.py) through
-      # Tirith, and for inline code
+      # patterns show whether this case's worker used the variable form. What keeps
+      # the skills from teaching the variable form again in inline code is
       # tests/test_skill_inline_commands.py and the stockout plugin's
       # test_skill_commands.py. Those read the skill's own
       # text, so they see a chain's later commands, but their patterns miss

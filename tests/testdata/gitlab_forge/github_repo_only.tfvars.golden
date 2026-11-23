@@ -52,6 +52,10 @@ alert_daily_limits = {}
 # install.env). The composition passes the chart nothing for the default.
 platform_agent_storage_size = "50Gi"
 
+# The PlatformAgent's spec.deployment.sizingProfile
+# (PLATFORM_AGENT_SIZING_PROFILE in install.env, default auto).
+platform_agent_sizing_profile = "auto"
+
 # Gateway redaction (LITELLM_REDACTION_* in install.env). The composition
 # renders nothing into the chart while enabled is false.
 litellm_redaction = { enabled = false }
@@ -92,6 +96,7 @@ chat_topic_name           = "platform-agent-chat-events"
 chat_subscription_name    = "platform-agent-chat-events-sub"
 google_chat_allowed_users = []
 google_chat_home_channel  = ""
+google_chat_home_channel_policy = ""
 google_chat_mode          = "default"
 
 enable_slack            = false
@@ -109,6 +114,8 @@ github_app_id        = ""
 enable_gke_backup_plan = false
 
 helm_upgrade_install = false
+
+card_stop_enabled = false
 
 # The CRD defaults dashboardEnabled to true; the installer has always
 # defaulted it to false and asks. Memory settings mirror --memory.

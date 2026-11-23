@@ -378,7 +378,7 @@ the worker checks, as does a `tool_called` with a `result` pattern, since the tr
 cannot show"). A case whose premise
 the transport removes is a different matter:
 `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with its reason, and the
-api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
+roster files are untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
 unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
 `API_SERVER_KEY` the operator sets on it, and the deploy's start-line wait requires
@@ -406,10 +406,10 @@ session pod waits on the profile and dispatcher work, which has no date, and the
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a container in the agent pod
-that the operator renders under `next` (a CR may declare its own on `spec.deployment.sidecars`
+that the operator renders (a CR may declare its own on `spec.deployment.sidecars`
 instead) and whose image `a2a/Dockerfile.hermes-bridge` builds. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
-addressee stays `platform`, which is what the addressee token is for. An install under `next`
+addressee stays `platform`, which is what the addressee token is for. An install
 whose bridge is not consuming - still waiting for the bus to be provisioned, or failing - has a bus
 with nobody consuming `platform` tasks, and every case on the
 inject transport ends as infrastructure. That is the correct reading of that install, and it is
@@ -482,8 +482,8 @@ comparison. The lane now runs the bridge's `api` executor, the default a custome
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
 transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
 session store rather than from the trajectory (Completion signals), so a case whose answer is a
-delegated worker's report is graded on that report, as on the api lane. Two differences from the
-api lane remain, and both are the transport's rather than the agent's. A router-scope
+delegated worker's report is graded on that report, as a run over the agent API grades it. Two
+differences from the agent API remain, and both are the transport's rather than the agent's. A router-scope
 `tool_called` reads the Planning Agent's calls through the door's trace, from which the harness leaves out the
 calls the bridge labels with a card worker's session. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
 call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
@@ -502,7 +502,7 @@ prerequisite warns and the unit runs. A fence that could not run to its verdict 
 Ready gateway pod or an exec that did not reach the container, leaves the unit unlaunched and recorded
 as infrastructure, so no block follows it. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
-`api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
+`api` being acceptable per case and stable across the on-demand runs, not the agent API's numbers.
 Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
 through the exclusion list with its reason. And every case carries a GitHub-write safeguard,
@@ -562,7 +562,7 @@ What it adds to the proof: the A2A relay instance pulls the install's subscripti
 broker with its own audience, the gateway mints the session and the `authority` block, the
 allowed-users gate admits the sender, and the reply reaches the thread.
 
-The operator work this stage stood on is rendered: under `next` with Google Chat enabled the
+The operator work this stage stood on is rendered: with Google Chat enabled the
 gateway carries the adapter's env and relay token, the broker arms the A2A relay instance on
 the install's one subscription with the third audience, the gateway's ServiceAccount is a
 broker caller and a NetworkPolicy peer, and the legacy consumer is not rendered (the gateway
@@ -602,7 +602,7 @@ The caveat that decides how much of the time cost stage 1 removes: the bridge ru
 per task, by default a turn in the conversation's session through the pod's API server and as
 the fallback a `hermes -p platform chat -Q -q <prompt>` subprocess, and publishes its terminal
 when that turn ends.
-Kanban stays the delegation mechanism inside the persona under `next` (decided 2026-09-17).
+Kanban stays the delegation mechanism inside the persona (decided 2026-09-17).
 Agent-initiated delegation as a child task on the bus is designed and not built:
 [`spec-subagent-profiles.md`](spec-subagent-profiles.md) has an orchestrator delegate by
 publishing a submission on `a2a.tasks.{profile}.{taskId}.in` ("How a profile becomes a pod"), a
@@ -710,6 +710,8 @@ history at that key (agent model included; the main nightly and the presubmit ru
 The dashboard's Trend page keeps a series per mode: it draws `next` by default, and the legacy
 `today` series stays selectable from the lines the store already holds until they age out of
 its window; its Nightly page reads the main nightly's runs, so it shows `next`.
+
+**The front door (#6539).** `EVAL_FRONT_DOOR` picks which front door a run deploys. `platform`, the default, sends a plain conversation to the platform agent, as every install does today. `session` sets the chart's `platformAgent.harness.tuning.defaultRoute` to `session`, so each new conversation gets a session pod of its own: the default session that the sessions-by-default change (#2371) makes the front door. The door takes the install's route, so the cases run unchanged. On the session route a session costs its conversation's replays too, 7 TASKS consumers rather than 3, and the floor would fit only 2 sessions at 4 parallel conversations. So a session run sizes `maxSessions` to the run's parallelism plus two (`EVAL_FRONT_DOOR_SESSIONS=fair`), and its fresh TASKS is created at that budget. The headroom matters because the gateway doesn't queue at the cap: it evicts the longest-idle pod or refuses the turn, and an eviction between a multi-turn case's turns would cost B for something that isn't the front door. `EVAL_FRONT_DOOR_SESSIONS=shipped` leaves the cap at the install default instead, which is what a customer install gets; an eviction or refusal there is a finding about that default. The deploy writes the front door to `front-door.txt` in its artifacts. A session run keeps its records apart from the main nightly's: the gate files them under the version key's `next-session` mode, the dashboard publish skips the run, and it never records into the shared replay cache. `scripts/eval_front_door_ab.py <run A> <run B>` reads the two runs' `case-<name>.json` hand-offs and lists every case B fails where A passed. When both runs carry their `eval-grading.log`, it also compares each case's median answer words, infrastructure repetitions left out, and flags a case whose answer on B runs more than 25% and at least 10 words over A's; `--length-gate` makes that exit 1 too, since answer length is part of front-door parity, and exits 2 when a run has no shapes to compare. It exits 1 on a regression, and 2 when the runs can't be compared: an empty run, swapped front doors, or a B where no case was graded.
 
 **History.** While `spec.mode: today` existed, `EVAL_MODE_NEXT=1` on a Prow job chose this path:
 the deploy installed `today`, proved it, then flipped the install to `next` through the chart's

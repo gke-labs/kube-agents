@@ -1274,10 +1274,17 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
         self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
         self.assertLess(policy_at, call_at)
+        chat_policy_at = text.find('export GOOGLE_CHAT_HOME_CHANNEL_POLICY=""')
+        self.assertNotEqual(chat_policy_at, -1, "uninstall.sh must blank GOOGLE_CHAT_HOME_CHANNEL_POLICY")
+        self.assertLess(chat_policy_at, call_at)
         # The data volume size likewise: the generator refuses a malformed size.
         storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
         self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")
         self.assertLess(storage_at, call_at)
+        # The runtime sizing profile likewise: the generator refuses an unknown value.
+        sizing_at = text.find('export PLATFORM_AGENT_SIZING_PROFILE=""')
+        self.assertNotEqual(sizing_at, -1, "uninstall.sh must blank PLATFORM_AGENT_SIZING_PROFILE")
+        self.assertLess(sizing_at, call_at)
         # The scoped service account pool too: the generator refuses a
         # misspelt switch or a malformed cap, and the pool goes with the state.
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')

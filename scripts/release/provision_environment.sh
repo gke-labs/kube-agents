@@ -36,6 +36,8 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # timeout-minutes in deploy-environment.yml is sized to this budget and to
 # teardown_common.sh's second run of a failed uninstall.sh.
 readonly PROVISION_STOCKOUT_PATTERN='does not have enough resources available to fulfill request|ZONE_RESOURCE_POOL_EXHAUSTED'
+readonly PLATFORM_AGENT_SIZING_PROFILE_VALUES="small medium fleet auto"
+readonly PLATFORM_AGENT_SIZING_PROFILE_CHOICES="small | medium | fleet | auto"
 PROVISION_STOCKOUT_ATTEMPTS="${PROVISION_STOCKOUT_ATTEMPTS:-3}"
 PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
 # Each knob has to be a plain decimal: a word makes the attempt comparison
@@ -213,6 +215,21 @@ if provision_is_truthy "${SLACK_ENABLED:-}"; then
   fi
 fi
 
+if [ -n "${PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+  _sizing_valid="false"
+  for _sizing_choice in $PLATFORM_AGENT_SIZING_PROFILE_VALUES; do
+    if [ "$PLATFORM_AGENT_SIZING_PROFILE" = "$_sizing_choice" ]; then
+      _sizing_valid="true"
+      break
+    fi
+  done
+  if [ "$_sizing_valid" != "true" ]; then
+    echo "::error title=PLATFORM_AGENT_SIZING_PROFILE is invalid::'${PLATFORM_AGENT_SIZING_PROFILE}' is not ${PLATFORM_AGENT_SIZING_PROFILE_CHOICES}, and install.sh refuses it after the teardown. Refusing before the teardown rather than after."
+    echo "==> PLATFORM_AGENT_SIZING_PROFILE='${PLATFORM_AGENT_SIZING_PROFILE}' is not valid (use ${PLATFORM_AGENT_SIZING_PROFILE_CHOICES})." >&2
+    INSTALL_REFUSAL_STATUS=1
+  fi
+fi
+
 [ "$INSTALL_REFUSAL_STATUS" -eq 0 ] || exit 1
 
 # The teardown half of a provision: uninstall.sh, its three outcomes read out
@@ -313,6 +330,10 @@ if [ -n "${GOOGLE_CHAT_HOME_CHANNEL:-}" ]; then
   INSTALL_ARGS+=(--google-chat-home-channel="${GOOGLE_CHAT_HOME_CHANNEL}")
 fi
 
+if [ -n "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}" ]; then
+  INSTALL_ARGS+=(--google-chat-home-channel-policy="${GOOGLE_CHAT_HOME_CHANNEL_POLICY}")
+fi
+
 if [ -n "${CHAT_TOPIC_NAME:-}" ]; then
   INSTALL_ARGS+=(--chat-topic-name="${CHAT_TOPIC_NAME}")
 fi
@@ -387,6 +408,10 @@ fi
 
 if [ -n "${PLATFORM_AGENT_PERMISSION_SET:-}" ]; then
   INSTALL_ARGS+=(--permission-set="${PLATFORM_AGENT_PERMISSION_SET}")
+fi
+
+if [ -n "${PLATFORM_AGENT_SIZING_PROFILE:-}" ]; then
+  INSTALL_ARGS+=(--sizing-profile="${PLATFORM_AGENT_SIZING_PROFILE}")
 fi
 
 if [ -n "${REGISTRY_PREFIX:-}" ]; then

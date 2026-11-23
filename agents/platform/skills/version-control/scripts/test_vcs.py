@@ -799,6 +799,30 @@ class CollaborationTest(VcsTestCase):
             [{"kube-agents.event": "proposal-opened", "proposal": {"url": url, "number": 12, "title": "Raise replicas"}}],
         )
 
+    def test_proposal_create_with_an_answer_nested_too_deep_is_one_json_error_and_no_record(self):
+        """Through the real `call` and the real `vcs_call`: the broker's reply to `proposal-create` holds
+        a title that nests deeper than the bound. The proposal can be open, so the text does not say "retry"."""
+        bound = vcs_client.credential_proxy_client.MAX_VCS_BODY_DEPTH
+        title = b"[" * bound + b"]" * bound
+        deep = b'{"proposal": {"number": 12, "title": %s, "url": "https://github.com/acme/infra/pull/12"}, "claim": "c"}' % title
+
+        def reply(request, *args, **kwargs):
+            verb = request.full_url.rsplit("/", 1)[1]
+            answer = self.broker(verb, json.loads(request.data))
+            return io.BytesIO(deep if verb == "proposal-create" else json.dumps(answer).encode())
+
+        self.run_vcs("branch", "fix/replicas")
+        stderr = io.StringIO()
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        with mock.patch.object(vcs_client, "call", REAL_CALL), mock.patch.dict(os.environ, environment), mock.patch.object(
+            vcs_client.credential_proxy_client, "open_broker_request", reply
+        ), redirect_stderr(stderr):
+            code, out = self.run_vcs("proposal", "create", "--title", "Raise replicas")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, {"error": vcs_client.ANSWER_TOO_DEEP_TEXT})
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertIn("proposal-create", [verb for verb, _ in self.broker.calls])
+
     def test_a_proposal_read_records_nothing(self):
         stderr = io.StringIO()
         with mock.patch.object(vcs_client, "call", REAL_CALL), \
@@ -1261,6 +1285,49 @@ class BrokerCallTest(unittest.TestCase):
         self.assertTrue(vcs._nests_deeper_than({"a": {}}, 1))
         self.assertFalse(vcs._nests_deeper_than({"a": {}}, 2))
 
+    def main_with_the_broker_body(self, status: int, body: bytes):
+        """Run `capabilities` through the real `vcs_call` with `body` as the broker's reply; as above."""
+
+        def reply(request, *args, **kwargs):
+            if status == 200:
+                return io.BytesIO(body)
+            raise urllib.error.HTTPError(request.full_url, status, "refused", {}, io.BytesIO(body))
+
+        out = io.StringIO()
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(vcs_client, "ROOT", Path(tmp)), mock.patch.dict(
+            os.environ, environment
+        ), mock.patch.object(vcs_client.credential_proxy_client, "open_broker_request", reply), redirect_stdout(out):
+            code = vcs.main(["capabilities", "acme/infra"])
+        return code, json.loads(out.getvalue())
+
+    def test_a_broker_body_nested_deeper_than_the_bound_ends_in_one_json_object(self):
+        """The broker client holds the body to its bound before a verb uses it; the skill prints the result."""
+        bound = vcs_client.credential_proxy_client.MAX_VCS_BODY_DEPTH
+        # The object is one level; its value holds the rest.
+        deep = b"[" * bound + b"]" * bound
+        code, printed = self.main_with_the_broker_body(200, b'{"baseBranch": "main", "verbs": %s}' % deep)
+        self.assertEqual(code, 1)
+        self.assertEqual(printed, {"error": vcs_client.ANSWER_TOO_DEEP_TEXT})
+
+        code, printed = self.main_with_the_broker_body(422, b'{"error": %s, "code": "FORGE_REJECTED"}' % deep)
+        self.assertEqual(code, 1)
+        self.assertEqual(printed, {"error": "HTTP 422", "code": "FORGE_REJECTED"})
+
+        code, printed = self.main_with_the_broker_body(
+            409, b'{"error": "the base branch moved", "code": "BASE_MOVED", "detail": %s}' % deep
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            printed,
+            {"error": "the base branch moved", "code": "BASE_MOVED", "detail": "left out: nested too deep to read"},
+        )
+
+        at_the_bound = b"[" * (bound - 1) + b"]" * (bound - 1)
+        code, printed = self.main_with_the_broker_body(200, b'{"baseBranch": "main", "verbs": %s}' % at_the_bound)
+        self.assertEqual(code, 0)
+        self.assertEqual(printed["baseBranch"], "main")
+
     def test_a_refusal_part_that_is_a_number_is_kept_beside_a_detail_that_is_left_out(self):
         error = vcs.VcsError("the forge refused the change", code=422, detail=self.nested_lists(vcs.MAX_PRINT_DEPTH))
         with mock.patch.object(vcs_client, "call", side_effect=error):
@@ -1290,6 +1357,17 @@ class BrokerCallTest(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(printed["code"], "FORGE_REJECTED")
             self.assertEqual(printed["detail"], "left out: nested too deep to print")
+
+    def test_an_encoder_error_that_is_not_a_recursion_error_gets_out_of_the_print_step(self):
+        """The clause behind the bound takes RecursionError only: another error of the encoder
+        is not printed as an answer that is nested too deep."""
+        with self.assertRaises(TypeError):
+            vcs._as_text({"entries": {1, 2}})
+        # RecursionError is a RuntimeError; the parent type is not taken either.
+        fault = RuntimeError("another fault of the encoder")
+        with mock.patch.object(vcs.json, "dumps", side_effect=fault), self.assertRaises(RuntimeError) as caught:
+            vcs._as_text({"baseBranch": "main"})
+        self.assertIs(caught.exception, fault)
 
     def test_an_answer_and_a_refusal_that_can_be_printed_are_printed_as_before(self):
         code, printed = self.main_with_the_broker_answer(return_value={"baseBranch": "main", "entries": [[1], {"a": 2}]})

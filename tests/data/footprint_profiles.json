@@ -6,15 +6,15 @@
       "autopilot": false,
       "requirements": {
         "chartSurgePods": 2,
-        "limitsCpu": 43050,
-        "limitsEphemeral": 27648851968,
-        "limitsMemory": 56136564736,
+        "limitsCpu": 43550,
+        "limitsEphemeral": 27715960832,
+        "limitsMemory": 56405000192,
         "maxSessions": 10,
         "persistentVolumeClaims": 7,
-        "pods": 31,
-        "requestsCpu": 5936,
-        "requestsEphemeral": 27648851968,
-        "requestsMemory": 19209912320,
+        "pods": 32,
+        "requestsCpu": 6036,
+        "requestsEphemeral": 27715960832,
+        "requestsMemory": 19344130048,
         "requestsStorage": 244813135872,
         "sessionLimitsCpu": 20000,
         "sessionLimitsEphemeral": 11408506880,
@@ -30,7 +30,7 @@
         "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
-      "sessionQuotaPods": 39
+      "sessionQuotaPods": 40
     },
     "autopilot": {
       "label": "GKE Autopilot",
@@ -38,15 +38,15 @@
       "autopilot": true,
       "requirements": {
         "chartSurgePods": 2,
-        "limitsCpu": 43050,
-        "limitsEphemeral": 27648851968,
-        "limitsMemory": 56136564736,
+        "limitsCpu": 43550,
+        "limitsEphemeral": 27715960832,
+        "limitsMemory": 56405000192,
         "maxSessions": 10,
         "persistentVolumeClaims": 7,
-        "pods": 31,
-        "requestsCpu": 8436,
-        "requestsEphemeral": 27648851968,
-        "requestsMemory": 22296920064,
+        "pods": 32,
+        "requestsCpu": 8536,
+        "requestsEphemeral": 27715960832,
+        "requestsMemory": 22431137792,
         "requestsStorage": 244813135872,
         "sessionLimitsCpu": 20000,
         "sessionLimitsEphemeral": 11408506880,
@@ -62,7 +62,7 @@
         "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
-      "sessionQuotaPods": 39
+      "sessionQuotaPods": 40
     },
     "one-server": {
       "label": "One NATS server, GKE Standard",
@@ -72,15 +72,15 @@
       "autopilot": false,
       "requirements": {
         "chartSurgePods": 2,
-        "limitsCpu": 39950,
-        "limitsEphemeral": 27380416512,
-        "limitsMemory": 53519319040,
+        "limitsCpu": 40450,
+        "limitsEphemeral": 27447525376,
+        "limitsMemory": 53787754496,
         "maxSessions": 10,
         "persistentVolumeClaims": 5,
-        "pods": 29,
-        "requestsCpu": 5316,
-        "requestsEphemeral": 27380416512,
-        "requestsMemory": 17901289472,
+        "pods": 30,
+        "requestsCpu": 5416,
+        "requestsEphemeral": 27447525376,
+        "requestsMemory": 18035507200,
         "requestsStorage": 158913789952,
         "sessionLimitsCpu": 20000,
         "sessionLimitsEphemeral": 11408506880,
@@ -96,7 +96,7 @@
         "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
-      "sessionQuotaPods": 37
+      "sessionQuotaPods": 38
     },
     "hindsight-minter": {
       "label": "Hindsight and the GitHub minter, GKE Standard",
@@ -107,15 +107,15 @@
       "autopilot": false,
       "requirements": {
         "chartSurgePods": 4,
-        "limitsCpu": 49050,
-        "limitsEphemeral": 28856811520,
-        "limitsMemory": 62042144768,
+        "limitsCpu": 49550,
+        "limitsEphemeral": 28923920384,
+        "limitsMemory": 62310580224,
         "maxSessions": 10,
         "persistentVolumeClaims": 8,
-        "pods": 35,
-        "requestsCpu": 6786,
-        "requestsEphemeral": 28856811520,
-        "requestsMemory": 21760049152,
+        "pods": 36,
+        "requestsCpu": 6886,
+        "requestsEphemeral": 28923920384,
+        "requestsMemory": 21894266880,
         "requestsStorage": 253403070464,
         "sessionLimitsCpu": 20000,
         "sessionLimitsEphemeral": 11408506880,
@@ -131,7 +131,7 @@
         "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
-      "sessionQuotaPods": 45
+      "sessionQuotaPods": 46
     },
     "installer-autopilot": {
       "label": "",
@@ -145,15 +145,15 @@
       "autopilot": true,
       "requirements": {
         "chartSurgePods": 5,
-        "limitsCpu": 48550,
-        "limitsEphemeral": 28856811520,
-        "limitsMemory": 60163096576,
+        "limitsCpu": 49050,
+        "limitsEphemeral": 28923920384,
+        "limitsMemory": 60431532032,
         "maxSessions": 10,
         "persistentVolumeClaims": 8,
-        "pods": 36,
-        "requestsCpu": 9130,
-        "requestsEphemeral": 28856811520,
-        "requestsMemory": 24444403712,
+        "pods": 37,
+        "requestsCpu": 9230,
+        "requestsEphemeral": 28923920384,
+        "requestsMemory": 24578621440,
         "requestsStorage": 575525617664,
         "sessionLimitsCpu": 20000,
         "sessionLimitsEphemeral": 11408506880,
@@ -169,7 +169,7 @@
         "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
-      "sessionQuotaPods": 47
+      "sessionQuotaPods": 48
     },
     "installer-standard": {
       "label": "",
@@ -183,15 +183,15 @@
       "autopilot": false,
       "requirements": {
         "chartSurgePods": 5,
-        "limitsCpu": 48550,
-        "limitsEphemeral": 28856811520,
-        "limitsMemory": 60163096576,
+        "limitsCpu": 49050,
+        "limitsEphemeral": 28923920384,
+        "limitsMemory": 60431532032,
         "maxSessions": 10,
         "persistentVolumeClaims": 8,
-        "pods": 36,
-        "requestsCpu": 6630,
-        "requestsEphemeral": 28856811520,
-        "requestsMemory": 21357395968,
+        "pods": 37,
+        "requestsCpu": 6730,
+        "requestsEphemeral": 28923920384,
+        "requestsMemory": 21491613696,
         "requestsStorage": 575525617664,
         "sessionLimitsCpu": 20000,
         "sessionLimitsEphemeral": 11408506880,
@@ -207,7 +207,7 @@
         "surgeRequestsEphemeral": 1342177280,
         "surgeRequestsMemory": 2147483648
       },
-      "sessionQuotaPods": 47
+      "sessionQuotaPods": 48
     }
   }
 }

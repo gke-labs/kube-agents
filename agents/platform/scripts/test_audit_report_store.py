@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hashlib
 import http.server
 import json
 import os
@@ -205,12 +206,20 @@ class StoreTestCase(unittest.TestCase):
         verifier = store.TokenVerifier(fetch=self.fetch, **verifier_args)
         return TestClient(store.create_app(verifier, root=str(root or self.root)))
 
-    def call(self, method: str, path: str, body: bytes | None = None, token: str | None = "default"):
+    def call(
+        self, method: str, path: str, body: bytes | None = None, token: str | None = "default",
+        writer: str | None = "default",
+    ):
         headers = {}
         if token == "default":
             token = self.token
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
+        # Every PUT carries the broker's writer stamp unless a test says otherwise.
+        if writer == "default":
+            writer = store.REPORT_WRITER_SHELL if method == "PUT" else None
+        if writer is not None:
+            headers[store.REPORT_WRITER_HEADER] = writer
         return self.client.request(method, path, content=body, headers=headers)
 
     def put_run(self, stamp: str, doc: dict | None = None, stream: str = STREAM):
@@ -269,7 +278,10 @@ class RouteTests(StoreTestCase):
         for stamp in stamps:
             self.assertEqual(204, self.put_run(stamp).status_code)
         self.assertEqual(list(reversed(stamps[1:])), self.call("GET", f"{STREAM}/runs").json())
-        self.assertEqual(14, len(list((self.root / "compliance-audit" / "acme" / "gitops" / "runs").iterdir())))
+        runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        self.assertEqual(14, len(list(runs.glob("*.json"))))
+        # Each envelope goes with its writer sidecar.
+        self.assertEqual(sorted(f"{stamp}.writer" for stamp in stamps[1:]), sorted(p.name for p in runs.glob("*.writer")))
 
     def test_a_failed_prune_does_not_fail_the_write(self) -> None:
         for day in range(1, 15):
@@ -683,7 +695,9 @@ class HardeningTests(StoreTestCase):
         real = store._read_at
 
         def counting(dir_fd, name):
-            reads.append(name)
+            # The ring entries read; the matched entry's writer sidecar is read after.
+            if name.endswith(".json"):
+                reads.append(name)
             return real(dir_fd, name)
 
         with mock.patch.object(store, "_read_at", side_effect=counting):
@@ -1085,6 +1099,266 @@ class FutureStampTests(StoreTestCase):
         past = time.strftime("%Y%m%dT%H%M%S.000000Z", time.gmtime(FIXED_NOW + store.RUN_STAMP_MAX_FUTURE_SECONDS + 5))
         self.assertEqual(400, self.put_run(past).status_code)
 
+
+class WriterTests(StoreTestCase):
+    """The broker's X-Report-Writer stamp, kept beside each envelope (fleet-audit-report-store.md §3)."""
+
+    BUILTIN = "builtin-schedule:compliance-audit:task-7f3a"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        self.store_dir = self.runs.parent
+
+    @staticmethod
+    def sidecar(writer: str, body: bytes) -> dict:
+        return {"writer": writer, "sha256": hashlib.sha256(body).hexdigest()}
+
+    def put(self, stamp: str, writer: str | None, doc: dict | None = None):
+        body = json.dumps(doc or {"finished_at": stamp}).encode()
+        return self.call("PUT", f"{STREAM}/runs/{stamp}", body, writer=writer), body
+
+    def test_each_valid_writer_is_stored_beside_the_envelope(self) -> None:
+        for stamp, writer in ((STAMP_1, "shell"), (STAMP_2, self.BUILTIN)):
+            with self.subTest(writer=writer):
+                response, body = self.put(stamp, writer)
+                self.assertEqual(204, response.status_code)
+                sidecar = self.runs / f"{stamp}.writer"
+                self.assertEqual(self.sidecar(writer, body), json.loads(sidecar.read_bytes()))
+                self.assertEqual(0o644, sidecar.stat().st_mode & 0o777)
+                # The envelope is the caller's bytes, unchanged.
+                self.assertEqual(body, (self.runs / f"{stamp}.json").read_bytes())
+                got = self.call("GET", f"{STREAM}/runs/{stamp}")
+                self.assertEqual(body, got.content)
+                self.assertEqual(writer, got.headers.get(store.REPORT_WRITER_HEADER))
+        self.assertEqual([], [p.name for p in self.runs.iterdir() if p.suffix == ".tmp"])
+        # The run index and the stream list name envelopes alone, and carry no writer.
+        index = self.call("GET", f"{STREAM}/runs")
+        self.assertEqual([STAMP_2, STAMP_1], index.json())
+        self.assertNotIn(store.REPORT_WRITER_HEADER, index.headers)
+        listed = self.call("GET", "/v1/audit-reports")
+        self.assertEqual(STAMP_2, listed.json()[0]["newest_run"])
+        self.assertNotIn(store.REPORT_WRITER_HEADER, listed.headers)
+
+    def test_a_missing_or_malformed_writer_is_400_and_writes_nothing(self) -> None:
+        for writer in ("", "Shell", "shellx", "profile", "builtin-schedule", "builtin-schedule:compliance-audit",
+                       "builtin-schedule:compliance-audit:", "builtin-schedule::task-1",
+                       "builtin-schedule:compliance-audit:Task-1", "builtin-schedule:compliance-audit:task_1",
+                       "builtin-schedule:compliance-audit:a:b", "builtin-schedule:compliance-audit:" + "a" * 64,
+                       "builtin-schedule:compliance-audit:-task", "collector:compliance-audit:task-1"):
+            with self.subTest(writer=writer):
+                response, _ = self.put(STAMP_1, writer)
+                self.assertEqual(400, response.status_code, response.text)
+        self.assertFalse(any(self.root.rglob("*.json")))
+        self.assertFalse(any(self.root.rglob("*.writer")))
+
+    def test_an_unstamped_put_is_written_with_no_sidecar(self) -> None:
+        # A broker from before the stamp sends none; the two roll independently.
+        self.put(STAMP_1, "shell")
+        response, body = self.put(STAMP_1, None, {"unstamped": 1})
+        self.assertEqual(204, response.status_code)
+        self.assertEqual(body, (self.runs / f"{STAMP_1}.json").read_bytes())
+        self.assertFalse((self.runs / f"{STAMP_1}.writer").exists())
+        got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
+        self.assertEqual(body, got.content)
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", body).status_code)
+        self.assertFalse((self.store_dir / "latest.writer").exists())
+        self.assertNotIn(store.REPORT_WRITER_HEADER, self.call("GET", f"{STREAM}/latest").headers)
+
+    def test_two_writer_headers_are_400(self) -> None:
+        response = self.client.request(
+            "PUT", f"{STREAM}/runs/{STAMP_1}", content=b"{}",
+            headers=[("Authorization", f"Bearer {self.token}"), (store.REPORT_WRITER_HEADER, "shell"),
+                     (store.REPORT_WRITER_HEADER, self.BUILTIN)],
+        )
+        self.assertEqual(400, response.status_code)
+        self.assertFalse(any(self.root.rglob("*.json")))
+
+    def test_a_builtin_writer_for_another_audit_is_400(self) -> None:
+        response, _ = self.put(STAMP_1, "builtin-schedule:other-audit:task-1")
+        self.assertEqual(400, response.status_code)
+        self.assertFalse(any(self.root.rglob("*.json")))
+
+    def test_a_rewritten_run_takes_the_new_writer(self) -> None:
+        self.put(STAMP_1, self.BUILTIN)
+        response, body = self.put(STAMP_1, "shell", {"again": 1})
+        self.assertEqual(204, response.status_code)
+        self.assertEqual(self.sidecar("shell", body), json.loads((self.runs / f"{STAMP_1}.writer").read_bytes()))
+
+    def test_no_sidecar_answers_no_writer(self) -> None:
+        # An envelope from before the sidecar, or the file store's own write.
+        self.runs.mkdir(parents=True)
+        (self.runs / f"{STAMP_1}.json").write_text("{}")
+        (self.store_dir / "latest.json").write_text("{}")
+        for path in (f"{STREAM}/runs/{STAMP_1}", f"{STREAM}/latest"):
+            with self.subTest(path=path):
+                got = self.call("GET", path)
+                self.assertEqual(200, got.status_code)
+                self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+
+    def test_a_malformed_sidecar_answers_no_writer(self) -> None:
+        self.runs.mkdir(parents=True)
+        body = b"{}"
+        (self.runs / f"{STAMP_1}.json").write_bytes(body)
+        digest = hashlib.sha256(body).hexdigest()
+        for raw in (b"shell", b"shell\r\nX-Other: 1", b"", b"[]", b"{", b'{"writer": "shell"}',
+                    json.dumps({"sha256": digest}).encode(), json.dumps({"writer": "Shell", "sha256": digest}).encode(),
+                    json.dumps({"writer": "shell\r\nX-Other: 1", "sha256": digest}).encode(),
+                    json.dumps({"writer": "shell", "sha256": 7}).encode(), "\u00e9".encode(),
+                    # ASCII on disk, a non-ASCII str once decoded: never compared.
+                    json.dumps({"writer": "shell", "sha256": "\u00e9" * 64}).encode(),
+                    json.dumps({"writer": "shell", "sha256": digest.upper()}).encode()):
+            with self.subTest(raw=raw):
+                (self.runs / f"{STAMP_1}.writer").write_bytes(raw)
+                got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
+                self.assertEqual(200, got.status_code)
+                self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        # PUT latest copies the matched run's sidecar: a planted digest is no
+        # writer there either, and the copy still goes ahead.
+        (self.runs / f"{STAMP_1}.writer").write_bytes(json.dumps({"writer": "shell", "sha256": "\u00e9" * 64}).encode())
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", body).status_code)
+        self.assertNotIn(store.REPORT_WRITER_HEADER, self.call("GET", f"{STREAM}/latest").headers)
+        # The same sidecar, well formed, is passed on.
+        (self.runs / f"{STAMP_1}.writer").write_text(json.dumps(self.sidecar("shell", body)))
+        self.assertEqual("shell", self.call("GET", f"{STREAM}/runs/{STAMP_1}").headers.get(store.REPORT_WRITER_HEADER))
+
+    def test_a_sidecar_for_other_bytes_answers_no_writer(self) -> None:
+        _, body = self.put(STAMP_1, self.BUILTIN, {"run": 1})
+        self.call("PUT", f"{STREAM}/latest", body)
+        # The envelopes rewritten under their sidecars, as a listener that
+        # keeps none would after a rollback: the hashes no longer bind.
+        (self.runs / f"{STAMP_1}.json").write_text('{"run": "forged"}')
+        (self.store_dir / "latest.json").write_text('{"run": "forged"}')
+        for path in (f"{STREAM}/runs/{STAMP_1}", f"{STREAM}/latest"):
+            with self.subTest(path=path):
+                got = self.call("GET", path)
+                self.assertEqual(b'{"run": "forged"}', got.content)
+                self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+
+    def test_a_write_between_the_two_reads_never_pairs_mismatched(self) -> None:
+        # A concurrent writer (one that ignores the lock: the platform-agent
+        # container, or a listener without it) swaps latest and its sidecar
+        # between the envelope read and the sidecar read, either way round.
+        _, first = self.put(STAMP_1, "shell", {"run": 1})
+        _, second = self.put(STAMP_2, self.BUILTIN, {"run": 2})
+        writers = {first: "shell", second: self.BUILTIN}
+        real = store._read_at
+        for before, after in ((first, second), (second, first)):
+            with self.subTest(before=before):
+                self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", before).status_code)
+
+                def racing(dir_fd, name, after=after):
+                    data = real(dir_fd, name)
+                    if name == store.REPORT_LATEST_NAME:
+                        (self.store_dir / "latest.json").write_bytes(after)
+                        (self.store_dir / "latest.writer").write_text(json.dumps(self.sidecar(writers[after], after)))
+                    return data
+
+                with mock.patch.object(store, "_read_at", side_effect=racing):
+                    got = self.call("GET", f"{STREAM}/latest")
+                self.assertEqual(before, got.content)
+                self.assertIn(got.headers.get(store.REPORT_WRITER_HEADER), (None, writers[before]))
+                self.assertIsNone(got.headers.get(store.REPORT_WRITER_HEADER))
+
+    def test_reads_hold_the_store_lock(self) -> None:
+        _, body = self.put(STAMP_1, "shell")
+        self.call("PUT", f"{STREAM}/latest", body)
+        held = []
+        real = store._locked
+
+        def recording(dir_fd):
+            held.append(dir_fd)
+            return real(dir_fd)
+
+        with mock.patch.object(store, "_locked", side_effect=recording):
+            for path in (f"{STREAM}/latest", f"{STREAM}/runs/{STAMP_1}"):
+                with self.subTest(path=path):
+                    held.clear()
+                    self.assertEqual("shell", self.call("GET", path).headers.get(store.REPORT_WRITER_HEADER))
+                    self.assertEqual(1, len(held))
+
+    def test_put_latest_copies_the_matched_runs_writer(self) -> None:
+        _, shell_body = self.put(STAMP_1, "shell", {"run": 1})
+        _, builtin_body = self.put(STAMP_2, self.BUILTIN, {"run": 2})
+        # The caller's own header on PUT latest is not what is kept.
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", builtin_body, writer="shell").status_code)
+        self.assertEqual(self.sidecar(self.BUILTIN, builtin_body), json.loads((self.store_dir / "latest.writer").read_bytes()))
+        self.assertEqual(0o644, (self.store_dir / "latest.writer").stat().st_mode & 0o777)
+        got = self.call("GET", f"{STREAM}/latest")
+        self.assertEqual(builtin_body, got.content)
+        self.assertEqual(self.BUILTIN, got.headers.get(store.REPORT_WRITER_HEADER))
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", shell_body, writer=self.BUILTIN).status_code)
+        self.assertEqual("shell", self.call("GET", f"{STREAM}/latest").headers.get(store.REPORT_WRITER_HEADER))
+        # A matched entry with no sidecar leaves latest with none, never the last one's.
+        (self.runs / f"{STAMP_1}.writer").unlink()
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", shell_body).status_code)
+        self.assertFalse((self.store_dir / "latest.writer").exists())
+        self.assertNotIn(store.REPORT_WRITER_HEADER, self.call("GET", f"{STREAM}/latest").headers)
+
+    def test_delete_latest_drops_its_writer(self) -> None:
+        _, body = self.put(STAMP_1, "shell")
+        self.call("PUT", f"{STREAM}/latest", body)
+        self.assertTrue((self.store_dir / "latest.writer").exists())
+        self.assertEqual(204, self.call("DELETE", f"{STREAM}/latest").status_code)
+        self.assertFalse((self.store_dir / "latest.writer").exists())
+
+    def test_prune_removes_each_sidecar_with_its_envelope(self) -> None:
+        stamps = [f"202611{day:02d}T000000.000000Z" for day in range(1, store.REPORT_HISTORY + 3)]
+        self.runs.mkdir(parents=True)
+        # An orphan sidecar older than the ring, as a sidecar-less listener's prune leaves.
+        (self.runs / "20261001T000000.000000Z.writer").write_text(json.dumps(self.sidecar("shell", b"{}")))
+        for stamp in stamps:
+            self.assertEqual(204, self.put(stamp, self.BUILTIN)[0].status_code)
+        kept = stamps[-store.REPORT_HISTORY:]
+        self.assertEqual(sorted(f"{s}.json" for s in kept), sorted(p.name for p in self.runs.glob("*.json")))
+        self.assertEqual(sorted(f"{s}.writer" for s in kept), sorted(p.name for p in self.runs.glob("*.writer")))
+
+    def test_a_symlinked_sidecar_is_no_writer(self) -> None:
+        _, body = self.put(STAMP_1, "shell")
+        outside = self.tmp / "outside.writer"
+        outside.write_text(json.dumps(self.sidecar(self.BUILTIN, body)))
+        sidecar = self.runs / f"{STAMP_1}.writer"
+        sidecar.unlink()
+        sidecar.symlink_to(outside)
+        # Never followed: the envelope reads, unstamped.
+        got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
+        self.assertEqual((200, body), (got.status_code, got.content))
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        # PUT latest copies no writer from it.
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", body).status_code)
+        self.assertFalse((self.store_dir / "latest.writer").exists())
+        # latest.writer as a symlink: no writer on read, never followed.
+        (self.store_dir / "latest.writer").symlink_to(outside)
+        got = self.call("GET", f"{STREAM}/latest")
+        self.assertEqual((200, body), (got.status_code, got.content))
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        # A directory at the sidecar's name is no writer either.
+        sidecar.unlink()
+        sidecar.mkdir()
+        got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
+        self.assertEqual(200, got.status_code)
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        sidecar.rmdir()
+        # A rewrite replaces a linked sidecar itself and leaves its target alone.
+        (self.runs / f"{STAMP_1}.writer").symlink_to(outside)
+        self.assertEqual(204, self.put(STAMP_1, "shell")[0].status_code)
+        self.assertFalse(sidecar.is_symlink())
+        self.assertEqual(self.sidecar(self.BUILTIN, body), json.loads(outside.read_text()))
+
+    def test_delete_latest_holds_the_store_lock(self) -> None:
+        _, body = self.put(STAMP_1, "shell")
+        self.call("PUT", f"{STREAM}/latest", body)
+        held = []
+        real = store._locked
+
+        def recording(dir_fd):
+            held.append(dir_fd)
+            return real(dir_fd)
+
+        with mock.patch.object(store, "_locked", side_effect=recording):
+            self.assertEqual(204, self.call("DELETE", f"{STREAM}/latest").status_code)
+        self.assertEqual(1, len(held))
 
 if __name__ == "__main__":
     unittest.main()

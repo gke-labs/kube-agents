@@ -180,6 +180,15 @@ MUTATIONS: list[Mutation] = [
         "the permit, which names no proposal, to keep it off a person's",
     ),
     Mutation(
+        "A3-profile-write-any-tasks",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)\n",
+         "                    refusal, fresh_branch = None, None\n"),
+        "test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work",
+        "let a confirmed task write on any open proposal the install owns, since "
+        "the permit says a change was asked for -- though not which one",
+    ),
+    Mutation(
         "A3-report-credential-any-route",
         "agents/platform/scripts/credential_proxy.py",
         ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
@@ -306,6 +315,46 @@ MUTATIONS: list[Mutation] = [
         "test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod",
         "serve the store from the exec tier too, to spread the load -- an exec "
         "pod has no store token, and its pods' tokens are not the broker's",
+    ),
+    Mutation(
+        "A3-report-writer-shell-for-every-caller",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role == CALLER_ROLE_SHELL:\n        return REPORT_WRITER_SHELL\n",
+         "    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE):\n        return REPORT_WRITER_SHELL\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every permitted write `shell`, since the broker already decided "
+        "the caller may write -- a profile task's run then reads as the shell's, "
+        "and the A2A relay cannot tell which task wrote it",
+    ),
+    Mutation(
+        "A3-report-writer-task-is-the-profile",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        task_id = getattr(task, \"task\", None)\n",
+         "        task_id = getattr(task, \"profile\", None)\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp the profile instead of the task, as the allowlist names profiles "
+        "-- every task of the profile then wrote every run, and the relay cannot "
+        "hold a report to the task that asked for it",
+    ),
+    Mutation(
+        "A3-report-writer-caller-header-kept",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if caller_headers is not None:\n            del caller_headers[REPORT_WRITER_HEADER]\n",
+         "        if caller_headers is not None:\n            pass\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "leave the caller's header in place, since the relay builds its own "
+        "headers -- until a change forwards the request's headers and a caller "
+        "names its own writer",
+    ),
+    Mutation(
+        "A3-report-writer-on-every-write",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            if rule is None and method == \"PUT\" and report_route_kind(path) == REPORT_ROUTE_RUN:\n",
+         "            if rule is None:\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every write, latest and DELETE included -- the listener copies "
+        "latest's writer from the matched run, and a stamp sent there is one it "
+        "must then be trusted to ignore",
     ),
     Mutation(
         "A3-report-no-role-is-shell",
@@ -1798,6 +1847,16 @@ Mutation(
         "which are commercial hosts, are relayed",
     ),
     Mutation(
+        "C2-universe-domain-metadata-check",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if reported != configured:\n",
+         "    if False and reported != configured:\n"),
+        "test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts",
+        "trust the universe domain the environment names again, so a value "
+        "the host's metadata server contradicts starts the broker and its "
+        "credential goes to that domain's hosts",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
@@ -2568,10 +2627,93 @@ Mutation(
     Mutation(
         "A3-a2a-google-roster-chat-map",
         "a2a/gateway/gateway.go",
-        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
-         "\tif backend == consoleBackend {"),
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
+         "\tif backend == consoleBackend || backend == a2aEntraBackend {"),
         "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
         "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
+        "A3-a2a-entra-alg-unpinned",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif header.Alg != a2aEntraAlgorithm {", "\tif false {"),
+        "test_A3_an_entra_token_is_checked_against_the_tenants_keys_with_the_algorithm_pinned",
+        "let the token name its own algorithm, so a forger who writes alg none "
+        "or an HMAC alg keyed with the public key is checked the way they ask",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-tenant",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !issued || !strings.EqualFold(claims.Tid, v.tenantID) {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token from any tenant whose key happens to be in the set, so "
+        "an account outside the install's directory signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-application",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !audience {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token the tenant issued for some other application, so a "
+        "token a person granted another app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-entra-id-token-admitted",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\tif strings.TrimSpace(claims.Scp) == "" {', "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "admit a token that grants no delegated scope, so an ID token lifted "
+        "from a browser or a client log signs its subject in",
+    ),
+    Mutation(
+        "A3-a2a-entra-any-bearer-parsed",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !entraTokenShaped(token) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_jwt_never_reaches_the_tenants_keys",
+        "decode every non-static bearer as a JWT, so junk bearers and a "
+        "mistyped door token cost a parse and a key lookup each",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || objectID == "" {', '\tif objectID == "" {'),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "resolve an id that did not come through the door's Entra check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-entra-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aEntraAllowed[strings.ToLower(objectID)] {", "\tif false {"),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "admit every Entra-verified object id, so anyone in the tenant who can "
+        "mint a token for the install's application signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif err == nil && !d.entraAllowed[strings.ToLower(id.objectID)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_entra_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any account of the tenant "
+        "creates door conversations and submissions that evict a listed "
+        "person's",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-spellable",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\ta2aEntraCallerPrefix = ":entra:"', '\ta2aEntraCallerPrefix = "entra:"'),
+        "test_A3_no_eval_caller_can_spell_an_entra_caller",
+        "drop the leading colon, so an eval caller \"entra\" naming the context "
+        "\"<oid>:<ctx>\" spells a person's conversation key with the static token",
+    ),
+    Mutation(
+        "A3-a2a-entra-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
+         "\tif backend == consoleBackend || backend == a2aGoogleBackend {"),
+        "test_A3_the_entra_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Entra class's roster through principalMapFor, whose default "
         "is the chat map, so a door caller's id resolves as a chat identity",
     ),
     Mutation(
@@ -2803,6 +2945,23 @@ Mutation(
         "Authorization header, and every brokered command from every session "
         "pod is a 401 -- with the Go suite and the Python suite both green, "
         "because neither names the other's spelling",
+    ),
+    Mutation(
+        "C1-tier-membership-env-renamed-on-the-gateway-side",
+        "a2a/gateway/tier_membership.go",
+        ('const EnvTierMembership = "A2A_TIER_MEMBERSHIP"', 'const EnvTierMembership = "A2A_TIER_MEMBERS"'),
+        "test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary",
+        "rename the membership variable in the module that reads it. The "
+        "operator still renders the old name, so the gateway reads no "
+        "membership and every person runs at read",
+    ),
+    Mutation(
+        "C1-tier-membership-env-renamed-on-the-operator-side",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP"', 'a2aTierMembershipEnvVar = "A2A_TIER_MEMBERSHIP_LIST"'),
+        "test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary",
+        "rename the membership variable in the module that renders it; the "
+        "gateway keeps reading the old name and sees no membership",
     ),
     Mutation(
         "C1-target-allowlist-env-renamed-on-the-gateway-side",
@@ -3162,6 +3321,56 @@ Mutation(
         "worker can then start tasks of its own outside the gateway's checks",
     ),
     Mutation(
+        "A3-console-mcp-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t\t"chat.console.*.in",\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",',
+         '\t\t\t"chat.console.*.in",\n\t\t\ta2aConsoleConfirmSubject,\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the console MCP server's user the console's confirm door, so "
+        "an IDE agent can confirm the change it just proposed. A model can "
+        "then grant its own task the permit to open a pull request",
+    ),
+    Mutation(
+        "A3-session-derives-all-chat",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\t"chat.>",\n\t\t},'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "derive every executor publish on `chat.>` so a worker can post its "
+        "own progress to a chat surface. It never spells `chat.console`, and "
+        "it reaches the console's confirm door all the same",
+    ),
+    Mutation(
+        "A3-dispatcher-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"chat.console.*.confirm",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the AgentProfile dispatcher the console's confirm door, so it "
+        "can confirm a queued change on the requester's behalf. Its identity "
+        "is built in its own file, outside the identities file the writer "
+        "sets used to read",
+    ),
+    Mutation(
+        "A3-dispatcher-stops-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"a2a.stop.*.*",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the dispatcher publish on stop records, so it can drop a "
+        "queued task itself on a deadline. It can then stop any requester's task",
+    ),
+    Mutation(
+        "A3-bridge-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.console.*.confirm",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the static bridge publish on the console's confirm door, so the "
+        "platform agent can confirm a card's proposed change itself. A task "
+        "can then grant itself the change permit",
+    ),
+    Mutation(
         "A3-bridge-sends-a-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
@@ -3195,8 +3404,8 @@ Mutation(
     Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aNotifyReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole, a2aNotifyReplySubjects)\n"),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the notify reply namespace, the symmetric-"
         "looking grant (it already reads there). The agent can then forge the "
@@ -3216,8 +3425,8 @@ Mutation(
     Mutation(
         "A3-agent-answers-the-board",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aBoardReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole, a2aBoardReplySubjects)\n"),
         "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the board reply namespace, so the agent "
         "container can answer the gateway's board request itself. What it "

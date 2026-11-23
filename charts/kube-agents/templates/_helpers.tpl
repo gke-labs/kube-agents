@@ -235,25 +235,31 @@ true
 
 {{/*
 The operator flags the chart sets from first-class values, as a YAML env list (empty when
-none is on). operator-deployment.yaml renders it ahead of operator.extraEnv, and the quota
-preflight reads it ahead of extraEnv, so the two agree on which flagged pods run. A flag
+every default stands). operator-deployment.yaml renders it ahead of operator.extraEnv, and the
+quota preflight reads it ahead of extraEnv, so the two agree on which flags are set. A flag
 operator.extraEnv already names is left out: extraEnv wins either way, and leaving it out
 keeps the container's env free of a duplicate name. `| default dict` because
-`helm upgrade --reuse-values` renders against a release that predates operator.mcpServer.
+`helm upgrade --reuse-values` renders against a release that predates operator.mcpServer or
+operator.profileDispatcher.
 */}}
 {{- define "kube-agents.operatorFlagEnv" -}}
 {{- $named := dict -}}
 {{- range $e := (.Values.operator.extraEnv | default list) -}}
 {{- $_ := set $named (toString (index ($e | default dict) "name")) true -}}
 {{- end -}}
-{{- if and (.Values.operator.mcpServer | default dict).enabled (not (hasKey $named "A2A_MCP_DOOR")) -}}
+{{- $mcp := (.Values.operator.mcpServer | default dict) -}}
+{{- if and (hasKey $mcp "enabled") (eq (toString $mcp.enabled) "false") (not (hasKey $named "A2A_MCP_DOOR")) }}
 - name: A2A_MCP_DOOR
-  value: "true"
+  value: "false"
 {{- end -}}
 {{- $dispatcher := (.Values.operator.profileDispatcher | default dict) -}}
 {{- if and (hasKey $dispatcher "enabled") (eq (toString $dispatcher.enabled) "false") (not (hasKey $named "A2A_PROFILE_DISPATCHER")) }}
 - name: A2A_PROFILE_DISPATCHER
   value: "false"
+{{- end -}}
+{{- if and (.Values.operator.cardStop | default dict).enabled (not (hasKey $named "A2A_CARD_STOP")) }}
+- name: A2A_CARD_STOP
+  value: "true"
 {{- end -}}
 {{- with (.Values.operator.slackTestUsers | default list) }}
 {{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
@@ -3651,11 +3657,12 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.clampInt64" $session.requestsEphemeral | int64)) | int64 -}}
     {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.clampInt64" $session.limitsEphemeral | int64)) | int64 -}}
   {{- end -}}
-  {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
-         #3869). The profile dispatcher, on by default, is in footprint.yaml; switched off
-         (operator.profileDispatcher.enabled false) it is still counted, which over-counts
-         by its one pod in the safe direction. The operator renders each only while
-         its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
+  {{- /* Standing pods behind an opt-in operator flag (files/flagged-pods.yaml: the OKF
+         memory curator, #5566). The MCP server and the profile dispatcher, both on by
+         default, are in footprint.yaml; switched off (operator.mcpServer.enabled or
+         operator.profileDispatcher.enabled false) each is still counted, which over-counts
+         by its one pod in the safe direction. The operator renders each flagged pod only while
+         its flag is set in operator.extraEnv, so no golden
          renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.
          A setting the chart cannot read -- a valueFrom, a non-string value, a string holding
@@ -3674,7 +3681,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
   {{- end -}}
   {{- $flagged := index $flaggedFile "pods" -}}
-  {{- /* The flags first-class values set (operator.mcpServer.enabled), then extraEnv: the
+  {{- /* The flags first-class values set, then extraEnv: the
          order operator-deployment.yaml renders them in, so the last setting wins here too. */ -}}
   {{- $flagEnv := list -}}
   {{- with (include "kube-agents.operatorFlagEnv" .) -}}

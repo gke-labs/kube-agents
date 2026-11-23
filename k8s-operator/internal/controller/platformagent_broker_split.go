@@ -211,7 +211,8 @@ var allBrokerCallersOwned = brokerCallerOwnership{mcp: true, scope: true}
 // TokenReview usernames the broker will serve.
 //
 // Three of them on every install (the gateway's, the sandbox's and the A2A
-// gateway's), and more under their flags. The sandbox's is the caller that matters —
+// gateway's), the MCP server's by default (unless A2A_MCP_DOOR=false), and
+// more under their flags. The sandbox's is the caller that matters —
 // the shell is where every credentialed command runs, so a broker that served
 // only the gateway's identity would answer 401 to all of them. The gateway's
 // is there because its chat relays, its Pub/Sub platform adapter and its
@@ -246,7 +247,7 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if a2aSessionClusterViewEnabled(agent) {
 		callers = append(callers, a2aSessionBrokerCaller(agent))
 	}
-	// The MCP server's own ServiceAccount, under its flag
+	// The MCP server's own ServiceAccount, unless switched off
 	// (a2aMCPBrokerEnabled) and only while this PlatformAgent owns the
 	// account (a2aMCPIdentityOwned), never the namespace default it ran as
 	// before. Held to the mcp role by CREDENTIAL_PROXY_MCP_CALLERS, which

@@ -1,27 +1,27 @@
 ---
 title: MCP server
-description: The opt-in A2A MCP server, a Model Context Protocol endpoint through which an external coding agent or IDE talks to an install over its message bus.
+description: The A2A MCP server, a Model Context Protocol endpoint through which an external coding agent or IDE talks to an install over its message bus.
 sidebar:
   order: 11
 ---
 
-The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It is off by default.
+The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It runs by default.
 
-## Turning it on
+## What the operator renders
 
-The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`. The chart value `operator.mcpServer.enabled: true` sets it. An `A2A_MCP_DOOR` entry in `operator.extraEnv`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, also works and wins over the value. With it set, the operator renders beside the console server:
+Unless the operator runs with `A2A_MCP_DOOR=false`, it renders beside the console server:
 
 - `<name>-a2a-mcp`: a Deployment running the MCP binary from the `a2a-console` image, a ClusterIP Service on port 8089, and the ServiceAccount of the same name;
 - `<name>-a2a-mcp-netpol`: a deny-all ingress NetworkPolicy on that pod, so the only way in is `kubectl port-forward`;
 - `<name>-a2a-mcp-token`: a Secret holding the bearer token callers present, minted once by the operator.
 
-If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Turn the flag off and all of it is removed, the token included.
+Set `operator.mcpServer.enabled: false` in the chart to turn it off. An `A2A_MCP_DOOR` entry in `operator.extraEnv`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, also works and wins: empty leaves it on, boolean spellings are parsed, and any other value keeps it off. Turning it off removes all of those objects, the token included. If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)).
 
-Its pod adds one to the namespace's session pod quota, and the chart's quota check counts it whenever the flag is on ([Prerequisites](/kube-agents/install/prerequisites/)).
+Its pod adds one to the namespace's session pod quota while enabled, and the chart's quota check counts it with the standing pods ([Prerequisites](/kube-agents/install/prerequisites/)).
 
 ## Connecting a client
 
-To connect Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents from Antigravity](/kube-agents/install/antigravity-mcp/). A client that talks to the server directly connects as below.
+To connect Claude Code, Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents over MCP](/kube-agents/install/mcp/). A client that talks to the server directly connects as below.
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
@@ -41,7 +41,9 @@ The match fails closed. The bridge renames a deployment to `<kube-context>/<name
 
 The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
 
-When a turn call carries `_meta.conversation_id` or `stream_steps: true`, `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact. The workstation bridge sets `stream_steps: true` only when its host passes `_meta.conversation_id` (or a vendor-prefixed `*/conversation_id`); a host that sends only `_meta.progressToken` keeps the single-answer form. With streaming on, each step's `title` and `markdown` reach the host. While the task is still running, `result` starts with ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running``, prompting the host to call `task_control` (`get`) for the next step.
+When a turn call carries `_meta.conversation_id` or `stream_steps: true`, `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact. The workstation bridge sets `stream_steps: true` only when its host passes `_meta.conversation_id` (or a vendor-prefixed `*/conversation_id`); a host that sends only `_meta.progressToken` keeps the single-answer form.
+
+The bridge's `KUBE_AGENTS_MCP_STREAM_STEPS` setting (or `--stream-steps`) overrides this. `off` sends `stream_steps: false` and returns plain results even when the host passes a conversation id. `on` sends `stream_steps: true` for every host. A `stream_steps` the call names itself always wins, though under `off` its step windows come back as plain text, without the envelope. With streaming on, each step's `title` and `markdown` reach the host. While the task is still running, `result` starts with ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running``, prompting the host to call `task_control` (`get`) for the next step.
 
 A streamed `get` can re-read a finished turn that delegated, outside the stream that sent it. With no live watch of its chain, it settles at once. It returns the root's own answer and a note that the delegated tasks were not followed.
 

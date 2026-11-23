@@ -314,6 +314,16 @@ refused there as written, and a `<service>.googleapis.com` entry also as
 one under `googleapis.com`, has no routed host, so every request is refused: a `GET` with
 `gcp.api.host`, any other method at step 1. The broker does not start with such a value.
 
+The broker also does not start with a value from its environment (`GOOGLE_CLOUD_UNIVERSE_DOMAIN`,
+then `CLOUDSDK_CORE_UNIVERSE_DOMAIN`) that the host's metadata server contradicts: a well-formed
+value can name hosts of another universe, or commercial hosts under another name, and the
+metadata server says which universe the host is in. A value that the metadata server confirms
+starts. A host with no universe route (HTTP 404) starts too, with a WARNING record that the value
+was not checked. If the metadata server gives no answer in ten tries, about 15 seconds, the
+broker starts with the value and writes the same record: a host with no metadata server, such
+as a harness on kind, never gets an answer. The operator holds `spec.harness.universeDomain` to
+the same answer before it renders; the broker's check holds what its own environment names.
+
 `evaluate` answers in this order, and the order is the security argument:
 
 1. A `POST` that is not exactly the host and path of an entry with a body check, or any
