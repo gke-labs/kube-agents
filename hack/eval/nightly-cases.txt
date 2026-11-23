@@ -1008,7 +1008,7 @@
 # would, then sends the reply on it; the hermes-bridge attaches the stored
 # report to the turn. deployer: noop, two front-door turns, reads no cluster;
 # needs the inject door.
-./tasks/chat-reply-under-pushed-report/task.yaml
+# twin: ./tasks/chat-reply-under-pushed-report/task.yaml
 
 # A question naming one seeded cluster reaches that cluster's Cluster Agent
 # when the roster block counts the Cluster Agents instead of naming them
