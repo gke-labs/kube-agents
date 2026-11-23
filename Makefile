@@ -17,8 +17,8 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 # make command line only: the golang image exports an environment variable of
 # the same name (a bare version, no `-alpine`), and a build inside such a
 # container must not take its builder tag from there.
-ifeq ($(origin GOLANG_VERSION),environment)
-GOLANG_VERSION :=
+ifneq ($(filter environment%,$(origin GOLANG_VERSION)),)
+override GOLANG_VERSION :=
 endif
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE GOLANG_VERSION
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
@@ -918,8 +918,12 @@ recipe-check: ## Validate every fix recipe: it loads, its eval case names it bac
 # Install a Go toolchain before trusting a green run here: the injector seam
 # compiles the real Go client, and without `go` on PATH it skips itself rather
 # than failing, which reads exactly like a pass.
+#
+# The tests run with KUBECONFIG set to an empty file, as each file of the
+# test-python sweep does, so an unstubbed kubectl or helm call finds no cluster.
 test-integration: ## Run just the integration seam tests; CI reaches them through the PYTHON_TEST_DIRS sweep.
-	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
+	@kubeconfig=$$(mktemp) && trap 'rm -f "$$kubeconfig"' EXIT INT TERM && \
+	cd tests/integration && KUBECONFIG="$$kubeconfig" PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 
 # The agent's own instructions are prose, and prose is not compiled: a persona
 # that cites a renamed skill or an SOP that names a moved script merges clean

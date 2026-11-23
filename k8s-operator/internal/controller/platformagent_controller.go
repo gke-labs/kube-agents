@@ -302,22 +302,27 @@ const (
 		"A sandbox older than the agent fails its kubectl calls at the credential proxy with a policy refusal. " +
 		"Clear the field to run the operator's image, or set it to the matching build."
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
-	// install.env key, what the field holds, and where the posts go
-	// meanwhile (one of the sentences below).
+	// install.env clause (homeChannelUnsetViaInstallEnvFormat, or "" for a
+	// backend the installer has no key for), what the field holds, and
+	// where the posts go meanwhile (one of the sentences below).
 	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s and %[2]s is empty, so the agent's " +
 		"proactive posts -- alerts, drift reports, scheduled reports -- %[5]s; " +
-		"replies in a conversation still arrive. Set %[2]s (%[3]s in install.env) to %[4]s to deliver them."
+		"replies in a conversation still arrive. Set %[2]s%[3]s to %[4]s to deliver them."
+	// homeChannelUnsetViaInstallEnvFormat takes the install.env key that
+	// sets the CR field, for the backends the installer configures.
+	homeChannelUnsetViaInstallEnvFormat = " (%s in install.env)"
 	// homeChannelUnsetKept is the meanwhile for each backend without a home
 	// when no armed backend has one: the agent still sends, the gateway
 	// refuses and keeps (a2a/gateway/notify_refused.go).
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
-	// homeChannelUnsetToGchat and homeChannelUnsetToSlackRoute are the
-	// meanwhile when the other armed backend has a home: the agent sends
-	// home posts only to the platforms with one, the CR's list and then a
-	// learned channel or space (agents/platform/scripts/chat_notify.py,
-	// routed_platforms).
+	// homeChannelUnsetToGchat, homeChannelUnsetToSlackRoute and
+	// homeChannelUnsetToTeams are the meanwhile when another armed backend
+	// has a home: the agent sends home posts only to the platforms with
+	// one, the CR's list and then a learned channel or space
+	// (agents/platform/scripts/chat_notify.py, routed_platforms).
 	homeChannelUnsetToGchat      = "go to Google Chat's home channel meanwhile"
 	homeChannelUnsetToSlackRoute = "go to Slack's home channel meanwhile"
+	homeChannelUnsetToTeams      = "go to Microsoft Teams' home channel meanwhile"
 	// homeChannelUnsetJoin joins the sentences when both backends lack a home.
 	homeChannelUnsetJoin = " "
 	// What homeChannelUnsetMessageFormat takes for Google Chat: the backend,
@@ -355,6 +360,7 @@ const (
 	// say True where the property does not hold. See workloadRenderState.
 	hostPathDroppedConditionType = "VolumesDropped"
 	hostPathDroppedReason        = "HostPathVolumeDropped"
+	watcherTokenDroppedReason    = "WatcherTokenVolumeDropped" // #nosec G101 -- Condition reason, not a credential
 	// hostPathDroppedEntryFormat renders one dropped entry as the author would
 	// find it in the spec: field, index, name, and the host path it asked for.
 	hostPathDroppedEntryFormat = "%s[%d] %q (hostPath %s)"
@@ -399,8 +405,12 @@ const (
 	// projection of the watcher audience under another name, so without this a
 	// sidecar would lose a mount its author wrote with nothing in status to say
 	// why.
-	watcherAudienceDroppedEntryFormat   = "%s[%d] %q"
-	watcherAudienceDroppedMessageFormat = "Volumes that would deliver the credential proxy's watcher token are left out " +
+	watcherAudienceDroppedEntryFormat       = "%s[%d] %q"
+	watcherContainerMountDroppedEntryFormat = "%s[%d].volumeMounts[%d] %q"
+	extraVolumeMountsField                  = "spec.deployment.extraVolumeMounts"
+	initContainersField                     = "spec.deployment.initContainers"
+	sidecarsField                           = "spec.deployment.sidecars"
+	watcherAudienceDroppedMessageFormat     = "Volumes that would deliver the credential proxy's watcher token are left out " +
 		"of the Pod template the operator renders, along with every volumeMount naming them: %s. That token belongs " +
 		"to the gateway's agent-api-auth container alone; any other container holding it would hold the broker's " +
 		"watcher role on every fleet cluster. Remove the entries from the spec to clear this condition."
@@ -5773,17 +5783,23 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
 // spec and the home-channel record, or "" when the condition is to be absent:
 // the A2A stack holds no chat backend, or each one it holds has a home
-// channel, from the CR or admitted from the record. With both
-// backends lacking one, the message carries both sentences, Chat first, and
-// each says the gateway keeps the posts; with one lacking it, its sentence
-// says the posts go to the other's home channel meanwhile. A
-// malformed home channel is not this condition's: the gateway refuses it at
-// start and says so. With the CR field empty each backend's base sentence
-// carries at most one more: why the record did not stand in (manual, not an
-// id, refused), or that a mention sets it.
+// channel, from the CR or admitted from the record. With every armed backend
+// lacking one, the message carries a sentence per backend, Chat first, then
+// Teams, then Slack, and each says the gateway keeps the posts; with one
+// lacking it, its sentence says the posts go to another's home channel
+// meanwhile (the first of Chat, Slack, Teams that has one, which is how
+// chat_notify.py routes them). A malformed home channel is not this
+// condition's: the gateway refuses it at start and says so. With the CR
+// field empty, a Chat or Slack base sentence carries at most one more: why
+// the record did not stand in (manual, not an id, refused), or that a
+// mention sets it. Teams names no install.env key: the installer has none,
+// and the guide sets the CR field directly.
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	var parts []string
 	if msg := gchatHomeChannelUnsetMessage(agent, rec); msg != "" {
+		parts = append(parts, msg)
+	}
+	if msg := teamsHomeChannelUnsetMessage(agent, rec); msg != "" {
 		parts = append(parts, msg)
 	}
 	if msg := slackHomeChannelUnsetMessage(agent, rec); msg != "" {
@@ -5799,11 +5815,14 @@ func gchatHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 		return ""
 	}
 	meanwhile := homeChannelUnsetKept
-	if a2aSlackHasHome(agent, rec) {
+	switch {
+	case a2aSlackHasHome(agent, rec):
 		meanwhile = homeChannelUnsetToSlackRoute
+	case a2aTeamsHasHome(agent):
+		meanwhile = homeChannelUnsetToTeams
 	}
 	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, homeChannelUnsetGchatBackend,
-		homeChannelUnsetGchatField, homeChannelUnsetGchatEnvKey, homeChannelUnsetGchatHolds, meanwhile)
+		homeChannelUnsetGchatField, fmt.Sprintf(homeChannelUnsetViaInstallEnvFormat, homeChannelUnsetGchatEnvKey), homeChannelUnsetGchatHolds, meanwhile)
 	switch {
 	case gchatHomeChannelPolicy(agent) == gchatHomeChannelPolicyManual:
 		return msg + homeChannelUnsetManualSuffix
@@ -5817,6 +5836,24 @@ func gchatHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 	return msg + gchatHomeChannelUnsetLearnSuffix
 }
 
+// teamsHomeChannelUnsetMessage is homeChannelUnsetMessage's Microsoft Teams
+// sentence, or "" when the gateway's Teams backend is not armed or has a
+// home channel. Teams has no learned channel and no install.env key.
+func teamsHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
+	if !a2aTeamsArmed(agent) || strings.TrimSpace(agent.Spec.Integration.Teams.HomeChannel) != "" {
+		return ""
+	}
+	meanwhile := homeChannelUnsetKept
+	switch {
+	case a2aGchatHasEffectiveHome(agent, rec):
+		meanwhile = homeChannelUnsetToGchat
+	case a2aSlackHasHome(agent, rec):
+		meanwhile = homeChannelUnsetToSlackRoute
+	}
+	return fmt.Sprintf(homeChannelUnsetMessageFormat, "Microsoft Teams",
+		"spec.integration.teams.homeChannel", "", "a Teams conversation id (19:<id>@thread.tacv2 for a channel, a:<id> for a personal chat)", meanwhile)
+}
+
 // slackHomeChannelUnsetMessage is homeChannelUnsetMessage's Slack sentence,
 // or "" when Slack is not armed or has a home channel.
 func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
@@ -5824,11 +5861,15 @@ func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 		return ""
 	}
 	meanwhile := homeChannelUnsetKept
-	if a2aGchatHasEffectiveHome(agent, rec) {
+	switch {
+	case a2aGchatHasEffectiveHome(agent, rec):
 		meanwhile = homeChannelUnsetToGchat
+	case a2aTeamsHasHome(agent):
+		meanwhile = homeChannelUnsetToTeams
 	}
 	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
-		"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)", meanwhile)
+		"spec.integration.slack.homeChannel", fmt.Sprintf(homeChannelUnsetViaInstallEnvFormat, "SLACK_HOME_CHANNEL"),
+		"a channel id (C... or G...)", meanwhile)
 	switch {
 	case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
 		return msg + homeChannelUnsetManualSuffix
@@ -5844,9 +5885,12 @@ func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 
 // noChatPlatformMsg is the NoChatPlatform condition's message for this spec,
 // or "" when the condition is to be absent: the install has a chat platform
-// (HomeChannelUnset then says what a missing home channel costs).
+// the agent's proactive posts reach (HomeChannelUnset then says what a
+// missing home channel costs). Teams counts with the gateway backend armed,
+// which is when the delivery resolver names it; on the Hermes path it never
+// did, and that is unchanged here.
 func noChatPlatformMsg(agent *agentv1alpha1.PlatformAgent) string {
-	if googleChatEnabled(agent) || slackEnabled(agent) {
+	if googleChatEnabled(agent) || slackEnabled(agent) || a2aTeamsArmed(agent) {
 		return ""
 	}
 	where := noChatPlatformNoRepo
@@ -5958,6 +6002,17 @@ func setHomeChannelUnsetCondition(agent *agentv1alpha1.PlatformAgent, msg string
 	})
 }
 
+// volumesDroppedReason returns the VolumesDropped condition's Reason for the
+// entries the render strips: HostPathVolumeDropped whenever a hostPath volume
+// is among them, and WatcherTokenVolumeDropped when only watcher-token volumes
+// or mounts are dropped.
+func volumesDroppedReason(agent *agentv1alpha1.PlatformAgent) string {
+	if len(hostPathVolumes(agent)) > 0 {
+		return hostPathDroppedReason
+	}
+	return watcherTokenDroppedReason
+}
+
 // hostPathDroppedConditionCurrent reports whether the VolumesDropped condition
 // on the CR already says msg, where "" means the condition is to be absent.
 // Both status writers gate their write on this -- the Degraded one only on the
@@ -5970,12 +6025,12 @@ func hostPathDroppedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg str
 		return existing == nil
 	}
 	return existing != nil && existing.Status == metav1.ConditionTrue &&
-		existing.Reason == hostPathDroppedReason && existing.Message == msg
+		existing.Reason == volumesDroppedReason(agent) && existing.Message == msg
 }
 
 // setHostPathDroppedCondition writes the VolumesDropped condition, or removes
-// it when msg is "" because the spec carries no hostPath any more. The caller
-// does the API write.
+// it when msg is "" because the spec carries no dropped volumes or mounts any
+// more. The caller does the API write.
 func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
 	if msg == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, hostPathDroppedConditionType)
@@ -5984,7 +6039,7 @@ func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string,
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type:               hostPathDroppedConditionType,
 		Status:             metav1.ConditionTrue,
-		Reason:             hostPathDroppedReason,
+		Reason:             volumesDroppedReason(agent),
 		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -6116,9 +6171,11 @@ func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsP
 	return strings.Join(parts, " ")
 }
 
-// watcherTokenDroppedEntries names, field and index, each user volume the
-// render strips for delivering the watcher token: the set
-// watcherTokenSourceNames builds, read back against the two volume lists.
+// watcherTokenDroppedEntries names, field and index, each user volume and bare
+// reserved-volume mount the render strips for delivering the watcher token: the
+// set watcherTokenSourceNames builds, read back against the two volume lists,
+// plus any mount on the three user-authored mount lists that names the reserved
+// watcher-token volume directly.
 func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
 	if agent.Spec.Deployment == nil {
 		return nil
@@ -6135,6 +6192,26 @@ func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
 		for i, v := range list.volumes {
 			if sources[v.Name] {
 				entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, list.field, i, v.Name))
+			}
+		}
+	}
+	for i, m := range agent.Spec.Deployment.ExtraVolumeMounts {
+		if m.Name == watcherTokenVolume {
+			entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, extraVolumeMountsField, i, m.Name))
+		}
+	}
+	for _, list := range []struct {
+		field      string
+		containers []corev1.Container
+	}{
+		{initContainersField, agent.Spec.Deployment.InitContainers},
+		{sidecarsField, agent.Spec.Deployment.Sidecars},
+	} {
+		for ci, c := range list.containers {
+			for mi, m := range c.VolumeMounts {
+				if m.Name == watcherTokenVolume {
+					entries = append(entries, fmt.Sprintf(watcherContainerMountDroppedEntryFormat, list.field, ci, mi, m.Name))
+				}
 			}
 		}
 	}

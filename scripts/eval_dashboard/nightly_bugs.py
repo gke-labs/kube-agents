@@ -106,7 +106,8 @@ Comments are read the same way: an issue whose listing counts
 more comments than the read returned is not commented on that tick.
 
 **Triage first, when armed** (``--triage-pending``, which the workflow passes
-while ``NIGHTLY_TRIAGE_LIVE`` is ``true``). A domain bug or a group issue is
+while ``NIGHTLY_TRIAGE_LIVE`` is ``true`` and ``NIGHTLY_TRIAGE_MODEL`` names a
+model). A domain bug or a group issue is
 then filed unassigned, labelled ``triage:pending``, with every @-mention in
 its body written as code, so nobody is notified yet, and a marker
 (TRIAGE_PENDING_MARKER) naming who the rule above would assign and mention.

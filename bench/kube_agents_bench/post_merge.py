@@ -14,9 +14,8 @@ ticks itself rather than waiting on the five-minute cron. On its first poll it:
 1. finds the one pull request the run's reply names, under ``owner``;
 2. merges it with the harness's write token (:data:`WRITE_TOKEN_ENV`), never
    the agent's;
-3. applies every manifest the pull request adds, and, for a recipe that edits a
-   field (``apply_edits``), the head version of every object manifest it edits,
-   to the cluster carrying ``apply_fixture_role``, as a reconciler would. No reconciler names the merge
+3. applies every manifest the pull request adds to the cluster carrying
+   ``apply_fixture_role``, as a reconciler would. No reconciler names the merge
    commit, so the check's apply step sees the object the fix adds instead.
    Reconciler matching is covered by ``post_merge_check``'s unit tests;
 4. runs ``post_merge_check.py`` (the cron job's own entry, no arguments) in
@@ -32,8 +31,7 @@ It also requires the ``post-merge-check`` cron job in the platform profile's
 Every poll after that reads the record by the pull request's URL from the agent
 pod's SQLite file, read-only, through ``kubectl exec``. The record must be of the
 fix recipe the case grades (``recipe``, the ``kind`` column, a directory under
-``agents/platform/scripts/fix_recipes/``): one case per recipe, each naming its
-own fixture role. Until the record has an
+``agents/platform/scripts/fix_recipes/``). Until the record has an
 outcome and has been reported the poll is a fail that is polled again. Then
 the check passes when that outcome is ``outcome`` and the report matches
 ``report``, the install's ``KUBEAGENTS_POST_MERGE_CHECK``:
@@ -51,8 +49,6 @@ agent.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import logging
 import re
@@ -110,12 +106,8 @@ DRIVE_DEADLINE_SEC = 900.0
 #: Past RUN_BUDGET, so a long tick's exec is not cut off mid-run.
 TICK_TIMEOUT_SEC = 300.0
 MANIFEST_SUFFIXES = (".yaml", ".yml")
-#: A Kustomize file a pull request may edit beside an object; not itself an object to apply.
-NOT_OBJECTS = ("kustomization.yaml", "kustomization.yml")
 #: A fix recipe's kind, as `fix_recipes/registry.KIND_RE` checks it.
 RECIPE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-#: A manifest that is a Kubernetes object: top-level `apiVersion:` and `kind:` lines.
-OBJECT_KEY = re.compile(r"(?ms)^apiVersion:.*^kind:|^kind:.*^apiVersion:")
 MAX_FILES_PAGES = 5
 FILES_PAGE_SIZE = 100
 MAX_COMMENT_PAGES = 5
@@ -272,10 +264,6 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     # The fix recipe the case grades: the record's `kind`, a directory under
     # agents/platform/scripts/fix_recipes/ whose recipe.yaml names this case.
     recipe: str = Field(min_length=1)
-    # Whether the fix edits a manifest already on the branch (a recipe whose
-    # recipe.yaml declares `applied: field_equals`). Off, edited files are
-    # restored on the branch afterwards but never applied, as for no-pdb.
-    apply_edits: bool = False
 
     @field_validator("recipe")
     @classmethod
@@ -304,9 +292,6 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     # What the merge put on the default branch and the apply put on the
     # cluster, for _clean_up: the pool's fixture must read as unbudgeted again.
     _added: list[tuple[str, str]] = PrivateAttr(default_factory=list)
-    # Manifests the pull request edits: (path, head text, base text). The head is applied,
-    # and cleanup applies the base back rather than deleting a live object.
-    _edited: list[tuple[str, str, str]] = PrivateAttr(default_factory=list)
     _repo: tuple[str, str] | None = PrivateAttr(default=None)
     _kubeconfig: str = PrivateAttr(default="")
     _touched: list[tuple[str, str]] = PrivateAttr(default_factory=list)
@@ -338,10 +323,6 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 logger.warning("post_merge_outcome: could not delete an applied manifest: %s", exc)
-        for path, _, base_text in self._edited if self._kubeconfig else []:
-            ok, why = _apply(base_text, self._kubeconfig)
-            if not ok:
-                logger.warning("post_merge_outcome: could not put %s back as it was: %s", path, why)
         token = (os.environ.get(WRITE_TOKEN_ENV) or "").strip()
         if not token or self._repo is None:
             return
@@ -462,12 +443,6 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
             time.sleep(TICK_INTERVAL_SEC)
 
     def _merge_and_apply(self, timeout: float) -> tuple[VerificationStatus, str]:
-        if self._repo is not None:
-            # Merged on an earlier poll whose apply failed: keep what cleanup needs to undo the
-            # merge and retry only the apply, never the reads or the merge.
-            return self._apply_all()
-        # A poll that errored before the merge is retried from scratch, so nothing is listed twice.
-        self._touched, self._added, self._edited = [], [], []
         snap = transcript.get()
         if snap is None:
             return "error", _NO_TRANSCRIPT_REASON
@@ -507,24 +482,14 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                     self._touched.append((path, str(entry.get("status") or "")))
                     if entry.get("previous_filename"):
                         self._touched.append((str(entry["previous_filename"]), "removed"))
-                if path.endswith(MANIFEST_SUFFIXES) and entry.get("status") == "added":
+                if path.endswith(MANIFEST_SUFFIXES):
                     text = _added_file_text(entry)
                     if text:
                         self._added.append((path, text))
-                elif (self.apply_edits and path.endswith(MANIFEST_SUFFIXES) and entry.get("status") == "modified"
-                      and path.rsplit("/", 1)[-1] not in NOT_OBJECTS):
-                    head = str((pull.get("head") or {}).get("sha") or "")
-                    texts = [self._file_at(owner, repo, path, ref, read_token, timeout) for ref in (head, self._base)]
-                    if not head or not self._base or None in texts:
-                        return "error", f"{path} in {owner}/{repo}#{number} could not be read at its head and base"
-                    # Only an object is applied: a values file or a Kustomize patch beside the fix is
-                    # restored on the branch afterwards, as before, but never sent to the cluster.
-                    if all(OBJECT_KEY.search(text) for text in texts):
-                        self._edited.append((path, texts[0], texts[1]))
             if len(files) < FILES_PAGE_SIZE:
                 break
-        if not self._added and not self._edited:
-            return "error", f"{owner}/{repo}#{number} adds or edits no manifest to apply"
+        if not self._added:
+            return "error", f"{owner}/{repo}#{number} adds no manifest to apply"
         status, payload = _github_write("PUT", f"{api}/merge", write_token, {"merge_method": "squash"})
         if status not in (200, 405):
             return "error", f"GitHub answered {status} to merging {owner}/{repo}#{number}: {(payload or {}).get('message')}"
@@ -536,31 +501,12 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         self._repo = (owner, repo)
         self._number = number
         self._kubeconfig = kubeconfig
-        return self._apply_all()
-
-    def _apply_all(self) -> tuple[VerificationStatus, str]:
-        """Apply what the merged pull request adds (and, with ``apply_edits``, edits); ``_merged`` once all applied."""
-        owner, repo = self._repo
-        for manifest in [text for _, text in self._added] + [head for _, head, _ in self._edited]:
+        for _, manifest in self._added:
             ok, why = _apply(manifest, self._kubeconfig)
             if not ok:
-                return "error", f"applying {owner}/{repo}#{self._number}'s manifest failed: {why}"
-        self._merged = (owner, repo, self._number)
+                return "error", f"applying {owner}/{repo}#{number}'s manifest failed: {why}"
+        self._merged = (owner, repo, number)
         return "pass", ""
-
-    @staticmethod
-    def _file_at(owner: str, repo: str, path: str, ref: str, token: str, timeout: float) -> str | None:
-        """``path``'s text at ``ref``, or None when GitHub does not answer with it."""
-        if not ref:
-            return None
-        url = f"{forges.github_api_root()}/repos/{owner}/{repo}/contents/{urllib.parse.quote(path)}?ref={ref}"
-        status, body = _forge_get_json(url, token, timeout)
-        if status != 200 or not isinstance(body, dict) or not isinstance(body.get("content"), str):
-            return None
-        try:
-            return base64.b64decode(body["content"]).decode("utf-8")
-        except (binascii.Error, UnicodeDecodeError):
-            return None
 
     def _marked_comments(self, owner: str, repo: str, number: int, timeout: float) -> tuple[int, str]:
         token = forges.read_token(forges.FORGE_GITHUB) or ""

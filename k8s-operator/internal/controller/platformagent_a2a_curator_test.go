@@ -106,9 +106,19 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 	if np.Name != agent.Name+"-curator-netpol" {
 		t.Fatalf("NetworkPolicy name = %q, want %q", np.Name, agent.Name+"-curator-netpol")
 	}
-	if len(np.Spec.Ingress) != 0 {
-		t.Errorf("Ingress rules = %d, want 0 (deny all ingress)", len(np.Spec.Ingress))
+	if len(np.Spec.Ingress) != 1 {
+		t.Fatalf("Ingress rules = %d, want 1 (GMP collector namespace on port %d)", len(np.Spec.Ingress), a2aCuratorStatusPort)
 	}
+	collectorRule := np.Spec.Ingress[0]
+	if len(collectorRule.From) != 1 || collectorRule.From[0].PodSelector != nil || collectorRule.From[0].IPBlock != nil ||
+		collectorRule.From[0].NamespaceSelector == nil || collectorRule.From[0].NamespaceSelector.MatchLabels[labelMetadataName] != gmpNamespace {
+		t.Errorf("collector Ingress From = %+v, want strictly namespace %s=%s", collectorRule.From, labelMetadataName, gmpNamespace)
+	}
+	if len(collectorRule.Ports) != 1 || collectorRule.Ports[0].Protocol == nil || *collectorRule.Ports[0].Protocol != corev1.ProtocolTCP ||
+		collectorRule.Ports[0].Port == nil || collectorRule.Ports[0].Port.IntVal != a2aCuratorStatusPort {
+		t.Errorf("collector Ingress Ports = %+v, want TCP %d alone", collectorRule.Ports, a2aCuratorStatusPort)
+	}
+
 	wantTypes := []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
 	if !slices.Equal(np.Spec.PolicyTypes, wantTypes) {
 		t.Errorf("PolicyTypes = %v, want %v", np.Spec.PolicyTypes, wantTypes)

@@ -33,6 +33,7 @@ const (
 	requestDurationSecondsName  = "request_duration_seconds"
 	inFlightRequestsName        = "in_flight_requests"
 	processStartTimeSecondsName = "process_start_time_seconds"
+	certReloadFailuresTotalName = "certificate_reload_failures_total"
 
 	labelVerb        = "verb"
 	labelResource    = "resource"
@@ -175,6 +176,7 @@ var (
 		ReasonSubresourceBlocked:       {},
 		ReasonDryRunRequired:           {},
 		ReasonVerbBlocked:              {},
+		ReasonStreamingBlocked:         {},
 		ReasonExcludedCluster:          {},
 		ReasonExcludeUnreadable:        {},
 	}
@@ -206,6 +208,7 @@ type Metrics struct {
 	requestDuration  *prometheus.HistogramVec
 	inFlightRequests prometheus.Gauge
 	processStart     prometheus.Gauge
+	certReloadFails  prometheus.Counter
 }
 
 // NewMetrics creates a new Metrics instance with an isolated Prometheus registry.
@@ -272,6 +275,12 @@ func NewMetrics() *Metrics {
 			Name: processStartTimeSecondsName,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
 		}),
+		certReloadFails: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      certReloadFailuresTotalName,
+			Help:      "Total changed TLS server certificate or key files kube-proxy could not load, each time keeping the previous certificate.",
+		}),
 	}
 	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
 	reg.MustRegister(
@@ -285,6 +294,7 @@ func NewMetrics() *Metrics {
 		m.requestDuration,
 		m.inFlightRequests,
 		m.processStart,
+		m.certReloadFails,
 	)
 	m.secretsRedacted.WithLabelValues(SecretActionAcceptHeaderRewritten)
 	m.secretsRedacted.WithLabelValues(SecretActionPayloadScrubbed)
@@ -297,6 +307,15 @@ func (m *Metrics) Handler() http.Handler {
 		MaxRequestsInFlight: metricsMaxRequestsInFlight,
 		Timeout:             metricsScrapeTimeout,
 	})
+}
+
+// RecordCertificateReloadFailure counts a changed server certificate or key that could
+// not be loaded, so the previous certificate is still served.
+func (m *Metrics) RecordCertificateReloadFailure() {
+	if m == nil {
+		return
+	}
+	m.certReloadFails.Inc()
 }
 
 func (m *Metrics) incInFlight() {

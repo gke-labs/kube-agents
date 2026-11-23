@@ -249,6 +249,7 @@ func TestABatchIsRefusedWhileAnEarlierChildIsLive(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, targetPlatform, "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	waitParentTerminalRelayed(t, r, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "child detached", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)

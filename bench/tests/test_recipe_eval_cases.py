@@ -1,10 +1,12 @@
-"""Each fix recipe's end-to-end case: the one ``bench/tasks`` case its ``recipe.yaml`` names as ``eval_case``.
+"""Each fix recipe's end-to-end case, and every ``post_merge_outcome`` case's recipe.
 
-A recipe that names a case gets one, not four (detect, fix, verify and refuse in
-one run): the agent opens the fix, ``post_merge_outcome`` merges and applies it,
-and the install's post-merge check must reach ``verified_fixed`` for a record
-of that recipe's kind. This pins the link both ways, so a case cannot grade one
-recipe while its ``recipe.yaml`` names it for another.
+A recipe's ``recipe.yaml`` names its primary end-to-end case as ``eval_case``:
+the agent opens the fix, ``post_merge_outcome`` merges it, and the install's
+post-merge check grades a record of that recipe's kind. Other cases may grade
+the same recipe (another outcome, such as ``still_broken`` or ``not_applied``),
+so the link is held one way from the recipe and only to an existing recipe from
+the case: a case cannot grade a recipe that does not exist, and the case a
+recipe names must grade that recipe.
 """
 
 from __future__ import annotations
@@ -66,25 +68,18 @@ def test_every_recipe_that_names_a_case_is_graded_by_it():
         assert task.is_file(), f"{path.parent.name}/recipe.yaml names eval_case {case!r}, which has no {task}"
         checks = _cases().get(case, [])
         assert checks, f"{case} grades no post_merge_outcome, so it is not {fields['kind']}'s end-to-end case"
-        assert {check.get("recipe") for check in checks} == {fields["kind"]}, (
+        assert fields["kind"] in {check.get("recipe") for check in checks}, (
             f"{case} grades recipe {[c.get('recipe') for c in checks]}, not {fields['kind']!r}"
         )
-        assert all(check.get("outcome") == "verified_fixed" and check.get("apply_fixture_role") for check in checks)
-        edits = fields.get("applied") == "field_equals"
-        assert all(bool(check.get("apply_edits")) == edits for check in checks), (
-            f"{case} must set apply_edits: {str(edits).lower()} for {fields['kind']}, whose applied probe is "
-            f"{fields.get('applied') or 'unset'}"
-        )
+        assert all(check.get("apply_fixture_role") for check in checks)
     assert named, "no recipe names its end-to-end case; no-pdb's is post-merge-verified-fixed"
 
 
-def test_every_post_merge_case_is_named_by_its_recipe():
-    recipes = {path.parent.name: _recipe_fields(path) for path in RECIPES.glob("*/recipe.yaml")}
+def test_every_post_merge_case_grades_a_recipe_that_exists():
+    # Several cases may grade one recipe (#6343's cases 2 and 3 grade no-pdb
+    # with other outcomes), so the case need not be the recipe's eval_case.
+    recipes = {path.parent.name for path in RECIPES.glob("*/recipe.yaml")}
     for case, checks in _cases().items():
         for check in checks:
             kind = check.get("recipe")
             assert kind in recipes, f"{case} grades recipe {kind!r}, which has no fix_recipes/{kind}/recipe.yaml"
-            assert recipes[kind].get("eval_case") == case, (
-                f"{case} grades {kind!r}, but fix_recipes/{kind}/recipe.yaml names eval_case "
-                f"{recipes[kind].get('eval_case')!r}"
-            )

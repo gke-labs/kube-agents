@@ -154,6 +154,29 @@ spec:
     - port: 8444
       path: /metrics
       interval: 30s
+---
+{{- /*
+The OKF memory curator's status and metrics listener (a2aCuratorStatusPort in
+the operator): outcome processing counts, OKF record gauges by type and status,
+recurrence graduations, and memory queries. Empty while A2A_CURATOR is off;
+active once the operator renders the curator pod.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-curator-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-curator
+      kubeagents.x-k8s.io/component: curator
+  endpoints:
+    - port: 8080
+      path: /metrics
+      interval: 30s
 {{- if include "kube-agents.a2aNATSExporterRendered" . }}
 ---
 {{- /*
