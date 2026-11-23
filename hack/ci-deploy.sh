@@ -1716,9 +1716,11 @@ fi
 # session run sizes its session cap: fair (the default) gives it one session
 # per parallel conversation plus FRONT_DOOR_SESSION_HEADROOM, so the cap's
 # eviction (the gateway evicts the longest-idle pod at the cap, or refuses;
-# nothing queues) doesn't land on a multi-turn case between its turns; shipped
-# leaves the cap at the install default, what a customer install gets, and an
-# eviction or refusal there is a finding about that default.
+# with the session-cap queue (#6882), a turn waits in line instead, for up to
+# five minutes, before the refusal) doesn't land on a multi-turn case between
+# its turns; shipped leaves the cap at the install default, what a customer
+# install gets, and an eviction, a wait or a refusal there is a finding about
+# that default.
 EVAL_FRONT_DOOR="${EVAL_FRONT_DOOR:-platform}"
 EVAL_FRONT_DOOR_SESSIONS="${EVAL_FRONT_DOOR_SESSIONS:-fair}"
 case "${EVAL_FRONT_DOOR}" in
