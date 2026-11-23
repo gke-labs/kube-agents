@@ -969,10 +969,26 @@ class FrontDoorSwitchTest(unittest.TestCase):
         ask = go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayAsk")
         manifests = text(_A2A_MANIFESTS)
         self.assertRegex(manifests, re.compile(r"^\s*a2aTasksReplaySessionAsks\s*=\s*a2aTasksReplayTailFactor \* a2aTasksReplayAsk$", re.MULTILINE))
+        # The session route's per-session count is the named consumers plus
+        # the replay asks, and the per-route count returns it only there.
         self.assertRegex(
             manifests,
-            r"if resolveA2ADefaultRoute\(agent\) == agentv1alpha1\.DefaultRouteSession \{\s*"
-            r"return a2aSessionConsumersPerSession \+ a2aTasksReplaySessionAsks",
+            re.compile(
+                r"^\s*a2aTasksConsumersPerSessionOnSessionRoute\s*=\s*a2aSessionConsumersPerSession \+ a2aTasksReplaySessionAsks$",
+                re.MULTILINE,
+            ),
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSessionOn\(route string\) int \{\s*"
+            r"if route == agentv1alpha1\.DefaultRouteSession \{\s*"
+            r"return a2aTasksConsumersPerSessionOnSessionRoute\s*\}\s*"
+            r"return a2aSessionConsumersPerSession\s*\}",
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSession\(agent \*agentv1alpha1\.PlatformAgent\) int \{\s*"
+            r"return a2aTasksConsumersPerSessionOn\(resolveA2ADefaultRoute\(agent\)\)",
         )
         self.assertEqual(int(consts["A2A_SESSION_REPLAY_ASKS"]), tail * ask)
 
