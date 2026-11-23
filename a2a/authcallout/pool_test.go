@@ -17,13 +17,13 @@ import (
 	"github.com/nats-io/nkeys"
 )
 
-// The worker pool, measured at the handler rather than through a fleet of TLS
-// clients. The full harness (integration_test.go) proves the pool against the
-// operator's rendered server; what it cannot do is time the pool on its own,
+// The worker pool, measured without a fleet of TLS clients. The full harness
+// (integration_test.go) proves the pool against the operator's rendered
+// server; what it cannot do is hold the pool to one round after another,
 // because its sixty-four clients arrive as their handshakes finish, spread
-// over most of a second under the race detector. Here the requests are handed
-// to handle and decide directly, the way the subscription's one dispatch
-// goroutine does, so what is measured is decisions and nothing else.
+// over most of a second under the race detector. Here the tests build the
+// requests and call decide and handle themselves, with no server and no
+// subscription between, so what is measured is decisions and nothing else.
 
 // directCallout is a Service whose responses can be read back: the requests
 // are bound to a subscription on a plain embedded server, so handle's
@@ -157,11 +157,17 @@ func response(t *testing.T, m *nats.Msg) *jwt.AuthorizationResponseClaims {
 // sixteen reviews are held at once; while it is held, the next sixteen
 // requests are already behind it and none of them may be reviewed or
 // answered. Releasing it must bring sixteen authorizations and then exactly
-// the next sixteen reviews. A pool narrower than sixteen never fills a round,
-// and a wider one lets the waiting requests into a full round.
+// the next sixteen reviews. A pool narrower than sixteen never fills a round.
+// A wider one lets a waiting request into a full round; when that request
+// arrives is the scheduler's choice, so the slot count is read as well, and
+// every round's reviews are counted at the end.
+//
+// The rounds are the pool's share of the second and no more. What one
+// decision costs outside its review is not bounded here: the wall clock is
+// logged, not asserted.
 //
 // Each request gets a goroutine of its own, as handle gives it, but not
-// handle's authDecisionBudget: that is a wall clock from receipt, and a held
+// handle's decision budget: that is a wall clock from receipt, and a held
 // round on a busy runner outlasts it, which is a refusal the pool did not
 // cause. TestHandleReturnsBeforeTheDecisionIsMade covers handle itself.
 func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
@@ -170,7 +176,7 @@ func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 	// calloutWorkers is a change to this test as well.
 	const rounds = 4
 	if calloutWorkers*rounds != callbacks {
-		t.Fatalf("calloutWorkers = %d, so %d callbacks are not %d full rounds; the issue's acceptance is sixteen abreast", calloutWorkers, callbacks, rounds)
+		t.Fatalf("calloutWorkers = %d, so %d callbacks are not %d full rounds; this test is written for sixteen abreast", calloutWorkers, callbacks, rounds)
 	}
 	// How long one step (a review starting, an answer arriving) may take
 	// before the test gives up on it. Nothing waits this long unless the
@@ -188,7 +194,10 @@ func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 	inFlight, peak, reviews := 0, 0, 0
 	// gate holds the reviews of the round now filling; the test closes it
 	// to release them, after putting the next round's gate in its place.
+	// startedIn counts the reviews that began under each round's gate.
 	gate := make(chan struct{})
+	filling := 0
+	startedIn := make([]int, rounds+1)
 	started := make(chan struct{}, callbacks)
 	// Closed when the test ends, so a review a failed test left held lets
 	// its goroutine go.
@@ -201,6 +210,7 @@ func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 			peak = inFlight
 		}
 		held := gate
+		startedIn[filling]++
 		mu.Unlock()
 		started <- struct{}{}
 		select {
@@ -214,11 +224,15 @@ func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 		}
 	})
 	t.Cleanup(func() { close(testOver) })
+	if got := cap(d.svc.slots); got != calloutWorkers {
+		t.Fatalf("the pool has %d slots, want %d", got, calloutWorkers)
+	}
 
 	requests := make([]*nats.Msg, callbacks)
 	for i := range requests {
 		requests[i] = d.request(t, presented[i])
 	}
+	begun := time.Now()
 	for _, m := range requests {
 		go d.svc.decide(context.Background(), m)
 	}
@@ -244,6 +258,7 @@ func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 		now := inFlight
 		held := gate
 		gate = make(chan struct{})
+		filling++
 		mu.Unlock()
 		if now != calloutWorkers {
 			t.Fatalf("round %d: %d reviews in flight with the round held, want exactly the %d slots", round, now, calloutWorkers)
@@ -261,11 +276,31 @@ func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 		}
 	}
 
+	elapsed := time.Since(begun)
+
 	mu.Lock()
 	defer mu.Unlock()
-	t.Logf("%d callbacks decided in %d rounds, peak %d in flight", callbacks, rounds, peak)
+	// The wall clock is the record of what the decisions cost besides their
+	// reviews, which here cost nothing. A loaded runner sets it, so it is
+	// not asserted.
+	t.Logf("%d callbacks decided in %d rounds, peak %d in flight, %v in all with no review time", callbacks, rounds, peak, elapsed)
 	if reviews != callbacks {
 		t.Errorf("TokenReviews = %d for %d callbacks; a review ran that no round accounted for", reviews, callbacks)
+	}
+	// A review that got into a round already full is counted in that round
+	// even where the reads above came too early to see it in flight.
+	for round := 1; round <= rounds; round++ {
+		if got := startedIn[round-1]; got != calloutWorkers {
+			t.Errorf("round %d: %d reviews started while it was filling or held, want exactly the %d slots", round, got, calloutWorkers)
+		}
+	}
+	if got := startedIn[rounds]; got != 0 {
+		t.Errorf("%d reviews started after the last round was released", got)
+	}
+	select {
+	case m := <-d.replies:
+		t.Errorf("a callback was answered (error %q) beyond the %d the rounds read", response(t, m).Error, callbacks)
+	default:
 	}
 	if peak != calloutWorkers {
 		t.Errorf("peak concurrent decisions = %d, want exactly the %d slots", peak, calloutWorkers)
@@ -275,27 +310,43 @@ func TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast(t *testing.T) {
 // handle hands the request on and returns, which is what lets the one
 // goroutine that dispatches the subscription's callbacks start the next
 // decision while this one is still at its TokenReview. The review here waits
-// for handle to have returned. A handle that decided inline would wait on it
-// until the budget lapsed, and the answer would be a refusal.
+// for handle to have returned. Under a handle that decided inline it would
+// wait for ever, so it gives up after handOffWait and says so.
+//
+// Both budgets are lifted past handOffWait, as serveCallout lifts them, so
+// the shipped 1.5s is not a clock this test runs against: a runner that
+// stalls between handle's return and the review seeing it is not refused.
 func TestHandleReturnsBeforeTheDecisionIsMade(t *testing.T) {
-	const answerWait = 10 * time.Second
+	// How long the review waits for handle to return, and the test for the
+	// answer. Nothing waits this long unless it is never going to happen.
+	const handOffWait = 10 * time.Second
 
 	returned := make(chan struct{})
+	var reviewOutwaitedHandle atomic.Bool
 	d := startDirectCallout(t, map[string]Attested{agentToken: {ServiceAccount: agentSA}}, func(string) func() {
-		<-returned
+		select {
+		case <-returned:
+		case <-time.After(handOffWait):
+			reviewOutwaitedHandle.Store(true)
+		}
 		return func() {}
 	})
+	d.svc.decisionBudget = testDialTimeout
+	d.svc.validator.reviewBudget = testDialTimeout
 
 	d.svc.handle(d.request(t, agentToken))
 	close(returned)
+	if reviewOutwaitedHandle.Load() {
+		t.Fatalf("handle had not returned %v into its request's TokenReview; it decides inline, and holds the goroutine that dispatches every callback", handOffWait)
+	}
 
 	select {
 	case m := <-d.replies:
 		if rc := response(t, m); rc.Error != "" || rc.Jwt == "" {
-			t.Fatalf("the callback was refused (%q); handle held its caller until the decision was over", rc.Error)
+			t.Fatalf("the callback was refused: %q", rc.Error)
 		}
-	case <-time.After(answerWait):
-		t.Fatalf("the callback was not answered %v after handle returned", answerWait)
+	case <-time.After(handOffWait):
+		t.Fatalf("the callback was not answered %v after handle returned", handOffWait)
 	}
 }
 
