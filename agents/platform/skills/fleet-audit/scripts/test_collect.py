@@ -26,6 +26,7 @@ import types
 import unittest
 from contextlib import contextmanager, redirect_stderr
 from datetime import datetime, timedelta, timezone
+import argparse
 from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -16018,3 +16019,89 @@ class TestWebhookCaBundleExpired(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOnlyCluster(unittest.TestCase):
+    """`--cluster <location>/<name>` (#5623): one cluster of --project, the rest
+    dropped before any read; and with no flag, the manifest is today's."""
+
+    LISTING = json.dumps(
+        [
+            {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+            {"name": "c2", "location": "us-east1", "status": "RUNNING"},
+            {"name": "c3", "location": "us-west1", "status": "PROVISIONING"},
+        ]
+    )
+    GOLDEN = Path(__file__).resolve().parent / "testdata" / "no_cluster_flag"
+
+    def setUp(self):
+        self.addCleanup(setattr, collect, "only_cluster", None)
+        self.calls = []
+
+    def run_fake(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+            return collect.Run(argv, 0, self.LISTING, "", 0.05)
+        if "get-credentials" in argv:
+            return collect.Run(argv, 0, "", "", 0.05)
+        if argv[:2] == ["kubectl", "get"]:
+            return collect.Run(argv, 0, json.dumps({"apiVersion": "v1", "kind": "List", "items": [], "metadata": {}}), "", 0.05)
+        return collect.Run(argv, 0, "", "", 0.01)
+
+    def manifest(self, audit):
+        kubeconfigs = Path("/tmp/kc-golden")
+        kubeconfigs.mkdir(exist_ok=True)
+        # The real paged read, which the platform job runs: this module swaps in
+        # a shared double for its other tests (setUpModule).
+        with patch.object(collect, "KUBECONFIG_DIR", kubeconfigs), patch.object(
+            collect, "paged_dump", _PAGED_DUMP.temp_original
+        ):
+            m = collect.collect_fleet(audit, "acme", run=self.run_fake, max_workers=1)
+        # The fields that differ between any two runs of the same code: the
+        # collector's own digest, and the clock.
+        m["checks_revision"] = "<checks_revision>"
+        m["started_at"] = "<started_at>"
+        m["finished_at"] = "<finished_at>"
+        return json.dumps(m, indent=2, sort_keys=True).replace(str(kubeconfigs), "<kubeconfig_dir>") + "\n"
+
+    def test_with_no_flag_the_manifest_is_byte_identical_to_main_before_the_flag(self):
+        # testdata/no_cluster_flag holds each manifest as the collector made it
+        # before --cluster existed, on this fixture. The platform agent's own
+        # audit runs with no flag, so it must not change by a byte.
+        for audit in ("obtainability-audit", "compliance-audit"):
+            with self.subTest(audit=audit):
+                self.assertEqual(self.manifest(audit), (self.GOLDEN / f"{audit}.json").read_text())
+
+    def test_the_flag_reads_only_its_cluster(self):
+        collect.only_cluster = ("us-east1", "c2")
+        clusters, not_running, error = collect.enumerate_clusters("acme", run=self.run_fake)
+        self.assertEqual([c["target"] for c in clusters], ["acme/us-east1/c2"])
+        self.assertEqual((not_running, error), ([], None))
+
+    def test_a_cluster_the_project_doesnt_list_is_refused_and_nothing_is_read(self):
+        for wanted in (("us-east1", "nope"), ("europe-west1", "c2")):
+            with self.subTest(wanted=wanted):
+                collect.only_cluster = wanted
+                self.calls.clear()
+                with patch.object(collect, "KUBECONFIG_DIR", Path("/tmp/kc-golden")):
+                    m = collect.collect_fleet("compliance-audit", "acme", run=self.run_fake, max_workers=1)
+                self.assertIn("--cluster", m.get("error") or "")
+                self.assertFalse(any("get-credentials" in c or c[:2] == ["kubectl", "get"] for c in self.calls), self.calls)
+
+    def test_a_cluster_the_scope_excludes_is_refused_too(self):
+        collect.declared_scope.set("acme", None, "acme/us-east1/c2")
+        self.addCleanup(collect.declared_scope.set, None, None)
+        collect.only_cluster = ("us-east1", "c2")
+        with mock.patch("sys.stderr"):
+            clusters, _, error = collect.enumerate_clusters("acme", run=self.run_fake)
+        self.assertEqual(clusters, [])
+        self.assertIn("--cluster", error)
+
+    def test_the_flag_is_shape_checked_and_needs_a_project(self):
+        for bad in ("c2", "us-east1/", "/c2", "US-EAST1/c2", "us-east1/C2", "us-east1/c2/x", "us-east1/" + "a" * 41):
+            with self.subTest(bad=bad):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    collect.cluster_arg(bad)
+        self.assertEqual(collect.cluster_arg("us-east1/c2"), ("us-east1", "c2"))
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            collect.main(["compliance-audit", "--cluster", "us-east1/c2"])
