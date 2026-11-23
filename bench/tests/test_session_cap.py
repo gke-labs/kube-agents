@@ -330,6 +330,21 @@ def test_an_unknown_directive_is_infrastructure_and_sends_nothing(monkeypatch, t
     assert sent == []
 
 
+@pytest.mark.parametrize("typo", ["[bench:session-cap-queu]", "[bench:sesion-cap-queue]", "[bench:reply-under-pushed-reprot]"])
+def test_a_typod_directive_is_infrastructure_not_a_model_failure(monkeypatch, typo):
+    """A near miss of a real directive is a case-authoring mistake: it must
+    surface as infrastructure naming the directive, never reach the agent as
+    text and be graded as the model's failure."""
+    _inject_env(monkeypatch, "2")
+    monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+    sent: list[Any] = []
+    monkeypatch.setattr(inject, "_request", lambda *a, **k: sent.append(a) or {})
+    got = harness.KubeAgentsHarness()._execute(f"{typo} max-cap=2\n{ASK}")
+    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert typo in got.errors[0]
+    assert sent == []
+
+
 def test_every_case_directive_is_one_the_harness_knows():
     import pathlib
 
