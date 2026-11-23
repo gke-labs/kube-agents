@@ -2329,3 +2329,42 @@ profiles:
       limits:
         cpu: "1"
         memory: 2Gi
+  # The fleet-audit profile (#5623, #5620): the parent of the install's
+  # fleet-wide scheduled audits and of onboarding's first inventory
+  # (`agents/fleet-audit/persona`). It reads no cluster itself: each cluster's
+  # checks run as a delegated `cluster` task. Off until the onboarding PR runs
+  # a schedule on it.
+  fleetAudit:
+    enabled: false
+    description: >-
+      Fleet-wide audit runner: hands each in-scope cluster's read-only checks
+      to the cluster profile as one delegated task per cluster, collects their
+      results, and composes the audit's findings and report. Never reads or
+      changes a cluster itself.
+    persona:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/persona-fleet-audit
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+    harness:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+      model: model-default
+      maxTurns: 120
+    # A scheduled audit runs at unattended. No read tier until the persona
+    # can do an on-demand run: a read tier on the card makes the profile a
+    # delegate target of every chat session, and today a run without dry_run
+    # only says it can't and stops.
+    allowedTiers:
+      - unattended
+    lifecycle:
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 600
+    concurrency: 1
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi

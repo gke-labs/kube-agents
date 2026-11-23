@@ -29,7 +29,9 @@ It also requires the ``post-merge-check`` cron job in the platform profile's
 ``jobs.json``, enabled, so the schedule the install ships is still graded.
 
 Every poll after that reads the record by the pull request's URL from the agent
-pod's SQLite file, read-only, through ``kubectl exec``. Until the record has an
+pod's SQLite file, read-only, through ``kubectl exec``. The record must be of the
+fix recipe the case grades (``recipe``, the ``kind`` column, a directory under
+``agents/platform/scripts/fix_recipes/``). Until the record has an
 outcome and has been reported the poll is a fail that is polled again. Then
 the check passes when that outcome is ``outcome`` and the report matches
 ``report``, the install's ``KUBEAGENTS_POST_MERGE_CHECK``:
@@ -49,6 +51,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import subprocess
 import time
@@ -83,7 +86,7 @@ COMMENT_MARKER = "<!-- kube-agents:post-merge-check -->"
 SILENT_STAMP = "silent:"
 RECORD_READ = "__POST_MERGE_RECORD_READ__"
 OUTCOMES = ("verified_fixed", "still_broken", "not_applied")
-RECORD_FIELDS = ("url", "merged_at", "applied_at", "health_result", "outcome", "outcome_at", "outcome_detail", "reported_at")
+RECORD_FIELDS = ("url", "kind", "merged_at", "applied_at", "health_result", "outcome", "outcome_at", "outcome_detail", "reported_at")
 #: Where the agent container keeps Session KV's database unless it says otherwise.
 SESSION_KV_DB_DEFAULT = "/var/lib/kube-agents/session/session_kv.db"
 #: The agent container's script directory and the platform profile's cron file.
@@ -103,6 +106,8 @@ DRIVE_DEADLINE_SEC = 900.0
 #: Past RUN_BUDGET, so a long tick's exec is not cut off mid-run.
 TICK_TIMEOUT_SEC = 300.0
 MANIFEST_SUFFIXES = (".yaml", ".yml")
+#: A fix recipe's kind, as `fix_recipes/registry.KIND_RE` checks it.
+RECIPE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 MAX_FILES_PAGES = 5
 FILES_PAGE_SIZE = 100
 MAX_COMMENT_PAGES = 5
@@ -256,6 +261,16 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     comment_phrase: str = ""
     # The fixture role whose cluster plays the reconciler's target.
     apply_fixture_role: str = Field(min_length=1)
+    # The fix recipe the case grades: the record's `kind`, a directory under
+    # agents/platform/scripts/fix_recipes/ whose recipe.yaml names this case.
+    recipe: str = Field(min_length=1)
+
+    @field_validator("recipe")
+    @classmethod
+    def _recipe_shape(cls, value: str) -> str:
+        if not RECIPE_RE.fullmatch(value):
+            raise ValueError(f"recipe {value!r} must be a fix recipe's kind, such as no-pdb")
+        return value
 
     @field_validator("apply_fixture_role")
     @classmethod
@@ -393,6 +408,8 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         record = answer.get("record")
         if record is None:
             return "fail", f"no post_merge_records row for {url}: the install did not record the fix it opened", None
+        if record.get("kind") != self.recipe:
+            return "fail", f"{url} is recorded as a {record.get('kind')!r} fix, not the {self.recipe!r} recipe this case grades", record
         if not record.get("outcome"):
             return "fail", f"{url} has no outcome yet (merged {record.get('merged_at')}, applied {record.get('applied_at')})", record
         if record["outcome"] != self.outcome:
