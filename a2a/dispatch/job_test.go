@@ -2,7 +2,6 @@ package dispatch
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -91,7 +90,7 @@ func (f *fakeJobs) launchCount() int {
 // unattended tier, with no warm pool.
 func unattendedInstall(concurrency int, edit func(*lib.DispatchConfig)) *testInstall {
 	prof := testProfile("inv", concurrency, "unattended")
-	prof.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"worker"}]}}`)
+	prof.JobTemplateRef = &lib.DispatchJobTemplateRef{Hash: "h1"}
 	ti := &testInstall{src: NewStaticSource(testDispatchConfig(6, prof)), pool: NewStaticPool()}
 	if edit != nil {
 		ti.update(edit)
@@ -286,7 +285,7 @@ func TestAProfileWithoutAJobTemplateUsesThePool(t *testing.T) {
 	b := newBus(t, "inv-0")
 	b.ensure("inv", 1, 0, "unattended")
 	w := b.worker("inv", "unattended", "inv-0", answerAccept, 200*time.Millisecond)
-	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplateRef = nil })
 	ti.pool.Set("inv", "unattended", "inv-0")
 	jobs := newFakeJobs(0)
 	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
@@ -350,7 +349,7 @@ func TestAnUnattendedTaskWithNoRunnerIsRefusedAtOnce(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			b := newBus(t)
 			b.ensure("inv", 1, 0, "unattended")
-			ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+			ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplateRef = nil })
 			jobs := newFakeJobs(0)
 			if withJobs {
 				b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
@@ -425,7 +424,7 @@ func TestAnUnstartedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
 	if _, err := jobs.Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil { // an earlier pass, in Job mode
 		t.Fatal(err)
 	}
-	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplateRef = nil })
 	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
 	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
 	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateRejected || !hasReason(ts, ReasonNoWorker) {
@@ -439,7 +438,7 @@ func TestAnUnstartedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
 var leaveInstall = map[string]func(*lib.DispatchConfig){
 	"draining": func(c *lib.DispatchConfig) {
 		p := c.Profiles[0]
-		p.Durables, p.DrainingUntil = nil, time.Now().Add(time.Hour)
+		p.DrainingUntil = time.Now().Add(time.Hour)
 		c.Profiles[0] = p
 	},
 	"removed": func(c *lib.DispatchConfig) { c.Profiles = nil },
@@ -449,7 +448,7 @@ var leaveInstall = map[string]func(*lib.DispatchConfig){
 // bound.
 func waitBound(t *testing.T, d *Dispatcher, ti *testInstall) {
 	t.Helper()
-	n := len(ti.src.Config().Profiles[0].Durables)
+	n := len(ti.src.Config().Profiles[0].DerivedDurables())
 	waitFor(t, 10*time.Second, "the durables bound", func() bool {
 		d.mu.Lock()
 		defer d.mu.Unlock()
@@ -545,7 +544,7 @@ func TestAReadoptedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
 	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "task-1 started", func() bool { return w.startedTask("task-1") })
 	stop1()
-	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplateRef = nil })
 	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
 	if ts := b.waitTerminal("task-1", 20*time.Second); ts.state != lib.StateCompleted {
 		t.Fatalf("terminal %+v, want the worker's completed", ts)
@@ -655,7 +654,6 @@ func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
 	jobs := newFakeJobs(-1) // never ready
 	ti := unattendedInstall(1, func(c *lib.DispatchConfig) {
 		c.Profiles[0].Tiers = []string{"read", "unattended"}
-		c.Profiles[0].Durables = nil // derived from the tiers (#5649)
 		c.JobStartSeconds, c.BreakerThreshold = 60, 1
 	})
 	d, _ := b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
@@ -665,7 +663,6 @@ func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
 	start := time.Now()
 	ti.update(func(c *lib.DispatchConfig) {
 		c.Profiles[0].Tiers = []string{"read"}
-		c.Profiles[0].Durables = nil // derived from the tiers and the drain (#5649)
 		c.Profiles[0].DrainingTiers = []lib.DrainingTier{{Tier: "unattended", Mode: "unattended", Until: time.Now().Add(2 * time.Minute), Ending: true}}
 	})
 	ts := b.waitTerminal("task-1", 10*time.Second)
@@ -684,5 +681,46 @@ func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
 	})
 	if open := d.Health().OpenBreakers; len(open) != 0 {
 		t.Errorf("breakers %v open; an administrator's end is no worker loss", open)
+	}
+}
+
+// A script-run task's confirm carries the script its trigger names, as the
+// profile's spec.scripts lists it in the config the dispatcher admitted the
+// task on (#5622): the worker takes the path from here, never from the task.
+// A model task's confirm carries none.
+func TestAScriptTasksConfirmCarriesTheProfilesScript(t *testing.T) {
+	b := newBus(t, "job-task-1", "job-task-2")
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "job-task-1", answerAccept, 200*time.Millisecond)
+	w2 := b.worker("inv", "unattended", "job-task-2", answerAccept, 200*time.Millisecond)
+	want := lib.DispatchScript{Name: "stall-watch", Path: lib.ScriptRoot + "stall_watch.py", TimeoutSeconds: 30}
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].Scripts = []lib.DispatchScript{want} })
+	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, newFakeJobs(100*time.Millisecond))
+
+	env := triggeredEnv(t, "inv", "task-1", "cap-ok", `{"name":"schedule/stall-watch","origin":"builtin","script":"stall-watch"}`, map[string]string{})
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject("inv", "unattended", lib.SubmitKindTop, "task-1"), env); err != nil {
+		t.Fatal(err)
+	}
+	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v, want completed", ts)
+	}
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-2")
+	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("model task terminal %+v, want completed", ts)
+	}
+
+	scripts := map[string]*lib.DispatchScript{}
+	for _, wk := range []*fakeWorker{w, w2} {
+		wk.mu.Lock()
+		for _, m := range wk.confirms {
+			scripts[m.TaskID] = m.Script
+		}
+		wk.mu.Unlock()
+	}
+	if got := scripts["task-1"]; got == nil || *got != want {
+		t.Errorf("the script task's confirm carried script %+v; want %+v", got, want)
+	}
+	if got, ok := scripts["task-2"]; !ok || got != nil {
+		t.Errorf("the model task's confirm (seen %v) carried script %+v; want none", ok, got)
 	}
 }

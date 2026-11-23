@@ -48,7 +48,13 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   by hand. Given the public half, the chart
   also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
   Secret the sandbox mounts — the sandbox never mounts the credential Secret
-  itself. The sandbox is always on — `harness.experimental.shellSandbox.enabled`
+  itself. With `create=false`, the template reads `SANDBOX_SSH_PUBLIC_KEY` via
+  Helm `lookup`, so offline `helm template` renders (such as Argo CD) omit
+  `<platformAgent.name>-shell-authorized-keys` and you must provision that
+  Secret alongside `platform-agent-secrets`; see
+  [Deploying kube-agents via Argo CD without Helm lookup](../../docs/site/src/content/docs/deploy/gitops-argocd.md#deploying-kube-agents-via-argo-cd-without-helm-lookup)
+  for the `ExternalSecret` layout and SSH keypair rotation procedure. The sandbox
+  is always on — `harness.experimental.shellSandbox.enabled`
   is not a toggle, the operator refuses `false`, and this chart fails at template
   time — so without the pair the agent has no key to dial the sandbox with. See
   [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
@@ -413,6 +419,41 @@ conversation a Vertex `session_id` so a new conversation's first turn can read
 a prompt another conversation warmed:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
 
+To override the Vertex AI endpoint host through `litellm.envFromSecret`
+([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)) with
+`VERTEXAI_API_BASE` or render a custom-universe Vertex `api_base` in
+`config.yaml` via `platformAgent.harness.universeDomain`, pair them with
+`litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and
+`litellm.vertex.location`:
+
+```bash
+kubectl create secret generic vertex-endpoint -n kubeagents-system \
+  --from-literal=VERTEXAI_API_BASE=https://us-east4-aiplatform.universe.example.com
+
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set litellm.modelProvider=vertex_ai \
+  --set litellm.modelDefaultName=gemini-3.8-flash \
+  --set litellm.vertex.projectId=my-serving-project \
+  --set litellm.vertex.location=us-east4 \
+  --set litellm.envFromSecret=vertex-endpoint
+```
+
+When `api_base` is empty in `config.yaml`, LiteLLM reads `VERTEXAI_API_BASE`
+from the environment and appends
+`/v1/projects/<VERTEXAI_PROJECT>/locations/<VERTEXAI_LOCATION>/...` to a
+host-only base, so the chart's project and location still apply. Setting a
+non-default `platformAgent.harness.universeDomain` renders `api_base`
+(`https://aiplatform.<universeDomain>` for `global` or
+`https://<location>-aiplatform.<universeDomain>` for a regional location) in
+`config.yaml`, which wins over `VERTEXAI_API_BASE`. Container `env` entries
+(`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+when `platformAgent.harness.universeDomain` is non-default) always override
+matching keys in `litellm.envFromSecret`. Full precedence and examples:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden).
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI
@@ -476,8 +517,8 @@ including `/v1`) are required, and the render fails without them. Set
 mounts whole into the gateway container as environment variables (`envFrom`,
 optional, so the pod starts without it). You create it; the chart only names
 it, and a Helm upgrade never touches it. It carries whatever the LiteLLM
-provider reads from the environment, which is how the providers without a
-key in the credentials Secret get theirs:
+provider reads from the environment — credentials for providers without a key
+in the credentials Secret, or custom environment variables for `vertex_ai`:
 
 - **SAP AI Core (`litellm.modelProvider=sap`).** LiteLLM's `sap/` driver
   exchanges the service key's client credentials at your tenant's token URL
@@ -496,10 +537,21 @@ key in the credentials Secret get theirs:
   in the Secret, the chart ships a pre-call hook that fetches the bearer token,
   caches it and renews it before expiry
   ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
+- **Vertex AI custom environment variables (`litellm.modelProvider=vertex_ai`).**
+  Set `VERTEXAI_API_BASE` (matching `litellm.vertex.location`) or other custom
+  variables in the Secret (`envFrom`, which does not render `api_base` in
+  `config.yaml`, so a non-default `platformAgent.harness.universeDomain`
+  rendering `api_base` wins over `VERTEXAI_API_BASE`); pair with
+  `litellm.vertex.projectId` (or `projectSecretRef`) and
+  `litellm.vertex.location`
+  ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
 
-A variable the chart also sets from the credentials Secret (`GEMINI_API_KEY`,
-`HOSTED_VLLM_API_KEY`, ...) wins over the same name in this Secret. Rotating
-the Secret does not roll the pods: `kubectl rollout restart deployment/litellm`.
+A variable the chart sets directly in container `env` — keys from the
+credentials Secret (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY`, ...), plus
+`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+(when `platformAgent.harness.universeDomain` is non-default) on `vertex_ai` —
+wins over the same name in this Secret. Rotating the Secret does not roll the
+pods: `kubectl rollout restart deployment/litellm`.
 
 ```bash
 kubectl create secret generic sap-aicore -n kubeagents-system \
@@ -930,13 +982,27 @@ install runs at once and renders only when set.
 
 ### MCP server (`operator.mcpServer.enabled`)
 
-`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
-then renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
-manages. It defaults to `false`. An
-`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
-still works and wins over the value. The
+The operator renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
+manages by default (`operator.mcpServer.enabled: true`). Setting `operator.mcpServer.enabled: false`
+sets `A2A_MCP_DOOR=false` on the controller manager and removes the server, its Service, its
+ServiceAccount, its NetworkPolicy and its token Secret. An `A2A_MCP_DOOR` entry in
+`operator.extraEnv` still works and wins over the value. A hand-run `helm upgrade` from a
+release where `operator.mcpServer.enabled` defaulted to `false` uses
+`--reset-then-reuse-values` (or `--set operator.mcpServer.enabled=true`), since
+`--reuse-values` preserves the earlier chart's default. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
+
+### Card stop (`operator.cardStop.enabled`)
+
+`operator.cardStop.enabled: true` sets `A2A_CARD_STOP=true` on the controller manager, which
+renders it onto the A2A gateway: a chat `stop`, or Slack's Stop button, then also stops the
+kanban cards the conversation filed. It defaults to `false`, because the stop needs a
+hermes-bridge sidecar and agent image that answer it; an older pair answers that it couldn't
+confirm the cards stopped. An `A2A_CARD_STOP` entry in `operator.extraEnv` wins over the value.
+The install's `CARD_STOP_ENABLED` key sets it through `terraform/examples/full-install`. The
+[ChatOps page](https://gke-labs.github.io/kube-agents/concepts/chatops/) is canonical for what a
+stop replies.
 
 ### Slack end-to-end test users (`operator.slackTestUsers`)
 
@@ -947,6 +1013,16 @@ It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it t
 when the gateway runs the Slack adapter. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
 user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
 off a real install, and a listed member's posts through any app in the workspace read as theirs.
+
+### Microsoft Teams on the A2A gateway (`A2A_TEAMS_BACKEND`)
+
+An `operator.extraEnv` entry `A2A_TEAMS_BACKEND=true` (no value key yet) has the A2A gateway's
+`teams` backend consume the credential broker's Teams queue for every `PlatformAgent` whose
+`integration.teams` is enabled, in place of the Planning Agent's Teams adapter: replies render as
+Adaptive Cards, the gateway's `chat.notify` route posts proactive alerts and reports into
+`integration.teams.homeChannel`, the agent's delivery resolver names Teams for the roster's scheduled reports (a Hermes cron job that names `deliver: teams` or `deliver: chat` by hand does not reach Teams there: the Hermes scheduler has no Teams platform on an armed install), and the broker admits the gateway on its Teams routes only on this switch. Off by default,
+so an operator upgrade moves no Teams install on its own. `docs/chatops/microsoft-teams.md` in the
+repository has the details.
 
 ### Data volume size (`platformAgent.storage.size`)
 
@@ -1021,8 +1097,10 @@ means zero rather than unset. Setting `platformAgent.harness.universeDomain` fai
 `googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
 of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
 to a domain other than `googleapis.com`, the chart also sets
-`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
-renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter`,
+renders `api_base` on `litellm` (`vertex_ai`) `model_list` entries in
+`config.yaml`, and renders `githubMinter`'s `ISSUER_ALLOWLIST` against
+`https://container.<universeDomain>/...`.
 
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.
@@ -1037,7 +1115,9 @@ has the arithmetic behind the memory floor. The chart fails the render on an
 override the operator would refuse, on a quantity it cannot read, and on any key
 under `resources` other than `requests`, `limits` and `claims` (`limit:` for
 `limits:`), which the CRD would prune silently. A quantity with more than 15
-significant digits is refused at render as well: the chart compares quantities as
+significant digits is refused at render as well, and so is one with an exponent
+below -18 (`1e-19`), which the operator decodes only slowly and no resource
+needs: the chart compares quantities as
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
@@ -1100,6 +1180,13 @@ rules as `alertDailyLimits` apply: an entry with the same name in `platformAgent
 wins, and a `valueFrom` entry for it fails the render while the key is above `0`. The
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
 says what is counted and what a held triage does.
+
+`platformAgent.deployment.evalRunTags` is for eval installs that run the replay proxy in front of
+LiteLLM. `true` renders `KUBEAGENTS_EVAL_RUN_TAGS=1` into the CR's `spec.deployment.env`, and the
+agent then names the eval run, case and repetition in HTTP headers on its model requests, which the
+proxy logs and does not forward. `false`, the default, renders nothing. A literal entry with the
+same name in `platformAgent.deployment.env` wins. A `valueFrom` entry with the key `true` fails the
+render, because the operator forwards only literal values and would drop it.
 
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
@@ -1321,9 +1408,9 @@ existing install.
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings, and a fourth where the web
-console and its environment page are on. Two are generated from
+`admissionPolicy.enabled` (default `true`) installs cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, some only where the
+feature they hold is on. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1331,18 +1418,26 @@ check the rules of a role a binding _references_ — CEL cannot read another
 object — and the content policy only selects manifests carrying the
 `kube-agents/tier` label; see that file's header.
 
-The third, `kube-agents-a2a-gateway-pod`, is generated from
+Another, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
-ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", exactly the session labels, no runtime
+ServiceAccount, no automount, the session token audiences, no Secret volume, no
+Secret read but the session's own inference key, no host access, Pod Security
+"restricted", exactly the session labels, no runtime
 class, node selector, affinity or positive priority, and only the scheduler and
 tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
 
-The fourth, `kube-agents-web-console-cr`, is generated from
+Another, `kube-agents-agentschedule-builtin`, is generated from
+`k8s-operator/config/admission/agentschedule-builtin-policy.yaml`. It keeps
+everyone but the operator's ServiceAccount from making or unmaking a built-in
+`AgentSchedule`. Nobody else may set, change or remove its
+`kubeagents.x-k8s.io/origin: builtin` label or its controller reference, on create or update, or change a built-in schedule's spec (except `spec.suspend`). The garbage collector may still orphan a schedule. Annotating a built-in schedule (`run-now`) or suspending it (`spec.suspend`) still
+works for anyone the RBAC lets write it.
+
+Another, `kube-agents-web-console-cr`, is generated from
 `k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the
 web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
@@ -1425,11 +1520,12 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an operator flag,
-listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning).
-The profile dispatcher runs by default, so it is in `footprint.yaml`, and switched off
-(`operator.profileDispatcher.enabled: false`) it is still counted. It has a ceiling: about 200
+It also counts the standing pods the operator renders only behind an opt-in operator flag,
+listed with their sizes in `files/flagged-pods.yaml` (such as the OKF memory curator when
+`A2A_CURATOR` is `true`).
+The MCP server and the profile dispatcher both run by default, so they are in `footprint.yaml`,
+and switched off (`operator.mcpServer.enabled: false` or `operator.profileDispatcher.enabled: false`)
+each is still counted. The profile dispatcher has a ceiling: about 200
 AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 1.30+, where each
 carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
 profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones

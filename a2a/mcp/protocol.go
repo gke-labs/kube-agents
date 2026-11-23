@@ -3,7 +3,7 @@
 // one in-cluster `next` install as a console client.
 //
 // It runs as its own Deployment (a2a/cmd/mcp), holding its own bus credential,
-// console-mcp, and nothing else, and only when the install opts in. A caller authenticates
+// console-mcp, and nothing else, unless the install switches it off. A caller authenticates
 // with the server's own bearer token; the bus never sees that token, and the
 // server never takes a caller's word for which bus to dial.
 //

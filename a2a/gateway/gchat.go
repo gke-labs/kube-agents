@@ -198,6 +198,8 @@ func verifiedByFor(backend string) string {
 		return gchatVerifiedBy
 	case consoleBackend:
 		return consoleVerifiedBy
+	case teamsBackend:
+		return teamsVerifiedBy
 	case slackBackend:
 		// The map-joined case. A Slack requester's mechanism depends on its
 		// principal, so the authority path asks verifiedByOf, which sends
@@ -222,6 +224,10 @@ func verifiedByFor(backend string) string {
 		// What checked the caller is Google, through the door's tokeninfo
 		// call: neither the door's static token nor a map.
 		return a2aGoogleVerifiedBy
+	case a2aEntraBackend:
+		// What checked the caller is the tenant's signature on the token,
+		// read at the door: its own value for the same reason.
+		return a2aEntraVerifiedBy
 	}
 	return "principal-map"
 }
@@ -233,7 +239,7 @@ func verifiedByFor(backend string) string {
 // everywhere else (Discord's ConfigMap).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
-	case gchatBackend:
+	case gchatBackend, teamsBackend:
 		return "the allowed users list"
 	case slackBackend:
 		// The list is the gate; the map is named too for the one refusal it
@@ -249,6 +255,8 @@ func unverifiedRemedyFor(backend string) string {
 		return "the A2A door's principal map"
 	case a2aGoogleBackend:
 		return "the A2A door's allowed users list"
+	case a2aEntraBackend:
+		return "the A2A door's Entra allowed users list"
 	}
 	return "the principal map"
 }
@@ -488,8 +496,8 @@ type GoogleChatAdapter struct {
 	countInterval time.Duration
 	subscription  string
 
-	// metrics counts each pull by outcome beside the summary line's counts
-	// (SetMetrics; nil counts nothing).
+	// metrics counts each pull by outcome beside the summary line's counts,
+	// and times each Chat API call (SetMetrics; nil counts nothing).
 	metrics *Metrics
 
 	// quotedReadTimeout bounds the read of a quoted message
@@ -500,6 +508,13 @@ type GoogleChatAdapter struct {
 	// adapter posts nothing in a sender's conversation ahead of the gateway
 	// for a sender it would refuse. Nil admits nobody.
 	admits SenderAdmission
+
+	// homeLearn is the learned home space's state, and homePending the typed
+	// messages that could set it, by message name, waiting for the gateway's
+	// verdict; homePendingOrder is its ring (gchat_home_channel.go).
+	homeLearn        homeLearner
+	homePending      map[string]gchatHomeCandidate
+	homePendingOrder []string
 }
 
 var _ SenderAdmissionSink = (*GoogleChatAdapter)(nil)
@@ -522,8 +537,8 @@ func (a *GoogleChatAdapter) admitted(msg InboundMessage) bool {
 }
 
 // SetMetrics gives the adapter the gateway's counters, so each pull is
-// counted by outcome where the summary line counts it. Called once, before
-// Run.
+// counted by outcome where the summary line counts it and each Chat API call
+// is timed. Called once, before Run.
 func (a *GoogleChatAdapter) SetMetrics(m *Metrics) {
 	a.metrics = m
 }
@@ -568,7 +583,9 @@ func (a *GoogleChatAdapter) apiCallContext(ctx context.Context, resource []strin
 	if err != nil {
 		return fmt.Errorf("gchat: encoding %s.%s: %w", strings.Join(resource, "."), method, err)
 	}
-	resp, err := a.relayPostContext(ctx, gchatRelayAPIPath, payload)
+	start := time.Now()
+	resp, relayStatus, err := a.relayPostStatus(ctx, gchatRelayAPIPath, payload)
+	a.metrics.gchatAPICall(gchatAPIMethodLabel(resource, method), relayStatus, gchatCarriedStatus(err), time.Since(start))
 	if err != nil {
 		return err
 	}
@@ -604,31 +621,39 @@ func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, erro
 
 // relayPostContext is relayPost under ctx.
 func (a *GoogleChatAdapter) relayPostContext(ctx context.Context, path string, payload []byte) ([]byte, error) {
+	body, _, err := a.relayPostStatus(ctx, path, payload)
+	return body, err
+}
+
+// relayPostStatus is relayPostContext with the relay's own HTTP status
+// beside the body: 0 when the request was never sent, got no response, or
+// its body could not be read.
+func (a *GoogleChatAdapter) relayPostStatus(ctx context.Context, path string, payload []byte) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("gchat: building relay request: %w", err)
+		return nil, 0, fmt.Errorf("gchat: building relay request: %w", err)
 	}
 	if err := a.authorize(req); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("gchat: relay request: %w", err)
+		return nil, 0, fmt.Errorf("gchat: relay request: %w", err)
 	}
 	defer resp.Body.Close()
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return nil, fmt.Errorf("gchat: reading relay response: %w", err)
+		return nil, 0, fmt.Errorf("gchat: reading relay response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		// The relay scrubs Chat error bodies before they get here, down to
 		// the Chat status and reason, and those are carried forward: a 502
 		// alone cannot tell a 403 (the app's grant) from a 404 (a space the
 		// app is not in) from an outage.
-		return nil, gchatRelayError(fmt.Sprintf("gchat: relay %s answered %d", path, resp.StatusCode), buf.Bytes())
+		return nil, resp.StatusCode, gchatRelayError(fmt.Sprintf("gchat: relay %s answered %d", path, resp.StatusCode), buf.Bytes())
 	}
-	return buf.Bytes(), nil
+	return buf.Bytes(), resp.StatusCode, nil
 }
 
 // Post writes text to a conversation and returns the created message's
@@ -1058,6 +1083,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 	// every read is under ctx, so the wait is finite.
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	defer a.closeHomeLearn()
 	windowStart := time.Now()
 	var received, emptyPulls, failedPulls int
 	for {
@@ -1492,6 +1518,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if text != "" {
 		a.noteTypedAnswer(msg, sender)
 	}
+	a.noteHomeCandidate(ev, msg)
 	return msg, ""
 }
 
@@ -1757,6 +1784,8 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 		return g.resolveA2APrincipal(authorID)
 	case a2aGoogleBackend:
 		return g.resolveA2AGooglePrincipal(authorID)
+	case a2aEntraBackend:
+		return g.resolveA2AEntraPrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -1774,6 +1803,14 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 		return ""
 	case slackBackend:
 		return g.resolveSlackPrincipal(authorID)
+	case teamsBackend:
+		// Chat's rule carried to Teams: the backend-asserted Entra object id
+		// is the principal, gated by the allowlist alone, compared lowercased
+		// (an object id is a GUID; Teams spells it lowercase).
+		if g.teamsAllowAll || g.teamsAllowed[strings.ToLower(authorID)] {
+			return authorID
+		}
+		return ""
 	}
 	return g.pm.Resolve(authorID)
 }
@@ -1874,8 +1911,9 @@ func (g *Gateway) resolveInjectPrincipal(authorID string) string {
 // refusal for anything else. The caller named itself in a header or the
 // message metadata, so the map is the only thing standing between a
 // bearer-token holder and a principal of their choosing, exactly as on the
-// inject door. The developer and unattended identity classes, when they
-// land, resolve through a verifier beside this and never through this map.
+// inject door. The Google and Entra classes resolve through verifiers beside
+// this (resolveA2AGooglePrincipal, resolveA2AEntraPrincipal), as the
+// unattended class will, never through this map.
 func (g *Gateway) resolveA2APrincipal(authorID string) string {
 	if g.a2aPM == nil {
 		return ""
@@ -1909,6 +1947,22 @@ func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
 		return ""
 	}
 	return email
+}
+
+// resolveA2AEntraPrincipal is resolveA2AGooglePrincipal for a caller the
+// A2A door verified as a Microsoft Entra token: the object id is the
+// principal, admitted only if it is on the door's Entra allowlist, and only
+// under the class's prefix. It is returned as Entra sent it, case-preserved,
+// the string the Teams backend reads for the same person.
+func (g *Gateway) resolveA2AEntraPrincipal(authorID string) string {
+	objectID, ok := strings.CutPrefix(authorID, a2aEntraCallerPrefix)
+	if !ok || objectID == "" {
+		return ""
+	}
+	if !g.a2aEntraAllowed[strings.ToLower(objectID)] {
+		return ""
+	}
+	return objectID
 }
 
 // gchatConversationID mints the session key for one inbound message. space is

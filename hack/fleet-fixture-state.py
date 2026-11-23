@@ -61,7 +61,8 @@ world-open firewall rule and its VM, the peered jumbo-frame network, the two
 orphaned snapshots) is published as `<role>.confirmed` alone, and its subjects
 are read with `gcloud compute instances list`, `gcloud compute firewall-rules
 list`, `gcloud compute networks list` or `gcloud compute snapshots list` in the
-project. `serial_contains` reads an instance subject's serial port 1 output as
+project. A cluster role can carry one such subject too, `reservation/<prefix>*`,
+read with `gcloud compute reservations list`. `serial_contains` reads an instance subject's serial port 1 output as
 well, with `gcloud compute instances get-serial-port-output`: the startup-fail
 VM's failure line is printed at boot only, and the buffer that holds it rotates
 within weeks. `source_disk_gone` reads the project's disks for the name a
@@ -189,13 +190,29 @@ BLOB_SHA_SHORT = 8
 # cluster carries. Its subjects are `<kind>/<name-prefix>*`, read with
 # `gcloud compute <collection> list` in the project, and this is the kind to
 # collection map. The runner's probe grammar (hack/fleet-kubeconfigs.sh,
-# PROJECT_PROBE) accepts the same four kinds. A network's listing carries
+# PROJECT_PROBE) accepts the first four kinds. A network's listing carries
 # its `peerings`, which is how the declared-mtu-peering role reads both
 # halves of its peering, one list per network.
-PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks", "snapshot": "snapshots"}
-PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network|snapshot)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
+PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks", "snapshot": "snapshots", "reservation": "reservations"}
+PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network|snapshot|reservation)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
+# A reservation is the project's, and the node pool that names it is a
+# cluster's. So this one project subject is also for a cluster role: the
+# missing-reservation-pool role asserts on its pool and on the absence of the
+# reservation that the pool names. It is a state subject only: no probe takes
+# it, because a probe passes when an object is there.
+RESERVATION_KIND = "reservation"
 # The collection `source_disk_gone` reads beside a snapshot subject.
 DISKS_COLLECTION = "disks"
+# What gcloud prints, with exit 0, when a part of a list did not answer (a zone
+# that failed, a refused request): the list is then not the whole project's.
+PARTIAL_LIST_WARNING = "Some requests did not succeed"
+# Under that warning gcloud lists each part that failed as one item with this
+# start, and this is the reason when it lists none.
+PARTIAL_LIST_ITEM_START = "- "
+PARTIAL_LIST_NO_ITEM = "gcloud named no failed part"
+# The exit status of a tool that is there and cannot be started, as a shell
+# has it for a file that is not executable.
+STATUS_CANNOT_EXECUTE = 126
 
 # Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
 # discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;
@@ -461,6 +478,13 @@ def _verifier():
     return _VERIFIER
 
 
+def names_reservations(subject) -> bool:
+    """Does `subject` name the project's reservations? That kind is the project
+    subject on each role, a cluster role too, and never a kubectl kind, so a
+    `reservation?<selector>` is refused as malformed."""
+    return isinstance(subject, str) and subject.startswith((f"{RESERVATION_KIND}/", f"{RESERVATION_KIND}?"))
+
+
 def repository_path(subject: str) -> str | None:
     """The path a `repository/<path>` subject names; None for any other subject."""
     match = REPOSITORY_SUBJECT_RE.fullmatch(str(subject))
@@ -557,9 +581,10 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                         f"{where} names {in_repository!r}, which provisioning does not seed "
                         f"(the verifier's GITOPS_SEEDED_FILES: {sorted(_verifier().GITOPS_SEEDED_FILES)})"
                     )
-            elif project_scoped:
+            elif project_scoped or names_reservations(subject):
                 # Only the Compute Engine shape: a project-scoped role has no
-                # cluster to describe and no kubeconfig to read objects with.
+                # cluster to describe and no kubeconfig to read objects with,
+                # and a reservation is read in the project on a cluster role too.
                 if not isinstance(subject, str) or not PROJECT_SUBJECT_RE.fullmatch(subject):
                     raise CatalogError(f"{where} declares a malformed project subject {subject!r}")
             elif subject != CLUSTER_SUBJECT and (
@@ -639,6 +664,10 @@ def _run(cmd: list[str], timeout: float) -> tuple[int, str, str]:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        # Not executable, the wrong binary format, a path through a file: the
+        # read failed before the tool ran, and the text says how.
+        return STATUS_CANNOT_EXECUTE, "", str(exc)
     except subprocess.TimeoutExpired:
         return 124, "", f"timed out after {timeout:g}s: {' '.join(cmd)}"
     return proc.returncode, proc.stdout, proc.stderr
@@ -700,6 +729,20 @@ def _objects(kind: str, out: str) -> list[dict]:
     raise Unreadable(f"kubectl get {kind} printed an unexpected document")
 
 
+def _partial_list_reasons(err: str) -> str:
+    """Why gcloud read a list only in part: the items under its warning, one for
+    each part that failed. The last line of stderr is not the reason: after an
+    answer with no item, gcloud ends with a warning about the filter's key."""
+    lines = err.splitlines()
+    start = next(i for i, line in enumerate(lines) if PARTIAL_LIST_WARNING in line)
+    items = [
+        line.strip()[len(PARTIAL_LIST_ITEM_START):].strip()
+        for line in lines[start + 1 :]
+        if line.strip().startswith(PARTIAL_LIST_ITEM_START)
+    ]
+    return "; ".join(items) or PARTIAL_LIST_NO_ITEM
+
+
 def _compute_list(project: str, collection: str, name_filter: str) -> list[dict]:
     """`gcloud compute <collection> list` in `project`, filtered on the name.
     None there is an observation (an empty list), which an assertion may fail
@@ -712,6 +755,10 @@ def _compute_list(project: str, collection: str, name_filter: str) -> list[dict]
     rc, out, err = _run(cmd, GCLOUD_TIMEOUT_SECONDS)
     if rc != 0:
         raise Unreadable(f"compute {collection} list failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+    if PARTIAL_LIST_WARNING in err:
+        # An empty or short list here is not an observation: an `absent` or
+        # `none_eq` assertion would pass on what gcloud could not read.
+        raise Unreadable(f"compute {collection} list was partial: {_partial_list_reasons(err)}")
     try:
         doc = json.loads(out)
     except ValueError as exc:
@@ -1166,7 +1213,7 @@ class Reader:
             if isinstance(cached, (Unreadable, Unasserted)):
                 raise cached
             return cached
-        if spec["cluster_slot"] is None:
+        if spec["cluster_slot"] is None or names_reservations(subject):
             return read_compute(self.project, subject)
         if subject == CLUSTER_SUBJECT:
             slot = spec["cluster_slot"]

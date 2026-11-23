@@ -3832,6 +3832,15 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         self.assertLess(out.index("Pub/Sub Topic Name:"), out.index("SUMMARY"))
         self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
 
+    def test_reuses_exported_project_number_without_second_gcloud_call(self):
+        proc, calls = self._run(
+            "full",
+            {"GOOGLE_CHAT_ENABLED": "true", "CHAT_TOPIC_NAME": "t", "PROJECT_NUMBER": "987654321"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), ["CHECKLIST args=[] number=987654321 env=/x/install.env topic=t", "SUMMARY"])
+        self.assertEqual(calls, "")
+
 
 class UpgradeMakesTheInstallEnvPathAbsoluteTest(unittest.TestCase):
     """#3615. The chat checklist's re-run command names the run's install.env,
@@ -4215,6 +4224,590 @@ class DowngradeCheckWiringTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(proc.stdout.startswith("true\n"), proc.stdout)
         self.assertIn("--allow-breaking-downgrade", proc.stdout.split("\n", 1)[1])
+
+
+class UpgradeSizingProfileAndScanTest(unittest.TestCase):
+    """#6407: --sizing-profile wiring, pre-apply cluster scan, and harness CRD safety."""
+
+    def test_the_flag_is_parsed_validated_and_helped(self):
+        for args, expected in (
+            ("--sizing-profile=fleet", "PARAM=[fleet] PASSED=[true]"),
+            ("--sizing-profile medium", "PARAM=[medium] PASSED=[true]"),
+        ):
+            with self.subTest(args=args):
+                proc = subprocess.run(
+                    [
+                        "bash", "-c",
+                        f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                        f'parse_args {args}\n'
+                        'echo "PARAM=[$PARAM_PLATFORM_AGENT_SIZING_PROFILE] PASSED=[$PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED]"\nshow_help',
+                    ],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn(expected, proc.stdout)
+                self.assertIn("--sizing-profile PROFILE", proc.stdout)
+
+    def test_scan_runs_before_mode_dispatch_and_skips_offline_dry_run(self):
+        text = _UPGRADE_SH.read_text(encoding="utf-8")
+        dry_run_block = text[text.index('if [ "$PARAM_DRY_RUN" = "true" ]; then') : text.index('export PROJECT_ID="$target_project"')]
+        self.assertIn("Runtime Sizing Profile:", dry_run_block)
+        self.assertNotIn("report_cluster_sizing_guidance", dry_run_block)
+
+        write_tfvars = text.index('write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"')
+        scan_call = text.index('report_cluster_sizing_guidance "${SIZING_SCAN_CONTEXT_UPGRADE:-upgrade}" "$target_project"')
+        plan_branch = text.index('if [ "$PARAM_PLAN" = "true" ]; then', write_tfvars)
+        dispatch = text.index('case "$PARAM_UPGRADE_MODE" in', plan_branch)
+        self.assertLess(write_tfvars, scan_call)
+        self.assertLess(scan_call, plan_branch)
+        self.assertLess(plan_branch, dispatch)
+
+    def test_harness_arm_sets_sizing_profile_when_crd_supports_it_and_guards_legacy_crd(self):
+        text = _UPGRADE_SH.read_text(encoding="utf-8")
+        harness = text[text.index("    harness)") : text.index("    full)")]
+        marker = "      HARNESS_EXTRA_SET_ARGS=()\n"
+        end_marker = '      harness_retag_keys "$RETAG_VALUES_JSON"'
+        prep_block = harness[harness.index(marker) : harness.index(end_marker)]
+
+        helm_retag_start = text.index("  helm_retag() {")
+        helm_retag_fn = text[helm_retag_start : text.index("\n  }\n", helm_retag_start) + len("\n  }\n")]
+
+        with_field = '{"spec":{"versions":[{"storage":true,"schema":{"openAPIV3Schema":{"properties":{"spec":{"properties":{"deployment":{"properties":{"sizingProfile":{"type":"string"}}}}}}}}}]}}'
+        without_field = '{"spec":{"versions":[{"storage":true,"schema":{"openAPIV3Schema":{"properties":{"spec":{"properties":{"deployment":{"properties":{}}}}}}}}]}}'
+
+        def run_case(crd_json, explicit, release_json="{}", crd_rc=0):
+            with tempfile.TemporaryDirectory() as tmp:
+                bin_dir = pathlib.Path(tmp) / "bin"
+                bin_dir.mkdir()
+                k = bin_dir / "kubectl"
+                k.write_text(f"#!/usr/bin/env bash\nprintf '%s' {shlex.quote(crd_json)}\nexit {crd_rc}\n")
+                k.chmod(0o755)
+                helm = bin_dir / "helm"
+                helm.write_text('#!/usr/bin/env bash\necho "HELM:$*"\n')
+                helm.chmod(0o755)
+                script = (
+                    f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                    f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                    f'{helm_retag_fn}\n'
+                    'repo_dir="."\ntarget_namespace="kubeagents-system"\nPARAM_IMAGE_TAG="0.3.0"\n'
+                    'HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag")\n'
+                    f'RETAG_VALUES_JSON={shlex.quote(release_json)}\n'
+                    f'sizing_profile_explicit={shlex.quote(explicit)}\n'
+                    f'run_harness_prep() {{\n{prep_block}\n}}\n'
+                    'run_harness_prep\n'
+                    'helm_retag "${HARNESS_RETAG_KEYS[@]}"\n'
+                )
+                return subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True, text=True,
+                    env=get_isolated_test_env(overrides={"PLATFORM_AGENT_SIZING_PROFILE": ""}, bin_dir=str(bin_dir)),
+                    cwd=str(_REPO_ROOT),
+                )
+
+        # 1. Supported CRD + unset release value -> wires auto
+        p_ok = run_case(with_field, "false", "{}")
+        self.assertEqual(p_ok.returncode, 0, p_ok.stdout + p_ok.stderr)
+        self.assertIn("--set platformAgent.deployment.sizingProfile=auto", p_ok.stdout)
+
+        # 2. Supported CRD + implicit + release already sets fleet -> preserves existing override
+        p_keep = run_case(with_field, "false", '{"platformAgent":{"deployment":{"sizingProfile":"fleet"}}}')
+        self.assertEqual(p_keep.returncode, 0, p_keep.stdout + p_keep.stderr)
+        self.assertNotIn("--set platformAgent.deployment.sizingProfile=", p_keep.stdout)
+
+        # 3. Legacy CRD + implicit default -> warns cleanly and still re-tags image
+        p_warn = run_case(without_field, "false", "{}")
+        self.assertEqual(p_warn.returncode, 0, p_warn.stdout + p_warn.stderr)
+        self.assertIn("predates spec.deployment.sizingProfile", p_warn.stdout + p_warn.stderr)
+        self.assertNotIn("--set platformAgent.deployment.sizingProfile=", p_warn.stdout)
+        self.assertIn("--set platformAgent.deployment.image.tag=0.3.0", p_warn.stdout)
+
+        # 4. Legacy CRD + explicit --sizing-profile / install.env -> refuses before helm upgrade
+        p_refuse = run_case(without_field, "true", "{}")
+        self.assertEqual(p_refuse.returncode, 1, p_refuse.stdout + p_refuse.stderr)
+        self.assertIn("predates spec.deployment.sizingProfile", p_refuse.stdout + p_refuse.stderr)
+        self.assertNotIn("HELM:", p_refuse.stdout)
+
+        # 5. Unreadable/forbidden CRD (rc=2): implicit warns & proceeds; explicit refuses before helm
+        p_unreadable_warn = run_case("", "false", "{}", crd_rc=1)
+        self.assertEqual(p_unreadable_warn.returncode, 0, p_unreadable_warn.stdout + p_unreadable_warn.stderr)
+        self.assertIn("Could not probe installed PlatformAgent CRD", p_unreadable_warn.stdout + p_unreadable_warn.stderr)
+        self.assertIn("--set platformAgent.deployment.image.tag=0.3.0", p_unreadable_warn.stdout)
+
+        p_unreadable_refuse = run_case("", "true", "{}", crd_rc=1)
+        self.assertEqual(p_unreadable_refuse.returncode, 1, p_unreadable_refuse.stdout + p_unreadable_refuse.stderr)
+        self.assertIn("Cannot verify whether the installed PlatformAgent CRD supports", p_unreadable_refuse.stdout + p_unreadable_refuse.stderr)
+        self.assertNotIn("HELM:", p_unreadable_refuse.stdout)
+
+        # 6. Older target chart schema lacking sizingProfile: warns when implicit, refuses when explicit, and survives unset DEFAULT_PLATFORM_AGENT_SIZING_PROFILE under set -u.
+        for explicit, expect_rc in (("false", 0), ("true", 1)):
+            with self.subTest(schema_without_sizing=True, explicit=explicit):
+                with tempfile.TemporaryDirectory() as tmp:
+                    bin_dir = pathlib.Path(tmp) / "bin"
+                    bin_dir.mkdir()
+                    k = bin_dir / "kubectl"
+                    k.write_text(f"#!/usr/bin/env bash\nprintf '%s' {shlex.quote(with_field)}\nexit 0\n")
+                    k.chmod(0o755)
+                    helm = bin_dir / "helm"
+                    helm.write_text('#!/usr/bin/env bash\necho "HELM:$*"\n')
+                    helm.chmod(0o755)
+                    schema_dir = pathlib.Path(tmp) / "charts" / "kube-agents"
+                    schema_dir.mkdir(parents=True)
+                    (schema_dir / "values.schema.json").write_text(
+                        '{"properties":{"platformAgent":{"properties":{"deployment":{"properties":{}}}}}}'
+                    )
+                    script = (
+                        f'set -u\nKUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                        f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                        'unset DEFAULT_PLATFORM_AGENT_SIZING_PROFILE\n'
+                        f'{helm_retag_fn}\n'
+                        f'repo_dir={shlex.quote(tmp)}\ntarget_namespace="kubeagents-system"\nPARAM_IMAGE_TAG="0.3.0"\n'
+                        'HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag")\n'
+                        'RETAG_VALUES_JSON="{}"\n'
+                        f'sizing_profile_explicit={shlex.quote(explicit)}\n'
+                        f'run_harness_prep() {{\n{prep_block}\n}}\n'
+                        'run_harness_prep\n'
+                        'helm_retag "${HARNESS_RETAG_KEYS[@]}"\n'
+                    )
+                    p_schema = subprocess.run(
+                        ["bash", "-c", script],
+                        capture_output=True, text=True,
+                        env=get_isolated_test_env(overrides={"PLATFORM_AGENT_SIZING_PROFILE": ""}, bin_dir=str(bin_dir)),
+                        cwd=str(_REPO_ROOT),
+                    )
+                    out = p_schema.stdout + p_schema.stderr
+                    self.assertEqual(p_schema.returncode, expect_rc, out)
+                    self.assertIn("does not declare platformAgent.deployment.sizingProfile", out)
+                    self.assertNotIn("--set platformAgent.deployment.sizingProfile=", p_schema.stdout)
+                    if expect_rc == 0:
+                        self.assertIn("--set platformAgent.deployment.image.tag=0.3.0", p_schema.stdout)
+                    else:
+                        self.assertNotIn("HELM:", p_schema.stdout)
+
+        # 7. Target checkout predating #6470 (installer_common.sh lacks crd_supports_platform_agent_sizing_profile
+        #    and its helper constants): schema refusal must still fire when schema lacks sizingProfile, and
+        #    inline CRD probe fallback must apply or refuse cleanly when schema declares sizingProfile.
+        for schema_has_field, crd_json, explicit, expect_rc, want_msg, want_set in (
+            (False, with_field, "true", 1, "does not declare platformAgent.deployment.sizingProfile", False),
+            (False, with_field, "false", 0, "does not declare platformAgent.deployment.sizingProfile", False),
+            (True, with_field, "true", 0, None, True),
+            (True, without_field, "true", 1, "predates spec.deployment.sizingProfile", False),
+            (True, without_field, "false", 0, "predates spec.deployment.sizingProfile", False),
+            (True, "", "true", 1, "Cannot verify whether the installed PlatformAgent CRD supports", False),
+        ):
+            with self.subTest(legacy_target_checkout=True, schema_has_field=schema_has_field, crd_ok=(crd_json == with_field), explicit=explicit):
+                with tempfile.TemporaryDirectory() as tmp:
+                    bin_dir = pathlib.Path(tmp) / "bin"
+                    bin_dir.mkdir()
+                    k = bin_dir / "kubectl"
+                    k_rc = 0 if crd_json else 1
+                    k.write_text(f"#!/usr/bin/env bash\nprintf '%s' {shlex.quote(crd_json)}\nexit {k_rc}\n")
+                    k.chmod(0o755)
+                    helm = bin_dir / "helm"
+                    helm.write_text('#!/usr/bin/env bash\necho "HELM:$*"\n')
+                    helm.chmod(0o755)
+                    schema_dir = pathlib.Path(tmp) / "charts" / "kube-agents"
+                    schema_dir.mkdir(parents=True)
+                    field_json = '{"sizingProfile":{"type":"string"}}' if schema_has_field else '{}'
+                    (schema_dir / "values.schema.json").write_text(
+                        f'{{"properties":{{"platformAgent":{{"properties":{{"deployment":{{"properties":{field_json}}}}}}}}}}}'
+                    )
+                    script = (
+                        f'set -u\nKUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                        f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                        'unset -f crd_supports_platform_agent_sizing_profile\n'
+                        'unset DEFAULT_PLATFORM_AGENT_SIZING_PROFILE\n'
+                        'unset -f gke_context_name\n'
+                        f'{helm_retag_fn}\n'
+                        f'repo_dir={shlex.quote(tmp)}\ntarget_namespace="kubeagents-system"\nPARAM_IMAGE_TAG="0.3.0"\n'
+                        'HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag")\n'
+                        'RETAG_VALUES_JSON="{}"\n'
+                        f'sizing_profile_explicit={shlex.quote(explicit)}\n'
+                        'PLATFORM_AGENT_SIZING_PROFILE="fleet"\n'
+                        f'run_harness_prep() {{\n{prep_block}\n}}\n'
+                        'run_harness_prep\n'
+                        'helm_retag "${HARNESS_RETAG_KEYS[@]}"\n'
+                    )
+                    p_old = subprocess.run(
+                        ["bash", "-c", script],
+                        capture_output=True, text=True,
+                        env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                        cwd=str(_REPO_ROOT),
+                    )
+                    out = p_old.stdout + p_old.stderr
+                    self.assertEqual(p_old.returncode, expect_rc, out)
+                    if want_msg:
+                        self.assertIn(want_msg, out)
+                    if want_set:
+                        self.assertIn("--set platformAgent.deployment.sizingProfile=fleet", p_old.stdout)
+                    else:
+                        self.assertNotIn("--set platformAgent.deployment.sizingProfile=", p_old.stdout)
+
+    def test_validates_and_prints_without_default_var_or_helper_under_set_u(self):
+        text = _UPGRADE_SH.read_text(encoding="utf-8")
+        val_start = text.index('  _upgrade_validate_sizing_profile() {\n')
+        val_end = text.index('  # A GITHUB_APP_ID', val_start)
+        val_block = text[val_start:val_end]
+        dry_marker = '    local dry_run_profile="'
+        dry_start = text.index(dry_marker)
+        echo_start = text.index('    echo -e "  • ${C_CYAN}Runtime Sizing Profile:', dry_start)
+        dry_block = text[dry_start : text.index("\n", echo_start)]
+        p_unset = subprocess.run(
+            [
+                "bash", "-c",
+                f'set -u\nKUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                'unset DEFAULT_PLATFORM_AGENT_SIZING_PROFILE\n'
+                'PLATFORM_AGENT_SIZING_PROFILE=""\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE="small"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"\n'
+                'install_env_file="/tmp/install.env"\n'
+                f'run_val() {{\n{val_block}\n}}\nrun_val\n'
+                'unset PLATFORM_AGENT_SIZING_PROFILE\n'
+                f'show_dry() {{\n{dry_block}\n}}\nshow_dry\n',
+            ],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        out = p_unset.stdout + p_unset.stderr
+        self.assertEqual(p_unset.returncode, 0, out)
+        self.assertIn("--sizing-profile='small' applies for this run only", out)
+        self.assertIn("Runtime Sizing Profile:", out)
+        self.assertIn("auto", out)
+
+    def test_validates_without_helper_from_older_target_checkout_and_warns_on_override(self):
+        text = _UPGRADE_SH.read_text(encoding="utf-8")
+        val_start = text.index('  _upgrade_validate_sizing_profile() {\n')
+        val_end = text.index('  # A GITHUB_APP_ID', val_start)
+        val_block = text[val_start:val_end]
+        p_bad = subprocess.run(
+            [
+                "bash", "-c",
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                'PLATFORM_AGENT_SIZING_PROFILE="small"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE="bogus"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"\n'
+                f'run_val() {{\n{val_block}\n}}\nrun_val\n',
+            ],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(p_bad.returncode, 1)
+        self.assertIn("--sizing-profile='bogus' is not valid", p_bad.stdout + p_bad.stderr)
+
+        p_override = subprocess.run(
+            [
+                "bash", "-c",
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                'install_env_file="/tmp/install.env"\n'
+                'PLATFORM_AGENT_SIZING_PROFILE="small"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE="fleet"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"\n'
+                f'run_val() {{\n{val_block}\n}}\nrun_val\n',
+            ],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(p_override.returncode, 0, p_override.stdout + p_override.stderr)
+        self.assertIn("--sizing-profile='fleet' overrides PLATFORM_AGENT_SIZING_PROFILE='small'", p_override.stdout + p_override.stderr)
+
+    def test_operator_mode_refuses_sizing_profile_flag_and_marks_dry_run_and_resolves_project_number(self):
+        text = _UPGRADE_SH.read_text(encoding="utf-8")
+        mode_start = text.index('  case "$PARAM_UPGRADE_MODE" in\n')
+        mode_end = text.index('  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then\n', mode_start)
+        mode_block = text[mode_start:mode_end]
+        p_op = subprocess.run(
+            [
+                "bash", "-c",
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                'PARAM_UPGRADE_MODE="operator"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE="fleet"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"\n'
+                f'check_mode() {{\n{mode_block}\n}}\ncheck_mode\n',
+            ],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(p_op.returncode, 1)
+        self.assertIn("--sizing-profile does not apply to --upgrade-mode=operator", p_op.stdout + p_op.stderr)
+
+        dry_start = text.index('    local dry_run_profile=')
+        dry_end = text.index('    echo -e "  • ${C_CYAN}Secrets:', dry_start)
+        dry_block = text[dry_start:dry_end]
+        p_dry = subprocess.run(
+            [
+                "bash", "-c",
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                'PARAM_UPGRADE_MODE="operator"\n'
+                'PLATFORM_AGENT_SIZING_PROFILE="fleet"\n'
+                f'show_dry() {{\n{dry_block}\n}}\nshow_dry\n',
+            ],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(p_dry.returncode, 0, p_dry.stdout + p_dry.stderr)
+        self.assertIn("fleet (not applied in --upgrade-mode=operator)", p_dry.stdout)
+
+        proj_start = text.index('  if command -v gcloud >/dev/null 2>&1;')
+        proj_end = text.index('  if declare -F report_cluster_sizing_guidance', proj_start)
+        proj_block = text[proj_start:proj_end]
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            g = bin_dir / "gcloud"
+            g.write_text('#!/usr/bin/env bash\nif [ "${1:-}" = "projects" ] && [ "${2:-}" = "describe" ]; then echo "987654321"; exit 0; fi\nexit 1\n')
+            g.chmod(0o755)
+            p_num = subprocess.run(
+                [
+                    "bash", "-c",
+                    f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                    'target_project="host-proj"\nPROJECT_NUMBER="111111"\n'
+                    f'resolve_num() {{\n{proj_block}\n}}\nresolve_num\necho "PN=[$PROJECT_NUMBER]"\n',
+                ],
+                capture_output=True, text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)), cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(p_num.returncode, 0, p_num.stdout + p_num.stderr)
+            self.assertIn("PN=[987654321]", p_num.stdout)
+
+        note_start = text.index('  local effective_operator_sizing=')
+        note_end = text.index('\n  if [ "$PARAM_PLAN" = "true" ]; then', note_start)
+        note_block = text[note_start:note_end]
+        for label, live_present, live_prof, env_prof, want in (
+            ("pre-sizing-cr-default-auto", "true", "", "", "sizingProfile='auto'"),
+            ("small-to-fleet", "true", "small", "fleet", "sizingProfile='fleet'"),
+            ("already-auto", "true", "auto", "", None),
+            ("no-live-cr", "false", "", "fleet", None),
+        ):
+            with self.subTest(operator_skip_note=label):
+                p_note = subprocess.run(
+                    [
+                        "bash", "-c",
+                        f'set -u\nKUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                        'PARAM_UPGRADE_MODE="operator"\n'
+                        f'LIVE_CR_PRESENT={shlex.quote(live_present)}\n'
+                        f'LIVE_CR_SIZING_PROFILE={shlex.quote(live_prof)}\n'
+                        f'PLATFORM_AGENT_SIZING_PROFILE={shlex.quote(env_prof)}\n'
+                        f'check_note() {{\n{note_block}\n}}\ncheck_note\n',
+                    ],
+                    capture_output=True, text=True,
+                    env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertEqual(p_note.returncode, 0, p_note.stdout + p_note.stderr)
+                if want is None:
+                    self.assertNotIn("--upgrade-mode=operator only applies CRDs", p_note.stdout)
+                else:
+                    self.assertIn("--upgrade-mode=operator only applies CRDs", p_note.stdout)
+                    self.assertIn(want, p_note.stdout)
+
+
+class KanbanAdmissionPreflightTest(unittest.TestCase):
+    """Pre-upgrade detection of kanban.admission memoryBudgetMiB < workerRssCapMiB on live CRs."""
+
+    def _run_preflight(self, cr_json=None, extra_mock=""):
+        env = get_isolated_test_env()
+        assign = f"PLATFORM_AGENT_CR_JSON={shlex.quote(cr_json)}; " if cr_json is not None else ""
+        cmd = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"; '
+            f'DEFAULT_NAMESPACE="kubeagents-system"; '
+            f'{extra_mock}'
+            f'{assign}'
+            f'warn_live_cr_kanban_admission "kubeagents-system"'
+        )
+        return subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True, text=True, env=env,
+        )
+
+    def test_warns_when_deployment_resources_override_leaves_budget_below_cap(self):
+        import json
+
+        cr = {
+            "items": [{
+                "metadata": {"name": "platform-agent", "namespace": "kubeagents-system"},
+                "spec": {"deployment": {"resources": {"requests": {"memory": "512Mi"}}}},
+            }]
+        }
+        proc = self._run_preflight(json.dumps(cr))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("memoryBudgetMiB=512MiB < workerRssCapMiB=1536MiB", proc.stdout)
+        self.assertIn("spec.deployment.resources.requests.memory=512Mi", proc.stdout)
+        self.assertIn("has no Helm chart value", proc.stdout)
+        self.assertIn("at least 1536Mi", proc.stdout)
+        self.assertNotIn('"/spec/deployment/resources"', proc.stdout)
+        self.assertNotIn("failClosed: false", proc.stdout)
+
+    def test_reads_live_cr_via_kubectl_when_env_unset(self):
+        import json
+
+        cr = {
+            "items": [{
+                "metadata": {"name": "pa-live", "namespace": "kubeagents-system"},
+                "spec": {"deployment": {"resources": {"requests": {"memory": "512Mi"}}}},
+            }]
+        }
+        mock = f"kubectl() {{ printf '%s' {shlex.quote(json.dumps(cr))}; return 0; }}; export -f kubectl; "
+        proc = self._run_preflight(cr_json=None, extra_mock=mock)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("PlatformAgent 'pa-live'", proc.stdout)
+        self.assertIn("spec.deployment.resources.requests.memory=512Mi", proc.stdout)
+
+    def test_warns_on_limits_only_and_clamped_or_si_or_fail_open_or_cap_oversized(self):
+        import json
+
+        cases = (
+            (
+                {"deployment": {"resources": {"limits": {"memory": "1Gi"}}}},
+                "limits.memory=1Gi",
+                "has no Helm chart value",
+            ),
+            (
+                {"deployment": {"resources": {"requests": {"memory": "256Mi"}}}},
+                "memoryBudgetMiB=512MiB",
+                "at least 1536Mi",
+            ),
+            (
+                {"deployment": {"resources": {"requests": {"memory": "1.5G"}}}},
+                "memoryBudgetMiB=1430MiB",
+                "at least 1536Mi",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "4Gi"}, "limits": {"memory": "8Gi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 1024}}},
+                },
+                "spec.harness.tuning.admission.memoryBudgetMiB=1024",
+                "raise spec.harness.tuning.admission.memoryBudgetMiB to at least 1536 (or clear it to follow container memory request)",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "512Mi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 1024}}},
+                },
+                "spec.harness.tuning.admission.memoryBudgetMiB=1024",
+                "raise spec.harness.tuning.admission.memoryBudgetMiB to at least 1536 (and raise spec.deployment.resources memory to at least 1536Mi if you want to clear admission)",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "512Mi"}}},
+                    "harness": {"tuning": {"admission": {"failClosed": False}}},
+                },
+                "memoryBudgetMiB=512MiB < workerRssCapMiB=1536MiB",
+                "has no Helm chart value",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "4Gi"}}},
+                    "harness": {"tuning": {"admission": {"workerRssCapMiB": 5000}}},
+                },
+                "workerRssCapMiB=5000MiB",
+                "lower spec.harness.tuning.admission.workerRssCapMiB to at most 4096, raise spec.harness.tuning.admission.memoryBudgetMiB to at least 5000, or set spec.deployment.resources memory to at least 5000Mi",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "4Gi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 2048, "workerRssCapMiB": 4096}}},
+                },
+                "workerRssCapMiB=4096MiB",
+                "lower spec.harness.tuning.admission.workerRssCapMiB to at most 2048, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least 4096 (or clear it to follow container memory request)",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "2Gi"}}},
+                    "harness": {"tuning": {"admission": {"memoryBudgetMiB": 2048, "workerRssCapMiB": 4096}}},
+                },
+                "workerRssCapMiB=4096MiB",
+                "lower spec.harness.tuning.admission.workerRssCapMiB to at most 2048, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least 4096 via kubectl",
+            ),
+            (
+                {
+                    "deployment": {"resources": {"requests": {"memory": "512Mi"}}},
+                    "harness": {"tuning": {"admission": {"workerRssCapMiB": 5000}}},
+                },
+                "workerRssCapMiB=5000MiB",
+                "Raise memory under spec.deployment.resources to at least 5000Mi (or set spec.harness.tuning.admission.memoryBudgetMiB to at least 5000, or lower workerRssCapMiB to at most 512)",
+            ),
+        )
+        for raw_spec, want_fragment, want_remedy in cases:
+            with self.subTest(want_fragment=want_fragment):
+                cr = {"items": [{"metadata": {"name": "pa", "namespace": "kubeagents-system"}, "spec": raw_spec}]}
+                proc = self._run_preflight(json.dumps(cr))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("exceeds the pod's admission budget", proc.stdout)
+                self.assertIn(want_fragment, proc.stdout)
+                self.assertIn(want_remedy, proc.stdout)
+                self.assertNotIn("failClosed: false", proc.stdout)
+                admission = raw_spec.get("harness", {}).get("tuning", {}).get("admission", {})
+                if admission.get("memoryBudgetMiB") == 2048:
+                    self.assertNotIn("spec.deployment.resources", proc.stdout)
+                if admission.get("workerRssCapMiB") == 5000:
+                    self.assertNotIn("clear the sub-cap memory override", proc.stdout)
+                if "Note: spec.deployment.resources has no Helm chart value" in proc.stdout and not admission:
+                    self.assertNotIn("TF_VAR_extra_helm_values", proc.stdout)
+                else:
+                    self.assertIn("platformAgent.harness.tuning.admission", proc.stdout)
+                    self.assertIn("TF_VAR_extra_helm_values", proc.stdout)
+
+        # Malformed non-integer admission fields on one CR must not abort warnings for remaining CRs.
+        mixed_cr = {
+            "items": [
+                {"metadata": {"name": "pa-malformed"}, "spec": {"harness": {"tuning": {"admission": {"workerRssCapMiB": "not-an-int"}}}}},
+                {"metadata": {"name": "pa-subcap"}, "spec": {"deployment": {"resources": {"requests": {"memory": "512Mi"}}}}},
+            ]
+        }
+        proc_mixed = self._run_preflight(json.dumps(mixed_cr))
+        self.assertEqual(proc_mixed.returncode, 0, proc_mixed.stderr)
+        self.assertIn("PlatformAgent 'pa-subcap'", proc_mixed.stdout)
+        self.assertNotIn("TF_VAR_extra_helm_values", proc_mixed.stdout)
+
+    def test_silent_when_valid_or_unreadable(self):
+        import json
+
+        for label, payload in (
+            ("defaults", {"items": [{"metadata": {"name": "pa"}, "spec": {}}]}),
+            ("equal boundary", {"items": [{"metadata": {"name": "pa"}, "spec": {"deployment": {"resources": {"requests": {"memory": "2Gi"}}}, "harness": {"tuning": {"admission": {"workerRssCapMiB": 2048}}}}}]}),
+            ("SI 2G >= 1536", {"items": [{"metadata": {"name": "pa"}, "spec": {"deployment": {"resources": {"requests": {"memory": "2G"}}}}}]}),
+            ("empty list", {"items": []}),
+        ):
+            with self.subTest(label=label):
+                proc = self._run_preflight(json.dumps(payload))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn("exceeds the pod's admission budget", proc.stdout)
+
+        # Missing/unreadable kubectl output fails open silently.
+        kubectl_fail = 'kubectl() { return 1; }; export -f kubectl; '
+        proc = self._run_preflight(cr_json=None, extra_mock=kubectl_fail)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_preflight_runs_in_main_before_plan_and_mode_dispatch(self):
+        text = _UPGRADE_SH.read_text()
+        main = text[text.index("main() {"):]
+        call_idx = main.index('warn_live_cr_kanban_admission "$target_namespace"')
+        self.assertLess(main.index("write_tfvars_from_state"), call_idx)
+        self.assertLess(call_idx, main.index('print_step "4. Planning (read-only)"'))
+        self.assertLess(call_idx, main.index('case "$PARAM_UPGRADE_MODE" in', main.index('exit "$plan_status"')))
+
+    def test_sourcing_upgrade_and_installer_common_has_no_readonly_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            env_file = tmp_path / "install.env"
+            env_file.write_text('PROJECT_ID="ci-test-project"\nCLUSTER_NAME="ci-test-cluster"\nREGION="us-central1"\n')
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            for cmd in ("gcloud", "kubectl", "helm", "jq", "terraform"):
+                stub = bin_dir / cmd
+                stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+                stub.chmod(0o755)
+            sha = subprocess.check_output(["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True).strip()
+            env = get_isolated_test_env(bin_dir=str(bin_dir))
+            env["KUBE_AGENTS_INSTALL_ENV"] = str(env_file)
+            proc = subprocess.run(
+                [
+                    str(_UPGRADE_SH),
+                    "--dry-run",
+                    "-y",
+                    "--upgrade-mode=full",
+                    "--gcp-project-id=ci-test-project",
+                    f"--image-tag={sha}",
+                ],
+                capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Dry-Run Upgrade Plan Preview", proc.stdout)
 
 
 if __name__ == "__main__":

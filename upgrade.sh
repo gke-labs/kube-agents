@@ -64,6 +64,15 @@ readonly KUBE_AGENTS_RELEASE_BUNDLE_MARKER=".release-bundle"
 # The schema the re-tag modes filter the release's recorded values against,
 # relative to the sources this run applies.
 readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
+readonly SIZING_PROFILE_SCHEMA_JQ='.properties.platformAgent.properties.deployment.properties.sizingProfile != null'
+readonly RETAG_SIZING_PROFILE_JQ='.platformAgent.deployment.sizingProfile // ""'
+readonly PLATFORM_AGENT_SIZING_PROFILE_DEFAULT="auto"
+readonly UPGRADE_PLATFORM_AGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
+readonly UPGRADE_CRD_SIZING_PROFILE_JQ='[.spec.versions[]? | select(.storage == true or .served == true) | .schema.openAPIV3Schema.properties.spec.properties.deployment.properties.sizingProfile] | map(select(. != null)) | length > 0'
+readonly UPGRADE_KUBECTL_PROBE_TIMEOUT="10s"
+readonly UPGRADE_CRD_PROBE_UNREADABLE_RC=2
+readonly UPGRADE_SIZING_PROFILE_VALUES="small medium fleet auto"
+readonly UPGRADE_SIZING_PROFILE_CHOICES="small | medium | fleet | auto"
 # What marks a commit as a breaking change: a `type!:` subject or a BREAKING
 # CHANGE footer. The same patterns as commit_messages_have_breaking_change in
 # scripts/release/common.sh, which picks the version bump, held here because
@@ -86,6 +95,21 @@ readonly DOWNGRADE_AGENT_DEPLOYMENT_DEFAULT="platform-agent-gateway"
 readonly DOWNGRADE_AGENT_CONTAINER="platform-agent"
 readonly DOWNGRADE_OPERATOR_DEPLOYMENT_DEFAULT="kube-agents-controller-manager"
 readonly DOWNGRADE_OPERATOR_CONTAINER="manager"
+# Admission budget defaults matching the operator (platformagent_manifests.go);
+# used to flag live CRs whose overrides put memoryBudgetMiB below workerRssCapMiB.
+readonly ADMISSION_DEFAULT_MEMORY_BUDGET_MIB=4096
+readonly ADMISSION_DEFAULT_WORKER_RSS_CAP_MIB=1536
+readonly ADMISSION_MEMORY_BUDGET_FLOOR_MIB=512
+readonly DEFAULT_PLATFORM_AGENT_CR_NAME="platform-agent"
+readonly ADMISSION_BYTES_PER_MIB=$((1024 * 1024))
+readonly ADMISSION_QTY_RE='^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)\s*$'
+readonly ADMISSION_QTY_BIN_BASE=1024
+readonly ADMISSION_QTY_DEC_BASE=1000
+readonly ADMISSION_QTY_MILLI_SCALE="0.001"
+readonly ADMISSION_BIN_SUFFIXES="Ki,Mi,Gi,Ti,Pi,Ei"
+readonly ADMISSION_DEC_SUFFIXES="k,M,G,T,P,E"
+readonly ADMISSION_DEC_UPPER_K="K"
+readonly ADMISSION_MILLI_SUFFIX="m"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -113,6 +137,8 @@ PARAM_REGION=""
 # Empty means "whatever the loaded configuration says", which is how this ran
 # before the flag existed: the namespace came from install.env alone.
 PARAM_AGENT_NAMESPACE=""
+PARAM_PLATFORM_AGENT_SIZING_PROFILE=""
+PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="false"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-${BAKED_RELEASE_VERSION:-}}"
 # Whether that default came from the baked version alone: the one default a
 # release-line checkout past its stamp takes back (see
@@ -349,6 +375,9 @@ Options:
   --gcp-region REGION      GKE GCP Region
   --agent-namespace NS     Kubernetes namespace the release lives in
                            (default: the install's own, else kubeagents-system)
+  --sizing-profile PROFILE PlatformAgent spec.deployment.sizingProfile preset
+                           (auto | small | medium | fleet; defaults to
+                           PLATFORM_AGENT_SIZING_PROFILE in install.env or auto)
   --image-tag TAG          Validated immutable release tag or full commit SHA.
                            Developer and CI/CD testing only: an official release
                            bakes its own version into this script and upgrades to
@@ -1276,6 +1305,172 @@ check_downgrade_for_mode() {
   fi
 }
 
+# Inspects live PlatformAgent CR(s) in $1 and warns with exact remediation when
+# effective kanban.admission settings resolve memoryBudgetMiB < workerRssCapMiB.
+# Spec overrides under spec.deployment.resources have no Helm chart value and
+# survive upgrades untouched. Fails open when CR state cannot be read so offline
+# or un-CRD'd runs proceed.
+warn_live_cr_kanban_admission() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+  local cr_json="${PLATFORM_AGENT_CR_JSON:-}"
+  if [ -z "$cr_json" ]; then
+    cr_json="$(trap - ERR; kubectl get "${PLATFORM_AGENT_CRD_NAME:-$UPGRADE_PLATFORM_AGENT_CRD_NAME}" -n "$namespace" -o json 2>/dev/null)" || cr_json=""
+  fi
+  [ -n "$cr_json" ] || return 0
+
+  local findings=""
+  findings="$(trap - ERR; printf '%s' "$cr_json" | python3 -c '
+from decimal import Decimal, InvalidOperation
+import json
+import re
+import sys
+
+default_budget_mib = int(sys.argv[1])
+default_rss_cap_mib = int(sys.argv[2])
+budget_floor_mib = int(sys.argv[3])
+default_cr_name = sys.argv[4]
+mib_bytes = int(sys.argv[5])
+qty_re = re.compile(sys.argv[6])
+bin_base = Decimal(sys.argv[7])
+dec_base = Decimal(sys.argv[8])
+milli_scale = Decimal(sys.argv[9])
+bin_suffixes = [s for s in sys.argv[10].split(",") if s]
+dec_suffixes = [s for s in sys.argv[11].split(",") if s]
+dec_upper_k = sys.argv[12]
+milli_suffix = sys.argv[13]
+
+bin_scales = {}
+acc = Decimal(1)
+for sfx in bin_suffixes:
+    acc *= bin_base
+    bin_scales[sfx] = acc
+
+dec_scales = {milli_suffix: milli_scale, "": Decimal(1)}
+acc = Decimal(1)
+for sfx in dec_suffixes:
+    acc *= dec_base
+    dec_scales[sfx] = acc
+dec_scales[dec_upper_k] = dec_base
+
+def parse_mib(raw):
+    if raw is None or not isinstance(raw, str):
+        return None
+    match = qty_re.match(raw)
+    if not match:
+        return None
+    num_str, suffix = match.group(1), match.group(2)
+    scale = bin_scales.get(suffix, dec_scales.get(suffix))
+    if scale is None:
+        return None
+    try:
+        total_bytes = int(Decimal(num_str) * scale)
+    except (InvalidOperation, ValueError):
+        return None
+    return total_bytes // mib_bytes
+
+try:
+    payload = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    sys.exit(0)
+if not isinstance(payload, dict):
+    sys.exit(0)
+items = payload.get("items") or []
+if not isinstance(items, list):
+    sys.exit(0)
+
+for cr in items:
+    if not isinstance(cr, dict):
+        continue
+    name = ((cr.get("metadata") or {}).get("name")) or default_cr_name
+    spec = cr.get("spec") or {}
+    deployment = spec.get("deployment") or {}
+    resources = deployment.get("resources") or {}
+    admission = ((spec.get("harness") or {}).get("tuning") or {}).get("admission") or {}
+    if not isinstance(admission, dict):
+        continue
+
+    try:
+        rss_cap_mib = default_rss_cap_mib if admission.get("workerRssCapMiB") is None else int(admission["workerRssCapMiB"])
+        explicit_budget = None if admission.get("memoryBudgetMiB") is None else int(admission["memoryBudgetMiB"])
+    except (TypeError, ValueError):
+        continue
+
+    req_mem = (resources.get("requests") or {}).get("memory")
+    lim_mem = (resources.get("limits") or {}).get("memory")
+    req_mib = parse_mib(str(req_mem)) if req_mem is not None else None
+    lim_mib = parse_mib(str(lim_mem)) if lim_mem is not None else None
+    if req_mib is not None:
+        res_budget_mib = max(budget_floor_mib, req_mib)
+        res_source_desc = f"spec.deployment.resources.requests.memory={req_mem}"
+    elif lim_mib is not None:
+        res_budget_mib = max(budget_floor_mib, lim_mib)
+        res_source_desc = f"spec.deployment.resources.limits.memory={lim_mem}"
+    else:
+        res_budget_mib = default_budget_mib
+        res_source_desc = f"default memoryBudgetMiB={default_budget_mib}"
+
+    if explicit_budget is not None:
+        budget_mib = explicit_budget
+        budget_source = "admission"
+        source_desc = f"spec.harness.tuning.admission.memoryBudgetMiB={budget_mib}"
+    else:
+        budget_mib = res_budget_mib
+        budget_source = "resources" if (req_mib is not None or lim_mib is not None) else "default"
+        source_desc = res_source_desc
+
+    if budget_mib < rss_cap_mib:
+        if budget_mib < default_rss_cap_mib:
+            blame = budget_source
+        elif budget_source == "admission":
+            blame = "cap-explicit-budget"
+        else:
+            blame = "cap"
+        if blame == "resources":
+            can_clear_override = default_budget_mib >= rss_cap_mib
+        else:
+            can_clear_override = res_budget_mib >= rss_cap_mib
+        has_admission = bool(admission)
+        print(f"{name}\t{budget_mib}\t{rss_cap_mib}\t{source_desc}\t{blame}\t{str(can_clear_override).lower()}\t{str(has_admission).lower()}")
+' "$ADMISSION_DEFAULT_MEMORY_BUDGET_MIB" "$ADMISSION_DEFAULT_WORKER_RSS_CAP_MIB" "$ADMISSION_MEMORY_BUDGET_FLOOR_MIB" "$DEFAULT_PLATFORM_AGENT_CR_NAME" "$ADMISSION_BYTES_PER_MIB" "$ADMISSION_QTY_RE" "$ADMISSION_QTY_BIN_BASE" "$ADMISSION_QTY_DEC_BASE" "$ADMISSION_QTY_MILLI_SCALE" "$ADMISSION_BIN_SUFFIXES" "$ADMISSION_DEC_SUFFIXES" "$ADMISSION_DEC_UPPER_K" "$ADMISSION_MILLI_SUFFIX" 2>/dev/null)" || return 0
+
+  [ -n "$findings" ] || return 0
+
+  local cr_name budget_mib cap_mib source blame can_clear_override has_admission
+  while IFS=$'\t' read -r cr_name budget_mib cap_mib source blame can_clear_override has_admission; do
+    [ -n "$cr_name" ] || continue
+    print_warning "PlatformAgent '${cr_name}' in '${namespace}' resolves kanban.admission to memoryBudgetMiB=${budget_mib}MiB < workerRssCapMiB=${cap_mib}MiB (${source}), so a single worker's RSS cap exceeds the pod's admission budget."
+    case "$blame" in
+      resources)
+        if [ "$can_clear_override" = "true" ]; then
+          print_info "Note: spec.deployment.resources has no Helm chart value, so Helm/Terraform upgrades preserve CR overrides untouched. Raise memory under spec.deployment.resources to at least ${cap_mib}Mi (or clear the sub-cap memory override, set spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib}, or lower workerRssCapMiB to at most ${budget_mib}) via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        else
+          print_info "Note: spec.deployment.resources has no Helm chart value, so Helm/Terraform upgrades preserve CR overrides untouched. Raise memory under spec.deployment.resources to at least ${cap_mib}Mi (or set spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib}, or lower workerRssCapMiB to at most ${budget_mib}) via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        fi
+        ;;
+      admission)
+        if [ "$can_clear_override" = "true" ]; then
+          print_info "Remediation: raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} (or clear it to follow container memory request), or lower workerRssCapMiB to at most ${budget_mib} via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        else
+          print_info "Remediation: raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} (and raise spec.deployment.resources memory to at least ${cap_mib}Mi if you want to clear admission), or lower workerRssCapMiB to at most ${budget_mib} via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        fi
+        ;;
+      cap-explicit-budget)
+        if [ "$can_clear_override" = "true" ]; then
+          print_info "Remediation: lower spec.harness.tuning.admission.workerRssCapMiB to at most ${budget_mib}, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} (or clear it to follow container memory request) via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        else
+          print_info "Remediation: lower spec.harness.tuning.admission.workerRssCapMiB to at most ${budget_mib}, or raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib} via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        fi
+        ;;
+      *)
+        print_info "Remediation: lower spec.harness.tuning.admission.workerRssCapMiB to at most ${budget_mib}, raise spec.harness.tuning.admission.memoryBudgetMiB to at least ${cap_mib}, or set spec.deployment.resources memory to at least ${cap_mib}Mi via kubectl edit platformagent ${cr_name} -n ${namespace}."
+        ;;
+    esac
+    if [ "$blame" != "resources" ] || [ "$has_admission" = "true" ]; then
+      print_info "If platformAgent.harness.tuning.admission was set in Helm values or TF_VAR_extra_helm_values, update those values too (e.g., in install.env before --upgrade-mode=full; operator and harness modes replay recorded release values) so the upgrade does not fail template rendering or re-apply the old values."
+    fi
+  done <<< "$findings"
+}
+
 # Refuses a move that leaves behind a commit marked as a breaking change, naming
 # each one. A move is forward only when the installed commit is an ancestor of
 # the target; any other move between related commits leaves behind what the
@@ -1502,6 +1697,15 @@ parse_args() {
       --gcp-region) PARAM_REGION="$2"; shift 2 ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
+      --sizing-profile=*)
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE="${1#*=}"
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"
+        shift ;;
+      --sizing-profile)
+        [ $# -ge 2 ] || { print_error "--sizing-profile requires a value (auto | small | medium | fleet)."; return 2; }
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE="$2"
+        PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"
+        shift 2 ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; IMAGE_TAG_DEFAULTED_FROM_BAKED="false"; shift ;;
       --image-tag) PARAM_IMAGE_TAG="$2"; IMAGE_TAG_DEFAULTED_FROM_BAKED="false"; shift 2 ;;
       --help|-h) show_help; exit 0 ;;
@@ -1767,6 +1971,10 @@ main() {
     print_error "--drop-undeclared-values applies to --upgrade-mode=operator and harness, which reuse the release's recorded values. A full upgrade renders them from install.env."
     exit 1
   fi
+  if [ "$PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "operator" ]; then
+    print_error "--sizing-profile does not apply to --upgrade-mode=operator (operator mode only applies CRDs and re-tags the operator image). Use --upgrade-mode=full or --upgrade-mode=harness."
+    exit 1
+  fi
 
   if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
     print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."
@@ -1840,6 +2048,7 @@ main() {
   # the caller's shell exports REGION=europe-west1 would make the cross-check
   # below blame install.env for a value the file never recorded.
   unset PROJECT_ID CLUSTER_NAME REGION
+  unset PROJECT_NUMBER
   if load_install_env "$install_env_file"; then
     print_success "Loaded install configuration from: ${install_env_file}"
   else
@@ -1868,6 +2077,39 @@ main() {
   # the chart and the generator read. Derived here, after the load and before
   # anything reads it.
   normalize_memory_vars
+  _upgrade_validate_sizing_profile() {
+    local val="${1:-}" item
+    if declare -F is_valid_platform_agent_sizing_profile >/dev/null; then
+      is_valid_platform_agent_sizing_profile "$val"
+      return $?
+    fi
+    for item in $UPGRADE_SIZING_PROFILE_VALUES; do
+      [ "$val" = "$item" ] && return 0
+    done
+    return 1
+  }
+
+  local sizing_profile_explicit="false"
+  local file_sizing_profile="${PLATFORM_AGENT_SIZING_PROFILE:-}"
+  if [ -n "$file_sizing_profile" ] || [ "$PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED" = "true" ]; then
+    sizing_profile_explicit="true"
+  fi
+  if [ "$PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED" = "true" ]; then
+    if ! _upgrade_validate_sizing_profile "${PARAM_PLATFORM_AGENT_SIZING_PROFILE:-}"; then
+      print_error "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE:-}' is not valid; use ${UPGRADE_SIZING_PROFILE_CHOICES}."
+      exit 1
+    fi
+    local default_profile="${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$PLATFORM_AGENT_SIZING_PROFILE_DEFAULT}"
+    if [ -n "$file_sizing_profile" ] && [ "$file_sizing_profile" != "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" ]; then
+      print_warning "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' overrides PLATFORM_AGENT_SIZING_PROFILE='${file_sizing_profile}' in ${install_env_file:-install.env} for this run only; update ${install_env_file:-install.env} so future upgrades keep it."
+    elif [ -z "$file_sizing_profile" ] && [ "$PARAM_PLATFORM_AGENT_SIZING_PROFILE" != "$default_profile" ]; then
+      print_warning "--sizing-profile='${PARAM_PLATFORM_AGENT_SIZING_PROFILE}' applies for this run only (${install_env_file:-install.env} has no PLATFORM_AGENT_SIZING_PROFILE, so future upgrades default to '${default_profile}')."
+    fi
+    export PLATFORM_AGENT_SIZING_PROFILE="$PARAM_PLATFORM_AGENT_SIZING_PROFILE"
+  elif [ -n "$file_sizing_profile" ] && ! _upgrade_validate_sizing_profile "$file_sizing_profile"; then
+    print_error "PLATFORM_AGENT_SIZING_PROFILE='${file_sizing_profile}' in ${install_env_file:-install.env} is not valid; use ${UPGRADE_SIZING_PROFILE_CHOICES}."
+    exit 1
+  fi
   # A GITHUB_APP_ID that is a name rather than the App's number leaves the
   # token minter crash-looping behind Helm's rollout wait (#3076); refused here,
   # --dry-run included. Guarded: an older target's helpers lack it.
@@ -1934,6 +2176,11 @@ main() {
     print_step "2. Dry-Run Upgrade Plan Preview"
     echo -e "  • ${C_CYAN}Action:${C_RESET} Perform ${PARAM_UPGRADE_MODE} upgrade on cluster '${target_cluster}'"
     echo -e "  • ${C_CYAN}Image Overrides:${C_RESET} ${REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}/*:${PARAM_IMAGE_TAG}"
+    local dry_run_profile="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$PLATFORM_AGENT_SIZING_PROFILE_DEFAULT}}"
+    if [ "${PARAM_UPGRADE_MODE:-full}" = "operator" ]; then
+      dry_run_profile="${dry_run_profile} (not applied in --upgrade-mode=operator)"
+    fi
+    echo -e "  • ${C_CYAN}Runtime Sizing Profile:${C_RESET} ${dry_run_profile}"
     echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate SESSION_KV_API_KEY / SESSION_KV_SALT into '${PLATFORM_AGENT_SECRET}' only if absent (existing values are never rewritten)"
     echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate the shell sandbox SSH keypair into '${PLATFORM_AGENT_SECRET}' and '${PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET}' only if absent"
     write_report "DRY_RUN_COMPLETE"
@@ -2070,7 +2317,7 @@ main() {
     done
     printf '%s\n' "$RETAG_VALUES_JSON" | helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
       --namespace "$target_namespace" --reset-values --values - \
-      "${set_args[@]}" --wait --timeout 10m
+      "${set_args[@]}" ${HARNESS_EXTRA_SET_ARGS[@]+"${HARNESS_EXTRA_SET_ARGS[@]}"} --wait --timeout 10m
   }
 
   # The release guard runs before the tfvars generation on purpose: a
@@ -2112,6 +2359,24 @@ main() {
     KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
     KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"
+
+  warn_live_cr_kanban_admission "$target_namespace"
+
+  if command -v gcloud >/dev/null 2>&1; then
+    local resolved_project_number=""
+    resolved_project_number="$(trap - ERR; gcloud projects describe "$target_project" --format='value(projectNumber)' 2>/dev/null || true)"
+    [ -z "$resolved_project_number" ] || export PROJECT_NUMBER="$resolved_project_number"
+  fi
+  if declare -F report_cluster_sizing_guidance >/dev/null; then
+    report_cluster_sizing_guidance "${SIZING_SCAN_CONTEXT_UPGRADE:-upgrade}" "$target_project" "${TFVARS_CLUSTER_MODE:-}" "false"
+  fi
+  local effective_operator_sizing="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$PLATFORM_AGENT_SIZING_PROFILE_DEFAULT}}"
+  if [ "$PARAM_UPGRADE_MODE" = "operator" ] && [ -n "$effective_operator_sizing" ]; then
+    if { [ -n "${LIVE_CR_SIZING_PROFILE:-}" ] && [ "${LIVE_CR_SIZING_PROFILE}" != "$effective_operator_sizing" ]; } || \
+       { [ "${LIVE_CR_PRESENT:-false}" = "true" ] && [ -z "${LIVE_CR_SIZING_PROFILE:-}" ]; }; then
+      print_info "Note: --upgrade-mode=operator only applies CRDs and re-tags the operator image; run --upgrade-mode=harness or --upgrade-mode=full to apply spec.deployment.sizingProfile='${effective_operator_sizing}'."
+    fi
+  fi
 
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"
@@ -2208,6 +2473,72 @@ main() {
       # calls, not substitutions: a failed read stops the run here, once, with
       # its own message shown.
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      HARNESS_EXTRA_SET_ARGS=()
+      local existing_retag_sizing crd_sizing_rc=0 target_harness_sizing schema_file schema_has_sizing="true" crd_name="${PLATFORM_AGENT_CRD_NAME:-$UPGRADE_PLATFORM_AGENT_CRD_NAME}"
+      existing_retag_sizing="$(jq -r "$RETAG_SIZING_PROFILE_JQ" <<<"$RETAG_VALUES_JSON" 2>/dev/null || echo "")"
+      target_harness_sizing="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$PLATFORM_AGENT_SIZING_PROFILE_DEFAULT}}"
+      schema_file="${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      if [ -f "$schema_file" ] && ! jq -e "$SIZING_PROFILE_SCHEMA_JQ" "$schema_file" >/dev/null 2>&1; then
+        schema_has_sizing="false"
+      fi
+      if [ "$sizing_profile_explicit" = "true" ] || [ -z "$existing_retag_sizing" ]; then
+        if [ "$schema_has_sizing" != "true" ]; then
+          if [ "$sizing_profile_explicit" = "true" ]; then
+            print_error "Cannot apply sizingProfile='${target_harness_sizing}' in --upgrade-mode=harness: chart schema ${KUBE_AGENTS_VALUES_SCHEMA} does not declare platformAgent.deployment.sizingProfile."
+            print_info "Choose a target revision that declares platformAgent.deployment.sizingProfile, or drop PLATFORM_AGENT_SIZING_PROFILE for this rollback."
+            exit 1
+          fi
+          print_warning "Chart schema ${KUBE_AGENTS_VALUES_SCHEMA} does not declare platformAgent.deployment.sizingProfile; leaving sizingProfile unset in --upgrade-mode=harness."
+        else
+          if declare -F crd_supports_platform_agent_sizing_profile >/dev/null; then
+            crd_supports_platform_agent_sizing_profile || crd_sizing_rc=$?
+          else
+            # Target checkouts older than #6470 lack crd_supports_platform_agent_sizing_profile in
+            # installer_common.sh; probe the live CRD inline so supported profiles still apply and
+            # legacy CRDs still warn or refuse.
+            crd_sizing_rc="$UPGRADE_CRD_PROBE_UNREADABLE_RC"
+            if command -v kubectl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+              local _crd_ctx_args=() _crd_ctx="" _crd_json="" _crd_ctx_ok="true"
+              if [ -n "${PROJECT_ID:-}" ] && [ -n "${REGION:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
+                if declare -F gke_context_name >/dev/null; then
+                  _crd_ctx="$(gke_context_name)"
+                else
+                  _crd_ctx="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
+                fi
+                if kubectl config get-contexts "$_crd_ctx" >/dev/null 2>&1; then
+                  _crd_ctx_args=(--context "$_crd_ctx")
+                else
+                  _crd_ctx_ok="false"
+                fi
+              fi
+              if [ "$_crd_ctx_ok" = "true" ] && _crd_json="$(trap - ERR; kubectl ${_crd_ctx_args[@]+"${_crd_ctx_args[@]}"} get crd "$crd_name" -o json --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT:-$UPGRADE_KUBECTL_PROBE_TIMEOUT}" 2>/dev/null)" && [ -n "$_crd_json" ]; then
+                if printf '%s' "$_crd_json" | jq -e "${CRD_SIZING_PROFILE_JQ:-$UPGRADE_CRD_SIZING_PROFILE_JQ}" >/dev/null 2>&1; then
+                  crd_sizing_rc=0
+                else
+                  crd_sizing_rc=1
+                fi
+              fi
+            fi
+          fi
+          if [ "$crd_sizing_rc" -eq 0 ]; then
+            HARNESS_EXTRA_SET_ARGS=(--set "platformAgent.deployment.sizingProfile=${target_harness_sizing}")
+          elif [ "$crd_sizing_rc" -eq 1 ]; then
+            if [ "$sizing_profile_explicit" = "true" ]; then
+              print_error "Cannot apply sizingProfile='${target_harness_sizing}' in --upgrade-mode=harness: the installed PlatformAgent CRD predates spec.deployment.sizingProfile."
+              print_info "Run ./upgrade.sh --upgrade-mode=operator or ./upgrade.sh --upgrade-mode=full to apply the updated CRDs first."
+              exit 1
+            fi
+            print_warning "Installed PlatformAgent CRD predates spec.deployment.sizingProfile; run ./upgrade.sh --upgrade-mode=operator or --upgrade-mode=full to update CRDs and wire sizingProfile='${target_harness_sizing}'."
+          else
+            if [ "$sizing_profile_explicit" = "true" ]; then
+              print_error "Cannot verify whether the installed PlatformAgent CRD supports spec.deployment.sizingProfile to apply '${target_harness_sizing}' in --upgrade-mode=harness."
+              print_info "Ensure kubectl can read CRD ${crd_name} (and its GKE context exists), or run ./upgrade.sh --upgrade-mode=operator or --upgrade-mode=full."
+              exit 1
+            fi
+            print_warning "Could not probe installed PlatformAgent CRD for spec.deployment.sizingProfile (leaving recorded sizingProfile unchanged); ensure cluster CRD access or run --upgrade-mode=operator or --upgrade-mode=full."
+          fi
+        fi
+      fi
       harness_retag_keys "$RETAG_VALUES_JSON"
       # After the reads, not before them: they are the last things this arm
       # does that can fail without having changed anything.
@@ -2363,8 +2694,8 @@ main() {
   # file that names none renders the default, which the helper must be handed,
   # since the generator keeps it local.
   if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
-    local project_number=""
-    if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    local project_number="${PROJECT_NUMBER:-}"
+    if [ -z "$project_number" ] && is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
       project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
     fi
     CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \

@@ -349,6 +349,57 @@ class RegistrationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             recheck.narrowed_cluster_check("no-pdb", "pdbs")
 
+    def test_the_no_pdb_recheck_comes_from_its_recipe_with_the_same_kinds_and_steps(self):
+        spec = recheck.RECHECKS["no-pdb"]
+        self.assertEqual(
+            spec.kinds, "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers"
+        )
+        # Find the target, run no-pdb, then each sibling behind its selecting step.
+        self.assertEqual(len(spec.steps), 6)
+        self.assertEqual(
+            [spec.steps[i] for i in (0, 2, 4)],
+            [recheck.in_scope_workload, recheck.select_target_workload, recheck.select_budgets],
+        )
+        self.assertEqual(sorted(recheck.RECHECKS), ["no-pdb"])
+
+    def test_a_recipe_builds_its_steps_and_an_unknown_sibling_fails(self):
+        full = "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers"
+        recipe = recheck.registry.Recipe("no-pdb", "n", "t", "dev", recheck_kinds=full)
+        self.assertEqual(len(recheck.recheck_for(recipe).steps), 2)
+        with self.assertRaises(KeyError):
+            recheck.recheck_for(recipe._replace(recheck_siblings="no-such-sibling"))
+        # The recipe's own check refuses a read missing what it looks up (the
+        # budgets) or a workload kind its target could be.
+        for missing in ("deployments", "statefulsets", "daemonsets", "poddisruptionbudgets"):
+            kinds = ",".join(k for k in full.split(",") if k != missing)
+            with self.subTest(own_check=True, missing=missing), \
+                    self.assertRaisesRegex(ValueError, rf"^no-pdb needs {missing}\b"):
+                recheck.recheck_for(recipe._replace(recheck_kinds=kinds))
+        with self.assertRaises(ValueError):
+            recheck.recheck_for(recipe._replace(recheck_kinds="deployments"))
+        # A check that has not declared what it reads cannot be re-checked yet.
+        with self.assertRaises(KeyError):
+            recheck.recheck_for(recipe._replace(kind="hpa-floors-at-one"))
+        # Each PDB sibling refuses a read missing any kind it counts: the
+        # autoscaler floor, and every workload kind a budget can select (a
+        # DaemonSet under the budget makes it unscalable). The own check's needs
+        # are emptied so each case reaches the sibling's own refusal.
+        sibling_needs = (
+            ("blocking-pdb", ("deployments", "statefulsets", "daemonsets", "poddisruptionbudgets",
+                              "horizontalpodautoscalers")),
+            ("pdb-overlapping", ("deployments", "statefulsets", "daemonsets", "poddisruptionbudgets")),
+        )
+        with mock.patch.dict(recheck.CHECK_NEEDS, {"no-pdb": frozenset()}):
+            for sibling, required in sibling_needs:
+                for missing in required:
+                    kinds = ",".join(k for k in full.split(",") if k != missing)
+                    with self.subTest(sibling=sibling, missing=missing), \
+                            self.assertRaisesRegex(ValueError, rf"^no-pdb: {sibling} needs {missing}\b"):
+                        recheck.recheck_for(recipe._replace(recheck_kinds=kinds, recheck_siblings=sibling))
+        # A group-qualified name reads the same kind.
+        qualified = full.replace("poddisruptionbudgets", "poddisruptionbudgets.policy")
+        recheck.recheck_for(recipe._replace(recheck_kinds=qualified, recheck_siblings="blocking-pdb pdb-overlapping"))
+
     def test_a_workload_step_runs_the_collectors_function_for_that_id(self):
         # The step is the collector's CheckSpec, not a copy of it.
         spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb")

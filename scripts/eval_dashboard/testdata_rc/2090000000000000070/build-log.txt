@@ -1,0 +1,240 @@
+=== [2025-09-11T03:35:40Z] Connectivity Smoke Test Passed (Duration: 53s) ===
+=== [2025-09-11T03:35:40Z] Resolving the release candidate to measure ===
+ℹ️ Note: staging_2609092307_0707070 (0707070) already carries a validation marker; measuring it again.
+======================================================================
+🏷️ RELEASE CANDIDATE EVAL TARGET
+Release Tag:    staging_2609092307_0707070
+Commit SHA:     0707070707070707070707070707070707070707
+Images:         ghcr.io/gke-labs/kube-agents/<image>:0707070707070707070707070707070707070707
+======================================================================
+=== [2025-09-11T03:35:49Z] Checking out staging_2609092307_0707070 (0707070); this tree was heads/staging_2609092307_0707070 ===
+HEAD is now at 0707070 fix: an invented subject (#107)
+=== [2025-09-11T03:35:49Z] Deploying release candidate 0707070 ===
+Installed helm v3.21.4 (amd64) to /tmp/kube-agents-helm-v3.21.4-amd64
+heartbeat sent for resource "kube-agents-evals-10"
+✓ Successfully leased project: kube-agents-evals-10
+EVAL_TIER=nightly: 8 nightly-only task(s) join the matrix, 26 tasks total
+>>> [2025-09-11T07:49:37Z] Grading Task: case-02 (./tasks/case-02/task.yaml) x3 <<<
+Task case-02 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:37Z] Grading Task: case-16 (./tasks/case-16/task.yaml) x3 <<<
+Task case-16 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:37Z] Grading Task: case-29 (./tasks/case-29/task.yaml) x3 <<<
+Task case-29 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:38Z] Grading Task: case-27 (./tasks/case-27/task.yaml) x3 <<<
+Task case-27 Result: [UNSTABLE] passed 2 of 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.4 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.4 OutcomeValidity=0.55 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:38Z] Grading Task: case-13 (./tasks/case-13/task.yaml) x3 <<<
+Task case-13 Result: [UNSTABLE] passed 2 of 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:38Z] Grading Task: case-01 (./tasks/case-01/task.yaml) x3 <<<
+Task case-01 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:38Z] Grading Task: case-12 (./tasks/case-12/task.yaml) x3 <<<
+Task case-12 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:39Z] Grading Task: case-22 (./tasks/case-22/task.yaml) x3 <<<
+Task case-22 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:39Z] Grading Task: case-21 (./tasks/case-21/task.yaml) x3 <<<
+Task case-21 Result: [UNSTABLE] passed 1 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent; check-2: none of the alternative phrasings is present [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent; check-2: none of the alternative phrasings is present [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:39Z] Grading Task: case-03 (./tasks/case-03/task.yaml) x3 <<<
+Task case-03 Result: [UNSTABLE] passed 0 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:39Z] Grading Task: case-35 (./tasks/case-35/task.yaml) x3 <<<
+Task case-35 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:40Z] Grading Task: case-23 (./tasks/case-23/task.yaml) x3 <<<
+Task case-23 Result: [UNSTABLE] passed 1 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent; check-2: none of the alternative phrasings is present [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent; check-2: none of the alternative phrasings is present [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:40Z] Grading Task: case-09 (./tasks/case-09/task.yaml) x3 <<<
+Task case-09 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:40Z] Grading Task: case-19 (./tasks/case-19/task.yaml) x3 <<<
+Task case-19 Result: [UNSTABLE] passed 2 of 3 repetitions
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:41Z] Grading Task: case-14 (./tasks/case-14/task.yaml) x3 <<<
+Task case-14 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:41Z] Grading Task: case-18 (./tasks/case-18/task.yaml) x3 <<<
+Task case-18 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:41Z] Grading Task: case-30 (./tasks/case-30/task.yaml) x3 <<<
+Task case-30 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:41Z] Grading Task: case-24 (./tasks/case-24/task.yaml) x3 <<<
+Task case-24 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.55]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.55]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.55]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2025-09-11T07:49:42Z] Grading Task: case-26 (./tasks/case-26/task.yaml) x3 <<<
+Task case-26 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:42Z] Grading Task: case-34 (./tasks/case-34/task.yaml) x3 <<<
+Task case-34 Result: [UNSTABLE] passed 0 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.4 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.4 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.4 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.4 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-2: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-3: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:42Z] Grading Task: case-06 (./tasks/case-06/task.yaml) x3 <<<
+Task case-06 Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.6 (floor 1.0) -- check-1: the required phrase is absent [OutcomeScore=0.6 OutcomeValidity=0.25 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:43Z] Grading Task: case-15 (./tasks/case-15/task.yaml) x3 <<<
+Task case-15 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.25 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:43Z] Grading Task: case-11 (./tasks/case-11/task.yaml) x3 <<<
+Task case-11 Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-2: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-3: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:43Z] Grading Task: case-05 (./tasks/case-05/task.yaml) x3 <<<
+Task case-05 Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: tofu
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the required phrase is absent; check-2: none of the alternative phrasings is present [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-11T07:49:43Z] Grading Task: case-25 (./tasks/case-25/task.yaml) x3 <<<
+Task case-25 Result: [RESOURCE_PREPARATION_FAILED] all 3 repetition(s) failed on infrastructure before the case could be evaluated
+  deployer: tofu
+  rep 1: infra -- the run died provisioning, before any agent ran (command failed with exit code 1: tofu apply -auto-approve -input=false); deployer=tofu had infrastructure to fail on, so this is resource preparation, not the pull request
+  rep 2: infra -- the run died provisioning, before any agent ran (command failed with exit code 1: tofu apply -auto-approve -input=false); deployer=tofu had infrastructure to fail on, so this is resource preparation, not the pull request
+  rep 3: infra -- the run died provisioning, before any agent ran (command failed with exit code 1: tofu apply -auto-approve -input=false); deployer=tofu had infrastructure to fail on, so this is resource preparation, not the pull request
+  admission: the run carries no version key, so no baseline matches it
+>>> [2025-09-11T07:49:44Z] Grading Task: case-33 (./tasks/case-33/task.yaml) x3 <<<
+Task case-33 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+Release-candidate run (RC_COMMIT_SHA=0707070707070707070707070707070707070707): the baseline store is read, never written — the candidate is judged against main's window, not added to it.
+## Evaluation verdict
+**GREEN**
+Admitted-case pass rate: 88.0% (no baseline at the current version key -- advisory)
+| Case | Domain | Verdict | Passes | Detail |
+| --- | --- | --- | --- | --- |
+| `case-02` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-16` | capacity | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-29` | security | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-27` | upgrades | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions |
+| `case-13` | consistency | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions |
+| `case-01` | cost | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-12` | security | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-22` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-21` | reliability | UNSTABLE (rung 7) | 1/3 | passed 1 of 3 repetitions (not admitted, so it cannot collapse) |
+| `case-03` | reliability | UNSTABLE (rung 7) | 0/3 | passed 0 of 3 repetitions (not admitted, so it cannot collapse) |
+| `case-35` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-23` | remediation | UNSTABLE (rung 7) | 1/3 | passed 1 of 3 repetitions (not admitted, so it cannot collapse) |
+| `case-09` | fleet-audits | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-19` | cluster-debugging | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions |
+| `case-14` | cluster-debugging | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-18` | cluster-debugging | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-30` | cluster-debugging | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-24` | chat-and-routing | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-26` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-34` | capacity | UNSTABLE (rung 7) | 0/3 | passed 0 of 3 repetitions (not admitted, so it cannot collapse) |
+| `case-06` | upgrades | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions (not admitted, so it cannot collapse) |
+| `case-15` | consistency | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `case-11` | reliability | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions (not admitted, so it cannot collapse) |
+| `case-05` | -- | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions (not admitted, so it cannot collapse) |
+| `case-25` | incident-triage | RESOURCE_PREPARATION_FAILED (rung 99) | 0/0 | all 3 repetition(s) failed on infrastructure before the case could be evaluated |
+| `case-33` | -- | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+=== [2025-09-11T07:49:44Z] PR Smoke Test Evaluation Succeeded (Total Duration: 10554s) ===
+eval-dashboard publish skipped: RC_COMMIT_SHA=0707070707070707070707070707070707070707 is set: a release-candidate run measures a candidate, it does not report main's history
+======================================================================
+🏷️ RELEASE CANDIDATE EVAL
+Candidate:   staging_2609092307_0707070 (0707070707070707070707070707070707070707)
+Tier:        nightly
+Verdict:     GREEN (advisory: this lane gates nothing)
+Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2090000000000000070
+======================================================================
+rc eval summary: /logs/artifacts/rc-eval-summary.md

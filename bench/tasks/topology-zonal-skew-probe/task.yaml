@@ -14,9 +14,10 @@
 #     leeway: `volume_pinning`, `storage_topology`. Fix is storage, not a
 #     spread edit.
 #   - `zonal-skew-capacity` (`deployment/capacity-starved-worker`): four 500m
-#     replicas under a `DoNotSchedule` spread; the running ones sit in the
-#     second zone and the rest are Pending for CPU because `first-zone-sponge`
-#     fills the first zone's e2-small. leeway: `domain_capacity_shortfall`,
+#     replicas under a `ScheduleAnyway` spread; the running ones sit in the
+#     second zone and the rest are Pending for CPU because GKE's own pods and
+#     `first-zone-sponge` leave the first zone's e2-small under one worker's
+#     worth of free CPU. leeway: `domain_capacity_shortfall`,
 #     `cluster_capacity`. Fix is capacity or sizing, not a spread edit.
 #   - the same role's `deployment/first-zone-sponge`: six replicas pinned by
 #     `nodeSelector` to `default-pool`, which has nodes in the first zone only.
@@ -26,6 +27,12 @@
 #     confirms the single-zone pool via `kubectl get nodes` either way.
 #     Fix is the node pool; widening the affinity or adding a spread
 #     constraint leaves pods Pending.
+#     Fewer of the six may run than it asks for: GKE's own pods on the first
+#     zone's e2-small leave room for anywhere from none of them to all six,
+#     the rest Pending. The prompt counts a workload as multi-replica by the
+#     replicas it asks for, not the ones running, and keeps one with none
+#     running in scope (`running there: 0/0`), so the sponge is declared
+#     however many run.
 #
 # What the case grades, and why it is shaped this way (review rounds 1-4 on
 # #3419): the prompt names the namespace and the output grammar and nothing
@@ -59,8 +66,11 @@ name: Topology drift analysis attributes four single-zone concentrations to four
 prompt: >-
   One of our clusters is multi-zonal: its nodes span two zones. Analyze the
   topology distribution of the multi-replica workloads in its
-  `seeded-topology` namespace. For every workload whose running replicas all
-  sit in one zone, report the per-zone running pod distribution, attribute
+  `seeded-topology` namespace. A workload is multi-replica when it asks for
+  more than one replica, however many are running; one with none running is
+  in scope too, and its line names the zone its pods are confined to with
+  `running there: 0/0`. For every workload whose running replicas all sit in one
+  zone, report the per-zone running pod distribution, attribute
   the root cause of the concentration, and state the appropriate remediation
   category. Conclude with one summary line per such workload in the exact
   form:
@@ -145,6 +155,11 @@ verification_spec:
         - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowed ?topolog|persistent ?volume|pvc|storage ?class|zonal (?:pd|disk|volume)|volume[_ -]pinning)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
         - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|node-pool)\b'
+  # The capacity evidence names the shortage: the scheduler's words for it
+  # (Pending, FailedScheduling, Insufficient cpu), leeway's cause, or the CPU
+  # arithmetic itself, CPU beside "allocated" or "allocatable", as an agent
+  # that read the node's allocated CPU writes it. A request or "free" alone
+  # is not a shortage, and passes nothing.
   - name: report-attributes-capacity-skew
     role: objective
     mode: assert
@@ -157,7 +172,7 @@ verification_spec:
         - "capacity-starved-worker"
         - "Pending"
       any_of_patterns:
-        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|failedscheduling|capacity[_ -]shortfall)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|failedscheduling|capacity[_ -]shortfall|\bv?cpus?\b[^\n;]*\ballocat\w*|\ballocat\w*[^\n;]*\bv?cpus?\b)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
         - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume|node-pool)\b'
   # The single-zone node-pool case (`selector_confined` under

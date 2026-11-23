@@ -623,7 +623,7 @@ class StandaloneRelaySendTest(unittest.TestCase):
                 raise result
             return FakeHTTPResponse({"response": result})
 
-        return captured, mock.patch("urllib.request.urlopen", side_effect=fake_urlopen)
+        return captured, mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen)
 
     def _send(self, entry, message="alert", **kwargs):
         return asyncio.run(
@@ -755,7 +755,7 @@ class StandaloneRelaySendTest(unittest.TestCase):
             callers.append(threading.current_thread())
             return FakeHTTPResponse({"response": {"name": "spaces/AAA/messages/m"}})
 
-        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=fake_urlopen):
             self._send(entry)
 
         self.assertEqual(1, len(callers))

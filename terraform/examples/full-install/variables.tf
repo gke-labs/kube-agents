@@ -156,6 +156,12 @@ variable "namespace" {
   default     = "kubeagents-system"
 }
 
+variable "card_stop_enabled" {
+  description = "Whether a chat `stop`, or Slack's Stop button, also stops the kanban cards the conversation filed: the chart's operator.cardStop.enabled, which sets A2A_CARD_STOP=true on the operator for the A2A gateway. Off by default; it needs a hermes-bridge sidecar and agent image that answer the stop."
+  type        = bool
+  default     = false
+}
+
 variable "helm_upgrade_install" {
   description = "Install the kube-agents release with `helm upgrade --install` semantics (opt-in), so an apply whose state lost a live release adopts it instead of failing with \"cannot re-use a name that is still in use\" (#4108). It also silently takes over a release of the same name that another Terraform state or a manual `helm install` owns in the namespace, so set it only on a long-lived environment whose own state owns the release."
   type        = bool
@@ -660,6 +666,16 @@ variable "google_chat_home_channel" {
   default     = ""
 }
 
+variable "google_chat_home_channel_policy" {
+  description = "\"auto\" (also empty) or \"manual\". With google_chat_home_channel empty, \"auto\" lets the A2A gateway make the space of the first top-level mention of the agent in a named space the home channel; \"manual\" leaves google_chat_home_channel alone to decide. A set google_chat_home_channel wins under either. Only used when enable_google_chat is true."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "auto", "manual"], var.google_chat_home_channel_policy)
+    error_message = "google_chat_home_channel_policy must be \"\", \"auto\" or \"manual\"."
+  }
+}
+
 variable "google_chat_mode" {
   description = "Google Chat output verbosity: 'default' (quiet) or 'debug' (surfaces tool progress, memory reviews, and approval cards). Mirrors GOOGLE_CHAT_MODE."
   type        = string
@@ -1095,6 +1111,18 @@ variable "platform_agent_storage_size" {
   validation {
     condition     = try(tonumber(regex("^[0-9]+", var.platform_agent_storage_size)) * lookup({ Mi = 1, Gi = 1024, Ti = 1048576 }, regex("[MGT]i$", var.platform_agent_storage_size)) <= 67108864, true)
     error_message = "platform_agent_storage_size must be at most 64Ti, the largest persistent disk size."
+  }
+}
+
+variable "platform_agent_sizing_profile" {
+  description = "The PlatformAgent's spec.deployment.sizingProfile preset: \"small\", \"medium\", \"fleet\", \"auto\" (promotes at 10 and 25 clusters under namespace ResourceQuota and LimitRange admission checks), or \"\" (passes nothing, which leaves small in effect). Default is \"auto\" so Terraform- and installer-managed installs scale runtime pods automatically as clusters grow. Separate from var.sizing_profile, which sizes Standard node pools. Mirrors PLATFORM_AGENT_SIZING_PROFILE in install.env, and its default is DEFAULT_PLATFORM_AGENT_SIZING_PROFILE in install.defaults.env."
+  type        = string
+  default     = "auto"
+  nullable    = false
+
+  validation {
+    condition     = var.platform_agent_sizing_profile == "" || contains(["small", "medium", "fleet", "auto"], var.platform_agent_sizing_profile)
+    error_message = "platform_agent_sizing_profile must be \"\", \"small\", \"medium\", \"fleet\", or \"auto\"."
   }
 }
 

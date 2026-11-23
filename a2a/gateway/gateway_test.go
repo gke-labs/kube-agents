@@ -1419,10 +1419,20 @@ func (s *fakeSpawner) setReusable(pods ...string) {
 	}
 }
 
+// SessionPods pads its list with keyless pods up to live, so a test that
+// sets only a count still drives the cap, whose count is the list's length.
+// A keyless pod is never an eviction candidate.
 func (s *fakeSpawner) SessionPods(context.Context) ([]sessionPod, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]sessionPod(nil), s.sessionPods...), nil
+	if s.liveErr != nil {
+		return nil, s.liveErr
+	}
+	out := append([]sessionPod(nil), s.sessionPods...)
+	for i := len(out); i < s.live; i++ {
+		out = append(out, sessionPod{PodName: fmt.Sprintf("fake-live-%d", i)})
+	}
+	return out, nil
 }
 
 func (s *fakeSpawner) setSessionPods(p ...sessionPod) {
@@ -2777,6 +2787,10 @@ func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
 		{slackBackend, "slack:dm/D1", false},
 		{slackBackend, "not-a-key", false},
 		{discordBackend, "discord:g1/thread-s1", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2;messageid=1794603936403", true},
+		{teamsBackend, "teams:a:1UxxASmI", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2", false},
+		{teamsBackend, "teams:19:group@thread.v2", false},
 	} {
 		if got := conversationIsOwnThread(c.backend, c.key); got != c.want {
 			t.Errorf("conversationIsOwnThread(%s, %s) = %v, want %v", c.backend, c.key, got, c.want)

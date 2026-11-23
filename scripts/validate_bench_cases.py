@@ -20,6 +20,14 @@ valid case is. A rule added here therefore gates the day it is written, with
 no second edit anywhere. The CLI runs in no workflow; the lint is what reds a
 pull request.
 
+One rule needs more than PyYAML: on a case that no other rule faults, each check
+entry is read and loaded with the harness's own YAML reader and parser, which
+are in the bench package (`make test-bench-deps`). Where that package is not installed, as
+in the lint's job, or is another checkout's, the rule does not run and the CLI says so on its
+last line;
+`bench/tests/test_case_entries_load.py` gates it in the job that installs the
+package.
+
 `docs/designs/bench-case-format.md` is the contract these rules enforce,
 `docs/designs/bench-fleet-catalog.md` the fixture half of it, and
 `bench/CONTRIBUTING.md` the submission path the `owner:` and sanitization rules
@@ -35,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import functools
 import importlib.util
 import ipaddress
 import json
@@ -74,6 +83,27 @@ REQUESTED_PULL_REQUESTS_KEY = "requested_pull_requests"
 REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 CHECK_CHILD_KEYS = ("checks", "check")
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# The harness refuses an entry that its parser (devops-bench's `parse_entries`) refuses, records
+# it in `verification_parse_errors`, and runs the case without it.
+UNLOADABLE_ENTRY = "the harness cannot load this entry and drops it at run time"
+PARSER_RAISED = "the harness's parser raises on this entry"
+HARNESS_CANNOT_READ = "the harness's YAML reader cannot read this file"
+FIELD_CHECK_SKIPPED = (
+    "bench-case-check: the field check did NOT run: the bench package is not installed here, so no "
+    "check entry was loaded with the harness's parser, and an entry with a field that its verifier "
+    "does not have passes. Install the package with `make test-bench-deps` and run this again."
+)
+# The rule's verdict comes from the bench package that the interpreter resolves. One from another
+# checkout, or a copy that an install made, does not know a check type or a field that this tree
+# added since, and would refuse entries that a run loads. Only the package that resolves to this
+# checkout's own source folder counts, which is what an editable install gives.
+BENCH_DIR = REPO_ROOT / "bench"
+BENCH_PACKAGE_DIR = BENCH_DIR / "kube_agents_bench"
+FIELD_CHECK_STALE = (
+    "bench-case-check: the field check did NOT run: the bench package is installed, but behind the "
+    "tree: this interpreter resolves it to {path}, not to this checkout's bench/. Install this "
+    "checkout's with `make test-bench-deps` and run this again."
+)
 # A run's record is never committed beside a case: a public file names the run
 # and its outcome, nothing from inside the record. The harness writes runs
 # under bench/results/, which is gitignored, so nothing legitimate lands here.
@@ -346,16 +376,12 @@ FIXTURE_NOT_READY = {
         "#4896: needs two clusters of more than 100,000 Pods (KWOK) on the pool; "
         "no pool project carries one"
     ),
-    # Needs Config Sync's RootSync CRD and one root-sync object reporting
-    # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
-    # API, so Config Sync is installed nowhere, and the seeded fleet plants no
-    # custom resource. The CRD alone is enough (no operator): apply the
-    # upstream CRD, create the object, write its status with
-    # `kubectl patch --subresource=status`. #2580's "Fixture & Eval" section
-    # specifies the object.
-    "compliance-configsync-stalled": (
-        "#2580: needs the Config Sync RootSync CRD and a Stalled root-sync object "
-        "on a seeded cluster; no pool project runs Config Sync"
+    # Asks the fleet question of the install that watches the sized test fleet
+    # (bench/tf/sized-fleet/). The fleet is in its own project, not on the eval
+    # pool; the sized fleet's nightly runs the case from
+    # hack/eval/sized-fleet-cases.txt until the pool carries it.
+    "chat-routing-fleet-question-sized": (
+        "#3753: needs the sized test fleet, which runs in its own project and is not on the eval pool"
     ),
     # Needs a GitOps repository that declares the namespace under a path a
     # reconciler syncs; no pool project's repository has one. Run by hand on
@@ -527,6 +553,19 @@ FIXTURE_NOT_READY = {
         "read fails for a reason that is not the case's, and the blocked path is "
         "graded by the rule's unit tests on a recorded list"
     ),
+    # Needs the two orphaned-snapshot roles past their age gate: the GCE
+    # compute audit's 2.5 flags a snapshot only when
+    # (now - creationTimestamp).days > 90, and the timestamp is server-set,
+    # so the pool's snapshots of 2026-11-18 are invisible to the check until
+    # 2027-02-17. The entry goes in the pull request that moves the case to
+    # the nightly file on that date, once the fixture-state scan reads both
+    # roles ready on every pool project.
+    "compute-declared-intent-no-finding": (
+        "#1408: needs the declared-orphan-snapshot and orphan-snapshot roles past their "
+        "91-day age gate (bench/tf/fleet/fixtures.json ready_after_hours); the pool's "
+        "snapshots date from 2026-11-18, so the compute audit first sees them on "
+        "2027-02-17 and the case cannot be red or green before then"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -640,6 +679,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # install, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
+    # This repository, agent-pod-reading. No field: whether every plugin the
+    # image ships is on the front door's data volume, agent-owned and
+    # matching the image, is the whole assertion. Reads the agent's own
+    # install, so not in CLUSTER_READING_TYPES.
+    "gateway_plugins_as_shipped": (),
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
@@ -753,6 +797,50 @@ ENTRY_MODES = frozenset({"converge", "assert"})
 # case's turn too, since the nightly runs every case against one install.
 GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
+
+
+@functools.lru_cache(maxsize=1)
+def spec_parser() -> tuple[Any, Any] | str:
+    """The harness's YAML reader and its parser of a case's entries, or the note that says why
+    the rule cannot run here: the bench package is not installed, or it is another checkout's."""
+    try:
+        import kube_agents_bench  # noqa: PLC0415 -- the package whose installed entry points register this repository's check types
+        from devops_bench.tasks.loader import safe_parse_yaml  # noqa: PLC0415
+        from devops_bench.verification.spec import parse_entries  # noqa: PLC0415
+    except ImportError:
+        return FIELD_CHECK_SKIPPED
+    origin = getattr(kube_agents_bench, "__file__", None)
+    if not origin or pathlib.Path(origin).resolve().parent != BENCH_PACKAGE_DIR.resolve():
+        return FIELD_CHECK_STALE.format(path=pathlib.Path(origin).resolve().parent if origin else "a package with no file")
+    return safe_parse_yaml, parse_entries
+
+
+def unloadable_entries(path: pathlib.Path) -> list[str]:
+    """One problem for each entry of the case that the harness does not load; none where the rule
+    cannot run (`spec_parser`).
+
+    The entries are read with the harness's own reader, not with PyYAML: the two read `no`, `on`
+    and `22:30` as different types (YAML 1.1 and 1.2), and the parser has to see what a run sees.
+    One entry goes to the parser at a time, so a parser that raises names its entry."""
+    harness = spec_parser()
+    if isinstance(harness, str):
+        return []
+    read, parse = harness
+    try:
+        entries = read(path.read_text(encoding="utf-8")).get("verification_spec") or []
+    except Exception as exc:  # noqa: BLE001 -- any failure of the harness's reader is this case's problem
+        return [f"{HARNESS_CANNOT_READ}: {type(exc).__name__}: {exc}"]
+    problems: list[str] = []
+    for index, entry in enumerate(entries):
+        where = f"verification_spec[{index}]"
+        try:
+            where = f"check {entry.get('name')!r}"
+            errors = parse([entry])[1]
+        except Exception as exc:  # noqa: BLE001 -- a crash of the parser is a result too, and must not hide the other cases
+            problems.append(f"{where}: {PARSER_RAISED}: {type(exc).__name__}: {exc}")
+            continue
+        problems.extend(f"{where}: {UNLOADABLE_ENTRY}: {error['reason']}" for error in errors)
+    return problems
 
 
 def _populated(value: Any) -> bool:
@@ -1855,6 +1943,10 @@ def validate_case(
             "a reviewed KNOWN_UNREGISTERED entry with the reason it must not run"
         )
 
+    # Last, and only on a case that no rule above faults: the harness's own parser refuses most of
+    # what those rules refuse, so on a faulted case it would report one defect a second time.
+    if not problems:
+        problems.extend(unloadable_entries(path))
     return problems
 
 
@@ -2221,9 +2313,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")
-        return 1
-    print(f"{len(results)} bench case(s) OK.")
-    return 0
+    else:
+        print(f"{len(results)} bench case(s) OK.")
+    harness = spec_parser()
+    if isinstance(harness, str):
+        # Last, and on stderr: an "OK" above it does not cover the fields of a check.
+        sys.stdout.flush()
+        print(harness, file=sys.stderr)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

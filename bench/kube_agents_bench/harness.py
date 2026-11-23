@@ -82,7 +82,11 @@ Environment:
     AGENT_TRANSPORT: ``api`` (default; everything above), ``slack`` (advisory, for
         the Slack lane: a test user's post in a CI channel, read back from the
         thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
-        ``AGENT_SLACK_TIMEOUT``, 600 s unset) or ``inject``, which
+        ``AGENT_SLACK_TIMEOUT``, 600 s unset; a prompt opening with
+        ``[bench:reply-under-home-post: <marker>]`` replies under a post the agent
+        made on its own instead, its wait for the post,
+        ``BENCH_SLACK_HOME_POST_WAIT``, coming before that budget, and only this
+        transport takes it) or ``inject``, which
         hands the prompt to the agent through the A2A gateway's inject backend
         instead -- ``POST /inject`` with the prompt, then the conversation's
         transcript folded until the task's terminal, the way the gateway
@@ -156,6 +160,7 @@ import http.client
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -180,7 +185,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, idle_reply, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -467,6 +472,9 @@ _RUN_ID_HEX_WIDTH = 12
 # Set while a card-wake replay sends its turns, so they land on one
 # conversation: see KubeAgentsHarness._execute_card_wake.
 _PINNED_RUN_ID: ContextVar[str | None] = ContextVar("pinned_run_id", default=None)
+# Set while a fresh-session answer opens its own conversation, so its eval run
+# tag keeps the repetition's run id: see KubeAgentsHarness._execute_fresh_answer.
+_PINNED_EVAL_RUN_ID: ContextVar[str | None] = ContextVar("pinned_eval_run_id", default=None)
 # How long one injected task may run before the harness reads the record and
 # classifies it. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
 # there, with AGENT_DELEGATION_TIMEOUT covering the work across status turns;
@@ -554,6 +562,23 @@ _TIMING_DECIMALS = 3
 # Where the delivered reply's shape goes (chat_shape.measure), for the eval
 # dashboard. hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
 _SHAPE_FILE_ENV = "KUBE_AGENTS_SHAPE_FILE"
+# Where the invocation's eval run tag goes, ``{"eval_run": "<run>/<case>/<rep>",
+# "run_id", "case_id", "repetition"}``, so a retried repetition's attempt is
+# told apart from the first by its run id. hack/ci-eval-pr.sh sets it per
+# repetition and copies it beside results.json; unset, nothing is written.
+_EVAL_RUN_FILE_ENV = "KUBE_AGENTS_EVAL_RUN_FILE"
+_EVAL_RUN_KEY = "eval_run"
+_EVAL_RUN_ID_KEY = "run_id"
+_EVAL_RUN_CASE_KEY = "case_id"
+_EVAL_RUN_REPETITION_KEY = "repetition"
+# The api transport sends the tag on each turn. The agent records it for the
+# turn's session and, while the install has KUBEAGENTS_EVAL_RUN_TAGS on, stamps
+# it on every model request the work makes (deploy/docker/patches/eval_run_tag.py),
+# where the replay proxy logs it. Off, the agent ignores it. Nothing the model
+# reads carries it. On the inject transport the bridge sends the same tag from
+# the conversation key (a2a/hermes-bridge/api.go).
+_EVAL_RUN_HEADER = "X-Kube-Agents-Eval-Run"
+_EVAL_RUN_SEPARATOR = "/"
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -2610,6 +2635,36 @@ def _write_chat_shape(result: AgentResult) -> None:
         _write_sidecar(_SHAPE_FILE_ENV, shape, "reply shape")
 
 
+def _eval_run_identity(run_id: str) -> dict[str, str]:
+    """The tag ``<run>/<case>/<rep>`` for ``run_id``, with its parts.
+
+    The case and repetition are ``EVAL_CASE_ID`` and ``EVAL_REPETITION`` as the
+    presubmit exports them, ``adhoc`` and ``1`` outside it, as on the inject path.
+    """
+    case = os.environ.get(_EVAL_CASE_ID_ENV, "").strip() or _EVAL_CASE_FALLBACK
+    repetition = os.environ.get(_EVAL_REPETITION_ENV, "").strip() or _EVAL_REPETITION_FALLBACK
+    return _eval_run_record(run_id, case, repetition)
+
+
+def _eval_run_record(run_id: str, case: str, repetition: str) -> dict[str, str]:
+    """What ``KUBE_AGENTS_EVAL_RUN_FILE`` holds: the tag ``<run>/<case>/<rep>`` and its parts.
+
+    The one shape both transports write; the inject path's conversation key
+    is the same triple joined the same way.
+    """
+    return {
+        _EVAL_RUN_KEY: _EVAL_RUN_SEPARATOR.join((run_id, case, repetition)),
+        _EVAL_RUN_ID_KEY: run_id,
+        _EVAL_RUN_CASE_KEY: case,
+        _EVAL_RUN_REPETITION_KEY: repetition,
+    }
+
+
+def _write_eval_run(identity: dict[str, str]) -> None:
+    """Write the invocation's eval run tag to ``KUBE_AGENTS_EVAL_RUN_FILE``."""
+    _write_sidecar(_EVAL_RUN_FILE_ENV, identity, "eval run tag")
+
+
 def _write_sidecar(env: str, payload: dict[str, Any], what: str) -> None:
     """Write ``payload`` as JSON to the file ``env`` names, when it names one.
 
@@ -2775,6 +2830,34 @@ def expand_fleet_cluster_placeholders(prompt: str) -> tuple[str, str | None]:
         return {"PROJECT": project, "LOCATION": location, "NAME": name}[m.group(1)]
 
     return _FLEET_CLUSTER_PLACEHOLDER.sub(value, prompt), None
+
+
+# The job's GitOps repository, for a prompt that has to name it: the
+# version-control skill writes only to the repository its task names, and the
+# repository differs per pool project. Read from BENCH_GITOPS_REPO, which
+# hack/ci-eval-pr.sh exports and the forge checks read (github_writes), so the
+# prompt names the repository the checks grade. Not {{GITOPS_REPO}}: that one
+# is bench/hack/run-gitops-pilot.sh's, rendered into its own task copies.
+GITOPS_REPO_PLACEHOLDER = "{{BENCH_GITOPS_REPO}}"
+
+
+def expand_gitops_repo_placeholder(prompt: str) -> tuple[str, str | None]:
+    """``prompt`` with the job's GitOps repository written in, and the setup
+    problem, if any.
+
+    A prompt that doesn't name the placeholder is returned as it is. One that
+    does needs ``BENCH_GITOPS_REPO``; without it the run is a setup failure the
+    caller records as infrastructure, never the model's.
+    """
+    if GITOPS_REPO_PLACEHOLDER not in prompt:
+        return prompt, None
+    repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
+    if not repo or any(ch.isspace() for ch in repo):
+        return prompt, (
+            f"the case prompt names the job's GitOps repository ({GITOPS_REPO_PLACEHOLDER}), but "
+            f"{github_writes.GITOPS_REPO_ENV_VAR} is {'unset' if not repo else repr(repo)}"
+        )
+    return prompt.replace(GITOPS_REPO_PLACEHOLDER, repo), None
 
 
 def _infra_failure(detail: str) -> AgentResult:
@@ -2963,14 +3046,47 @@ def _execute_slack(prompt: str) -> AgentResult:
         timeout = _numeric_env("AGENT_SLACK_TIMEOUT", _SLACK_DEFAULT_TIMEOUT, float)
     except ValueError as exc:
         return AgentResult.errored(str(exc))
-    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
     try:
-        exchange = turn.run(prompt, timeout)
+        home_post = slack.parse_home_post(prompt)
+        lookback = _numeric_env(slack.HOME_POST_LOOKBACK_ENV, str(slack.HOME_POST_LOOKBACK_SECONDS), float)
+        wait = _numeric_env(slack.HOME_POST_WAIT_ENV, str(slack.HOME_POST_WAIT_SECONDS), float)
+        case_start = _numeric_env(slack.CASE_START_ENV, "0", float)
+        for name, value in ((slack.HOME_POST_LOOKBACK_ENV, lookback), (slack.HOME_POST_WAIT_ENV, wait),
+                            (slack.CASE_START_ENV, case_start)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite number of seconds, at least 0")
+    except ValueError as exc:
+        return AgentResult.errored(str(exc))
+    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
+    home_ts = ""
+    search_errors: list[str] = []
+    try:
+        if home_post is None:
+            exchange = turn.run(prompt, timeout)
+        else:
+            marker, reply = home_post
+            since = case_start - slack.CASE_START_MARGIN_SECONDS if case_start else turn.wall() - lookback
+            post = turn.find_home_post(marker, since, wait, search_errors)
+            if post is None:
+                # The agent never posted what the case set it up to post: the
+                # case's failure to grade, not infrastructure.
+                return AgentResult(
+                    output="", trajectory=[], tokens={},
+                    errors=[f"slack: no top-level post of the bot's holding {marker!r} in the channel within {wait:g}s"],
+                    metadata={"transport": TRANSPORT_SLACK, "outcome": "no_home_post", "slack_home_post_marker": marker,
+                              "slack_transient_errors": len(search_errors)},
+                )
+            home_ts = str(post["ts"])
+            exchange = turn.reply_under(home_ts, reply, timeout)
     except (slack.SlackAPIError, OSError) as exc:
         return _infra_failure(f"slack: {exc}")
     timing = exchange.timing()
     then_text = os.environ.get(slack.THEN_ENV, "").strip()
-    if then_text and exchange.outcome == "settled":
+    if then_text and home_ts:
+        # A reply under the agent's post is the case's one turn; a second
+        # one would need the post's thread, not the reply's.
+        timing["slack_then_outcome"] = "skipped: a reply under a home post takes no second turn"
+    elif then_text and exchange.outcome == "settled":
         timing.update(_slack_then(turn, exchange, then_text, timeout))
     elif then_text:
         timing["slack_then_outcome"] = f"skipped: the first turn's outcome was {exchange.outcome}"
@@ -2992,9 +3108,10 @@ def _execute_slack(prompt: str) -> AgentResult:
             "outcome": exchange.outcome,
             "window_posts": len(exchange.posts),
             "slack_ask_ts": exchange.ask_ts,
+            "slack_home_post_ts": home_ts or None,
             "slack_reaction": exchange.reaction or None,
             "slack_buttons": exchange.buttons,
-            "slack_transient_errors": len(exchange.errors),
+            "slack_transient_errors": len(exchange.errors) + len(search_errors),
             **timing,
         },
     )
@@ -3150,6 +3267,8 @@ class KubeAgentsHarness(AgentHarness):
         prompt, setup_problem = expand_agent_cluster_placeholders(prompt, os.environ.get("AGENT_CLUSTER_CONTEXT"))
         if setup_problem is None:
             prompt, setup_problem = expand_fleet_cluster_placeholders(prompt)
+        if setup_problem is None:
+            prompt, setup_problem = expand_gitops_repo_placeholder(prompt)
         if setup_problem is not None:
             transcript.set("", [], prompt=prompt, started_at=started_at)
             return _infra_failure(setup_problem)
@@ -3200,6 +3319,11 @@ class KubeAgentsHarness(AgentHarness):
         if transport not in _TRANSPORTS:
             return AgentResult.errored(
                 f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
+            )
+        if transport != TRANSPORT_SLACK and prompt.lstrip().startswith(slack.HOME_POST_DIRECTIVE):
+            # Only Slack shows a post the agent made on its own to reply under.
+            return AgentResult.errored(
+                f"{slack.HOME_POST_DIRECTIVE} <marker>] needs AGENT_TRANSPORT={TRANSPORT_SLACK}, got {transport!r}"
             )
         if transport == TRANSPORT_INJECT:
             result = self._execute_inject(prompt)
@@ -3303,6 +3427,7 @@ class KubeAgentsHarness(AgentHarness):
             raise _TransportError(f"A2A door {what}: {last}")
 
         run_id, case_id, repetition = _inject_identity()
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
         message_id = inject.message_id(run_id, case_id, repetition)
         # A fixed context, so a retried send (the first reply lost after the
         # door took it) is the same message on the same context, which the
@@ -3534,7 +3659,10 @@ class KubeAgentsHarness(AgentHarness):
         # 127.0.0.1 rather than localhost, matching _port_open's probe host: a
         # v4/v6 mismatch would make the probe and the request disagree.
         url = f"http://127.0.0.1:{local_port}{api_path}"
-        headers = {"Content-Type": "application/json"}
+        run_id = _run_id()
+        eval_run = _eval_run_identity(_PINNED_EVAL_RUN_ID.get() or run_id)
+        _write_eval_run(eval_run)
+        headers = {"Content-Type": "application/json", _EVAL_RUN_HEADER: eval_run[_EVAL_RUN_KEY]}
         token = os.environ.get("PLATFORM_AGENT_TOKEN")
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -3543,7 +3671,7 @@ class KubeAgentsHarness(AgentHarness):
             # The endpoint is stateful and replays the whole conversation's tool
             # calls, so a shared id would make each task inherit the previous
             # task's trajectory and corrupt trajectory scoring.
-            "conversation": _run_id(),
+            "conversation": run_id,
             "input": prompt,
         }
 
@@ -3940,11 +4068,14 @@ class KubeAgentsHarness(AgentHarness):
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
             return AgentResult.errored(str(exc))
+        # A new conversation, but the same repetition: the tag keeps the wake's run id.
+        tag = _PINNED_EVAL_RUN_ID.set(_run_id())
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
             return self._execute_api(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
+            _PINNED_EVAL_RUN_ID.reset(tag)
 
     def _execute_inject(self, prompt: str, *, follow_up: _InjectFollowUp | None = None) -> AgentResult:
         """The inject transport: send the prompt through the gateway's front door.
@@ -4051,6 +4182,8 @@ class KubeAgentsHarness(AgentHarness):
         # the door dedupe a retried POST on it.
         conversation = inject.conversation_key(run_id, case_id, repetition)
         message_id = inject.message_id(run_id, case_id, repetition)
+        # The same triple the bridge sends as the tag (a2a/hermes-bridge/api.go).
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
         if follow_up is not None:
             conversation, message_id = follow_up.conversation, message_id + follow_up.suffix
         identity: dict[str, Any] = {
@@ -4340,8 +4473,14 @@ class KubeAgentsHarness(AgentHarness):
             return "no cancel was published (see the log), so it may still be running"
 
         # The profile fields go only on a turn addressed to a profile, so every
-        # other turn is built exactly as it was before #5945.
-        addressed = {"profile": target.name, "parameters": target.parameters} if target is not None else {}
+        # other turn is built exactly as it was before #5945. The intent goes
+        # only when the directive names it (intent=confirm), so a profile turn
+        # without it is built as it was before too.
+        addressed: dict[str, Any] = (
+            {"profile": target.name, "parameters": target.parameters} if target is not None else {}
+        )
+        if target is not None and target.intent:
+            addressed["intent"] = target.intent
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,

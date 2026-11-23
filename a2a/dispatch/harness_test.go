@@ -57,14 +57,8 @@ func testProfile(name string, concurrency int, tiers ...string) lib.DispatchProf
 	if len(tiers) == 0 {
 		tiers = []string{"read"}
 	}
-	p := lib.DispatchProfile{Name: name, Tiers: tiers, Concurrency: concurrency,
+	return lib.DispatchProfile{Name: name, Tiers: tiers, Concurrency: concurrency,
 		QueueTimeoutSeconds: 3600, ActiveDeadlineSeconds: 60}
-	for _, tier := range tiers {
-		for _, kind := range submitKinds {
-			p.Durables = append(p.Durables, lib.DispatchDurable{Tier: tier, Kind: kind, Name: lib.ProfileDurableName(name, tier, kind)})
-		}
-	}
-	return p
 }
 
 // testDispatchConfig is the install at test speed. Lease and renewal ride

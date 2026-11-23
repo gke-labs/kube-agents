@@ -73,9 +73,9 @@ VERSIONS = Versions(fleet=1, verifiers=1)
 # The legacy today key: the lines recorded before every install ran the A2A
 # stack carry it. NEXT_KEY below is the key every run writes now.
 KEY = VersionKey(
-    setup_id="gemini-3-1-pro-preview-kubeagents-mcp",
+    setup_id="setup-x",
     scoring_version="v1",
-    judge_model="gemini-3.1-pro-preview",
+    judge_model="model-x",
     fleet=1,
     verifiers=1,
     mode=MODE_TODAY,
@@ -169,7 +169,7 @@ def test_the_key_builds_from_a_real_captured_run(name):
     key = VersionKey.from_run(
         setup_id=rec.setup_id,
         scoring_version=rec.scoring_version,
-        judge_model="gemini-3.1-pro-preview",
+        judge_model="model-x",
         versions=VERSIONS,
     )
     assert key == NEXT_KEY
@@ -492,7 +492,7 @@ def test_a_key_with_no_record_reports_stale_rather_than_comparing(tmp_path):
     admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
     assert admitted is False
     assert why.startswith("stale:")
-    assert "gemini-3.1-pro-preview" in why
+    assert "model-x" in why
 
 
 def test_a_run_with_no_key_is_not_admitted(tmp_path):
@@ -634,7 +634,7 @@ def test_evidence_ignores_lines_at_another_key(tmp_path):
     other = VersionKey(
         setup_id="some-other-setup",
         scoring_version="v1",
-        judge_model="gemini-3.1-pro-preview",
+        judge_model="model-x",
         fleet=1,
         verifiers=1,
     )
@@ -1011,3 +1011,16 @@ def test_a_scoped_store_answers_the_same_as_a_whole_one_in_scope(tmp_path):
     assert scoped.admission("planted-pdb", KEY, bar=bar) == whole.admission(
         "planted-pdb", KEY, bar=bar
     )
+
+
+def test_the_run_mode_follows_the_front_door(monkeypatch):
+    """``next`` unless the deploy chose the default session as the front door
+    (EVAL_FRONT_DOOR=session, #6539), whose records stay apart."""
+    from kube_agents_bench.baselines import MODE_NEXT_SESSION, run_mode
+
+    for value, want in ((None, MODE_NEXT), ("platform", MODE_NEXT), ("session", MODE_NEXT_SESSION)):
+        if value is None:
+            monkeypatch.delenv("EVAL_FRONT_DOOR", raising=False)
+        else:
+            monkeypatch.setenv("EVAL_FRONT_DOOR", value)
+        assert run_mode() == want

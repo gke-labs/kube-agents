@@ -18,6 +18,8 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // Config is the adapter's contract with its pod: everything here arrives as
@@ -361,6 +363,11 @@ type adapter struct {
 	finalized bool
 	finalErr  error
 	appended  map[string]bool // artifact name -> first chunk already out
+	// askKind is the mark.ask token for the task's prompt (lib/askkind),
+	// carried on every progress line as the hermes-bridge carries it, so the
+	// gateway's reaction follows a profile task as it follows a platform one
+	// (#6536). Set once the prompt is read, before the harness runs.
+	askKind string
 
 	// harnessSession is the session id the harness reported at init, which
 	// the next task in a reused pod resumes (Config.SessionReuse).
@@ -639,6 +646,11 @@ type turnPlan struct {
 	// dispatched worker's persona config). The run publishes a failed
 	// terminal for it and runs nothing.
 	setupErr error
+	// script is the helper script a script-run task runs in place of the
+	// harness, cleared by prepareScript (#5622). scriptRefusal, set
+	// instead, is why it can't run: the task is rejected and nothing runs.
+	script        *scriptRun
+	scriptRefusal string
 }
 
 // turnOutcome is one task's run, as the session loop needs it: the terminal
@@ -748,6 +760,16 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return done(Result{State: state}, a.finalize(state, reason, ""))
 	}
 
+	// A script-run task runs its script, or is refused, here: after the
+	// capability check, and never as a model turn.
+	if plan.scriptRefusal != "" {
+		state := lib.StateRejected
+		return done(Result{State: state}, a.finalize(state, "reason: script-refused - "+plan.scriptRefusal, ""))
+	}
+	if plan.script != nil {
+		return a.runScript(ctx, origin, originSeq, plan.script)
+	}
+
 	// The deliverable prompt is the message's text parts. A submission with
 	// none is refused before any model spend - terminal rejected, the A2A
 	// state for an executor that refuses work before starting it.
@@ -757,6 +779,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		err := a.finalize(state, "reason: no-text-parts - the submission message carries nothing to execute", "")
 		return done(Result{State: state}, err)
 	}
+	// The kind is the ask's words, as the bridge reads them: the message's
+	// own text, before any primer.
+	a.askKind = askkind.Kind(prompt)
 	prompt = withPrimer(plan.primer, prompt)
 
 	// The live in-subject consumer opens positioned just after the
@@ -1230,7 +1255,7 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 			}
 		case "text":
 			if block.Text != "" {
-				a.publishArtifactChunk(ctx, lib.ArtifactProgress, lib.Part{Kind: "text", Text: block.Text}, false)
+				a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(block.Text, a.askKind), false)
 			}
 		case "tool_use":
 			entry, err := json.Marshal(map[string]any{
@@ -1250,26 +1275,55 @@ func (a *adapter) publishAssistant(ctx context.Context, ev harnessEvent) {
 // is logged and the task continues - the deliverable and the terminal event
 // are the load-bearing publishes, not the telemetry.
 func (a *adapter) publishArtifactChunk(ctx context.Context, name string, part lib.Part, last bool) {
+	a.publishArtifactChunks(ctx, name, []lib.Part{part}, last)
+}
+
+// publishArtifactChunks is publishArtifactChunk for a chunk of several parts
+// in one artifact-update: a progress line's text and the chat message that
+// marks it.
+func (a *adapter) publishArtifactChunks(ctx context.Context, name string, parts []lib.Part, last bool) {
 	a.mu.Lock()
 	appendChunk := a.appended[name]
 	a.appended[name] = true
 	a.mu.Unlock()
-	if err := a.publishArtifactPart(ctx, name, part, appendChunk, last); err != nil {
+	if err := a.publishArtifactParts(ctx, name, parts, appendChunk, last); err != nil {
 		a.log.Warn("artifact publish failed", "name", name, "err", err)
 	}
+}
+
+// progressParts is one progress line as the hermes-bridge publishes it
+// (hermes-bridge/chat.go): the text, then a chat message carrying only the
+// ask's mark, which the gateway draws on the ask (markFrom) and which lays
+// nothing out, so the rolling line still renders the text. A mark the
+// chat message refuses leaves the bare text, as the bridge does.
+func progressParts(line, ask string) []lib.Part {
+	if ask == "" {
+		return []lib.Part{{Kind: "text", Text: line}}
+	}
+	parts, err := chatmsg.Parts(chatmsg.Progress, line, chatmsg.Message{Mark: &chatmsg.Mark{Ask: ask}})
+	if err != nil {
+		return []lib.Part{{Kind: "text", Text: line}}
+	}
+	return parts
 }
 
 // publishArtifactPart is the one place an artifact-update for this task is
 // built and published: one part on the named artifact, whose id is derived
 // from the task and the name. Callers own the chunking and the error policy.
 func (a *adapter) publishArtifactPart(ctx context.Context, name string, part lib.Part, appendChunk, last bool) error {
+	return a.publishArtifactParts(ctx, name, []lib.Part{part}, appendChunk, last)
+}
+
+// publishArtifactParts is publishArtifactPart for several parts in one
+// update.
+func (a *adapter) publishArtifactParts(ctx context.Context, name string, parts []lib.Part, appendChunk, last bool) error {
 	update := lib.ArtifactUpdate{
 		TaskID:    a.taskID,
 		ContextID: a.contextID,
 		Artifact: lib.Artifact{
 			ArtifactID: "artifact-" + a.taskID + "-" + name,
 			Name:       name,
-			Parts:      []lib.Part{part},
+			Parts:      parts,
 		},
 		Append:    appendChunk,
 		LastChunk: last,

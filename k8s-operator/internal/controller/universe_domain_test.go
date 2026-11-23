@@ -227,6 +227,82 @@ func TestValidateUniverseDomainRefusesADomainUnderGoogleapis(t *testing.T) {
 	}
 }
 
+func TestAKeptUniverseDomainThatIsRefusedIsNotUsedAgain(t *testing.T) {
+	const refused = "mtls.googleapis.com"
+	agent := func(specDomain, statusDomain string) *agentv1alpha1.PlatformAgent {
+		a := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Harness: &agentv1alpha1.HarnessSpec{
+					ProjectID:      "sample-project",
+					Location:       "us-central1",
+					ClusterName:    "host-cluster",
+					UniverseDomain: specDomain,
+				},
+			},
+		}
+		a.Status.ResolvedUniverseDomain = statusDomain
+		a.Status.UniverseDomainSource = universeDomainSourceSpec
+		return a
+	}
+	// The metadata probe fails, which is when the operator keeps the status value.
+	probeFails := &PlatformAgentReconciler{
+		UniverseDomainDetector: func(context.Context) (string, bool) { return "", false },
+	}
+	ctx := context.Background()
+
+	// The user removed the refused spec value, as the refusal's message says.
+	// The status still holds it from before the upgrade.
+	removed := agent("", refused)
+	if reason, _, transient := probeFails.validateUniverseDomain(ctx, removed); reason != "" || !transient {
+		t.Fatalf("validateUniverseDomain = (%q, transient=%v), want a requeue and no render", reason, transient)
+	}
+	if domain, source := probeFails.resolvedUniverseDomainPair(ctx, removed); domain != "" || source != "" {
+		t.Fatalf("resolvedUniverseDomainPair = (%q, %q), want the refused status value dropped", domain, source)
+	}
+	safeCopy, skipFQDN := probeFails.guardrailAgentForUniverse(ctx, removed)
+	if !skipFQDN {
+		t.Fatal("guardrailAgentForUniverse must skip the FQDN policy when the only known universe domain is refused")
+	}
+	if got := effectiveUniverseDomain(safeCopy); got != agentv1alpha1.DefaultUniverseDomain {
+		t.Fatalf("guardrail copy renders against %q, want %q", got, agentv1alpha1.DefaultUniverseDomain)
+	}
+
+	// The user left the refused value in the spec: the guardrails must not
+	// render against the same value from the status.
+	left := agent(refused, refused)
+	safeCopy, skipFQDN = probeFails.guardrailAgentForUniverse(ctx, left)
+	if !skipFQDN {
+		t.Fatal("guardrailAgentForUniverse must skip the FQDN policy for a refused spec value and a refused status value")
+	}
+	if got := effectiveUniverseDomain(safeCopy); got != agentv1alpha1.DefaultUniverseDomain {
+		t.Fatalf("guardrail copy renders against %q, want %q", got, agentv1alpha1.DefaultUniverseDomain)
+	}
+
+	// A valid kept value is used as before while the probe fails.
+	kept := agent("", testCustomUniverseDomain)
+	if reason, _, transient := probeFails.validateUniverseDomain(ctx, kept); reason != "" || transient {
+		t.Fatalf("validateUniverseDomain with a valid kept value = (%q, transient=%v), want neither", reason, transient)
+	}
+	if domain, source := probeFails.resolvedUniverseDomainPair(ctx, kept); domain != testCustomUniverseDomain || source != universeDomainSourceSpec {
+		t.Fatalf("resolvedUniverseDomainPair = (%q, %q), want the valid kept pair", domain, source)
+	}
+	if safeCopy, skipFQDN := probeFails.guardrailAgentForUniverse(ctx, kept); skipFQDN || effectiveUniverseDomain(safeCopy) != testCustomUniverseDomain {
+		t.Fatalf("guardrail copy = (%q, skip=%v), want the valid kept value and no skip", effectiveUniverseDomain(safeCopy), skipFQDN)
+	}
+
+	// With a metadata answer, the refused status value is replaced by the answer.
+	answers := &PlatformAgentReconciler{
+		UniverseDomainDetector: func(context.Context) (string, bool) { return agentv1alpha1.DefaultUniverseDomain, true },
+	}
+	if reason, _, transient := answers.validateUniverseDomain(ctx, removed); reason != "" || transient {
+		t.Fatalf("validateUniverseDomain with a metadata answer = (%q, transient=%v), want neither", reason, transient)
+	}
+	if domain, source := answers.resolvedUniverseDomainPair(ctx, removed); domain != agentv1alpha1.DefaultUniverseDomain || source != universeDomainSourceDiscovered {
+		t.Fatalf("resolvedUniverseDomainPair with a metadata answer = (%q, %q)", domain, source)
+	}
+}
+
 func TestCustomUniversePropagatesToManifestsAndStripsExtraEnvOverrides(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},

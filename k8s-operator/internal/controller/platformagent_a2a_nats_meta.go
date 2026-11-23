@@ -61,6 +61,12 @@ import (
 // recorded on the StatefulSet before the pod is deleted, so it happens once
 // per server per bus, never in a loop; a server still outside after its one
 // restart keeps the condition, and is left for a person.
+//
+// A fresh bus whose servers never agree on a meta leader at all (#6273: one
+// server campaigned alone, its peers' votes never reaching it) has no stray
+// to single out. After the same bound, on a bus never provisioned whose
+// servers all hold nothing, every server is restarted once, recorded the same
+// way first; after that one attempt the hold fails as before.
 const (
 	a2aBusMetaConditionType = "A2ABusMetaGroup"
 	a2aBusMetaOutsideReason = "ServerOutsideMetaGroup"
@@ -73,6 +79,9 @@ const (
 	a2aBusMetaDownReason = "ServerNotRunning"
 	// a2aBusMetaRestartedReason is the Warning Event on the one restart.
 	a2aBusMetaRestartedReason = "A2ABusServerRestarted"
+	// a2aBusMetaGroupRestartedReason is the Warning Event on the one restart
+	// of every server, on a bus that never agreed a meta leader (#6273).
+	a2aBusMetaGroupRestartedReason = "A2ABusMetaGroupRestarted"
 	// a2aBusMetaRestartedAnnotation, on the bus StatefulSet, lists the pods
 	// restarted for being outside the meta group, comma-separated. Written by
 	// its own patch, not the StatefulSet's server-side apply, so the apply
@@ -337,8 +346,20 @@ func leaderListsCurrent(leader *a2aBusServerView, pod string) bool {
 // formed; restarted lists the outside servers already restarted once.
 func a2aBusMetaMessage(v a2aBusMetaVerdict, restarted []string) string {
 	if v.Leader == "" {
-		return fmt.Sprintf("no JetStream meta leader is agreed by a quorum of the bus's servers (%s); stream provisioning waits",
+		msg := fmt.Sprintf("no JetStream meta leader is agreed by a quorum of the bus's servers (%s); stream provisioning waits",
 			strings.Join(v.Outside, ", "))
+		all, any := len(v.Outside) > 0, false
+		for _, pod := range v.Outside {
+			all = all && slices.Contains(restarted, pod)
+			any = any || slices.Contains(restarted, pod)
+		}
+		switch {
+		case all:
+			msg += ". Every server was restarted once already; the operator restarts them only once, so it is left for a person (wipe the bus)"
+		case any:
+			msg += ". A server was restarted once already, so the operator won't restart the bus; it is left for a person (wipe the bus)"
+		}
+		return msg
 	}
 	var once []string
 	for _, pod := range v.Outside {
@@ -375,6 +396,10 @@ func a2aBusMetaRestarted(sts *appsv1.StatefulSet) []string {
 // every guard holds. since is when the condition first said a server was
 // outside (zero when it does not yet). It returns whether it restarted one.
 func (r *PlatformAgentReconciler) healA2ABusMeta(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, views []a2aBusServerView, v a2aBusMetaVerdict, since, now time.Time) (bool, error) {
+	// No leader agreed at all: there is no stray to single out.
+	if v.Known && !v.Formed && v.Leader == "" && len(views) > 1 && len(v.Outside) == len(views) {
+		return r.restartA2ABusWithNoMetaLeader(ctx, agent, sts, views, since, now)
+	}
 	// Exactly one outside, with an agreed leader: the verdict then has every
 	// other server naming that leader and listed by it as current, so the
 	// rest are a quorum without the stray.
@@ -449,6 +474,69 @@ func (r *PlatformAgentReconciler) healA2ABusMeta(ctx context.Context, agent *age
 	logf.FromContext(ctx).Info("restarted an A2A bus server outside the JetStream meta group, once",
 		"pod", stray, "leader", v.Leader, "outsideFor", now.Sub(since).Truncate(time.Second))
 	return true, nil
+}
+
+// restartA2ABusWithNoMetaLeader restarts every server of a fresh bus whose
+// servers never agreed a meta leader, once (#6273). since is when the
+// condition first said so. Guards, beyond the bound: never on a bus that has
+// been provisioned; every server holds no stream or consumer and has started
+// its meta node (a server still recovering its store reports neither); no
+// server has been restarted before, by this or the one-stray heal; and every
+// pod is this StatefulSet's own and not already going. The restart is
+// recorded on the StatefulSet first, every server at once, so a pass that
+// dies part-way, or an operator restarted mid-way, never tries again: a
+// partial restart counts as the one attempt.
+func (r *PlatformAgentReconciler) restartA2ABusWithNoMetaLeader(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, views []a2aBusServerView, since, now time.Time) (bool, error) {
+	if since.IsZero() || now.Sub(since) < a2aBusMetaHealAfter || busProvisioned(agent) {
+		return false, nil
+	}
+	restarted := a2aBusMetaRestarted(sts)
+	var names []string
+	for _, view := range views {
+		if view.Streams != 0 || view.Consumers != 0 || view.ClusterSize == 0 || slices.Contains(restarted, view.Pod) {
+			return false, nil
+		}
+		names = append(names, view.Pod)
+	}
+	pods := make([]*corev1.Pod, 0, len(names))
+	for _, name := range names {
+		pod := &corev1.Pod{}
+		if err := r.podReader().Get(ctx, client.ObjectKey{Namespace: sts.Namespace, Name: name}, pod); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || pod.DeletionTimestamp != nil {
+			return false, nil
+		}
+		pods = append(pods, pod)
+	}
+	// The record first, every server at once.
+	patch := client.MergeFrom(sts.DeepCopy())
+	if sts.Annotations == nil {
+		sts.Annotations = map[string]string{}
+	}
+	sts.Annotations[a2aBusMetaRestartedAnnotation] = strings.Join(append(restarted, names...), ",")
+	if err := r.Patch(ctx, sts, patch); err != nil {
+		return false, err
+	}
+	var firstErr error
+	for _, pod := range pods {
+		uid := pod.UID
+		if err := r.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil && !errors.IsNotFound(err) && !errors.IsConflict(err) && firstErr == nil {
+			// Left recorded: the attempt was made, and a second one would be
+			// the loop the record exists to prevent.
+			firstErr = err
+		}
+	}
+	what := fmt.Sprintf("restarted every bus server (%s) once", strings.Join(names, ", "))
+	if firstErr != nil {
+		what = fmt.Sprintf("tried to restart every bus server (%s) once, and a delete failed (%v), so the restart may be partial; it is not tried again", strings.Join(names, ", "), firstErr)
+	}
+	r.recordEvent(agent, corev1.EventTypeWarning, a2aBusMetaGroupRestartedReason,
+		fmt.Sprintf("%s: they agreed no JetStream meta leader for %s, on a bus never provisioned whose servers hold no stream or consumer; a bus still without a leader after this is left for a person (#6273)",
+			what, now.Sub(since).Truncate(time.Second)))
+	logf.FromContext(ctx).Info("restarted every A2A bus server, once: no JetStream meta leader",
+		"pods", names, "withoutLeaderFor", now.Sub(since).Truncate(time.Second), "deleteErr", firstErr)
+	return firstErr == nil, firstErr
 }
 
 // a2aBusMetaSince is when the condition began saying a server is outside.

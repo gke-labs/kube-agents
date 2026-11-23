@@ -39,6 +39,7 @@ import board_snapshot
 import chat_notify
 import clean_merges
 import dial_state
+from fix_recipes import registry as fix_recipes_registry
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -93,9 +94,9 @@ PROPOSAL_OPENED_AT_MAX_CHARS = 64
 # claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
 # fix the check knows, by the fleet audit's check id, which is the first segment
 # of its finding id (`<check>.<cluster>.<namespace>.<object>`); the kind is
-# derived from that id here, never taken from the caller. The pr_opened plugin
-# holds a copy (POST_MERGE_KINDS), which a test pins to this one.
-POST_MERGE_KINDS = ("no-pdb",)
+# derived from that id here, never taken from the caller. Both this and the
+# pr_opened plugin read the kinds from fix_recipes/registry.py.
+POST_MERGE_KINDS = tuple(sorted(fix_recipes_registry.kinds()))
 POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
@@ -106,6 +107,19 @@ ORIGIN_COMPRESSION_WALK_MAX = 32
 # sessions are in that profile's `state.db`, not in this server's own.
 GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
 ORIGIN_DB_TIMEOUT_SECONDS = 5.0
+# The eval run tag of a session (deploy/docker/patches/eval_run_tag.py): which
+# eval run, case and repetition an API turn belongs to, as the harness sent it
+# in X-Kube-Agents-Eval-Run. Written only while the install has
+# KUBEAGENTS_EVAL_RUN_TAGS on, once per session (the first write wins), in a
+# table of its own so no session_metadata blob is rewritten for it. Read back
+# through compression, as the origin record is.
+SESSION_EVAL_RUNS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS session_eval_runs ("
+    " session_id TEXT PRIMARY KEY, eval_run TEXT NOT NULL, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+)
+SESSION_EVAL_RUN_KEY = "eval_run"
+# `<run>/<case>/<rep>`, the pattern eval_run_tag.TAG_RE and the replay proxy hold.
+SESSION_EVAL_RUN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}")
 # The board's origin stamp (`_stamp_board_task_origin`, the drift backlog's
 # writer), a side table in the kanban database that the first stamp wins.
 KANBAN_TASK_ORIGINS_SCHEMA = """
@@ -240,6 +254,8 @@ SQLITE_INT64_MAX = (1 << 63) - 1
 # task's full report in one response.
 FEED_EVENTS_DEFAULT_LIMIT = 50
 FEED_EVENTS_MAX_LIMIT = 500
+# `since` on the feed: the ledger's own `created_at` form, UTC, no zone.
+FEED_EVENTS_SINCE_FORMAT = "%Y-%m-%d %H:%M:%S"
 FEED_TASKS_DEFAULT_LIMIT = 50
 FEED_TASKS_MAX_LIMIT = 200
 # Per-task child rows `GET /v1/tasks/{id}` returns, the same ceilings the admin
@@ -527,8 +543,9 @@ CONVERSATION_HASHED_PREFIX = "h-"
 CONVERSATION_HASHED_HEX_CHARS = 32
 # The conversation key's prefix for each platform the A2A gateway can hold, as
 # the gateway spells its session-record keys (gchatConversationID,
-# slackConversationID); a key for another backend is refused.
-CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "console": "console:"}
+# slackConversationID, teamsConversationID); a key for another backend is
+# refused.
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "teams": "teams:", "console": "console:"}
 # The metadata key the route is kept under. Its own key, not the row's
 # platform/chat_id/thread_id: those are a chat thread's address, which other
 # readers (send_notification, the delegation headers) use as one, and a
@@ -1957,10 +1974,20 @@ def init_db() -> None:
                     reported_at     TEXT,
                     followup_state  TEXT,
                     followup_attempts INTEGER,
-                    followup_detail TEXT
+                    followup_detail TEXT,
+                    changed_paths   TEXT
                 )
                 """
             )
+            # `changed_paths` arrived after the table did: the files a merged fix
+            # changed, read from its diff once by `post_merge_check.py health`
+            # and kept, since a merged pull request's files never change.
+            if "changed_paths" not in {row[1] for row in conn.execute("PRAGMA table_info(post_merge_records)")}:
+                try:
+                    conn.execute("ALTER TABLE post_merge_records ADD COLUMN changed_paths TEXT")
+                except sqlite3.OperationalError as exc:
+                    if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
+                        raise
             # One-time stamp tickets for a card's board origin; spent or
             # expired rows are removed by `cleanup_old_records`.
             conn.execute(
@@ -2809,7 +2836,9 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
 
 # The chat platforms this harness ships an egress path for, in the order a
 # message is posted to them and in the order a single-destination caller picks
-# one. Google Chat leads, and the ordering is the whole of #1094.
+# one. Google Chat leads, and the ordering is the whole of #1094. On an install
+# the A2A gateway serves, chat_notify.in_routed_order then puts a configured
+# home ahead of a learned one.
 #
 # #855 put Slack first, on the reasoning that a dual-platform install "resolves
 # the same way whichever branch answers". It does — and the answer it resolves
@@ -2822,7 +2851,16 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
 # This does not undo #855. That defect was a Slack-*only* install calling itself
 # google_chat, and resolution below is per platform: with Google Chat off,
 # nothing puts it in the list whatever the order says.
-CHAT_PLATFORMS = ("google_chat", "slack")
+CHAT_PLATFORMS = ("google_chat", "slack", "teams")
+
+# The platforms this resolver names only when the A2A gateway routes them
+# (`chat_notify.routes`); no config file or environment signal enables them
+# here. Teams on the Hermes path has its own cron delivery (`deliver: teams`)
+# and was never a destination of these callers; the gateway's Teams backend
+# (the operator's A2A_TEAMS_BACKEND switch) is, through its chat.notify route,
+# so an install moves to it only with that switch, never on an upgrade. The
+# twin in chat_platforms.py carries the same tuple.
+ROUTE_ONLY_PLATFORMS = ("teams",)
 
 # Per-platform environment signals, consulted only when no config file settles
 # the question. The relay URL leads each list because the operator sets it on
@@ -2854,10 +2892,11 @@ DEFAULT_CHAT_PLATFORM = "google_chat"
 HOME_CHANNEL_SETTINGS: Dict[str, str] = {
     "google_chat": "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
     "slack": "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",
+    "teams": "spec.integration.teams.homeChannel",
 }
 # The refusal when no platform can be named: no chat at all, a malformed home
 # channel the gateway refuses, or a backend this file has no route for.
-NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
+NO_CHAT_ROUTE_ERROR = "no Google Chat, Slack or Microsoft Teams route to post to; check the chat integration and homeChannel"
 
 
 def _mapping(value: object) -> dict:
@@ -2953,7 +2992,7 @@ def _slack_home_channel() -> str:
 
 
 def enabled_chat_platforms() -> list[str]:
-    """Every chat platform this install posts to, in CHAT_PLATFORMS order.
+    """Every chat platform this install posts to, in CHAT_PLATFORMS order, the routed ones in routing order.
 
     Three sources, most specific first, resolved **per platform** rather than
     per source — so a file that names one platform cannot silence another that
@@ -2984,9 +3023,11 @@ def enabled_chat_platforms() -> list[str]:
     A2A gateway holds its backend, and posts to it go through the gateway
     instead, so each is still a platform this install posts to. The operator
     lists the armed routes with a CR home channel; ``routed_platforms()`` adds
-    Slack when the file names a channel, and takes every armed route when no
+    a platform whose projected file names a learned home, after those, and takes every armed route when no
     platform has a home, the gateway keeping the refused posts for a digest.
-    The alert takes the first of them. The variables are the operator's, and
+    The routed platforms come back in that order (``chat_notify.in_routed_order``),
+    and the alert takes the first of them, so a configured home is picked
+    ahead of a learned one. The variables are the operator's, and
     they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
@@ -3050,6 +3091,8 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
         if chat_notify.routes(name):
             enabled = True
             explicit[name] = True
+        elif name in ROUTE_ONLY_PLATFORMS:
+            enabled = False
         elif name in from_managed:
             enabled = from_managed[name]
             explicit[name] = enabled
@@ -3063,7 +3106,9 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
             )
         if enabled:
             resolved.append(name)
-    return resolved, explicit
+    # The routed platforms in the routing rule's order, so every caller that
+    # takes one destination takes a configured home ahead of a learned one.
+    return chat_notify.in_routed_order(resolved), explicit
 
 
 def _chat_platforms_disabled() -> bool:
@@ -8405,6 +8450,41 @@ def get_session_origin(session_id: str) -> Dict[str, str]:
     return {"origin": origin, "platform": platform}
 
 
+def _session_eval_run_row(session_id: str) -> str:
+    """The eval run tag recorded for exactly `session_id`, or ""."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        try:
+            row = conn.execute("SELECT eval_run FROM session_eval_runs WHERE session_id = ?", (session_id,)).fetchone()
+        except sqlite3.OperationalError:  # no tag was ever recorded on this volume
+            return ""
+    return str(row[0]) if row and row[0] else ""
+
+
+@app.put("/v1/sessions/{session_id}/eval-run", dependencies=[Depends(verify_api_key)])
+def put_session_eval_run(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record a session's eval run tag unless it has one; answers the tag the session keeps."""
+    tag = request_data.get(SESSION_EVAL_RUN_KEY)
+    if not isinstance(tag, str) or not SESSION_EVAL_RUN_RE.fullmatch(tag.strip()):
+        raise HTTPException(status_code=400, detail="eval_run must be <run>/<case>/<repetition>")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        conn.execute(SESSION_EVAL_RUNS_SCHEMA)
+        conn.execute(
+            "INSERT OR IGNORE INTO session_eval_runs (session_id, eval_run) VALUES (?, ?)", (session_id, tag.strip())
+        )
+        conn.commit()
+    return {SESSION_EVAL_RUN_KEY: _session_eval_run_row(session_id)}
+
+
+@app.get("/v1/sessions/{session_id}/eval-run", dependencies=[Depends(verify_api_key)])
+def get_session_eval_run(session_id: str) -> Dict[str, str]:
+    """The session's eval run tag, inherited through compression; 404 when none."""
+    for candidate in (session_id, *_session_compression_ancestors(session_id)):
+        tag = _session_eval_run_row(candidate)
+        if tag:
+            return {SESSION_EVAL_RUN_KEY: tag}
+    raise HTTPException(status_code=404, detail="the session has no eval run tag")
+
+
 def _cron_job_origin(job_id: str) -> Optional[tuple[str, str]]:
     """The `(origin, platform)` recorded for a cron job id, or None."""
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
@@ -8971,28 +9051,56 @@ def _feed_status(
 def list_intercepted_events(
     since_id: Optional[int] = None,
     limit: int = FEED_EVENTS_DEFAULT_LIMIT,
+    since: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The event ledger, one row per event a producer forwarded.
 
     Without `since_id`, the newest `limit` rows, newest first — what a page
     shows on load. With `since_id` (including `since_id=0` after an empty
     initial poll), the rows after that id, oldest first, so a poller passes
-    back `next_since_id` and sees each row once, in order. `truncated` says
-    more rows matched than were returned.
+    back `next_since_id` and sees each row once, in order. `since`, a UTC
+    time in the ledger's own `created_at` form (`YYYY-MM-DD HH:MM:SS`),
+    keeps rows from that time on in either order; `truncated` says more rows
+    matched than were returned, counting the window's rows only.
     """
     if since_id is not None:
         since_id = _validate_non_negative_int64(since_id, "since_id")
+    if since is not None:
+        try:
+            # Re-rendered, so an unpadded field cannot reach the string compare.
+            since = datetime.strptime(since, FEED_EVENTS_SINCE_FORMAT).strftime(FEED_EVENTS_SINCE_FORMAT)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="since must be a UTC time of the form YYYY-MM-DD HH:MM:SS",
+            )
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
+    # `created_at` is the same text form, so the string compare is the time
+    # compare and the window is a range of idx_intercepted_events_created_at.
+    # Newest first within a window is read off that index backwards, with the
+    # id as the tie-break inside a second; without a window, by id as before.
+    # One literal statement per shape, so scripts/check_sqlite_query_plans.py
+    # reads each plan (a statement assembled from parts is one it cannot judge).
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
         "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request, "
         "excluded"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
-        if since_id is not None:
+        if since is not None and since_id is not None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE created_at >= ? AND id > ? ORDER BY id ASC LIMIT ?",
+                (since, since_id, limit + 1),
+            ).fetchall()
+        elif since_id is not None:
             rows = conn.execute(
                 f"SELECT {columns} FROM intercepted_events WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (since_id, limit + 1),
+            ).fetchall()
+        elif since is not None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (since, limit + 1),
             ).fetchall()
         else:
             rows = conn.execute(

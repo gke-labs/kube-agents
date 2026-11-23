@@ -104,7 +104,45 @@ readonly LITELLM_BUDGET_MIN_USD="0.01"
 # ─── Data volume size ─────────────────────────────
 # The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
 # disk, which the admission webhook and the chart also take as the limit.
+readonly PLATFORM_AGENT_STORAGE_MI_PER_MI=1
+readonly PLATFORM_AGENT_STORAGE_MI_PER_GI=1024
+readonly PLATFORM_AGENT_STORAGE_MI_PER_TI=1048576
 readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
+
+# ─── Runtime & fleet sizing presets ───────────────
+# spec.deployment.sizingProfile accepted values and the cluster-count
+# thresholds where the operator's "auto" mode steps up to medium and fleet
+# (held equal to sizingMediumClusterThreshold and sizingFleetClusterThreshold in
+# k8s-operator/internal/controller/sizing_profile.go by
+# tests/test_sizing_profile_parity.py).
+readonly PLATFORM_AGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
+readonly PLATFORM_AGENT_SIZING_PROFILE_VALUES="small medium fleet auto"
+readonly CAI_GKE_CLUSTER_ASSET_TYPE="container.googleapis.com/Cluster"
+readonly SIZING_TIER_SMALL="small"
+readonly SIZING_TIER_MEDIUM="medium"
+readonly SIZING_TIER_FLEET="fleet"
+readonly SIZING_PROFILE_AUTO="auto"
+readonly GKE_CLUSTER_MODE_STANDARD="standard"
+readonly SIZING_SCAN_CONTEXT_INSTALL="install"
+readonly SIZING_SCAN_CONTEXT_UPGRADE="upgrade"
+readonly SIZING_SCAN_SKIP_FLAG="skip_scan"
+readonly SIZING_SCAN_PROJ_TMP_TEMPLATE="kube-agents-scan-proj.XXXXXX"
+readonly SIZING_SCAN_ASSET_TMP_TEMPLATE="kube-agents-scan-asset.XXXXXX"
+readonly SIZING_SCAN_CR_TMP_TEMPLATE="kube-agents-scan-cr.XXXXXX"
+readonly CRD_SIZING_PROFILE_JQ='[.spec.versions[]? | select(.storage == true or .served == true) | .schema.openAPIV3Schema.properties.spec.properties.deployment.properties.sizingProfile] | map(select(. != null)) | length > 0'
+readonly CRD_PROBE_SUPPORTED_RC=0
+readonly CRD_PROBE_MISSING_FIELD_RC=1
+readonly CRD_PROBE_UNREADABLE_RC=2
+readonly SIZING_MEDIUM_CLUSTER_THRESHOLD=10
+readonly SIZING_FLEET_CLUSTER_THRESHOLD=25
+readonly SIZING_SCAN_MAX_PROJECT_PROBES=50
+readonly SIZING_FLEET_STORAGE_SIZE_RECOMMENDATION="100Gi"
+readonly SIZING_FLEET_STORAGE_RECOMMENDATION_MI=102400
+readonly SIZING_AGENT_BASE_STORAGE_MI=8192
+readonly SIZING_AGENT_PER_PROFILE_MI=400
+readonly SIZING_SCAN_GCLOUD_CLUSTER_COLUMNS=3
+readonly SIZING_SCAN_LOC_REGEX='^[a-z]+-[a-z0-9-]+$'
+readonly SIZING_SCAN_ASSET_NAME_REGEX='^//container\.googleapis\.com/projects/([^/]+)/(?:locations|zones)/([^/]+)/clusters/([^/]+)$'
 # A GSA account id is 6-30 characters. A cluster name too long for
 # "<cluster>-minter" keeps this many of its characters, plus this many hex
 # characters of its hash (minter_derived_names).
@@ -131,6 +169,7 @@ readonly GATEWAY_HOME_CHANNEL_SLACK_PLATFORM="Slack"
 # `helm get notes` is the command that does.
 readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
 readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_SCHEMA_FILE="values.schema.json"
 readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
 readonly FOOTPRINT_PROBE_KEY="summary"
 readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
@@ -172,6 +211,7 @@ readonly FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN='-var-file|-var[=[:space:]]+
 # terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
 # one pair per line.
 readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.storage.size
+platform_agent_sizing_profile=platformAgent.deployment.sizingProfile
 memory_provider=platformAgent.harness.memory.provider
 hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
 web_console_enabled=webConsole.enabled
@@ -336,6 +376,11 @@ readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
 # slack_home_channel_policy validation holds the same three values.
 readonly SLACK_HOME_CHANNEL_POLICY_AUTO="auto"
 readonly SLACK_HOME_CHANNEL_POLICY_MANUAL="manual"
+# spec.integration.googleChat.homeChannelPolicy takes the same two values on
+# the same terms; Terraform's google_chat_home_channel_policy validation holds
+# the same three.
+readonly GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO="$SLACK_HOME_CHANNEL_POLICY_AUTO"
+readonly GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL="$SLACK_HOME_CHANNEL_POLICY_MANUAL"
 # The prefix of a Google Chat space's resource name, the only home channel
 # form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
 # The gateway and the operator hold the same rule; keep the three in step
@@ -956,17 +1001,75 @@ is_valid_redaction_ip_action() {
 # takes. The CRD's spec.storage.size takes any quantity; this is the narrower
 # subset a disk is sized in. A number with more digits than the limit in Mi is
 # over it in every unit, which keeps the multiply inside Bash's int64.
+_platform_agent_storage_unit_mi() {
+  case "${1:-}" in
+    Mi) printf '%s' "$PLATFORM_AGENT_STORAGE_MI_PER_MI" ;;
+    Gi) printf '%s' "$PLATFORM_AGENT_STORAGE_MI_PER_GI" ;;
+    Ti) printf '%s' "$PLATFORM_AGENT_STORAGE_MI_PER_TI" ;;
+    *) return 1 ;;
+  esac
+}
+
 is_valid_platform_agent_storage_size() {
   [[ "${1:-}" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || return 1
   local unit="${BASH_REMATCH[1]}" number mi_per_unit
   number="${1%"$unit"}"
   [ "${#number}" -le "${#PLATFORM_AGENT_STORAGE_SIZE_MAX_MI}" ] || return 1
-  case "$unit" in
-    Mi) mi_per_unit=1 ;;
-    Gi) mi_per_unit=1024 ;;
-    Ti) mi_per_unit=1048576 ;;
-  esac
+  mi_per_unit="$(_platform_agent_storage_unit_mi "$unit")" || return 1
   [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
+}
+
+# PLATFORM_AGENT_SIZING_PROFILE: one of small, medium, fleet, or auto.
+is_valid_platform_agent_sizing_profile() {
+  local value="${1:-}" item
+  for item in $PLATFORM_AGENT_SIZING_PROFILE_VALUES; do
+    [ "$value" = "$item" ] && return 0
+  done
+  return 1
+}
+
+# Maps a visible or live cluster count to the operator's sizing tier.
+sizing_tier_for_cluster_count() {
+  local count="${1:-0}"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  if [ "$count" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; then
+    printf '%s' "$SIZING_TIER_FLEET"
+  elif [ "$count" -ge "$SIZING_MEDIUM_CLUSTER_THRESHOLD" ]; then
+    printf '%s' "$SIZING_TIER_MEDIUM"
+  else
+    printf '%s' "$SIZING_TIER_SMALL"
+  fi
+}
+
+# Converts a whole Mi/Gi/Ti quantity to MiB (0 when empty or unparseable).
+storage_quantity_to_mi() {
+  local value="${1:-}" unit number mi_per_unit
+  [[ "$value" =~ ^([1-9][0-9]*)(Mi|Gi|Ti)$ ]] || { printf '0'; return 0; }
+  number="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]}"
+  mi_per_unit="$(_platform_agent_storage_unit_mi "$unit")" || { printf '0'; return 0; }
+  printf '%s' "$((number * mi_per_unit))"
+}
+
+# Checks whether the cluster's PlatformAgent CRD declares
+# spec.deployment.sizingProfile.
+# Returns: 0 = supported, 1 = CRD present without field, 2 = unreadable/absent.
+crd_supports_platform_agent_sizing_profile() {
+  command -v kubectl >/dev/null 2>&1 || return "$CRD_PROBE_UNREADABLE_RC"
+  command -v jq >/dev/null 2>&1 || return "$CRD_PROBE_UNREADABLE_RC"
+  local ctx_args=() expected_ctx=""
+  if [ -n "${PROJECT_ID:-}" ] && [ -n "${REGION:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
+    expected_ctx="$(gke_context_name)"
+    kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1 || return "$CRD_PROBE_UNREADABLE_RC"
+    ctx_args=(--context "$expected_ctx")
+  fi
+  local crd_json
+  crd_json="$(trap - ERR; kubectl ${ctx_args[@]+"${ctx_args[@]}"} get crd "$PLATFORM_AGENT_CRD_NAME" -o json --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" 2>/dev/null)" || return "$CRD_PROBE_UNREADABLE_RC"
+  [ -n "$crd_json" ] || return "$CRD_PROBE_UNREADABLE_RC"
+  if printf '%s' "$crd_json" | jq -e "$CRD_SIZING_PROFILE_JQ" >/dev/null 2>&1; then
+    return "$CRD_PROBE_SUPPORTED_RC"
+  fi
+  return "$CRD_PROBE_MISSING_FIELD_RC"
 }
 
 # The value of a top-level `key = value` assignment in a terraform.tfvars file,
@@ -982,7 +1085,8 @@ tfvars_scalar() {
 # Renders the chart's footprint summary for the install terraform.tfvars
 # describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
 # $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
-# the chart is not in the checkout, or the render refuses; the caller decides
+# the chart is not in the checkout, a step of the probe chart's build fails
+# (the probe directory is removed), or the render refuses; the caller decides
 # whether that is worth more than a warning.
 render_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
@@ -1000,14 +1104,15 @@ render_footprint_summary() {
   # only template beside the probe. values.schema.json comes too, so a value
   # the chart would refuse is refused here as well.
   cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
-  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  [ ! -f "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" ] || cp "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
   cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
-  mkdir -p "$probe_dir/templates"
-  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  mkdir -p "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE%/*}" || { rm -rf "$probe_dir"; return 1; }
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}" || { rm -rf "$probe_dir"; return 1; }
   # A ConfigMap, so the output is one YAML document helm's manifest sorter
   # reads; the block scalar keeps the summary's lines as they are.
   printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
-    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}" \
+    || { rm -rf "$probe_dir"; return 1; }
   local -a set_args=()
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue
@@ -1386,11 +1491,11 @@ gateway_home_channel_unset_key() {
 # four arguments. Google Chat first, as the agent picks where home posts go
 # (chat_notify.routed_platforms). A Chat home counts only as a space name, and
 # a Slack home only as a channel id: the gateway arms no route for anything
-# else (the operator's slackChannelID). It cannot see a Slack channel
-# the gateway learned from a mention, which only the cluster records: with
-# that channel learned, the warning for Google Chat still says the gateway
-# keeps its posts, while the agent sends them to Slack. Called when a key is
-# unset, so the platform it prints is the other one.
+# else (the operator's slackChannelID). It cannot see a Slack channel or a
+# Chat space the gateway learned from a mention, which only the cluster
+# records: with one learned, the warning for the other platform still says the
+# gateway keeps its posts, while the agent sends them to the learned home.
+# Called when a key is unset, so the platform it prints is the other one.
 gateway_home_channel_set_platform() {
   local home
   if google_chat_moves_to_a2a_gateway "${2:-}"; then
@@ -1432,7 +1537,7 @@ gateway_home_channel_unset_remedy() {
       ;;
     GOOGLE_CHAT_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
-      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space."
+      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space; or, under homeChannelPolicy auto (the default), mention the agent once, top-level, in the named space you want."
       ;;
   esac
 }
@@ -1768,6 +1873,9 @@ load_install_env() {
   # grow both data claims for one run, and the next run from a clean shell
   # would drop the field again, leaving claims larger than the CR says.
   unset PLATFORM_AGENT_STORAGE_SIZE
+  # The runtime sizing profile too: once install.env exists, only install.env
+  # (or an explicit front-door flag) sets it.
+  unset PLATFORM_AGENT_SIZING_PROFILE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub, and an inherited GITOPS_HOST would
@@ -2373,6 +2481,20 @@ require_slack_home_channel_policy() {
   esac
   [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel-policy"
   print_error "SLACK_HOME_CHANNEL_POLICY is '${value}', which is not ${SLACK_HOME_CHANNEL_POLICY_AUTO} or ${SLACK_HOME_CHANNEL_POLICY_MANUAL} (empty means ${SLACK_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.slack.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
+  return 1
+}
+
+# GOOGLE_CHAT_HOME_CHANNEL_POLICY, on require_slack_home_channel_policy's
+# terms: it renders spec.integration.googleChat.homeChannelPolicy, whose CRD
+# enum accepts the same two spellings. $1 the value; $2 is "flags" when
+# install.sh's flag can set it too, so the remedy names it.
+require_google_chat_home_channel_policy() {
+  local value="${1:-}" via="install.env"
+  case "$value" in
+    "" | "$GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO" | "$GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL") return 0 ;;
+  esac
+  [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel-policy"
+  print_error "GOOGLE_CHAT_HOME_CHANNEL_POLICY is '${value}', which is not ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO} or ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_MANUAL} (empty means ${GOOGLE_CHAT_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.googleChat.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
   return 1
 }
 
@@ -4219,6 +4341,358 @@ if isinstance(value, str) and value:
 '
 }
 
+# The Standard node-pool sizing_profile recorded in Terraform state (empty when
+# unset or unavailable).
+tf_state_sizing_profile() {
+  local state
+  state=$(tf_state_read) || return 0
+  printf '%s' "$state" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+value = (doc.get("outputs", {}).get("sizing_profile") or {}).get("value")
+if isinstance(value, str) and value:
+    sys.stdout.write(value)
+'
+}
+
+# Scans GKE clusters visible to this shell across PROJECT_ID, SCOPE_PROJECTS,
+# SCOPE_FOLDERS and SCOPE_ORGANIZATIONS (honoring SCOPE_EXCLUDE_PROJECTS and
+# SCOPE_EXCLUDE_CLUSTERS), and optionally folds in the live PlatformAgent's
+# status.usage cluster counters when $2 is "true". Best-effort: fails open if
+# gcloud or Cloud Asset API cannot be read so installs/upgrades never abort on
+# advisory telemetry.
+# Sets SIZING_SCAN_* and LIVE_CR_* globals.
+SIZING_SCAN_CLUSTER_COUNT=""
+SIZING_SCAN_GCLOUD_COUNT=""
+SIZING_SCAN_LIVE_CR_COUNT=""
+SIZING_SCAN_TIER=""
+SIZING_SCAN_SOURCE=""
+SIZING_SCAN_INCOMPLETE="false"
+LIVE_CR_SIZING_PROFILE=""
+LIVE_CR_EFFECTIVE_TIER=""
+LIVE_CR_STORAGE_SIZE=""
+LIVE_CR_EXPECTED_CLUSTER_PROFILES=""
+# shellcheck disable=SC2034  # read by upgrade.sh (--upgrade-mode=operator notice)
+LIVE_CR_PRESENT="false"
+
+scan_visible_clusters_in_scope() {
+  local project_id="${1:-${PROJECT_ID:-}}" include_host_cr="${2:-false}"
+  SIZING_SCAN_CLUSTER_COUNT=""
+  SIZING_SCAN_GCLOUD_COUNT=""
+  SIZING_SCAN_LIVE_CR_COUNT=""
+  SIZING_SCAN_TIER=""
+  SIZING_SCAN_SOURCE=""
+  SIZING_SCAN_INCOMPLETE="false"
+  SIZING_SCAN_INCOMPLETE_DETAIL=""
+  LIVE_CR_SIZING_PROFILE=""
+  LIVE_CR_EFFECTIVE_TIER=""
+  LIVE_CR_STORAGE_SIZE=""
+  LIVE_CR_EXPECTED_CLUSTER_PROFILES=""
+  # shellcheck disable=SC2034  # read by upgrade.sh (--upgrade-mode=operator notice)
+  LIVE_CR_PRESENT="false"
+
+  local probe_ok="0" probe_failed="0" scan_incomplete="false" projects_incomplete="false" scope_incomplete="false"
+  local gcloud_proj_file gcloud_asset_file cr_json_file parsed
+  gcloud_proj_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/${SIZING_SCAN_PROJ_TMP_TEMPLATE}")" || return 0
+  gcloud_asset_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/${SIZING_SCAN_ASSET_TMP_TEMPLATE}")" || { rm -f "$gcloud_proj_file"; return 0; }
+  cr_json_file="$(trap - ERR; mktemp "${TMPDIR:-/tmp}/${SIZING_SCAN_CR_TMP_TEMPLATE}")" || { rm -f "$gcloud_proj_file" "$gcloud_asset_file"; return 0; }
+
+  if command -v gcloud >/dev/null 2>&1; then
+    local -a projects=()
+    local item seen_projects=""
+    for item in "$project_id" $(csv_list_items "${SCOPE_PROJECTS:-}"); do
+      [ -n "$item" ] || continue
+      case " ${seen_projects} " in
+        *" ${item} "*) continue ;;
+      esac
+      seen_projects="${seen_projects:+${seen_projects} }${item}"
+      projects+=("$item")
+    done
+
+    local probed=0 proj out loc c_name
+    for proj in "${projects[@]}"; do
+      if [ "$probed" -ge "$SIZING_SCAN_MAX_PROJECT_PROBES" ]; then
+        scan_incomplete="true"
+        projects_incomplete="true"
+        break
+      fi
+      probed=$((probed + 1))
+      if out="$(trap - ERR; gcloud container clusters list --project="$proj" --format="value(name,location)" 2>/dev/null)"; then
+        probe_ok=1
+        while IFS=$'\t' read -r c_name loc _; do
+          [ -n "$c_name" ] && [ -n "$loc" ] || continue
+          printf '%s\t%s\t%s\n' "$proj" "$loc" "$c_name" >> "$gcloud_proj_file"
+        done <<< "$out"
+      else
+        probe_failed=1
+        projects_incomplete="true"
+      fi
+    done
+
+    local folder org
+    for folder in $(csv_list_items "${SCOPE_FOLDERS:-}"); do
+      [ -n "$folder" ] || continue
+      if out="$(trap - ERR; gcloud asset search-all-resources --scope="folders/${folder}" --asset-types="$CAI_GKE_CLUSTER_ASSET_TYPE" --format="value(name)" 2>/dev/null)"; then
+        probe_ok=1
+        [ -z "$out" ] || printf '%s\n' "$out" >> "$gcloud_asset_file"
+      else
+        probe_failed=1
+        scan_incomplete="true"
+        scope_incomplete="true"
+      fi
+    done
+    for org in $(csv_list_items "${SCOPE_ORGANIZATIONS:-}"); do
+      [ -n "$org" ] || continue
+      if out="$(trap - ERR; gcloud asset search-all-resources --scope="organizations/${org}" --asset-types="$CAI_GKE_CLUSTER_ASSET_TYPE" --format="value(name)" 2>/dev/null)"; then
+        probe_ok=1
+        [ -z "$out" ] || printf '%s\n' "$out" >> "$gcloud_asset_file"
+      else
+        probe_failed=1
+        scan_incomplete="true"
+        scope_incomplete="true"
+      fi
+    done
+  fi
+
+  if [ -n "${SCOPE_SHARED_VPC_HOSTS:-}" ] || [ -n "${SCOPE_METRICS_SCOPES:-}" ]; then
+    scan_incomplete="true"
+    scope_incomplete="true"
+  fi
+
+  local has_cr_json="false"
+  if [ "$include_host_cr" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    local cr_ctx_ok="true" cr_ctx_args=() cr_ctx=""
+    if [ -n "${PROJECT_ID:-}" ] && [ -n "${REGION:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
+      cr_ctx="$(gke_context_name)"
+      if kubectl config get-contexts "$cr_ctx" >/dev/null 2>&1; then
+        cr_ctx_args=(--context "$cr_ctx")
+      else
+        cr_ctx_ok="false"
+      fi
+    fi
+    if [ "$cr_ctx_ok" = "true" ] && \
+       kubectl ${cr_ctx_args[@]+"${cr_ctx_args[@]}"} get crd "$PLATFORM_AGENT_CRD_NAME" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" >/dev/null 2>&1 && \
+       kubectl ${cr_ctx_args[@]+"${cr_ctx_args[@]}"} get platformagents -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" -o json --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" > "$cr_json_file" 2>/dev/null; then
+      has_cr_json="true"
+    fi
+  fi
+
+  parsed="$(python3 -c '
+import fnmatch, json, pathlib, re, sys
+
+proj_file, asset_file, cr_file = sys.argv[1:4]
+has_cr_json = sys.argv[4] == "true"
+probe_ok = sys.argv[5] == "1"
+host_project_id, host_project_number = sys.argv[6], sys.argv[7]
+excl_projects_raw, excl_clusters_raw = sys.argv[8], sys.argv[9]
+gcloud_cluster_col_count = int(sys.argv[10])
+loc_re = re.compile(sys.argv[11])
+asset_re = re.compile(sys.argv[12])
+
+def csv_tokens(raw):
+    return [t for t in re.split(r"[\s,]+", raw.strip()) if t]
+
+excl_projects = csv_tokens(excl_projects_raw)
+excl_clusters = set(csv_tokens(excl_clusters_raw))
+
+def canonical_project(tok):
+    if host_project_number and host_project_id and tok == host_project_number:
+        return host_project_id
+    return tok
+
+def is_excluded(proj, loc, name):
+    if any(fnmatch.fnmatchcase(proj, pat) for pat in excl_projects):
+        return True
+    return f"{proj}/{loc}/{name}" in excl_clusters
+
+clusters = set()
+for line in pathlib.Path(proj_file).read_text(encoding="utf-8").splitlines():
+    parts = line.split("\t")
+    if len(parts) != gcloud_cluster_col_count:
+        continue
+    proj, loc, name = (p.strip() for p in parts)
+    if not (proj and name and loc_re.match(loc)):
+        continue
+    proj = canonical_project(proj)
+    if not is_excluded(proj, loc, name):
+        clusters.add((proj, loc, name))
+
+for line in pathlib.Path(asset_file).read_text(encoding="utf-8").splitlines():
+    m = asset_re.match(line.strip())
+    if not m:
+        continue
+    proj, loc, name = m.group(1), m.group(2), m.group(3)
+    proj = canonical_project(proj)
+    if not is_excluded(proj, loc, name):
+        clusters.add((proj, loc, name))
+
+live_cr_count = ""
+cr_sizing = ""
+cr_tier = ""
+cr_storage = ""
+cr_expected = ""
+cr_present = "false"
+if has_cr_json:
+    try:
+        data = json.loads(pathlib.Path(cr_file).read_text(encoding="utf-8"))
+        items = data.get("items") or []
+        if items:
+            cr_present = "true"
+            item = items[0]
+            spec = item.get("spec") or {}
+            status = item.get("status") or {}
+            dep = spec.get("deployment") or {}
+            storage = spec.get("storage") or {}
+            usage = status.get("usage") or {}
+            if isinstance(dep.get("sizingProfile"), str):
+                cr_sizing = dep["sizingProfile"]
+            if isinstance(status.get("effectiveSizingTier"), str):
+                cr_tier = status["effectiveSizingTier"]
+            if isinstance(storage.get("size"), str):
+                cr_storage = storage["size"]
+            if isinstance(storage.get("expectedClusterProfiles"), int):
+                cr_expected = str(storage["expectedClusterProfiles"])
+            counts = []
+            for key in ("clustersRegistered", "clustersMonitored"):
+                val = usage.get(key)
+                if isinstance(val, int) and val >= 0:
+                    counts.append(val)
+            if counts:
+                live_cr_count = str(max(counts))
+    except Exception:
+        pass
+
+gcloud_count = str(len(clusters)) if probe_ok else ""
+best = ""
+if gcloud_count and live_cr_count:
+    best = str(max(int(gcloud_count), int(live_cr_count)))
+elif gcloud_count:
+    best = gcloud_count
+elif live_cr_count:
+    best = live_cr_count
+
+print(f"{best}|{gcloud_count}|{live_cr_count}|{cr_sizing}|{cr_tier}|{cr_storage}|{cr_expected}|{cr_present}")
+' "$gcloud_proj_file" "$gcloud_asset_file" "$cr_json_file" "$has_cr_json" "$probe_ok" "$project_id" "${PROJECT_NUMBER:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "$SIZING_SCAN_GCLOUD_CLUSTER_COLUMNS" "$SIZING_SCAN_LOC_REGEX" "$SIZING_SCAN_ASSET_NAME_REGEX" 2>/dev/null)" || parsed=""
+
+  rm -f "$gcloud_proj_file" "$gcloud_asset_file" "$cr_json_file"
+  [ -n "$parsed" ] || return 0
+
+  # shellcheck disable=SC2034  # LIVE_CR_PRESENT is read by upgrade.sh (--upgrade-mode=operator notice)
+  IFS='|' read -r SIZING_SCAN_CLUSTER_COUNT SIZING_SCAN_GCLOUD_COUNT SIZING_SCAN_LIVE_CR_COUNT \
+    LIVE_CR_SIZING_PROFILE LIVE_CR_EFFECTIVE_TIER LIVE_CR_STORAGE_SIZE LIVE_CR_EXPECTED_CLUSTER_PROFILES LIVE_CR_PRESENT <<< "$parsed"
+
+  if [ -n "$SIZING_SCAN_CLUSTER_COUNT" ]; then
+    SIZING_SCAN_TIER="$(sizing_tier_for_cluster_count "$SIZING_SCAN_CLUSTER_COUNT")"
+    if [ -n "$SIZING_SCAN_GCLOUD_COUNT" ] && [ -n "$SIZING_SCAN_LIVE_CR_COUNT" ]; then
+      SIZING_SCAN_SOURCE="${SIZING_SCAN_GCLOUD_COUNT} visible via gcloud, ${SIZING_SCAN_LIVE_CR_COUNT} in live PlatformAgent status.usage"
+    elif [ -n "$SIZING_SCAN_GCLOUD_COUNT" ]; then
+      SIZING_SCAN_SOURCE="discovered across configured GCP scope"
+    else
+      SIZING_SCAN_SOURCE="live PlatformAgent status.usage"
+    fi
+  fi
+  if [ "$scan_incomplete" = "true" ] || [ "$probe_failed" -gt 0 ]; then
+    SIZING_SCAN_INCOMPLETE="true"
+    if [ "$projects_incomplete" = "true" ] && [ "$scope_incomplete" = "true" ]; then
+      SIZING_SCAN_INCOMPLETE_DETAIL="listed SCOPE_PROJECTS targets or folder, organization, Shared VPC, or Metrics Scope targets"
+    elif [ "$projects_incomplete" = "true" ]; then
+      SIZING_SCAN_INCOMPLETE_DETAIL="listed SCOPE_PROJECTS targets (probe failure or >${SIZING_SCAN_MAX_PROJECT_PROBES} project cap)"
+    else
+      SIZING_SCAN_INCOMPLETE_DETAIL="some folder, organization, Shared VPC, or Metrics Scope targets"
+    fi
+  fi
+}
+
+# Prints cluster-count scan findings and actionable runtime / Standard node-pool /
+# storage recommendations across install.sh and upgrade.sh.
+# Args: <context: install|upgrade> <project_id> <cluster_mode> [create_cluster] [skip_scan]
+report_cluster_sizing_guidance() {
+  local context="${1:-$SIZING_SCAN_CONTEXT_INSTALL}" project_id="${2:-${PROJECT_ID:-}}" cluster_mode="${3:-}" create_cluster="${4:-false}" skip_scan="${5:-false}"
+  local include_cr="false"
+  if [ "$context" = "$SIZING_SCAN_CONTEXT_UPGRADE" ] || [ "$create_cluster" = "false" ]; then
+    include_cr="true"
+  fi
+
+  if [ "$skip_scan" != "$SIZING_SCAN_SKIP_FLAG" ]; then
+    scan_visible_clusters_in_scope "$project_id" "$include_cr"
+  fi
+  local configured_profile="${PLATFORM_AGENT_SIZING_PROFILE:-$DEFAULT_PLATFORM_AGENT_SIZING_PROFILE}"
+  local effective_storage="${PLATFORM_AGENT_STORAGE_SIZE:-${LIVE_CR_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}}"
+
+  if [ -n "$SIZING_SCAN_CLUSTER_COUNT" ]; then
+    local live_note=""
+    if [ -n "$LIVE_CR_SIZING_PROFILE" ] && [ "$LIVE_CR_SIZING_PROFILE" != "$configured_profile" ]; then
+      live_note="; live CR currently sets '${LIVE_CR_SIZING_PROFILE}'"
+    fi
+    print_info "Cluster sizing scan: ${SIZING_SCAN_CLUSTER_COUNT} cluster(s) in scope (${SIZING_SCAN_SOURCE}) -> recommended runtime tier '${SIZING_SCAN_TIER}' (spec.deployment.sizingProfile='${configured_profile}'${live_note})."
+    if [ "$SIZING_SCAN_INCOMPLETE" = "true" ]; then
+      local incomplete_detail="${SIZING_SCAN_INCOMPLETE_DETAIL:-some folder, organization, Shared VPC, or Metrics Scope targets}"
+      if [ "$configured_profile" = "$SIZING_PROFILE_AUTO" ]; then
+        print_info "Note: ${incomplete_detail} could not be enumerated yet; once registered, spec.deployment.sizingProfile='${SIZING_PROFILE_AUTO}' adjusts upward automatically where quota allows."
+      else
+        print_info "Note: ${incomplete_detail} could not be enumerated yet; visible count excludes unprobed targets (runtime profile is pinned at '${configured_profile}')."
+      fi
+    fi
+
+    if { [ "$configured_profile" = "$SIZING_TIER_SMALL" ] && [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_MEDIUM_CLUSTER_THRESHOLD" ]; } || \
+       { [ "$configured_profile" = "$SIZING_TIER_MEDIUM" ] && [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; }; then
+      print_warning "Configured PLATFORM_AGENT_SIZING_PROFILE='${configured_profile}' pins runtime pods below the '${SIZING_SCAN_TIER}' tier recommended for ${SIZING_SCAN_CLUSTER_COUNT} cluster(s)."
+      print_info "Omit PLATFORM_AGENT_SIZING_PROFILE (defaults to '${SIZING_PROFILE_AUTO}') or set PLATFORM_AGENT_SIZING_PROFILE='${SIZING_SCAN_TIER}' in install.env."
+    fi
+
+    local runtime_is_fleet="false"
+    if [ "$configured_profile" = "$SIZING_TIER_FLEET" ] || \
+       { [ "$configured_profile" = "$SIZING_PROFILE_AUTO" ] && [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; } || \
+       [ "$LIVE_CR_EFFECTIVE_TIER" = "$SIZING_TIER_FLEET" ]; then
+      runtime_is_fleet="true"
+    fi
+
+    if [ "$cluster_mode" = "$GKE_CLUSTER_MODE_STANDARD" ] && \
+       { [ "$runtime_is_fleet" = "true" ] || [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ]; }; then
+      local tf_node_profile="${TF_VAR_sizing_profile:-}"
+      if [ -z "$tf_node_profile" ] && [ "$create_cluster" != "true" ]; then
+        tf_node_profile="$(tf_state_sizing_profile 2>/dev/null || true)"
+      fi
+      if [ -z "${TF_VAR_standard_machine_type:-}" ] && [ "$tf_node_profile" != "$SIZING_TIER_FLEET" ]; then
+        if [ "$runtime_is_fleet" = "true" ]; then
+          local fleet_trigger="configured/live '${SIZING_TIER_FLEET}' runtime profile"
+          if [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ] && [ "$configured_profile" = "$SIZING_PROFILE_AUTO" ]; then
+            fleet_trigger="${SIZING_SCAN_CLUSTER_COUNT} cluster(s) trigger the '${SIZING_TIER_FLEET}' runtime tier"
+          fi
+          if [ "$create_cluster" = "true" ]; then
+            print_info "GKE Standard host recommendation: ${fleet_trigger}; set TF_VAR_sizing_profile=${SIZING_TIER_FLEET} (or >= 8 vCPU nodes such as e2-standard-8) so the credential proxy's 4 vCPU request schedules."
+          else
+            print_warning "GKE Standard fleet host note: ${fleet_trigger} (credential-proxy requests 4 vCPU), which does not fit on default '${SIZING_TIER_SMALL}' e2-standard-4 nodes."
+            print_info "Ensure a Standard node pool has >= 8 vCPU nodes (for example, set TF_VAR_sizing_profile=${SIZING_TIER_FLEET} in install.env alongside any explicit standard_*/gvisor_* inputs kept by guard_node_pool_shape; changing a pool's machine type replaces its nodes)."
+          fi
+        else
+          print_info "GKE Standard host note: ${SIZING_SCAN_CLUSTER_COUNT} cluster(s) sit in the '${SIZING_TIER_FLEET}' range (>= ${SIZING_FLEET_CLUSTER_THRESHOLD}), but runtime is pinned to '${configured_profile}'; raising to '${SIZING_PROFILE_AUTO}' or '${SIZING_TIER_FLEET}' later will require >= 8 vCPU Standard nodes (TF_VAR_sizing_profile=${SIZING_TIER_FLEET})."
+        fi
+      fi
+    fi
+
+    local storage_mi
+    storage_mi="$(storage_quantity_to_mi "$effective_storage")"
+    if [ "$SIZING_SCAN_CLUSTER_COUNT" -ge "$SIZING_FLEET_CLUSTER_THRESHOLD" ] && [ "$storage_mi" -gt 0 ] && [ "$storage_mi" -lt "$SIZING_FLEET_STORAGE_RECOMMENDATION_MI" ]; then
+      print_info "Storage sizing recommendation: at ${SIZING_SCAN_CLUSTER_COUNT} cluster(s), set PLATFORM_AGENT_STORAGE_SIZE=${SIZING_FLEET_STORAGE_SIZE_RECOMMENDATION} in install.env (current effective size: ${effective_storage})."
+    fi
+
+    local formula_mi crossover_profiles cr_expected="${LIVE_CR_EXPECTED_CLUSTER_PROFILES:-0}"
+    [[ "$cr_expected" =~ ^[0-9]+$ ]] || cr_expected=0
+    formula_mi=$((SIZING_AGENT_BASE_STORAGE_MI + SIZING_SCAN_CLUSTER_COUNT * SIZING_AGENT_PER_PROFILE_MI))
+    if [ "$storage_mi" -gt 0 ] && [ "$formula_mi" -gt "$storage_mi" ] && [ "$cr_expected" -lt "$SIZING_SCAN_CLUSTER_COUNT" ]; then
+      crossover_profiles=0
+      if [ "$storage_mi" -gt "$SIZING_AGENT_BASE_STORAGE_MI" ]; then
+        crossover_profiles=$(( (storage_mi - SIZING_AGENT_BASE_STORAGE_MI) / SIZING_AGENT_PER_PROFILE_MI ))
+      fi
+      print_info "Large-fleet storage recommendation: at ${SIZING_SCAN_CLUSTER_COUNT} cluster(s), the 8Gi + N x 400Mi provisioning formula passes ${effective_storage} (~${crossover_profiles} profiles); set spec.storage.expectedClusterProfiles=${SIZING_SCAN_CLUSTER_COUNT} on the PlatformAgent CR (or platformAgent.storage.expectedClusterProfiles=${SIZING_SCAN_CLUSTER_COUNT} via TF_VAR_extra_helm_values) to size the agent volume to 8Gi + N x 400Mi."
+    fi
+  fi
+}
+
 # The image tag an install is currently serving, read off the agent Deployment.
 #
 # The Deployment rather than the Helm release: `helm get values` reports what
@@ -5406,6 +5880,7 @@ write_tfvars_from_state() {
   # would name the variable after the interview, or after the Day-2 menu has
   # rewritten install.env. Every route to Terraform passes here.
   require_slack_home_channel_policy "${SLACK_HOME_CHANNEL_POLICY:-}" || return 1
+  require_google_chat_home_channel_policy "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: the chart refuses to render
   # openai_compatible without these, and upgrade.sh regenerates without
   # install.sh's interview.
@@ -5476,6 +5951,11 @@ write_tfvars_from_state() {
   local platform_agent_storage_size="${PLATFORM_AGENT_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}"
   if ! is_valid_platform_agent_storage_size "$platform_agent_storage_size"; then
     print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
+    return 1
+  fi
+  local platform_agent_sizing_profile="${PLATFORM_AGENT_SIZING_PROFILE:-$DEFAULT_PLATFORM_AGENT_SIZING_PROFILE}"
+  if ! is_valid_platform_agent_sizing_profile "$platform_agent_sizing_profile"; then
+    print_error "PLATFORM_AGENT_SIZING_PROFILE='${platform_agent_sizing_profile}' must be one of small, medium, fleet, or auto (empty defaults to '${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE}'). Fix it in install.env, or on a first install, in the value this shell exports."
     return 1
   fi
   # Refused when the web console is on and the operator has accepted an
@@ -5588,6 +6068,10 @@ write_tfvars_from_state() {
     echo "# install.env). The composition passes the chart nothing for the default."
     echo "platform_agent_storage_size = $(hcl_str "$platform_agent_storage_size")"
     echo ""
+    echo "# The PlatformAgent's spec.deployment.sizingProfile"
+    echo "# (PLATFORM_AGENT_SIZING_PROFILE in install.env, default auto)."
+    echo "platform_agent_sizing_profile = $(hcl_str "$platform_agent_sizing_profile")"
+    echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."
     if is_truthy "$redaction_enabled"; then
@@ -5675,6 +6159,7 @@ write_tfvars_from_state() {
     echo "chat_subscription_name    = $(hcl_str "$chat_sub")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"
     echo "google_chat_home_channel  = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+    echo "google_chat_home_channel_policy = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}")"
     echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}")"
     echo ""
     echo "enable_slack            = $(hcl_bool "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}")"
@@ -5749,6 +6234,10 @@ write_tfvars_from_state() {
     # Read from install.env (or the environment) only: no flag or interview
     # question sets it, so install.sh exports nothing over it. See the variable.
     echo "helm_upgrade_install = $(hcl_bool "$helm_upgrade_install")"
+    echo ""
+    # The same: install.env (or the environment) only. Unset, or any spelling
+    # is_truthy does not take, renders false, the stop's default.
+    echo "card_stop_enabled = $(hcl_bool "${CARD_STOP_ENABLED:-}")"
     echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."

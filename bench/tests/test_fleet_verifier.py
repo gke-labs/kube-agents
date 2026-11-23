@@ -1349,74 +1349,8 @@ _PATH_SCOPED_ABSENT_WITNESSES[
 
 
 # The ComputeClass fixtures on slot c (defects-c.tf): the workload that names
-# the class through nodeAffinity alone. `present` is what the remediation
-# would write; `absent` is the object as planted.
-_PATH_SCOPED_ABSENT_WITNESSES[
-    "ccc-prefilter-nodeaffinity-bypass/audit-did-not-add-the-compute-class-selector"
-] = {
-    # What `kubectl patch deployment app-worker-b -n seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'` writes.
-    "present": {
-        "kind": "Deployment",
-        "metadata": {"name": "app-worker-b", "namespace": "seeded-compute-class"},
-        "spec": {
-            "replicas": 1,
-            "template": {
-                "metadata": {"labels": {"app": "app-worker-b"}},
-                "spec": {
-                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [
-                                    {
-                                        "matchExpressions": [
-                                            {
-                                                "key": "cloud.google.com/compute-class",
-                                                "operator": "In",
-                                                "values": ["general-ccc"],
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        }
-                    },
-                    "containers": [{"name": "worker"}],
-                },
-            },
-        },
-    },
-    "absent": {
-        "kind": "Deployment",
-        "metadata": {"name": "app-worker-b", "namespace": "seeded-compute-class"},
-        "spec": {
-            "replicas": 1,
-            "template": {
-                "metadata": {"labels": {"app": "app-worker-b"}},
-                "spec": {
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [
-                                    {
-                                        "matchExpressions": [
-                                            {
-                                                "key": "cloud.google.com/compute-class",
-                                                "operator": "In",
-                                                "values": ["general-ccc"],
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        }
-                    },
-                    "containers": [{"name": "worker"}],
-                },
-            },
-        },
-    },
-}
+# no class. `present` is what the remediation would write; `absent` is the
+# object as planted.
 _PATH_SCOPED_ABSENT_WITNESSES[
     "obtainability-untargeted-compute-class-manifest/audit-did-not-add-the-compute-class-selector"
 ] = {
@@ -1452,78 +1386,9 @@ _PATH_SCOPED_ABSENT_WITNESSES[
 }
 
 
-# The ComputeClass fixtures on slot c (defects-c.tf): the untargeted workload
-# and the labelled, untainted pool. `present` is what each remediation would
-# write; `absent` is the object as planted.
-_PATH_SCOPED_ABSENT_WITNESSES[
-    "ccc-prefilter-missing-nodeselector-drop/audit-did-not-add-the-compute-class-selector"
-] = {
-    # What `kubectl patch deployment app-worker-a -n seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'` writes.
-    "present": {
-        "kind": "Deployment",
-        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
-        "spec": {
-            "replicas": 3,
-            "template": {
-                "metadata": {"labels": {"app": "app-worker-a"}},
-                "spec": {
-                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
-                    "containers": [{"name": "worker"}],
-                },
-            },
-        },
-    },
-    "absent": {
-        "kind": "Deployment",
-        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
-        "spec": {
-            "replicas": 3,
-            "template": {
-                "metadata": {"labels": {"app": "app-worker-a"}},
-                "spec": {"containers": [{"name": "worker"}]},
-            },
-        },
-    },
-}
-_PATH_SCOPED_ABSENT_WITNESSES[
-    "ccc-prefilter-missing-nodeselector-drop/audit-did-not-add-a-compute-class-affinity"
-] = {
-    # What a remediation that targets the class through a required
-    # nodeAffinity term, the other targeting path, writes.
-    "present": {
-        "kind": "Deployment",
-        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
-        "spec": {
-            "replicas": 3,
-            "template": {
-                "metadata": {"labels": {"app": "app-worker-a"}},
-                "spec": {
-                    "affinity": {
-                        "nodeAffinity": {
-                            "requiredDuringSchedulingIgnoredDuringExecution": {
-                                "nodeSelectorTerms": [
-                                    {
-                                        "matchExpressions": [
-                                            {
-                                                "key": "cloud.google.com/compute-class",
-                                                "operator": "In",
-                                                "values": ["general-ccc"],
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        }
-                    },
-                    "containers": [{"name": "worker"}],
-                },
-            },
-        },
-    },
-    "absent": _PATH_SCOPED_ABSENT_WITNESSES[
-        "ccc-prefilter-missing-nodeselector-drop/audit-did-not-add-the-compute-class-selector"
-    ]["absent"],
-}
+# The ComputeClass fixtures on slot c (defects-c.tf): the labelled, untainted
+# pool. `present` is what the remediation would write; `absent` is the object
+# as planted.
 _PATH_SCOPED_ABSENT_WITNESSES[
     "ccc-untainted-node-pool-absorption/audit-did-not-taint-the-class-pool"
 ] = {
@@ -2046,7 +1911,7 @@ def _provision(shell, tmp_path, **env) -> Path:
         ),
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation seeded-intent"
-            " seeded-token seeded-headroom seeded-qos seeded-stall seeded-upgrade seeded-topology seeded-shapes seeded-defaults"
+            " seeded-token seeded-headroom seeded-family seeded-qos seeded-stall seeded-upgrade seeded-topology seeded-shapes seeded-defaults"
             " seeded-scaled-zero seeded-compute-class"
         ),
         # Most tests are about discovery and presence, not the credential, so
@@ -2754,6 +2619,19 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
                 continue
             if seeded_by_provisioning(role, subject):
                 seen += 1
+                continue
+            if subject.startswith("reservation/"):
+                # The project's reservations, which no apply creates: the
+                # fixture is that the one a pool names is not there. So the
+                # assertion is that no reservation has exactly that name, and
+                # its tie to the Terraform is the name that the pool consumes.
+                seen += 1
+                name = subject[len("reservation/") :].rstrip("*")
+                assert (assertion["op"], assertion["path"], assertion["value"]) == ("none_eq", "name", name), (role, subject, assertion)
+                assert re.search(rf'values\s*=\s*\["{re.escape(name)}"\]', body), (
+                    f"role {role!r} asserts that no reservation {name!r} exists, but no pool in main.tf or "
+                    f"defects-{entry['cluster_slot']}.tf consumes a reservation of that name"
+                )
                 continue
             if "?" in subject:
                 selector = subject.split("?", 1)[1]

@@ -95,7 +95,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `persona-cluster` | `ghcr.io/gke-labs/kube-agents/persona-cluster` | release tag | — | The worker pods of the cluster AgentProfile, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
 | `persona-tse` | `ghcr.io/gke-labs/kube-agents/persona-tse` | release tag | — | The worker pods of the tse AgentProfile, when the chart's profiles.tse.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
 | `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders. |
-| `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders (and the opt-in MCP server and OKF memory curator Deployments when A2A_MCP_DOOR or A2A_CURATOR is set). |
+| `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders, the MCP server Deployment it renders unless `operator.mcpServer.enabled` is `false`, and the opt-in OKF memory curator Deployment when A2A_CURATOR is set. |
 | `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders. It resolves the same way the gateway, the worker and the callout do. |
 | `a2a-dispatcher` | `ghcr.io/gke-labs/kube-agents/a2a-dispatcher` | release tag | `A2A_DISPATCHER_IMAGE` | The AgentProfile dispatcher Deployment the operator renders unless `operator.profileDispatcher.enabled` is `false`. |
 | `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) when that image is the release platform-agent image by tag, else from the operator's release set, unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
@@ -378,7 +378,15 @@ images first with `INCLUDE=build-time`, and use `crane` or `skopeo` rather than 
 Hermes pin is by digest, and a `docker pull`/`push` round trip changes it. A mirrored `golang` copy
 is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`.
 A later bump of the `go` directive in `k8s-operator/go.mod` past that patch therefore fails the
-rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
+rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION` on
+the same `make` command, for a tag that the mirror holds.
+
+A rebuilt `platform-agent` image needs a `hermes-bridge` image at the same registry path and tag
+for the bridge sidecar. `make docker-build-hermes-bridge` with the same variables builds the agent
+image and the bridge image from it; otherwise set `A2A_BRIDGE_IMAGE` on the operator to a bridge
+image built another way. The operator takes the `credential-proxy` image from the agent image in
+the same way: build it with `make docker-build-credential-proxy` and the same variables, or set
+`CREDENTIAL_PROXY_IMAGE` on the operator.
 
 ### Registry authentication
 
@@ -425,4 +433,4 @@ yourself from the mirror and set `enable_cert_manager = false`.
 
 ## Local builds
 
-`make docker-build` at the repository root builds the agent, credential-proxy, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.
+`make docker-build` at the repository root builds the agent, credential-proxy, hermes-bridge, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one, and `make docker-build-hermes-bridge` builds the agent image and the bridge image from it. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.
