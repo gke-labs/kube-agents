@@ -239,9 +239,9 @@ LEDGER_TIMEOUT_SECONDS = 2.0
 #: the opener's word (the claim proves the url, not the target), so the check
 #: re-checks the workload rather than trusting the row. The record is written only for a claimed proposal whose finding is of a known kind
 #: while the switch is not ``off``; the check still verifies the fix itself.
-#: ``session_kv_server.POST_MERGE_KINDS`` is the server's copy; a test pins them.
+#: The kinds are the fix recipes' (``fix_recipes/registry.py`` beside the shared
+#: scripts), which ``session_kv_server.POST_MERGE_KINDS`` reads too.
 POST_MERGE_PATH = "/v1/post-merge/records"
-POST_MERGE_KINDS = frozenset({"no-pdb"})
 POST_MERGE_SWITCH = "POST_MERGE_CHECK"
 #: What the record costs at most: the card's thread read and the write, plus
 #: half a second of margin. Skipped when less than this is left before the claim
@@ -490,11 +490,23 @@ def card_thread(task_id):
     return tuple(str(value or "") for value in row) if row else NO_THREAD
 
 
+def post_merge_kinds():
+    """The kinds of fix the post-merge check records, from the fix recipes. Empty, logged, when unreadable."""
+    try:
+        _on_scripts_path()
+        from fix_recipes import registry
+
+        return registry.kinds()
+    except Exception as exc:  # noqa: BLE001 — no record rather than a failed claim
+        logger.warning("pr_opened: the fix recipes are unreadable: %r", exc)
+        return frozenset()
+
+
 def post_merge_target(target):
     """``target``'s :data:`TARGET_KEYS` when it names a finding of a kind the check knows, else None."""
     if not isinstance(target, dict) or not all(isinstance(target.get(key), str) for key in TARGET_KEYS):
         return None
-    if target["finding_id"].split(".", 1)[0] not in POST_MERGE_KINDS or not target["object"]:
+    if target["finding_id"].split(".", 1)[0] not in post_merge_kinds() or not target["object"]:
         return None
     return {key: target[key] for key in TARGET_KEYS}
 

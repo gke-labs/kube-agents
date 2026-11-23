@@ -59,7 +59,7 @@ A reply that arrives as edits to a streamed message, rather than through
 ``send_final_ledgered``, is drawn as upstream draws it, and its claim is
 dropped as an unsent one is.
 
-Under ``spec.mode: next`` a wake's reply in an alert's thread is sent by the
+Where the gateway holds the platform, a wake's reply in an alert's thread is sent by the
 kanban notifier's chat.notify stand-in (``kanban_chat_notify``), which has no
 blocks to hand :func:`maybe_blocks`. It asks :func:`chat_for` instead, under
 the same mark: the reply's first sentence as the headline, the rest as the
@@ -184,7 +184,7 @@ def _wake_note() -> str:
 
 def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
     """Mark ``sub``'s thread when this wake announces a failure on a platform whose
-    replies are laid out: Slack, or Google Chat under ``spec.mode: next``
+    replies are laid out: Slack, or Google Chat where the gateway serves it
     (``kanban_notifier.chat_ux_on``)."""
     try:
         if not _chat_ux_on(sub.get("platform")):
@@ -291,8 +291,8 @@ def _slack_key(source: Any) -> Optional[tuple[str, str, str]]:
 
 def _chat_ux_on(platform: Any) -> bool:
     """Whether ``platform``'s failure replies are laid out: Slack with the flag on, or Google
-    Chat with the flag on where the gateway serves it (``spec.mode: next``, where the A2A
-    gateway lays the reply out; under ``today`` Google Chat takes text). Anything wrong
+    Chat with the flag on where the gateway serves it (the A2A gateway lays the reply
+    out; Hermes's own Google Chat adapter takes text). Anything wrong
     reads as off."""
     name = str(platform or "").strip().lower()
     if not enabled():

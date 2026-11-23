@@ -13,10 +13,13 @@ for the same Helm release.
 """
 
 import importlib.util
+import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -32,7 +35,7 @@ _TF_VARIABLES = _REPO_ROOT / "terraform" / "examples" / "full-install" / "variab
 _RECONCILE_SH = _REPO_ROOT / "scripts" / "release" / "reconcile_environment.sh"
 _UPGRADE_SH = _REPO_ROOT / "upgrade.sh"
 
-_LONG_LIVED = ("autopush", "autopush-next", "staging")
+_LONG_LIVED = ("autopush", "staging")
 
 
 def _executable_lines(chunk):
@@ -416,7 +419,7 @@ class ReconcileWorkflowTest(unittest.TestCase):
 
     def test_every_deploy_dispatch_can_pass_the_bypass(self):
         """The deploy workflows' own image_tag dispatch is where a refused rollback is retried."""
-        for name in ("autopush-deploy.yml", "autopush-next-deploy.yml", "staging-deploy.yml"):
+        for name in ("autopush-deploy.yml", "staging-deploy.yml"):
             with self.subTest(workflow=name):
                 doc = _doc(_WORKFLOWS / name)
                 triggers = doc.get("on") or doc.get(True)
@@ -537,7 +540,7 @@ class PreflightLookupTest(unittest.TestCase):
                 "GITHUB_API_URL": "https://api.github.invalid",
                 "GH_TOKEN": "token",
                 "REPOSITORY": "gke-labs/kube-agents",
-                "TARGET": "autopush-next",
+                "TARGET": "unprovisioned",
                 "SKIP_UNCONFIGURED": "true",
             }
             proc = subprocess.run(["bash", "-c", self.script], env=env, capture_output=True, text=True, check=False)
@@ -587,10 +590,9 @@ class DriftWorkflowTest(unittest.TestCase):
         report = self.doc["jobs"]["report"]["strategy"]["matrix"]["environment"]
         self.assertEqual(sorted(report), sorted(plan))
 
-    def test_only_autopush_next_may_skip_while_unprovisioned(self):
+    def test_no_environment_may_skip_while_unprovisioned(self):
         """A missing autopush or staging is a failure, not something to skip."""
-        self.assertEqual(self.doc["jobs"]["plan"]["with"]["skip_unconfigured"],
-                         "${{ matrix.environment == 'autopush-next' }}")
+        self.assertNotIn("skip_unconfigured", self.doc["jobs"]["plan"]["with"])
 
     def test_it_pins_no_image_tag(self):
         """Otherwise the report conflates image lag with infrastructure drift."""
@@ -694,7 +696,7 @@ class RebuildLeaseGuardTest(unittest.TestCase):
                 "FAKE_LEASE": lease,
                 "FAKE_STATE": state,
                 "FAKE_PROJECT_CLUSTERS": project_clusters,
-                "TARGET": "autopush-next",
+                "TARGET": "staging",
                 "GCP_PROJECT_ID": "p",
                 "GCP_REGION": "us-central1",
                 "GKE_CLUSTER_NAME": "platform-agent-host",
@@ -1126,6 +1128,141 @@ class ReportDriftTest(unittest.TestCase):
         self.assertEqual(totals, "")
         self.assertEqual(actions, [])
         self.assertFalse(destructive)
+
+
+class LeaseLeakRecoveryTest(unittest.TestCase):
+    """#6381: a failed release no longer blocks every reconcile for the lease's TTL.
+
+    Runs the script's own lease code -- `release_lease` and the apply branch's
+    lease block, cut out of reconcile_environment.sh -- under bash, with
+    `live_test_lease.py` and `reconcile_lease_predecessor.py` stubbed through a
+    python3 shim that passes every other call to the real interpreter.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.text = _RECONCILE_SH.read_text()
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        real = sys.executable
+        shim = self.tmp / "bin" / "python3"
+        shim.parent.mkdir()
+        shim.write_text(
+            "#!/bin/bash\n"
+            "case \"$1\" in\n"
+            "  */live_test_lease.py) shift; echo \"lease $*\" >> \"$STUB_LOG\";\n"
+            "    case \"$1\" in\n"
+            "      acquire) exit \"${STUB_ACQUIRE_RC:-1}\" ;;\n"
+            "      status) printf '%%s' \"$STUB_STATUS\"; exit 0 ;;\n"
+            "      takeover) exit \"${STUB_TAKEOVER_RC:-0}\" ;;\n"
+            "      release) echo \"$STUB_RELEASE_OUT\"; exit \"${STUB_RELEASE_RC:-0}\" ;;\n"
+            "    esac; exit 9 ;;\n"
+            "  */reconcile_lease_predecessor.py) shift; echo \"predecessor $*\" >> \"$STUB_LOG\";\n"
+            "    printf '%%s' \"$STUB_PREDECESSOR\"; exit 0 ;;\n"
+            "esac\n"
+            "exec %s \"$@\"\n" % real)
+        shim.chmod(0o755)
+
+    def _cut(self, start, end_re):
+        i = self.text.index(start)
+        m = re.compile(end_re, re.MULTILINE).search(self.text, i)
+        self.assertIsNotNone(m, "no end after %r" % start)
+        return self.text[i:m.end()]
+
+    def _run(self, body, **env):
+        import subprocess
+        log = self.tmp / "calls.log"
+        summary = self.tmp / "summary.md"
+        log.write_text("")
+        summary.write_text("")
+        script = (
+            "set -uo pipefail\n"
+            'REPO_ROOT=/repo; ENV_NAME=autopush; MODE=apply; LEASE_POLICY="${LEASE_POLICY:-fail}"\n'
+            "LEASE_TTL_MINUTES=90; LEASE_RELEASE_ATTEMPTS=4; LEASE_RELEASE_BACKOFF=10\n"
+            'summary() { echo "$*" >> "$SUMMARY"; }\n'
+            'output() { echo "OUTPUT $1=$2"; }\n'
+            + body)
+        full_env = {"PATH": "%s:%s" % (self.tmp / "bin", os.environ["PATH"]),
+                    "STUB_LOG": str(log), "SUMMARY": str(summary), "GITHUB_RUN_ID": "222",
+                    "GITHUB_REPOSITORY": "gke-labs/kube-agents", "HOME": str(self.tmp)}
+        full_env.update(env)
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=full_env)
+        return proc, log.read_text(), summary.read_text()
+
+    def _lease_block(self):
+        return self._cut('if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then',
+                         r"^fi$") + '\necho "LEASE_HELD=$LEASE_HELD"\n'
+
+    HELD = json.dumps([{"name": "autopush", "state": "held", "session": "gha-111",
+                        "note": "scheduled reconcile of autopush"}])
+
+    def test_a_finished_predecessors_lease_is_taken_over_and_the_apply_goes_on(self):
+        pred = json.dumps({"takeover": True, "session": "gha-111", "run_id": "111",
+                           "conclusion": "success"})
+        proc, calls, summary = self._run('LEASE_HELD=false\n' + self._lease_block(),
+                                         STUB_STATUS=self.HELD, STUB_PREDECESSOR=pred)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("LEASE_HELD=true", proc.stdout)
+        self.assertIn("lease takeover --if-session gha-111 --if-note scheduled reconcile of autopush --ttl 90", calls)
+        self.assertIn("::notice title=Live-test lease taken over::", proc.stdout)
+        self.assertIn("run [111]", summary)
+        self.assertIn("(success)", summary)
+
+    def test_a_lease_that_is_not_a_finished_predecessors_is_still_refused(self):
+        pred = json.dumps({"takeover": False, "reason": "run 111 is still in_progress"})
+        proc, calls, _ = self._run('LEASE_HELD=false\n' + self._lease_block(),
+                                   STUB_STATUS=self.HELD, STUB_PREDECESSOR=pred)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Refusing to apply", proc.stdout)
+        self.assertNotIn("takeover", calls)
+
+    def test_a_lost_takeover_race_is_still_refused(self):
+        pred = json.dumps({"takeover": True, "session": "gha-111", "run_id": "111",
+                           "conclusion": "success"})
+        proc, calls, _ = self._run('LEASE_HELD=false\n' + self._lease_block(),
+                                   STUB_STATUS=self.HELD, STUB_PREDECESSOR=pred,
+                                   STUB_TAKEOVER_RC="1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Refusing to apply", proc.stdout)
+        self.assertIn("lease takeover", calls)
+
+    def test_an_unreadable_predecessor_answer_is_no(self):
+        proc, calls, _ = self._run('LEASE_HELD=false\n' + self._lease_block(),
+                                   STUB_STATUS=self.HELD, STUB_PREDECESSOR="garbage")
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("takeover", calls)
+
+    def test_a_free_acquire_never_asks_about_a_predecessor(self):
+        proc, calls, _ = self._run('LEASE_HELD=false\n' + self._lease_block(),
+                                   STUB_ACQUIRE_RC="0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("LEASE_HELD=true", proc.stdout)
+        self.assertNotIn("predecessor", calls)
+
+    def _release(self):
+        return self._cut("release_lease() {", r"^}$") + "\nLEASE_HELD=true\nrelease_lease\n"
+
+    def test_the_release_retries_and_its_output_is_shown(self):
+        proc, calls, summary = self._run(self._release(),
+                                         STUB_RELEASE_OUT="OK  autopush: released")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("lease release --attempts 4 --backoff 10", calls)
+        self.assertIn("released", proc.stdout)
+        self.assertEqual(summary, "")
+
+    def test_a_failed_release_is_a_visible_warning_not_a_silent_one(self):
+        proc, calls, summary = self._run(
+            self._release(), STUB_RELEASE_RC="1",
+            STUB_RELEASE_OUT="FAIL  autopush: cluster unreachable (kubectl timed out after 15s) (after 4 attempts)",
+            KUBE_AGENTS_LEASE_SESSION="gha-222")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("::warning title=Live-test lease not released::", proc.stdout)
+        self.assertIn("kubectl timed out after 15s", proc.stdout)
+        self.assertIn("kubectl timed out after 15s", proc.stderr)
+        self.assertIn("gha-222", summary)
+
+    def test_the_release_output_is_no_longer_discarded(self):
+        self.assertNotIn("live_test_lease.py\" release >/dev/null", self.text)
 
 
 if __name__ == "__main__":

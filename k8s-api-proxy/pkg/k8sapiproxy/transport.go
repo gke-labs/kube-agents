@@ -2,6 +2,7 @@ package k8sapiproxy
 
 import (
 	"context"
+	"errors"
 	"net/http"
 )
 
@@ -12,9 +13,14 @@ type CallerIdentity struct {
 	Groups   []string
 }
 
+// ErrAuthenticationUnavailable is the error a CallerAuthenticator wraps when it could not
+// decide (a TokenReview or a key fetch failed), so the handler answers 503 rather than
+// telling the caller its credential is wrong.
+var ErrAuthenticationUnavailable = errors.New("caller authentication is unavailable")
+
 // CallerAuthenticator identifies the caller of a request, returning an error when it is not
-// an authorized sandbox. The caller gets a fixed 401, or a fixed 503 when the package's
-// TokenReview authenticator could not complete the review, never the error's text.
+// an authorized sandbox. The caller gets a fixed 401, or a fixed 503 when the error wraps
+// ErrAuthenticationUnavailable, never the error's text.
 type CallerAuthenticator interface {
 	AuthenticateRequest(r *http.Request) (*CallerIdentity, error)
 }

@@ -264,6 +264,13 @@ func (g *Gateway) wakeBatch(ctx context.Context, rec *SessionRecord, parent, las
 	}
 	text := batchWakeText(parentRef.Request, kids, full, cards)
 	woken, why = g.startWake(ctx, rec, last, parentRef, authority, steered, text, log)
+	if woken {
+		// The wake carries the results now, and the record outlives the
+		// stream copy of each (SessionTTL past the TASKS retention), so the
+		// children's text goes; their ends stay, so the batch still counts
+		// them ended.
+		rec.clearBatchText(parent.ID)
+	}
 	return woken, why, false
 }
 
@@ -297,7 +304,7 @@ func (g *Gateway) batchChildAsks(ctx context.Context, rec *SessionRecord, child 
 		return
 	}
 	if child.StatusMsgID != "" {
-		g.editLine(rec.Key, child.StatusMsgID, noticeBatchChildAsked, "")
+		g.editLine(rec.Key, child.StatusMsgID, withLineNote(noticeBatchChildAsked, child.LineNote), "")
 		setParentLine(rec, child.ID, "")
 	}
 	g.batchChildEnded(ctx, rec, child, BatchEnd{State: lib.StateInputRequired, Text: question, Source: TerminalFromExecutor}, "")
@@ -315,8 +322,31 @@ func (g *Gateway) batchChildAsks(ctx context.Context, rec *SessionRecord, child 
 	g.retireTaskRoute(ctx, child.ID)
 }
 
+// batchChildQueueAllowance is how long the heal lets a fan-out profile
+// child sit with nothing on its stream before FirstEventGrace starts:
+// the dispatcher's default queue timeout (a profile's queueTimeoutSeconds,
+// 3600). A fan-out wider than its profile's concurrency leaves children
+// queued at the dispatcher, which publishes nothing for a queued submission
+// (it naks it until a slot frees) and ends one itself, with a queue-timeout
+// terminal the heal reads, once it has waited past that timeout. So until
+// then an empty stream is a child waiting its turn, not one that never
+// started (spec-chatops-gateway.md, "A fan-out's wake").
+const batchChildQueueAllowance = time.Hour
+
+// batchChildGrace is how long a fan-out child may have nothing on its
+// stream before the heal ends it as never started: FirstEventGrace, after
+// batchChildQueueAllowance for a profile child the dispatcher may still hold
+// queued. A stopped child's stop record ends it at the dispatcher at once, so
+// it gets FirstEventGrace alone, as a platform child does.
+func (g *Gateway) batchChildGrace(kid TaskRef) time.Duration {
+	if kid.Tier == "" || kid.Canceled {
+		return g.cfg.FirstEventGrace
+	}
+	return batchChildQueueAllowance + g.cfg.FirstEventGrace
+}
+
 // noticeBatchChildNeverStarted is what the room reads when the heal ends a
-// fan-out child that produced nothing past FirstEventGrace.
+// fan-out child that produced nothing past its grace (batchChildGrace).
 const noticeBatchChildNeverStarted = "⚠️ delegated task `%s` has produced nothing on its event stream in %s; it is counted as not started"
 
 // healFanOut is healActiveTask's case for a fan-out parent holding the
@@ -330,7 +360,7 @@ const noticeBatchChildNeverStarted = "⚠️ delegated task `%s` has produced no
 func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *ActiveTask, parent TaskRef) {
 	changed := false
 	if active.StatusMsgID != "" {
-		if task, _, _, err := g.client.TasksGetTerminal(ctx, rec.AddresseeFor(parent.ID), parent.ID); err == nil && task.Final {
+		if task, _, _, err := g.client.TasksGetTerminal(ctx, rec.AddresseeFor(parent.ID), parent.ID, g.profileRead(rec, parent.ID, rec.AddresseeFor(parent.ID))); err == nil && task.Final {
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(task.State, ""), active.LineNote), "")
 			active.StatusMsgID = ""
 			changed = true
@@ -356,17 +386,20 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 // marked, the child's route retired and its line closed, and its end
 // recorded with its result unposted (the card carries none); a child with no
 // first event past FirstEventGrace is ended as never started, with its stop
-// record for a profile task. It reports whether it healed.
+// record for a profile task. A profile child's grace allows for the
+// dispatcher's queue first (batchChildGrace). It reports whether it healed.
 func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid TaskRef) bool {
-	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, kid.Addressee, kid.ID)
+	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, kid.Addressee, kid.ID, g.profileRead(rec, kid.ID, kid.Addressee))
 	switch {
 	case err == nil && task.Final:
-		source := TerminalFromExecutor
-		if terminalSubject == lib.TaskSupervisorSubject(kid.Addressee, kid.ID) {
-			source = TerminalFromSupervisor
-		}
+		// Either supervisor form (#5301), read as the relay reads it, so a
+		// healed child's terminal and a relayed one are booked alike.
+		source := terminalSourceOf(terminalSubject)
 		g.log.Info("healing a fan-out child whose terminal the relay never delivered", "conversation", rec.Key, "taskId", kid.ID, "state", task.State)
-		g.post(rec.Key, formatTaskStatus(task, "", kid.StartedAt))
+		// A canceled child writes nothing to the room (applyCanceledEvent).
+		if !kid.Canceled {
+			g.post(rec.Key, formatTaskStatus(task, "", kid.StartedAt))
+		}
 		g.logTaskTerminal(rec, kid.Addressee, kid.ID, task.State, source, finalMessageText(task))
 		rec.MarkTerminalObserved(kid.ID)
 		var terminal chatmsg.Reading
@@ -376,7 +409,7 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 		g.terminalMark(rec, kid.ID, task.State, terminal)
 		g.retireTaskRoute(ctx, kid.ID)
 		if kid.StatusMsgID != "" {
-			g.editLine(rec.Key, kid.StatusMsgID, terminalLine(task.State, ""), "")
+			g.editLine(rec.Key, kid.StatusMsgID, withLineNote(terminalLine(task.State, ""), kid.LineNote), "")
 			setParentLine(rec, kid.ID, "")
 		}
 		toCards := cardsPending(task.State, terminal) || handedOff(task.State, foldHandedOff(task))
@@ -393,15 +426,18 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 		}
 		g.batchChildEnded(ctx, rec, kid, BatchEnd{State: task.State, Text: text, Source: source, Unposted: true, Cards: toCards}, reason)
 		return true
-	case noFirstEventPastGrace(&ActiveTask{SubmittedAt: kid.StartedAt}, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
+	case noFirstEventPastGrace(&ActiveTask{SubmittedAt: kid.StartedAt}, isTaskNotFound(err), g.batchChildGrace(kid), time.Now()):
+		grace := g.batchChildGrace(kid)
 		g.log.Info("healing a fan-out child with no first event inside the grace", "conversation", rec.Key, "taskId", kid.ID,
-			"addressee", kid.Addressee, "grace", g.cfg.FirstEventGrace)
-		g.post(rec.Key, fmt.Sprintf(noticeBatchChildNeverStarted, kid.ID, g.cfg.FirstEventGrace))
+			"addressee", kid.Addressee, "grace", grace)
+		if !kid.Canceled {
+			g.post(rec.Key, fmt.Sprintf(noticeBatchChildNeverStarted, kid.ID, grace))
+		}
 		g.logTaskTerminal(rec, kid.Addressee, kid.ID, lib.StateFailed, TerminalNeverStarted, "")
 		g.publishDispatchStop(ctx, kid)
 		g.retireTaskRoute(ctx, kid.ID)
 		if kid.StatusMsgID != "" {
-			g.editLine(rec.Key, kid.StatusMsgID, terminalLine(lib.StateFailed, ""), "")
+			g.editLine(rec.Key, kid.StatusMsgID, withLineNote(terminalLine(lib.StateFailed, ""), kid.LineNote), "")
 			setParentLine(rec, kid.ID, "")
 		}
 		g.batchChildEnded(ctx, rec, kid, BatchEnd{State: lib.StateFailed, Text: childNeverStarted, Source: TerminalNeverStarted, Unposted: true}, childNeverStarted)
@@ -449,7 +485,7 @@ func (g *Gateway) answerFanOutStatus(ctx context.Context, rec *SessionRecord, pa
 			continue
 		}
 		state := fanOutStateUnknown
-		task, err := g.client.TasksGet(ctx, k.Addressee, k.ID)
+		task, err := g.client.TasksGet(ctx, k.Addressee, k.ID, g.profileRead(rec, k.ID, k.Addressee))
 		switch {
 		case err == nil:
 			state = string(task.State)

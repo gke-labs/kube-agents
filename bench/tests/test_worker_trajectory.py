@@ -143,25 +143,6 @@ def _board(root: Path, *, children_table: bool = True) -> None:
             conn.execute("INSERT INTO task_links VALUES (?, ?)", (FRONT, CHILD))
 
 
-@pytest.fixture(autouse=True)
-def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Keep ``_settle`` off whatever cluster kubectl is pointed at.
-
-    Same guard as the harness suite's: settling reads the pod and then
-    deletes the card's state through ``kubectl exec``, and left live the two
-    ``_settle`` tests below would aim those at the developer's current
-    context. Returns the scripts that would have run.
-    """
-    scripts: list[str] = []
-
-    def _record(script: str, timeout: float) -> str:
-        scripts.append(script)
-        return ""
-
-    monkeypatch.setattr(harness, "_agent_shell", _record)
-    return scripts
-
-
 @pytest.fixture
 def data_root(tmp_path: Path) -> Path:
     """An agent data volume: the board plus one session store per profile."""
@@ -922,9 +903,46 @@ def test_a_value_that_fit_before_the_clip_still_does(data_root: Path) -> None:
     assert args.startswith(json.dumps({"body": "b" * 1500, "title": "t" * 400})[:-1] + ', "notes": "nnn')
 
 
+# The search for the JSON parser's depth limit tries no document deeper than
+# this (about a million levels): the in-pod script's time on such a document
+# grows faster than its depth, and a deeper one would take minutes.
+DEEPEST_DOCUMENT_TRIED = 1 << 20
+
+
+def _document_too_deep_to_parse() -> str | None:
+    """A JSON array nested deeper than this Python's parser accepts, or None when the search finds no such depth.
+
+    The parser's depth limit is the interpreter's: some thousands of levels on
+    Python 3.12 and 3.13, and on 3.14 as many as the stack holds. A document
+    that parses and is too deep to walk is withheld, so a fixed depth is the
+    wrong side of the limit on some Python. The document is a quarter deeper
+    than the first depth that this process refuses: the in-pod script runs in
+    a process of its own, whose parser accepts a few levels more.
+    """
+    depth = 20000
+    while depth <= DEEPEST_DOCUMENT_TRIED:
+        try:
+            json.loads("[" * depth + "]" * depth)
+        except RecursionError:
+            depth += depth // 4
+            return "[" * depth + "]" * depth
+        depth *= 2
+    return None
+
+
+TOO_DEEP_TO_PARSE = _document_too_deep_to_parse()
+
+
 @pytest.mark.parametrize(
     "arguments",
-    ["not json " + "y" * 3000, json.dumps(["y" * 3000, "short"]), "[" * 20000 + "]" * 20000],
+    [
+        "not json " + "y" * 3000,
+        json.dumps(["y" * 3000, "short"]),
+        pytest.param(
+            TOO_DEEP_TO_PARSE,
+            marks=pytest.mark.skipif(TOO_DEEP_TO_PARSE is None, reason="the JSON parser of this Python has no depth limit that the search finds"),
+        ),
+    ],
     ids=["text", "array", "nested-past-the-recursion-limit"],
 )
 def test_arguments_that_are_not_a_json_object_are_clipped_as_they_stand(

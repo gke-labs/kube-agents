@@ -35,6 +35,7 @@ from tests.testing.common import (
     create_minimal_tools_bin,
     create_mock_git_repo,
     get_isolated_test_env,
+    installer_report_env,
 )
 from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
@@ -64,6 +65,11 @@ _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 # this is stuck -- on a prompt, if the terminal detach ever slips -- and the
 # bound turns that into a failure with output, not a hang.
 _INSTALLER_RUN_TIMEOUT_SECONDS = 60
+# install.sh's variable for the report file, a seam for tests, and the path a
+# real install writes, which INSTALL.md and the install skill tell an agent to
+# read.
+_INSTALL_REPORT_FILE_ENV = "KUBE_AGENTS_INSTALL_REPORT_FILE"
+_INSTALL_REPORT_DEFAULT_FILE = "/tmp/kube-agents-install-report.json"
 # What `gcloud container clusters describe` prints for a cluster that does not
 # exist, and for one it could not read.
 _GCLOUD_CLUSTER_NOT_FOUND = "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: c."
@@ -72,8 +78,20 @@ _GCLOUD_CLUSTER_FORBIDDEN = (
 )
 
 
+# For a test that runs the main of install.sh or of upgrade.sh with no dry run:
+# bash that looks on the PATH for each tool that main would start for its work,
+# or use to install a missing one. For the first one it finds, it prints this
+# marker with the tool's name and exits, so main does not start. Such a test
+# puts it before main and expects no marker.
+_HOST_TOOL_MARKER = "host-tool="
+_HOST_TOOL_PROBE = (
+    "for tool in git gcloud kubectl helm terraform brew apt-get; do "
+    f'command -v "$tool" >/dev/null && {{ echo "{_HOST_TOOL_MARKER}$tool"; exit 97; }}; done\n'
+)
+
+
 def _run_installer_bash(body, env, cwd=_REPO_ROOT):
-    """Run a bash body that sources install.sh, detached from any terminal.
+    """Run a bash body that sources or runs install.sh, detached from any terminal.
 
     install.sh's prompts read /dev/tty whenever has_controlling_tty finds one,
     and /dev/tty resolves through the controlling terminal rather than stdin,
@@ -481,7 +499,12 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
-            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            env={
+                "HOME": str(home_dir),
+                "PATH": os.environ["PATH"],
+                # A refused checkout ends in the ERR handler, which writes the report.
+                **installer_report_env(),
+            },
             cwd=str(outside_dir),
         )
 
@@ -1660,17 +1683,25 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
 
     def test_preflight_rejects_directory_github_pem_path(self):
         """Preflight must fail fast when --github-pem-path is a directory instead of a file."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        with tempfile.TemporaryDirectory() as tmp_dir, tempfile.TemporaryDirectory() as tools_dir:
+            # The installer runs with no dry run. If this check did not stop
+            # it, step one would start the host's git, gcloud and terraform,
+            # and a package manager for a tool that is missing. The PATH has
+            # none of them, and the runner keeps the terminal away from the
+            # prompt that a missing tool gets.
             test_env = get_isolated_test_env(
-                overrides={"KUBE_AGENTS_LOCK_FILE": str(self._empty_install_env.parent / "test.lock")}
+                overrides={
+                    "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+                    "KUBE_AGENTS_LOCK_FILE": str(self._empty_install_env.parent / "test.lock"),
+                    "PATH": str(create_minimal_tools_bin(tools_dir, exclude=("git",))),
+                }
             )
-            proc = subprocess.run(
-                ["bash", str(_INSTALL_SH), "--image-tag=0.1.0", f"--github-pem-path={tmp_dir}"],
-                capture_output=True,
-                text=True,
-                env=test_env,
-                cwd=str(_REPO_ROOT),
+            proc = _run_installer_bash(
+                _HOST_TOOL_PROBE
+                + f"exec bash {shlex.quote(str(_INSTALL_SH))} --image-tag=0.1.0 --github-pem-path={shlex.quote(tmp_dir)}",
+                test_env,
             )
+            self.assertNotIn(_HOST_TOOL_MARKER, proc.stdout)
             self.assertEqual(proc.returncode, 1, f"Expected exit code 1, got {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
             combined = proc.stdout + proc.stderr
             self.assertIn("not a regular file", combined)
@@ -2819,6 +2850,11 @@ verify_local_source_ref() {
   echo "VERIFIED_IMAGE_TAG=$2"
   exit 0
 }
+# The panel reads gVisor from the live install when install.env is silent
+# (resolve_existing_install_gvisor), and it sources installer_common.sh
+# itself, so a function stub would be overwritten. An explicit value wins
+# and keeps that read off the gcloud on PATH (#5893's guard).
+export ENABLE_GVISOR="false"
 PROJECT_ID="test-project"
 PARAM_IMAGE_TAG="0.4.0"
 run_menu_system "."
@@ -2849,6 +2885,7 @@ gcloud() { return 1; }
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2900,6 +2937,7 @@ EOF
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2930,6 +2968,7 @@ PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
 CHAT_SUB_NAME="platform-agent-chat-events-sub"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -3274,12 +3313,29 @@ PARAM_GENERATE_ONLY="true"
 PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 write_json_report "GENERATE_ONLY_SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
         self.assertIn('"generate_only": true', proc.stdout)
+
+    def test_the_report_goes_to_the_documented_file_unless_a_test_names_another(self):
+        """A real install writes the one file the docs name; only the variable
+        moves it. Held by the source: a run of write_json_report with the
+        variable unset would write that file."""
+        source = _INSTALL_SH.read_text()
+        self.assertEqual(
+            source.count(_INSTALL_REPORT_DEFAULT_FILE), 1, "install.sh names the report path in one place"
+        )
+        self.assertEqual(
+            source.count(
+                f'  local report_file="${{{_INSTALL_REPORT_FILE_ENV}:-{_INSTALL_REPORT_DEFAULT_FILE}}}"\n'
+            ),
+            1,
+            "write_json_report takes the variable, then the documented path",
+        )
+        self.assertIn(_INSTALL_REPORT_DEFAULT_FILE, (_REPO_ROOT / "INSTALL.md").read_text())
 
     def test_write_json_report_records_network_policy_enforcement(self):
         """The choice to install without enforcement outlives the terminal (#1682)."""
@@ -3290,7 +3346,7 @@ PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
 write_json_report "SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -3686,6 +3742,28 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
             "a generator call site gained or lost the memory opt-in; if the new one "
             "is followed by an apply it needs KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true",
         )
+
+    def test_every_applying_generator_call_refuses_to_blank_a_secret_it_could_not_read(self):
+        """#6126: a generator call whose tfvars get applied must carry
+        KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true, or a failed read of the live
+        Secret writes its keys empty over the live values. install.sh and
+        upgrade.sh only apply, so every call site in either needs it; only
+        uninstall.sh, which destroys, goes without.
+        """
+        unguarded = []
+        for script in (_INSTALL_SH, _INSTALL_SH.parent / "upgrade.sh"):
+            lines = script.read_text().splitlines()
+            for index, line in enumerate(lines):
+                code_line = line.split("#", 1)[0].strip()
+                if not re.search(r"\bwrite_tfvars_from_state\b", code_line) or code_line.startswith("write_tfvars_from_state()"):
+                    continue
+                prefix, back = [line], index - 1
+                while back >= 0 and lines[back].rstrip().endswith("\\"):
+                    prefix.append(lines[back])
+                    back -= 1
+                if "KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true" not in "\n".join(prefix):
+                    unguarded.append(f"{script.name}:{index + 1}")
+        self.assertEqual(unguarded, [], "a generator call site that applies lacks KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true")
 
     def test_accepting_the_memory_prompts_unseeded_default_is_not_an_answer(self):
         """A bare enter on the memory menu must not count as a stated mode.
@@ -5504,7 +5582,15 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     invocation, so dropping it again would look like nothing in a diff.
     """
 
-    def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
+    # The version of the `go` stub each run gets unless the test names one. No
+    # release of Go has it, so the line the installer prints for this version
+    # tells the stub from a host's own Go, and it is above each minimum the
+    # installer can ask for.
+    _STUB_GO_VERSION = "1.99.0"
+    # What the `git` stub says for a clone that the test did not ask to fail.
+    _NO_CLONE_ASKED = "the git stub of this test: the run cloned, and the test did not pass git_clone_fails"
+
+    def _run(self, creates_fail=False, describe_fails=True, go_version=_STUB_GO_VERSION, git_clone_fails=False,
              keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None,
              cluster=""):
         """import_github_pem against a stub gcloud that records every call.
@@ -5520,11 +5606,17 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         leaves it untested -- see the ERR-trap test below.
 
         describe_fails=False confirms the key instead, which is the only way
-        past that branch and into the import itself. go_version and
-        git_clone_fails plant the two tools the import shells out to: without
-        them the real ones on PATH decide the outcome, and a real `git clone`
-        would reach the network. Both stubs are deliberate, not incidental --
-        the paths below exist precisely for when those tools disappoint.
+        past that branch and into the import itself. The import shells out to
+        two tools. Each run gets a `go` stub, and go_version is the version it
+        prints: import_github_pem asks for `go` before it creates the key, so
+        without the stub the host's Go decides the outcome, and a host with
+        none gets auto_install_tool, which installs Go through Homebrew or apt
+        where it can. Each run also gets a `git` stub whose clone fails:
+        without it a real `git clone` would reach the network.
+        git_clone_fails makes the stub fail as a remote that cannot be read; a
+        run that clones without it gets _NO_CLONE_ASKED. The too-old Go and the
+        failed clone are deliberate, not incidental -- the paths below exist
+        precisely for when those tools disappoint.
         """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -5586,24 +5678,23 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
-            if go_version is not None:
-                go = bin_dir / "go"
-                go.write_text(
-                    "#!/usr/bin/env bash\n"
-                    f'[ "$1" = version ] && echo "go version go{go_version} linux/amd64" && exit 0\n'
-                    "exit 0\n"
-                )
-                go.chmod(go.stat().st_mode | stat.S_IEXEC)
-            if git_clone_fails:
-                git = bin_dir / "git"
-                git.write_text(
-                    "#!/usr/bin/env bash\n"
-                    "case \"$*\" in\n"
-                    "  *clone*) echo 'fatal: could not read from remote repository' >&2; exit 128 ;;\n"
-                    "esac\n"
-                    "exit 0\n"
-                )
-                git.chmod(git.stat().st_mode | stat.S_IEXEC)
+            go = bin_dir / "go"
+            go.write_text(
+                "#!/usr/bin/env bash\n"
+                f'[ "$1" = version ] && echo "go version go{go_version} linux/amd64" && exit 0\n'
+                "exit 0\n"
+            )
+            go.chmod(go.stat().st_mode | stat.S_IEXEC)
+            clone_error = "fatal: could not read from remote repository" if git_clone_fails else self._NO_CLONE_ASKED
+            git = bin_dir / "git"
+            git.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"$*\" in\n"
+                f"  *clone*) echo '{clone_error}' >&2; exit 128 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            git.chmod(git.stat().st_mode | stat.S_IEXEC)
             body = (
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 f'source "{_INSTALLER_COMMON}"\n'
@@ -5627,6 +5718,19 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
+
+    def test_the_go_the_import_asks_is_the_stub_whatever_the_host_has(self):
+        """A run asks the `go` stub, with Go on the host or without: the installer names the stub's version."""
+        proc, _ = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Go {self._STUB_GO_VERSION} meets the minimum", proc.stdout + proc.stderr)
+
+    def test_the_git_the_import_asks_is_the_stub_whatever_the_host_has(self):
+        """A run that goes on to the clone asks the `git` stub: the host's git would clone over the network."""
+        proc, _ = self._run(describe_fails=False)
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn(self._NO_CLONE_ASKED, combined)
 
     def test_the_key_is_created_with_this_installs_owner_labels(self):
         """The apply's adoption step refuses an unlabelled key it doesn't hold (#3504)."""
@@ -6648,6 +6752,414 @@ class PlatformAgentStorageSizePersistsThroughInstallEnvTest(unittest.TestCase):
             self.assertIn("SIZE=[]", proc.stdout)
 
 
+class PlatformAgentSizingProfilePersistsThroughInstallEnvTest(unittest.TestCase):
+    """PLATFORM_AGENT_SIZING_PROFILE persistence, flag validation, and fleet Standard wiring."""
+
+    @staticmethod
+    def _env(overrides=None):
+        env = get_isolated_test_env(overrides=overrides or {})
+        env.pop("PLATFORM_AGENT_SIZING_PROFILE", None)
+        env.pop("TF_VAR_sizing_profile", None)
+        if overrides:
+            env.update(overrides)
+        return env
+
+    def _bootstrap_with_export(self, tmp, export_line):
+        dest = pathlib.Path(tmp) / "new.install.env"
+        loaded = pathlib.Path(tmp) / "loaded.install.env"
+        loaded.write_text("")
+        loaded.chmod(0o600)
+        proc = _run_installer_bash(
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'source scripts/installer/installer_common.sh\n'
+            'resolve_shared_defaults\n'
+            'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+            f'{export_line}\n'
+            f'bootstrap_install_env_file "{dest}" some-tag >/dev/null',
+            env=self._env({
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            }),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+        return dest
+
+    def test_an_inherited_sizing_profile_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export PLATFORM_AGENT_SIZING_PROFILE="medium"')
+            self.assertIn("PLATFORM_AGENT_SIZING_PROFILE=medium\n", dest.read_text())
+
+    def test_an_unset_sizing_profile_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for export_line in ("unset PLATFORM_AGENT_SIZING_PROFILE", 'export PLATFORM_AGENT_SIZING_PROFILE=""'):
+                with self.subTest(export_line=export_line):
+                    dest = self._bootstrap_with_export(tmp, export_line)
+                    self.assertNotIn("PLATFORM_AGENT_SIZING_PROFILE", dest.read_text())
+                    dest.unlink()
+
+    def test_a_later_run_drops_an_inherited_sizing_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("PROJECT_ID=p\n")
+            loaded.chmod(0o600)
+            proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'echo "PROFILE=[${PLATFORM_AGENT_SIZING_PROFILE:-}]"',
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(loaded), "PLATFORM_AGENT_SIZING_PROFILE": "fleet"}),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("PROFILE=[]", proc.stdout)
+
+    def test_sizing_profile_flag_and_help(self):
+        help_proc = subprocess.run(
+            ["bash", str(_INSTALL_SH), "--help"],
+            capture_output=True, text=True, env=self._env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
+        self.assertIn("--sizing-profile=PROFILE", help_proc.stdout)
+
+        parse_proc = _run_installer_bash(
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'source scripts/installer/installer_common.sh\n'
+            'parse_args --sizing-profile=fleet\n'
+            'is_valid_platform_agent_sizing_profile "$PARAM_PLATFORM_AGENT_SIZING_PROFILE"\n'
+            'echo "PROFILE=[$PARAM_PLATFORM_AGENT_SIZING_PROFILE] PASSED=[$PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED]"\n'
+            'echo "TYPED=[$INSTALL_ENV_FLAGS_TYPED]"',
+            env=self._env(),
+        )
+        self.assertEqual(parse_proc.returncode, 0, parse_proc.stderr + parse_proc.stdout)
+        self.assertIn("PROFILE=[fleet] PASSED=[true]", parse_proc.stdout)
+        self.assertNotIn("PLATFORM_AGENT_SIZING_PROFILE", parse_proc.stdout.split("TYPED=[", 1)[1])
+
+        # --menu rejects --sizing-profile with its own message (never as a "chat flag").
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = pathlib.Path(tmp) / "install.env"
+            loaded.write_text("PROJECT_ID=p\n")
+            menu_proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'run_menu_system() { echo "MENU"; }\n'
+                'print_banner() { :; }\n'
+                'parse_args --menu --sizing-profile=fleet\n'
+                'main\n',
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(loaded)}),
+            )
+            self.assertEqual(menu_proc.returncode, 1)
+            self.assertIn("--menu takes no --sizing-profile", menu_proc.stdout + menu_proc.stderr)
+            self.assertNotIn("chat flag", menu_proc.stdout + menu_proc.stderr)
+
+    def test_fleet_scan_on_new_standard_cluster_sets_and_persists_tf_var_sizing_profile(self):
+        # Extract the exact scan+Standard auto-sizing snippet from install.sh main() so we
+        # verify the production wiring against 26 stubbed clusters, interactive prompt_read,
+        # pre-existing install.env queueing, and generate-only handoff.
+        text = _INSTALL_SH.read_text(encoding="utf-8")
+        self.assertNotIn("prompt_yes_no", text)
+        marker = '  # Scan visible clusters in scope to report runtime/host/storage sizing\n'
+        end_marker = '  # Written once, and only when there is nothing there.'
+        block = text[text.index(marker) : text.index(end_marker, text.index(marker))]
+        lines = "\\n".join(f"cluster-{i}\\tus-central1" for i in range(1, 27))
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            g = bin_dir / "gcloud"
+            g.write_text(
+                f'#!/usr/bin/env bash\nif [ "${{1:-}}" = "container" ] && [ "${{2:-}}" = "clusters" ] && [ "${{3:-}}" = "list" ]; then printf "{lines}\\n"; exit 0; fi\nexit 1\n'
+            )
+            g.chmod(g.stat().st_mode | stat.S_IEXEC)
+            dest = pathlib.Path(tmp) / "install.env"
+            loaded = pathlib.Path(tmp) / "loaded.env"
+            loaded.write_text("")
+            proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                f'bootstrap_install_env_file "{dest}" v1.2.3 >/dev/null\n'
+                'print_generate_only_handoff "." "p" "c" "us-central1" "terraform.tfvars"\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            out = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, out)
+            self.assertIn("TFVAR=[fleet]", out)
+            self.assertNotIn("GKE Standard host recommendation:", out)
+            self.assertIn("TF_VAR_sizing_profile=fleet ./lifecycle.sh apply", out)
+            self.assertIn("TF_VAR_sizing_profile=fleet\n", dest.read_text())
+
+            # When install.env already exists without TF_VAR_sizing_profile, record_flags_into_install_env persists it on commit.
+            existing = pathlib.Path(tmp) / "existing.env"
+            existing.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+            existing.chmod(0o600)
+            proc_existing = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'INSTALL_ENV_FILE="' + str(existing) + '"\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'record_flags_into_install_env\n',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(existing),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_existing.returncode, 0, proc_existing.stdout + proc_existing.stderr)
+            self.assertIn("TF_VAR_sizing_profile=fleet\n", existing.read_text())
+
+            # Existing Terraform-managed Standard cluster (TFVARS_CLUSTER_EXISTS=true, even though
+            # TFVARS_CREATE_CLUSTER=true) MUST NOT auto-select/persist TF_VAR_sizing_profile=fleet
+            # and MUST inspect the live CR.
+            tf_managed = pathlib.Path(tmp) / "tf-managed.env"
+            tf_managed.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+            tf_managed.chmod(0o600)
+            k = bin_dir / "kubectl"
+            cr_json = '{"items":[{"spec":{"deployment":{"sizingProfile":"auto"}},"status":{"usage":{"clustersRegistered":26,"clustersMonitored":26}}}]}'
+            k.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "${1:-}" = "config" ] && [ "${2:-}" = "get-contexts" ]; then exit 0; fi\n'
+                'if [ "${1:-}" = "--context" ]; then shift 2; fi\n'
+                'if [ "${1:-}" = "get" ] && [ "${2:-}" = "crd" ]; then exit 0; fi\n'
+                f"printf '%s' {shlex.quote(cr_json)}\n"
+            )
+            k.chmod(k.stat().st_mode | stat.S_IEXEC)
+            proc_managed = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'INSTALL_ENV_FILE="' + str(tf_managed) + '"\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_EXISTS="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n'
+                'echo "INC=[$sizing_include_cr] CREATE=[$sizing_is_create_cluster]"\n'
+                '}\n_test_scan_block\n'
+                'record_flags_into_install_env\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(tf_managed),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            out_managed = proc_managed.stdout + proc_managed.stderr
+            self.assertEqual(proc_managed.returncode, 0, out_managed)
+            self.assertIn("INC=[true] CREATE=[false]", out_managed)
+            self.assertIn("TFVAR=[]", out_managed)
+            self.assertIn("26 visible via gcloud, 26 in live PlatformAgent status.usage", out_managed)
+            self.assertIn("GKE Standard fleet host note:", out_managed)
+            self.assertNotIn("Setting TF_VAR_sizing_profile=fleet", out_managed)
+            self.assertNotIn("TF_VAR_sizing_profile", tf_managed.read_text())
+
+            # Finding 1: TF_VAR_gvisor_machine_type alone MUST NOT suppress default-pool TF_VAR_sizing_profile=fleet.
+            proc_gvisor_only = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                'export TF_VAR_gvisor_machine_type="n2-standard-8"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_gvisor_only.returncode, 0, proc_gvisor_only.stdout + proc_gvisor_only.stderr)
+            self.assertIn("TFVAR=[fleet]", proc_gvisor_only.stdout)
+
+            # Finding 3: explicit PLATFORM_AGENT_SIZING_PROFILE=small keeps runtime below fleet, so do not auto-select TF_VAR_sizing_profile=fleet.
+            proc_pinned_small = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'export PLATFORM_AGENT_SIZING_PROFILE="small"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_pinned_small.returncode, 0, proc_pinned_small.stdout + proc_pinned_small.stderr)
+            self.assertIn("TFVAR=[]", proc_pinned_small.stdout)
+            self.assertNotIn("Setting TF_VAR_sizing_profile=fleet", proc_pinned_small.stdout)
+
+            # Finding 4: read-only install.env missing TF_VAR_sizing_profile fails early in apply mode and succeeds in dry-run.
+            if os.geteuid() != 0:
+                ro_env = pathlib.Path(tmp) / "readonly.env"
+                ro_env.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+                ro_env.chmod(0o400)
+                try:
+                    for dry_run, non_interactive, want_rc in (
+                        ("false", "true", 1),
+                        ("false", "false", 1),
+                        ("true", "true", 0),
+                    ):
+                        with self.subTest(read_only_dry_run=dry_run, non_interactive=non_interactive):
+                            tfvars_stub = pathlib.Path(tmp) / f"ro-{dry_run}-{non_interactive}.tfvars"
+                            tfvars_stub.write_text("# stale tfvars\n")
+                            tty_stub = ""
+                            if non_interactive == "false":
+                                tty_stub = (
+                                    'has_controlling_tty() { return 0; }\n'
+                                    'prompt_read() { echo "PROMPT_CALLED"; return 1; }\n'
+                                )
+                            proc_ro = _run_installer_bash(
+                                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                                'source scripts/installer/installer_common.sh\n'
+                                'resolve_shared_defaults\n'
+                                f'{tty_stub}'
+                                f'INSTALL_ENV_FILE="{ro_env}"\n'
+                                f'tfvars_file="{tfvars_stub}"\n'
+                                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                                f'PARAM_NON_INTERACTIVE="{non_interactive}"; PARAM_DRY_RUN="{dry_run}"; PARAM_MEMORY="file"\n'
+                                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                                'echo "KEYS=[$INSTALL_ENV_KEYS_TO_RECORD]"',
+                                env=self._env({
+                                    "KUBE_AGENTS_INSTALL_ENV": str(ro_env),
+                                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                                }),
+                            )
+                            self.assertEqual(proc_ro.returncode, want_rc, proc_ro.stdout + proc_ro.stderr)
+                            self.assertNotIn("PROMPT_CALLED", proc_ro.stdout + proc_ro.stderr)
+                            if want_rc == 1:
+                                self.assertIn("not writable", proc_ro.stdout + proc_ro.stderr)
+                                self.assertFalse(tfvars_stub.exists())
+                            else:
+                                self.assertIn("KEYS=[]", proc_ro.stdout)
+                                self.assertTrue(tfvars_stub.exists())
+                finally:
+                    ro_env.chmod(0o600)
+
+            # Explicit TF_VAR_sizing_profile="" in install.env intentionally pins Standard node pools
+            # to small and MUST NOT be overridden to fleet by Step 11.
+            explicit_small_env = pathlib.Path(tmp) / "explicit-small.env"
+            explicit_small_env.write_text('PROJECT_ID=p\nCLUSTER_NAME=c\nTF_VAR_sizing_profile=""\n')
+            explicit_small_env.chmod(0o600)
+            proc_explicit_small = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                f'INSTALL_ENV_FILE="{explicit_small_env}"\n'
+                'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"\n',
+                env=self._env({
+                    "KUBE_AGENTS_INSTALL_ENV": str(explicit_small_env),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }),
+            )
+            self.assertEqual(proc_explicit_small.returncode, 0, proc_explicit_small.stdout + proc_explicit_small.stderr)
+            self.assertIn("TFVAR=[]", proc_explicit_small.stdout)
+            self.assertNotIn("Setting TF_VAR_sizing_profile=fleet", proc_explicit_small.stdout)
+
+            # Interactive prompt_read branches (both y accept and n decline) under tty.
+            for ans, want_fleet in (("y", True), ("n", False)):
+                with self.subTest(interactive_ans=ans):
+                    prompt_env = pathlib.Path(tmp) / f"interactive-{ans}.env"
+                    prompt_env.write_text("PROJECT_ID=p\nCLUSTER_NAME=c\n")
+                    prompt_env.chmod(0o600)
+                    proc_interactive = _run_installer_bash(
+                        f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                        'source scripts/installer/installer_common.sh\n'
+                        'resolve_shared_defaults\n'
+                        'has_controlling_tty() { return 0; }\n'
+                        f'prompt_read() {{ printf -v "$2" "%s" "{ans}"; echo "PROMPT:$1"; }}\n'
+                        f'INSTALL_ENV_FILE="{prompt_env}"\n'
+                        'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
+                        'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
+                        'PARAM_NON_INTERACTIVE="false"; PARAM_DRY_RUN="false"; PARAM_MEMORY="file"\n'
+                        'TFVARS_CREATE_CLUSTER="true"; TFVARS_CLUSTER_MODE="standard"\n'
+                        f'_test_scan_block() {{\n{block}\n}}\n_test_scan_block\n'
+                        'record_flags_into_install_env\n'
+                        'echo "TFVAR=[${TF_VAR_sizing_profile:-}]"\n',
+                        env=self._env({
+                            "KUBE_AGENTS_INSTALL_ENV": str(prompt_env),
+                            "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                        }),
+                    )
+                    out_i = proc_interactive.stdout + proc_interactive.stderr
+                    self.assertEqual(proc_interactive.returncode, 0, out_i)
+                    self.assertIn("PROMPT:Set TF_VAR_sizing_profile=fleet for the new Standard node pools", out_i)
+                    if want_fleet:
+                        self.assertIn("Set TF_VAR_sizing_profile=fleet for the new Standard cluster.", out_i)
+                        self.assertIn("TFVAR=[fleet]", out_i)
+                        self.assertIn("TF_VAR_sizing_profile=fleet\n", prompt_env.read_text())
+                    else:
+                        self.assertIn("Leaving Standard node pools at default machine types", out_i)
+                        self.assertIn("TFVAR=[]", out_i)
+                        self.assertNotIn("TF_VAR_sizing_profile", prompt_env.read_text())
+
+            # Paused Step 11 handoff command preserves TF_VAR_sizing_profile=fleet when chosen.
+            pause_start = text.index('        print_info "To launch provisioning later, run:')
+            pause_line_start = text.rindex('        local paused_sizing_prefix=""\n', 0, pause_start)
+            pause_end = text.index("\n", pause_start)
+            pause_block = text[pause_line_start:pause_end]
+            proc_pause = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'source scripts/installer/installer_common.sh\n'
+                'resolve_shared_defaults\n'
+                'TF_VAR_sizing_profile="fleet"\n'
+                f'_test_pause() {{\n{pause_block}\n}}\n_test_pause\n',
+                env=self._env(),
+            )
+            self.assertEqual(proc_pause.returncode, 0, proc_pause.stdout + proc_pause.stderr)
+            self.assertIn("TF_VAR_sizing_profile=fleet ./lifecycle.sh apply", proc_pause.stdout)
+
+    def test_validation_override_warning_and_summary_survive_older_defaults_under_set_u(self):
+        text = _INSTALL_SH.read_text(encoding="utf-8")
+        val_start = text.index("  _install_is_valid_sizing_profile() {\n")
+        val_end = text.index("  # The chat flags against an existing install.env", val_start)
+        val_block = text[val_start:val_end]
+        sum_start = text.index('  local summary_sizing_profile="${PLATFORM_AGENT_SIZING_PROFILE:-')
+        sum_end = text.index('  echo -e "  • ${C_CYAN}Cluster Footprint', sum_start)
+        sum_block = text[sum_start:sum_end]
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\nPLATFORM_AGENT_SIZING_PROFILE=small\n")
+            env_file.chmod(0o600)
+            proc = _run_installer_bash(
+                f'set -u\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'unset DEFAULT_PLATFORM_AGENT_SIZING_PROFILE\n'
+                'INSTALL_ENV_FILE="' + str(env_file) + '"\n'
+                'PLATFORM_AGENT_SIZING_PROFILE="medium"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE="fleet"\n'
+                'PARAM_PLATFORM_AGENT_SIZING_PROFILE_PASSED="true"\n'
+                f'_test_val() {{\n{val_block}\n}}\n_test_val\n'
+                'unset PLATFORM_AGENT_SIZING_PROFILE\n'
+                f'_test_sum() {{\n{sum_block}\n}}\n_test_sum\n',
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+            )
+            out = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, out)
+            self.assertIn("overrides PLATFORM_AGENT_SIZING_PROFILE='small'", out)
+            self.assertNotIn("medium", out)
+            self.assertIn("Runtime Sizing Profile:", out)
+            self.assertIn("auto", out)
+
+
 class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
     """The flag on the first run, the file on every later one.
 
@@ -7311,6 +7823,7 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
     _GENERATOR = (
         "  KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n"
         "    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n"
+        "    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \\\n"
         '    write_tfvars_from_state "$tfvars_file" "$image_tag"\n'
     )
     _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
@@ -8506,8 +9019,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         return get_isolated_test_env(overrides=overrides, absent=(
             "SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
             "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME", "SLACK_HOME_CHANNEL_POLICY",
-            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
-            "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
+            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "GOOGLE_CHAT_MODE",
+            "CHAT_TOPIC_NAME", "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
         ))
 
     def _run(self, body, install_env, extra_env=None):
@@ -8535,7 +9048,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     # integration's settings and nothing in the test exported them.
     _EMPTY_COMPANIONS = {
         "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\n",
-        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_MODE=''\n",
+        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_HOME_CHANNEL_POLICY=''\nGOOGLE_CHAT_MODE=''\n",
     }
 
     def _check(self, tmp, content, flags, extra_env=None):
@@ -8591,6 +9104,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("SLACK_HOME_CHANNEL_POLICY=auto\n", "--slack-home-channel-policy=manual", "SLACK_HOME_CHANNEL_POLICY", "--slack-home-channel-policy=manual"),
                 ("ALLOWED_USERS=a@example.com\n", "--google-chat-allowed-users=b@example.com", "ALLOWED_USERS", "--google-chat-allowed-users=b@example.com"),
                 ("GOOGLE_CHAT_HOME_CHANNEL=spaces/A\n", "--google-chat-home-channel=spaces/B", "GOOGLE_CHAT_HOME_CHANNEL", "--google-chat-home-channel=spaces/B"),
+                ("GOOGLE_CHAT_HOME_CHANNEL_POLICY=auto\n", "--google-chat-home-channel-policy=manual", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "--google-chat-home-channel-policy=manual"),
                 # A topic rename is a destroy and re-create of the Pub/Sub topic.
                 ("CHAT_TOPIC_NAME=topic-a\n", "--chat-topic-name=topic-b", "CHAT_TOPIC_NAME", "--chat-topic-name=topic-b"),
                 ("GOOGLE_CHAT_MODE=default\n", "--google-chat-mode=debug", "GOOGLE_CHAT_MODE", "--google-chat-mode=debug"),
@@ -8780,6 +9294,35 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     path, proc, out = self._check(tmp, f"SLACK_HOME_CHANNEL_POLICY={value}\n", f"--slack-home-channel-policy={value}")
                     self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
 
+    def test_the_google_chat_policy_is_checked_the_same_way(self):
+        # main() runs require_google_chat_home_channel_policy beside Slack's,
+        # before the file check, with the flag named only when this run typed it.
+        source = _INSTALL_SH.read_text()
+        main = source[source.index("\nmain() {"):]
+        start = main.index('require_google_chat_home_channel_policy "${PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"')
+        call = main[start:main.index("|| exit 1", start) + len("|| exit 1")]
+        self.assertIn("check_flags_against_install_env || exit 1", main[start:])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(f"parse_args --google-chat-home-channel-policy=sometimes; {call}; {self._CHECK}", path)
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'sometimes'", out)
+            self.assertIn("--google-chat-home-channel-policy", out)
+            self.assertNotIn("QUEUED=", out)
+            path = self._file(tmp, "GOOGLE_CHAT_HOME_CHANNEL_POLICY=Manual\n")
+            proc = self._run(f"parse_args; {call}; {self._CHECK}", path)
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'Manual'", out)
+            self.assertIn("Set it in install.env and run again", out)
+            self.assertNotIn("--google-chat-home-channel-policy", out)
+            for value in ("", "auto", "manual"):
+                with self.subTest(value=value):
+                    path, proc, out = self._check(tmp, f"GOOGLE_CHAT_HOME_CHANNEL_POLICY={value}\n",
+                                                  f"--google-chat-home-channel-policy={value}")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
     def test_a_bad_policy_this_run_did_not_type_is_sent_back_to_the_file(self):
         # The remedy names --slack-home-channel-policy only when this run typed
         # it. A flag cannot correct a value the file carries: the enum check
@@ -8895,6 +9438,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("--slack-home-channel-policy", "SLACK_HOME_CHANNEL_POLICY", "manual"),
                 ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
                 ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
+                ("--google-chat-home-channel-policy", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
                 ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
                 ("--google-chat-mode", "GOOGLE_CHAT_MODE", "debug"),
             ):
@@ -8956,9 +9500,11 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 (
                     "--enable-google-chat",
                     "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
-                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
+                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual "
+                    "GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
                     ["ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
-                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
+                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual",
+                     "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
                     ("CHAT_SUB_NAME",),
                 ),
             ):
@@ -9314,8 +9860,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+            # One read of the whole Secret (-o json) holding both tokens.
+            f'  *"get secret platform-agent-secrets"*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"SLACK_BOT_TOKEN\": \"{bot_b64}\", \"SLACK_APP_TOKEN\": \"{app_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -9329,6 +9876,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
             env=env,
             kubectl_script=kubectl_stub,
+            # The cluster exists (recovery runs only then); get-credentials succeeds.
+            describe_stub="printf 'False\\n'; exit 0",
+            gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n",
         )
         self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
         return dest.read_text(), proc.stdout
@@ -9642,6 +10192,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             self.assertIn("Tool 'gke-gcloud-auth-plugin' is still missing", proc.stderr + proc.stdout)
 
 
+# How the error banner names the log's tee when that is the command it blames.
+_TEE_NAMED_IN_BANNER = '): tee "'
+
+
 class RunLifecycleApplyTrapTest(unittest.TestCase):
     """Verifies that run_lifecycle_apply does not trigger duplicate ERR traps or
     misleading 'tee' error banners when lifecycle.sh fails (#1298)."""
@@ -9652,6 +10206,8 @@ class RunLifecycleApplyTrapTest(unittest.TestCase):
         self._tmp_path = pathlib.Path(tmp.name)
         self._empty_install_env = self._tmp_path / "install.env"
         self._empty_install_env.write_text("")
+        # Where _run_func sends the report: a file of this test.
+        self._report_file = self._tmp_path / "report.json"
 
     def _run_func(self, func_call, cwd=None):
         setup = f"""
@@ -9661,7 +10217,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 """
         overrides = {
             "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
-            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._report_file),
         }
         full_env = get_isolated_test_env(overrides=overrides)
         return subprocess.run(
@@ -9692,6 +10248,59 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
 
+    def test_only_an_explicit_gvisor_off_confirms_the_pool_destroy(self):
+        # guard_gvisor_pool_teardown reads KUBEAGENTS_ALLOW_NODE_POOL_DESTROY.
+        # An explicit --enable-gvisor=false or "No" at the interview's prompt
+        # (both set PARAM_ENABLE_GVISOR_EXPLICIT) confirms it; ENABLE_GVISOR=false
+        # from install.env alone does not (#5824).
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text('#!/bin/bash\necho "ALLOW=${KUBEAGENTS_ALLOW_NODE_POOL_DESTROY:-unset}"\n')
+        lifecycle_sh.chmod(0o755)
+        log_file = self._tmp_path / "provision.log"
+        cases = (
+            ("export ENABLE_GVISOR=false; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=true"),
+            ("export ENABLE_GVISOR=false", "ALLOW=unset"),
+            ("export ENABLE_GVISOR=true; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=unset"),
+        )
+        for setup, want in cases:
+            with self.subTest(setup=setup):
+                proc = self._run_func(
+                    f'unset KUBEAGENTS_ALLOW_NODE_POOL_DESTROY; {setup}; run_lifecycle_apply "{repo_dir}" "{log_file}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(want, log_file.read_text())
+
+    def test_the_interviews_no_marks_gvisor_explicit(self):
+        text = _INSTALL_SH.read_text()
+        start = text.index('prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)"')
+        yes_default = text[start:]
+        yes_default = yes_default[: yes_default.index("    else\n")]
+        self.assertIn('enable_gvisor="false"', yes_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', yes_default)
+        # No as the default (install.env already false), kept at the prompt:
+        # the operator affirmed it, so it confirms the destroy too.
+        no_default = text[text.index('prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)"'):]
+        no_default = no_default[: no_default.index("    fi\n")]
+        self.assertIn("else", no_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', no_default[no_default.index("else"):])
+
+    def test_the_enable_gvisor_flag_marks_the_choice_explicit(self):
+        for flag, want in (("--enable-gvisor=false", "M=[true]"), ("--enable-gvisor=true", "M=[true]")):
+            with self.subTest(flag=flag):
+                proc = self._run_func(f'parse_args {flag}; echo "M=[${{PARAM_ENABLE_GVISOR_EXPLICIT:-}}]"')
+                self.assertIn(want, proc.stdout, proc.stderr)
+        proc = self._run_func('parse_args; echo "M=[${PARAM_ENABLE_GVISOR_EXPLICIT:-}]"')
+        self.assertIn("M=[]", proc.stdout, proc.stderr)
+
+    def test_the_control_panel_reads_gvisor_from_the_live_install(self):
+        text = _INSTALL_SH.read_text()
+        panel = text[text.index("run_menu_system() {"):]
+        panel = panel[: panel.index("\n}\n")]
+        self.assertIn('enable_gvisor="$(resolve_existing_install_gvisor "$project_id" "$cluster_name" "$region")"', panel)
+        self.assertNotIn("${ENABLE_GVISOR:-false}", panel)
+
     def test_successful_apply_writes_log_file_and_succeeds(self):
         repo_dir = self._tmp_path / "mock-repo"
         compose_dir = repo_dir / "terraform" / "examples" / "full-install"
@@ -9707,6 +10316,99 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertTrue(log_file.exists())
         self.assertIn("Apply complete", log_file.read_text())
 
+    def _wait_for(self, condition, what, proc):
+        deadline = time.monotonic() + _INSTALLER_RUN_TIMEOUT_SECONDS
+        while not condition():
+            # A run that ended cannot meet the condition later: say so at once.
+            if proc.poll() is not None and not condition():
+                raise AssertionError(f"{what}: the run ended with {proc.returncode} first")
+            if time.monotonic() > deadline:
+                os.killpg(proc.pid, signal.SIGKILL)
+                raise AssertionError(f"{what} within {_INSTALLER_RUN_TIMEOUT_SECONDS}s")
+            time.sleep(0.05)
+
+    def test_one_ctrl_c_lets_the_apply_shut_down_and_log_it(self):
+        """Ctrl-C reaches every process in the foreground group. The tee that
+        copies the apply to the log must outlive it, or the next line
+        lifecycle.sh prints meets a closed pipe and SIGPIPE ends the apply
+        before Terraform has saved state and released the lock (#6902).
+
+        The stub lifecycle.sh stands in for that shutdown: it holds a lock
+        file, traps INT, and after the signal prints, removes the lock and
+        prints again. It writes nothing after the signal until the test lets
+        it, so on a tee that dies of SIGINT the pipe is closed by then."""
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lock = self._tmp_path / "state.lock"
+        trapped = self._tmp_path / "trapped"
+        release = self._tmp_path / "release"
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text(f"""#!/bin/bash
+interrupted=""
+trap 'interrupted=1' INT
+: > "{lock}"
+echo "apply started"
+while [ -z "$interrupted" ]; do sleep 0.1; done
+: > "{trapped}"
+while [ ! -e "{release}" ]; do sleep 0.1; done
+echo "Interrupt received. Gracefully shutting down..."
+rm -f "{lock}"
+echo "state saved, lock released"
+exit 1
+""")
+        lifecycle_sh.chmod(0o755)
+        log_file = self._tmp_path / "provision.log"
+        script = f"""
+source "{_INSTALLER_COMMON}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+run_lifecycle_apply "{repo_dir}" "{log_file}"
+"""
+        env = get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._report_file),
+        })
+        out_path = self._tmp_path / "stdout"
+        err_path = self._tmp_path / "stderr"
+        with open(out_path, "w") as out, open(err_path, "w") as err:
+            # A process group of its own, so the signal reaches what a
+            # terminal's Ctrl-C reaches and not the test runner. SIGINT at its
+            # default: a runner started with it ignored (a `&` job of a
+            # non-interactive shell) would hand that on, and nothing here
+            # would then see the signal.
+            proc = subprocess.Popen(
+                ["bash", "-c", script], stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                env=env, cwd=str(_REPO_ROOT), start_new_session=True,
+                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+            )
+            try:
+                self._wait_for(
+                    lambda: log_file.exists() and "apply started" in log_file.read_text(),
+                    "the apply's first line never reached the log", proc)
+                os.killpg(proc.pid, signal.SIGINT)
+                self._wait_for(trapped.exists, "the stub never saw SIGINT", proc)
+                # Only how surely an unfixed tee is gone before the stub's next
+                # write depends on this pause; a tee that ignores SIGINT is
+                # there however long it is.
+                time.sleep(0.5)
+                release.write_text("")
+                returncode = proc.wait(timeout=_INSTALLER_RUN_TIMEOUT_SECONDS)
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+        log = log_file.read_text()
+        stderr = err_path.read_text()
+        self.assertFalse(lock.exists(), f"the apply died holding the lock; log:\n{log}\nstderr:\n{stderr}")
+        self.assertIn("Gracefully shutting down", log)
+        self.assertIn("state saved, lock released", log)
+        self.assertIn("state saved, lock released", out_path.read_text())
+        # The interrupted apply is reported as the failed command, as any
+        # other apply that exits non-zero is.
+        self.assertEqual(returncode, 1, stderr)
+        self.assertIn("(exit code 1): ./lifecycle.sh apply -auto-approve -input=false", stderr)
+        self.assertNotIn(_TEE_NAMED_IN_BANNER, stderr)
+
     def test_a_failure_inside_a_sourced_library_names_its_file_and_function(self):
         """The abort banner points at the frame that failed.
 
@@ -9718,11 +10420,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         """
         lib = self._tmp_path / "helper_lib.sh"
         lib.write_text("library_probe() {\n  false\n}\n")
-        # Same file the other write_json_report tests read, removed first so
-        # the assertions below read this run's report and not the one the
-        # previous test left behind.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
 
         self.assertEqual(proc.returncode, 1, proc.stderr)
@@ -9856,9 +10554,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         inherited trap in this shape, so there this asserts the contract
         without exercising the check; the unhandled case below does.
         """
-        # Same file the other write_json_report tests read.
-        report = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report.unlink(missing_ok=True)
+        report = self._report_file
         proc = self._run_func(
             "probe() { false; }\n"
             'step() { if ! x="$(probe)"; then echo "handled"; fi; }\n'
@@ -9881,10 +10577,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         hand the caller a clean exit. The parent's trap then fires at the
         assignment and prints the one banner.
         """
-        # Same file the other write_json_report tests read, removed first so
-        # the report assertion reads this run's and not the previous test's.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(
             'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
             'x="$(probe)"\n'
@@ -10622,6 +11315,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
         "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
         "--slack-home-channel-policy": ("PARAM_SLACK_HOME_CHANNEL_POLICY", "manual"),
+        "--google-chat-home-channel-policy": ("PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
         "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
         "--scope-folders": ("PARAM_SCOPE_FOLDERS", "123456789012"),
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),
@@ -12166,13 +12860,14 @@ class DomainScopedFlagsTest(unittest.TestCase):
         """The A2A gateway authenticates one bot token, with Google Chat or without,
         so a list fails there with nothing in the PlatformAgent's status. The help
         text is where a caller choosing the tokens reads the flag."""
-        proc = subprocess.run(
-            ["bash", str(_INSTALL_SH), "--help"],
-            capture_output=True,
-            text=True,
-            env=get_isolated_test_env(),
-            cwd=str(_REPO_ROOT),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+                cwd=str(_REPO_ROOT),
+            )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         help_text = " ".join((proc.stdout + proc.stderr).split())
         self.assertIn(
@@ -13172,10 +13867,12 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                     self.assertIn(f"set {key}= (empty) in install.env", out)
 
     def test_the_flags_are_in_the_help_text(self):
-        proc = subprocess.run(
-            ["bash", str(_INSTALL_SH), "--help"],
-            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+            )
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
                      "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS", "--scope-max-projects=N",
@@ -13638,6 +14335,7 @@ prompt_menu() {{
     3) printf -v "$var" '%s' "6" ;;
   esac
 }}
+export ENABLE_GVISOR="false"
 run_menu_system "{repo_tmp}"
 """,
                         source_common=False,

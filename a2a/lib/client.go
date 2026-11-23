@@ -43,7 +43,8 @@ func TaskEventsSubject(addressee, taskID string) string {
 // the supervisor's `from` that replay could not tell from the real thing. The
 // token is the same count as `events`, so every `a2a.tasks.*.*.<class>`
 // pattern and the TASKS stream filter behave identically and the pair share
-// one stream sequence. tasks/get folds both in that order.
+// one stream sequence. tasks/get folds both in that order, subject to the
+// profile cutoff (AcceptsSupervisorEvent).
 func TaskSupervisorSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
 }
@@ -59,8 +60,10 @@ func TaskSupervisorSubject(addressee, taskID string) string {
 const TaskProfileSupervisorToken = "p"
 
 // ProfileSupervisorSubject is a profile task's supervisor subject in its
-// profile form. Nothing publishes it yet: readers accept it beside
-// TaskSupervisorSubject until the dispatcher moves to it (#5301).
+// profile form (#5301). Readers accept it beside TaskSupervisorSubject; the
+// dispatcher publishes a terminal here when its dispatch config's
+// ProfileSupervisorForm is ProfileSupervisorFormProfile
+// (DispatchConfig.SupervisorSubjectFor).
 func ProfileSupervisorSubject(profile, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s.%s", TaskProfileSupervisorToken, profile, taskID, TaskClassSupervisor)
 }
@@ -230,12 +233,16 @@ type Client struct {
 	opts clientOptions
 	log  *slog.Logger
 
-	mu      sync.RWMutex
-	nc      *nats.Conn
-	js      jetstream.JetStream
-	subs    []*durableSub
-	cores   []*coreSub
-	closing atomic.Bool
+	mu sync.RWMutex
+	nc *nats.Conn
+	// asyncErrHooks are told every async connection error (OnAsyncError),
+	// under mu.
+	asyncErrHooks map[int]func(error)
+	asyncErrNext  int
+	js            jetstream.JetStream
+	subs          []*durableSub
+	cores         []*coreSub
+	closing       atomic.Bool
 
 	// rebuildMu serializes terminal-close rebuilds so a flapping server can
 	// never leave a stale rebuild storing a dead connection last.
@@ -252,6 +259,9 @@ type Client struct {
 	// disagreements count here too: they are the one protocol error this
 	// client sees and does not refuse.
 	protocolViolations atomic.Int64
+	// profileSupervisorDrops counts the five-token supervisor messages reads
+	// refused as a profile task's terminal (AcceptSupervisorEvent).
+	profileSupervisorDrops atomic.Int64
 }
 
 // ProtocolViolations reports how many protocol errors this client has
@@ -271,6 +281,9 @@ type clientOptions struct {
 	// (WithFirstDialNATSOptions).
 	firstDialOpts []nats.Option
 	agreement     AgreementPolicy
+	// profileSupervisorCutoff is WithProfileSupervisorCutoff's, zero when
+	// unlatched.
+	profileSupervisorCutoff time.Time
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come
@@ -372,6 +385,15 @@ func (c *Client) dial(extra ...nats.Option) (*nats.Conn, jetstream.JetStream, er
 				subject = sub.Subject
 			}
 			c.log.Error("nats async error", "err", err, "subject", subject)
+			c.mu.RLock()
+			hooks := make([]func(error), 0, len(c.asyncErrHooks))
+			for _, h := range c.asyncErrHooks {
+				hooks = append(hooks, h)
+			}
+			c.mu.RUnlock()
+			for _, h := range hooks {
+				h(err)
+			}
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			if c.closing.Load() {
@@ -1317,5 +1339,26 @@ func (s *durableSub) stopIntake() {
 	defer s.mu.Unlock()
 	if s.cc != nil {
 		s.cc.Stop()
+	}
+}
+
+// OnAsyncError registers f to be told every async error on the client's
+// connection, a permissions violation among them: the server refuses a
+// subscription after the SUB is flushed, so SubscribeCore returns nil and only
+// this hears the refusal. f runs on nats.go's callback goroutine and must not
+// block. The returned func unregisters it.
+func (c *Client) OnAsyncError(f func(error)) (remove func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.asyncErrHooks == nil {
+		c.asyncErrHooks = map[int]func(error){}
+	}
+	id := c.asyncErrNext
+	c.asyncErrNext++
+	c.asyncErrHooks[id] = f
+	return func() {
+		c.mu.Lock()
+		delete(c.asyncErrHooks, id)
+		c.mu.Unlock()
 	}
 }

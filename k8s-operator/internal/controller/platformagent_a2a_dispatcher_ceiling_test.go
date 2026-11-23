@@ -375,26 +375,27 @@ func twoTierProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.
 }
 
 // parameterHeavyProfiles is twoTierProfiles with each profile declaring the
-// most parameters it can, at the longest names. A parameter costs the
-// dispatch config bytes and the dispatcher's identity entry nothing, so the
-// config's limit cuts before the identity's. Since #5485 a Job template is a
-// reference in the config, not the template itself, so Job mode alone no
-// longer reaches that limit first.
+// most parameters it can, at the longest names, each required. A parameter
+// costs the dispatch config bytes and the dispatcher's identity entry
+// nothing, so the config's limit cuts before the identity's. Since #5485 a
+// Job template is a reference in the config, not the template itself, so Job
+// mode alone no longer reaches that limit first, and since #5479 the config
+// doesn't list durables, so only parameters at their largest still do.
 func parameterHeavyProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.AgentProfile {
 	profiles := twoTierProfiles(agent, n)
 	for i := range profiles {
 		for j := 0; j < 16; j++ {
 			name := fmt.Sprintf("p%02d_%s", j, strings.Repeat("x", 59))
-			profiles[i].Spec.Parameters = append(profiles[i].Spec.Parameters, agentv1alpha1.AgentProfileParameter{Name: name})
+			profiles[i].Spec.Parameters = append(profiles[i].Spec.Parameters, agentv1alpha1.AgentProfileParameter{Name: name, Required: true})
 		}
 	}
 	return profiles
 }
 
 // The dispatch config's shares, summed, are at least the ConfigMap the
-// operator writes for the same profiles, and only a little over: a Job
-// template is charged at the larger of its two renderings, and the first
-// entry one comma it doesn't take (gke-labs/kube-agents#5479).
+// operator writes for the same profiles, and only a little over: the first
+// entry is charged one comma it doesn't take (gke-labs/kube-agents#5479).
+// TestTheDispatchConfigMeasureIsTheWrittenShape covers the other shapes.
 func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "false") // no cut: measure all of them
@@ -416,7 +417,7 @@ func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 	}
 	largest := 0
 	for _, imageVolumes := range []bool{true, false} {
-		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -426,7 +427,7 @@ func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 		}
 		largest = max(largest, actual)
 	}
-	// Against the larger rendering, which is what each share is charged at,
+	// A template is referenced by a fixed-width hash, so at either rendering
 	// the sum is over by the first entry's comma alone.
 	if estimate-largest > 1 {
 		t.Errorf("the shares sum to %d bytes, %d over the larger ConfigMap's %d", estimate, estimate-largest, largest)
@@ -462,7 +463,7 @@ func TestUnderJobModeTheConfigLimitCutsFirst(t *testing.T) {
 	// either rendering, and at the larger it uses most of the budget: the cut
 	// is safe and not far early.
 	for _, imageVolumes := range []bool{true, false} {
-		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes, a2aTaskSigningKeyPlaceholder), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -507,7 +508,11 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	profiles = profiles[:len(profiles)-len(a2aDispatcherCeilingRefused(agent, profiles))]
 	until := time.Now().Add(a2aDrainingWindow).Truncate(time.Second).UTC()
 	var draining []a2aDispatchProfile
-	for i := 0; i < 600; i++ {
+	// 240: enough to take the config past one ConfigMap while the identity
+	// entry stays under its own ceiling. Each profile's grant names both
+	// supervisor forms since #5301, so the entry grows faster per drain
+	// than it did at 300.
+	for i := 0; i < 240; i++ {
 		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i), Tiers: []string{agentv1alpha1.AgentProfileTierRead}, DrainingUntil: until})
 	}
 	entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
@@ -516,7 +521,7 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	}
 	cond, over, err := a2aDispatcherCeiling(agent, profiles, draining)
 	if err != nil || !over {
-		t.Fatalf("over=%v err=%v: 600 draining entries past the config's reserve didn't read as over", over, err)
+		t.Fatalf("over=%v err=%v: 240 draining entries past the config's reserve didn't read as over", over, err)
 	}
 	if cond.Reason != dispatcherCeilingReasonOver || !strings.Contains(cond.Message, "ConfigMap") || !strings.Contains(cond.Message, "#5479") {
 		t.Errorf("condition %s: %s", cond.Reason, cond.Message)
@@ -616,7 +621,7 @@ func TestJobModeAloneNoLongerFillsTheConfig(t *testing.T) {
 	if refused := a2aDispatcherCeilingRefused(agent, profiles); len(refused) != 0 {
 		t.Errorf("%d of 400 two-tier profiles under Job mode were refused", len(refused))
 	}
-	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

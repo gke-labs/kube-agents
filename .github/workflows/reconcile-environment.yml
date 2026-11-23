@@ -6,8 +6,8 @@ name: "Shared: Reconcile Environment"
 # This is the in-place half of #1117. deploy-environment.yml is the other half:
 # it destroys the environment and builds it again, which is right for `rc` and
 # `nightly` — they exist to prove an install works from nothing — and wrong for
-# `autopush`, `autopush-next` and `staging`, which people live-test against and
-# which hold state nobody wants rebuilt nightly.
+# `autopush` and `staging`, which people live-test against and which hold
+# state nobody wants rebuilt nightly.
 #
 # In-place is also the only path that exercises what a real user upgrading an
 # existing install goes through. Nothing else in CI covers it.
@@ -45,8 +45,9 @@ on:
       # environment does not exist, or exists without GCP_PROJECT_ID, the run
       # posts a notice and reports `skipped` instead of failing on the strict
       # render. Off by default, because on an environment that should exist a
-      # missing one is the failure. A caller drops it once the environment is
-      # provisioned, so that clearing its variables reds the run again.
+      # missing one is the failure. No workflow passes it today; a caller that
+      # does should drop it once its environment is provisioned, so that
+      # clearing its variables reds the run again.
       skip_unconfigured:
         description: "Skip, rather than fail, when the GitHub environment or its GCP_PROJECT_ID is missing"
         required: false
@@ -68,7 +69,6 @@ on:
         type: choice
         options:
           - "autopush"
-          - "autopush-next"
           - "staging"
           - "rc"
           - "nightly"
@@ -305,6 +305,7 @@ jobs:
           GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
           GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
           GOOGLE_CHAT_HOME_CHANNEL: ${{ vars.GOOGLE_CHAT_HOME_CHANNEL }}
+          GOOGLE_CHAT_HOME_CHANNEL_POLICY: ${{ vars.GOOGLE_CHAT_HOME_CHANNEL_POLICY }}
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
           CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
           ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
@@ -322,6 +323,7 @@ jobs:
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
           HELM_UPGRADE_INSTALL: ${{ vars.HELM_UPGRADE_INSTALL }}
+          CARD_STOP_ENABLED: ${{ vars.CARD_STOP_ENABLED }}
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
           # Unset leaves the key out of install.env and the shipped default (true)
@@ -338,6 +340,7 @@ jobs:
           VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
+          PLATFORM_AGENT_SIZING_PROFILE: ${{ vars.PLATFORM_AGENT_SIZING_PROFILE }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}

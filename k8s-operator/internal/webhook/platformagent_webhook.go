@@ -61,10 +61,11 @@ const DefaultPort = 10250
 // agentv1alpha1.BusCredentialRoutes. Each names the thing matched, so the
 // author reading the field error knows which line to change and why.
 const (
-	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone" // #nosec G101 -- Error message format, not a credential
-	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"                                 // #nosec G101 -- Error message format, not a credential
-	forgeCredsSecretForbiddenFmt = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"                         // #nosec G101 -- Error message format, not a credential
-	forgeCredsEnvForbiddenFmt    = "container %q references Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be referenced by the CR"               // #nosec G101 -- Error message format, not a credential
+	busTokenAudienceForbiddenFmt     = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone"                    // #nosec G101 -- Error message format, not a credential
+	watcherTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the credential proxy's watcher token audience; the operator projects that token for the agent-api-auth container alone" // #nosec G101 -- Error message format, not a credential
+	busCredsSecretForbiddenFmt       = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"                                                    // #nosec G101 -- Error message format, not a credential
+	forgeCredsSecretForbiddenFmt     = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"                                            // #nosec G101 -- Error message format, not a credential
+	forgeCredsEnvForbiddenFmt        = "container %q references Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be referenced by the CR"                                  // #nosec G101 -- Error message format, not a credential
 )
 
 // The data volume size checks on spec.storage.size. A PersistentVolumeClaim
@@ -394,9 +395,26 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, storageErrs...)
 	warnings = append(warnings, storageWarnings...)
 
-	// 6. The bus's server count, on an update: an edit asking an existing bus
-	// for another count is refused here as the operator refuses it.
+	// 6. The bus's server count, on an update: a change while a migration
+	// runs is refused; otherwise a change is how a migration starts.
 	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
+	// 7. Leaving next while a bus migration holds the bus: the run's
+	// staging claim can hold the only copy of the bus's data.
+
+	// 8. Effective kanban.admission memoryBudgetMiB >= workerRssCapMiB so a
+	// single worker's RSS cap never exceeds the pod's memory admission budget.
+	admissionErrs, admissionWarnings := validateKanbanAdmission(oldObj, platformAgent)
+	allErrs = append(allErrs, admissionErrs...)
+	warnings = append(warnings, admissionWarnings...)
+
+	// 9. Tier membership (#3659): no unattended or legacy tier for a person,
+	// and no person listed twice. A tier nothing defines yet is let through:
+	// the gateway refuses that member's profile tasks until it exists.
+	memberErrs, err := controller.ValidateTierMembership(ctx, v.Client, oldObj, platformAgent, field.NewPath("spec", "tiers", "membership"))
+	if err != nil {
+		return nil, err
+	}
+	allErrs = append(allErrs, memberErrs...)
 
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
@@ -428,30 +446,26 @@ func (v *PlatformAgentCustomValidator) validateOperatorNamespace(oldObj, platfor
 		fmt.Sprintf(operatorNamespaceRefusedFmt, v.OperatorNamespace, platformAgent.Namespace))}, nil
 }
 
-// validateBusReplicas refuses an update that sets
-// spec.harness.tuning.busReplicas to a count other than the one the existing
-// bus runs, with the operator's own message (controller.BusConversionRefusedMessage):
-// converting a bus empties it until #4225 brings the migration. Best effort:
-// the running count is the stored object's status.busReplicas, which an older
-// CRD prunes, so the operator's refusal on every pass is the enforcement and
-// this only refuses the edit early. An update that leaves the field as it was
-// is let through, so a CR the operator already holds to its count can still
-// be edited otherwise.
+// validateBusReplicas refuses an update that changes
+// spec.harness.tuning.busReplicas while the bus's migration is under way:
+// a run converts to the count it started for, and turning it around mid-way
+// is not a migration it knows how to make. Setting the field to the other
+// count on an existing bus is otherwise how a migration starts (#4225).
+// Best effort: the run is read from the stored object's status.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
 	if oldObj == nil {
 		return nil
 	}
-	running := oldObj.Status.BusReplicas
-	asked := busReplicasField(platformAgent)
-	if (running != 1 && running != 3) || asked == nil || int32(*asked) == running { // #nosec G115 -- the CRD admits 1 or 3
+	run := oldObj.Status.BusMigration
+	if run == nil || run.Phase == "Done" || run.Phase == "Abandoned" || run.Phase == "Failed" {
 		return nil
 	}
-	if previous := busReplicasField(oldObj); previous != nil && *previous == *asked {
+	previous, asked := busReplicasField(oldObj), busReplicasField(platformAgent)
+	if (previous == nil) == (asked == nil) && (previous == nil || *previous == *asked) {
 		return nil
 	}
 	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"),
-		controller.BusConversionRefusedMessage(int32(*asked), running)+ // #nosec G115 -- the CRD admits 1 or 3
-			" (The operator holds the bus to its count on every pass; this admission check only refuses the edit early.)")}
+		fmt.Sprintf("the A2A bus's %s migration is under way (phase %s); busReplicas can change again once it has ended (status.busMigration)", run.Leg, run.Phase))}
 }
 
 func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {
@@ -512,6 +526,23 @@ func storageSize(platformAgent *agentv1alpha1.PlatformAgent) *resource.Quantity 
 		return nil
 	}
 	return platformAgent.Spec.Storage.Size
+}
+
+// validateKanbanAdmission rejects creates or updates whose resolved
+// kanban.admission block sets memoryBudgetMiB below workerRssCapMiB. When
+// oldObj already carried a mismatched configuration and neither
+// spec.deployment.resources nor spec.harness.tuning.admission changed, the
+// update passes with a warning so unrelated edits to an existing CR are not
+// deadlocked.
+func validateKanbanAdmission(oldObj, platformAgent *agentv1alpha1.PlatformAgent) (field.ErrorList, admission.Warnings) {
+	errs := controller.ValidateKanbanAdmission(platformAgent)
+	if len(errs) == 0 {
+		return nil, nil
+	}
+	if oldObj != nil && controller.KanbanAdmissionInputsEqual(oldObj, platformAgent) && len(controller.ValidateKanbanAdmission(oldObj)) > 0 {
+		return nil, admission.Warnings{fmt.Sprintf("%s: %s", errs[0].Field, errs[0].Detail)}
+	}
+	return errs, nil
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a
@@ -631,6 +662,11 @@ func validateBusCredentialSource(vol corev1.Volume, agentName string, path *fiel
 			errs = append(errs, field.Forbidden(
 				path.Child("projected", "sources").Index(route.Source).Child("serviceAccountToken", "audience"),
 				fmt.Sprintf(busTokenAudienceForbiddenFmt, vol.Name, agentv1alpha1.A2ABusTokenAudience),
+			))
+		case agentv1alpha1.BusCredentialRouteWatcherAudience:
+			errs = append(errs, field.Forbidden(
+				path.Child("projected", "sources").Index(route.Source).Child("serviceAccountToken", "audience"),
+				fmt.Sprintf(watcherTokenAudienceForbiddenFmt, vol.Name, agentv1alpha1.WatcherTokenAudience),
 			))
 		case agentv1alpha1.BusCredentialRouteSecret:
 			at := path.Child("secret", "secretName")

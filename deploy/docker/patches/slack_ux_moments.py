@@ -77,7 +77,7 @@ legacy attachment holding every block below the headline. A settle sends the
 attachment again, since ``chat.update`` would otherwise keep the old one, buttons
 and all; a question settled down to its headline alone loses the bar.
 
-Under ``spec.mode: next`` a card reaches the thread through the kanban
+Where the gateway holds the platform, a card reaches the thread through the kanban
 notifier's chat.notify stand-in (``kanban_chat_notify``), which has no Slack
 client. The same moments go out as ``kube-agents.chat/v1`` messages
 (``agents/platform/scripts/chat_message.py``): the PR card once per thread and

@@ -87,11 +87,11 @@ code says two of those don't cross the door:
 
 The callers that do cross the door fall into three classes:
 
-| Class       | Who                                                                                                                                           | How it reaches `:8643`                                                                                                                     |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| **console** | the web console (`a2a/cmd/web-console`)                                                                                                       | the Service, `HERMES_URL=http://<agent>.<ns>.svc.cluster.local:8642` (`charts/kube-agents/templates/web-console.yaml:94-95`)               |
-| **eval**    | the bench's api transport (`bench/kube_agents_bench/harness.py`), driven by `hack/ci-eval-pr.sh` and `bench/hack/run-gitops-pilot.sh`         | a port-forward to the Service (`harness.py:181,529-532`), or an exec relay to `agent-api-auth:8643` under gVisor (`bench/README.md:60-63`) |
-| **ops**     | install and CI smoke checks: `hack/ci-deploy.sh`, `hack/rollback-roundtrip.sh`, `hack/kind-up.sh` and the e2e suite (`tests/e2e/conftest.py`) | the Service, or the e2e exec relay                                                                                                         |
+| Class       | Who                                                                                                                                   | How it reaches `:8643`                                                                                                                     |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **console** | the web console (`a2a/cmd/web-console`)                                                                                               | the Service, `HERMES_URL=http://<agent>.<ns>.svc.cluster.local:8642` (`charts/kube-agents/templates/web-console.yaml:94-95`)               |
+| **eval**    | the bench's api transport (`bench/kube_agents_bench/harness.py`), driven by `hack/ci-eval-pr.sh` and `bench/hack/run-gitops-pilot.sh` | a port-forward to the Service (`harness.py:181,529-532`), or an exec relay to `agent-api-auth:8643` under gVisor (`bench/README.md:60-63`) |
+| **ops**     | install and CI smoke checks: `hack/ci-deploy.sh`, `hack/kind-up.sh` and the e2e suite (`tests/e2e/conftest.py`)                       | the Service, or the e2e exec relay                                                                                                         |
 
 The bench's inject transport goes to the gateway's `:8099`, and its board, worker-session and
 triage reads use `kubectl exec` and sqlite, so none of those cross the door
@@ -134,7 +134,7 @@ Sources:
   scheduled sessions (`main.go:41-46`).
 - **eval:** `harness.py:775-777` (token counts from the session row) and
   `harness.py:1826,1879-1890,1977` (turns, and status polls with `conversation` = the run id).
-- **ops:** `ci-deploy.sh:2600`, `rollback-roundtrip.sh:851`, `kind-up.sh:161`,
+- **ops:** `ci-deploy.sh:2600`, `kind-up.sh:161`,
   `tests/e2e/conftest.py:475,526` (an `/api/sessions?limit=1` liveness probe) and
   `tests/e2e/test_agent_api_health.py:20`.
 

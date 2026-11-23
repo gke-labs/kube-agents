@@ -334,6 +334,20 @@ SOURCES: dict[str, Source] = {
     # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
     # can compare them, and a NetworkPolicy that selects nothing is
     # indistinguishable from one that is working.
+    # The broker's a2a-chat caller binding (#6090): the env name the operator
+    # renders, which the Python broker reads under its own constant. Two
+    # modules, so only this suite can see the two names drift apart.
+    "a2a_chat_callers_env_go": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("credentialProxyA2AChatCallersEnvVar =",),
+    ),
+    # The exec tier's list of the broker env it leaves out (#6090): the A2A
+    # gateway stays an allowed caller there, so its a2a-chat binding must not
+    # be on that list.
+    "exec_tier_env_go": Source(
+        "k8s-operator/internal/controller/credential_proxy_exec_tier.go",
+        ("credentialProxyA2AChatAudienceEnvVar: true,",),
+    ),
     "a2a_session_fence": Source(
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
@@ -400,13 +414,29 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveA2AGooglePrincipal", "a2aGoogleCallerPrefix"),
     ),
+    # The A2A door's Microsoft Entra class: the same four seams, with the
+    # token checked locally against the tenant's keys rather than asked of
+    # an endpoint.
+    "a2a_door_entra": Source(
+        "a2a/gateway/a2adoor_entra.go",
+        (
+            "func (v *entraTokenVerifier) verify",
+            "func (v *entraTokenVerifier) identity",
+            "a2aEntraCallerPrefix =",
+            ") identifyEntra(",
+        ),
+    ),
+    "a2a_door_entra_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2AEntraPrincipal", "a2aEntraCallerPrefix"),
+    ),
     "a2a_door_callers": Source(
         "a2a/gateway/a2adoor.go",
         ("func callerOf(",),
     ),
     "a2a_door_roster": Source(
         "a2a/gateway/gateway.go",
-        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend"),
+        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend", "a2aEntraBackend"),
     ),
     # The gateway's Slack identity rule: the allowlist gates, the map
     # overrides, and the member id is the principal otherwise.
@@ -423,6 +453,18 @@ SOURCES: dict[str, Source] = {
     "operator_labels": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
+    ),
+    # The audit-report store's operator half (#5619): the env names it
+    # reserves, and the gateway-policy rule.
+    "audit_report_store_operator": Source(
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("auditReportStoreEnvNames", "auditReportStoreIngressRule("),
+    ),
+    # The listener itself, read as text: the suite does not import it (it
+    # needs FastAPI and cryptography).
+    "audit_report_store_listener": Source(
+        "agents/platform/scripts/audit_report_store.py",
+        ("ALLOWED_SUBJECT_ENV", "DEFAULT_API_SERVER", "DEFAULT_REPORTS_DIR"),
     ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",
@@ -459,6 +501,13 @@ SOURCES: dict[str, Source] = {
     "a2a_gateway_allowlist": Source(
         "a2a/gateway/allowlist.go",
         ("EnvTargetAllowedUsersGchat", "EnvTargetAllowedUsersSlack", "func (g *Gateway) targetAllows"),
+    ),
+    # Who runs at which tier (#3659), as the gateway reads it. The name
+    # crosses the module boundary from the operator's render of
+    # spec.tiers.membership; C1 pins the pair.
+    "a2a_gateway_tier_membership": Source(
+        "a2a/gateway/tier_membership.go",
+        ("EnvTierMembership", "func parseTierMembership", "func (g *Gateway) tierOf"),
     ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
@@ -513,10 +562,6 @@ SOURCES: dict[str, Source] = {
     # authenticates through the callout, so it is in no served config, and
     # its publish list is appended to a per-profile slice that the identity
     # reader above can't parse; the writer tests read its body directly.
-    "a2a_dispatcher": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
-        ("func dispatcherIdentity(", "a2a.dispatch.*.*.*"),
-    ),
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         (
@@ -527,6 +572,19 @@ SOURCES: dict[str, Source] = {
             "a2aBusUserEnv",
             "a2aAgentBusUser",
             "a2aBridgeUser",
+        ),
+    ),
+    # The AgentProfile dispatcher's identity is built in its own file, from the
+    # profiles and durables the authmap lists, and joins the identity map
+    # beside the rows above. A writer set read from the identities file alone
+    # leaves it out of every one-writer assertion.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        (
+            "func dispatcherIdentity(",
+            "a2a.dispatch.*.*.*",
+            "a2aDispatcherUser",
+            "var perProfile []string",
         ),
     ),
     # The JetStream halves of the publish lists live in the manifests file, and

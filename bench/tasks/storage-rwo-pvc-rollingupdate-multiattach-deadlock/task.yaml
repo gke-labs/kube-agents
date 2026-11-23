@@ -8,7 +8,7 @@
 id: storage-rwo-pvc-rollingupdate-multiattach-deadlock
 name: "Deployment Mounting a ReadWriteOnce Claim Under RollingUpdate (rwo-claim-contended)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 audit_streams:
   - obtainability-audit
 fixtures: []

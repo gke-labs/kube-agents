@@ -891,6 +891,7 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	waitParentTerminalRelayed(t, r, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "child detached", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
@@ -910,6 +911,44 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	if key, _ := r.g.reg.SessionForTask(ctx, child.TaskID); key != conv {
 		t.Fatalf("the detached child was retired with the pod: index=%q", key)
 	}
+}
+
+// TestAStoppedChildBlocksUntilItEnds: a stop doesn't end a child, so one
+// still running after its cancel is the conversation's live delegation and a
+// later turn's request is refused, naming it; once its terminal arrives the
+// next request mints.
+func TestAStoppedChildBlocksUntilItEnds(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-stopped-child-blocks"
+	exec, _, _ := sessionTurn(t, r, spawn, conv, "x")
+	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
+	child := r.awaitTask(t, targetPlatform)
+	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	waitParentTerminalRelayed(t, r, "")
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "child detached", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached
+	})
+	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
+	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "second"))
+	waitFor(t, "busy refusal", loggedContaining(r, "delegation refused", "rule="+ruleDelegationBusy, origin2.TaskID, "child="+child.TaskID))
+	_ = exec2.PublishStatus(ctx, lib.StateCompleted, true)
+
+	_ = r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateCanceled, true)
+	waitFor(t, "the stopped child's route retired", func() bool {
+		key, err := r.g.reg.SessionForTask(ctx, child.TaskID)
+		return err == nil && key == ""
+	})
+	exec3, origin3, _ := sessionTurn(t, r, spawn, conv, "and again")
+	_ = exec3.PublishArtifact(ctx, delegateArtifact(t, "platform", "third"))
+	waitFor(t, "the next child on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin3.TaskID)
+		return len(pref.Children) == 1
+	})
 }
 
 // ---- the wake-up turn after the child's end ------------------------------
@@ -981,6 +1020,34 @@ func completeTask(t *testing.T, exec *lib.TaskExecution, text string) {
 	}
 }
 
+// waitParentTerminalRelayed waits for the delegating turn's own terminal to
+// be relayed: its line closed at completed, or, on a backend that shows task
+// status itself (no lines), its answer posted alone (answer, when it had
+// one). Not any post containing the answer's words: the child's line note
+// "(delegated to platform)" matches "delegated to platform" the moment the
+// child is minted, before the turn ends. Since one stop cancels the whole
+// tree (#5682), a stop sent before the turn's terminal also cancels the
+// still-running turn (#6782).
+func waitParentTerminalRelayed(t *testing.T, r *rig, answer string) {
+	t.Helper()
+	waitFor(t, "parent terminal relayed", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, terminalLine(lib.StateCompleted, "")) {
+				return true
+			}
+		}
+		if answer == "" {
+			return false
+		}
+		for _, p := range r.adapter.postTexts() {
+			if strings.TrimSpace(p) == answer {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 // delegated runs a session turn that delegates, stamped as arriving through
 // backend ("" is the rig's own; sessionTurnVia), waits for the chain on the
 // record, and ends the delegating turn as the adapter does, waiting for its
@@ -999,7 +1066,7 @@ func delegated(t *testing.T, r *rig, spawn *fakeSpawner, conv, backend string) (
 		return len(pref.Children) == 1
 	})
 	completeTask(t, exec, "delegated to platform")
-	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	waitParentTerminalRelayed(t, r, "delegated to platform")
 	return origin, session, child
 }
 
@@ -1170,17 +1237,19 @@ func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
 		name string
 		end  func(t *testing.T, r *rig, child *lib.Envelope)
 	}{
+		// Nothing a stopped child writes reaches the room: each end is
+		// dropped, and logged.
 		{"canceled", func(t *testing.T, r *rig, child *lib.Envelope) {
 			_ = r.execFor(t, child, targetPlatform).PublishStatus(context.Background(), lib.StateCanceled, true)
-			waitFor(t, "canceled relayed", postedContaining(r, "🛑 canceled"))
+			waitFor(t, "canceled dropped", loggedContaining(r, "dropped a canceled task's write", child.TaskID))
 		}},
 		{"completed", func(t *testing.T, r *rig, child *lib.Envelope) {
 			completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
-			waitFor(t, "result relayed", postedContaining(r, "fleet is green"))
+			waitFor(t, "result dropped", loggedContaining(r, "dropped a canceled task's write", child.TaskID, "what=result"))
 		}},
 		{"failed", func(t *testing.T, r *rig, child *lib.Envelope) {
 			publishFinal(t, r, child, targetPlatform, lib.StateFailed, "the fleet is on fire")
-			waitFor(t, "failure relayed", postedContaining(r, "the fleet is on fire"))
+			waitFor(t, "failure dropped", loggedContaining(r, "dropped a canceled task's write", child.TaskID))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1207,6 +1276,11 @@ func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
 			}
 			assertOnlyRoot(t, obs, origin.TaskID)
 			assertNoDelivery(t, obs)
+			for _, late := range []string{"🛑 canceled", "fleet is green", "the fleet is on fire"} {
+				if postedContaining(r, late)() {
+					t.Fatalf("a stopped child's end was posted: %q", late)
+				}
+			}
 		})
 	}
 }

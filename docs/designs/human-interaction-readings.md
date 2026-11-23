@@ -28,7 +28,7 @@ its own, `chatSessionsTotal`, projected from `sessionsChat` alone. `sessionsTota
 the summary and existing dashboards read it, and a split that renames it buys nothing.
 
 `chatSessionsTotal` is a counter under the standard contract (`…Total`, monotonic across restarts,
-clamped to `[0, 1<<53]`): the same document counter, one more projection. On a next install the
+clamped to `[0, 1<<53]`): the same document counter, one more projection. The
 chat half sums the Hermes plugin's sessions series and the A2A gateway's, as `sessionsTotal` does
 today. Its first value is the document's chat half as it stands. An upgrade keeps the usage
 document, and the poller's re-seed (`usageStatusSeed`) puts the whole of `sessionsTotal` into that
@@ -51,12 +51,12 @@ newer fields.
 
 ### 2.2 People: a count of pseudonyms the A2A gateway has seen in a window
 
-Next-mode installs are the target: chat arrives through the A2A gateway, which resolves the sender
+Chat arrives through the A2A gateway, which resolves the sender
 to a principal on every turn and hashes it (`Authority.Requester.Principal`, `hmac:` plus a
 salted HMAC-SHA256 prefix, `Pseudonymizer` in `a2a/gateway/principal.go`). The gateway is the
-producer. The Hermes session store is not: a today install gets no people count in this design,
-and a platform a next install still serves through Hermes (Slack, while Chat is on the A2A door)
-is outside the count until it moves to the door. The docs say both.
+producer. The Hermes session store is not: the one platform an install still serves through
+Hermes (Teams) is outside the count until it moves to the door. The docs
+say so.
 
 **State.** The gateway keeps its durable state in NATS JetStream key-value buckets (`session-state`
 without a TTL, `feedback` with a 720-hour one). It gets one more bucket, `people`, history 1, a
@@ -104,7 +104,7 @@ which is the bound the anti-goal below sets. The ChatOps page gets a paragraph t
 which is where the page already says what a kept record holds and who can read it.
 
 A turn counts when the gateway has verified its sender and its backend is a chat platform a
-person writes on: one of the gateway's three chat backends, Google Chat, Slack or Discord, named
+person writes on: one of the gateway's chat backends, Google Chat, Slack, Discord or (armed) Teams, named
 as such in the code and not by reference to any counter's label set. The program doors (`inject`,
 `a2a`, and the Google door) are not people, and an eval or CI install must not read its inject
 principals as such; the console is not counted either, since every console user resolves to the
@@ -137,8 +137,8 @@ added: a third reading kind, `people`, with two fields, `peopleSeen7d` and `peop
 one, `max` across pods, never moving `lastActiveTime`). They are readings and not counters because
 a window count falls when people stop writing, which a monotonic counter cannot say. The operator reads the `people` reading only while no chat platform the install enables is
 served through Hermes: not Chat on its legacy consumer, not Slack on its legacy consumer (the
-facts that choose the Slack consumer), and not Teams, which Hermes alone serves and the gateway
-has no backend for; while any of them is, the fields stay absent, since a real 0 would say nobody
+facts that choose the Slack consumer), and not Teams while Hermes serves it (the gateway's Teams backend takes it only under the
+operator's `A2A_TEAMS_BACKEND` switch); while any of them is, the fields stay absent, since a real 0 would say nobody
 wrote while those platforms' users were writing, and the summary prints "no reading". The slot as
 that design specifies it reads the broker's body alone; this design generalises it to a target per
 reading, the
@@ -257,7 +257,7 @@ re-seeded before this release reads its first value with triage sessions in it, 
 the docs, rather than hidden behind a baseline the poller would have to keep.
 
 Non-goals: per-person anything (no field, label or log carries a pseudonym); a split of
-`sessionsTotal` itself; a people count on a today install, or for a platform a next install still
+`sessionsTotal` itself; a people count for a platform an install still
 serves through Hermes; a count of people who only read (reactions and views are not interactions
 here).
 

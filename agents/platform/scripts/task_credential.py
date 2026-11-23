@@ -14,12 +14,13 @@ and cannot import the Go package. So this is a second implementation of
     TestCredentialProxyFixtures -update-proxy-fixtures`` regenerates them) and
     verified again here by ``test_task_credential.py``, so the two verifiers
     are held to one verdict per token.
-  * Where this is stricter it says so: ``target`` is required except on a
-    report credential (Go makes it optional for this audience, and a proxy
-    credential with no target confines nothing; see REPORT_TIER), base64url must be canonical, the header must carry exactly
-    ``typ`` and ``alg``, and a JSON ``null`` is refused where Go would read the
-    zero value. Each of those is a fixture with ``go_ok`` and ``proxy_ok``
-    apart.
+  * ``target`` is required except on a report credential (a proxy credential
+    with no target confines nothing; see REPORT_TIER), and Go holds the same
+    rule, so the dispatcher never mints one this refuses.
+  * Where this is stricter it says so: base64url must be canonical, the header
+    must carry exactly ``typ`` and ``alg``, and a JSON ``null`` is refused where
+    Go would read the zero value (a null target included). Each of those is a
+    fixture with ``go_ok`` and ``proxy_ok`` apart.
 
 The credential authenticates nothing by itself. The broker binds it to the pod
 the API server attested by TokenReview (pod name and UID) and to that pod's
@@ -101,10 +102,11 @@ ED25519_SIGNATURE_LENGTH = 64
 # is refused at every level (taskcred refuses an unknown nats or target key in
 # decodePayload, and a case variant of an allowed one in checkStrictClaims).
 TOP_LEVEL_CLAIMS = frozenset({"jti", "iat", "iss", "name", "sub", "aud", "exp", "nbf", "nats"})
-NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target", "trigger"})
-# Every nats key but target and trigger is required. Target is optional in Go
-# for this audience; here it may be absent only on a report credential (below),
-# so this is stricter than Go everywhere else. Trigger is optional in both.
+NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target", "trigger", "permits"})
+# Every nats key but target, trigger and permits is required. Permits is
+# taskcred's Permits, which Mint omits when there is none (#3993). Target may be
+# absent only on a report credential (below), in Go as here. Trigger is optional
+# in both.
 NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid"})
 # A report credential (#5619): a proxy credential with no target, which only an
 # unattended task started by a trigger may carry. A fleet audit names no
@@ -121,6 +123,15 @@ TRIGGER_ORIGINS = frozenset({"builtin"})
 # lib.ValidateTrigger's schedule/<stream> rule.
 TRIGGER_SCHEDULE_SOURCE = "schedule"
 HEADER_KEYS = frozenset({"typ", "alg"})
+
+# taskcred.PermitVCSProposalCreate: what a profile worker's credential carries
+# when its submission asked for a change, and what the broker's version-control
+# write verbs require of a profile caller.
+PERMIT_VCS_PROPOSAL_CREATE = "vcs:proposal-create"
+
+# Every permit taskcred mints and verifies. Closed: a credential naming any
+# other is refused, not read as carrying fewer permits.
+KNOWN_PERMITS = frozenset({PERMIT_VCS_PROPOSAL_CREATE})
 
 # int64, the width of jwt/v2's time claims. A JSON integer outside it fails
 # Go's decode; Python would read it as a bignum.
@@ -191,6 +202,9 @@ class TaskClaims:
     target: TaskTarget | None
     # The unattended trigger that started the task, when one did (#4685).
     trigger: TaskTrigger | None = None
+    # The permits the credential carries (taskcred.Claims.Permits), empty
+    # when it carries none.
+    permits: frozenset[str] = frozenset()
 
     @property
     def report_only(self) -> bool:
@@ -400,6 +414,30 @@ def _target_field(value: str, name: str) -> str:
     return value
 
 
+def _permits(nats: Mapping[str, Any]) -> frozenset[str]:
+    """The permits claim: absent, or a non-empty list of known permits, none twice.
+
+    taskcred's validate, plus what this verifier refuses on its own account: a
+    null or empty list (Mint omits the claim when there is no permit, so a
+    present-but-empty one was not minted there).
+    """
+    if "permits" not in nats:
+        return frozenset()
+    value = nats["permits"]
+    if type(value) is not list or not value:
+        raise TaskCredentialError("task credential permits is not a non-empty list")
+    seen: set[str] = set()
+    for permit in value:
+        if type(permit) is not str:
+            raise TaskCredentialError("task credential permits holds a value that is not a string")
+        if permit not in KNOWN_PERMITS:
+            raise TaskCredentialError(f"task credential permit {permit[:MAX_LABEL]!r} is not one this verifier knows")
+        if permit in seen:
+            raise TaskCredentialError(f"task credential permit {permit!r} appears twice")
+        seen.add(permit)
+    return frozenset(seen)
+
+
 # ---------------------------------------------------------------------------
 # Verify.
 # ---------------------------------------------------------------------------
@@ -483,6 +521,13 @@ def verify(
         )
 
     audience = claims["aud"]
+    # taskcred's rule for permits, stated here although the audience check
+    # below refuses every other audience anyway: a permit is a grant only this
+    # audience enforces, so a credential for any other carrying one is refused
+    # for that, whatever else this verifier comes to accept.
+    if "permits" in nats and audience != AUDIENCE:
+        raise TaskCredentialError(f"task credential permits may appear only on a {AUDIENCE!r} credential")
+    permits = _permits(nats)
     if type(audience) is not str or audience != AUDIENCE:
         raise TaskCredentialError(f"task credential is not for {AUDIENCE!r}")
 
@@ -530,6 +575,7 @@ def verify(
             location=_target_field(_string(target_claim, "location", "nats.target"), "location"),
             cluster=_target_field(_string(target_claim, "cluster", "nats.target"), "cluster"),
         ),
+        permits=permits,
         trigger=trigger,
     )
 

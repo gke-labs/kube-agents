@@ -46,6 +46,10 @@ type Health struct {
 	// DroppedAnswers counts worker answers for tasks they don't hold that
 	// were dropped over a pod's budget, since start.
 	DroppedAnswers int64
+	// SupervisorFallbacks counts terminals written on the five-token
+	// supervisor subject because the configured six-token one failed: a grant
+	// that hasn't reached this connection yet, or was taken away (#5301).
+	SupervisorFallbacks int64
 	// OpenBreakers are the (profile, tier) pairs, as profile/tier, whose
 	// breaker is open, holding every new submission queued, and
 	// HalfOpenBreakers those past the cooldown, trying one task at a time
@@ -100,7 +104,7 @@ func (d *Dispatcher) Health() Health {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	h := Health{Running: map[string]int{}, Offering: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{}, Breaker: map[string]int{}, HandOffFailed: map[string]int{},
-		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load()}
+		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load(), SupervisorFallbacks: d.supervisorFallbacks.Load()}
 	// offering is the tasks out on offer: a waiting entry for one is not
 	// forgotten while its offer round runs, however long the accept
 	// timeouts make it.
@@ -147,7 +151,7 @@ func (d *Dispatcher) Health() Health {
 func (d *Dispatcher) logHealth() {
 	h := d.Health()
 	d.log.Info("dispatcher health", "running", h.Running, "offering", h.Offering, "waiting", h.Waiting, "noWorker", h.NoWorker,
-		"oldestWait", h.OldestWait, "droppedAnswers", h.DroppedAnswers)
+		"oldestWait", h.OldestWait, "droppedAnswers", h.DroppedAnswers, "supervisorFallbacks", h.SupervisorFallbacks)
 	if h.JobAdmission != "" {
 		d.log.Warn(jobRefusedHint, "err", h.JobAdmission)
 	}
@@ -189,7 +193,7 @@ func (d *Dispatcher) logHealth() {
 }
 
 // Ready reports whether the dispatcher is serving: Run holds its accept and
-// lease subscriptions, and every durable the current config lists is bound.
+// lease subscriptions, and every durable the current config derives is bound.
 // When it isn't, the string says what is missing. A durable the operator
 // hasn't created yet, or one the grants don't cover, keeps it unready, so a
 // config the dispatcher can't fully serve shows on the pod and not only in
@@ -203,7 +207,7 @@ func (d *Dispatcher) Ready() (bool, string) {
 	defer d.mu.Unlock()
 	var unbound []string
 	for _, p := range cfg.Profiles {
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			if d.subs[dur.Name] == nil {
 				unbound = append(unbound, dur.Name)
 			}

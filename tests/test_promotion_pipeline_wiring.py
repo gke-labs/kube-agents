@@ -610,6 +610,14 @@ class PromotionPipelineWiringTest(unittest.TestCase):
             f"gchat must run before agent-plugin in optional_suites, got: {optional_suites!r}",
         )
 
+    def test_the_rollback_leg_forwards_platform_agent_sizing_profile(self):
+        steps = self.jobs[_ROLLBACK_LEG_JOB]["steps"]
+        run_step = next(step for step in steps if "rollback_environment.sh" in str(step.get("run", "")))
+        self.assertEqual(
+            run_step["env"].get("PLATFORM_AGENT_SIZING_PROFILE"),
+            "${{ vars.PLATFORM_AGENT_SIZING_PROFILE }}",
+        )
+
 
 class ConcurrencyGroupTest(unittest.TestCase):
     def test_no_workflow_hardcodes_the_rc_environment_lock(self):
@@ -802,87 +810,6 @@ class AutopushDeployWiringTest(unittest.TestCase):
         self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
 
 
-_AUTOPUSH_NEXT_DEPLOY = "autopush-next-deploy.yml"
-
-
-class AutopushNextDeployWiringTest(unittest.TestCase):
-    """autopush-next deploys what autopush deploys, in a workflow of its own.
-
-    Its own file is what lets each lane hold a workflow-level group: a run holds
-    it from creation, so resolve and deploy are serialized as a unit and an
-    older publish can never land after a newer one. A job-level group would
-    be acquired in order of resolve completion instead.
-    """
-
-    def setUp(self):
-        self.doc = _doc(_WORKFLOWS / _AUTOPUSH_NEXT_DEPLOY)
-        self.jobs = self.doc["jobs"]
-        self.autopush = _doc(_WORKFLOWS / _AUTOPUSH_DEPLOY)
-
-    def test_it_has_its_own_workflow_level_lock(self):
-        """Shared only by runs that deploy.
-
-        A run created for a failed or cancelled publish deploys nothing, but in
-        the shared group it would still cancel a pending deploy of a good one.
-        """
-        concurrency = self.doc.get("concurrency", {})
-        self.assertEqual(
-            concurrency.get("group"),
-            "${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')"
-            " && 'autopush-next-deploy' || format('autopush-next-deploy-noop-{0}', github.run_id) }}",
-        )
-        self.assertNotIn(f"'{self.autopush['concurrency']['group']}'", concurrency["group"])
-        self.assertFalse(concurrency.get("cancel-in-progress"), "running deploys must not be cancelled mid-flight")
-        for name, job in self.jobs.items():
-            with self.subTest(job=name):
-                self.assertNotIn("concurrency", job)
-
-    def test_it_triggers_exactly_as_autopush_does(self):
-        on = self.doc[True]
-        autopush_on = self.autopush[True]
-        self.assertEqual(on["workflow_run"], autopush_on["workflow_run"])
-        self.assertNotIn("schedule", on)
-        self.assertEqual(on["workflow_dispatch"]["inputs"]["lease_policy"]["default"], "fail")
-
-    def test_it_resolves_the_candidate_exactly_as_autopush_does(self):
-        resolve = self.jobs["resolve-candidate"]
-        autopush_resolve = self.autopush["jobs"]["resolve-candidate"]
-        self.assertEqual(resolve["if"], autopush_resolve["if"])
-        self.assertEqual(resolve["steps"], autopush_resolve["steps"])
-
-    def test_the_resolve_job_never_binds_autopush_next(self):
-        """Binding a GitHub environment that does not exist creates it, empty."""
-        self.assertEqual(self.jobs["resolve-candidate"].get("environment"), "autopush")
-
-    def test_deploy_reconciles_autopush_next_at_the_resolved_candidate(self):
-        deploy = self.jobs["deploy"]
-        autopush_deploy = self.autopush["jobs"]["deploy"]
-        self.assertEqual(deploy["needs"], "resolve-candidate")
-        self.assertEqual(deploy["uses"], autopush_deploy["uses"])
-        self.assertEqual(deploy["permissions"], autopush_deploy["permissions"])
-        self.assertEqual(deploy["with"]["github_environment"], "autopush-next")
-        self.assertEqual(deploy["with"]["mode"], "apply")
-        self.assertEqual(deploy["with"]["image_tag"], autopush_deploy["with"]["image_tag"])
-        self.assertEqual(deploy["with"]["lease_policy"], autopush_deploy["with"]["lease_policy"])
-        self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
-
-    def test_only_autopush_next_may_skip_while_unprovisioned(self):
-        self.assertIs(self.jobs["deploy"]["with"]["skip_unconfigured"], True)
-        self.assertNotIn("skip_unconfigured", self.autopush["jobs"]["deploy"]["with"])
-
-    def test_verify_allows_skipped_for_autopush_next_only(self):
-        verify = self.jobs["verify-deploy"]
-        self.assertEqual(set(verify["needs"]), {"resolve-candidate", "deploy"})
-        step = next(s for s in verify["steps"] if "verify_deploy_result.sh" in s.get("run", ""))
-        self.assertEqual(step["env"]["TARGET_ENVIRONMENT"], "autopush-next")
-        self.assertEqual(step["env"]["DEPLOY_RESULT"], "${{ needs.deploy.outputs.result }}")
-        self.assertEqual(step["env"]["ALLOW_SKIPPED"], "true")
-        autopush = next(
-            s for s in self.autopush["jobs"]["verify-deploy"]["steps"] if "verify_deploy_result.sh" in s.get("run", "")
-        )
-        self.assertNotIn("ALLOW_SKIPPED", autopush["env"])
-
-
 class DockerPublishGhcrWiringTest(unittest.TestCase):
     def setUp(self):
         self.doc = _doc(_WORKFLOWS / "docker-publish-ghcr.yml")
@@ -1032,6 +959,77 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                     and any(str(key).lower() == "app-id" for key in (step.get("with") or {}))
                 ]
                 self.assertEqual(offenders, [], f"steps in {path.name} still mint with the deprecated app-id input")
+
+
+_GA_DISPATCH_JOB = "step-6b-dispatch-ga-scheduler"
+_GA_DISPATCH_SCRIPT_NAME = "dispatch_release_scheduler.sh"
+_GA_SCHEDULER = _WORKFLOWS / "release-scheduler.yml"
+
+
+class GASchedulerDispatchWiringTest(unittest.TestCase):
+    """Step 6b asks the GA scheduler to evaluate as soon as the staging tag exists.
+
+    On 2026-11-18 the promotion tagged three minutes after the scheduler's daily
+    tick had read the tag graph, and the candidate shipped a day late. The job
+    that closes that gap must run only after a real promotion, dispatch through
+    the one script, and send the scheduler nothing it does not declare.
+    """
+
+    def setUp(self):
+        self.jobs = _doc(_PROMOTION)["jobs"]
+        self.job = self.jobs[_GA_DISPATCH_JOB]
+
+    def test_it_runs_only_after_the_staging_tag_is_pushed(self):
+        self.assertIn(_PROMOTE_JOB, self.job["needs"])
+        self.assertIn("step-1-resolve-candidate", self.job["needs"])
+        condition = " ".join(self.job["if"].split())
+        for status_function in _STATUS_FUNCTIONS:
+            self.assertNotIn(status_function, condition)
+
+    def test_it_repeats_the_promotions_own_guards(self):
+        """A skipped promotion pushed no tag, so there is nothing to evaluate."""
+        condition = " ".join(self.job["if"].split())
+        self.assertIn("github.repository == 'gke-labs/kube-agents'", condition)
+        # The scheduler evaluates on main only (its job guard), so a dispatch from
+        # any other ref would produce a skipped run and nothing else.
+        self.assertIn("github.ref == 'refs/heads/main'", condition)
+        self.assertIn("skip_pipeline != 'true'", condition)
+        self.assertIn("skip_promotion != 'true'", condition)
+        self.assertNotIn("||", condition)
+
+    def test_the_default_token_can_write_actions_and_nothing_more(self):
+        permissions = self.job["permissions"]
+        self.assertEqual(permissions.get("actions"), "write")
+        self.assertEqual(permissions.get("contents"), "read")
+        self.assertEqual(set(permissions), {"actions", "contents"})
+
+    def test_it_dispatches_only_through_the_script(self):
+        runs = [step.get("run") or "" for step in self.job["steps"]]
+        dispatching = [run for run in runs if _GA_DISPATCH_SCRIPT_NAME in run]
+        self.assertEqual(len(dispatching), 1, runs)
+        for run in runs:
+            self.assertNotIn("gh workflow run", run)
+        step = next(step for step in self.job["steps"] if _GA_DISPATCH_SCRIPT_NAME in (step.get("run") or ""))
+        self.assertIn("github.token", step["env"]["GH_TOKEN"])
+        self.assertIn("staging_tag", step["env"]["STAGING_TAG"])
+
+    def test_the_scheduler_accepts_a_dispatch_with_no_inputs(self):
+        """The script passes none, and the scheduler must keep declaring none."""
+        scheduler = _doc(_GA_SCHEDULER)
+        triggers = scheduler.get(True, scheduler.get("on", {}))
+        self.assertIn("workflow_dispatch", triggers)
+        self.assertFalse(
+            (triggers.get("workflow_dispatch") or {}).get("inputs"),
+            "release-scheduler.yml declares inputs the promotion's dispatch does not send",
+        )
+        source = (_REPO_ROOT / "scripts" / "release" / _GA_DISPATCH_SCRIPT_NAME).read_text()
+        self.assertIn("release-scheduler.yml", source)
+        self.assertNotIn(" -f ", source)
+
+    def test_the_teardown_does_not_wait_on_it(self):
+        """Teardown must not inherit the eval wait through the new job."""
+        teardown_needs = self.jobs[_TEARDOWN_JOB]["needs"]
+        self.assertNotIn(_GA_DISPATCH_JOB, teardown_needs)
 
 
 if __name__ == "__main__":

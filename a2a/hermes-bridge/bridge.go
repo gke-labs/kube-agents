@@ -202,6 +202,12 @@ type Config struct {
 	// BRIDGE_DURABLE_PRECREATED=true beside a grant that denies this
 	// principal the create on that name. Off, the bridge creates it as before.
 	DurablePrecreated bool
+	// BusWaitMax caps the backoff between attempts to reach the bus and the
+	// runtime-state bucket in New (default DefaultBusWaitMax). A bus that is
+	// not there yet (an install whose provisioning Job has not run) is waited
+	// for rather than exited on, so the operator can render the bridge from
+	// its first pass and the agent pod rolls once (#5962).
+	BusWaitMax time.Duration
 	// ResultChunkSize bounds one result artifact-update's text part so a
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
@@ -273,6 +279,9 @@ func (c *Config) defaults() {
 	}
 	if c.APIConnectRetry <= 0 {
 		c.APIConnectRetry = DefaultAPIConnectRetry
+	}
+	if c.BusWaitMax <= 0 {
+		c.BusWaitMax = DefaultBusWaitMax
 	}
 	if c.APIModel == "" {
 		c.APIModel = DefaultAPIModel
@@ -540,13 +549,97 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
+	if err := b.waitForBus(ctx); err != nil {
+		return nil, err
+	}
+	if err := b.listenActivity(); err != nil {
+		b.close()
+		return nil, err
+	}
+	return b, nil
+}
+
+func (b *Bridge) close() {
+	b.c.Close()
+	b.nc.Close()
+	b.closeActivity()
+}
+
+// DefaultBusWaitMax is the longest wait between attempts to reach the bus.
+const DefaultBusWaitMax = 30 * time.Second
+
+// busWaitStart is the first wait between attempts; each failure doubles it
+// up to Config.BusWaitMax.
+const busWaitStart = time.Second
+
+// busWaitWarnAfter is how long the bridge waits for the bus before it says so
+// at Warn: past a fresh install's provisioning, which takes a few minutes.
+const busWaitWarnAfter = 5 * time.Minute
+
+// busRefused reports whether err is the bus refusing this bridge's
+// credentials or grants, as opposed to the bus or its bucket not being there.
+func busRefused(err error) bool {
+	return errors.Is(err, nats.ErrAuthorization) || errors.Is(err, nats.ErrAuthExpired) ||
+		errors.Is(err, nats.ErrAuthRevoked) || errors.Is(err, nats.ErrPermissionViolation) ||
+		errors.Is(err, nats.ErrAccountAuthExpired)
+}
+
+// waitForBus connects to the bus and opens the runtime-state bucket,
+// retrying with a capped backoff until both succeed or ctx ends. On a fresh
+// install the bridge starts before the provisioning Job has created the
+// bucket, or before the bus serves at all; exiting then would crash-loop the
+// agent pod, which is why the operator used to withhold the bridge until
+// the bus was provisioned and so rolled the pod a second time (#5962). Each
+// failed attempt is logged with its cause. The pod is not held unready
+// meanwhile: the agent's own API serves without the bus, and the
+// PlatformAgent's BusProvisioned condition says the bus is not there yet.
+func (b *Bridge) waitForBus(ctx context.Context) error {
+	wait := busWaitStart
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		err := b.connectBus(ctx)
+		if err == nil {
+			if attempt > 1 {
+				b.cfg.Logger.Info("reached the bus", "attempts", attempt, "waited", time.Since(start).Round(time.Second))
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		switch {
+		case busRefused(err):
+			// A wrong password or a missing user or grant: the bus is up and
+			// says no, which waiting alone won't fix. Said at Error, in the
+			// words the troubleshooting guide keys on, every attempt.
+			b.cfg.Logger.Error("the bus refused this bridge; waiting for its credentials or grants to be fixed",
+				"attempt", attempt, "retryIn", wait, "err", err, "profile", b.cfg.Profile, "session", b.from.Session)
+		case time.Since(start) >= busWaitWarnAfter:
+			b.cfg.Logger.Warn("the bus is still not ready; waiting", "attempt", attempt, "waited", time.Since(start).Round(time.Second), "retryIn", wait, "err", err)
+		default:
+			b.cfg.Logger.Info("the bus is not ready yet; waiting", "attempt", attempt, "retryIn", wait, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, b.cfg.BusWaitMax)
+	}
+}
+
+// connectBus is one attempt at the bus connection, the KV connection and the
+// runtime-state bucket. On failure it closes whatever it opened, so the next
+// attempt starts clean.
+func (b *Bridge) connectBus(ctx context.Context) error {
+	cfg := b.cfg
 	var err error
 	b.c, err = lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName(b.from.Session),
 		lib.WithLogger(cfg.Logger),
 		lib.WithNATSOptions(cfg.NATSOptions...))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// An async error handler, for the same reason the session executor has one
 	// (worker-adapter/adapter.go) and one this connection made sharper.
@@ -584,29 +677,21 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.nc, err = nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		b.c.Close()
-		return nil, fmt.Errorf("kv connection: %w", err)
+		return fmt.Errorf("kv connection: %w", err)
 	}
 	b.js, err = jetstream.New(b.nc)
 	if err != nil {
-		b.close()
-		return nil, fmt.Errorf("kv jetstream: %w", err)
+		b.c.Close()
+		b.nc.Close()
+		return fmt.Errorf("kv jetstream: %w", err)
 	}
 	b.kv, err = b.js.KeyValue(ctx, cfg.KVBucket)
 	if err != nil {
-		b.close()
-		return nil, fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
+		b.c.Close()
+		b.nc.Close()
+		return fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
 	}
-	if err := b.listenActivity(); err != nil {
-		b.close()
-		return nil, err
-	}
-	return b, nil
-}
-
-func (b *Bridge) close() {
-	b.c.Close()
-	b.nc.Close()
-	b.closeActivity()
+	return nil
 }
 
 // Run sweeps orphans from a prior incarnation, then consumes the profile's
@@ -1805,7 +1890,11 @@ func tail(s string, n int) string {
 func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int, backoff time.Duration) (task *lib.Task, attempts int, err error) {
 	get := b.tasksGet
 	if get == nil {
-		get = b.c.TasksGetOpened
+		// The bridge reads only its own profile's tasks, and that profile is
+		// never an AgentProfile (platform), so no read option applies.
+		get = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
+			return b.c.TasksGetOpened(ctx, addressee, taskID)
+		}
 	}
 	for attempts = 1; attempts <= maxAttempts; attempts++ {
 		var opened bool
@@ -1867,7 +1956,7 @@ func (b *Bridge) clearSeenSecrets(run *taskRun) {
 	if a == nil {
 		return
 	}
-	if n := a.secrets.clear(); n > 0 {
+	if n := a.secrets.Clear(); n > 0 {
 		b.cfg.Logger.Debug(fmt.Sprintf("seen-set refused %d values", n), "task", run.origin.TaskID, "refused", n)
 	}
 }
@@ -2215,12 +2304,23 @@ func chunkString(s string, size int) []string {
 // follow-up's. ok is false when there is nothing textual to ask: no text
 // part holds anything but blankRune's runes.
 func promptFromMessage(payload json.RawMessage) (string, bool) {
+	return promptFromParts(messageParts(payload))
+}
+
+// messageParts are the payload's message parts, or nil when it is not a
+// message.
+func messageParts(payload json.RawMessage) []lib.Part {
 	var m lib.Message
 	if err := json.Unmarshal(payload, &m); err != nil {
-		return "", false
+		return nil
 	}
+	return m.Parts
+}
+
+// promptFromParts is promptFromMessage on parts already decoded.
+func promptFromParts(parts []lib.Part) (string, bool) {
 	var texts []string
-	for _, p := range m.Parts {
+	for _, p := range parts {
 		if p.Kind == "text" && strings.TrimFunc(p.Text, blankRune) != "" {
 			texts = append(texts, p.Text)
 		}

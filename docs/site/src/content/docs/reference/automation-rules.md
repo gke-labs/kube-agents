@@ -86,6 +86,65 @@ cannot be caught this way: it is a valid label value that matches no cluster.
 - A rule is missing `fix` or `environments`, names a fix kind kube-agents does not open, has an
   environment that is not a label value, or is an allow rule that uses `*`.
 
+## The auto-merge labels
+
+With the switch `practice` or `on`, each time the fleet audit opens or refreshes a pull request for a
+`no-pdb` fix, kube-agents' credential broker judges it. When all of these hold it adds a label,
+`kube-agents:would-auto-merge` under `practice` and `kube-agents:auto-merge` under `on`:
+
+1. The pull request is open and was opened by kube-agents.
+2. It adds one file and changes nothing else, and that file is, byte for byte, the
+   PodDisruptionBudget the audit generates: `maxUnavailable: 1` over the workload's own selector. The
+   file sits in its cluster's own directory, `clusters/<cluster>/`, as in the reference layout.
+3. The pull request targets the repository's base branch, and this file, read from that branch,
+   allows `no-pdb` in the cluster's environment.
+4. The cluster, read at that moment, passes three safety checks. The workload has at least two
+   replicas and all of them are Ready. No other PodDisruptionBudget selects its pods or has the new
+   one's name. The new budget's selector is the workload's live selector and selects no other
+   workload's pods.
+
+A pull request that carries a label and no longer qualifies loses it on the audit's next
+run, which includes after the switch is turned back to `off`. A change of switch value swaps
+one label for the other. While the autonomy dial is below Auto-merge, `kube-agents:auto-merge` is held
+back and a carried one comes off. The broker reads all of this itself, and no request from the agent can add,
+remove or create either label. The pull request's body shows the same safety checks under **Safety
+checks**.
+
+A push kube-agents makes to the branch takes the label off at once. A push made any other way keeps
+it until the audit's next run, so a pipeline that merges on the label should also require that every
+commit on the pull request is kube-agents' own.
+
+The labels are applied only on GitHub and Gitea. Bitbucket has no labels, and on GitLab a `/label` line in a comment or a description sets a
+label, so no label there is kube-agents' alone. Under `practice` the label is the whole effect:
+compare the pull requests that carry it with the ones your team merged. Under `on` your pipeline may
+merge a pull request that carries `kube-agents:auto-merge`. kube-agents merges nothing in either
+mode.
+
+## When an auto-merged fix is still broken
+
+A fix that carries the `kube-agents:auto-merge` label merged without a human review. When it has
+merged and kube-agents' after-merge check finds the problem still there, it opens pull requests
+against the branch the fix merged into, and comments once on the fix to link them:
+
+- `platform-agent/revert-<number>` undoes the fix's changes, whether it merged as a merge commit, a
+  squash or a rebase. The label decides this, so turning the switch off after a bad auto-merge still
+  gets the revert.
+- With the switch `on`, `platform-agent/automerge-step-down-<number>` adds a deny rule for that kind
+  of fix in that environment to this file. It edits the file in place and keeps everything else you
+  wrote; in a block-style file a comment above the rule names the fix. Delete the rule later to
+  allow those fixes again. Under `off` or `practice` nothing else merges unattended, so no rule is
+  proposed and the comment says so.
+
+Both go through your normal review; kube-agents merges neither. Until the rules change merges, fixes
+of that kind can still merge on their own. A fix a person merged gets only the after-merge report.
+
+When one of the two cannot be made, the comment says why and the other still opens. The revert is
+skipped when the fix's changes no longer undo cleanly, for example because someone already reverted
+it. The rules change is skipped when the file is absent or refused on that branch, already denies
+that kind there, or is laid out in a way kube-agents cannot add a rule to. A failure that persists
+is tried again on later runs, five attempts in all; then kube-agents comments once on the fix with what did and did not
+open, and stops.
+
 ## Check a file
 
 In the install's shell sandbox (the `<name>-shell` Pod), where the agent's checkouts live:

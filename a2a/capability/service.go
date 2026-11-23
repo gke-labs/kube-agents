@@ -154,18 +154,21 @@ type Request struct {
 	RequestID string `json:"requestId,omitempty"`
 }
 
+// malformedRequestReason is the refusal for a request that doesn't decode or
+// carries a malformed request id.
+const malformedRequestReason = "the request is not well-formed"
+
 // requestIDBytes is the entropy in one request id: 128 bits.
 const requestIDBytes = 16
 
 // acceptUnechoedReply is whether a client acts on a reply that carries no
-// request id, which is what a verifier from before #5647 sends. True for one
-// release, so a new client keeps working against an old verifier during a roll
-// and after a one-step rollback; a reply carrying a different id is never
-// acted on. The follow-up turns this false once a GA release with the echo is
-// published and isn't the newest (the N→N-1 window,
-// docs/site/src/content/docs/deploy/rollback.md), and an un-echoed reply then
-// fails the check closed at its timeout.
-const acceptUnechoedReply = true
+// request id, which is what a verifier from before #5647 sends. False: every
+// verifier a one-step rollback can reach (docs/site/src/content/docs/deploy/
+// rollback.md) echoes the id, because a GA release with the echo was
+// published and was no longer the newest before this turned false. An
+// un-echoed reply is dropped like one carrying another id, and a check that
+// gets no answer of its own fails closed at its timeout.
+const acceptUnechoedReply = false
 
 // newRequestID draws a fresh request id.
 func newRequestID() (string, error) {
@@ -230,17 +233,35 @@ type Service struct {
 // Answer applies the rules to one request. Split out from the subscription so
 // the rules can be tested without a bus.
 func (s *Service) Answer(ctx context.Context, subject string, data []byte) Response {
+	// The id is read first, on its own, so the two refusals below answer the
+	// request that asked too: a client that acts only on its own id would
+	// otherwise drop them, and a refusal would end as an unreachable check.
+	id := echoableRequestID(data)
 	caller, err := callerFromSubject(subject)
 	if err != nil {
-		return Response{Reason: Reason(err)}
+		return Response{Reason: Reason(err), RequestID: id}
 	}
 	var req Request
 	if err := json.Unmarshal(data, &req); err != nil || (req.RequestID != "" && !validRequestID(req.RequestID)) {
-		return Response{Reason: "the request is not well-formed"}
+		return Response{Reason: malformedRequestReason, RequestID: id}
 	}
 	resp := s.decide(ctx, caller, req)
 	resp.RequestID = req.RequestID
 	return resp
+}
+
+// echoableRequestID is the request id in data when it is well-formed, read on
+// its own, so a request whose other fields don't decode still gets its id
+// back; "" when there is none to echo (not JSON, no id, or an id that isn't
+// what newRequestID produces).
+func echoableRequestID(data []byte) string {
+	var probe struct {
+		RequestID string `json:"requestId"`
+	}
+	if json.Unmarshal(data, &probe) != nil || !validRequestID(probe.RequestID) {
+		return ""
+	}
+	return probe.RequestID
 }
 
 // decide is Answer's verdict on a request that parsed. Answer stamps the
@@ -599,7 +620,7 @@ func (c *Client) check(ctx context.Context, req Request) error {
 // and the wait goes on, so a correct answer later in the window is still acted
 // on, and with none the ask ends as every unanswered ask does, in
 // errUnreachable and, once the window is spent, a refusal. A reply with no id
-// is an older verifier's, acted on while acceptUnechoedReply holds.
+// is dropped the same way (acceptUnechoedReply).
 func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte, id string) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

@@ -204,9 +204,16 @@ NAMESPACED_VERBS_BY_KIND = {
 #                             map's List; get: the read half (the reconciler's
 #                             Get is served by the informer; its uncached
 #                             reader reads ServiceAccounts only); patch:
-#                             patchFinalizers' merge patch (an Update would
-#                             drop spec fields a newer CRD added).
+#                             patchFinalizers' merge patch and
+#                             consumeEndTierDrain's (an Update would drop
+#                             spec fields a newer CRD added).
 #   agentprofiles/status      update: Status().Update (writeStatus); get: the
+#                             read half.
+#   agentschedules            list/watch: the For() informer and the Lists
+#                             that map a profile or PlatformAgent change to
+#                             its schedules (schedulesForProfile,
+#                             schedulesInNamespace); get: the reconciler's Get.
+#   agentschedules/status     update: Status().Update (writeStatus); get: the
 #                             read half.
 #   (no agentprofiles/finalizers: nothing the operator renders carries an
 #                             owner reference to a profile, the profile's
@@ -222,6 +229,8 @@ CR_VERBS_BY_RESOURCE = {
     "agentplugins/status": frozenset({"get", "patch"}),
     "agentprofiles": frozenset({"get", "list", "watch", "patch"}),
     "agentprofiles/status": frozenset({"get", "update"}),
+    "agentschedules": frozenset({"get", "list", "watch"}),
+    "agentschedules/status": frozenset({"get", "update"}),
 }
 # Subresources the ClusterRole must not name at all: a row here with any verb
 # is a grant with no caller (see the table's note on agentprofiles/finalizers).

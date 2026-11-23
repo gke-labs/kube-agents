@@ -18,8 +18,7 @@
 #
 # Why seeded-c. The obtainability audit's 3.24 (`untargeted-compute-class-
 # workload`) files nothing while the cluster has an untainted node pool with
-# no compute-class label ("general capacity is available"), and the stockout
-# checks the certification suite waits for reuse that predicate. seeded-a's
+# no compute-class label ("general capacity is available"). seeded-a's
 # default-pool must stay untainted and unlabelled for the fixtures it hosts,
 # so the family lives on the one seeded cluster whose only pool can carry the
 # class label: seeded-c, which main.tf labels for `general-ccc` and which
@@ -66,8 +65,9 @@ resource "kubernetes_namespace_v1" "seeded_compute_class" {
 # The class. One `nodepools` rule naming the labelled default-pool, then two
 # machine-family rules nothing backs, auto-creation off, not the default class:
 #   - the nodepools rule plus the label on default-pool is the shape the
-#     pre-filter cases read (untargeted-compute-class-workload,
-#     compute-class-affinity-workload, compute-class-toleration-workload);
+#     obtainability audit's 3.24 reads (untargeted-compute-class-workload); the
+#     roles compute-class-affinity-workload and
+#     compute-class-toleration-workload stand on it as controls no case reads;
 #   - the two unbacked family rules with auto-creation off are the manual-pools
 #     shape (manual-pools-compute-class): GKE can create no pool for a later
 #     rule, so the fallback the class promises does not exist;
@@ -105,7 +105,7 @@ resource "kubernetes_manifest" "general_ccc" {
   depends_on = [google_container_node_pool.seeded_c_default]
 }
 
-# Defect (stockout, obtainability 3.24): three replicas with no
+# Defect (obtainability 3.24): three replicas with no
 # `cloud.google.com/compute-class` nodeSelector, no compute-class affinity, in a
 # namespace with no default class, on a cluster whose only untainted pool
 # carries the class label. The Cluster Autoscaler's pre-filter leaves such pods
@@ -213,10 +213,11 @@ resource "kubernetes_pod_disruption_budget_v1" "app_worker_a" {
   }
 }
 
-# Defect (stockout): the class named only in nodeAffinity, never in
-# nodeSelector. The pre-filter reads `nodeSelector` alone, so a workload
-# targeted this way is dropped from the scale-up simulation while reading as
-# correctly targeted.
+# Control: the class named only in a required nodeAffinity, never in
+# nodeSelector. A required nodeAffinity on the class key also requests the
+# class: the autoscaler grew the pool for such a pod on GKE 1.35.8 and 1.36.4
+# (gke-compute-classes, references/compute-class-debug.md, Symptom 13). No
+# check may flag this workload; it stands beside the untargeted app-worker-a.
 # Addressed by the compute-class-affinity-workload role.
 resource "kubernetes_deployment_v1" "app_worker_b" {
   provider = kubernetes.seeded_c
@@ -296,20 +297,25 @@ resource "kubernetes_deployment_v1" "app_worker_b" {
   depends_on = [kubernetes_manifest.general_ccc]
 }
 
-# Defect (stockout): targeted through the nodeSelector, with a hand-written
+# Not a defect: targeted through the nodeSelector, with a hand-written
 # toleration for the class taint that names the key, the value and the effect
-# and no operator. The pool it targets carries no taint (the untainted-pool
-# defect above), so the toleration has no runtime effect here and the pod
-# runs; the check this plants for reads the toleration's shape against the
-# taint GKE puts on class nodes, not a scheduling failure. The pod is also
-# what keeps default-pool from reading as idle.
+# and no operator. GKE adds its own toleration with operator Equal to a Pod
+# that selects a class, with node pool auto-creation on or off, and a live
+# test ran a Pod of this shape on a tainted class pool, one made by hand and
+# one that GKE created (Standard 1.35.8 and Autopilot 1.36.4; not tested on an
+# older version). Kubernetes also reads an omitted operator as Equal ("The
+# default value for operator is Equal", kubernetes.io, Taints and
+# Tolerations). So no check may flag it. The pool it targets carries no taint
+# (the untainted-pool defect above), so the pod runs. The pod is also what
+# keeps default-pool from reading as idle.
 #
 # A kubernetes_manifest, not kubernetes_deployment_v1: the typed resource
 # writes `operator: Equal` into a toleration that names none (the provider's
 # default), and the API server stores a toleration without the field as
 # written, so only a raw manifest plants the shape. The role's state asserts
 # the field's absence.
-# Addressed by the compute-class-toleration-workload role.
+# Addressed by the compute-class-toleration-workload role, and by the
+# no-ephemeral-limit-workload role, which a case reads.
 resource "kubernetes_manifest" "batch_worker_a" {
   provider = kubernetes.seeded_c
 

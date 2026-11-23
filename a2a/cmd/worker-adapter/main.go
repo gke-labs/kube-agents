@@ -27,6 +27,8 @@
 // pool. It answers /readyz on lib.ProfileWorkerStatusPort once it's
 // listening. It exits 0 when it stops (at SIGTERM, or after one task with
 // PROFILE_WORKER_ONE_SHOT), and 1 if it can't start.
+// A2A_PERSONA_INTEGRITY=required refuses a persona without a build-time
+// content manifest; any other non-empty value exits 1.
 package main
 
 import (
@@ -123,17 +125,34 @@ const (
 	// server it is appended alongside).
 	delegateToolID = "mcp__" + workeradapter.DelegateMCPServer + "__" + workeradapter.DelegateToolName
 	// delegatePrompt tells the model the tool exists and when to reach for
-	// it; the tool's own schema (mcp.go) covers how to call it.
+	// it; the tool's own schema (mcp.go) covers how to call it. Only session
+	// pods carry it (an AgentProfile pool sets A2A_DELEGATE_TOOL=off). Its
+	// last two sentences are for a session with the cluster view: its own
+	// reads pull it toward reading first, and an ask that also needs a change
+	// then splits into read delegations whose change never reaches platform
+	// (#6859). Handing the whole ask over in one turn is the shorter path
+	// whether or not a later turn could delegate again. platform is offered
+	// only to users its allowlist admits (gateway/delegatetargets.go), and an
+	// agent the person named comes first; a proposal-only ask stays in the
+	// reply (#2610).
 	delegatePrompt = "You can hand a task to another agent with the `delegate` tool. Its addressee field lists the agents you may use this turn: usually `platform`, the platform agent, which can read and act on the fleet, and any agent profile this conversation can reach. If it says no agent is available, don't call it. " +
 		"When the person asks for one of those agents by name, delegate to it under that name. " +
 		"The gateway checks that the user may reach that agent before anything runs. Calling `delegate` ends your turn; the agent's result arrives as your next turn, so say what you are delegating and why in one line first. " +
-		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can."
+		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can. " +
+		"When the person wants a change made, applied or opened as a pull request, and `platform` is listed, hand the whole ask to `platform` in the turn it arrives, with the reads it depends on, unless they named another agent: one handoff is the shorter path, and `platform` makes those reads itself. " +
+		"A fix you are only asked to propose is not a change: write it in your reply."
 
 	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey
 	// is not a credential: the gateway here runs keyless and the harness only
 	// checks that the variable is non-empty.
 	defaultModelBaseURL = "http://inference-gateway"
 	defaultModelAPIKey  = "a2a-playground" // #nosec G101 -- placeholder, not a secret
+
+	// The env names that tell the harness how to reach the model.
+	modelBaseURLEnv   = "ANTHROPIC_BASE_URL"
+	modelAPIKeyEnv    = "ANTHROPIC_API_KEY"    // #nosec G101 -- env name, not a credential
+	modelAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN" // #nosec G101 -- env name, not a credential
+	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
 func main() {
@@ -212,18 +231,28 @@ func run() int {
 			harness = persona.ClaudeCode
 		}
 		cfg = profileModeConfig(cfg)
+		requireIntegrity, err := workeradapter.ParsePersonaIntegrity(os.Getenv(lib.EnvPersonaIntegrity))
+		if err != nil {
+			log.Error("profile worker failed", "err", err)
+			return 1
+		}
 		pw := workeradapter.ProfileWorkerConfig{
 			Tier:       os.Getenv(lib.EnvProfileTier),
 			OneShot:    oneShot == "1" || oneShot == "true",
 			ReadyAddr:  fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
 			PersonaDir: lib.ProfilePersonaDir,
-			Harness:    harness,
-			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
+			// Whether the persona must carry a build-time content manifest.
+			RequirePersonaIntegrity: requireIntegrity,
+			Harness:                 harness,
+			ConfigRoot:              envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
 			// The persona's MCP servers through the broker's relay (#5495).
 			Relay:      workeradapter.ProfileRelay(selfPath(), os.Getenv),
 			ResetPaths: resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
+			// What a script-run task's credential is verified against
+			// (#5622): rendered into Job templates only.
+			TaskSigningKeys: os.Getenv("A2A_TASK_SIGNING_PUBLIC_KEYS"),
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
@@ -615,7 +644,8 @@ var busCredentialEnv = []string{"NATS_PASSWORD", "NATS_USER", "NATS_URL"}
 // credential, plus model-auth defaults. With nothing configured, the harness
 // talks to the install's own LiteLLM - Vertex-backed via the install's
 // credentials, no per-worker key (playground posture; the deployment spec's
-// auth story replaces this).
+// auth story replaces this). The placeholder key goes in whenever the pod
+// sets no key, no bearer token and no Vertex, so a pod spec never needs one.
 func harnessEnv() []string {
 	withheld := make(map[string]bool, len(busCredentialEnv))
 	for _, key := range busCredentialEnv {
@@ -631,12 +661,18 @@ func harnessEnv() []string {
 	has := func(key string) bool {
 		return os.Getenv(key) != ""
 	}
-	if !has("ANTHROPIC_BASE_URL") && !has("CLAUDE_CODE_USE_VERTEX") && !has("ANTHROPIC_API_KEY") {
-		env = append(env,
-			"ANTHROPIC_BASE_URL="+defaultModelBaseURL,
-			// LiteLLM here runs keyless; the value only satisfies the
-			// harness's "an API key exists" check.
-			"ANTHROPIC_API_KEY="+defaultModelAPIKey)
+	if !has(modelBaseURLEnv) && !has(modelUseVertexEnv) && !has(modelAPIKeyEnv) {
+		env = append(env, modelBaseURLEnv+"="+defaultModelBaseURL)
+	}
+	// The gateway runs keyless. The placeholder only satisfies the harness's
+	// "an API key exists" check. The adapter adds it here, in the child env,
+	// also when the pod sets ANTHROPIC_BASE_URL (an AgentProfile worker sets
+	// the full gateway name). Thus a pod spec does not need a literal model
+	// key, which the AI workload audit flags (fleet-audit check 3.5,
+	// model-credential-plaintext-env). Vertex and a bearer token do not use
+	// the key, so the adapter does not add it.
+	if !has(modelAPIKeyEnv) && !has(modelUseVertexEnv) && !has(modelAuthTokenEnv) {
+		env = append(env, modelAPIKeyEnv+"="+defaultModelAPIKey)
 	}
 	for _, kv := range []string{
 		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",

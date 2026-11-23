@@ -51,6 +51,11 @@ class GcpTest(unittest.TestCase):
         ):
             with self.subTest(method=method, path=path):
                 self.assertFalse(w.evaluate_gcp(method, PUBSUB, path, b"{}", SUB).allowed)
+        for verb in (":pull", ":acknowledge", ":modifyAckDeadline"):
+            with self.subTest(verb=verb):
+                decision = w.evaluate_gcp("GET", PUBSUB, "v1/" + SUB + verb, b"", SUB)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.rule_id, w.RULE_GCP_METHOD)
 
     def test_a_post_body_with_an_unexpected_key_or_type_is_refused(self):
         for verb, body in (
@@ -592,6 +597,9 @@ class PlatformPubsubTest(unittest.TestCase):
             ("DELETE", "v1/" + ALERTS, b"", w.RULE_PUBSUB_METHOD),
             ("POST", "v1/projects/kagents-dev/topics/t:publish", b"{}", w.RULE_PUBSUB_ROUTE),
             ("POST", "v1/" + ALERTS, b"{}", w.RULE_PUBSUB_METHOD),
+            ("GET", "v1/" + ALERTS + ":pull", b"", w.RULE_PUBSUB_METHOD),
+            ("GET", "v1/" + ALERTS + ":acknowledge", b"", w.RULE_PUBSUB_METHOD),
+            ("GET", "v1/" + ALERTS + ":modifyAckDeadline", b"", w.RULE_PUBSUB_METHOD),
             ("POST", "v1/" + ALERTS + ":pull", json.dumps({"maxMessages": "10"}).encode(), w.RULE_PUBSUB_BODY),
             ("POST", "v1/" + ALERTS + ":acknowledge", json.dumps({"ackIds": [1]}).encode(), w.RULE_PUBSUB_BODY),
         ):

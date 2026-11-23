@@ -26,11 +26,13 @@ from tests.test_install_script import (
     _INSTALL_SH,
     _INSTALLER_COMMON,
     _REPO_ROOT,
+    _HOST_TOOL_MARKER,
+    _HOST_TOOL_PROBE,
     _run_installer_bash,
 )
 # The module, not the class: a TestCase imported by name is collected here too.
 from tests import test_installer_common as _installer_common
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _SENTINEL = "glpat-SENTINEL-7d1f0c9e4b2a"
 _READ_SENTINEL = "glpat-READONLY-3a9e5b1c7f20"
@@ -142,10 +144,14 @@ class GitLabTfvarsTest(unittest.TestCase):
     # GitHub installs this change must leave byte-identical. The goldens were
     # rendered by this same harness at the commit before GitLab support
     # (0347c610), with GITLAB_GOLDEN_WRITE pointing at the testdata directory.
+    # ENABLE_GVISOR is pinned to what the generator rendered when these were
+    # written: with no key, an existing cluster's gVisor intent is now read from
+    # the live install (#5824), which these goldens are not about.
     _GOLDEN_CASES = {
-        "github_minter": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra", "GITHUB_APP_ID": "123"},
-        "github_repo_only": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra"},
-        "github_none": {},
+        "github_minter": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra", "GITHUB_APP_ID": "123",
+                          "ENABLE_GVISOR": "false"},
+        "github_repo_only": {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra", "ENABLE_GVISOR": "false"},
+        "github_none": {"ENABLE_GVISOR": "false"},
     }
 
     def test_github_tfvars_match_the_pre_gitlab_rendering(self):
@@ -1017,12 +1023,20 @@ class GitLabThroughMainTest(unittest.TestCase):
 
     def _main(self, *args):
         body = (
+            f"{_HOST_TOOL_PROBE}"
             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
             f"main {' '.join(shlex.quote(a) for a in args)} && rc=0 || rc=$?\n"
             'echo "rc=$rc"\n'
         )
-        env = get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._install_env)})
-        return _run_installer_bash(body, env)
+        # main runs with no dry run. If the forge check did not stop it, step
+        # one would start the host's git, gcloud and terraform, and a package
+        # manager for a tool that is missing. The PATH has none of them.
+        env = get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(self._install_env),
+            "PATH": str(create_minimal_tools_bin(self._tmp, exclude=("git",)))})
+        proc = _run_installer_bash(body, env)
+        self.assertNotIn(_HOST_TOOL_MARKER, proc.stdout)
+        return proc
 
     def test_a_github_app_with_gitlab_is_refused_before_step_one(self):
         proc = self._main(
@@ -1246,6 +1260,8 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
 
     def setUp(self):
         self.main = (_FULL_INSTALL / "main.tf").read_text()
+        # The checks the chart's values must pass sit on the values output.
+        self.outputs = (_FULL_INSTALL / "outputs.tf").read_text()
         self.variables = (_FULL_INSTALL / "variables.tf").read_text()
 
     def test_variables_exist_with_github_defaults(self):
@@ -1273,7 +1289,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertIn('role = "gitops"', self.main)
 
     def test_precondition_refuses_a_minter_on_gitlab(self):
-        self.assertIn("!var.enable_github_minter", self.main)
+        self.assertIn("!var.enable_github_minter", self.outputs)
 
 
 class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):

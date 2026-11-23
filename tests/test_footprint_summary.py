@@ -86,9 +86,10 @@ data:
 
 
 def _expected_lines(req: dict) -> dict:
-    """The summary's figures from the quota totals, by the formula the template pins."""
-    cores = req["requestsCpu"] / _MILLIS_PER_CORE
-    memory_gib = req["requestsMemory"] / _GIB
+    """The summary's figures from the quota totals, by the formula the template pins: the
+    standing release, so the session pods' share (counted in the totals) comes off."""
+    cores = (req["requestsCpu"] - req["sessionRequestsCpu"]) / _MILLIS_PER_CORE
+    memory_gib = (req["requestsMemory"] - req["sessionRequestsMemory"]) / _GIB
     disk_gib = req["requestsStorage"] / _GIB
     cpu_cost = cores * _CPU_PER_VCPU_HOUR * _HOURS_PER_MONTH
     memory_cost = memory_gib * _MEMORY_PER_GIB_HOUR * _HOURS_PER_MONTH
@@ -97,7 +98,7 @@ def _expected_lines(req: dict) -> dict:
     return {
         "cpu": f"CPU requests:        {cores:.3f} cores",
         "memory": f"Memory requests:     {memory_gib:.2f} GiB",
-        "pods": f"Pods:                {req['pods']}",
+        "pods": f"Pods:                {req['pods'] - req['sessionPods']}",
         "storage": f"Persistent storage:  {disk_gib:.0f} GiB over {req['persistentVolumeClaims']} claims",
         "cpu_cost": (
             f"CPU:      {cores:.3f} cores x ${_CPU_PER_VCPU_HOUR}/vCPU-hour"
@@ -155,14 +156,14 @@ class FootprintSummaryTest(unittest.TestCase):
         self._assert_summary_matches(notes, req)
         # The stock install's figures, the ones the prerequisites page quotes, in the
         # words the notes use, so a wording change is a deliberate one here too.
-        self.assertIn("CPU requests:        4.436 cores", notes)
-        self.assertIn("Memory requests:     14.77 GiB", notes)
+        self.assertIn("CPU requests:        4.536 cores", notes)
+        self.assertIn("Memory requests:     14.89 GiB", notes)
         self.assertIn("Persistent storage:  228 GiB over 7 claims", notes)
         self.assertIn("$0.0445/vCPU-hour", notes)
         self.assertIn("$0.0049225/GiB-hour", notes)
         self.assertIn("$0.10/GiB-month", notes)
         self.assertIn("$73.00/month GKE cluster fee", notes)
-        self.assertIn("Not counted: the session pods", notes)
+        self.assertIn("Not in these figures or the cost: the session pods", notes)
         # The disk is the balanced class on the footprint line and on the cost line alike.
         self.assertIn("balanced persistent disk", notes)
         self.assertNotIn("SSD", notes)
@@ -187,13 +188,30 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertNotEqual(_expected_lines(req)["total"], _expected_lines(default_req)["total"])
         self.assertIn(_expected_lines(default_req)["total"], default_notes)
 
+    def test_the_summary_sizes_the_session_pods_at_the_cap(self) -> None:
+        """#6028: the session line gives the share at maxSessions from the same requirements."""
+        notes, req = self._render()
+        self.assertIn(
+            "At the cap of 10 they request 1.500 cores and 3.12 GiB over 10 pods,"
+            " which the quota preflight adds to the figures above.", notes)
+        self.assertNotIn("Autopilot's per-Pod minimums", notes)
+        notes, req = self._render(["platformAgent.harness.tuning.maxSessions=4"])
+        self.assertEqual(req["sessionRequestsCpu"], 4 * 150)
+        self.assertIn("At the cap of 4 they request 0.600 cores and 1.25 GiB over 4 pods", notes)
+
+    def test_an_install_with_no_session_pods_prints_no_session_line(self) -> None:
+        notes, req = self._render(["platformAgent.enabled=false", "hindsight.enabled=true"])
+        self.assertEqual(req["sessionPods"], 0)
+        self.assertNotIn("Not in these figures or the cost", notes)
+        self.assertIn("are in the figures above", notes)
+
     def test_the_summary_names_what_it_leaves_out(self) -> None:
         notes, req = self._render()
         self._assert_summary_matches(notes, req)
         # The preflight sums the A2A stack with the operator's other workloads, so the
         # figures carry it, the NATS bus's JetStream claims included, and only the
         # session pods are left out.
-        self.assertIn("Not counted: the session pods", notes)
+        self.assertIn("Not in these figures or the cost: the session pods", notes)
         self.assertIn("its JetStream claims among them, are in the figures above", notes)
         # One 40 GiB JetStream claim per NATS server, three by default; one server keeps one.
         one_notes, one = self._render(["platformAgent.harness.tuning.busReplicas=1"])

@@ -254,6 +254,60 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	}
 }
 
+// A watcher body serving watch_set_ready=0 is still building its watch set, so
+// Clusters and DataVolume read as nil (missing reading) while counters and start
+// time still parse. At watch_set_ready=1, 0 cluster_up series reads as a
+// genuine empty fleet.
+func TestPodUsageSource_WatchSetReadyGatesClusterAndDataVolumeReadings(t *testing.T) {
+	starting := strings.Join([]string{
+		"# TYPE k8s_event_watcher_events_injected_total counter",
+		`k8s_event_watcher_events_injected_total{cluster="a",location="l",namespace="n",project="p",reason="BackOff"} 7`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 100",
+		"# TYPE k8s_event_watcher_watch_set_ready gauge",
+		"k8s_event_watcher_watch_set_ready 0",
+		"# TYPE kubeagents_data_volume_bytes gauge",
+		`kubeagents_data_volume_bytes{kind="free"} 100`,
+		`kubeagents_data_volume_bytes{kind="total"} 1000`,
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, starting)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+	if err != nil {
+		t.Fatalf("Scrape starting watcher: %v", err)
+	}
+	if reading.Clusters != nil {
+		t.Errorf("watch_set_ready=0 yielded Clusters = %+v, want nil (no reading)", reading.Clusters)
+	}
+	if reading.DataVolume != nil {
+		t.Errorf("watch_set_ready=0 yielded DataVolume = %+v, want nil (no reading)", reading.DataVolume)
+	}
+	if reading.sample() != 7 || reading.StartTime == nil || *reading.StartTime != 100 {
+		t.Errorf("watch_set_ready=0 lost sample or start time: sample=%d, start=%v", reading.sample(), reading.StartTime)
+	}
+
+	emptyReady := strings.Join([]string{
+		"# TYPE k8s_event_watcher_events_injected_total counter",
+		"# TYPE k8s_event_watcher_watch_set_ready gauge",
+		"k8s_event_watcher_watch_set_ready 1",
+		"# TYPE kubeagents_data_volume_bytes gauge",
+		`kubeagents_data_volume_bytes{kind="free"} 100`,
+		`kubeagents_data_volume_bytes{kind="total"} 1000`,
+		"",
+	}, "\n")
+	addr = serveBody(t, http.StatusOK, emptyReady)
+	reading, err = newPodUsageSource().Scrape(context.Background(), addr, usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+	if err != nil {
+		t.Fatalf("Scrape ready empty watcher: %v", err)
+	}
+	if reading.Clusters == nil || reading.Clusters.Registered != 0 || reading.Clusters.Monitored != 0 {
+		t.Fatalf("watch_set_ready=1 with 0 clusters = %+v, want known zero fleet", reading.Clusters)
+	}
+	if reading.DataVolume == nil || reading.DataVolume.Free != 100 || reading.DataVolume.Total != 1000 {
+		t.Fatalf("watch_set_ready=1 DataVolume = %+v, want 100/1000", reading.DataVolume)
+	}
+}
+
 // A watcher body with more cluster_up series than any fleet has is refused
 // whole, so a body on the port cannot set the gauges past the ceiling.
 func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
@@ -655,6 +709,12 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if _, asked := reading.Samples[usageCounterPositiveFeedback]; asked {
 		t.Fatalf("the chat listener was asked for the thumbs-ups it never serves: %v", reading.Samples)
 	}
+	// Nor for the post ratings, which only the A2A gateway counts.
+	for _, counter := range []string{usageCounterAutonomousNegativeFeedback, usageCounterAutonomousPositiveFeedback} {
+		if _, asked := reading.Samples[counter]; asked {
+			t.Fatalf("the chat listener was asked for %s, which it never serves: %v", counter, reading.Samples)
+		}
+	}
 	a2a := strings.Join([]string{
 		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
 		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
@@ -673,6 +733,12 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="down"} 2`,
 		`kubeagents_a2a_gateway_answer_feedback_total{platform="other",rating="down"} 1`,
 		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="other"} 3`,
+		"# TYPE kubeagents_a2a_gateway_post_feedback_total counter",
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="up",kind="alert"} 4`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="up",kind="report"} 1`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="down",kind="alert"} 7`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="googlechat",rating="down",kind="other"} 2`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="other",kind="alert"} 5`,
 		"",
 	}, "\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageMetricsPath, usageA2AChatCounters, nil)
@@ -693,6 +759,12 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	// platform; a rating outside the two counts into neither.
 	if reading.Samples[usageCounterNegativeFeedback] != 3 || reading.Samples[usageCounterPositiveFeedback] != 6 {
 		t.Fatalf("a2a samples = %v, want 3 thumbs-downs (2 + 1) and 6 thumbs-ups", reading.Samples)
+	}
+	// The post ratings are their own family: down and up into the autonomous
+	// pair, each over every platform and kind, and never into the answer
+	// counters above; a rating outside the two counts into neither.
+	if reading.Samples[usageCounterAutonomousNegativeFeedback] != 9 || reading.Samples[usageCounterAutonomousPositiveFeedback] != 5 {
+		t.Fatalf("a2a samples = %v, want 9 thumbs-downs on posts (7 + 2) and 5 thumbs-ups (4 + 1)", reading.Samples)
 	}
 	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {
 		t.Fatalf("A2A samples = %v, want 5 messages and 5 sessions", reading.Samples)

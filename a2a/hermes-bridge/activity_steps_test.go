@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -531,15 +532,15 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := scrubInlineSecrets(tc.in)
+			got := answerscrub.ScrubInline(tc.in)
 			for _, f := range tc.forbidden {
 				if strings.Contains(got, f) {
-					t.Fatalf("scrubInlineSecrets(%q) leaked %q in %q", tc.in, f, got)
+					t.Fatalf("answerscrub.ScrubInline(%q) leaked %q in %q", tc.in, f, got)
 				}
 			}
 			for _, w := range tc.wantSub {
 				if !strings.Contains(got, w) {
-					t.Fatalf("scrubInlineSecrets(%q) = %q, missing %q", tc.in, got, w)
+					t.Fatalf("answerscrub.ScrubInline(%q) = %q, missing %q", tc.in, got, w)
 				}
 			}
 		})
@@ -1109,6 +1110,45 @@ func TestAFailedKanbanCreateNamesNoCard(t *testing.T) {
 	}
 }
 
+// A titled kanban_create whose result reports ok or non-error status but
+// names another task's card in error or free text, or carries an error key,
+// must not record that card in cardTitles.
+func TestActivity_ATitledRejectedCreateDoesNotRecordCardTitle(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-titled-reject"
+	callNum := 0
+	create := func(result string) {
+		callNum++
+		d := hookDelivery{
+			Event:      hookPostToolCall,
+			SessionID:  a.sessionID,
+			DeliveryID: fmt.Sprintf("post-create-%d", callNum),
+			ToolName:   kanbanCreateTool,
+			ToolInput:  json.RawMessage(`{"title":"Deploy service"}`),
+		}
+		d.Extra.ToolCallID = fmt.Sprintf("c%d", callNum)
+		d.Extra.Status = hookStatusOK
+		d.Extra.Result = json.RawMessage(result)
+		a.observe(d)
+	}
+
+	create(`{"error":"title required; duplicate of t_other1"}`)
+	create(`"title required: see t_other2"`)
+	create(`{"error":"board locked","id":"t_other3"}`)
+
+	for _, other := range []string{"t_other1", "t_other2", "t_other3"} {
+		if a.hasCardID(other) {
+			t.Errorf("rejected create recorded card %s in cardTitles", other)
+		}
+	}
+
+	// A valid successful create does record the card title.
+	create(`{"id":"t_valid1","status":"todo"}`)
+	if !a.hasCardID("t_valid1") {
+		t.Error("valid create was not recorded in cardTitles")
+	}
+}
+
 // A card id read from a worker's cwd is hermes's id shape or nothing.
 func TestACwdCardIDMustBeACardID(t *testing.T) {
 	for cwd, want := range map[string]string{
@@ -1142,11 +1182,11 @@ func TestAWorkersCardIDIsCapped(t *testing.T) {
 
 // A URL's password may hold a path character and is still scrubbed.
 func TestScrubCatchesAURLPasswordWithAPathCharacter(t *testing.T) {
-	got := scrubInlineSecrets("connect postgres://app:ab/cd+ef==@db-1:5432/prod failed")
+	got := answerscrub.ScrubInline("connect postgres://app:ab/cd+ef==@db-1:5432/prod failed")
 	if strings.Contains(got, "ab/cd") || !strings.Contains(got, "db-1:5432/prod") || !strings.Contains(got, "postgres://app:") {
 		t.Errorf("scrubbed = %q, want the password gone and the host kept", got)
 	}
-	if got := scrubInlineSecrets("see https://example.com/docs/page"); got != "see https://example.com/docs/page" {
+	if got := answerscrub.ScrubInline("see https://example.com/docs/page"); got != "see https://example.com/docs/page" {
 		t.Errorf("a URL with no credentials changed: %q", got)
 	}
 }

@@ -17,13 +17,19 @@ limitations under the License.
 package controller
 
 import (
+	"maps"
+	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"sigs.k8s.io/yaml"
 )
 
 func TestBuildA2ACuratorDeploymentIsCredentialFreeAndHardened(t *testing.T) {
@@ -50,6 +56,9 @@ func TestBuildA2ACuratorDeploymentIsCredentialFreeAndHardened(t *testing.T) {
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
 		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.AutomountServiceAccountToken)
 	}
+	if pod.DNSConfig == nil || len(pod.DNSConfig.Options) != 1 || pod.DNSConfig.Options[0].Name != "ndots" || pod.DNSConfig.Options[0].Value == nil || *pod.DNSConfig.Options[0].Value != "3" {
+		t.Errorf("DNSConfig = %+v, want ndots=3 from brokerCallerPodDNSConfig()", pod.DNSConfig)
+	}
 	for _, vol := range pod.Volumes {
 		if vol.Secret != nil {
 			t.Errorf("curator pod mounts Secret volume %q (%s); curator must hold zero Secrets", vol.Name, vol.Secret.SecretName)
@@ -59,8 +68,8 @@ func TestBuildA2ACuratorDeploymentIsCredentialFreeAndHardened(t *testing.T) {
 				if src.Secret != nil {
 					t.Errorf("curator pod projects Secret %s; curator must hold zero Secrets", src.Secret.Name)
 				}
-				if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience != a2aBusTokenAudience {
-					t.Errorf("curator projected token audience = %q, want %q (never credential-proxy)", src.ServiceAccountToken.Audience, a2aBusTokenAudience)
+				if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience != a2aBusTokenAudience && src.ServiceAccountToken.Audience != credentialProxyCuratorAudience {
+					t.Errorf("curator projected token audience = %q, want %q or %q (never shell/chat credential-proxy)", src.ServiceAccountToken.Audience, a2aBusTokenAudience, credentialProxyCuratorAudience)
 				}
 			}
 		}
@@ -97,15 +106,25 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 	if np.Name != agent.Name+"-curator-netpol" {
 		t.Fatalf("NetworkPolicy name = %q, want %q", np.Name, agent.Name+"-curator-netpol")
 	}
-	if len(np.Spec.Ingress) != 0 {
-		t.Errorf("Ingress rules = %d, want 0 (deny all ingress)", len(np.Spec.Ingress))
+	if len(np.Spec.Ingress) != 1 {
+		t.Fatalf("Ingress rules = %d, want 1 (GMP collector namespace on port %d)", len(np.Spec.Ingress), a2aCuratorStatusPort)
 	}
+	collectorRule := np.Spec.Ingress[0]
+	if len(collectorRule.From) != 1 || collectorRule.From[0].PodSelector != nil || collectorRule.From[0].IPBlock != nil ||
+		collectorRule.From[0].NamespaceSelector == nil || collectorRule.From[0].NamespaceSelector.MatchLabels[labelMetadataName] != gmpNamespace {
+		t.Errorf("collector Ingress From = %+v, want strictly namespace %s=%s", collectorRule.From, labelMetadataName, gmpNamespace)
+	}
+	if len(collectorRule.Ports) != 1 || collectorRule.Ports[0].Protocol == nil || *collectorRule.Ports[0].Protocol != corev1.ProtocolTCP ||
+		collectorRule.Ports[0].Port == nil || collectorRule.Ports[0].Port.IntVal != a2aCuratorStatusPort {
+		t.Errorf("collector Ingress Ports = %+v, want TCP %d alone", collectorRule.Ports, a2aCuratorStatusPort)
+	}
+
 	wantTypes := []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
 	if !slices.Equal(np.Spec.PolicyTypes, wantTypes) {
 		t.Errorf("PolicyTypes = %v, want %v", np.Spec.PolicyTypes, wantTypes)
 	}
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("Egress rules = %d, want 4 (DNS, NATS, LiteLLM, Hindsight)", len(np.Spec.Egress))
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("Egress rules = %d, want 5 (DNS, NATS, LiteLLM, Hindsight, credential-proxy snapshot)", len(np.Spec.Egress))
 	}
 	for i, rule := range np.Spec.Egress {
 		if len(rule.To) == 0 {
@@ -119,8 +138,8 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 		for _, peer := range rule.To {
 			if peer.PodSelector != nil {
 				labels := peer.PodSelector.MatchLabels
-				if strings.Contains(labels["app"], "credential-proxy") || strings.Contains(labels["app"], "kube-proxy") {
-					t.Errorf("curator NetworkPolicy grants egress to %v; curator must not reach credential-proxy or kube-proxy", labels)
+				if strings.Contains(labels["app"], "kube-proxy") {
+					t.Errorf("curator NetworkPolicy grants egress to %v; curator must not reach kube-proxy", labels)
 				}
 			}
 		}
@@ -204,5 +223,98 @@ func TestCuratorFlagControlsAuthMapAndNATSPeers(t *testing.T) {
 	}
 	if _, reserved := reservedProfileServiceAccounts(agent)[a2aCuratorName(agent)]; !reserved {
 		t.Errorf("reservedProfileServiceAccounts does not reserve %q", a2aCuratorName(agent))
+	}
+	if !strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), a2aCuratorBrokerCaller(agent)) {
+		t.Errorf("allowedBrokerCallers = %q, missing %q", allowedBrokerCallers(agent, allBrokerCallersOwned), a2aCuratorBrokerCaller(agent))
+	}
+	if len(a2aCuratorBrokerEnv(agent)) != 2 || len(a2aCuratorBrokerPeers(agent)) != 1 {
+		t.Errorf("a2aCuratorBrokerEnv=%v a2aCuratorBrokerPeers=%v", a2aCuratorBrokerEnv(agent), a2aCuratorBrokerPeers(agent))
+	}
+}
+
+func TestHindsightAPINetworkPolicySelectsOnlyTrustedMemoryClients(t *testing.T) {
+	raw, err := os.ReadFile("../../config/integrations/hindsight/networkpolicy.yaml")
+	if err != nil {
+		t.Fatalf("read hindsight networkpolicy.yaml: %v", err)
+	}
+	var apiNP *networkingv1.NetworkPolicy
+	for _, doc := range strings.Split(string(raw), "\n---") {
+		if strings.TrimSpace(doc) == "" {
+			continue
+		}
+		var np networkingv1.NetworkPolicy
+		if err := yaml.Unmarshal([]byte(doc), &np); err != nil {
+			t.Fatalf("unmarshal NetworkPolicy doc: %v", err)
+		}
+		if np.Name == "hindsight-api" {
+			apiNP = &np
+			break
+		}
+	}
+	if apiNP == nil || len(apiNP.Spec.Ingress) == 0 {
+		t.Fatalf("hindsight-api NetworkPolicy missing or has no ingress rules")
+	}
+
+	var selectors []labels.Selector
+	for _, peer := range apiNP.Spec.Ingress[0].From {
+		if peer.PodSelector == nil {
+			t.Fatalf("expected PodSelector on intra-namespace peer, got %+v", peer)
+		}
+		sel, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
+		if err != nil {
+			t.Fatalf("LabelSelectorAsSelector(%+v): %v", peer.PodSelector, err)
+		}
+		selectors = append(selectors, sel)
+	}
+	admits := func(podLabels map[string]string) bool {
+		set := labels.Set(podLabels)
+		for _, sel := range selectors {
+			if sel.Matches(set) {
+				return true
+			}
+		}
+		return false
+	}
+
+	agent := a2aTestAgent()
+	gwDepLabels := maps.Clone(buildDeployment(agent, "c", "f", "s", "p", nil, renderOptions{}).Spec.Template.Labels)
+	gwStsLabels := maps.Clone(buildStatefulSet(agent, "c", "f", "s", "p", nil, renderOptions{}).Spec.Template.Labels)
+	gwStsLabels["statefulset.kubernetes.io/pod-name"] = agent.Name + "-gateway-0"
+	a2aGwLabels := maps.Clone(buildA2AGatewayDeployment(agent).Spec.Template.Labels)
+	curatorLabels := maps.Clone(buildA2ACuratorDeployment(agent).Spec.Template.Labels)
+
+	for name, lbls := range map[string]map[string]string{
+		"gateway Deployment":  gwDepLabels,
+		"gateway StatefulSet": gwStsLabels,
+		"A2A gateway":         a2aGwLabels,
+		"standalone Curator":  curatorLabels,
+	} {
+		if !admits(lbls) {
+			t.Errorf("hindsight-api ingress selector rejected %s (%v); expected admitted", name, lbls)
+		}
+	}
+
+	sandboxLabels := maps.Clone(buildShellSandboxStatefulSet(agent, "keys", "", "s").Spec.Template.Labels)
+	sandboxLabels["statefulset.kubernetes.io/pod-name"] = shellSandboxName(agent) + "-0"
+	credProxyDep := buildCredentialProxyDeployment(agent, "p")
+	credProxyLabels := maps.Clone(credProxyDep.Spec.Template.Labels)
+	execTierLabels := maps.Clone(buildCredentialProxyExecTierDeployment(agent, credProxyDep).Spec.Template.Labels)
+	kubeProxyLabels := maps.Clone(buildKubeProxyDeployment(agent, "", true, "tls").Spec.Template.Labels)
+	dispatcherLabels := maps.Clone(buildA2ADispatcherDeployment(agent).Spec.Template.Labels)
+	scopePubLabels := maps.Clone(buildScopePublisherJob(agent, time.Now(), "h").Spec.Template.Labels)
+
+	for name, lbls := range map[string]map[string]string{
+		"shell sandbox":              sandboxLabels,
+		"credential-proxy":           credProxyLabels,
+		"credential-proxy-exec-tier": execTierLabels,
+		"kube-proxy":                 kubeProxyLabels,
+		"A2A dispatcher":             dispatcherLabels,
+		"scope-publisher":            scopePubLabels,
+		"A2A session pod":            a2aLabels(agent, "session"),
+		"AgentProfile worker pod":    a2aLabels(agent, agentProfileWorkerComponent),
+	} {
+		if admits(lbls) {
+			t.Errorf("hindsight-api ingress selector admitted %s (%v); expected rejected", name, lbls)
+		}
 	}
 }

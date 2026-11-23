@@ -6,7 +6,8 @@
 Run from a full clone of main with the release tags fetched. For each row of the "Breaking changes in
 recent releases" table still labelled `pending`, it asks check_upgrade_table_releases.py's own rule
 (pending_row_release) which release contains the row, and rewrites the row's Release cell to that
-release, so a relabel this script writes is one the check accepts. Rows no release contains stay
+release, so a relabel this script writes is one the check accepts. It then puts the table's rows in
+newest-first order (`pending` rows on top), which the check also holds the table to. Rows no release contains stay
 `pending`. It edits the page in the working tree and prints one line per relabelled row,
 `<release>\t<change>`, so a caller can say what changed. It prints nothing when there is nothing to
 relabel.
@@ -14,8 +15,9 @@ relabel.
 The release job runs it after cutting a tag (scripts/release/open_upgrade_relabel_pr.sh), so main's
 `make docs-check-upgrade-releases` is not left failing until someone relabels the rows by hand.
 
-The table is prettier-aligned. The new label is padded to the cell's existing width; a label longer
-than that width is written as is, and the caller runs prettier on the page.
+The new label is padded to the cell's existing width; a label longer than that width is written as
+is. The table is out of Prettier (`prettier-ignore`, #6286), so its columns need not line up, and the
+`pending` rows left behind stay in the order of their change text.
 """
 
 from __future__ import annotations
@@ -75,6 +77,27 @@ def relabelled(page: str, labels: list[tuple[check.Row, str]]) -> str:
     return LINE_BREAK.join(lines)
 
 
+def newest_first(page: str) -> str:
+    """`page` with the table's rows in newest-first order: `pending` rows first, then each release's rows,
+    newest release first. The sort is stable, so rows of one release keep their order, and each row line
+    goes back into one of the rows' own line positions, so nothing else on the page moves. A relabel
+    leaves a row where it was added, which can put a newer release's row below an older one's (#5991)."""
+    lines = page.split(LINE_BREAK)
+    table = check.table_rows(page)
+    positions = [row.line - 1 for row in table]
+    by_line = {row.line - 1: row for row in table}
+
+    def key(index: int) -> tuple[int, tuple[int, ...]]:
+        release = by_line[index].release
+        return (0, ()) if release == check.PENDING else (1, tuple(-part for part in check.version_key(release)))
+
+    ordered = sorted(positions, key=key)
+    rewritten = list(lines)
+    for position, source in zip(positions, ordered):
+        rewritten[position] = lines[source]
+    return LINE_BREAK.join(rewritten)
+
+
 def main() -> int:
     problem = check.clone_problem()
     if problem:
@@ -87,7 +110,7 @@ def main() -> int:
     for note in left:
         print(f"{check.WARNING_PREFIX}{note}", file=sys.stderr)
     if labels:
-        page_path.write_text(relabelled(page, labels), encoding="utf-8")
+        page_path.write_text(newest_first(relabelled(page, labels)), encoding="utf-8")
     for row, release in labels:
         print(f"{release}{OUTPUT_SEPARATOR}{row.change}")
     return check.EXIT_OK

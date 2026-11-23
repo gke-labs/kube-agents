@@ -459,7 +459,7 @@ class ClusterPreflightTest(unittest.TestCase):
     # request queued at the broker. Check 3 reads the pinned file itself.
 
     def test_check_3_passes_while_kubectl_on_the_pinned_file_hangs(self):
-        # The today-mode smoke failure at check 3: the shim's request for it
+        # The smoke failure at check 3: the shim's request for it
         # queued past the 15s cap on a busy broker and a correct pin failed.
         # Check 4 still asks the broker, and the next test covers it timing out.
         start = time.monotonic()

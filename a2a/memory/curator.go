@@ -96,6 +96,7 @@ type CuratorConfig struct {
 type Curator struct {
 	cfg               CuratorConfig
 	log               *slog.Logger
+	metrics           *curatorMetrics
 	mu                sync.Mutex
 	bankEnsured       bool
 	knownIDsLoaded    bool
@@ -158,6 +159,7 @@ func NewCurator(cfg CuratorConfig) (*Curator, error) {
 	return &Curator{
 		cfg:           cfg,
 		log:           log,
+		metrics:       newCuratorMetrics(cfg.RepoDir),
 		knownIDs:      map[string]bool{},
 		seenEnvelopes: map[string]bool{},
 		queryCache:    map[string]MemoryQueryResponse{},
@@ -328,7 +330,7 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 	c.sub = sub
 
-	// Subscribe to the dedicated Curator outcome subject (_INBOX.agent.curator.outcomes,
+	// Subscribe to the dedicated Curator outcome subject (a2a.topics.agent.platform.curator-outcomes,
 	// reserved to the agent principal by NATS auth callout so worker/session pods
 	// cannot forge approved, resolved-merged, modified-merged, or refused outcomes).
 	outcomeSubjects := []string{SubjectCuratorOutcomes}
@@ -348,7 +350,7 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 
 	// Register the NATS request-reply responder for semantic memory queries on
-	// SubjectMemoryQuery (_INBOX.agent.memory.query, covered by the agent
+	// SubjectMemoryQuery (a2a.memory.query, covered by the agent
 	// principal's publish and subscribe grants) so callers can query memory over
 	// NATS without coupling to a specific storage backend.
 	querySubjects := []string{SubjectMemoryQuery}
@@ -480,15 +482,15 @@ func (c *Curator) handleAnnotationEnvelope(ctx context.Context, env *lib.Envelop
 	if env == nil || env.Kind != lib.KindTopicUpdate {
 		return
 	}
+	ev, ok := ExtractOutcomeEvent(env)
+	if !ok {
+		return
+	}
 	c.mu.Lock()
 	alreadySeen := c.markSeenLocked(env.EnvelopeID)
 	c.mu.Unlock()
 	if alreadySeen {
-		return
-	}
-
-	ev, ok := ExtractOutcomeEvent(env)
-	if !ok {
+		c.metrics.recordOutcome(ev.Kind, outcomeStatusDuplicate)
 		return
 	}
 	// Security invariant: worker profiles with publish access to the shared
@@ -496,6 +498,7 @@ func (c *Curator) handleAnnotationEnvelope(ctx context.Context, env *lib.Envelop
 	// never privileged lifecycle transitions (approved, modified-merged,
 	// resolved-merged, pr-merged-persists, refused, or retired).
 	if ev.Kind != OutcomeProposed {
+		c.metrics.recordOutcome(ev.Kind, outcomeStatusIgnored)
 		c.log.Warn("curator: rejected privileged outcome transition on shared annotations topic; must use SubjectCuratorOutcomes",
 			"kind", ev.Kind, "record_id", ev.RecordID)
 		return
@@ -528,19 +531,21 @@ func (c *Curator) handleCuratorOutcomeMsg(ctx context.Context, msg *nats.Msg, ex
 	var ev OutcomeEvent
 	var corrID string
 	if env, err := lib.ParseEnvelope(msg.Data); err == nil && env != nil && env.Kind != "" {
+		extracted, ok := ExtractOutcomeEvent(env)
+		if !ok {
+			return
+		}
 		c.mu.Lock()
 		alreadySeen := c.markSeenLocked(env.EnvelopeID)
 		c.mu.Unlock()
 		if alreadySeen {
-			return
-		}
-		extracted, ok := ExtractOutcomeEvent(env)
-		if !ok {
+			c.metrics.recordOutcome(extracted.Kind, outcomeStatusDuplicate)
 			return
 		}
 		// Topic-update envelopes from shared streams may never carry privileged transitions,
 		// blocking JetStream MSG.NEXT replay even from no_ack consumers.
 		if env.Kind == lib.KindTopicUpdate && extracted.Kind != OutcomeProposed {
+			c.metrics.recordOutcome(extracted.Kind, outcomeStatusIgnored)
 			c.log.Warn("curator: rejected topic-update envelope carrying privileged outcome", "kind", extracted.Kind)
 			return
 		}
@@ -633,10 +638,10 @@ func isOutcomeKind(k OutcomeKind) bool {
 
 func gitopsPRsDisabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("DECISION_MEMORY_GITOPS_PRS"))) {
-	case "0", "false", "no", "off", "disabled":
-		return true
+	case "1", "true", "yes", "on", "enabled":
+		return false
 	}
-	return false
+	return true
 }
 
 func isCrashRootCauseEvidence(ev OutcomeEvent) bool {
@@ -717,7 +722,7 @@ func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repo
 	endpoint := u.Scheme + "://" + u.Host + brokerSnapshotPath
 	reqBody, err := json.Marshal(map[string]any{
 		"repository": repoID,
-		"paths":      []string{"knowledge", ".kube-agents"},
+		"paths":      []string{"knowledge"},
 	})
 	if err != nil {
 		return err
@@ -909,7 +914,15 @@ func rejectedGovernedSameSubject(oldRec, activeRec Record) bool {
 // updates Hindsight (kube-agents-decisions) via document_id replacement, runs
 // cross-cluster recurrence graduation if applicable, and publishes the updated
 // BlueprintDigest to a2a.topics.shared.blueprint.
-func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlationID string) (OutcomeProcessResult, error) {
+func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlationID string) (res OutcomeProcessResult, err error) {
+	outcomeStatus := outcomeStatusProcessed
+	defer func() {
+		if err != nil {
+			outcomeStatus = outcomeStatusError
+		}
+		c.metrics.recordOutcome(ev.Kind, outcomeStatus)
+	}()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -977,18 +990,25 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 				// If matched fuzzily (no explicit RecordID) for a new PR, allocate a fresh ID.
 				if existing.Meta.Status == StatusActive {
 					if origRecordID != "" || prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+						if prRef != "" && existing.Meta.Evidence.PullRequest == prRef {
+							outcomeStatus = outcomeStatusDuplicate
+						} else {
+							outcomeStatus = outcomeStatusIgnored
+						}
 						return noopResult(), nil
 					}
 					ev.RecordID = ""
 				} else {
 					// Same PR (or no new PR): idempotent no-op.
 					if prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+						outcomeStatus = outcomeStatusDuplicate
 						return noopResult(), nil
 					}
 					// Attaching a newly opened PR reference to a PR-less proposed record:
 					// update only missing evidence links without overwriting title, guard, or body.
 					if existing.Meta.Evidence.PullRequest == "" && prRef != "" {
 						existing.Meta.Evidence.PullRequest = prRef
+						existing.Meta.Evidence.RemediationPR = firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
 						existing.Meta.Evidence.BreakingPR = firstNonEmpty(existing.Meta.Evidence.BreakingPR, ev.BreakingPR)
 						existing.Meta.Evidence.Incident = firstNonEmpty(existing.Meta.Evidence.Incident, ev.Incident)
 						existing.Meta.Evidence.Commit = firstNonEmpty(existing.Meta.Evidence.Commit, ev.Commit)
@@ -1001,6 +1021,7 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 					// if the caller explicitly named RecordID, refuse to clobber it;
 					// if matched fuzzily by title/rule, allocate a new ID for the new PR.
 					if origRecordID != "" {
+						outcomeStatus = outcomeStatusIgnored
 						return noopResult(), nil
 					}
 					ev.RecordID = ""
@@ -1149,6 +1170,7 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	if hasExisting && ev.Title == "" && ev.Rule == "" && ev.Summary == "" && ev.RootCause == "" && ev.Fix == "" {
 		prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 		existing.Meta.Evidence.PullRequest = prRef
+		existing.Meta.Evidence.RemediationPR = firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
 		existing.Meta.Evidence.BreakingPR = firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR)
 		existing.Meta.Evidence.Incident = firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident)
 		existing.Meta.Evidence.Commit = firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit)
@@ -1165,6 +1187,10 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	if prRef == "" {
 		prRef = existing.Meta.Evidence.PullRequest
 	}
+	remediationPR := firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
+	if !hasExisting && (rtype == RecordTypeLesson || ev.FindingID != "" || ev.SoakWindow != "") && prRef != "" && !strings.Contains(prRef, proposalBranchPrefix) {
+		remediationPR = firstNonEmpty(ev.RemediationPR, prRef)
+	}
 
 	meta := RecordMeta{
 		Type:   rtype,
@@ -1175,12 +1201,13 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 		Scope:  scope,
 		Guard:  guard,
 		Evidence: RecordEvidence{
-			PullRequest: prRef,
-			BreakingPR:  firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
-			Incident:    firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident),
-			Commit:      firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit),
-			FindingID:   firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID),
-			SoakWindow:  firstNonEmpty(ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
+			PullRequest:   prRef,
+			RemediationPR: remediationPR,
+			BreakingPR:    firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
+			Incident:      firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident),
+			Commit:        firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit),
+			FindingID:     firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID),
+			SoakWindow:    firstNonEmpty(ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
 		},
 		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
 	}
@@ -1805,6 +1832,7 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 			}
 		}
 		graduated = append(graduated, decID)
+		c.metrics.recordGraduations(1)
 	}
 	return graduated, nil
 }
@@ -2019,7 +2047,21 @@ func (c *Curator) handleQueryMsg(ctx context.Context, msg *nats.Msg, expectedSub
 // HandleQuery answers a MemoryQueryRequest against the configured semantic
 // memory backend (Hindsight + local OKF records) with in-memory caching that is
 // automatically invalidated whenever ProcessOutcome updates the store.
-func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) MemoryQueryResponse {
+func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) (resp MemoryQueryResponse) {
+	isRecallQuery := req.Action == "" || req.Action == "query" || req.Action == "recall"
+	defer func() {
+		if !isRecallQuery {
+			return
+		}
+		switch {
+		case resp.Error != "":
+			c.metrics.recordQuery(queryStatusError)
+		case len(resp.Results) > 0 || len(resp.Records) > 0 || resp.Outcome != nil:
+			c.metrics.recordQuery(queryStatusHit)
+		default:
+			c.metrics.recordQuery(queryStatusEmpty)
+		}
+	}()
 	switch req.Action {
 	case "propose", "resolve":
 		if req.Outcome == nil {
@@ -2264,7 +2306,7 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		results = []HindsightRecallResult{}
 	}
 
-	resp := MemoryQueryResponse{
+	resp = MemoryQueryResponse{
 		Schema:  MemoryQueryReplySchema,
 		Backend: backend,
 		Bank:    bank,

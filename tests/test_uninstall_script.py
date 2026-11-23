@@ -18,6 +18,7 @@ itself, and a ref with no uninstall.sh is refused rather than driven with an
 engine it does not carry.
 """
 
+import json
 import pathlib
 import re
 import shlex
@@ -27,12 +28,84 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.common import UNINSTALL_LOCK_FILE_ENV, create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _UNINSTALL_SH = _REPO_ROOT / "uninstall.sh"
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 _INSTALL_DEFAULTS = _REPO_ROOT / "install.defaults.env"
+
+# uninstall.sh's variable for its report file, a seam for tests, and the path a real
+# run writes, which the uninstall skill names.
+_REPORT_FILE_ENV = "KUBE_AGENTS_UNINSTALL_REPORT_FILE"
+_REPORT_DEFAULT_FILE = "/tmp/kube-agents-uninstall-report.json"
+# The file a real run locks. UNINSTALL_LOCK_FILE_ENV, the variable that names another file, is
+# a seam for tests; the shared test environment sets it.
+_LOCK_DEFAULT_FILE = "/tmp/kube-agents-uninstall.lock"
+
+
+class ReportFileTest(unittest.TestCase):
+    def test_the_report_goes_to_the_documented_file_unless_a_test_names_another(self):
+        """A real run writes the one file the docs name; only the variable
+        moves it. Held by the source: a run of write_report with the variable
+        unset would write that file."""
+        source = _UNINSTALL_SH.read_text()
+        self.assertEqual(source.count(_REPORT_DEFAULT_FILE), 1, "the script names the report path in one place")
+        self.assertEqual(
+            source.count(f'  local report_file="${{{_REPORT_FILE_ENV}:-{_REPORT_DEFAULT_FILE}}}"\n'),
+            1,
+            "write_report takes the variable, then the documented path",
+        )
+
+    def test_write_report_writes_the_file_the_variable_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "report.json"
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"\nwrite_report "PROBE" >/dev/null'],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={_REPORT_FILE_ENV: str(report)}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(report.read_text())["status"], "PROBE")
+
+
+class LockFileTest(unittest.TestCase):
+    def test_a_real_run_locks_the_same_file_as_before_unless_a_test_names_another(self):
+        """Held by the source: with the variable unset, the script locks the one
+        fixed file, and it names that file in one place."""
+        source = _UNINSTALL_SH.read_text()
+        self.assertEqual(source.count(_LOCK_DEFAULT_FILE), 1, "the script names the lock file in one place")
+        self.assertEqual(
+            source.count(f'\nLOCK_FILE="${{{UNINSTALL_LOCK_FILE_ENV}:-{_LOCK_DEFAULT_FILE}}}"\n'),
+            1,
+            "the script takes the variable, then the same file as before",
+        )
+
+    def test_a_sourced_script_opens_the_lock_file_the_variable_names(self):
+        # Checked before the run: a script that reads another variable would
+        # open the lock file of a real uninstall.
+        self.assertIn(f'\nLOCK_FILE="${{{UNINSTALL_LOCK_FILE_ENV}:-', _UNINSTALL_SH.read_text())
+        # A stand-in flock, because the script skips its lock block where flock
+        # is absent (macOS), and then this would hold nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            flock = bin_dir / "flock"
+            flock.write_text("#!/usr/bin/env bash\nexit 0\n")
+            flock.chmod(flock.stat().st_mode | stat.S_IEXEC)
+            lock = pathlib.Path(tmp) / "uninstall.lock"
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"\necho sourced'],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir), overrides={UNINSTALL_LOCK_FILE_ENV: str(lock)}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("sourced", proc.stdout)
+            self.assertTrue(lock.is_file(), "the script did not open the lock file that the variable names")
 
 
 class ResolveStateLocationTest(unittest.TestCase):
@@ -258,8 +331,8 @@ bash -c "exit 3"
             )
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         # The banner proves on_error actually ran and normalised. Without it
-        # this passes vacuously whenever /tmp/kube-agents-uninstall.lock is
-        # held: the lock branch also exits 1, having asserted nothing.
+        # this passes vacuously whenever the script's lock file is held: the
+        # lock branch also exits 1, having asserted nothing.
         self.assertIn("Teardown error encountered", proc.stderr)
         self.assertIn("exit code 1", proc.stderr)
 
@@ -1201,10 +1274,17 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
         self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
         self.assertLess(policy_at, call_at)
+        chat_policy_at = text.find('export GOOGLE_CHAT_HOME_CHANNEL_POLICY=""')
+        self.assertNotEqual(chat_policy_at, -1, "uninstall.sh must blank GOOGLE_CHAT_HOME_CHANNEL_POLICY")
+        self.assertLess(chat_policy_at, call_at)
         # The data volume size likewise: the generator refuses a malformed size.
         storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
         self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")
         self.assertLess(storage_at, call_at)
+        # The runtime sizing profile likewise: the generator refuses an unknown value.
+        sizing_at = text.find('export PLATFORM_AGENT_SIZING_PROFILE=""')
+        self.assertNotEqual(sizing_at, -1, "uninstall.sh must blank PLATFORM_AGENT_SIZING_PROFILE")
+        self.assertLess(sizing_at, call_at)
         # The scoped service account pool too: the generator refuses a
         # misspelt switch or a malformed cap, and the pool goes with the state.
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')

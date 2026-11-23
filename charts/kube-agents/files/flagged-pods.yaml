@@ -1,8 +1,7 @@
 # Standing pods the operator renders into the release namespace only while an
 # operator env flag is on. No golden sets those
 # flags, so footprint.yaml has no entry for them, and the quota preflight adds
-# each one here when its flag is set: by operator.extraEnv, or for the MCP
-# server by operator.mcpServer.enabled.
+# each one here when its flag is set in operator.extraEnv.
 #
 # Hand-kept, and held to the operator by TestTheChartCountsEveryFlaggedPod
 # (k8s-operator/internal/controller): every workload in the operator's
@@ -19,16 +18,6 @@
 # Profile workers aren't here: they run in the profile namespace, under the pod
 # quota the operator derives for it, not in the release namespace.
 pods:
-  - name: mcp
-    env: A2A_MCP_DOOR
-    enabledWhen: "true"
-    replicas: 1
-    cpuMillisRequest: 100
-    cpuMillisLimit: 500
-    memoryBytesRequest: 134217728
-    memoryBytesLimit: 268435456
-    ephemeralStorageBytesRequest: 0
-    ephemeralStorageBytesLimit: 0
   - name: curator
     env: A2A_CURATOR
     enabledWhen: "true"

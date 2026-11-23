@@ -101,6 +101,8 @@ ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
 COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
 # The wrapper below asks this first, and starts Python only when the context is not registered yet.
+# It then unsets the session pod's admission settings (session-kubectl.sh), so a sandbox session
+# keeps the sandbox's state directory, guard and refusals.
 COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexec/kubectl-context-registered
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
@@ -125,7 +127,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
       '    ;;' \
       '  esac' \
       'fi' \
-      'exec /usr/local/libexec/kubectl "$@"' \
+      'unset KUBECTL_ADMIT_RUN_DIR KUBECTL_ADMIT_GUARD_PATH KUBECTL_ADMIT_ON_BUSY' \
+      'exec python3 -I /usr/local/libexec/kubectl-admit "$@"' \
       >/usr/local/bin/kubectl && \
     chmod 0755 /usr/local/bin/kubectl && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
@@ -144,9 +147,9 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Pinned and checked against the release's SHA256SUMS, per architecture; a
 # version bump moves the hashes and the `leeway version` check in
 # deploy/sandbox/smoke-test.sh with it.
-ARG LEEWAY_VERSION=0.1.5
-ARG LEEWAY_SHA256_AMD64=f241671cf5a6e6b642fda5238b31ea3283e8dcb7aa6b9782358f268515e71d8a
-ARG LEEWAY_SHA256_ARM64=6282ea89eeb9af23a50ac4f9f06bcf135206ff93f3beda9efa96cf94144ccc5c
+ARG LEEWAY_VERSION=0.1.7
+ARG LEEWAY_SHA256_AMD64=b95a89c6b7d92b6a683138e3e2f3bd2523e344190644496352d78ff2b65c2b2a
+ARG LEEWAY_SHA256_ARM64=58d5f6c242f6761b363f7a541f243a697e4cd7d8bb038c8a46b77c12ece190b5
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) LEEWAY_SHA256="${LEEWAY_SHA256_AMD64}" ;; \
@@ -520,6 +523,17 @@ COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 # 0755: the model can run it and cannot rewrite it, which is the point, since
 # sshd runs it for every session that account opens.
 COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-session-command
+# Started by the entrypoint as root before sshd: it stops the largest session
+# process when the container nears its memory limit, so one oversized command
+# fails instead of the container being OOMKilled with every session in it.
+# Root-owned under libexec, so a session can neither rewrite nor stop it.
+COPY --chmod=0755 deploy/sandbox/shell-memory-guard.py /usr/local/libexec/shell-memory-guard
+# The kubectl admission /usr/local/bin/kubectl execs: it charges a large `get` the
+# peak the cost table lists for it and refuses one the shell cannot hold, before
+# it starts. The table is profiled ahead of time
+# (.agents/skills/update-kubectl-cost-table); nothing is estimated at run time.
+COPY --chmod=0755 deploy/sandbox/kubectl-admit.py /usr/local/libexec/kubectl-admit
+COPY --chmod=0644 deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/kubectl-costs.json
 
 # What the agent's shell actually reads and runs, staged at /opt/defaults for the
 # entrypoint to copy onto the volume (step 1a). Same two-part arrangement as the
@@ -628,6 +642,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   post_merge_stepdown.py opens the revert and the rules-file pull request for an
 #                          auto-merged fix still broken after merge; imports
 #                          automation_rules, kubeagents_switches and vcs_client
+#   automerge_switch.py    the autonomy dial's per-kind switch: the rules-file pull
+#                          request that turns auto-merge on or off for a kind of
+#                          fix in one repository; imports automation_rules,
+#                          post_merge_stepdown, kubeagents_switches and vcs_client
 #   post_merge_offer.py    opens the draft rules-file pull request that offers
 #                          auto-merge for a kind of fix; imports post_merge_stepdown,
 #                          repo_ref and clean_merges, whose thresholds it states
@@ -637,6 +655,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          through credential_proxy_client and sizes their pools
 #                          from it, falling back to four. Every sweep collector
 #                          imports it at load
+#   logging_reads.py       a `gcloud logging read` through the broker's Cloud API
+#                          relay (credential_proxy_client.ApiSession), for the
+#                          stockout collector and the readiness report's audit-log
+#                          rules; when the relay does not answer, they run gcloud
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
 #                          refusal. `vcs.py`, `forge.py`, submit-suggestion,
@@ -721,10 +743,12 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/kubeagents_switches.py \
      agents/platform/scripts/automation_rules.py \
      agents/platform/scripts/post_merge_stepdown.py \
+     agents/platform/scripts/automerge_switch.py \
      agents/platform/scripts/post_merge_offer.py \
      agents/platform/scripts/clean_merges.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
+     agents/platform/scripts/logging_reads.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
@@ -740,6 +764,10 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
      /opt/defaults/scripts/
+# automation_rules.py reads the kinds of fix from the fix-recipe registry, a
+# package with one directory per kind, so it is its own COPY: a directory in the
+# list above would land flattened into /opt/defaults/scripts.
+COPY agents/platform/scripts/fix_recipes/ /opt/defaults/scripts/fix_recipes/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/eod_report_generator.py

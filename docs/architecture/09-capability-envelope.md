@@ -248,8 +248,8 @@ is not built yet; until it is, every root is the install-wide one described in Â
 narrows only to itself, and a hop (a child entry a broker writes) carries its parent's profile
 unchanged, so no hop can relabel a human's `read` grant as `unattended` or choose which profile its
 chain may run. A profile task's child task does not hop: the gateway mints it a fresh root, naming
-the child's profile at the parent's tier, with a target inside the parent's, which is how fan-out
-crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream, script}`, added
+the child's profile at the parent's tier (at `read`, with no trigger, below an `unattended` parent,
+#6744), with a target inside the parent's, which is how fan-out crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream, script}`, added
 11/11, #4685): the unattended trigger whose submission the gateway minted it for. `script`, on a
 built-in schedule's run, names the profile script it executes: a label, only on a schedule's
 trigger. The readers accept it; resolving it against a profile allowlist, and writing it, are
@@ -513,9 +513,8 @@ subject falls outside the caller's own reply namespace, since the reply-to is ca
 check also gets a fresh reply subject and carries a fresh random `requestId`, which the verifier
 echoes on every verdict, and the client acts only on a reply that echoes its own id. That's defence
 in depth for the dispatcher's admission, which mints a task's credentials on the answer: a reply
-carrying another id is dropped, and a check with no answer of its own fails closed at its timeout,
-as does one whose reply doesn't parse. A reply with no id, from a verifier older than the echo, is
-still acted on while a release without the echo is inside the rollback window.
+carrying another id, or none, is dropped, and a check with no answer of its own fails closed at its
+timeout. A reply that doesn't parse is refused at once.
 
 **Where the weaker guarantee still applies.** With a shared agent identity the bound would be the
 widest capability concurrently delegated to that agent rather than the authority of the human whose

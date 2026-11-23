@@ -84,7 +84,7 @@ class FetchTest(unittest.TestCase):
 
     NEXT_GITHUB = {"name": "ci-kube-agents-eval-nightly", "mode": "next", "forge": "github"}
 
-    def record(self, build, ms, objects, runs=(), created=NOW, job=NEXT_GITHUB):
+    def record(self, build, ms, objects, runs=(), created=NOW, job=NEXT_GITHUB, produced=None, counts=None):
         """A publish record; `objects` maps a version to names, or to (name, bytes, target) entries."""
         described = {}
         for version, names in objects.items():
@@ -98,7 +98,9 @@ class FetchTest(unittest.TestCase):
                 described[version].append(entry)
         self.bucket.put(f"replay-cache/builds/{build}/publish-{ms}.json",
                         json.dumps({"build": build, "objects": described, "runs": list(runs),
-                                    **({"job": job} if job is not None else {})}), created)
+                                    **({"job": job} if job is not None else {}),
+                                    **({"produced": produced} if produced is not None else {}),
+                                    **({"produced_counts": counts} if counts is not None else {})}), created)
 
     def objects(self, version, *names, content=None):
         for name in names:
@@ -126,6 +128,139 @@ class FetchTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dest, "answers", f"{fp(9)}.json")), "no record named it")
         with open(self.runs_out) as handle:
             self.assertEqual(len(json.load(handle)["101"]), 2, "the fullest record's runs")
+
+    def test_an_alternate_comes_in_only_from_a_recent_record_whose_night_produced_it(self):
+        import replay_cache
+        old, new, slot = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json", f"slots/{fp(2)}.json"
+        self.targets[slot] = fp(1)
+        self.objects(VERSION, old, new, slot)
+        self.record("100", 1, {VERSION: [old]}, created=NOW - 40 * HOUR, produced={VERSION: {fp(1): [fp(7)]}})
+        # Tonight's record names the old answer too (found in the bucket), but its runs produced only the new one.
+        self.record("101", 1, {VERSION: [old, new, slot]}, produced={VERSION: {fp(1): [fp(8)]}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(os.listdir(os.path.join(self.dest, "alts", fp(1))), [f"{fp(8)}.json"],
+                         "alternates nest again, one directory per key, as replay_cache.py reads them")
+        self.assertEqual(result.skipped, {"not_produced": 1})
+        self.assertEqual(result.by_kind, {"alts": 1, "slots": 1}, "the slot's key has an answer")
+        self.assertEqual([name for name, _ in replay_cache.AnswerCache(self.dest).answers(fp(1))], [fp(8)])
+        self.assertTrue(FC.answers_arrived(self.dest))
+
+    def weights(self, fingerprint):
+        import replay_cache
+        return replay_cache.AnswerCache(self.dest).weights(fingerprint)
+
+    def test_counts_sum_across_builds_and_a_builds_newest_record_holds_its_count(self):
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        produced = {VERSION: {fp(1): [fp(7), fp(8)]}}
+        # Build 100 counted again on its second call: 4 and 1, not 2+4 and 1+1.
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced=produced,
+                    counts={VERSION: {fp(1): {fp(7): 2, fp(8): 1}}})
+        self.record("100", 2, {VERSION: []}, created=NOW - 9 * HOUR, produced={VERSION: {}},
+                    counts={VERSION: {fp(1): {fp(7): 4, fp(8): 1}}})
+        # Build 101, another night's runs: 5 more of the first.
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 5}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 9, fp(8): 1})
+        self.assertEqual(result.by_kind, {"alts": 2, "weights": 1})
+
+    def test_a_build_whose_records_give_no_count_adds_one_per_answer(self):
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced={VERSION: {fp(1): [fp(7), fp(8)]}})
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 3}}})
+        self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 1 + 3, fp(8): 1})
+
+    def test_a_build_whose_first_record_aged_out_still_loads_and_weighs_its_counted_answer(self):
+        # Build 100 listed fp(7) as produced in its first record, now past the
+        # window; its newer in-window record only counts it. Build 101 gave fp(8).
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a]}, created=NOW - 40 * HOUR, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 1}}})
+        self.record("100", 2, {VERSION: []}, created=NOW - 10 * HOUR, produced={VERSION: {}},
+                    counts={VERSION: {fp(1): {fp(7): 4}}})
+        self.record("101", 1, {VERSION: [b]}, produced={VERSION: {fp(1): [fp(8)]}},
+                    counts={VERSION: {fp(1): {fp(8): 1}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dest, "alts", fp(1)))), [f"{fp(7)}.json", f"{fp(8)}.json"])
+        self.assertEqual(self.weights(fp(1)), {fp(7): 4, fp(8): 1})
+        self.assertEqual(result.skipped, {})
+
+    def test_an_answer_whose_newest_count_is_zero_in_every_producing_build_is_refused(self):
+        # An interval pass put fp(7) up; the final pass found a disagreeing
+        # producer and counts it 0. fp(8) keeps the key answered.
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced={VERSION: {fp(1): [fp(7), fp(8)]}},
+                    counts={VERSION: {fp(1): {fp(7): 1, fp(8): 2}}})
+        self.record("100", 2, {VERSION: []}, created=NOW - 9 * HOUR, produced={VERSION: {}},
+                    counts={VERSION: {fp(1): {fp(7): 0, fp(8): 2}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(os.listdir(os.path.join(self.dest, "alts", fp(1))), [f"{fp(8)}.json"])
+        self.assertEqual(result.skipped, {"zero_count": 1})
+        self.assertFalse(any(c.endswith(a) for c in self.bucket.copied), "never downloaded")
+
+    def test_a_zero_count_in_one_build_is_outweighed_by_another_builds_positive_or_missing_count(self):
+        a = f"alts/{fp(1)}-{fp(7)}.json"
+        b = f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced={VERSION: {fp(1): [fp(7), fp(8)]}},
+                    counts={VERSION: {fp(1): {fp(7): 0, fp(8): 1}}})
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 3}}})
+        self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 3, fp(8): 1}, "build 100 adds nothing, build 101 its 3")
+        self.record("102", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}})
+        shutil.rmtree(self.dest, ignore_errors=True)
+        self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 3 + 1, fp(8): 1}, "a build with no count adds 1")
+
+    def test_a_key_with_one_answer_gets_no_weights_file(self):
+        a = f"alts/{fp(1)}-{fp(7)}.json"
+        self.objects(VERSION, a)
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 3}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertFalse(os.path.exists(os.path.join(self.dest, "weights")))
+        self.assertEqual(result.by_kind, {"alts": 1})
+
+    def test_produced_counts_outside_their_shape_refuse_the_whole_download(self):
+        message = f"messages/{'b' * 16}.json"
+        for counts in ([1], {VERSION: [1]}, {VERSION: {"../x": {fp(7): 1}}}, {VERSION: {fp(1): [fp(7)]}},
+                       {VERSION: {fp(1): {"../y": 1}}}, {VERSION: {fp(1): {fp(7): -1}}},
+                       {VERSION: {fp(1): {fp(7): True}}}, {VERSION: {fp(1): {fp(7): "2"}}}):
+            with self.subTest(counts=counts):
+                shutil.rmtree(self.bucket.root, ignore_errors=True)
+                self.bucket.created.clear()
+                self.objects(VERSION, message)
+                self.record("101", 1, {VERSION: [message]}, counts=counts)
+                with self.assertRaises(FC.Refused):
+                    self.fetcher().fetch(self.dest)
+
+    def test_a_slot_whose_keys_alternates_were_all_left_out_is_removed(self):
+        alt, slot = f"alts/{fp(1)}-{fp(7)}.json", f"slots/{fp(2)}.json"
+        self.targets[slot] = fp(1)
+        self.objects(VERSION, alt, slot)
+        self.record("101", 1, {VERSION: [alt, slot]}, produced={VERSION: {}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual((result.by_kind, result.left_out), ({}, {"slots": 1}))
+        self.assertFalse(FC.answers_arrived(self.dest))
+
+    def test_a_produced_list_outside_the_layout_refuses_the_whole_download(self):
+        message = f"messages/{'b' * 16}.json"  # a name in every version of the layout
+        for produced in ([fp(7)], {VERSION: [fp(7)]}, {VERSION: {"../x": [fp(7)]}}, {VERSION: {fp(1): ["../y"]}},
+                         {VERSION: {fp(1): fp(7)}}):
+            with self.subTest(produced=produced):
+                shutil.rmtree(self.bucket.root, ignore_errors=True)
+                self.bucket.created.clear()
+                self.objects(VERSION, message)
+                self.record("101", 1, {VERSION: [message]}, produced=produced)
+                with self.assertRaises(FC.Refused):
+                    self.fetcher().fetch(self.dest)
 
     def test_records_older_than_the_window_are_left_out(self):
         self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
@@ -332,7 +467,7 @@ class PrintCommitTest(FetchTest):
         job.update(overrides)
         return job
 
-    def main(self, *extra, mode_next="1"):
+    def main(self, *extra):
         import contextlib
         import io
         out, err = io.StringIO(), io.StringIO()
@@ -340,7 +475,7 @@ class PrintCommitTest(FetchTest):
         FC.default_run = self.bucket
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                status = FC.main(["--bucket", BUCKET, "--print-commit", "--eval-mode-next", mode_next, *extra])
+                status = FC.main(["--bucket", BUCKET, "--print-commit", *extra])
         finally:
             FC.default_run = original
         return status, out.getvalue(), err.getvalue()
@@ -400,6 +535,17 @@ class PrintCommitTest(FetchTest):
         night = self.fetcher().night_commit()
         self.assertEqual((night.commit, night.answers), (COMMIT_C, {COMMIT_B: 1, COMMIT_C: 2}))
 
+    def test_a_commit_with_more_alternates_but_fewer_keys_loses(self):
+        # Commit C confirmed three alternates of one key; commit B one answer
+        # each to two keys. Requests covered, not objects, decide.
+        a, b, c = "a" * 64, "b" * 64, "c" * 64
+        self.record("202", 1, {VERSION: [f"alts/{fp(5)}-{a}.json", f"alts/{fp(5)}-{b}.json",
+                                         f"alts/{fp(5)}-{c}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_C))
+        self.record("200", 1, {VERSION: [f"alts/{fp(1)}-{a}.json", f"answers/{fp(2)}.json"]},
+                    created=NOW - 2 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.answers), (COMMIT_B, {COMMIT_B: 2, COMMIT_C: 1}))
+
     def test_no_commit_prints_nothing_and_exits_1(self):
         for name, records in (("empty bucket", ()),
                               ("records before the commit", (("200", None), ("201", ""))),
@@ -420,7 +566,7 @@ class PrintCommitTest(FetchTest):
     def test_other_modes_and_forges_are_ignored(self):
         self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
         self.record("300", 1, {VERSION: [f"answers/{fp(2)}.json", f"answers/{fp(3)}.json"]}, created=NOW,
-                    job=self.job(COMMIT_C, name="ci-kube-agents-eval-nightly-gitlab", mode="today", forge="gitlab"))
+                    job=self.job(COMMIT_C, name="ci-kube-agents-eval-nightly-gitlab", forge="gitlab"))
         self.record("301", 1, {VERSION: [f"answers/{fp(4)}.json"]}, created=NOW,
                     job=self.job(COMMIT_A, mode="today"))
         self.record("302", 1, {VERSION: [f"answers/{fp(5)}.json"]}, created=NOW, job=None)
@@ -428,8 +574,39 @@ class PrintCommitTest(FetchTest):
         self.assertEqual((night.commit, night.builds, night.other_job_records), (COMMIT_B, ["200"], 3))
         status, out, _ = self.main()
         self.assertEqual((status, out), (0, COMMIT_B + "\n"))
-        status, out, _ = self.main("--forge", "gitlab", mode_next="")
+        status, out, _ = self.main("--forge", "gitlab")
         self.assertEqual((status, out), (0, COMMIT_C + "\n"), "the lane's own mode and forge pick the night")
+
+    def test_the_fetch_writes_the_newest_nights_builds_by_commit_as_print_commit_chose_them(self):
+        # Last night on commit A (its answer still served), tonight's shards on
+        # B (one publishing later), a rerun on C, and another forge's build.
+        self.objects(VERSION, *(f"answers/{fp(i)}.json" for i in (1, 2, 3, 4)))
+        self.record("100", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 26 * HOUR, job=self.job(COMMIT_A))
+        self.record("200", 1, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
+        self.record("200", 2, {}, created=NOW, job=self.job(COMMIT_B))
+        self.record("201", 1, {VERSION: [f"answers/{fp(3)}.json"]}, created=NOW - 2 * HOUR, job=self.job(COMMIT_B))
+        self.record("202", 1, {}, created=NOW - 1 * HOUR, job=self.job(COMMIT_C))
+        self.record("300", 1, {VERSION: [f"answers/{fp(4)}.json"]}, created=NOW,
+                    job=self.job(COMMIT_A, name="gl", mode="today", forge="gitlab"))
+        night_out = os.path.join(os.path.dirname(self.runs_out), FC.NIGHT_FILE)
+        result = self.fetcher(max_age_hours=30).fetch(self.dest, self.runs_out, night_out)
+        night = self.fetcher(max_age_hours=30).night_commit()
+        with open(night_out) as handle:
+            written = json.load(handle)
+        self.assertEqual(written, {"builds": ["200", "201", "202"],
+                                   "commit_builds": {COMMIT_B: ["200", "201"], COMMIT_C: ["202"]}})
+        self.assertEqual((written["builds"], written["commit_builds"]), (night.builds, night.commit_builds))
+        self.assertEqual(result.night_commit_builds, written["commit_builds"])
+
+    def test_a_malformed_commit_leaves_its_build_out_of_the_night_and_the_fetch_goes_on(self):
+        self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 2 * HOUR, job=self.job("HEAD"))
+        self.record("201", 1, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night_out = os.path.join(os.path.dirname(self.runs_out), FC.NIGHT_FILE)
+        result = self.fetcher().fetch(self.dest, self.runs_out, night_out)
+        self.assertEqual(result.downloaded, 2)
+        with open(night_out) as handle:
+            self.assertEqual(json.load(handle), {"builds": ["200", "201"], "commit_builds": {COMMIT_B: ["201"]}})
 
     def test_records_without_a_commit_are_tolerated(self):
         # A night of records some of which predate the commit: they count for

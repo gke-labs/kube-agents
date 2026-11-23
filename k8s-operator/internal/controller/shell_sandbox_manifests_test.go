@@ -1591,8 +1591,8 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 		t.Fatalf("expected exactly two ingress rules (the callers, the collector), got %d", len(np.Spec.Ingress))
 	}
 	in := np.Spec.Ingress[0]
-	if len(in.From) != 2 {
-		t.Fatalf("expected exactly two peers (sandbox, gateway), got %#v", in.From)
+	if len(in.From) != 4 {
+		t.Fatalf("expected four default peers (sandbox, gateway, A2A gateway, MCP), got %#v", in.From)
 	}
 	// A peer with a nil PodSelector matches every pod, and a NamespaceSelector
 	// widens it past this namespace. Either reads as a peer list in `kubectl get`.
@@ -1609,6 +1609,12 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	}
 	if got := in.From[1].PodSelector.MatchLabels["app"]; got != "test-agent-gateway" {
 		t.Errorf("second peer app = %q, want the gateway pod", got)
+	}
+	if got := in.From[2].PodSelector.MatchLabels["app"]; got != "test-agent-a2a-gateway" {
+		t.Errorf("third peer app = %q, want the A2A gateway pod (its report reader)", got)
+	}
+	if got := in.From[3].PodSelector.MatchLabels["app"]; got != "test-agent-a2a-mcp" {
+		t.Errorf("fourth peer app = %q, want the MCP server pod", got)
 	}
 
 	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
@@ -1629,20 +1635,20 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	}
 }
 
-// TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag: a third
+// TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag: a fifth
 // caller peer on the credentialed port, present exactly when the view is on.
 func TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
-	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
-		t.Fatalf("flag off: %d caller peers, want 2", got)
+	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 4 {
+		t.Fatalf("flag off: %d caller peers, want 4 (sandbox, gateway, A2A gateway, MCP)", got)
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	in := buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0]
-	if len(in.From) != 3 {
-		t.Fatalf("flag on: %d caller peers, want 3", len(in.From))
+	if len(in.From) != 5 {
+		t.Fatalf("flag on: %d caller peers, want 5", len(in.From))
 	}
-	peer := in.From[2]
+	peer := in.From[3]
 	if peer.PodSelector == nil || peer.NamespaceSelector != nil || peer.IPBlock != nil {
 		t.Fatalf("session peer reaches outside the namespace: %#v", peer)
 	}
@@ -1819,9 +1825,6 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
-		// The watchers' broker token: mounted into the agent container it
-		// would hand the model the broker's watcher role.
-		watcherTokenVolume,
 		"vcs-forge-credentials-0",
 		"vcs-forge-ca-0",
 	} {
@@ -2280,5 +2283,45 @@ func TestHostClusterContextNameAgreesOnKindAndGKE(t *testing.T) {
 	// /clusters/<context> prefix is refused, so the env is gone on every harness.
 	if v, ok := kpEnv["KUBE_PROXY_DEFAULT_CLUSTER"]; ok {
 		t.Errorf("kube-proxy still renders KUBE_PROXY_DEFAULT_CLUSTER=%q; it routes nothing now", v)
+	}
+}
+
+// The kubectl cost tier reaches the shell container only as a plain lowercase
+// literal from spec.deployment.env: the entrypoint writes it to a file the
+// admission opens by tier name.
+func TestShellSandboxKubectlCostTierEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envKubectlCostTier {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+	if _, ok := read(shellSandboxTestAgent()); ok {
+		t.Errorf("%s is set with no spec.deployment.env entry; unset means the default tier", envKubectlCostTier)
+	}
+	for value, want := range map[string]string{"fleet": "fleet", " Fleet ": "fleet", "large-2": "large-2"} {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envKubectlCostTier, Value: value}}}
+		if got, ok := read(agent); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", envKubectlCostTier, got, ok, value, want)
+		}
+	}
+	for _, value := range []string{"", "../etc", "fleet tier", "\"fleet\"", "9fleet"} {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envKubectlCostTier, Value: value}}}
+		if got, ok := read(agent); ok {
+			t.Errorf("%s = %q reached the sandbox for the CR value %q; only a plain tier name may", envKubectlCostTier, got, value)
+		}
+	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envKubectlCostTier,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envKubectlCostTier)
 	}
 }

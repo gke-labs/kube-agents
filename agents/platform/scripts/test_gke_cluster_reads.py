@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -43,6 +44,19 @@ class _Session:
 
 class GkeClusterReadsTest(unittest.TestCase):
     API = "https://container.googleapis.com/v1"
+
+    def setUp(self):
+        # `API` is the default universe's host. The module takes the universe
+        # from these two variables, which another test file in the process or a
+        # developer's shell can have set.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in (
+            reads.credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV,
+            reads.credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV,
+        ):
+            os.environ.pop(name, None)
 
     def _run(self, answers, request):
         session = _Session(answers)

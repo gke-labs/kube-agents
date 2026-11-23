@@ -52,7 +52,8 @@ KUBE_AGENTS_INSTALLER_COMMON_MARKER="scripts/installer/installer_common.sh"
 # /dev/null for the rest of the run. The release pipeline's teardown failed
 # that way on every scheduled run for weeks: uninstall.sh exited non-zero with
 # nothing on stderr to say why. Same shape as install.sh's lock, deliberately.
-LOCK_FILE="/tmp/kube-agents-uninstall.lock"
+# KUBE_AGENTS_UNINSTALL_LOCK_FILE is for tests.
+LOCK_FILE="${KUBE_AGENTS_UNINSTALL_LOCK_FILE:-/tmp/kube-agents-uninstall.lock}"
 if command -v flock >/dev/null 2>&1 && ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
   if ! flock -n 200 2>/dev/null; then
     echo -e "  \033[93m⚠ Another instance of kube-agents uninstaller is currently running. Exiting.\033[0m" >&2
@@ -259,7 +260,8 @@ parse_args() {
 
 write_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-uninstall-report.json"
+  # KUBE_AGENTS_UNINSTALL_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_UNINSTALL_REPORT_FILE:-/tmp/kube-agents-uninstall-report.json}"
   cat << EOF > "$report_file"
 {
   "status": "$(json_escape "$status")",
@@ -949,9 +951,13 @@ main() {
   # The Slack home channel policy, likewise: the generator refuses a value
   # outside the CRD's enum, and the destroy removes the release whatever it says.
   export SLACK_HOME_CHANNEL_POLICY=""
+  export GOOGLE_CHAT_HOME_CHANNEL_POLICY=""
   # The data volume size, likewise: the generator refuses a malformed size,
   # and a teardown must not stop on a typo in install.env.
   export PLATFORM_AGENT_STORAGE_SIZE=""
+  # The runtime sizing profile, likewise: the generator refuses an unknown
+  # value, and a teardown must not stop on a typo in install.env.
+  export PLATFORM_AGENT_SIZING_PROFILE=""
   # The daily alert ceilings, likewise: the generator refuses a value that is
   # not a whole number, and the ceilings go with the release. Each key is
   # named here, because an older installer_common.sh has no

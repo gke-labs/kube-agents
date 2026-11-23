@@ -23,7 +23,7 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
 metadata:
   # A dot-free DNS-1123 label: it is the addressee on the bus. The name plus its
-  # longest listed tier is at most 54 characters. `platform` is reserved.
+  # longest listed tier is at most 54 characters. `platform` and `session` are reserved.
   name: auditor
   namespace: kubeagents-system
 spec:
@@ -34,6 +34,7 @@ spec:
     image: registry.example.com/kube-agents/agent-worker:1.0
     model: model-default
     maxTurns: 50
+    # type: claude-code # optional; absent is claude-code, the only value accepted today
   tools: # optional
     - name: jq # at most 24 characters
       image: registry.example.com/kube-agents/tools-jq:1.7
@@ -52,10 +53,18 @@ spec:
   parameters: # optional; the task parameters the persona declares
     - name: cluster
       required: true
+  scripts: # optional; helper scripts a built-in schedule may run with no model
+    - name: stall-watch
+      path: /opt/kube-agents/scripts/stall_watch.py
+      timeoutSeconds: 300
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "1", memory: 2Gi }
 ```
+
+`harness.type` names the harness the worker image runs. Absent is `claude-code`, which is also the only value the CRD accepts today. Leave it out for Claude Code. The operator passes it to the worker as `A2A_HARNESS` only when it is set, so a profile without it keeps the pods it had. On an older CRD that lacks the field, a client that validates fields strictly, as kubectl does by default, refuses a manifest that sets it. A client that doesn't applies it with the field dropped, so the profile runs as Claude Code.
+
+The type is pod configuration only. It isn't on the profile's card, and no bus subject or permission depends on it. If a profile's type is one this operator doesn't render (an older, newer or edited CRD let it in), the operator refuses the profile: `IdentityReady` is False with reason `HarnessNotSupported`, and nothing is rendered for it.
 
 The persona image and each tools image keep their content under a `/files` directory. The persona mounts read-only at `/persona`. Each tool mounts read-only at `/opt/tools/<name>`, and its `/opt/tools/<name>/bin` goes on `PATH` in list order, so put a tool's binaries in `/files/bin`. Where the cluster can't mount image volumes (GKE Autopilot, Kubernetes below 1.35), an init container copies `/files` into an emptyDir instead, so these images also need `/bin/sh`. A tools image holds no credentials: a tool that needs them gets them from the broker, per task.
 
@@ -73,8 +82,6 @@ A profile binds to the PlatformAgent in its own namespace. The operator renders 
 
 When a bound `AgentProfile`'s name matches a built-in optional specialist template baked into the `platform-agent` image (`tse`), the operator also sets `KUBE_AGENTS_ENABLED_PROFILES` on the gateway Deployment (which triggers a gateway pod rollout when `tse` is added or removed so the entrypoint scaffolds or archives `$HERMES_HOME/profiles/tse`). Ordinary `AgentProfile` resources (such as `chat` or `auditor`) do not touch `KUBE_AGENTS_ENABLED_PROFILES` and do not roll the gateway pod.
 
-The chart's `tse` profile still ships a placeholder persona image with no persona payload. With the profile dispatcher on, its default, a bound `tse` gets a warm worker that crash-loops at its persona step until a real `tse` persona image ships. Handing work to `tse` through Kanban still works, since that runs in the scaffolded Hermes profile.
-
 Deletion waits on the `kubeagents.x-k8s.io/agentprofile-finalizer` finalizer, which every reconciled profile carries and which only the operator removes. Before rolling the operator back to a release without AgentProfiles, or uninstalling it, delete the profiles while the operator is still running. Otherwise `kubectl delete agentprofile` hangs, and so does deleting the CRD behind it. To clear one by hand (it publishes no tombstone, so the card stays on the directory), and then delete its ServiceAccounts in the profile namespace, which carry no owner reference and so outlive it. Left there, they'd make a profile re-created under the same name find them foreign and be refused:
 
 ```bash
@@ -90,7 +97,7 @@ The operator looks for AgentProfiles once, at startup. If the CRD isn't installe
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 
-`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
+`allowedTiers` lists the tiers the profile may run at, at most four: the built-in `read` and `unattended`, or a [`Tier`](/kube-agents/operator/tier-crd/) in the install's namespace. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Work a scheduled run delegates runs at `read`, but the gateway hands it only to a profile that also lists `unattended`. Absent means `read` alone.
 
 A listed tier name is at most 10 lowercase letters or digits, with no hyphen. It becomes part of the profile's bus identity (`profile-<name>-<tier>`, one 63-character label) and of its queue names, so the cap keeps every derived name valid, and the missing hyphen keeps two profiles' queue names from colliding. A longer or hyphenated `Tier` can exist, but no profile can list it.
 
@@ -98,11 +105,19 @@ The operator decides what each listed name renders, and reports it in the `Tiers
 
 - **A name with no tier** renders nothing (reason `TierUnknown`). The profile's other tiers render as usual, and a profile left with none renders nothing at all.
 - **At most one unattended-mode tier** per profile, because unattended tasks run as Jobs from one template per profile. If a profile lists a second one, the one it already serves keeps serving and the newcomer renders nothing (reason `TierModeConflict`). A new profile listing two renders neither until one is removed.
-- **A tier dropped from the list drains.** That covers one whose `Tier` is deleted, and one that stops rendering. The card stops advertising it, and nothing new starts at it at once. A task already queued at it is refused with the reason `tier-withdrawn`. A task already running at it keeps its ServiceAccount, queues and pool, and finishes. The tier drains for the longest deadline a task can carry plus 15 minutes, then everything it rendered is removed within a few minutes. `TiersRendered` names each draining tier and when its drain ends.
+- **A tier dropped from the list drains.** That covers one whose `Tier` is deleted, and one that stops rendering. The card stops advertising it, and nothing new starts at it at once. A task already queued at it is refused with the reason `tier-withdrawn`. A task already running at it keeps its ServiceAccount, queues and pool, and finishes. The tier drains for the longest deadline a task can carry plus 15 minutes, then everything it rendered is removed within seconds. `TiersRendered` names each draining tier and when its drain ends.
 
   Listing the tier again ends the drain once it renders again: not while its `Tier` is missing, and not while it conflicts with the profile's live unattended-mode tier. A running task that delegates to its own profile at the draining tier is refused like any new task; delegating to another profile still works. A profile left with no tier that renders drains as a removed profile does. A profile on a named ServiceAccount (`spec.identity`) serves one tier, so its tier is replaced at once rather than drained.
 
-  **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. There's no lever yet to end a whole tier's running work at once. Stop is the requester's, and an unattended Job has no chat. For now, delete a running task's worker pod, or its Job for an unattended task, in the profile namespace: that ends the one task, which the dispatcher fails `lease-expired`.
+  **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. To end a drain now, annotate the profile:
+
+  ```sh
+  kubectl -n <namespace> annotate agentprofile <name> kubeagents.x-k8s.io/end-tier-drain=<tier>[,<tier>]
+  ```
+
+  The dispatcher ends each task it holds at a listed tier: the task ends `canceled` with reason `tier-ended`, and its worker drops it. The tier is then removed within two minutes, with its ServiceAccount, pool and Jobs.
+
+  The annotation acts only on a tier the profile is draining. The operator removes each tier from the annotation once it has acted, and removes a listed tier that the profile runs or isn't draining, with a Warning event, so a leftover entry never ends a later drain. Anyone who can update the AgentProfile can set it. It ends one tier's drain on a profile that still runs another tier; a profile left with no tier drains as a whole, which this annotation doesn't end. A task still being offered to a worker when you set it is ended once it starts; one whose Job is still coming up is ended there, without waiting for the Job.
 
 `status.renderedTiers` records what the last pass rendered. The operator uses it to tell the tier a profile already serves from a newcomer. If status is lost (a restore, a GitOps apply), it reads the profile's own ServiceAccounts once instead.
 
@@ -111,6 +126,10 @@ The operator decides what each listed name renders, and reports it in the `Tiers
 Before `yieldToPinned`, every profile that takes a target handed off to a pinned profile: a generic profile you created yourself, not the chart's, needs `yieldToPinned: true` for its pinned profiles to keep receiving its tasks. The chart refuses to render its `cluster` profile against an AgentProfile CRD that predates the field, since the API server would drop it silently; apply `charts/kube-agents/crds/` first, as `upgrade.sh` does.
 
 `parameters` lists the task parameters the profile's persona declares, at most 16, each a lower-case identifier the worker exports as `PROFILE_TASK_<NAME>`. The gateway and the dispatcher read it here because neither can read the persona image: the gateway sends cluster work to a profile that declares `project`, `location` and `cluster`, and the dispatcher refuses a submission missing a `required` one. The list must match the persona's, and a worker refuses to run a task when they differ.
+
+`scripts` lists the helper scripts the profile may run as a script-run task: a built-in schedule's run that execs one of them with no model turn. A script runs only in Job mode, at an unattended tier, on a worker that verifies the task's credential before it starts. There are at most 16, each with a unique `name` that is a DNS-1123 label. Each `path` lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the worker image. Its segments start with a letter, digit or underscore and hold only those, dots and hyphens, so a path has no `..`, no empty segment and no shell metacharacter.
+
+`timeoutSeconds` may not exceed `lifecycle.activeDeadlineSeconds`, and the operator lowers it to the install's task-deadline cap when that is lower. The dispatcher refuses a task naming a script the list doesn't hold, as `script-not-allowed`. The path comes from this list, never from the task.
 
 Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates (and a kustomize `make deploy` creates). The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy. That policy lets its pods reach DNS, the bus, LiteLLM and the credential broker's port, and nothing else.
 
@@ -122,7 +141,9 @@ The profile's ServiceAccounts live there too. While the namespace is missing, or
 
 The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It is the only component that publishes directly to a profile task's supervisor subject, because the bus's config denies the A2A gateway each profile's by name. An install runs it by default; the chart's `operator.profileDispatcher.enabled: false` switches it off.
 
-Binding or removing a profile, or one finishing its drain, changes the bus's config, whether or not the dispatcher runs. The bus reloads it in place, without a restart, usually within a minute. Session pods' bus connections drop and reconnect at the reload, within a second, and their tasks carry on. If the reload can't be confirmed within three minutes, the operator restarts the bus pod instead and records a `BusConfigReloadFailed` Warning on the PlatformAgent. Two profile changes that reach the pod in one kubelet write can't be told apart in place, so they also end in that restart, recorded as a Normal `BusConfigReloadFolded` Event. A session task running at that moment fails, as on any bus restart.
+Binding or removing a profile, or one finishing its drain, changes the bus's config, whether or not the dispatcher runs. Every bus server reloads it in place, on one server or three, without a restart or a roll, usually within a minute. The operator confirms the reload on each server separately. Session pods' bus connections drop and reconnect at the reload, within a second, and their tasks carry on.
+
+If a server's reload can't be confirmed within three minutes, the operator restarts that server's pod, one server at a time and only while the others are Ready, and records a `BusConfigReloadFailed` Warning on the PlatformAgent. Two profile changes that reach a pod in one kubelet write can't be told apart in place, so they also end in that restart, recorded as a Normal `BusConfigReloadFolded` Event. A session task running on a restarted server at that moment fails, as on any bus restart. A newly bound profile stays held (`BusConfigPending`) until every server is confirmed on the new config, including while a server restarts or can't be read.
 
 The dispatcher has a ceiling, set by whichever of two limits comes first. Its bus identity names every profile's durable and has to fit in one shard of the callout's identity map, which comes to about 650 profiles at two tiers. Its config holds an entry per profile and has to fit in one ConfigMap. Under Job mode, each profile that allows `unattended` keeps its Job template in its own `DispatchJobTemplate`, and the config carries only a reference. So the identity limit usually comes first, though profiles that declare many parameters can fill the config sooner.
 
@@ -136,8 +157,8 @@ With the dispatcher on, each admitted profile also gets a warm pool for each of 
 
 [AgentProfile fields → Status](/kube-agents/operator/agentprofile-fields/#status) lists the status fields. The conditions carry the detail:
 
-| Condition                 | Meaning                                                                                                                                                                                                                                                                                          |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `TierUnknown` or `TierModeConflict` when no listed tier renders). |
-| `TiersRendered` condition | Every listed tier renders (`AllTiersRendered`), or which don't and why (`TierUnknown`, `TierModeConflict`). Its message names the tiers that render.                                                                                                                                             |
-| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, `BusConfigPending` while the bus loads a new profile's config, or the same mode and binding reasons as `IdentityReady`).                                             |
+| Condition                 | Meaning                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `HarnessNotSupported`, `TierUnknown` or `TierModeConflict` when no listed tier renders).                                     |
+| `TiersRendered` condition | Every listed tier renders (`AllTiersRendered`), or which don't and why (`TierUnknown`, `TierModeConflict`). Its message names the tiers that render.                                                                                                                                                                                                        |
+| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, `BusConfigPending` while the bus loads a new profile's config, or the same mode and binding reasons as `IdentityReady`). `DurableRecheck` means a durable that existed can't be found, and waits a pass before it's re-created. |

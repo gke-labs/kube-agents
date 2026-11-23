@@ -21,10 +21,9 @@ protocol - the wire contract is the payload spec's, unchanged.
 
 ## Where it runs
 
-**Sidecar in the platform-agent pod, rendered by the operator.** Under `mode: next` the
-operator renders the bridge as a container named `hermes-bridge` beside the agent container,
-and so it does under version skew (a mode this operator build does not recognize), where a
-frozen bus that is still running keeps its executor. Under `today` it renders none. The
+**Sidecar in the platform-agent pod, rendered by the operator.** On every install the
+operator renders the bridge as a container named `hermes-bridge` beside the agent container
+(`spec.mode` is deprecated and ignored; the stack it once gated renders unconditionally). The
 bridge needs two things that only exist in that pod: the `hermes` CLI (it lives in the
 platform-agent image, so the bridge image builds FROM it and adds one static binary) and
 the persona state - `$HERMES_HOME` is the agent's data PVC, RWO, holding the platform
@@ -61,7 +60,8 @@ of the same commit, so the two containers are one build. Otherwise - an agent im
 custom repository name, which has no bridge published beside it, or one pinned by digest
 alone, which the swap cannot carry over - it is the image the other release A2A images
 resolve to, derived from the operator image the way `A2A_GATEWAY_IMAGE` and the rest are
-when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Four
+when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`; on a chart
+install the value `hermesBridge.image` renders it. Four
 operator settings shape the rendered bridge. The operator reads them from its own
 environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 
@@ -83,10 +83,10 @@ set to a count ([the gateway spec](../../docs/designs/spec-chatops-gateway.md)).
 
 The rendered default is 10, not the bridge's own 2, because 10 is what the Hermes gateway
 runs agent turns on (its `ThreadPoolExecutor(max_workers=10)`), and the rendered bridge is that
-gateway's replacement on `next`. More workers don't let two turns race on one conversation's
+gateway's replacement. More workers don't let two turns race on one conversation's
 history. The `api` executor runs turns in one Hermes session one at a time (`sessionTurns`), and
 the `cli` executor starts every task as a fresh one-shot session with no history to share. At the default `maxSessions`
-of 10 the TASKS budget for 10 workers is 110, above the 64-consumer floor. A `next` install
+of 10 the TASKS budget for 10 workers is 110, above the 64-consumer floor. An install
 whose TASKS stream was created at the floor, before the rendered default was 10, is refused by
 its provision Job with the ways out named: delete TASKS and let provisioning recreate it, lower
 `maxSessions`, or set `A2A_BRIDGE_CONCURRENCY` lower. While that `A2AProvisionFailed`
@@ -95,17 +95,17 @@ the refusal parks the CR), running over the undersized stream, so consumer creat
 under load. That's the shape [#2043](https://github.com/gke-labs/kube-agents/issues/2043) describes. A fresh install creates TASKS at 110 from the first
 render.
 
-**It enters the pod once the bus is provisioned.** The rendered bridge is withheld from the
-agent pod until the CR's `BusProvisioned` condition is `True`: before that it has no bus to
-connect to and no runtime-state bucket, exits, and would hold the agent pod in
-`CrashLoopBackOff` through the bring-up. The TASKS consumer reserve does not wait; it counts
-the bridge from the first `next` render, so the one provisioning Job is already sized for it
-and the bridge's arrival does not re-render the Job. The cost is a second roll. On a fresh
-`next` install, and on a flip from `today` back to `next`, the agent pod rolls once for the
-mode and again when the bridge arrives after the Job. The agent Deployment's strategy is
-`Recreate` at one replica (`resolveDeploymentReplicasAndStrategy`), so each roll is a brief
-agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
-`True` the bridge stays in the pod on later renders.
+**It is in the pod from the first render.** The rendered bridge is in the agent pod before the
+bus is provisioned. Until the bus serves and the provisioning Job has created the runtime-state
+bucket, the bridge waits for them, logging each attempt with its cause and backing off up to 30
+seconds, instead of exiting. The agent pod is Ready meanwhile: the agent's own API serves
+without the bus, tasks for the bridge wait on its durable, and the CR's `BusProvisioned`
+condition says the bus isn't there yet. The operator ensures the bus creds Secret, which the
+bridge reads its password from, before it applies the agent Deployment. So the pod template is
+the same before and after provisioning, and a fresh install rolls the agent pod once. The TASKS
+consumer reserve counts the bridge from the first render too, so the one provisioning Job is
+already sized for it. A bridge image from before this wait, pinned under a newer operator, exits instead of waiting,
+so on a fresh install it restarts until the bus is provisioned.
 
 **It has its own resources, sized for the `api` executor.** The rendered bridge requests 250m
 CPU and 512Mi, with limits of 1 CPU and 1Gi. This paragraph is the one statement of that
@@ -123,8 +123,8 @@ Autopilot admits unchanged. On `api`, the default, it's a Go relay that
 holds one HTTP request per task to the agent container's API server, and the turn itself
 runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
 ([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
-container's resources, which doubled the agent pod's requests and could leave a `next` pod
-unschedulable on a cluster sized for `today`.
+container's resources, which doubled the agent pod's requests and could leave the agent pod
+unschedulable on a cluster sized without it.
 
 The `cli` executor doesn't fit these. It runs a one-shot `hermes chat` per task, about
 430Mi each, up to `BRIDGE_CONCURRENCY` of them. So under `cli` with no `A2A_BRIDGE_RESOURCES`
@@ -184,20 +184,16 @@ meaning of the field - the capability switch above, and the reserved volume name
 webhook refuses. `POD_NAMESPACE` is the other name the render writes, but it goes in as a
 default a CR beats, so it overrides nothing.
 
-**Flipping to `mode: today` with a declared bridge still set takes the agent down.** A
-rendered bridge leaves the pod with the mode: the flip renders none, so it needs no CR edit
-first. A declared one does not leave. The operator copies `spec.deployment.sidecars` into
-the pod without consulting the mode, so the flip removes the NATS Service and leaves the
-bridge dialling a host that no longer resolves. Confirmed live 2026-09-05: the sidecar
-crash-loops, and because it shares the agent's pod the pod never reaches Ready - the whole
-agent is down, not merely carrying an A2A trace. On an install that declares its own
-bridge, unset `spec.deployment.sidecars` _before_ flipping to `today`. In any flip runbook
-for such an install that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh`
-follows it: a CR with declared sidecars has the whole list unset, not only the sidecars
-that look like bus clients, flipped, and the saved list declared again once `next` is back;
-a CR with none, the lane's own, is only flipped. Asked to end under `today`
-(`ROLLBACK_END_MODE=today`, the today lane's run), it refuses a CR with declared sidecars before
-changing anything, since the last flip would leave them unset.
+**A declared bridge outlives the bus it dials.** The operator copies `spec.deployment.sidecars`
+into the pod as declared, so a declared bridge stays in the pod whatever happens to the NATS
+Service; a rendered one is the operator's and goes with the stack it renders. Confirmed live
+2026-09-05, when a flip to `spec.mode: today` still removed the bus: the sidecar crash-looped
+dialling a host that no longer resolved, and because it shared the agent's pod the pod never
+reached Ready - the whole agent was down, not merely carrying an A2A trace. The flip is gone (the
+webhook rewrites `today` to `next`, and `hack/rollback-roundtrip.sh`, which exercised it and
+refused a CR with declared sidecars, is deleted), but the shape remains: on an install that
+declares its own bridge, unset `spec.deployment.sidecars` _before_ removing the bus it dials. In
+any such runbook that step is a blocker, not tidiness.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
@@ -213,12 +209,15 @@ workflow publishes it as `hermes-bridge` beside the other first-party images, `F
 platform-agent image the same run pushed under the same commit tag, and `images.json`
 carries it with `A2A_BRIDGE_IMAGE` as its operator override, which the operator reads when
 it renders the bridge. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own in its
-`a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+`a2a-bridge` step on every build `hack/ci-deploy.sh` makes (the release-candidate path builds
+nothing), `FROM` the
 platform-agent image that same build produced, by the tag it just pushed and never from a
 registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
 `A2A_BRIDGE_CONCURRENCY`, for the eval install, and leaves `A2A_BRIDGE_EXECUTOR` unset, so the
 eval runs the `api` executor a customer install runs (`docs/designs/eval-next-transport.md`,
-"The CI flag"). Either way the sidecar and the agent
+"The inject door on every lane"). `scripts/dev/dev_rebuild_agent.sh` builds a dev install's own,
+`FROM` the agent image it just built, and the root Makefile's `docker-build-hermes-bridge` builds a
+local one `FROM` the platform-agent image of the same `make` run. In each case the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives
 as sidecar env from the operator's creds Secret, and it stays a password principal for the
@@ -246,7 +245,8 @@ subject under `chat.board.reply.gateway.`, the one namespace it may publish ther
 replying anywhere else is dropped. It is bound only when the bridge has session-kv's URL and
 key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and the route reads nothing else
 ([spec-nats-deployment.md](../../docs/designs/spec-nats-deployment.md), "The board route").
-A request with a body is a board-health row's Retry or Drop instead (`lib.BoardAction`): the
+A request with a body is a board action instead (`lib.BoardAction`): a board-health row's Retry or
+Drop, or a tap on the Home tab's autonomy dial. The
 bridge relays its known fields to session-kv's `POST /v1/board/actions` on a goroutine of its own,
 so a snapshot is not held behind it, and answers with what session-kv said, or the error.
 
@@ -325,8 +325,8 @@ measured.
 An install whose `spec.deployment.sidecars` entry still names the retired user fails
 closed rather than quietly: `worker` is gone from the rendered `nats.conf`, so the
 sidecar's connect is refused at authentication and the container crash-loops. Because it
-shares the agent's pod, the pod does not reach Ready — the same failure shape the
-`mode: today` flip produces above. Two edits, both in the sidecar's own `env`:
+shares the agent's pod, the pod does not reach Ready — the same failure shape a declared
+bridge with no bus produces above. Two edits, both in the sidecar's own `env`:
 `NATS_USER` becomes `bridge`, and `NATS_PASSWORD`'s `secretKeyRef.key` becomes
 `bridge-password`. The Secret is the same `<agent>-a2a-nats-creds`; the operator fills the
 new key on the next reconcile. It does not remove the old one: `ensureA2ACredsSecret` only
@@ -389,7 +389,7 @@ Hermes API server in the same pod (`BRIDGE_API_URL`, default
 `model-default`) with `Authorization: Bearer $API_SERVER_KEY` and three headers:
 `X-Hermes-Session-Key` and `X-Hermes-Session-Id`, both set to the session id below, and
 `Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice (a
-follow-up turn's key adds its envelope id; see **Steering** below). The
+follow-up turn's key adds its envelope id; see **Steering** below). On an inject-door conversation, whose key is `inject:<run>/<case>/<rep>`, it also sends `X-Kube-Agents-Eval-Run: <run>/<case>/<rep>`; the API server records it for the session while the install has `KUBEAGENTS_EVAL_RUN_TAGS` on and ignores it otherwise (`deploy/docker/patches/eval_run_tag.py`). The
 server loads the session's history from its own store before the turn and appends to it after,
 so the second task in a thread sees the first. The session id is `a2a-` plus the task's
 `contextId`, which the gateway mints once per backend conversation. A `contextId` that is not
@@ -424,29 +424,53 @@ user and disable personal memory in group conversations) in the pod's session-kv
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
-be posted back. A Google Chat, Slack or console conversation is posted back. A console
-conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
+be posted back. A Google Chat, Slack, Teams or console conversation is posted back. A console
+conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google- or Entra-token A2A door, or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
-Before the same first turn the bridge also reads the store the other way: a reply typed under a
-report the system pushed (a relayed scheduled report, the triage card's report the notifier posts
-under an alert, a card's report it posted into a Slack or Google Chat conversation) arrives with
-no link to that report, and under `next`
-nothing else attaches it, since the Hermes gateway's `incident_context` hook runs on no turn of
-the `api` executor. So the bridge asks session-kv for the row the poster stored
-(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's
-recent-reports index or its Google Chat first-reply recovery): first by the thread the conversation key
-names (`slack:<channel>/<ts>` is the row `(channel, ts)`; `gchat:spaces/A/threads/B` is
-`(spaces/A, the thread name)`), then by the Hermes session and the conversation key, which is how
-the notifier keys a card's report inviting a reply that it posted into a Slack or Google Chat
-gateway conversation (a console
-conversation's row carries the filing turn's task in its key, which a later reply does not know,
-so it is not found; a key naming a whole DM or space rather than a thread is not looked up at all,
-since every later message there shares it and would carry the first stored report for the row's
-life). A row found is spliced ahead of
+Before the same first turn the bridge also puts the report a reply is under ahead of it. A reply
+typed under a report the system pushed (a relayed scheduled report, the triage
+card's report the notifier posts under an alert, a card's report posted into a conversation)
+arrives with no link to that report, and nothing else attaches it, since the Hermes gateway's
+`incident_context` hook runs on no turn of the `api` executor. Two sources, in order. First the
+gateway's relay: the A2A gateway keeps the text of each report its notify route posts into a
+console conversation (a card's report, marked `report` by the notifier and naming its task; a
+progress note, which shares the thread and the task, is not kept) and into a chat thread (a Slack
+or Google Chat thread key, `lib.ThreadKeyedConversation`: the same marked report, kept under the
+thread's key with no task named; a post into a whole space or a thread-less DM, a relayed scheduled report
+and an alert's triage report it does not keep, and the lookup still serves them;
+`docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it on a reply's submission as a
+`pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the reply names the task the report
+was on (a console or MCP client's `replyTo`, the chain's root even when a delegated child filed the
+card) or is the next human turn that opens in a thread the gateway kept a report for (the newest
+one; `taskId` absent; once that turn is on the bus the gateway forgets the reports it read, and a
+message steered into the thread's running task empties them once the steer is on the bus, so the
+turn after falls back to the lookup below, and an alert's triage report is hidden for that one turn
+and no longer); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so what it kept is what
+the person read; it holds reports only, and when two reports share one root (two cards from one
+turn) or one thread the reply carries the newest. This is how a card filed in a delegated
+child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
+reply never reads, and the relay carries the report across. The relay rides a human turn on every
+route; this executor frames it on the platform route (the install's default), and a conversation
+on its own session pod (the a2a-worker) does not read it yet. Then, with no relayed part (the gateway restarted
+since the post, or the post was one it does not keep), the bridge asks session-kv for the row the poster stored
+(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's recent-reports
+index or its Google Chat first-reply recovery): first, when the submission carries a `replyTo`
+part, by the Hermes session and `<conversation key>#<task>`, which is how the notifier keys a
+card's report it posted into a console conversation (the report's frame names the filing turn's
+task as `replyTo`, and a console client, the MCP server's `send_message` with `reply_to`, echoes it
+with the reply; a reply while the turn is still running is steered into it and carries no
+`replyTo`, since the report is attached on an opening turn only); then by the thread the
+conversation key names (`slack:<channel>/<ts>` is the row `(channel, ts)`;
+`gchat:spaces/A/threads/B` is `(spaces/A, the thread name)`); then by the Hermes session and the
+conversation key, which is how the notifier keys a card's report it posted into a Slack, Google
+Chat or Teams gateway conversation. A console reply that names no task takes only the last,
+`(session, key)`, and finds no row, since the console row's key carries the task; a key naming a
+whole DM or space rather than a thread (a Teams personal or group chat among them) is not looked up at all, since every later message there
+shares it and would carry the first stored report for the row's life. A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
-the hook by its test). No row, a store that errors, or a bridge with no route store leaves the
+the hook by its test). No relayed part and no row, a store that errors, or a bridge with no route store leaves the
 prompt as typed; a steer queued during the task is not looked up, since its session has read the
 report, and a later message on the conversation is a new task and is.
 
@@ -510,8 +534,7 @@ restated reply that still names an id is delivered as it is, with a `card-id-res
 the log. The chat UX rule keeps ids out of user text outside a board read, the Planning Agent's SOUL
 says so, and in a thread whose earlier replies carry an id the model copied them all the same
 (`card_id_leak.go`). The CLI executor has no such step. Output that never passes the bridge is not guarded: a kanban card's result
-posted by the notifier, a `today`-mode reply from Hermes's own gateway platforms, and cron
-deliveries on every leg, `report_to_chat` included. The scheduled `deliver: "chat"` report of a
+posted by the notifier, a reply from Hermes's own gateway platform (Teams), and cron deliveries on every leg, `report_to_chat` included. The scheduled `deliver: "chat"` report of a
 fleet-audit job the image ships is already immune, because the relay posts the record the run's
 `finish` wrote, not its final message; a fleet-audit job created at runtime still posts its final
 message (`docs/designs/cron-report-relay.md`). For the rest the history patch only lowers the
@@ -687,8 +710,8 @@ failures name themselves in the status message:
 
 The answer stays on `TASKS`, because the gateway delivers it from there, so the copy a person is
 shown and the copy the stream keeps are the same message. The bridge scrubs it once, before it is
-published (`scrubAnswer` in `answer_scrub.go`, #5280). That covers the `result` artifact and the
-chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
+published (`scrubAnswer` in `answer_scrub.go`, over `answerscrub.Scrub` in `a2a/lib/answerscrub`,
+#5280). That covers the `result` artifact and the chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
 answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
 a failed CLI run's stdout and stderr tails, and an API error's body or error tail. Each is
 scrubbed before it is cut to its tail: the CLI executor keeps the last 64 KiB of each stream
@@ -742,7 +765,7 @@ a status message is the bridge's own text. There are two passes:
    result and the terminal are published, so a delivery still on its way past the door adds
    nothing. None of it is logged or published.
 
-2. **Shape rules.** `scrubInlineSecrets` runs over the answer (the classes are listed under
+2. **Shape rules.** `answerscrub.ScrubInline` runs over the answer (the classes are listed under
    "Activity" below).
 
 The bridge sees a tool's result only through the activity door. Hermes's `post_tool_call`
@@ -868,15 +891,15 @@ count: a task past it is accepted and `submitted` and then queued with no subpro
 worker frees, and the harness classifies a repetition that reaches its budget still
 `submitted` as infrastructure rather than a graded case - it cancels the task and the bridge
 answers `canceled-before-start`. The presubmit fans units out at `EVAL_TASK_PARALLELISM`,
-default 4, the next-mode nightlies at 6, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
+default 4, the nightlies at 6, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
 that value; at the defaults two of every four concurrent units wait for as long as the two ahead
 of them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
 and a submission past it is finalized `failed` with `reason: bridge-queue-overflow`, also
 infrastructure in the harness's classification. Size the parallelism against both: concurrency
 at or above the parallelism, and the number of submissions a run can have outstanding at once,
 the units in flight plus anything abandoned and not yet cancelled, well under the queue
-capacity. `hack/ci-deploy.sh` under `EVAL_MODE_NEXT=1` sets the operator's
-`A2A_BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`, and the operator renders that
+capacity. `hack/ci-deploy.sh` sets the operator's `A2A_BRIDGE_CONCURRENCY` to the run's
+`EVAL_TASK_PARALLELISM` on every eval install, and the operator renders that
 into the bridge. It sizes the TASKS consumer reserve from the same value, so a concurrency the
 stream cannot hold is a refused provision and a `Degraded` CR, not a silent shortfall. That
 read, the render in [Where it runs](#where-it-runs), the two env names it writes on every
@@ -950,7 +973,7 @@ nothing of it follows the final event. What of the input is published is the sam
   `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
   wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
   name, a wrapper's nested names). No string value rides the trace under any key, under either executor, and no tool results are included (the one exception is `BRIDGE_DEBUG_ERROR_TEXT`'s scrubbed error line, a maintainer's debugging switch, below).
-- **Under `api` (attribution on the same entry):** the entry additionally carries a human-readable `title` (the step title the call was planned under, else one built from the tool's name and the short identifier it acts on: a cluster, a file's tail, a search query, a card's title), `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and `resultPreview` = `card_id=<id>` on a successful `kanban_create` only. Nothing else of a tool's result is published, and neither is a failed call's error text: a failure is its `status` and hermes's own `errorType` word. For debugging only, setting `BRIDGE_DEBUG_ERROR_TEXT=true` on the bridge container adds `errorMessage`: the first line of the error, scrubbed by `scrubInlineSecrets` and capped at 320 bytes. It applies under both executors and is off by default. An AgentPlugin's env reaches the agent container unfiltered, so the rendered bridge drops any copy it would inherit and sets it `false` itself, which also overrides an `envFrom` key. A maintainer turns it on by editing the Deployment while the operator is paused, since a reconcile reverts it. A bridge the CR declares as its own sidecar is the CR author's container and keeps whatever env it's given. The model's reasoning is read for the step boundary it marks and is not published. The identifier a title names is the one argument-derived value on the bus, and it passes through `scrubInlineSecrets` as a net rather than a contract. Its classes are credential tokens by prefix, a credential after an HTTP auth scheme word or in an `Authorization` header or header pair, CLI secret flags (long and single-dash names, attached and quoted short values, `user:password` arguments, a flag and its value as separate argument-list items), private-key blocks, YAML Secret `data`/`stringData` blocks, URL userinfo (the password by shape: everything up to the `@` a host follows), libpq password-file entries, a Kubernetes env entry's literal value under a credential name, prose secrets, markdown tables and `key=value` secrets. The prose and `key=value` rules read through the markdown around a key or a value (paired bold, italic and code-span marks, a short parenthetical before the colon, an arrow used as a separator) and redact the value where it stands, a code-spanned value bounded by its backticks, and prose may say "decodes to" or "the password in secret X is". A table's value cells are redacted in a row whose first cell is a credential key, unless its headers show a listing of resources or checks, and under a header that is one. After an explicit credential word (a prose credential noun and verb, or a key whose last component is the credential word, a digit suffix or a value qualifier such as `_hash`, `_value` or `Confirm` allowed) a value is redacted unless it is a short list of state words, a literal, a placeholder or a short number, so a passphrase is redacted. A credential after `Bearer` or `Basic` is redacted unless it is one of the dictionary words prose puts there ("Basic Authentication"), while after the scheme words that are also ordinary English, and under a key that carries the credential word elsewhere (a container or proxy name, a field path, a TTL), the value must be token-shaped. The ambiguous keys `pass`, `pwd` and `auth` keep a path or prose (#5032). The same function scrubs the answer ("What of an answer reaches TASKS" above).
+- **Under `api` (attribution on the same entry):** the entry additionally carries a human-readable `title` (the step title the call was planned under, else one built from the tool's name and the short identifier it acts on: a cluster, a file's tail, a search query, a card's title), `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and `resultPreview` = `card_id=<id>` on a successful `kanban_create` only. Nothing else of a tool's result is published, and neither is a failed call's error text: a failure is its `status` and hermes's own `errorType` word. For debugging only, setting `BRIDGE_DEBUG_ERROR_TEXT=true` on the bridge container adds `errorMessage`: the first line of the error, scrubbed by `answerscrub.ScrubInline` (`a2a/lib/answerscrub`) and capped at 320 bytes. It applies under both executors and is off by default. An AgentPlugin's env reaches the agent container unfiltered, so the rendered bridge drops any copy it would inherit and sets it `false` itself, which also overrides an `envFrom` key. A maintainer turns it on by editing the Deployment while the operator is paused, since a reconcile reverts it. A bridge the CR declares as its own sidecar is the CR author's container and keeps whatever env it's given. The model's reasoning is read for the step boundary it marks and is not published. The identifier a title names is the one argument-derived value on the bus, and it passes through `answerscrub.ScrubInline` as a net rather than a contract. Its classes are credential tokens by prefix, a credential after an HTTP auth scheme word or in an `Authorization` header or header pair, CLI secret flags (long and single-dash names, attached and quoted short values, `user:password` arguments, a flag and its value as separate argument-list items), private-key blocks, YAML Secret `data`/`stringData` blocks, URL userinfo (the password by shape: everything up to the `@` a host follows), libpq password-file entries, a Kubernetes env entry's literal value under a credential name, prose secrets, markdown tables and `key=value` secrets. The prose and `key=value` rules read through the markdown around a key or a value (paired bold, italic and code-span marks, a short parenthetical before the colon, an arrow used as a separator) and redact the value where it stands, a code-spanned value bounded by its backticks, and prose may say "decodes to" or "the password in secret X is". A table's value cells are redacted in a row whose first cell is a credential key, unless its headers show a listing of resources or checks, and under a header that is one. After an explicit credential word (a prose credential noun and verb, or a key whose last component is the credential word, a digit suffix or a value qualifier such as `_hash`, `_value` or `Confirm` allowed) a value is redacted unless it is a short list of state words, a literal, a placeholder or a short number, so a passphrase is redacted. A credential after `Bearer` or `Basic` is redacted unless it is one of the dictionary words prose puts there ("Basic Authentication"), while after the scheme words that are also ordinary English, and under a key that carries the credential word elsewhere (a container or proxy name, a field path, a TTL), the value must be token-shaped. The ambiguous keys `pass`, `pwd` and `auth` keep a path or prose (#5032). The same function scrubs the answer ("What of an answer reaches TASKS" above).
 
 In both modes, values under keys with `token`, `secret`, `password`,
 `passwd`, `authorization`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`,
@@ -1013,8 +1036,7 @@ and it is what tells a stuck task from a slow one from outside the pod.
 
 Under the `api` executor there is no child to hand a key or a scope to: the turn runs in
 the long-lived gateway process, which serves the chat platforms, cron and kanban dispatch too.
-So the operator renders the entry in the pod's managed config instead, when the CR renders
-the agent's A2A surface (`mode: next`, or a mode this operator build does not recognize) and
+So the operator renders the entry in the pod's managed config instead, when the CR
 renders a bridge, or declares a bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`), that runs `api` and
 whose door the entry reaches. It runs `api` by the bridge's own rule: `BRIDGE_EXECUTOR=api`, or
 that entry empty and `API_SERVER_KEY` non-blank or taken from a reference. The door is reached

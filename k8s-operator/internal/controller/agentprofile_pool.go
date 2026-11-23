@@ -51,9 +51,11 @@ const (
 	profileWorkerScratchPath   = "/scratch"
 	// 2Gi: the session worker, the same image and harness, left its 1Gi
 	// scratch at 4 KiB over a week of dev-lane sessions (a2a/gateway/
-	// spawn.go), and the image has no git to clone with. Twice that floor
-	// keeps the worker's whole ephemeral request inside Autopilot's 10Gi
-	// per pod with up to profileWorkerAutopilotToolLimit tools.
+	// spawn.go). A persona's version-control skill keeps its working copies
+	// here too (KUBE_AGENTS_VCS_ROOT in a2a/Dockerfile.worker); the broker
+	// refuses a clone over 256 MiB by default. Twice that floor keeps
+	// the worker's whole ephemeral request inside Autopilot's 10Gi per pod
+	// with up to profileWorkerAutopilotToolLimit tools.
 	profileWorkerScratchSizeLimit = "2Gi"
 	// profileWorkerAutopilotToolLimit is how many tools a profile can carry
 	// before the worker's ephemeral-storage request passes Autopilot's 10Gi
@@ -96,11 +98,6 @@ const (
 	// <agent>-kube-proxy when KUBE_PROXY_URL is set and delegates to
 	// credential-proxy-exec kubectl on AgentProfile workers where it is unset.
 	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-	// profileWorkerModelKey only satisfies the harness's "an API key exists"
-	// check: the install's inference gateway runs keyless (the session
-	// worker's default, a2a/cmd/worker-adapter).
-	profileWorkerModelKey = "a2a-playground" // #nosec G101 -- placeholder, not a credential
 )
 
 // profileWorkerLabels are a worker pod's labels: the agent's, the worker
@@ -137,9 +134,12 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
 		// The install's inference gateway, by its full name: the worker runs
 		// in the profile namespace, where the session worker's short default
-		// doesn't resolve.
+		// doesn't resolve. The gateway runs keyless. Do not set
+		// ANTHROPIC_API_KEY here: the AI workload audit flags a literal model
+		// key in a pod spec (check 3.5, model-credential-plaintext-env), also
+		// a placeholder. worker-adapter adds the placeholder to the harness
+		// env (harnessEnv).
 		{Name: "ANTHROPIC_BASE_URL", Value: fmt.Sprintf("http://%s.%s.svc.cluster.local", inferenceGatewayServiceName, agent.Namespace)},
-		{Name: "ANTHROPIC_API_KEY", Value: profileWorkerModelKey},
 		{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)},
 		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},
 		{Name: "CREDENTIAL_PROXY_TASK_TOKEN_FILE", Value: profileWorkerTaskTokenPath + "/token"},
@@ -157,6 +157,19 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 	}
 	if n := profile.Spec.Harness.MaxTurns; n > 0 {
 		env = append(env, corev1.EnvVar{Name: "A2A_MAX_TURNS", Value: strconv.Itoa(int(n))})
+	}
+	// Only when set: a profile without a type renders as before the field
+	// existed, so an operator upgrade rolls no warm pool. The worker reads
+	// unset as Claude Code. Beside it, A2A_HARNESS_UNISOLATED rendered empty:
+	// it is the worker adapter's waiver for running a harness without its
+	// isolation, and pod env overrides the image's ENV, so a worker image
+	// can't set it for a type the profile names. It goes when that isolation
+	// lands (#6710).
+	if h := profile.Spec.Harness.Type; h != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "A2A_HARNESS", Value: h},
+			corev1.EnvVar{Name: "A2A_HARNESS_UNISOLATED", Value: ""},
+		)
 	}
 	if rendered.PathPrefix != "" {
 		env = append(env, corev1.EnvVar{Name: "PATH", Value: rendered.PathPrefix + ":" + profileWorkerImagePath})

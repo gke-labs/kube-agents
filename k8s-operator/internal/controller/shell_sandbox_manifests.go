@@ -64,7 +64,8 @@ const (
 	// deploy/sandbox/sshd_config. Above 1024 so the daemon does not need
 	// CAP_NET_BIND_SERVICE, and not 22 so nothing in the cluster mistakes it for
 	// a node.
-	shellSandboxPort = 2222
+	shellSandboxPort      = 2222
+	shellSandboxComponent = "shell-sandbox"
 
 	// Operator-level override for installs mirroring images into a private
 	// registry, matching the "override" field of the agent-sandbox entry in
@@ -244,6 +245,9 @@ const (
 	shellSandboxMemoryRequest = "512Mi"
 	shellSandboxCPULimit      = "2"
 	shellSandboxMemoryLimit   = "2Gi"
+	// The variable that carries the shell container's memory limit, in bytes,
+	// to the memory guard the entrypoint starts.
+	shellSandboxMemoryLimitEnvVar = "SANDBOX_MEMORY_LIMIT_BYTES"
 
 	// The shell container's name, which the sizing step-up check reads the
 	// StatefulSet's template by (sizing_profile.go) and the eval harness execs
@@ -603,6 +607,11 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			}
 		}
 	}
+	// The tier the same way: a literal only, and only a plain lowercase name,
+	// since the entrypoint writes it to a file the admission opens by name.
+	if tier, ok := kubectlCostTier(agent); ok {
+		env = append(env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
+	}
 	env = append(env, autonomySwitchEnv(agent)...)
 
 	containers := buildShellSandboxContainers(agent, env)
@@ -622,6 +631,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	for k, v := range labels {
 		podLabels[k] = v
 	}
+	podLabels["kubeagents.x-k8s.io/component"] = shellSandboxComponent
 	return &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -986,6 +996,16 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 	env = append(slices.Clone(env),
 		corev1.EnvVar{Name: shellSandboxImageTreesEnvVar, Value: shellSandboxImageTreesMode},
 		corev1.EnvVar{Name: shellSandboxHomeRootsEnvVar, Value: shellSandboxHomeRoots()},
+		// The memory guard's limit (deploy/sandbox/shell-memory-guard.py). Under
+		// gVisor the container's cgroup v1 limit is the sandbox's virtual memory,
+		// not this container's limit, so the guard reads the figure from here.
+		corev1.EnvVar{Name: shellSandboxMemoryLimitEnvVar, ValueFrom: &corev1.EnvVarSource{
+			ResourceFieldRef: &corev1.ResourceFieldSelector{
+				ContainerName: shellSandboxContainerName,
+				Resource:      containerMemoryLimitResource,
+				Divisor:       resource.MustParse("1"),
+			},
+		}},
 	)
 	container := corev1.Container{
 		Name:  shellSandboxContainerName,

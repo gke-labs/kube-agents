@@ -517,16 +517,15 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	}
 }
 
-// TestNoEgressPolicySelectsTheGatewayPod: Slack is reached outbound (the
-// Socket Mode websocket and the Web API), and the gateway pod carries no
-// egress fence - any policy that selects it (the inject door fence, the
-// A2A door fence, and the gateway's own fence) is ingress-only - so no rule has to admit those hosts, and
-// none could name them: the repository's standard policies are selector and CIDR
-// based (with the exception of buildFQDNNetworkPolicy, which fences the legacy
-// gateway pod rather than the A2A gateway pod).
-// Pinned here so the day a deny-default egress fence is put on the gateway, this
-// test is what says Slack's egress must come with it.
-func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
+// TestEveryEgressPolicyOnTheGatewayPodAdmitsSlack: Slack is reached outbound
+// (the Socket Mode websocket and the Web API), and a NetworkPolicy cannot
+// name its hosts, so every policy that fences the gateway pod's egress must
+// admit TCP 443 to public addresses. Today that is the gateway's egress
+// policy alone (buildA2AGatewayEgressPolicy, #6553); its ingress fences (the
+// inject door's, the A2A door's and the gateway's own) carry no egress type.
+// buildFQDNNetworkPolicy fences the legacy gateway pod, not this one, and
+// must not select it without this test being rewritten to read its patterns.
+func TestEveryEgressPolicyOnTheGatewayPodAdmitsSlack(t *testing.T) {
 	agent := a2aTestAgent()
 	dns := []string{"10.96.0.10"}
 	gatewayPod := labels.Set(buildA2AGatewayDeployment(agent).Spec.Template.Labels)
@@ -535,6 +534,7 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		buildA2AGatewayNetworkPolicy(agent),
 		buildA2ADoorNetworkPolicy(agent),
 		buildA2AGatewayFencePolicy(agent),
+		buildA2AGatewayEgressPolicy(agent, nil, dns),
 		buildA2ASessionNetworkPolicy(agent, dns),
 		buildA2ANATSNetworkPolicy(agent),
 		buildA2AVerifierNetworkPolicy(agent, dns),
@@ -563,7 +563,7 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
 		},
 	})
-	matched := 0
+	matched, egressFenced := 0, 0
 	for _, pol := range policies {
 		if pol == nil {
 			continue
@@ -580,14 +580,22 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 			if pt == networkingv1.PolicyTypeEgress {
 				if pol.Name == fqdnPolicy.GetName() {
 					t.Errorf("%s fences the gateway pod's egress; the FQDN policy must not select the A2A gateway pod without this test being rewritten to read its patterns", pol.Name)
-				} else {
-					t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", pol.Name)
+					continue
+				}
+				egressFenced++
+				for _, address := range []string{"203.0.113.10", "2001:db8::10"} {
+					if !egressAdmits(t, pol, egressDestination{name: "Slack", address: address, port: 443}) {
+						t.Errorf("%s fences the gateway pod's egress and denies %s on 443, which Slack's websocket and Web API need", pol.Name, address)
+					}
 				}
 			}
 		}
 	}
 	if matched == 0 {
 		t.Fatal("no policy matched the gateway pod; expected the gateway ingress fences to match")
+	}
+	if egressFenced == 0 {
+		t.Fatal("no policy fences the gateway pod's egress; expected the gateway's egress policy to")
 	}
 }
 

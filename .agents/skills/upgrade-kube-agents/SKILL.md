@@ -132,11 +132,17 @@ that is not the release being asked for is refused by name.
 - `--upgrade-mode=harness`: one `helm upgrade --reset-values` over the release's recorded values re-tagging the Platform Agent image (`platformAgent.deployment.image.tag`), the shell sandbox image (`agentSandbox.image.tag`) and every plugin image tag the release's values record (`plugins.pubsubPlatform.image.tag`, `plugins.stockoutInvestigator.image.tag`), followed by a read-back of the gateway Deployment's release images against the tag. Requires `jq`.
 - `--upgrade-mode=operator`: applies the chart's CRDs with `kubectl` first (Helm never touches `crds/` on upgrade), then the same `helm upgrade` re-tagging only the operator image. Both modes stop before any of the new release is applied, naming each recorded key the chart's `values.schema.json` refuses as undeclared; on an upgrade that is a renamed or removed setting, so use `--upgrade-mode=full`. `--drop-undeclared-values` drops and names those keys instead, for a rollback to a release that predates them; a later release that declares a dropped key renders it from that chart's default until a full-mode run there.
 - `--upgrade-mode=full` (Default): applies the CRDs, then runs a full `terraform apply` at the new `--image-tag` through the install engine — both image tags move and every setting in `install.env` is re-rendered. This mode additionally requires the `terraform` CLI.
+- `--sizing-profile=PROFILE`: optional override (`auto`, `small`, `medium`, or `fleet`) for `--plan`, `--upgrade-mode=full`, and `--upgrade-mode=harness`; warns when overriding a different `PLATFORM_AGENT_SIZING_PROFILE` in `install.env`. `--upgrade-mode=operator` refuses `--sizing-profile` (exit `1`, because operator mode applies CRDs and re-tags only the operator image). In `--upgrade-mode=harness`, sets `platformAgent.deployment.sizingProfile` if explicit or unset in the release when the installed CRD and target chart schema declare it, and stops exit `1` if explicit against a pre-`sizingProfile` or unreadable CRD (re-run `--upgrade-mode=operator` or `--upgrade-mode=full`) or a target chart schema lacking it. All live modes (`--plan`, `full`, `harness`, `operator`; skipped by offline `--dry-run`) run `report_cluster_sizing_guidance` before acting.
 
 Every mode stops before the Secret backfills when the move leaves behind a commit marked as a
 breaking change (`type!:` or a `BREAKING CHANGE:` footer), as a rollback to an older release
 usually does, and names each one; `--plan` only warns. Show the user the named commits and get
 their consent before re-running with `--allow-breaking-downgrade`.
+
+A full upgrade also stops before the apply when it would destroy the gVisor node pool
+(`ENABLE_GVISOR` resolving to `false` on a Standard install that runs one). Never add
+`--allow-node-pool-destroy` on your own: it is for a user who has said they want the sandbox off.
+Otherwise set `ENABLE_GVISOR="true"` in `install.env`.
 
 A GitLab install needs nothing extra. The upgrade reads the forge, host, project and Secret names
 from `install.env`, needs no token and no CA file, and keeps both Secrets.

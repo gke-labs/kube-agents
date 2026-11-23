@@ -29,9 +29,11 @@ The AgentProfile dispatcher runs by default, from the release set's image, which
 
 The Hermes bridge sidecar the operator renders into the agent pod is built from the
 `platform-agent` image of the same commit. The operator therefore takes its registry and tag from
-the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent`
-that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
-resource names.
+the agent image instead when that is the release `platform-agent` image by tag, else from the
+operator's release set, and `A2A_BRIDGE_IMAGE` on the operator overrides it. The chart value
+`hermesBridge.image` (`repository`, `tag`) renders that override; empty, the default, renders
+nothing. A `PlatformAgent` that declares its own `hermes-bridge` sidecar keeps it, and that
+sidecar's image is whatever the resource names.
 
 NATS, nats-box, the NATS config reloader and its metrics exporter are ordinary third-party pins,
 in the table as `nats`, `nats-box`, `nats-server-config-reloader` and `prometheus-nats-exporter`,
@@ -41,6 +43,10 @@ so `make mirror-images` copies them. The chart sets their env vars (`A2A_NATS_IM
 `global.thirdPartyImageRegistry` they render from the mirror, so a mirrored chart install pulls
 the four with nothing more to do. The two pinned by digest render under the prefix by tag alone,
 which is the copy `make mirror-images` pushes.
+
+An upgrade with `helm upgrade --reuse-values` from a release before `a2aBus.images` existed
+renders without that key. The chart then takes the same pins from its own templates, so under
+`global.thirdPartyImageRegistry` the bus still pulls from the mirror.
 
 A kustomize install (`make deploy`) renders the operator without the chart, so there the operator
 runs on its compiled defaults, the same pins on Docker Hub, until the four env vars are set by
@@ -61,9 +67,9 @@ The bases those images are built from are inventory entries too. `golang`, `node
 `a2a/Dockerfile.worker`, `a2a/Dockerfile.hermes-bridge` and `a2a/Dockerfile.web-console` alongside
 every other builder, so a build in a mirrored environment can resolve them like any other.
 
-Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
-`ARG` default, a compiled constant in the operator — and `make images-check` holds them in step with
-this file. How to bump a pin is in
+Several images keep a second copy of their pin elsewhere in the tree: a chart value, a Dockerfile
+`ARG` default, a compiled constant in the operator, or the chart's template default for the A2A bus.
+`make images-check` holds them in step with this file. How to bump a pin is in
 [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md#local-validation-before-committing).
 
 <!-- BEGIN GENERATED: container-images -->
@@ -85,13 +91,14 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `pubsub-platform` | `ghcr.io/gke-labs/kube-agents/pubsub-platform` | release tag | — | The pubsub-platform AgentPlugin. |
 | `gke-stockout-investigator` | `ghcr.io/gke-labs/kube-agents/gke-stockout-investigator` | release tag | — | The gke-stockout-investigator AgentPlugin. |
 | `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way. |
-| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `&lt;name&gt;-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`. |
+| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `&lt;name&gt;-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`. Under A2A_SESSION_CLUSTER_VIEW its kubectl uses the kubectl memory admission, its guard library, the kubectl cost table and the session fast-path figures the image carries. |
 | `persona-cluster` | `ghcr.io/gke-labs/kube-agents/persona-cluster` | release tag | — | The worker pods of the cluster AgentProfile, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
+| `persona-tse` | `ghcr.io/gke-labs/kube-agents/persona-tse` | release tag | — | The worker pods of the tse AgentProfile, when the chart's profiles.tse.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable. |
 | `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders. |
-| `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders (and the opt-in MCP server and OKF memory curator Deployments when A2A_MCP_DOOR or A2A_CURATOR is set). |
+| `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders, the MCP server Deployment it renders unless `operator.mcpServer.enabled` is `false`, and the opt-in OKF memory curator Deployment when A2A_CURATOR is set. |
 | `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders. It resolves the same way the gateway, the worker and the callout do. |
 | `a2a-dispatcher` | `ghcr.io/gke-labs/kube-agents/a2a-dispatcher` | release tag | `A2A_DISPATCHER_IMAGE` | The AgentProfile dispatcher Deployment the operator renders unless `operator.profileDispatcher.enabled` is `false`. |
-| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
+| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container. The operator derives it from the agent image (registry and tag) when that image is the release platform-agent image by tag, else from the operator's release set, unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
 | `web-console` | `ghcr.io/gke-labs/kube-agents/web-console` | release tag | — | The web console Deployment the chart renders when webConsole.enabled is true, and nothing on a default install. The chart takes the tag from webConsole.image.tag, else the agent image's tag, else the chart's appVersion. |
 
 ### Pulled by an install, built elsewhere
@@ -102,7 +109,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | ----- | ------------------ | --- | -------- | --------- |
 | `litellm` | `ghcr.io/berriai/litellm` | `v1.108.6` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.5` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
-| `nats` | `docker.io/library/nats` | `2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders. |
+| `nats` | `docker.io/library/nats` | `2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders. A one-server bus also runs its `stale-cluster-meta` init step on this image, which needs a shell with `du` and `cut`: mirror an `-alpine` tag, not the scratch-based `nats` tags. |
 | `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS. |
 | `nats-server-config-reloader` | `docker.io/natsio/nats-server-config-reloader` | `0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c` | `A2A_NATS_RELOADER_IMAGE` | A sidecar in the NATS pod the operator renders. |
 | `prometheus-nats-exporter` | `docker.io/natsio/prometheus-nats-exporter` | `0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255` | `A2A_NATS_EXPORTER_IMAGE` | The metrics sidecar in each pod of that NATS StatefulSet. |
@@ -122,7 +129,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
-| `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
+| `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (hermes-upstream stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.6` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
 | `node` | `docker.io/library/node` | `24-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
@@ -139,7 +146,7 @@ Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each
 
 ### `platform-agent`
 
-The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates:
+The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) from the files of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates:
 
 - the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint;
 - the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`;
@@ -233,12 +240,16 @@ Docker builds source `tags.env` via the `HERMES_AGENT_TAG` build arg:
 ```dockerfile
 ARG HERMES_AGENT_TAG
 ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
-FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
+FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS hermes-upstream
 ```
+
+The agent images do not build on that image's layers. The build copies its files into an empty stage and leaves out GSAP (`/opt/hermes/node_modules/gsap`), an animation library that Hermes' dashboard workspace installs under a licence that is not an open-source one. Hermes' built dashboard does not contain it, and no layer of `platform-agent` or `credential-proxy` holds it. The Hermes image itself still does, so a mirror of it carries the package.
 
 The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-agents` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
+
+A copy of files does not carry the Hermes image's own configuration, so the Dockerfile declares its `ENV`, `WORKDIR` and `VOLUME` again, and the build compares the `ENV` and `WORKDIR` with the pinned image. A bump that changes either fails the build at that comparison and prints the difference. Nothing compares the `VOLUME` or any other setting.
 
 The tool-call audit trail does not depend on Hermes' log line format: the `tool_call_audit` plugin and the `chat_message_audit` hook write their records to a file of their own that the `fluent-bit` sidecar tails as JSON ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)). What a bump can still change is the plugin and hook interfaces the two emitters are loaded through. Once a bumped `platform-agent` is running, has made a tool call and has answered a chat turn, query `jsonPayload.audit_event:*` in Logs Explorer. A `tool_call_start` record with a `jsonPayload.file_path` ending in `audit.jsonl` means the plugin still loads and writes, and a `chat_message_start` record means the hook does. None means the plugin or the hook no longer registers, which the agent container's startup output and `agent.log` name.
 
@@ -332,8 +343,23 @@ explicitly still wins, which is why `install.sh` leaves them unset: one explicit
 `CREDENTIAL_PROXY_IMAGE` pins the broker for every agent in the cluster, where the per-CR
 derivation keeps each broker in step with its own agent's image.
 
+The chart passes those three always, and `CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE` only
+when `credentialProxy.image` or `hermesBridge.image` (`repository`, `tag`) is set. Unset, the
+operator derives the broker from each agent's image, and the bridge from the agent image only when
+that is the release `platform-agent` image by tag, else from the operator's release set
+([hermes-bridge.md](https://github.com/gke-labs/kube-agents/blob/main/a2a/docs/hermes-bridge.md)).
+Set one for a tag the two images were never built for, or for a mirror or registry that holds them
+at a different tag than the agent image (set `tag`). For the broker alone, set it for a
+digest-pinned or custom-named agent image too.
+
+Under `global.imageRegistry` the rendered reference is `<prefix>/<trailing name>:<tag>`, so a
+different repository path needs the prefix empty. The pin applies to every `PlatformAgent` the
+operator manages; the chart's `values.yaml` has the rest of the contract. On an `install.sh` or
+Terraform install, pass the keys through `TF_VAR_extra_helm_values`.
+
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
-the above for that agent's containers — see the
+the above for that agent's containers, except these two pins, which the operator reads before the
+CR — see the
 [PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/). The sandbox has
 `spec.harness.experimental.shellSandbox.image`, which overrides `AGENT_SANDBOX_IMAGE` for that
 agent. The fluent-bit sidecar has no CR-level equivalent; `FLUENT_BIT_IMAGE` is its only override.
@@ -356,7 +382,15 @@ images first with `INCLUDE=build-time`, and use `crane` or `skopeo` rather than 
 Hermes pin is by digest, and a `docker pull`/`push` round trip changes it. A mirrored `golang` copy
 is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`.
 A later bump of the `go` directive in `k8s-operator/go.mod` past that patch therefore fails the
-rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
+rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION` on
+the same `make` command, for a tag that the mirror holds.
+
+A rebuilt `platform-agent` image needs a `hermes-bridge` image at the same registry path and tag
+for the bridge sidecar. `make docker-build-hermes-bridge` with the same variables builds the agent
+image and the bridge image from it; otherwise set `A2A_BRIDGE_IMAGE` on the operator to a bridge
+image built another way. The operator takes the `credential-proxy` image from the agent image in
+the same way: build it with `make docker-build-credential-proxy` and the same variables, or set
+`CREDENTIAL_PROXY_IMAGE` on the operator.
 
 ### Registry authentication
 
@@ -403,4 +437,4 @@ yourself from the mirror and set `enable_cert_manager = false`.
 
 ## Local builds
 
-`make docker-build` at the repository root builds the agent, credential-proxy, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.
+`make docker-build` at the repository root builds the agent, credential-proxy, hermes-bridge, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one, and `make docker-build-hermes-bridge` builds the agent image and the bridge image from it. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.

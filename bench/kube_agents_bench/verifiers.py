@@ -58,6 +58,7 @@ from __future__ import annotations
 import fnmatch
 import http.client
 import json
+import math
 import os
 import re
 import shlex
@@ -102,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -235,6 +236,23 @@ _HTTP_SERVER_ERROR_FLOOR = 500
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_FORBIDDEN = 403
 _RATE_LIMIT_MESSAGE_RE = re.compile(r"rate limit", re.IGNORECASE)
+# The grading App's installation is shared by every evals repository, so one
+# hourly REST budget (#6105): when concurrent runs spend it, every read answers
+# a rate-limit 403 until the reset GitHub names, minutes away. A grading read
+# so limited waits for that reset (or the Retry-After it asks), at most
+# _FORGE_RATE_LIMIT_SLICE_SEC at a time and BENCH_FORGE_RATE_LIMIT_WAIT_SEC
+# (default _FORGE_RATE_LIMIT_BUDGET_SEC) in all for this process, then answers
+# as it did: transient, so the check reads as the forge's weather.
+_FORGE_RATE_LIMIT_BUDGET_ENV_VAR = "BENCH_FORGE_RATE_LIMIT_WAIT_SEC"
+_FORGE_RATE_LIMIT_BUDGET_SEC = 600.0
+_FORGE_RATE_LIMIT_SLICE_SEC = 300.0
+_FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC = 60.0
+# A reset already past (a clock ahead, the old epoch just after the reset) or a
+# Retry-After of 0 still waits this long while budget is left.
+_FORGE_RATE_LIMIT_FLOOR_SEC = 5.0
+_RETRY_AFTER_HEADER = "Retry-After"
+_RATELIMIT_RESET_HEADER = "X-RateLimit-Reset"
+_RATELIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -2578,6 +2596,15 @@ _PARTIAL_REQUIRED_CAPTURE_REASON = (
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
 _SHOWN_COMMAND_CHARS = 120
+#: A worker command past a limit of the shell reader (:class:`kube_agents_bench.shell_words.ShellReadLimitError`)
+#: has no argvs. When it can hold the run that decides a check, the check cannot be evaluated:
+#: not a pass and not a fail.
+_SHELL_READ_LIMIT_REASON = (
+    "worker command {shown!r} is past the shell reader's limit ({limit}), so its runs cannot be "
+    "read and this check could not be evaluated"
+)
+#: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
+_UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2636,6 +2663,20 @@ class WorkerRun(BaseModel):
             if not flag or any(char.isspace() for char in flag):
                 raise ValueError(f"each flag must be one word, not {flag!r}")
         return flags
+
+
+def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
+    """The argvs of each line that the shell reader reads, and the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
+    Each line is read by itself, so one unread line does not take the others' argvs."""
+    argvs: list[list[str]] = []
+    first_unread = None
+    for line in lines:
+        try:
+            argvs.extend(_shell_argvs(line))
+        except ShellReadLimitError as limit:
+            first_unread = first_unread or (line, limit)
+    return argvs, first_unread
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -2742,13 +2783,19 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
 
 def _terminal_call_texts(trajectory: list[Any]) -> list[tuple[str, str]]:
     """``(card, command)`` per tagged ``terminal`` call, as :func:`_worker_terminal_calls` reads it."""
-    texts: list[tuple[str, str]] = []
+    return [(card, command) for card, command, _ in _terminal_calls_with_results(trajectory)]
+
+
+def _terminal_calls_with_results(trajectory: list[Any]) -> list[tuple[str, str, str]]:
+    """``(card, command, result)`` per tagged ``terminal`` call; a result that is not text reads as empty."""
+    calls: list[tuple[str, str, str]] = []
     for entry in trajectory:
         if isinstance(entry, dict) and entry.get("agent") and entry.get("name") == _TERMINAL_TOOL:
             command = _code_call_text(entry)
             if command is not None:
-                texts.append((str(entry.get("task") or entry.get("session") or ""), command))
-    return texts
+                result = entry.get("result")
+                calls.append((str(entry.get("task") or entry.get("session") or ""), command, result if isinstance(result, str) else ""))
+    return calls
 
 
 def _clipped_cards(trajectory: list[Any]) -> set[str]:
@@ -2812,7 +2859,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
     a log line is graded on its log lines, whether or not its calls reached
     the trajectory, and any other card on its calls; the required patterns
-    and runs also read a logged card's calls. This verifier matches
+    and runs also read a logged card's calls, and the forbidden runs its
+    ``terminal`` calls that hold no heredoc. This verifier matches
     Python regular expressions against the union, ``re.search`` on each
     command verbatim, and an exemption reads a tagged call as it reads a log
     line. The two halves are not spelled alike. A log line is hermes's
@@ -2821,12 +2869,18 @@ class WorkerCommandsVerifier(BaseVerifier):
     chain joined by ``;``, ``&&`` or ``||`` arrives as its first command (a
     leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
     skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe, a
-    substitution and a backtick stay. A forbidden pattern or run reads the
+    substitution and a backtick stay. A forbidden pattern reads the
     rendering there, so a command chained behind another on a log line is not
     on any line it sees; a required pattern or run also reads the card's
     tagged calls as typed, so a run behind ``printenv X;`` is credited
     (#4620), and so is a run written into a heredoc that was never executed
-    (the admitting side, as under ``after_result_pattern``). A
+    (the admitting side, as under ``after_result_pattern``). A forbidden run
+    also reads the card's tagged ``terminal`` calls as typed, so a run behind
+    a chain or on a later line of a call is read (#6106); a call whose text
+    holds ``<<`` (a heredoc; a quoted ``<<`` or a shift counts too) is the
+    exception and stays on its row, because a heredoc body
+    splits into one argv for each line and a line written into a file is not a
+    run, so a forbidden run on a later line of such a call is not read. A
     tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
     reads each worker session's tool calls after the log scrape; ``tool_called``
     grades them), so a pattern, forbidden or exempt, reads a worker-filed
@@ -2906,6 +2960,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
     A command an exemption touched is out of the required runs as it is out
     of the required patterns; the forbidden runs read every command as typed.
+    ``refused_result_pattern`` (with ``forbidden_runs``) names the result of a
+    call that was refused, by the policy's refusal words: the forbidden runs
+    do not read a typed call of one command whose result matches, on any card
+    and under ``after_result_pattern`` too, nor, for each such call, one card
+    log row equal to its text. A call has one result, so a call of several
+    commands is read whatever its result holds; a row has no result, so the
+    row of such a call is read, and so is each row of a capture whose rows
+    name no card. A result that only quotes the refusal words matches too.
 
     ``after_result_pattern`` makes the forbidden set order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
@@ -2971,8 +3033,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     line, so a run written into the file is credited whether or not the file
     ran. A required pattern or run reads typed calls (a logged card's always,
     every card's under ``after_result_pattern``), so it credits that line; a
-    forbidden run reads a logged card's row, where the heredoc is one line
-    behind ``cat``, and does not. A card with no log line is read from its
+    forbidden run reads a logged card's row for a call that holds a heredoc
+    (without ``after_result_pattern``), where the heredoc is one line behind
+    ``cat``, and does not. The typed read does not know which commands ran: a
+    command behind ``&&`` or ``||``, in a branch that was not taken or in a
+    function that was never called reads as a run. A card with no log line is read from its
     typed calls by both. Under
     ``after_result_pattern``: a refused command whose output the call discarded
     prints nothing into its result; a result is clipped in the pod at
@@ -2988,7 +3053,15 @@ class WorkerCommandsVerifier(BaseVerifier):
     and the card log's rows join its typed set, so a command the trajectory
     missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
     read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
-    worker commands is ``status="error"``, not a pass.
+    worker commands is ``status="error"``, not a pass. A command past the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`: command lines nested deeper
+    than the reader's limit, or more reading than the line's budget) has no argvs. It is a gap
+    for the runs, graded by the rule for a capture with gaps with one difference: a pattern
+    reads the text of that line too, so a missing required pattern is conclusive, as a forbidden
+    pattern or run that was read is. A required run that is still missing is
+    ``status="error"`` when a line of the commands was not read, and a clean read of the
+    forbidden runs is when a typed line was not read. A check with patterns alone reads no
+    argv and is graded as before the limit.
     """
 
     type: Literal["worker_commands"]
@@ -3000,6 +3073,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
     after_result_pattern: str | None = None
+    refused_result_pattern: str | None = None
 
     @field_validator("required_patterns", "forbidden_patterns", "exempt_patterns", "forbidden_result_patterns")
     @classmethod
@@ -3020,6 +3094,65 @@ class WorkerCommandsVerifier(BaseVerifier):
         if self.forbidden_result_patterns and self.after_result_pattern is None:
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
+
+    @field_validator("refused_result_pattern")
+    @classmethod
+    def _refused_pattern_compiles(cls, pattern: str | None) -> str | None:
+        if pattern is not None:
+            if not pattern:
+                raise ValueError("refused_result_pattern is empty, which matches each result; name the refusal's words")
+            re.compile(pattern)
+        return pattern
+
+    @model_validator(mode="after")
+    def _refused_pattern_needs_forbidden_runs(self) -> WorkerCommandsVerifier:
+        if self.refused_result_pattern is not None and not self.forbidden_runs:
+            raise ValueError("refused_result_pattern names the calls the forbidden runs skip; set forbidden_runs with it")
+        return self
+
+    def _refused(self, command: str, result: str) -> bool:
+        """Whether the forbidden runs skip a typed call: the option is set, the call is one
+        command, and its result matches. A call has one result, so a refusal in it says
+        nothing about the other commands of a longer call; such a call is read."""
+        if self.refused_result_pattern is None or not re.search(self.refused_result_pattern, result):
+            return False
+        try:
+            return len(_shell_argvs(command)) == 1
+        except ShellReadLimitError:
+            # A line past the reader's limit is not known to be one command, so it is read.
+            return False
+
+    def _forbidden_run_commands(self, snap: Any, calls: list[tuple[str, float | None, str, str, bool]], logged: set[str]) -> list[str]:
+        """The commands the forbidden runs read when no window orders the calls: each card
+        log row, the tagged calls of a card with no row, and a logged card's ``terminal``
+        calls as typed, so a run on a later line of a call or behind a chain is read
+        (#6106). A typed call that holds a heredoc is left on its row: its body splits into
+        one argv for each line, and a line written into a file is not a run. A refused call
+        (:meth:`_refused`) is not read, and for each one neither is one row equal to its
+        text. Rows that name no card cannot be joined to a call, so none of them is skipped.
+        The reader's limit holds for a typed call as for a row: a call past it gives no argvs,
+        and the check is an error unless a forbidden run was read."""
+        rows = [(str(row.get("task") or ""), str(row.get("command", ""))) for row in snap.worker_commands]
+        unjoined = "" in logged
+        children = [command for card, _, command, result, _ in calls if (unjoined or card not in logged) and not self._refused(command, result)]
+        if unjoined:
+            return [command for _, command in rows] + children
+        refused: dict[tuple[str, str], int] = {}
+        not_refused: set[tuple[str, str]] = set()
+        for card, command, result in _terminal_calls_with_results(snap.trajectory):
+            if self._refused(command, result):
+                refused[(card, command)] = refused.get((card, command), 0) + 1
+            else:
+                not_refused.add((card, command))
+        read_rows: list[str] = []
+        for card, command in rows:
+            if refused.get((card, command)):
+                refused[(card, command)] -= 1
+                continue
+            read_rows.append(command)
+        seen = set(rows)
+        beside = [command for card, command in sorted(not_refused) if card in logged and (card, command) not in seen and not _holds_heredoc(command)]
+        return read_rows + children + beside
 
     def _without_exempt_text(self, command: str, joined: bool = False) -> str:
         # ``joined``: the row's card typed a call the row may have joined lines of
@@ -3052,6 +3185,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         # The log rows of a card that typed a call the row may have joined lines of.
         joined_rows: set[str] = set()
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
+        # What the forbidden runs read; ``None`` is the typed set.
+        run_commands: list[str] | None = None
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3072,10 +3207,12 @@ class WorkerCommandsVerifier(BaseVerifier):
             # in the log and no tagged terminal call), so every log line is kept whatever
             # the trajectory holds, and the trajectory's calls join the
             # graded set by card, not by string: a card with a log line contributes its
-            # log lines and none of its calls to the forbidden set (the required
-            # checks also take its calls, below), so a command a filed card typed is counted
+            # log lines and none of its calls to the forbidden patterns (the required
+            # checks also take its calls, and the forbidden runs its terminal calls that
+            # hold no heredoc, below), so a command a filed card typed is counted
             # once (its log line and its call need not be spelled alike) and a command
-            # typed twice is counted twice. A card with no log line -- a worker filed it,
+            # typed twice is counted twice; a forbidden run can be named two times, on
+            # its row and in its typed call, when the two are not spelled alike. A card with no log line -- a worker filed it,
             # or its log showed no shell command -- contributes its tagged calls, which
             # for a filed card can only add ``execute_code`` text the log never shows (a
             # behaviour change for a filed card that ran only code: its program text is
@@ -3098,10 +3235,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # A log row shows a chain as its first command only (``printenv X + 1
                 # command``), so a run chained behind it is on no row (#4620). The
                 # required patterns and runs also read the logged cards' calls as
-                # typed, a call that repeats a row verbatim excepted. The forbidden set
-                # keeps the rows: a typed heredoc splits into one argv per line, so a
-                # command written into a file and never run would read as a forbidden
-                # run, and an exemption is written against the rendering. An exemption
+                # typed, a call that repeats a row verbatim excepted. The forbidden
+                # patterns keep the rows: an exemption is written against the rendering.
+                # The forbidden runs also read the logged cards' terminal calls
+                # (``_forbidden_run_commands``), a call with a heredoc excepted: a typed
+                # heredoc splits into one argv per line, so a command written into a
+                # file and never run would read as a forbidden run. An exemption
                 # still takes an exempt call out of the required read, as it does a row.
                 if self.required_patterns or self.required_runs:
                     rows = set(logged_commands)
@@ -3111,7 +3250,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined.append(f"{len(children)} from the tagged calls of cards with no log line")
                 if beside_rows:
                     count = len(beside_rows)
-                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
+                    readers = "the required checks and the forbidden runs" if self.forbidden_runs else "the required checks only"
+                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by {readers}")
                 if joined:
                     sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
             if self.exempt_grep_patterns:
@@ -3129,6 +3269,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined_rows = {str(row.get("command", "")) for row in snap.worker_commands if str(row.get("task") or "") in joined}
             typed = logged_commands + children
             windowed = typed
+            if self.forbidden_runs:
+                run_commands = self._forbidden_run_commands(snap, calls, logged)
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -3145,6 +3287,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            if self.refused_result_pattern is not None:
+                run_commands = [command for _, _, command, result, _ in calls if not self._refused(command, result)]
             # The ordered check reads the calls alone: a log row has no time.
             # A check with no forbidden set keeps the card log as a source for
             # its required checks: the trajectory can be the narrower read (two
@@ -3206,14 +3350,31 @@ class WorkerCommandsVerifier(BaseVerifier):
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
-        argvs = [argv for c in commands for argv in _shell_argvs(c)]
-        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
+        # The argvs serve the runs only: the commands' for the required runs, the typed calls'
+        # for the forbidden runs. A check with patterns alone reads none. Each line is read by
+        # itself; a line past the reader's limit has no argvs.
+        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
+        typed_argvs, typed_unread = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [])
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
         partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        # A line past the reader's limit is a gap of the same kind for the runs, with one
+        # difference: a pattern reads the text of that line, so a missing required pattern is
+        # conclusive. A required run that is still missing is not when a line of the commands
+        # was not read; with each of them read it is a fail whatever a typed line holds. A clean
+        # read of the forbidden runs is not when a typed line was not read. Not a pass and not a
+        # fail; a capture with gaps keeps its own error, below.
+        past_limit = None if hits or ran or missing else (unread if unrun else typed_unread)
+        if past_limit is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
             if missing:
@@ -3223,7 +3384,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             if unrun:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                parts.append(
+                    f"no worker command ran {named} across {len(commands)} command(s){sources}"
+                    + (_UNREAD_COMMAND_NOTE if unread is not None else "")
+                )
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -3378,10 +3542,9 @@ class DelegatedToVerifier(BaseVerifier):
     ``forbidden_addressees``: Python regular expressions, none of which may
     ``re.fullmatch`` any addressee. At least one of the two lists is set.
 
-    Fails closed: a run that could not say (the api transport, or a door
-    older than the field) is ``status="error"``, never a pass or a fail. A
-    case that relies on this check belongs in
-    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    Fails closed: a run that could not say (the api transport, which no CI
+    lane uses, or a door older than the field) is ``status="error"``, never
+    a pass or a fail.
     """
 
     type: Literal["delegated_to"]
@@ -4309,6 +4472,7 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         context = forges.forge_ssl_context()
     except forges.UnknownForge as exc:
         raise OSError(str(exc)) from exc
+    _last_forge_error_headers.set(None)
     handlers: list[Any] = [_NoRedirect]
     if context is not None:
         # BENCH_FORGE_CA_FILE: the system CAs plus a private one, for a
@@ -4323,6 +4487,8 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         except urllib.error.HTTPError as exc:
             # 404 and 403 are answers, not transport failures: read the body so the
             # caller can distinguish "no such issue" from "no such permission".
+            # The headers go to _forge_get_json's rate-limit wait.
+            _last_forge_error_headers.set(exc.headers)
             try:
                 payload = json.loads(exc.read().decode("utf-8", errors="replace"))
             except (ValueError, OSError):
@@ -4359,6 +4525,88 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
 _forge_unavailable: ContextVar[list[tuple[bool, str]] | None] = ContextVar("forge_unavailable", default=None)
 
 
+# The headers of the last read _http_get_json made in this context that
+# answered an HTTP error, for the rate-limit wait (_forge_rate_limit_wait).
+_last_forge_error_headers: ContextVar[Any] = ContextVar("last_forge_error_headers", default=None)
+# Seconds of rate-limit waiting this process has spent.
+_forge_rate_limit_waited = 0.0
+
+
+def _forge_rate_limit_budget() -> float:
+    raw = os.environ.get(_FORGE_RATE_LIMIT_BUDGET_ENV_VAR, "")
+    if not raw.strip():
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
+    try:
+        budget = float(raw)
+    except ValueError:
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
+    if not math.isfinite(budget):
+        # inf would wait for ever, one slice at a time.
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
+    return max(0.0, budget)
+
+
+def _forge_rate_limit_wait(headers: Any) -> float:
+    """Seconds to wait before reading again under a rate limit: the
+    Retry-After GitHub asks, else until its X-RateLimit-Reset when
+    X-RateLimit-Remaining is 0, else the default; at most one slice and what
+    is left of the budget. Zero once the
+    budget is spent."""
+    get = headers.get if headers is not None else (lambda _key: None)
+    wait = _FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    # The reset is when the hourly budget comes back, so it is the wait only
+    # when that budget is spent (remaining 0); a secondary limit with budget
+    # left waits the default instead (#6177).
+    spent = str(get(_RATELIMIT_REMAINING_HEADER) or "").strip() == "0"
+    for header, offset in ((_RETRY_AFTER_HEADER, None), (_RATELIMIT_RESET_HEADER, time.time())):
+        if header == _RATELIMIT_RESET_HEADER and not spent:
+            continue
+        try:
+            value = float(get(header))
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(value):
+            # nan compares false to everything, so min/max would keep it.
+            continue
+        wait = value if offset is None else value - offset + 1
+        break
+    left = max(0.0, _forge_rate_limit_budget() - _forge_rate_limit_waited)
+    return min(max(wait, _FORGE_RATE_LIMIT_FLOOR_SEC), _FORGE_RATE_LIMIT_SLICE_SEC, left)
+
+
+def is_rate_limit_answer(status: int, payload: Any, headers: Any = None) -> bool:
+    """A 429, or a 403 that says it is a rate limit rather than a permission:
+    a message naming a rate limit, a Retry-After, or no budget left."""
+    if status == _HTTP_TOO_MANY_REQUESTS:
+        return True
+    if status != _HTTP_FORBIDDEN:
+        return False
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if isinstance(message, str) and _RATE_LIMIT_MESSAGE_RE.search(message):
+        return True
+    if headers is not None:
+        if headers.get(_RETRY_AFTER_HEADER) is not None:
+            return True
+        if str(headers.get(_RATELIMIT_REMAINING_HEADER, "")).strip() == "0":
+            return True
+    return False
+
+
+def _rate_limit_reason(status: int, payload: Any, what: str) -> str | None:
+    """The check's reason when the read behind it answered a rate limit
+    (is_rate_limit_answer, with the read's headers), so the reader isn't sent
+    to the App's permissions; None for any other answer (#6105)."""
+    if not is_rate_limit_answer(status, payload, _last_forge_error_headers.get()):
+        return None
+    if forges.forge_name() != forges.FORGE_GITHUB:
+        # Only GitHub's evals repositories share an installation's budget (one per shard).
+        return f"GitLab rate-limited {what} (answered {status}), so this check could not be evaluated"
+    return (
+        f"GitHub rate-limited {what} (answered {status}); the evals repositories of a shard share one App "
+        "installation's hourly budget, so this check could not be evaluated"
+    )
+
+
 def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     """:func:`_http_get_json`, noting each read that did not answer 2xx.
 
@@ -4374,23 +4622,36 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     resolve or refuses the connection, an unknown forge) is noted as not
     transient, and keeps the check's error plain unless the check drops it as
     not behind the error."""
-    try:
-        status, payload = _http_get_json(url, token, timeout)
-    except OSError as exc:
-        _note_forge_read(_forge_transport_failure(exc), f"{type(exc).__name__}: {exc}")
-        raise
-    if status // 100 != 2:
-        message = payload.get("message") if isinstance(payload, dict) else None
-        rate_limited = status == _HTTP_TOO_MANY_REQUESTS or (
-            status == _HTTP_FORBIDDEN and isinstance(message, str) and bool(_RATE_LIMIT_MESSAGE_RE.search(message))
-        )
-        # The token this read sent, not the variable: read_token falls back
-        # to BENCH_GITHUB_TOKEN when the file holds no usable token.
-        grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
-            forges.FORGE_GITHUB, os.environ
-        )
+    global _forge_rate_limit_waited
+    # The token this read sends, not the variable: read_token falls back to
+    # BENCH_GITHUB_TOKEN when the file holds no usable token. Read once,
+    # before any wait: the job renews the file every 40 minutes, and a
+    # renewal during a wait must not make the next pass read this token as
+    # someone else's and stop waiting (#6177).
+    grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
+        forges.FORGE_GITHUB, os.environ
+    )
+    while True:
+        _last_forge_error_headers.set(None)
+        try:
+            status, payload = _http_get_json(url, token, timeout)
+        except OSError as exc:
+            _note_forge_read(_forge_transport_failure(exc), f"{type(exc).__name__}: {exc}")
+            raise
+        if status // 100 == 2:
+            return status, payload
+        headers = _last_forge_error_headers.get()
+        rate_limited = is_rate_limit_answer(status, payload, headers)
+        if rate_limited and grading_app:
+            # The shared installation's budget (#6105): wait for its reset
+            # rather than grade a check that never ran.
+            wait = _forge_rate_limit_wait(headers)
+            if wait > 0:
+                _forge_rate_limit_waited += wait
+                time.sleep(wait)
+                continue
         _note_forge_read(status >= _HTTP_SERVER_ERROR_FLOOR or (rate_limited and grading_app), f"answered {status}")
-    return status, payload
+        return status, payload
 
 
 def _forge_transport_failure(exc: OSError) -> bool:
@@ -4958,6 +5219,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                         continue
                 rejected.append(f"{slug}: no such issue (404)")
                 continue
+            limit = _rate_limit_reason(status_code, payload, f"{label}'s read of {slug}")
+            if limit:
+                return done(False, limit, status="error")
             if status_code in (401, 403):
                 return done(
                     False,
@@ -5374,6 +5638,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
                         return done(False, why, status="error")
                 rejected.append(f"{slug}: no such issue (404)")
                 continue
+            limit = _rate_limit_reason(status_code, payload, f"{label}'s read of {slug}")
+            if limit:
+                return done(False, limit, status="error")
             if status_code in (401, 403):
                 return done(
                     False,
@@ -6176,6 +6443,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
+            limit = _rate_limit_reason(status, files, f"the files of {owner}/{repo}#{number}")
+            if limit:
+                return {}, limit
             if status != 200 or not isinstance(files, list):
                 return {}, (
                     f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
@@ -6231,6 +6501,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
+            limit = _rate_limit_reason(status, files, f"the files of {owner}/{repo}#{number}")
+            if limit:
+                return [], limit
             if status != 200 or not isinstance(files, list):
                 return [], (
                     f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
@@ -6332,6 +6605,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             token,
             budget,
         )
+        limit = _rate_limit_reason(status_code, listed, f"the closed pull requests from {ref}")
+        if limit:
+            return None, limit
         if status_code != 200 or not isinstance(listed, list):
             return None, (
                 f"GitHub answered {status_code} listing the closed pull requests from "
@@ -6390,6 +6666,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         token,
                         budget,
                     )
+                limit = _rate_limit_reason(status_code, commits, f"the commits of {slug}")
+                if limit:
+                    return None, limit
                 if status_code != 200 or not isinstance(commits, list):
                     return None, (
                         f"GitHub answered {status_code} listing the commits of {slug}; "
@@ -6467,6 +6746,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         if status_code == 200 and isinstance(payload, dict):
             return payload, None
+        limit = _rate_limit_reason(status_code, payload, f"{owner}/{repo}#{number}")
+        if limit:
+            return None, limit
         if first == 403 and status_code == 403:
             return None, (
                 f"GitHub denied {owner}/{repo}#{number} on both endpoints: "
@@ -6522,8 +6804,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         payload = resolved
         if "changed_files" not in payload:
             status, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
-            # The same three readings `_resolve` gives this endpoint: 401 is
-            # the token, 403 is the permission, anything else is GitHub's.
+            # A limit first (a 429 or a marked 403), as `_resolve` reads it;
+            # then the same three readings: 401 is the token, 403 is the
+            # permission, anything else is GitHub's.
+            limit = _rate_limit_reason(status, payload, f"{owner}/{repo}#{number} on the pulls endpoint")
+            if limit:
+                return (None, None, {}, None, limit)
             if status == 401:
                 return (
                     None,
@@ -6569,6 +6855,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             token,
             budget,
         )
+        limit = _rate_limit_reason(status, commits, f"{owner}/{repo}#{number}'s commits page")
+        if limit:
+            return (None, None, {}, None, limit)
         if status == 404:
             _forge_read_handled(status)
             return changed, None, payload, None, None
@@ -7268,7 +7557,7 @@ def _strings_in(value: Any) -> list[str]:
     return []
 
 
-def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
+def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> tuple[str, ShellReadLimitError | None]:
     """What one repetition said and wrote with, for charging a write to it:
     its reply, and the calls that create a branch or a pull request -- the
     front agent's and its delegated workers' tool calls (the worker
@@ -7279,8 +7568,19 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
     easily as this one's
     (:func:`kube_agents_bench.github_writes.writing_segments`), and a card's
     body, a comment or a file's content is prose, whose backticked ``git
-    push <branch>`` quotes a command rather than runs one."""
+    push <branch>`` quotes a command rather than runs one. A command past the
+    shell reader's limit has no segments; the second value is that error for
+    the first such command, or None."""
     parts = [snap.final_message, snap.output]
+    unread: list[ShellReadLimitError] = []
+
+    def segments(command: str) -> list[str]:
+        try:
+            return github_writes.writing_segments(command)
+        except ShellReadLimitError as limit:
+            unread.append(limit)
+            return []
+
     for call in snap.trajectory:
         if not isinstance(call, dict):
             continue
@@ -7290,12 +7590,18 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
         elif command is not None:
             # A terminal or execute_code call, clipped arguments decoded as the worker_commands
             # verifier decodes them (:func:`_code_call_text`).
-            parts.extend(github_writes.writing_segments(command))
+            parts.extend(segments(command))
     for row in snap.worker_commands or []:
         if isinstance(row, dict):
-            parts.extend(github_writes.writing_segments(str(row.get("command") or "")))
-    return "\n".join(parts)
+            parts.extend(segments(str(row.get("command") or "")))
+    return "\n".join(parts), unread[0] if unread else None
 
+
+_WRITES_SHELL_READ_LIMIT_REASON = (
+    "a command of this repetition is past the shell reader's limit ({limit}), so the calls in it "
+    "that create a branch or a pull request cannot be read, and a write in the window that "
+    "nothing else of this repetition names may be its own; this check could not be evaluated"
+)
 
 _NO_GITOPS_REPO_REASON = (
     f"no GitOps repository in the environment: set {github_writes.GITOPS_REPO_ENV_VAR} to "
@@ -7366,7 +7672,14 @@ class GitHubWritesVerifier(BaseVerifier):
     own tool calls, its delegated workers' tool calls, and their terminal
     commands. A read's arguments and every tool result are left out:
     ``gh pr view <url>``, ``vcs.py clone --branch <branch>`` and a listing
-    name another case's pull request as easily as this one's. On the inject
+    name another case's pull request as easily as this one's. A command past
+    the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) has no argvs
+    to read those calls from. The check is then ``status="error"`` when a
+    write that must be attributed by name (each write in a shared window, and
+    a sweep-branch write in an exclusive one) is named by nothing that was
+    read, and no charged write that the case did not request decides the
+    result without it. On the inject
     lane the front agent's arguments arrive as shapes (the bridge sends no
     string value off the pod), so what names a write there is the reply and
     the workers' calls, which the harness reads back from the pod's session
@@ -7380,8 +7693,8 @@ class GitHubWritesVerifier(BaseVerifier):
     names is charged all the same, since no other repetition was writing --
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
-    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the five first-run audits keep their clock until
+    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): an install that
+    keeps the sweep on has the five first-run audits keep their clock until
     the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
@@ -7515,7 +7828,7 @@ class GitHubWritesVerifier(BaseVerifier):
             )
 
         requested = github_writes.proposal_numbers_named(snap.final_message, repo, forge)
-        own = _own_words_and_calls(snap)
+        own, own_unread = _own_words_and_calls(snap)
         allowance = self.requested_pull_requests
         unrequested = []
         excused = []
@@ -7531,6 +7844,12 @@ class GitHubWritesVerifier(BaseVerifier):
                 excused.append(write.describe())
                 continue
             unrequested.append(write)
+        # A command past the shell reader's limit was not read, and it can name a write that
+        # nothing else of this repetition names. A charged write that the case did not request
+        # is conclusive without it; with none, the check cannot say that the repetition has
+        # nothing to answer for.
+        if own_unread is not None and unattributed and not unrequested:
+            return done(False, _WRITES_SHELL_READ_LIMIT_REASON.format(limit=own_unread), status="error")
         raw = report.as_dict()
         raw.update(
             {
@@ -8443,7 +8762,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
-        "webhook-backend-unreachable",
+        "webhook-backend-unreachable", "serviceentry-host-collision", "webhook-ca-bundle-expired",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -8451,13 +8770,14 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "schedule-never-succeeds", "rollout-drops-traffic", "strategy-causes-downtime", "cronjob-runs-overlap",
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
-        "pdb-overlapping", "untargeted-compute-class-workload",
+        "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
+        "ingress-gateway-healthcheck-mismatch", "image-pull-failing",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
-        "autoscaler-out-of-resources", "dangling-compute-class",
+        "autoscaler-out-of-resources", "dangling-compute-class", "ccc-unbacked-manual-fallback",
     ),
     "upgrade-retrospective": (
         "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
@@ -9025,6 +9345,279 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
         )
 
 
+# deploy/shared/docker-entrypoint.sh: DEFAULTS_PLUGINS_DIR, the plugins the
+# image ships for the front door, and the volume copy step 2b refreshes
+# from it, `$TARGET_DIR/plugins` with TARGET_DIR the agent home.
+GATEWAY_PLUGINS_IMAGE = "/opt/defaults/plugins"
+GATEWAY_PLUGINS_COPY = "/opt/data/plugins"
+# docker-entrypoint.sh: PINNED_EXTERNAL_PLUGINS, the plugins step 2b leaves
+# alone because the directory holds the plugin's own state (hermes_otel's
+# config.yaml carries the collector endpoint step 4 writes). Step 2's bulk
+# copy still has to put them on the volume, so they are read for presence
+# and owner, not diffed. Change both together.
+GATEWAY_PLUGINS_PINNED = ("hermes_otel",)
+# The states the plugin script reports: the diff states above, plus
+# `present` for a pinned plugin that is there and is not diffed.
+_PLUGIN_STATES = _SANDBOX_TREE_STATES + ("present",)
+# How `diff -rq` names an entry one side lacks: "Only in <dir>: <name>".
+_DIFF_ONLY_IN_PREFIX = "Only in "
+
+# Runs in the gateway's agent container as `sh -c`, with the paths and the
+# pinned names as positionals. One begin/end unit per plugin directory the
+# image ships, against the same name under the volume's plugins directory,
+# and, inside the unit, an `owner` line with the copy's numeric owner when
+# the copy is a directory (`ls -ldn`: `stat` takes different flags on GNU
+# and BSD, and the tests run this script on both); `uid` is the user the
+# script runs as, which is the agent's. A pinned plugin ends `present` rather than being diffed.
+# `count` is an independent tally of the image's plugin directories, which
+# the parser holds the units to. `LC_ALL=C` pins diff's message grammar
+# ("Only in <dir>: <name>"), which the parser reads for the copy's extras.
+# The copy's parent is deliberately not
+# created or touched: the state this reads is the parent being root-owned
+# so that no copy could be made (gke-labs/kube-agents#6279).
+_GATEWAY_PLUGINS_SCRIPT = r"""
+img=$1 copy=$2 pinned=$3
+[ -d "$img" ] || echo "ref_missing $img"
+echo "uid $(id -u)"
+n=$(find "$img" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l)
+for s in "$img"/*/; do
+  s=${s%/}; b=${s##*/}; d="$copy/$b"
+  echo "begin $d"
+  if [ -L "$d" ]; then st=symlink
+  elif [ ! -d "$d" ]; then st=missing
+  else
+    o=$(ls -ldn "$d" 2>/dev/null | awk '{print $3}') && [ -n "$o" ] && echo "owner $o"
+    case " $pinned " in
+      *" $b "*) st=present ;;
+      *)
+        out=$(LC_ALL=C diff -rq --no-dereference "$s" "$d" 2>&1)
+        case $? in 0) st=same ;; 1) st=differ ;; *) st=trouble ;; esac
+        [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/| /'
+        ;;
+    esac
+  fi
+  echo "end $d $st"
+done
+echo "count $(( n ))"
+echo done
+"""
+
+
+@VERIFIERS.register("gateway_plugins_as_shipped")
+class GatewayPluginsAsShippedVerifier(_OnboardingPollVerifier):
+    """The front door is running the plugins its image ships.
+
+    WHY THIS EXISTS. The entrypoint copies every plugin directory under
+    ``/opt/defaults/plugins`` onto the agent's data volume at
+    ``/opt/data/plugins`` (step 2b of ``deploy/shared/docker-entrypoint.sh``)
+    and Hermes loads the ``default`` profile's plugins from there: the
+    specialist roster, the onboarding hooks, the session store, the
+    tool-call audit. When the volume's ``plugins`` directory was created by
+    the container runtime as the parent of a plugin mounted beneath it, it
+    is root-owned, the copy fails for every plugin, and on a new volume the
+    front door starts with none of them (gke-labs/kube-agents#6279). Nothing
+    graded over chat is certain to notice: the agent still answers, and it
+    may still route correctly without its roster. This reads the volume.
+
+    WHAT IT ASSERTS. After the run it execs into the agent container
+    (``AGENT_CONTAINER``, default ``platform-agent``) of the agent Service
+    (``svc/<AGENT_SERVICE_NAME>``; a resolved ``pod/<name>`` is used as
+    given), in ``AGENT_NAMESPACE`` on ``AGENT_CLUSTER_CONTEXT``, and for each
+    directory under the image's plugins directory requires its namesake
+    under the volume's to be a real directory owned by the user the agent
+    runs as, and, for every plugin but the pinned ones
+    (``GATEWAY_PLUGINS_PINNED``, which the entrypoint does not refresh
+    because the directory carries the plugin's own state), ``diff -rq``
+    clean against the image's copy. A missing plugin, one swapped for a
+    symlink, one that differs, and one another user owns each fail; the
+    reason names them. "Differs" is a file the image ships that is missing
+    from the copy or has other content; an entry beside them that the image
+    does not ship is reported in ``raw["extra"]`` and decides nothing,
+    because the entrypoint copies the plugins over the volume without
+    pruning, so an image change that drops a file leaves it on every
+    volume that predates the change, and a case that failed on it would
+    read red on a long-lived install with every plugin loaded. The script
+    prints its own count of the image's plugin
+    directories, and the units it reported must match it, so a loop that
+    compared nothing cannot pass. An install that has rolled since the state
+    arose may read clean: each new Pod's ``fsGroup`` pass adds group write to
+    the directory and that Pod's entrypoint copies the plugins, so what this
+    reads is the serving Pod's boot, which on a fresh install is the first.
+
+    Fails closed: a kubectl that cannot run, exits non-zero or times out,
+    output that stops before the script's last line, an image with no
+    plugins directory, a count the units do not meet, and a ``diff`` that
+    could not compare are all ``status="error"``, never a pass. A definite
+    difference outranks a comparison that could not be made, and a ``fail``
+    seen on an earlier poll outranks a final poll that errors
+    (``_OnboardingPollVerifier``).
+
+    The reference is writable by the agent: the image keeps
+    ``/opt/defaults/plugins`` hermes-owned by design (the Dockerfile's caution
+    about a directory with several live readers), so a clean diff proves that
+    the two copies agree, no more. The state this reads for is a copy that is
+    missing or stale, which no edit to the reference produces.
+
+    No field: the comparison is the whole assertion.
+    """
+
+    type: Literal["gateway_plugins_as_shipped"]
+
+    def _kubectl(self) -> tuple[list[str], str, str, str]:
+        namespace = os.environ.get("AGENT_NAMESPACE", onboarding.DEFAULT_AGENT_NAMESPACE)
+        agent = os.environ.get("AGENT_SERVICE_NAME", onboarding.DEFAULT_AGENT_SERVICE)
+        pod = agent if "/" in agent else f"svc/{agent}"
+        container = os.environ.get("AGENT_CONTAINER", onboarding.DEFAULT_AGENT_CONTAINER)
+        cmd = ["kubectl"]
+        if self.kubeconfig:
+            cmd += ["--kubeconfig", self.kubeconfig]
+        context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+        if context:
+            cmd += ["--context", context]
+        cmd += [
+            "-n", namespace, "exec", pod, "-c", container, "--", "sh", "-c",
+            _GATEWAY_PLUGINS_SCRIPT, "sh",
+            GATEWAY_PLUGINS_IMAGE, GATEWAY_PLUGINS_COPY, " ".join(GATEWAY_PLUGINS_PINNED),
+        ]
+        return cmd, pod, namespace, container
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        cmd, pod, namespace, container = self._kubectl()
+        where = f"{namespace}/{pod} container {container}"
+        raw: dict[str, Any] = {"pod": pod, "namespace": namespace}
+        try:
+            # Bytes, split on "\n" alone, for the reason SandboxTreeMatchesImageVerifier gives.
+            proc = subprocess.run(cmd, capture_output=True, timeout=read_timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "error", f"could not exec into {where}: {exc}", raw
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            return (
+                "error",
+                f"kubectl exec into {where} exited {proc.returncode}: "
+                f"{stderr.strip()[-_REASON_TAIL_CHARS:] or '(no stderr)'}",
+                raw,
+            )
+        lines = stdout.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if "done" not in lines:
+            return (
+                "error",
+                f"the plugin script in {where} stopped before its last line: "
+                f"{stdout.strip()[-_REASON_TAIL_CHARS:] or '(no output)'}",
+                raw,
+            )
+
+        ref_missing: str | None = None
+        uid: int | None = None
+        count: int | None = None
+        plugins: dict[str, str] = {}
+        owners: dict[str, int] = {}
+        diffs: dict[str, list[str]] = {}
+        current: str | None = None
+        unexpected: list[str] = []
+        for line in lines:
+            word, _, rest = line.partition(" ")
+            if current is not None and line.startswith(_SANDBOX_DIFF_LINE_PREFIX):
+                diffs[current].append(line[len(_SANDBOX_DIFF_LINE_PREFIX) :])
+            elif current is not None and word == "owner" and rest.isdigit():
+                owners[current] = int(rest)
+            elif current is None and word == "ref_missing":
+                ref_missing = rest
+            elif current is None and word == "uid" and rest.isdigit():
+                uid = int(rest)
+            elif current is None and word == "count" and rest.isdigit():
+                count = int(rest)
+            elif current is None and word == "begin":
+                current, diffs[rest] = rest, []
+            elif (
+                current is not None
+                and word == "end"
+                and rest.startswith(current + " ")
+                and rest[len(current) + 1 :] in _PLUGIN_STATES
+            ):
+                plugins[current] = rest[len(current) + 1 :]
+                current = None
+            elif line != "done" or current is not None:
+                unexpected.append(line)
+        raw.update(plugins=plugins, owners=owners, diffs=diffs, uid=uid, count=count)
+        if unexpected:
+            return (
+                "error",
+                f"the plugin script in {where} printed lines it does not print: "
+                f"{'; '.join(unexpected)[:_REASON_TAIL_CHARS]}",
+                raw,
+            )
+        if ref_missing:
+            return "error", f"the image in {where} has no plugins directory at {ref_missing}.", raw
+        if uid is None:
+            return "error", f"the plugin script in {where} did not report the user it ran as.", raw
+        if count is None:
+            return (
+                "error",
+                f"the plugin script in {where} did not report its count of the image's plugin "
+                f"directories: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                raw,
+            )
+        if count < 1 or count != len(plugins):
+            return (
+                "error",
+                f"the plugin script in {where} read {len(plugins)} plugin directories against a "
+                f"count of {count}: {stdout.strip()[-_REASON_TAIL_CHARS:]}",
+                raw,
+            )
+
+        # A `differ` unit whose every diff line is an entry only the copy has is
+        # a copy with extras, not a stale one: `diff -rq` prints "Only in
+        # <dir>: <name>" for such an entry, and <dir> is the copy's own path or
+        # one beneath it. A line about the image side ("Only in <image dir>")
+        # or about content ("Files ... differ") keeps the unit a difference.
+        extras: list[str] = []
+        for path, state in list(plugins.items()):
+            if state != "differ":
+                continue
+            only_in_copy = [
+                line for line in diffs[path]
+                if line.startswith(_DIFF_ONLY_IN_PREFIX + path)
+                and line[len(_DIFF_ONLY_IN_PREFIX) + len(path) :][:1] in (":", "/")
+            ]
+            if diffs[path] and len(only_in_copy) == len(diffs[path]):
+                extras.extend(only_in_copy)
+                plugins[path] = "same"
+                diffs[path] = []
+        raw["extra"] = extras
+
+        def detail(path: str) -> str:
+            shown = diffs[path][:_MAX_DIFF_LINES]
+            more = len(diffs[path]) - len(shown)
+            return "; ".join(shown) + (f"; and {more} more" if more > 0 else "")
+
+        wrong = []
+        for path, state in plugins.items():
+            if state == "differ":
+                wrong.append(f"{path} differs from the image: {detail(path)}")
+            elif state == "missing":
+                wrong.append(f"{path} is missing")
+            elif state == "symlink":
+                wrong.append(f"{path} has been replaced by a symlink")
+            elif path in owners and owners[path] != uid:
+                wrong.append(f"{path} is owned by uid {owners[path]}, not the agent's {uid}")
+        if wrong:
+            return "fail", "; ".join(wrong) + ".", raw
+        broken = [f"{p}: {detail(p) or s}" for p, s in plugins.items() if s not in ("same", "present")]
+        broken += [f"{p}: owner unread" for p in plugins if p not in owners]
+        if broken:
+            return "error", f"diff could not compare every plugin in {where}: {'; '.join(broken)}.", raw
+        beside = f" ({len(extras)} {'entry' if len(extras) == 1 else 'entries'} beside them that the image does not ship, reported in raw)" if extras else ""
+        return (
+            "pass",
+            f"all {count} plugin directories the image ships are on the volume in {where}, "
+            f"owned by the agent and matching the image{beside}.",
+            raw,
+        )
+
 
 # findings_queue.py: STATES, every state a row can be in.
 FindingState = Literal["queued", "surfaced", "snoozed", "accepted", "dismissed", "resolved", "stale"]
@@ -9129,7 +9722,7 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
+def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool = False) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
@@ -9137,7 +9730,9 @@ def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
     it has one (absent stays absent), each further top-level
     key named in ``keys`` (a ``required_envelope`` key; absent reads ``null``),
     and the ids of the findings in its ``document`` (this run's own, never ids it
-    only carried), or the ``error`` that kept it unread. The rest stays in the pod.
+    only carried), or the ``error`` that kept it unread. With ``excerpts``, also
+    each finding's ``evidence.excerpt`` as ``finding_excerpts`` (id -> excerpt),
+    which ``finish`` takes from the collector. The rest stays in the pod.
     """
     wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
@@ -9152,6 +9747,11 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
             entry[{_ENVELOPE_STARTED_KEY!r}] = envelope[{_ENVELOPE_STARTED_KEY!r}]
         findings = (envelope.get("document") or {{}}).get("findings") or []
         entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
+        if {excerpts!r}:
+            entry["finding_excerpts"] = {{
+                str(f.get("id", "")): str((f.get("evidence") or {{}}).get("excerpt") or "")
+                for f in findings if isinstance(f, dict)
+            }}
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
@@ -9178,10 +9778,10 @@ def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float)
 
 
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = ()
+    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = (), excerpts: bool = False
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit, keys), timeout)
+    reply = shell(report_store_command(audit, keys, excerpts), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -9210,8 +9810,14 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
     the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), and has, for each ``required_finding_phrases`` entry, a finding
-    in its ``document`` whose id contains it. ``current_ids`` is not read: it
+    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it, and has no finding whose id
+    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
+    that plants a look-alike the check must leave alone), and, for each
+    ``required_evidence_phrases`` entry, a finding whose id contains a
+    ``required_finding_phrases`` entry and whose ``evidence.excerpt`` contains
+    it: what the collector observed and ``finish`` published, read where it was
+    stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
     also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
@@ -9223,6 +9829,8 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
+    forbidden_finding_phrases: list[str] = Field(default_factory=list)
+    required_evidence_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
     # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
@@ -9233,6 +9841,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @model_validator(mode="after")
+    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
+        if self.required_evidence_phrases and not self.required_finding_phrases:
+            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
+        return self
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         snap = transcript.get()
@@ -9252,7 +9866,9 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         envelopes: list[dict[str, Any]] = []
         read_any = False
         for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(shell, self.audit, read_timeout, tuple(self.required_envelope))
+            listing = read_report_store(
+                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
+            )
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
@@ -9307,6 +9923,10 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         for envelope in fresh:
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
+            excerpts = envelope.get("finding_excerpts") or {}
+            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
+            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
             wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
@@ -9317,6 +9937,10 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            elif present:
+                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
+            elif unevidenced:
+                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw

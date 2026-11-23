@@ -39,7 +39,10 @@ so that the guest prints the startup-script failure line again: it prints it
 at boot only, and the serial buffer the GCE audit reads rotates it out within
 about three weeks. Only the one instance the project's state records at that
 address is reset; a reset that fails is a warning on the project's outcome,
-never a failure of it. `--no-fixture-refresh` skips the reset.
+never a failure of it. `--no-fixture-refresh` skips the reset. The serial-flood
+VM (`google_compute_instance.serial_flood`) is never reset: its designed state
+is a console whose boot lines have rotated out, which the VM renews itself,
+and a reset would put a fresh failure line on it.
 """
 
 import argparse
@@ -160,16 +163,17 @@ WORKER_DRAIN_SECONDS = INTERRUPT_GRACE_SECONDS + WORKER_DRAIN_MARGIN_SECONDS
 WORKER_JOIN_STEP_SECONDS = 0.2
 FLEET_SUBDIR = "bench/tf/fleet"
 # The files that change what a run applies: the stack and its lock file, the
-# allowlist the inspection reads, the program the stack's `external` data
-# source runs for seeded-b's pin, and the two the local-execs run (the
-# scaled-zero-gateway fixture's status and seeded-a's ConfigConnector
-# object). README.md and fixtures.json live beside
+# allowlist the inspection reads, the programs the stack's two `external` data
+# sources run (seeded-b's pin, and the orphaned snapshots' probe), and the
+# three the local-execs run (the scaled-zero-gateway fixture's status,
+# seeded-a's ConfigConnector object, and the orphaned snapshots' planter,
+# the probe's own file). README.md and fixtures.json live beside
 # them and tofu never reads them, so they do not move the fleet tree: a
 # docs-only merge neither stops a running reconcile nor needs one. A new input
 # kind (a tfvars file, a templatefile source) goes here, into the postsubmit's
 # run_if_changed in oss-test-infra, and into docs/ci-pool-projects.md 6.2.
 FLEET_INPUT_SUFFIXES = (".tf", ".hcl")
-FLEET_INPUT_NAMES = ("reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py")
+FLEET_INPUT_NAMES = ("reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py")
 GIT_TIMEOUT_SECONDS = 120
 # Prow's identifiers for the build, kept in the report and the markers.
 BUILD_ID_ENV = "BUILD_ID"

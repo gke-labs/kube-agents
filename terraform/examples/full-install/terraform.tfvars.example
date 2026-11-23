@@ -101,11 +101,21 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # namespace. Only for a long-lived install whose own state owns the release.
 # helm_upgrade_install = true
 
+# A chat `stop` also stops the conversation's kanban cards (A2A_CARD_STOP on
+# the operator). Off by default.
+# card_stop_enabled = true
+
 # The PlatformAgent's spec.storage.size: the agent's data volume and the shell
 # sandbox's, which the operator gives the same size. The default passes
 # nothing, so the operator default applies. Raising it grows both claims; a lower value is
 # refused. See variables.tf.
 # platform_agent_storage_size = "50Gi"
+
+# The PlatformAgent's spec.deployment.sizingProfile: auto | small | medium | fleet
+# (or "" to omit). Defaults to "auto", which promotes runtime pods at 10 and 25
+# clusters under namespace quota/LimitRange admission checks. Separate from
+# sizing_profile above, which sizes Standard node pools.
+# platform_agent_sizing_profile = "auto"
 
 # Optional Google Chat backend (Pub/Sub topic + subscription, Chat APIs);
 # the CR's googleChat integration is wired to the created topic/subscription
@@ -113,6 +123,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # (see the README).
 # enable_google_chat        = true
 # google_chat_allowed_users = ["you@example.com"]
+# google_chat_home_channel_policy = "auto"   # or "manual": with no google_chat_home_channel, "auto" learns it from the first mention in a named space
 
 # Model routing for the bundled LiteLLM gateway (defaults: gemini and the
 # provider's default model; set the matching *_api_key above).

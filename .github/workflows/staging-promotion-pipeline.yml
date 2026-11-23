@@ -21,6 +21,10 @@ name: "Staging: Promotion Pipeline"
 #           `Staging: Deploy` (staging-deploy.yml) reacts to, atomically
 #           reconciling the Terraform composition, Helm release, and container
 #           images together from that single validated commit.
+#   step 6b dispatches `Release: Scheduler` (release-scheduler.yml), which reads
+#           the tag graph and, when that tag makes a release eligible, dispatches
+#           release-publish.yml, which publishes it, without waiting for the
+#           scheduler's daily tick.
 #
 # The split exists because both tags would otherwise be the same tag, and a
 # single tag cannot both start an eval and wait for it: staging-deploy.yml would
@@ -33,8 +37,8 @@ name: "Staging: Promotion Pipeline"
 # `nightly` and take the `nightly-environment` lock, so none of them queues
 # behind or races the
 # three-hourly RC pipeline. Step 1 binds `nightly` for its variables without
-# taking the lock; steps 4 to 6 push and delete Git tags and read a GCS bucket,
-# so they do neither. Teardown runs concurrently with them for that reason — see
+# taking the lock; steps 4 to 6b push and delete Git tags, read a GCS bucket and
+# dispatch a workflow, so they do neither. Teardown runs concurrently with them for that reason — see
 # its own comment for why waiting on the eval would strand a cluster for hours.
 #
 # Dispatch-only on purpose: scheduled execution is owned by staging-promotion-scheduler.yml
@@ -62,9 +66,10 @@ on:
 # drives the environment end to end, another nightly, out of those gaps.
 #
 # The eval wait makes a run last up to roughly eight hours rather than three, so
-# this group is now held for most of a working day. That is still well inside the
-# scheduler's daily tick, and the environment itself is released much earlier:
-# teardown does not wait on the eval.
+# this group is now held for most of a working day. The environment itself is
+# released much earlier: teardown does not wait on the eval. A run that ends
+# after the GA scheduler's daily tick asks the scheduler to evaluate again
+# (step 6b), so the tick's time no longer bounds the run.
 concurrency:
   group: staging-promotion-pipeline
   cancel-in-progress: false
@@ -302,6 +307,7 @@ jobs:
           GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
           GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
           GOOGLE_CHAT_HOME_CHANNEL: ${{ vars.GOOGLE_CHAT_HOME_CHANNEL }}
+          GOOGLE_CHAT_HOME_CHANNEL_POLICY: ${{ vars.GOOGLE_CHAT_HOME_CHANNEL_POLICY }}
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
           CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
           ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
@@ -313,8 +319,10 @@ jobs:
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
           HELM_UPGRADE_INSTALL: ${{ vars.HELM_UPGRADE_INSTALL }}
+          CARD_STOP_ENABLED: ${{ vars.CARD_STOP_ENABLED }}
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
+          PLATFORM_AGENT_SIZING_PROFILE: ${{ vars.PLATFORM_AGENT_SIZING_PROFILE }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
@@ -618,6 +626,44 @@ jobs:
           STAGING_TAG: ${{ needs.step-1-resolve-candidate.outputs.staging_tag }}
         run: ./scripts/release/tag_staging_promotion.sh
 
+  # The GA scheduler's daily tick (release-scheduler.yml, 06:17 UTC) read the
+  # tag graph three minutes before this run tagged on 2026-11-18, and the
+  # candidate shipped a day late. The run that pushed the tag is the one place
+  # that knows the gate moved, so it asks the scheduler to evaluate now. The
+  # scheduler decides as it always does, from the tag graph. When this dispatch
+  # and the tick overlap a publish still in flight, both may start
+  # release-publish.yml; its own concurrency lock and its re-evaluation under
+  # schedule_gate=evaluate are what make the second publish nothing. The
+  # scheduler evaluates on main only, so this job runs only there. A failure
+  # here costs a day, not a release: the next tick evaluates the same tag.
+  step-6b-dispatch-ga-scheduler:
+    name: Step 6b - Ask the GA Scheduler to Evaluate the Promotion
+    needs: [step-1-resolve-candidate, step-6-create-staging-tag]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      github.ref == 'refs/heads/main' &&
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true' &&
+      needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The default token dispatches only with this. `workflow_dispatch` is
+      # exempt from the recursion suppression on runs the default token starts.
+      actions: write
+    steps:
+      - name: Checkout the dispatch script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release
+
+      - name: Dispatch the GA release scheduler
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_TAG: ${{ needs.step-1-resolve-candidate.outputs.staging_tag }}
+        run: ./scripts/release/dispatch_release_scheduler.sh
+
   step-7-teardown-env:
     name: Step 7 - Tear Down Nightly Environment
     # A failure in resolve or the matrix leaves the environment standing to be
@@ -627,15 +673,16 @@ jobs:
     # drop the gate and start destroying the environments this exists to
     # preserve. A failed deploy is the exception, below.
     #
-    # Steps 4 to 6 are deliberately absent from the list, and step 5 makes that
+    # Steps 4 to 6b are deliberately absent from the list, and step 5 makes that
     # load-bearing rather than merely tidy. Waiting on the eval would hold a GKE
     # cluster for the five and a half hours the poller is allowed, every night,
     # for a verdict about container images already in GHCR that the cluster has
     # no part in producing. The nomination, its withdrawal and the promotion have
     # only credential failure modes — an invalid GitHub App key or ID, a rejected
-    # push — which leave nothing on the cluster worth looking at either. Running
-    # them all concurrently is safe, because none of steps 4 to 6 touches a GCP
-    # resource and this job holds the nightly-environment lock.
+    # push, a refused workflow dispatch — which leave nothing on the cluster
+    # worth looking at either. Running them all concurrently is safe, because
+    # none of steps 4 to 6b touches a GCP resource and this job holds the
+    # nightly-environment lock.
     #
     # `step-3b-rollback-leg` is in the list for ordering alone: it holds the
     # cluster after the matrix, and a red leg gates nothing, so its result is

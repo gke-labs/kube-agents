@@ -41,7 +41,7 @@ from typing import Any
 import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
-from kube_agents_bench import pushed_report, scope_exclude, stop_hook, worker_trajectory
+from kube_agents_bench import pushed_report, scope_exclude, session_cap, stop_hook, worker_trajectory
 from kube_agents_bench.lane import REQUESTED_KEY as _REQUESTED_KEY
 from kube_agents_bench.lane import LaneSafeguardsError as _LaneSafeguardsError
 from kube_agents_bench.lane import declared_pull_requests as _lane_declared_pull_requests
@@ -75,9 +75,9 @@ __all__ = [
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
 #   ``scope_exclude.py``), ``writes_alone`` and ``requested_pull_requests``
 #   (read by ``lane.py`` and by ``load_case``), ``suite``
-#   (``certification``: the case runs on the certification lane only; the
+#   (``validated-capabilities``: the case runs on the validated-capabilities lane only; the
 #   lane and scripts/validate_bench_cases.py read the bare line from the task
-#   file), ``certification_part`` (which section of that lane, default 1)
+#   file), ``suite_part`` (which section of that lane, default 1)
 #   -- and ``task_version``, a
 #   case's own revision note that nothing reads. A new one is added here, in a
 #   pull request before any case a pull-request job grades uses it (the
@@ -91,7 +91,7 @@ REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
         "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
-        "certification_part",
+        "suite_part",
         _REQUESTED_KEY,
     }
 )
@@ -105,10 +105,12 @@ NOOP_DEPLOYER = "noop"
 
 # The check types that read the run's own tool calls or worker logs rather
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
-# ``worker_commands`` the delegated cards' worker logs (and, with
-# ``after_result_pattern``, the workers' trajectory entries as typed), ``worker_agents`` the
+# ``worker_commands`` the delegated cards' worker logs and the workers'
+# tagged ``terminal`` and ``execute_code`` entries in the trajectory (the
+# verifier's docstring says which check reads which record), ``worker_agents`` the
 # ``agent`` tags the harness puts on the workers' trajectory entries,
-# ``worker_budget`` the cards' run rows the same read collects. On the
+# ``worker_budget`` the checkpoint notice in the workers' tagged results and
+# the cards' run rows the same read collects. On the
 # inject transport they are blind in two different ways, and the scorer
 # sets each aside under its own condition (``scoring.py``, the inject lane).
 # ``tool_called`` in its default ``router`` scope reads the delegating
@@ -149,7 +151,9 @@ HARNESS_WRITTEN_ENTRIES = frozenset(
     {
         stop_hook.STOP_ENTRY,
         stop_hook.CARDS_STOPPED_ENTRY,
+        stop_hook.CANCEL_REPORTED_ENTRY,
         pushed_report.PLANT_ENTRY,
+        session_cap.QUEUED_ENTRY,
         worker_trajectory.GAP_ENTRY,
         worker_trajectory.NO_WORKER_CALLS_ENTRY,
     }

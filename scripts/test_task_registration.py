@@ -17,8 +17,9 @@ module returns rather than on a hand-listed set of substrings, which is what
 TestEveryTaskIsValid's whole-set assertion is for -- see its docstring for the
 rules that leaked through before it existed. `make bench-case-check` is
 invoked by no workflow; this lint, reached through PYTHON_TEST_DIRS in the
-Makefile and run by .github/workflows/python-tests.yml, is the whole of the
-enforcement on a pull request. A case passes by an entry in the presubmit
+Makefile and run by .github/workflows/python-tests.yml, is the enforcement on
+a pull request for every rule but one: the rule that needs the harness's parser
+is held by bench/tests/test_case_entries_load.py, in the job that installs it. A case passes by an entry in the presubmit
 file, by an entry in the nightly file (where a new case lands by default and
 earns a presubmit seat on its record -- decided 2026-09-15 on #1546/#1564),
 by a FIXTURE_NOT_READY entry in the validator naming the issue that plants
@@ -46,6 +47,7 @@ import re
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from unittest import mock
 import unittest.mock
@@ -90,7 +92,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         )
 
     def test_every_task_is_in_exactly_one_place(self):
-        # Presubmit, nightly, the certification suite line, FIXTURE_NOT_READY
+        # Presubmit, nightly, the validated-capabilities suite line, FIXTURE_NOT_READY
         # and KNOWN_UNREGISTERED are five answers to one question; a case with
         # two of them has a stale one. The shell rejects the presubmit/nightly overlap itself (it
         # would run the case twice a night); the allowlist overlaps are the
@@ -98,7 +100,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
-            "suite: certification (task files)": set(eval_rosters.certification_cases()),
+            "suite: validated-capabilities (task files)": set(eval_rosters.validated_capabilities_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -597,7 +599,7 @@ class TestTheValidatorItself(unittest.TestCase):
             path.parent.mkdir()
 
             path.write_text(yaml.safe_dump(spec))
-            with contextlib.redirect_stdout(io.StringIO()) as clean:
+            with contextlib.redirect_stdout(io.StringIO()) as clean, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(
                     validator.main([str(path)]),
                     0,
@@ -608,7 +610,7 @@ class TestTheValidatorItself(unittest.TestCase):
             # One rule broken -- an unknown domain -- is enough. Which rule
             # does not matter; that main() propagates any finding does.
             path.write_text(yaml.safe_dump({**spec, "domain": "not-a-real-domain"}))
-            with contextlib.redirect_stdout(io.StringIO()) as dirty:
+            with contextlib.redirect_stdout(io.StringIO()) as dirty, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(
                     validator.main([str(path)]),
                     1,
@@ -616,6 +618,169 @@ class TestTheValidatorItself(unittest.TestCase):
                     "reports success on a broken tree",
                 )
             self.assertIn("rejected", dirty.getvalue())
+
+
+class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
+    """The rule that loads each entry with the harness's reader and parser, in a job that
+    does not install the bench package (this one), with stand-ins for the two.
+    bench/tests/test_case_entries_load.py holds the rule against the real parser."""
+
+    ENTRY = {"name": "names-the-thing", "role": "objective", "check": {"type": "report_contains", "required_phrases": ["x"]}}
+    REFUSED = "Extra inputs are not permitted: 'no_such_field'"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = pathlib.Path(self.tmp.name) / "made-up-case" / "task.yaml"
+        self.path.parent.mkdir()
+        self.sent: list[list[dict]] = []
+
+    def _write(self, *entries, **top):
+        self.path.write_text(yaml.safe_dump({**TestTheRulesReject.VALID, "verification_spec": list(entries), **top}))
+
+    def _harness(self, errors=(), raises=None):
+        """A stand-in for the harness's reader and parser that records what the parser got."""
+
+        def parse(entries):
+            self.sent.append(entries)
+            if raises:
+                raise raises
+            return [], [{"name": entries[0]["name"], "reason": reason} for reason in errors]
+
+        return mock.patch.object(validator, "spec_parser", return_value=(yaml.safe_load, parse))
+
+    def _installed(self, package_dir):
+        """Stand-in modules for a bench package that is installed with its files in `package_dir`."""
+        bench = types.ModuleType("kube_agents_bench")
+        bench.__file__ = str(package_dir / "__init__.py") if package_dir else None
+        loader = types.ModuleType("devops_bench.tasks.loader")
+        loader.safe_parse_yaml = yaml.safe_load
+        spec = types.ModuleType("devops_bench.verification.spec")
+        spec.parse_entries = lambda entries: ([], [{"name": entries[0]["name"], "reason": self.REFUSED}])
+        modules = {name: types.ModuleType(name) for name in ("devops_bench", "devops_bench.tasks", "devops_bench.verification")}
+        modules.update({"kube_agents_bench": bench, "devops_bench.tasks.loader": loader, "devops_bench.verification.spec": spec})
+        validator.spec_parser.cache_clear()
+        self.addCleanup(validator.spec_parser.cache_clear)
+        return mock.patch.dict(sys.modules, modules)
+
+    def test_the_rule_reports_nothing_without_the_parser(self):
+        self._write(self.ENTRY)
+        with mock.patch.object(validator, "spec_parser", return_value=validator.FIELD_CHECK_SKIPPED):
+            self.assertEqual(validator.unloadable_entries(self.path), [])
+
+    def test_a_bench_package_of_this_checkout_gives_the_parser(self):
+        self._write(self.ENTRY)
+        with self._installed(validator.BENCH_DIR / "kube_agents_bench"):
+            self.assertNotIsInstance(validator.spec_parser(), str)
+            self.assertEqual(
+                validator.unloadable_entries(self.path),
+                [f"check 'names-the-thing': {validator.UNLOADABLE_ENTRY}: {self.REFUSED}"],
+            )
+
+    def test_a_checkout_that_is_installed_through_a_link_is_this_checkout(self):
+        link = pathlib.Path(self.tmp.name) / "link-to-bench"
+        link.symlink_to(validator.BENCH_DIR, target_is_directory=True)
+        with self._installed(link / "kube_agents_bench"):
+            self.assertNotIsInstance(validator.spec_parser(), str)
+
+    def test_a_copy_of_the_package_gives_the_note_wherever_it_is(self):
+        """A copy that an install made is as old as that install, also under this checkout's
+        `bench/`; and a module with no file has no place that can be compared."""
+        copy = validator.BENCH_DIR / ".venv" / "lib" / "python3.12" / "site-packages" / "kube_agents_bench"
+        for package_dir, shown in ((copy, str(copy.resolve())), (None, "a package with no file")):
+            with self.subTest(package=shown), self._installed(package_dir):
+                self.assertEqual(validator.spec_parser(), validator.FIELD_CHECK_STALE.format(path=shown))
+
+    def test_a_bench_package_of_another_checkout_gives_a_note_and_no_verdict(self):
+        """An older checkout's package does not know a check type or a field that this tree added,
+        so its verdict on this tree's cases would be a false one."""
+        self._write(self.ENTRY)
+        other = pathlib.Path(self.tmp.name).resolve() / "older-checkout" / "bench" / "kube_agents_bench"
+        with self._installed(other):
+            note = validator.spec_parser()
+            self.assertEqual(note, validator.FIELD_CHECK_STALE.format(path=other))
+            self.assertTrue(note.startswith("bench-case-check: the field check did NOT run"))
+            self.assertIn("installed, but behind the tree", note)
+            self.assertIn("make test-bench-deps", note)
+            # The stand-in parser refuses the entry; the rule must not ask it.
+            self.assertEqual(validator.unloadable_entries(self.path), [])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                self.assertEqual(validator.main([str(self.path)]), 0)
+            self.assertTrue(output.getvalue().endswith(f"{note}\n"), output.getvalue())
+
+    def test_the_rule_reports_what_the_parser_refuses(self):
+        self._write(self.ENTRY)
+        with self._harness(errors=[self.REFUSED]):
+            self.assertEqual(
+                validator.validate_case("made-up-case", self.path, registered=None),
+                [f"check 'names-the-thing': {validator.UNLOADABLE_ENTRY}: {self.REFUSED}"],
+            )
+
+    def test_a_parser_that_raises_is_a_problem_of_its_entry(self):
+        """The command must name the case and the entry, not stop with a traceback that hides every other case."""
+        self._write(self.ENTRY)
+        with self._harness(raises=re.error("missing ), unterminated subpattern")):
+            (problem,) = validator.validate_case("made-up-case", self.path, registered=None)
+        self.assertTrue(problem.startswith(f"check 'names-the-thing': {validator.PARSER_RAISED}: "), problem)
+        self.assertIn("unterminated subpattern", problem)
+
+    def test_a_case_that_another_rule_faults_does_not_go_to_the_parser(self):
+        """One defect is one problem: the parser refuses most of what the other rules refuse.
+        The rules reach an entry from inside the entry loop (an unknown type) and from outside it
+        (a fleet placeholder in `fixture_role`, a role that `fixtures:` does not declare)."""
+        role_check = {"type": "fleet_resource_property", "kind": "deployment", "resource_name": "x", "namespace": "y", "path": "spec.replicas", "op": "eq", "value": 1}
+        for needle, check in (
+            ("unknown check type 'no_such_type'", {"type": "no_such_type"}),
+            ("carries a fleet placeholder", {**role_check, "fixture_role": "{{FLEET_CLUSTER_NAME:rbac-overgrant}}"}),
+            ("own 'fixtures:' list does not declare", {**role_check, "fixture_role": "Rbac-Overgrant"}),
+        ):
+            with self.subTest(needle=needle):
+                self.sent.clear()
+                self._write({**self.ENTRY, "name": "faulted", "check": check}, self.ENTRY)
+                with self._harness(errors=[self.REFUSED]):
+                    problems = validator.validate_case("made-up-case", self.path, registered=None)
+                self.assertEqual(self.sent, [])
+                self.assertTrue(any(needle in problem for problem in problems), problems)
+                self.assertFalse(any(validator.UNLOADABLE_ENTRY in problem for problem in problems), problems)
+
+    def test_a_file_that_the_harness_cannot_read_is_a_problem_of_the_case(self):
+        self._write(self.ENTRY)
+
+        def unreadable(text):
+            raise ValueError("while constructing a mapping")
+
+        with mock.patch.object(validator, "spec_parser", return_value=(unreadable, None)):
+            self.assertEqual(
+                validator.unloadable_entries(self.path),
+                [f"{validator.HARNESS_CANNOT_READ}: ValueError: while constructing a mapping"],
+            )
+
+    def test_the_command_says_last_that_the_rule_did_not_run(self):
+        for domain, status in (("security", 0), ("not-a-real-domain", 1)):
+            self._write(self.ENTRY, domain=domain)
+            for installed in (False, True):
+                with self.subTest(exit_status=status, parser_installed=installed):
+                    # One buffer for both streams, so that the order is seen.
+                    output = io.StringIO()
+                    harness = self._harness() if installed else mock.patch.object(validator, "spec_parser", return_value=validator.FIELD_CHECK_SKIPPED)
+                    with harness, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                        # The note changes no exit status: the other rules decide it.
+                        self.assertEqual(validator.main([str(self.path)]), status)
+                    text = output.getvalue()
+                    self.assertIn("rejected" if status else "OK", text)
+                    if installed:
+                        self.assertNotIn(validator.FIELD_CHECK_SKIPPED, text)
+                    else:
+                        self.assertTrue(text.endswith(f"{validator.FIELD_CHECK_SKIPPED}\n"), text)
+                        # On stderr: a caller that reads stdout for "OK" still sees the note on a terminal.
+                        errors = io.StringIO()
+                        with mock.patch.object(validator, "spec_parser", return_value=validator.FIELD_CHECK_SKIPPED):
+                            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+                                validator.main([str(self.path)])
+                        self.assertEqual(errors.getvalue(), f"{validator.FIELD_CHECK_SKIPPED}\n")
+                        self.assertTrue(validator.FIELD_CHECK_SKIPPED.startswith("bench-case-check: the field check did NOT run"))
+                        self.assertIn("make test-bench-deps", validator.FIELD_CHECK_SKIPPED)
 
 
 class TestTheRulesReject(unittest.TestCase):
@@ -642,14 +807,14 @@ class TestTheRulesReject(unittest.TestCase):
         ],
     }
 
-    def _validate(self, *, registered=frozenset({"made-up-case"}), certification=None, text=None, **overrides):
+    def _validate(self, *, registered=frozenset({"made-up-case"}), validated_capabilities=None, text=None, **overrides):
         spec = {k: v for k, v in {**self.VALID, **overrides}.items() if v is not DELETE}
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text if text is not None else yaml.safe_dump(spec))
             return validator.validate_case(
-                "made-up-case", path, registered=set(registered), certification=None if certification is None else set(certification)
+                "made-up-case", path, registered=set(registered), validated_capabilities=None if validated_capabilities is None else set(validated_capabilities)
             )
 
     def _only(self, needle, **kwargs):
@@ -666,48 +831,48 @@ class TestTheRulesReject(unittest.TestCase):
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
 
-    # -- the certification suite: the bare line is the registration --
+    # -- the validated-capabilities suite: the bare line is the registration --
 
-    def test_a_certification_case_registers_by_its_line(self):
+    def test_a_validated_capabilities_case_registers_by_its_line(self):
         # Registered nowhere else: the line is the registration, so the
         # "registered nowhere" finding stays quiet.
-        self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+        self.assertEqual(self._validate(suite="validated-capabilities", validated_capabilities=set(), registered=set()), [])
 
     def test_a_suite_spelling_the_lane_does_not_read_is_reported(self):
-        for text in ('id: made-up-case\nsuite: "certification"\n', "id: made-up-case\nsuite: certification  # the page row\n"):
+        for text in ('id: made-up-case\nsuite: "validated-capabilities"\n', "id: made-up-case\nsuite: validated-capabilities  # the page row\n"):
             with self.subTest(text=text):
                 spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
-                self._only("spelling the lane does not read", text=text + spec, certification=set())
+                self._only("spelling the lane does not read", text=text + spec, validated_capabilities=set())
 
     def test_a_crlf_suite_line_is_a_spelling_the_lane_does_not_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
-            spec = yaml.safe_dump({**self.VALID, "suite": "certification"})
+            spec = yaml.safe_dump({**self.VALID, "suite": "validated-capabilities"})
             path.write_bytes(spec.replace("\n", "\r\n").encode())
-            problems = validator.validate_case("made-up-case", path, registered=set(), certification=set())
+            problems = validator.validate_case("made-up-case", path, registered=set(), validated_capabilities=set())
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("spelling the lane does not read", problems[0])
 
     def test_a_part_line_is_accepted_bare_and_reported_otherwise(self):
-        self.assertEqual(self._validate(suite="certification", certification_part=2, certification=set()), [])
-        self._only("without 'suite: certification'", certification_part=2)
-        self._only("is not a whole number from 1", suite="certification", certification_part="2", certification=set())
-        self._only("is not a whole number from 1", suite="certification", certification_part=0, certification=set())
+        self.assertEqual(self._validate(suite="validated-capabilities", suite_part=2, validated_capabilities=set()), [])
+        self._only("without 'suite: validated-capabilities'", suite_part=2)
+        self._only("is not a whole number from 1", suite="validated-capabilities", suite_part="2", validated_capabilities=set())
+        self._only("is not a whole number from 1", suite="validated-capabilities", suite_part=0, validated_capabilities=set())
         spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
-        self._only("spelling the lane does not read", text="id: made-up-case\nsuite: certification\ncertification_part: 2  # note\n" + spec, certification=set())
+        self._only("spelling the lane does not read", text="id: made-up-case\nsuite: validated-capabilities\nsuite_part: 2  # note\n" + spec, validated_capabilities=set())
 
     def test_a_parked_case_may_not_carry_the_suite_line(self):
         with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
-            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="validated-capabilities", validated_capabilities=set(), registered=set())
         with unittest.mock.patch.dict(validator.KNOWN_UNREGISTERED, {"made-up-case": "must not run"}, clear=False):
-            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="validated-capabilities", validated_capabilities=set(), registered=set())
 
     def test_a_suite_case_in_a_roster_file_is_reported(self):
-        self._only("runs on that lane only", suite="certification", certification={"made-up-case"})
+        self._only("runs on that lane only", suite="validated-capabilities", validated_capabilities={"made-up-case"})
 
     def test_an_unknown_suite_is_reported(self):
-        self._only("the only suite is 'certification'", suite="nightly")
+        self._only("the only suite is 'validated-capabilities'", suite="nightly")
 
     # -- the first-install-hello stack's phrase --
 
@@ -993,7 +1158,7 @@ class TestTheRulesReject(unittest.TestCase):
         problem = self._only(
             "declares no 'fixtures:'",
             fixtures=DELETE,
-            verification_spec=self._entry(check={"type": "fleet_resource_property", "fixture_role": "crashloop-workload", "kind": "deployment", "name": "payments-api", "namespace": "seeded-debug", "property_path": "spec.replicas", "op": "eq", "expected": 1}),
+            verification_spec=self._entry(check={"type": "fleet_resource_property", "fixture_role": "crashloop-workload", "kind": "deployment", "resource_name": "payments-api", "namespace": "seeded-debug", "path": "spec.replicas", "op": "eq", "value": 1}),
         )
         self.assertIn("reads live cluster state (fleet_resource_property)", problem)
 
@@ -1026,6 +1191,23 @@ class TestTheRulesReject(unittest.TestCase):
         self._only("doesn't list", prompt="on {{FLEET_CLUSTER_NAME:crashloop-workload}}", fixtures=["rbac-overgrant"])
         problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:not-a-role}}", fixtures=["rbac-overgrant", "not-a-role"])
         self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
+
+    def test_a_profile_directive_is_held_to_the_shape_the_harness_reads(self):
+        # #5945: [bench:profile ...] addresses the ask to a profile; a
+        # malformed one errors every run before the agent sees the ask.
+        good = "[bench:profile name=cluster project=p1 location=us-east1 cluster=prod] what is failing"
+        self.assertEqual(self._validate(prompt=good), [])
+        self._only("name= is required", prompt="[bench:profile project=p1] what is failing")
+        self._only("no closing", prompt="[bench:profile name=cluster what is failing")
+        self._only("must open the prompt", prompt="what is failing [bench:profile name=cluster] here")
+
+    def test_a_profile_directives_intent_is_confirm_or_absent(self):
+        # The door takes intent "confirm" alone and answers 400 to anything
+        # else, after the lease; the lint refuses it before.
+        good = "[bench:profile name=cluster intent=confirm project=p1 location=us-east1 cluster=prod] open the PR"
+        self.assertEqual(self._validate(prompt=good), [])
+        self._only("intent=cancel is not one", prompt="[bench:profile name=cluster intent=cancel] open the PR")
+        self._only("intent=CONFIRM is not one", prompt="[bench:profile name=cluster intent=CONFIRM] open the PR")
 
     def test_a_fleet_placeholder_naming_a_project_scoped_role_is_rejected(self):
         # world-open-ingress is in the catalogue with cluster_slot: null: the
@@ -1597,10 +1779,10 @@ class TestTheSanitizer(unittest.TestCase):
             path.parent.mkdir()
             path.write_text(yaml.safe_dump(spec))
             (path.parent / "values.yaml").write_text("upstream: 192.0.2.53\n")
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(validator.main([str(path)]), 0)
             (path.parent / "values.yaml").write_text("upstream: 10.0.0.53\n")
-            with contextlib.redirect_stdout(io.StringIO()) as out:
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(validator.main([str(path)]), 1)
             self.assertIn("unsanitized fixture", out.getvalue())
             self.assertIn("10.0.0.53", out.getvalue())
@@ -1724,16 +1906,21 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
             self.assertEqual(validator._load_yaml(path), yaml.safe_load(text))
 
     def test_one_unreadable_case_does_not_hide_the_others(self):
-        broken = validator.TASKS_DIR / "zz-not-a-real-case" / "task.yaml"
-        broken.parent.mkdir(parents=True)
-        try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_dir = pathlib.Path(tmp)
+            broken = tasks_dir / "aa-not-a-real-case" / "task.yaml"
+            broken.parent.mkdir(parents=True)
             broken.write_text("id: [unclosed\n")
-            results = validator.validate_all()
-        finally:
-            broken.unlink()
-            broken.parent.rmdir()
-        self.assertIn("could not be parsed as YAML", " ".join(results["zz-not-a-real-case"]))
-        self.assertGreater(len(results), 1)
+            sibling = tasks_dir / "made-up-case" / "task.yaml"
+            sibling.parent.mkdir(parents=True)
+            sibling.write_text(yaml.safe_dump(TestTheRulesReject.VALID))
+            with (
+                unittest.mock.patch.object(validator, "TASKS_DIR", tasks_dir),
+                unittest.mock.patch.object(eval_rosters, "TASKS_DIR", tasks_dir),
+            ):
+                results = validator.validate_all()
+        self.assertIn("could not be parsed as YAML", " ".join(results["aa-not-a-real-case"]))
+        self.assertIn("registered nowhere", " ".join(results["made-up-case"]))
 
 
 if __name__ == "__main__":

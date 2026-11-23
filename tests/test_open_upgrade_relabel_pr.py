@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from check_pr_template import sections as template_sections  # noqa: E402
 from test_check_upgrade_table_releases import PAGE, Repo, row  # noqa: E402
 
 COPIED = (
@@ -30,6 +32,17 @@ COPIED = (
 SCRIPT = "scripts/release/open_upgrade_relabel_pr.sh"
 BRANCH = "relabel-upgrade-table/pending"
 ISOLATED_ENV_VARS = ("GIT_USER_NAME", "GIT_USER_EMAIL", "STUB_OPEN_PR")
+# The template the review bot holds every description to. The body the script writes is read
+# against the repository's own copy, so a section added there fails here until the script answers it.
+TEMPLATE = ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
+# A heading line as the description writes it, at the level the template gives it.
+HEADING_RE = re.compile(r"^(#{2,6}) (.+)$")
+UX_BOX_TICKED = "- [x] No user-visible change"
+BODY_FLAG = " --body "
+# How a line the stubs logged for a call starts; a body line starts with neither.
+STUBBED_CALL_PREFIXES = ("gh ", "npx ")
+NOT_LIVE_TESTED_PREFIX = "Not live-tested: "
+LIVE_VALIDATION_HEADING = "### Live validation"
 STUB = """#!/bin/sh
 echo "$(basename "$0") $*" >> "{log}"
 if [ "$(basename "$0")" = npx ]; then echo "npx GH_TOKEN=${{GH_TOKEN:-unset}}" >> "{log}"; fi
@@ -105,9 +118,69 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
         self.assertEqual(len(create), 1, self.calls())
         self.assertIn("--base main", create[0])
         self.assertIn(f"--head {BRANCH}", create[0])
-        self.assertIn("relabel the pending rows 1.0.0 shipped, fixing main's Documentation Checks", create[0])
+        self.assertIn("relabel the pending rows 1.0.0 shipped", create[0])
+        self.assertNotIn("fixing main's Documentation Checks", create[0])
         self.assertIn("`a shipped change` → 1.0.0", self.log.read_text(encoding="utf-8"))
         self.assertTrue(any(c.startswith("npx --yes prettier@3.9.6 --write") for c in self.calls()))
+
+    def body_given_to(self, command: str) -> list[str]:
+        """The body lines `command` was handed, up to the next stubbed call or the log's end."""
+        lines = self.calls()
+        start = next(i for i, line in enumerate(lines) if line.startswith(command))
+        rest = lines[start + 1:]
+        end = next((i for i, line in enumerate(rest) if line.startswith(STUBBED_CALL_PREFIXES)), len(rest))
+        # The stub logs its arguments on one line, so the body's first line follows the flag.
+        return [lines[start].split(BODY_FLAG, 1)[1], *rest[:end]]
+
+    def opened_body(self) -> list[str]:
+        return self.body_given_to("gh pr create")
+
+    def test_the_body_answers_every_section_of_the_pull_request_template(self):
+        self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
+        self.repo.tag("1.0.0")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.opened_body()
+        # The parser `make docs-check-pr-template` uses, so the two cannot read the template differently.
+        wanted = [heading for heading, _ in template_sections(TEMPLATE.read_text(encoding="utf-8"))]
+        self.assertTrue(wanted, "the template has no sections to hold the body to")
+        written = {m.group(2): i for i, line in enumerate(body) if (m := HEADING_RE.match(line))}
+        for heading in wanted:
+            with self.subTest(heading=heading):
+                self.assertIn(heading, written)
+                # An empty heading is not an answer: the next line that is not blank is text,
+                # not the next heading.
+                after = [line for line in body[written[heading] + 1:] if line.strip()]
+                self.assertTrue(after and not HEADING_RE.match(after[0]), f"{heading} is left empty")
+
+    def test_the_body_says_the_page_was_not_live_tested_and_ticks_the_ux_box(self):
+        self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
+        self.repo.tag("1.0.0")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.opened_body()
+        self.assertIn(UX_BOX_TICKED, body)
+        after_live = [line for line in body[body.index(LIVE_VALIDATION_HEADING) + 1:] if line.strip()]
+        self.assertTrue(after_live[0].startswith(NOT_LIVE_TESTED_PREFIX), after_live[0])
+
+    def test_a_later_release_rewrites_the_open_pull_requests_title_and_description(self):
+        self.repo.commit("feat: first", row=row("pending", "the first change"))
+        self.repo.tag("1.0.0")
+        self.assertEqual(self.run_script("1.0.0").returncode, 0)
+        self.repo.commit("feat: second", row=row("pending", "the second change"))
+        self.repo.tag("1.1.0")
+        self.log.write_text("", encoding="utf-8")
+        result = self.run_script("1.1.0", STUB_OPEN_PR="42")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        edit = [c for c in self.calls() if c.startswith("gh pr edit")]
+        self.assertEqual(len(edit), 1, self.calls())
+        self.assertIn("gh pr edit 42 ", edit[0])
+        self.assertIn("relabel the pending rows 1.0.0, 1.1.0 shipped", edit[0])
+        body = self.body_given_to("gh pr edit")
+        self.assertIn("- `the first change` → 1.0.0", body)
+        self.assertIn("- `the second change` → 1.1.0", body)
+        self.assertTrue(any("Written by the release workflow after it tagged 1.1.0" in line for line in body), body)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_prettier_from_npm_never_sees_the_token(self):
         self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))

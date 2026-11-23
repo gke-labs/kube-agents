@@ -138,6 +138,7 @@ spec:
     image: <registry>/kube-agents/agent-worker:2026.08 # headless-contract runner + adapter
     model: model-default # via LiteLLM, as today
     maxTurns: 250
+    # type: claude-code # optional; absent is claude-code
   tools: # each mounted read-only at /opt/tools/<name>, bin/ on PATH
     - name: helm
       image: <registry>/kube-agents/tools-helm:3.17 # /files/bin/helm
@@ -162,8 +163,9 @@ spec:
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `description`                           | The routing blurb - today's `CAPABILITIES.md` first line. Rendered into the A2A agent card.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `persona.image`                         | OCI artifact holding the persona (the neutral layout of #3656: `persona.yaml`, `instructions.md`, `skills/`, `mcp.yaml`) under the image's `/files` directory, mounted read-only at `/persona`. Image volume (with `subPath: files`), the `AgentPlugin` mechanism, including its fallback: where image volumes are unavailable (GKE Autopilot, Kubernetes below 1.35) an init container copies `/files` into an emptyDir, so the image must also ship `/bin/sh`. One image works in both modes. Rendered by `k8s-operator/internal/profilepod`. (Decided 8/24: OCI-only, no `configMapRef` variant.) |
-| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below). The harness is a container image choice, nothing more.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `harness.model`, `maxTurns`             | Model routing and the turn budget, as in profile config today.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `harness.type`                          | Optional: the harness the worker image runs, passed to the worker as `A2A_HARNESS` only when set. Absent is `claude-code`, the only value accepted today. Pod configuration only: not on the card, and no bus subject or permission depends on it. A type the operator doesn't render refuses the profile (`IdentityReady` False, `HarnessNotSupported`).                                                                                                                                                                                                                                            |
 | `tools`                                 | Optional list of `{name, image, imagePullPolicy}` (name at most 24 characters): OCI images of command-line tools, each with its payload under `/files` mounted read-only at `/opt/tools/<name>` (same mechanism and fallback as `persona.image`), and `/opt/tools/<name>/bin` put on `PATH` in list order, so one tools image serves every harness. A tools image holds no credentials; a tool that needs them gets them from the broker, per task. Rendered by `k8s-operator/internal/profilepod`.                                                                                                  |
 | `bus.publishTopics` / `subscribeTopics` | Topic grants beyond the task subjects every executor gets. The operator renders these into the auth callout's identity-to-permissions map; the deny-by-default posture is the deployment spec's.                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `identity.serviceAccountName`           | The KSA the pod runs as. Optional. Absent means the operator creates a KSA with **zero** RBAC bindings, which is the default posture - the token exists to authenticate to NATS, not to talk to the API server.                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -177,11 +179,12 @@ spec:
 | `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
 | `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-Everything here is dark content: the dispatcher and the profile CRD render nothing unless
-the mode switch says `next`.
+Everything here renders on every install; the `spec.mode` switch that once held it dark
+is gone.
 
 As built, the CRD reserves the name `platform`, because the Hermes bridge is that addressee's
-executor, and `resources` and `concurrency` are required rather than defaulted. The example
+executor, and refuses a new profile named `session`, the gateway's session route (one created
+before that rule keeps working), and `resources` and `concurrency` are required rather than defaulted. The example
 above and the platform worked profile below are design sketches from before the CRD existed.
 
 ## How a profile becomes a pod
@@ -199,7 +202,7 @@ carried a Role with pod create/delete/watch; that goes away.)
 **The dispatcher turns messages into Jobs.** A dispatcher controller in the operator
 binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. The
 dispatcher and the janitor run under the operator manager's leader election - the
-`--leader-elect` machinery the operator already ships, required on under `mode: next` -
+`--leader-elect` machinery the operator already ships, required on the operator Deployment (the chart passes `--leader-elect`) -
 so "one dispatcher" and "exactly one final event" are elected properties, not deployment
 accidents. Scaling the operator for HA changes nothing here: followers hold no
 consumers. Only a
@@ -362,9 +365,12 @@ What the operator renders per profile, as built (amended 10/6):
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
   ask the metadata server for the broker's Workload Identity token). The broker gives them a
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
-  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist, and,
-  with a task credential, the MCP relay for Developer Knowledge's two document reads alone
-  (`mcp_policy.PROFILE_SERVER_TOOLS`).
+  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist; with a
+  task credential, the MCP relay for Developer Knowledge's two document reads alone
+  (`mcp_policy.PROFILE_SERVER_TOOLS`); the version-control routes under the permit rule
+  below; and the audit-report store's `/v1/audit-reports` routes under the reports allowlist
+  and the builtin-schedule write rule (#5619,
+  [`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4).
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
@@ -391,6 +397,55 @@ What the operator renders per profile, as built (amended 10/6):
     without a credential, so `get-credentials <cluster> --help` is a help read.
     `gcloud config` and `gcloud auth` are refused whole, since even their reads print the
     broker's own account and default project.
+  - Version control (#3993). `/v1/vcs/` admits the profile role, and every verb there needs a
+    valid task credential: one with no credential is refused before the body is read, not
+    run local-only. The reads (`clone`, `proposal-view`, `proposal-list`, `proposal-commits`,
+    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more, except that an
+    `issue-list` whose `query` is not plain words (a `:`, quote, backslash or parenthesis,
+    or `OR`, `AND` or `NOT` as a word), or whose label names hold a quote or a backslash, is
+    refused (`PROFILE_QUERY_QUALIFIER`, rule `caller.vcs-query`): GitHub composes those
+    fields into a search ahead of its own `repo:` qualifier, and any of them could add a
+    qualifier, swallow that one, or make it an alternative, reaching past the managed
+    repository. An `identity` with no `repository` answers the install's managed
+    repositories instead (`{managedRepositories: [host/path, …]}`), the names every verb is
+    held to, with no repository resolved and no forge called, so a task that names none can
+    find the one it may use. `publish`,
+    `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
+    `vcs:proposal-create`, which the dispatcher mints only when the submission's
+    `changeRequested` is true, and only the gateway sets that, for a structured confirm. The
+    claim is a closed list of strings, allowed only on the `credential-proxy` audience: an
+    unknown permit, a malformed list or a `permits` key on a `nats` credential refuses the
+    token, in both verifiers. The permit names no repository; the managed list bounds where
+    every verb lands, a permitted write included. The permit names one task, so its writes
+    reach only what that task made (#6400): `publish` a branch the task already published, or
+    one absent from the remote, claimed by the first task to publish it; `proposal-create`
+    only from a branch the task published; `proposal-update` only on a proposal the task
+    opened (`PROPOSAL_NOT_THIS_TASKS`, rule `caller.vcs-ownership`). The record is the one
+    stateful broker pod's own memory, so a restart refuses a task's later writes rather than
+    permitting anyone's. Under the permit the writes are also held
+    to the install's own work (`VcsBroker.require_agent_proposal`, profile role only, rule
+    `caller.vcs-ownership`): `proposal-update` only on a proposal `forge.is_agent_pull_request`
+    calls the install's (opened by the credential's login, from a branch under
+    `platform-agent/`, in this repository rather than a fork); `publish` only to a branch
+    under `platform-agent/`, and, `advance` or not, onto a branch carrying open proposals only
+    when every one passes that same test (a full or truncated list is refused, and `advance`
+    still needs one open proposal); `proposal-create` only from a bare `platform-agent/` branch
+    of this repository, with no field beyond `repository`, `title`, `body`, `source`, `target`
+    and `draft`, so `owner:branch` and any source-repository field are refused. A
+    `proposal-update` carries only `repository`, `number`, `title` and `body`: a label edit
+    (`labelsAdd`, `labelsRemove`, or any key naming labels) is refused even on the install's
+    own proposal, with code `PROFILE_LABELS_FORBIDDEN` under rule `caller.vcs-labels`, since a
+    hold or an approval label is a person's call. A `branch` or `source` must be the bare
+    name: `refs/heads/...` and `heads/...` are refused, because `publish` pushes the name as
+    given. A credential that cannot name its login is refused where a login is compared: on
+    `proposal-update`, and on a `publish` onto a branch that carries open proposals.
+    The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
+    `capabilities`, which skip the managed list, and every other write, `branch-delete`
+    among them. The shim sends the credential on these calls as it does on an exec. Known
+    limits: a task that names no cluster gets no targeted `proxyToken` (at most a report
+    credential, which the broker refuses here), so it reaches no version-control verb at
+    all; and `submit-suggestion` deletes a spent branch with
+    `branch-delete`, so on a profile worker that one path is refused.
   - A report credential (no target, the `unattended` tier and a trigger; #5619) is refused on
     `/v1/exec` and the MCP relay before any of this runs.
   - With a credential, every call is held to its target (`task_confinement.py`). Every
@@ -438,20 +493,20 @@ What the operator renders per profile, as built (amended 10/6):
 
 Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
 task connection) land, a worker's pod connection still reaches every task of its profile, so
-two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
-tombstone, because there is no bus to publish one on. The directory survives a flip to
-`today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
-Nothing sweeps directory entries that have no profile. Fixing that means either holding
-deletion on a `today` install or giving the operator a read of the whole directory.
+two pods of one profile can reach each other's task subjects. And nothing sweeps directory entries
+that have no profile: a profile deleted while its agent was still on `spec.mode: today`, before
+that mode went, released its finalizer with no tombstone, because there was no bus to publish one
+on, and its entry stays on the bus's PVC until the operator gains a read of the whole directory.
 
 Profile names and session names share the addressee space on `a2a.tasks.>`. A profile named
 exactly like a live session pod (`<profile>-<animal>-<hex>`) would get that session's events
-subject. Only `platform` is reserved. Matching the session shape would mean a regex that has
+subject. Only `platform` and `session` are reserved. Matching the session shape would mean a regex that has
 to track how the gateway mints names, and creating an AgentProfile is already a privileged act.
 
 The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
 two agents in one namespace (only possible with the singleton webhook off) a profile renders
-nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.
+nothing. The name `platform` is reserved: it is the Hermes bridge's addressee. So is `session`,
+the gateway's session route, for new profiles.
 
 Spawn latency is the demo's: roughly 5-10 seconds to first streamed output with a warm
 node and pre-pulled image. Fine for delegated tasks, which today sit in a 5-second
@@ -617,7 +672,8 @@ is the harness process itself, and its death is the orphan path.
 
 The platform agent is the privileged doer - provisioning, fleet audits, the GitOps write
 path - and today it is also a kanban worker like any other when the front door delegates
-to it. As a profile:
+to it. Everything it does today, and what a profile still lacks for each, is in
+[the platform-as-profile inventory](platform-as-profile-inventory.md). As a profile:
 
 ```yaml
 apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -685,17 +741,18 @@ metadata:
     kubeagents.x-k8s.io/persona: cluster
 spec:
   description: >-
-    Read-only SRE scoped to exactly one GKE cluster.  Live runtime state and workload
-    debugging: crash loops, OOMKills, unschedulable pods, autoscaling behavior, storage
-    binding.  Returns a grounded RCA and a proposed manifest patch; never mutates, never
-    opens PRs.
+    SRE scoped to exactly one GKE cluster, read-only on it.  Live runtime state and
+    workload debugging: crash loops, OOMKills, unschedulable pods, autoscaling behavior,
+    storage binding.  Returns a grounded RCA and a proposed manifest patch; never mutates
+    the cluster, and opens a PR only when the task asks for that change.
   clusterRef:
     projectId: acme-prod
     cluster: prod-a
     location: us-east1
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
-    # /files: persona.yaml, instructions.md, the gke-* debugging skills, mcp.yaml
+    # /files: persona.yaml, instructions.md, the gke-* debugging skills, the
+    # version-control skill, mcp.yaml
     # (developer_knowledge only: profile workers are refused gke and platform_control)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08

@@ -1018,6 +1018,15 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("--slack-home-channel-policy", (tmp_dir / MOCK_CALLS_LOG).read_text())
 
+    def test_the_google_chat_home_channel_policy_flag_follows_the_variable(self):
+        """As Slack's: set, it reaches install.sh as the flag; unset, no flag."""
+        proc, tmp_dir = self._run_recording({"GOOGLE_CHAT_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--google-chat-home-channel-policy=manual", (tmp_dir / MOCK_CALLS_LOG).read_text())
+        proc, tmp_dir = self._run_recording({})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--google-chat-home-channel-policy", (tmp_dir / MOCK_CALLS_LOG).read_text())
+
     def test_an_environment_without_slack_is_never_asked_for_tokens(self):
         """Which is every environment but the ones that opt in."""
         for overrides in ({}, {"SLACK_ENABLED": "false"}):
@@ -1034,6 +1043,36 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
                 self.assertNotEqual(
                     proc.returncode, 0, f"{spelling} enabled Slack but was not guarded"
                 )
+
+
+class PlatformAgentSizingProfileGuardTest(GithubMinterInputsTest):
+    """Invalid PLATFORM_AGENT_SIZING_PROFILE refuses before teardown; valid forwards."""
+
+    def _run_recording(self, overrides):
+        return self._run(
+            overrides, install_body=f'echo "install: $*" >> "{MOCK_CALLS_LOG}"\n'
+        )
+
+    def test_invalid_sizing_profile_refuses_before_teardown(self):
+        proc, tmp_dir = self._run_recording({"PLATFORM_AGENT_SIZING_PROFILE": "giant"})
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("PLATFORM_AGENT_SIZING_PROFILE='giant'", combined)
+        self.assertIn("::error", combined)
+        self.assertNotIn("Tearing down the existing environment", combined)
+        self.assertFalse(
+            (tmp_dir / MOCK_CALLS_LOG).exists(),
+            "the guard must fire before uninstall.sh or install.sh runs",
+        )
+
+    def test_valid_and_unset_sizing_profile_forwarding(self):
+        proc_set, tmp_set = self._run_recording({"PLATFORM_AGENT_SIZING_PROFILE": "fleet"})
+        self.assertEqual(proc_set.returncode, 0, proc_set.stdout + proc_set.stderr)
+        self.assertIn("--sizing-profile=fleet", (tmp_set / MOCK_CALLS_LOG).read_text())
+
+        proc_unset, tmp_unset = self._run_recording({"PLATFORM_AGENT_SIZING_PROFILE": ""})
+        self.assertEqual(proc_unset.returncode, 0, proc_unset.stdout + proc_unset.stderr)
+        self.assertNotIn("--sizing-profile", (tmp_unset / MOCK_CALLS_LOG).read_text())
 
 
 class A2AReadinessGateTest(unittest.TestCase):
@@ -1269,11 +1308,11 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
                 self.assertIn(name, step_env)
 
     def test_the_guard_is_armed_for_the_long_lived_environments_only(self):
-        """The dropdown's three long-lived options, and neither ephemeral one."""
+        """The dropdown's two long-lived options, and neither ephemeral one."""
         workflow = yaml.safe_load(self._WORKFLOW.read_text())
         dispatch = workflow[True]["workflow_dispatch"]
         options = dispatch["inputs"]["github_environment"]["options"]
-        self.assertEqual(sorted(options), ["autopush", "autopush-next", "nightly", "rc", "staging"])
+        self.assertEqual(sorted(options), ["autopush", "nightly", "rc", "staging"])
 
         expression = None
         for job in workflow["jobs"].values():
@@ -1281,7 +1320,7 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
                 if step.get("name") == self._STEP:
                     expression = step["env"]["LONG_LIVED_ENVIRONMENT"]
         self.assertIsNotNone(expression)
-        for env_name in ("autopush", "autopush-next", "staging"):
+        for env_name in ("autopush", "staging"):
             self.assertIn(
                 f"'{env_name}'",
                 expression,

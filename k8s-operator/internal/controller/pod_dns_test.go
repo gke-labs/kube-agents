@@ -42,7 +42,7 @@ func TestPodsSetTheirNdots(t *testing.T) {
 	}
 	pods := map[string]pod{
 		"shell sandbox":   {buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://broker:8080", "settings-hash").Spec.Template.Spec, "3"},
-		"worker Job":      {buildProfileJobTemplate(a2a, &profile, false).Spec, "3"},
+		"worker Job":      {buildProfileJobTemplate(a2a, &profile, false, "").Spec, "3"},
 		"warm pool":       {buildProfilePool(a2a, &profile, "read", "agentprofile-tse-read", false).Spec.Template.Spec, "3"},
 		"gateway":         {buildPodTemplateSpec(a2a, "h", "h", "h", "h", nil, renderOptions{}).Spec, "3"},
 		"A2A gateway":     {buildA2AGatewayDeployment(a2a).Spec.Template.Spec, "3"},

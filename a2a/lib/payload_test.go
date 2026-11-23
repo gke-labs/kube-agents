@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -272,6 +273,29 @@ func TestTaskParametersOfRefusesTwoParts(t *testing.T) {
 	}
 }
 
+// changeRequested is omitted when false, so a submission that asks for no
+// change is byte-identical to one written before the field existed, and an
+// absent field reads as false.
+func TestTaskParametersChangeRequestedRoundTrip(t *testing.T) {
+	off, err := TaskParametersPart(TaskParameters{})
+	if err != nil || string(off.Data) != `{"taskParameters":{"parameters":{}}}` {
+		t.Fatalf("no change: part = %s, %v", off.Data, err)
+	}
+	on, err := TaskParametersPart(TaskParameters{ChangeRequested: true})
+	if err != nil || string(on.Data) != `{"taskParameters":{"parameters":{},"changeRequested":true}}` {
+		t.Fatalf("change: part = %s, %v", on.Data, err)
+	}
+	for _, tc := range []struct {
+		part Part
+		want bool
+	}{{off, false}, {on, true}} {
+		got, ok, err := TaskParametersOf([]Part{tc.part})
+		if err != nil || !ok || got.ChangeRequested != tc.want {
+			t.Errorf("TaskParametersOf(%s) = %+v, %v, %v; want changeRequested %v", tc.part.Data, got, ok, err, tc.want)
+		}
+	}
+}
+
 func TestDelegateTargetsRoundTrip(t *testing.T) {
 	want := DelegateTargets{Targets: []DelegateTarget{
 		{Name: "platform", Description: "the platform agent"},
@@ -291,6 +315,118 @@ func TestDelegateTargetsRoundTrip(t *testing.T) {
 	}
 	if _, ok, err := DelegateTargetsOf([]Part{text}); ok || err != nil {
 		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+}
+
+func TestReplyToRoundTrip(t *testing.T) {
+	want := ReplyTo{TaskID: "task-0a1b2c3d"}
+	part, err := ReplyToPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(part.Data) != `{"replyTo":{"taskId":"task-0a1b2c3d"}}` {
+		t.Fatalf("part = %s", part.Data)
+	}
+	text := Part{Kind: "text", Text: "and the other pool?"}
+	got, ok, err := ReplyToOf([]Part{text, part})
+	if err != nil || !ok || got != want {
+		t.Fatalf("ReplyToOf = %+v %v %v, want %+v", got, ok, err, want)
+	}
+	if _, ok, err := ReplyToOf([]Part{text}); ok || err != nil {
+		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+}
+
+// The task id becomes half of a store key, so anything but a subject token
+// is refused on the way out and an error, not a skip, on the way in; so is a
+// second part, which would leave the report ambiguous.
+func TestReplyToRefusesWhatIsNotATaskID(t *testing.T) {
+	for _, id := range []string{"", "a.b", "task/1", strings.Repeat("x", 64)} {
+		if _, err := ReplyToPart(ReplyTo{TaskID: id}); err == nil {
+			t.Errorf("ReplyToPart(%q) accepted", id)
+		}
+		raw := Part{Kind: "data", Data: json.RawMessage(`{"replyTo":{"taskId":` + strconv.Quote(id) + `}}`)}
+		if _, ok, err := ReplyToOf([]Part{raw}); !ok || err == nil {
+			t.Errorf("ReplyToOf(%q) = ok %v err %v, want found and refused", id, ok, err)
+		}
+	}
+	part, _ := ReplyToPart(ReplyTo{TaskID: "task-1"})
+	if _, ok, err := ReplyToOf([]Part{part, part}); !ok || err == nil {
+		t.Errorf("two parts: ok %v err %v, want found and refused", ok, err)
+	}
+}
+
+func TestPushedReportRoundTrip(t *testing.T) {
+	for _, want := range []PushedReport{{TaskID: "task-root", Text: "np-quartz-7 is at 92%"}, {Text: "a thread's report"}} {
+		part, err := PushedReportPart(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok, err := PushedReportOf([]Part{{Kind: "text", Text: "and the other pool?"}, part})
+		if err != nil || !ok || got != want {
+			t.Fatalf("PushedReportOf = %+v %v %v, want %+v", got, ok, err, want)
+		}
+	}
+	if _, ok, err := PushedReportOf([]Part{{Kind: "text", Text: "hi"}}); ok || err != nil {
+		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+	part, _ := PushedReportPart(PushedReport{Text: "x"})
+	if string(part.Data) != `{"pushedReport":{"text":"x"}}` {
+		t.Fatalf("a report on no task = %s, want taskId omitted", part.Data)
+	}
+}
+
+// The text is spliced ahead of a prompt, so it is bounded; the task id is
+// half of a store key, so it is a subject token or absent. Refused on the
+// way out, and an error, not a skip, on the way in; so is a second part.
+func TestPushedReportRefusesEmptyOversizeAndBadTask(t *testing.T) {
+	for name, r := range map[string]PushedReport{
+		"no text":      {TaskID: "task-1"},
+		"past the cap": {Text: strings.Repeat("x", PushedReportTextCap+1)},
+		"a bad task":   {TaskID: "a.b", Text: "report"},
+	} {
+		if _, err := PushedReportPart(r); err == nil {
+			t.Errorf("%s: PushedReportPart accepted", name)
+		}
+		raw, _ := json.Marshal(map[string]PushedReport{"pushedReport": r})
+		if _, ok, err := PushedReportOf([]Part{{Kind: "data", Data: raw}}); !ok || err == nil {
+			t.Errorf("%s: PushedReportOf = ok %v err %v, want found and refused", name, ok, err)
+		}
+	}
+	part, _ := PushedReportPart(PushedReport{Text: "report"})
+	if _, ok, err := PushedReportOf([]Part{part, part}); !ok || err == nil {
+		t.Errorf("two parts: ok %v err %v, want found and refused", ok, err)
+	}
+}
+
+func TestWholeConversationKey(t *testing.T) {
+	for key, want := range map[string]bool{
+		"slack:dm/D123": true, "gchat:dm/spaces/DDD": true, "gchat:space/spaces/AAA": true,
+		"gchat:space/spaces/AAA/threads/BBB": true,
+		"slack:C0HOME/1712.0001":             false, "slack:dm/D123/1712.0001": false, "gchat:spaces/AAA/threads/BBB": false,
+		"gchat:dm/spaces/DDD/threads/TTT": false, "console:abc": false, "inject:bench-7": false, "": false,
+		// Teams: a personal chat, a group chat and a channel's own id are
+		// shared; a channel thread's id, with its token in either spelling, is not.
+		"teams:a:1UxxASmI": true, "teams:19:group@thread.v2": true, "teams:19:chan@thread.tacv2": true,
+		"teams:19:chan@thread.tacv2;messageid=1794603936403": false, "teams:19:chan@thread.tacv2;messageId=1794603936403": false,
+	} {
+		if got := WholeConversationKey(key); got != want {
+			t.Errorf("WholeConversationKey(%q) = %v, want %v", key, got, want)
+		}
+	}
+}
+
+func TestThreadKeyedConversation(t *testing.T) {
+	for key, want := range map[string]bool{
+		"slack:C0HOME/1712.0001": true, "gchat:spaces/AAA/threads/BBB": true, "gchat:dm/spaces/DDD/threads/TTT": true,
+		"slack:dm/D123/1712.0001": true,
+		"slack:dm/D123":           false, "gchat:space/spaces/AAA": false, "gchat:dm/spaces/DDD": false,
+		"console:abc": false, "inject:bench-7": false, "a2a:x": false, "discord:g1/t1": false, "": false,
+		"teams:19:chan@thread.tacv2;messageid=1794603936403": true, "teams:a:1UxxASmI": false, "teams:19:chan@thread.tacv2": false,
+	} {
+		if got := ThreadKeyedConversation(key); got != want {
+			t.Errorf("ThreadKeyedConversation(%q) = %v, want %v", key, got, want)
+		}
 	}
 }
 

@@ -29,18 +29,32 @@ takes it as an argument, so the server passes the one it loaded lazily and
 the bench's in-pod script passes the one it loaded by path. The agent image
 copies the scripts tree whole, so it ships at
 `/opt/defaults/scripts/worker_transcript.py`; the server imports it as a
-sibling module and the in-pod script loads it from that path.
+sibling module and the in-pod script loads it from that path. The one file it
+loads is the bench's shell reader (`SHELL_READER` below), which each image
+copies beside it.
 """
 
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+
+# The shell command-line reader of the bench's verifiers. Its one source is
+# `bench/kube_agents_bench/shell_words.py`, which is stdlib only. An image
+# copies that file beside this one. A repository checkout has it only in the
+# bench's package, so that path is the second place to look. The reader is
+# loaded by path because this module is itself loaded by path, with its folder
+# not on `sys.path`. An image that ships this module without the reader fails
+# at import, not at the first command it reads.
+SHELL_READER_FILENAME = "shell_words.py"
+SHELL_READER_REPOSITORY_PARTS = ("..", "..", "..", "bench", "kube_agents_bench", SHELL_READER_FILENAME)
+SHELL_READER_MODULE_NAME = "kube_agents_shell_words"
 
 # The markers the redactor leaves, spelled once so a reader grepping a
 # transcript finds one marker whichever rule masked the value.
@@ -216,7 +230,15 @@ JSON_OBJECT_CLOSE = "}"
 YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
 YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
 JSON_SECRET_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
-JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
+# A `"key": "value"` pair (groups 1 to 3; a value the block body cuts short
+# ends at the body's end), or a string that opens no pair, up to its closing
+# quote or to where it stops when it does not close (no group). Without the
+# second branch such a string was read again from each escaped quote in it,
+# which costs quadratic time; each of those reads ends where the first one
+# ended and meets the same text after it, so none of them finds a pair. A
+# match with no group 1 is left as it is, and the next read starts at the
+# closing quote, as before.
+JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)|"(?:[^"\\]|\\.)*')
 URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[ \t]*\r?\n[A-Za-z0-9+/=\s]*\Z",
@@ -240,10 +262,14 @@ CLI_NON_SECRET_FLAGS = frozenset({"with-token"})
 CLI_USERPASS_FLAG_RE = re.compile(
     r"\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm(?:\s+registry)?)\s+login)\b[^\r\n;|&]*"
 )
+# The user part does not start with `=`, but for the user `=` itself
+# (`-u=:pass`): the separator before it takes every `=`, and a user that
+# could start at each of them would read the rest of a run of `=` again from
+# each one, which costs quadratic time.
 CLI_USERPASS_ARG_RE = re.compile(
     r"(?P<prefix>\s(?:-u|--user)[ \t=]*)"
     r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"']+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
-    r"|(?P<user>[^:\s\"']+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+    r"|(?P<user>(?:=|[^:\s\"'=][^:\s\"']*):)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
 )
 CLI_SHORT_P_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
@@ -260,7 +286,8 @@ CLI_LONG_FLAG_AT_FOLD_RE = re.compile(
 CLI_USERPASS_ARG_AT_FOLD_RE = re.compile(
     r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"(?:-u|--user)[ \t=]*)"
     r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
-    r"|(?P<user>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+    r"|(?P<user>(?:=|[^:\s\"'=" + SHELL_ESCAPED_SPACE_FOLD + r"][^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]*):)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
 )
 CLI_SHORT_P_AT_FOLD_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
@@ -274,9 +301,21 @@ CLI_SHORT_P_AT_FOLD_RE = re.compile(
 # (same length, so every offset holds) and reads the flag and its value out
 # of the original at that span. A quote that does not close on its own line
 # is left as written, which is how a shell would reject it.
-SHELL_QUOTE_CHARS = ("'", '"')
+SHELL_SINGLE_QUOTE = "'"
+SHELL_QUOTE_CHARS = (SHELL_SINGLE_QUOTE, '"')
 SHELL_QUOTE_BLANK_CHAR = " "
-SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
+SHELL_SINGLE_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'")
+# A quoted span, or a double quote that does not close on its line with the
+# rest of that line (group `open`). No later double quote on that line can
+# close either: each one is the second character of an escape pair in the
+# walk from the first. Taking the rest of the line once keeps the scan
+# linear; tried again from each later quote, it costs quadratic time. The
+# single-quoted spans in that rest are still blanked (`blank_quoted_spans`).
+# So a match is not always a span to blank: read the group.
+SHELL_OPEN_QUOTE_GROUP = "open"
+SHELL_QUOTED_SPAN_RE = re.compile(
+    r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"|(?P<" + SHELL_OPEN_QUOTE_GROUP + r">\"[^\r\n]*)"
+)
 # A scheme-led value (`Bearer <token>`) after any credential-named key, with
 # `:` or `=` as the separator: the redactor's own bearer rule needs twelve
 # token characters from its alphabet, so a short or `~`-bearing token after
@@ -285,8 +324,16 @@ SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
 # masks the scheme word as the value; the marker it leaves there counts as
 # the scheme so the token after it is still taken. A shell operator is not a
 # token: `GH_TOKEN=[REDACTED_SECRET] && gh auth status` keeps its tail.
+# The key is read only from the first word character of its run of key
+# characters (once, or twice when a quote stands in front of the run): a key
+# always ends where its run ends, so a later start in the same run meets the
+# same text after it. Read again from each word start of a run (`-u-u-u`,
+# `a.b.c`), a long run costs quadratic time. The match now starts at the
+# run's start: the dots and hyphens in front of the first word character,
+# and a quote in front of them, are part of the prefix, which the rule
+# writes back unchanged. The key, the scheme and the value are the same.
 AUTH_SCHEME_HEADER_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
+    r"(?i)(?P<prefix>[\"']?(?<![\w.\-])[.\-]*\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
     r"(?P<scheme>bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
     + re.escape(REDACTED_SECRET_MARKER)
     + r")[ \t]+)"
@@ -504,8 +551,8 @@ SHELL_UNSAFE_TOKEN_RE = re.compile(r"[`$|<>;&()*?]")
 # (`sh -c 'kubectl …'`), is read as a command of its own.
 SHELL_SUBSTITUTION_RE = re.compile(r"[`$]")
 HARMLESS_REDIRECT_TOKENS = frozenset(("2>/dev/null", "2>&1", ">/dev/null", "&>/dev/null"))
-# The secret stores: for each, the pattern that names its family on a
-# command (the subcommand words after it captured) and the pattern of the
+# The secret stores: for each, the parts that name its family on a command,
+# the subcommand words after it (group 1 is read), and the pattern of the
 # named lists those words may be. Every mention on the command is read, so
 # a list and a value read on one line (`echo $(gcloud secrets list)
 # $(gcloud secrets versions access latest --secret=db)`) withhold. gcloud
@@ -519,31 +566,71 @@ HARMLESS_REDIRECT_TOKENS = frozenset(("2>/dev/null", "2>&1", ">/dev/null", "&>/d
 # a parenthesis or a path separator), since each is also a name elsewhere
 # (a namespace, `--vault-name`, a config file), and `vault` only with `kv`
 # or `read` as a word after its flags.
-SECRET_STORE_FAMILIES = (
+#
+# A family is read in one pass over the command
+# (`_simple_command_reads_a_secret`), so the time is linear in the command:
+# a pattern of the form `tool[^|&;]*?family words` read the command again
+# from each tool name. The pass meets, in the command's order:
+# - a separator (`|`, `&`, `;`): a tool name ahead of it no longer counts;
+# - the tool name (`gcloud`, `aws`, `az`), as a word;
+# - the gate, for the two families whose words may stand anywhere behind
+#   it, past separators too: `ssm` behind the tool name, and `vault` as a
+#   command word, each with a blank behind it;
+# - the start of the subcommand words. Where the parts ahead of it were met,
+#   the words pattern is matched at that place; where it matches, the words
+#   are read and the pass goes on behind them, with no part met.
+# The words start holds no character that another part can start on, so the
+# pass skips nothing when the words do not count.
+STORE_SEPARATOR_PATTERN = r"[|&;]"
+# Every part is read in any case.
+STORE_PATTERN_FLAGS = "(?i)"
+STORE_SEPARATOR_GROUP = "separator"
+STORE_TOOL_GROUP = "tool"
+STORE_GATE_GROUP = "gate"
+STORE_WORDS_GROUP = "words"
+# Per family: the tool name, the gate, the start of the subcommand words, the
+# words (matched at that start), the named lists. None where a family has no
+# such part.
+STORE_FAMILY_PARTS = (
+    (r"\bgcloud\b", None, r"\bsecrets", r"secrets\s+((?:versions\s+)?\S+)", r"^(?:list|describe|versions\s+(?:list|describe))\b"),
     (
-        re.compile(r"(?i)\bgcloud\b[^|&;]*?\bsecrets\s+((?:versions\s+)?\S+)"),
-        re.compile(r"(?i)^(?:list|describe|versions\s+(?:list|describe))\b"),
+        r"\baws\b",
+        None,
+        r"\bsecretsmanager",
+        r"secretsmanager\s+(\S+)",
+        r"^(?:list-secrets|describe-secret|list-secret-version-ids|get-resource-policy)\b",
     ),
+    (r"\baws\b", r"\bssm(?=\s)", r"(?<=\s)(?:get|describe)-parameter", r"((?:get|describe)-parameters?\S*)", r"^describe-parameters\b"),
+    (r"\baz\b", None, r"\bkeyvault", r"keyvault\s+secret\s+(\S+)", r"^(?:list|list-versions|list-deleted)\b"),
+    (None, r"(?:^|[\s('\"`/])vault(?=\s)", r"(?<=\s)(?:kv|read)\b", r"((?:kv|read)\b(?:\s+\S+)?)", r"^kv\s+(?:list|metadata)\b"),
+    (None, None, r"(?:^|[\s('\"`/])sops", r"(?:^|[\s('\"`/])sops\s+(\S+)", r"^(?:-e|--encrypt|encrypt|updatekeys|-v|--version)\b"),
+)
+# Per family, six items: the pattern of the start of the words alone, the
+# pattern of the pass (one named group per part the family has; a separator
+# only matters to a tool name), the words pattern, the named-lists pattern,
+# whether the family has no tool name, and whether it has no gate.
+SECRET_STORE_FAMILIES = tuple(
     (
-        re.compile(r"(?i)\baws\b[^|&;]*?\bsecretsmanager\s+(\S+)"),
-        re.compile(r"(?i)^(?:list-secrets|describe-secret|list-secret-version-ids|get-resource-policy)\b"),
-    ),
-    (
-        re.compile(r"(?i)\baws\b[^|&;]*?\bssm\s+(?:\S+\s+)*?((?:get|describe)-parameters?\S*)"),
-        re.compile(r"(?i)^describe-parameters\b"),
-    ),
-    (
-        re.compile(r"(?i)\baz\b[^|&;]*?\bkeyvault\s+secret\s+(\S+)"),
-        re.compile(r"(?i)^(?:list|list-versions|list-deleted)\b"),
-    ),
-    (
-        re.compile(r"(?i)(?:^|[\s('\"`/])vault\s+(?:\S+\s+)*?((?:kv|read)\b(?:\s+\S+)?)"),
-        re.compile(r"(?i)^kv\s+(?:list|metadata)\b"),
-    ),
-    (
-        re.compile(r"(?i)(?:^|[\s('\"`/])sops\s+(\S+)"),
-        re.compile(r"(?i)^(?:-e|--encrypt|encrypt|updatekeys|-v|--version)\b"),
-    ),
+        re.compile(STORE_PATTERN_FLAGS + words_start),
+        re.compile(
+            STORE_PATTERN_FLAGS
+            + "|".join(
+                "(?P<%s>%s)" % (group, part)
+                for group, part in (
+                    (STORE_SEPARATOR_GROUP, STORE_SEPARATOR_PATTERN if tool else None),
+                    (STORE_TOOL_GROUP, tool),
+                    (STORE_GATE_GROUP, gate),
+                    (STORE_WORDS_GROUP, words_start),
+                )
+                if part
+            )
+        ),
+        re.compile(STORE_PATTERN_FLAGS + words),
+        re.compile(STORE_PATTERN_FLAGS + named_lists),
+        tool is None,
+        gate is None,
+    )
+    for tool, gate, words_start, words, named_lists in STORE_FAMILY_PARTS
 )
 # The reads that stay a list: a jsonpath into a secret's data, and a file
 # read (also after `kubectl exec ... --`) under a well-known secret mount or
@@ -556,6 +643,337 @@ SECRET_READ_COMMAND_RE = re.compile(
     r"(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_|(?:[^\s/]*-)?(?:secrets?|creds|credentials)/)[^\r\n]*"
     r")"
 )
+# A command that prints the caller's own token or its environment, which holds
+# whatever credentials the process was started with
+# (`script_prints_token_or_environment`). One simple command is read as shell
+# words and operators, without its comments. A redirection goes off with its
+# target. Each `;`, `|`, `&` and `)` ends a command, and so does a `(` that is
+# first on a command or opens a substitution. A backtick pair is read as
+# `$(...)`, and each substitution outside single quotes is also read by
+# itself, since it runs inside double quotes too. A `gcloud` or environment
+# word counts where it is the command word:
+# - first on the command, behind assignments;
+# - behind a prefix word (`COMMAND_PREFIX_WORDS`), as the first word that is no
+#   option, number or assignment; a word right after an option may be that
+#   option's value, so the word behind it is read as the command too;
+# - as the word after a `-c` or the value of `--command` of a shell, `su`,
+#   `script` and the like (`SCRIPT_FLAG_WORDS`), read as a script;
+# - behind a word that runs a command elsewhere (`REMOTE_COMMAND_WORDS`,
+#   `OPERAND_COMMAND_WORDS`): after `--` when the command has one, else as any
+#   later word that names a command.
+# A quoted argument is read as a script of its own when a word on its command
+# runs one (`SCRIPT_RUNNING_WORDS`) and the argument holds a blank, a shell
+# operator or a backtick (`ssh host 'env|sort'`), or when it spans lines;
+# elsewhere it is prose or another language (`git commit -m "..."`,
+# `python3 -c "..."`, `jq '...'`).
+# Where the rule cannot read, it decides on less. Text with an unclosed quote
+# is read line by line; one such line, such text of many lines, a long
+# substitution and a line of many substitutions withhold when a dump starts a
+# line or a command, or when a `gcloud` token printer, another tool's name
+# with its printer path, or a language's use of its whole environment (by
+# the word walk's own patterns) stands anywhere (`_unsplit_text_prints`). A
+# command that costs more than
+# `MAX_READ_STEPS` to walk withholds when any of its words names a dump word,
+# `gcloud`, another tool with a token printer or an interpreter
+# (`WALK_LIMIT_COMMAND_WORDS`), and a call past its read budget
+# (`MAX_READ_CHARS_FACTOR`) withholds.
+# That is the first read (`_first_read_prints`). A second read
+# (`_read_script_prints`) takes the script's words, operators and substitutions
+# from the shell reader, which keeps one quote model and reads each
+# substitution whole, and gives each simple command to the same word walk. The
+# rule withholds when either read withholds, so the second read can only add a
+# withhold. It reads only text that the reader gives words for: text with an
+# unclosed quote or a redirect with no target has no words, and text with the
+# reader's mark character is kept away from the reader, so each of them is the
+# first read's alone.
+#
+# `gcloud auth`, as the first group behind `gcloud`: every subcommand withholds
+# but the ones named here, which print no token, and a flag right behind
+# `auth` withholds, since it may take the subcommand's place as its value. A
+# token printer withholds on any command where its group word (`auth`,
+# `config`) stands ahead of it, whatever the command word is (`sudo "$GCLOUD"
+# auth print-access-token`).
+GCLOUD_BINARY = "gcloud"
+GCLOUD_AUTH_GROUP = "auth"
+GCLOUD_RELEASE_TRACKS = frozenset(("alpha", "beta"))
+GCLOUD_AUTH_SERVED = frozenset(("list", "login", "revoke", "activate-service-account", "configure-docker"))
+GCLOUD_AUTH_SCOPE = "application-default"
+GCLOUD_AUTH_SCOPE_SERVED = frozenset(("login", "revoke", "set-quota-project"))
+GCLOUD_CONFIG_GROUP = "config"
+# Each token printer with the group word that stands ahead of it.
+GCLOUD_TOKEN_PRINTER_GROUPS = {
+    "print-access-token": GCLOUD_AUTH_GROUP,
+    "print-identity-token": GCLOUD_AUTH_GROUP,
+    "config-helper": GCLOUD_CONFIG_GROUP,
+}
+GCLOUD_TOKEN_PRINTERS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS)
+# `gcloud compute ssh`: the remote command is behind `--`, or is the value of `--command`.
+GCLOUD_SSH_COMMAND = "ssh"
+SCRIPT_LONG_FLAG = "--command"
+# Other tools' token printers: for each binary, the subcommand paths that
+# print a token. A path counts where the tool's subcommand can start, behind
+# the tool's own flags and their values (`_first_operands`), and its words
+# stand together (`kubectl -n ci create token builder`). The same words
+# behind another subcommand are arguments (`gh search issues auth token`),
+# and so is a path word behind a flag (`kubectl create -f token`).
+TOKEN_PRINTER_PATHS = {
+    "gh": (("auth", "token"),),
+    "az": (("account", "get-access-token"),),
+    "aws": (("sts", "get-session-token"),),
+    "kubectl": (("create", "token"),),
+    "oc": (("create", "token"),),
+}
+# Another language's print of its whole environment, as inline code
+# (`python3 -c '...os.environ...'`, `node -e '...process.env...'`, the code
+# behind the flag or in one word with it), also behind a tool that runs the
+# interpreter (`uv run python -c ...`). Served, because they print no value
+# of the whole: a read of one variable by a whole literal name
+# (`os.environ["HOME"]`, `os.environ.get("HOME")`, `process.env.HOME`),
+# `.update(`, `.keys()` and `Object.keys(...)`, a membership test of a
+# literal name (`"X" in os.environ`), the environment as a call's `env`
+# argument (`run(..., env=os.environ)`, `env={**os.environ, ...}`), a
+# destructuring of named variables (`const { NAME } = process.env`), and the
+# import itself (`from os import environ`). A subscript or a `.get(` by a
+# variable withholds (`os.environ[k]` in a loop over the names), and so does
+# an assignment of the whole to a variable (`env = os.environ.copy()`): the
+# rule cannot follow the variable to a print, so it decides closed. A code
+# file and code on standard input are not read.
+PYTHON_BINARY_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?)$")
+PYTHON_CODE_FLAG_RE = re.compile(r"^-[A-Za-z]*?c")
+_ENVIRONMENT_LITERAL = r"""(?:'[^']*'|"[^"]*")"""
+_ENVIRONMENT_LITERAL_KEY = r"\[\s*" + _ENVIRONMENT_LITERAL + r"\s*\]"
+# A method that reads or sets one variable: its first argument is a whole literal, closed by `,` or `)`.
+_PYTHON_ENVIRONMENT_ONE_VARIABLE = (
+    r"(?!\s*(?:" + _ENVIRONMENT_LITERAL_KEY + r"|\.(?:get|setdefault|pop)\s*\(\s*" + _ENVIRONMENT_LITERAL + r"\s*[,)]|\.(?:update|keys)\s*\())"
+)
+PYTHON_ENVIRONMENT_RE = re.compile(r"""(?:(?<!\w)os|__import__\(\s*['"]os['"]\s*\))\.environb?\b""" + _PYTHON_ENVIRONMENT_ONE_VARIABLE)
+# `from os import environ` makes the bare name the environment.
+PYTHON_ENVIRONMENT_IMPORT_RE = re.compile(r"\bfrom\s+os\s+import\b[^;\n]*\benvironb?\b")
+PYTHON_IMPORTED_ENVIRONMENT_RE = re.compile(r"(?<![\w.])environb?\b" + _PYTHON_ENVIRONMENT_ONE_VARIABLE)
+PYTHON_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(
+    r"""(?:[(,]\s*env\s*=\s*(?:\{\*\*|dict\()?|['"]\s+(?:not\s+)?in\s+|\bimport\s+(?:\w+\s*,\s*)*)$"""
+)
+NODE_BINARIES = frozenset(("node", "nodejs"))
+NODE_CODE_FLAG_RE = re.compile(r"^-[A-Za-z]*?[ep]")
+NODE_CODE_LONG_FLAGS = frozenset(("--eval", "--print"))
+NODE_ENVIRONMENT_RE = re.compile(r"(?<!\w)process\.env\b(?!\s*(?:\.[A-Za-z_$]|" + _ENVIRONMENT_LITERAL_KEY + r"))")
+NODE_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(r"""(?:\{[^{}.]*\}\s*=\s*|Object\.keys\(|['"]\s+in\s+)$""")
+# How much text ahead of the environment's name the served forms are read in.
+CODE_LOOKBACK_CHARS = 32
+# Tools that run a command in a project's environment. `npx` runs its
+# operand; `uv`, `poetry` and `pipenv` run one behind `run`, as `docker`
+# does (`uv venv env` names a folder).
+PACKAGE_RUNNER_WORDS = frozenset(("npx",))
+PACKAGE_RUN_VERB_WORDS = frozenset(("uv", "poetry", "pipenv"))
+# The environment: `env` with no command behind its options, and `printenv`,
+# `export`, `declare`, `typeset` or `readonly` with no name, print all of it;
+# bare `set` prints every variable. With a name, `printenv` and a declaring
+# builtin with `-p` withhold when the name is credential-shaped or is itself
+# an expansion (`ENV_NAME_WITHHELD_RE`). `env` ahead of a command is a wrapper.
+ENV_BINARY = "env"
+ENV_VALUE_FLAGS = frozenset(("-u", "--unset", "-C", "--chdir"))
+PRINTENV_BINARY = "printenv"
+SET_BUILTIN = "set"
+DECLARING_BUILTINS = frozenset(("export", "declare", "typeset", "readonly"))
+DECLARATION_PRINT_FLAG = "p"
+ENVIRONMENT_DUMP_WORDS = frozenset((ENV_BINARY, PRINTENV_BINARY, SET_BUILTIN)) | DECLARING_BUILTINS
+TOKEN_OR_ENVIRONMENT_COMMAND_WORDS = ENVIRONMENT_DUMP_WORDS | frozenset((GCLOUD_BINARY,))
+ENV_NAME_WITHHELD_RE = re.compile(r"(?i)token|secret|pass|_pwd$|key|cred|auth|cookie|(?:^|_)pat(?:$|_)|url|dsn|\$")
+# A shell word that starts `NAME=` is an assignment, whatever its value holds (`FOO="a b" env`).
+WORD_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+# A cluster of short flags (`-p`, `-px`, `-lc`); a long option (`--project`) is another command's.
+SHORT_FLAG_CLUSTER_RE = re.compile(r"^-[A-Za-z]+$")
+# A process's environment is the file `environ` under `/proc/<pid>`. A path
+# under `/proc` withholds, quoted as a whole or not and for any reader, when
+# it names `environ` or when its file part, below the process's directory, is
+# a glob or an expansion (`/proc/self/e*`, `/proc/1/$F`; `/proc/sys/vm/*` is
+# no process's). A quote inside the path ends it for the first read; the
+# second read tests each word with its quotes off (`/proc/"self"/e*`). A word
+# that ends in `/environ` withholds
+# too (`/proc/$(pgrep x)/environ`, `./environ`), and so does a file named
+# `environ` behind a file reader or as a command's input, since the shell may
+# stand in the process's directory.
+PROC_PATH_RE = re.compile(r"(?<![\w.-])/proc/[^\s'\"`;|&<>()]*")
+PROC_PROCESS_DEPTH = 2
+PROC_PROCESS_INDEX = 1
+PROC_PROCESS_NAME_RE = re.compile(r"^(?:\d+|self|thread-self)$")
+PROC_UNREADABLE_NAME_CHARS = frozenset("*?[{$")
+ENVIRON_FILE = "environ"
+ENVIRON_PATH_SUFFIX = PATH_SEPARATOR + ENVIRON_FILE
+FILE_READER_WORDS = frozenset(("cat", "head", "tail", "less", "more", "base64", "strings", "xxd", "od"))
+# Words that run the words after them as a command, here: the prefix words
+# above, a shell, and other wrappers. `command -v` and `command -V` only look
+# a name up. `xargs` and `parallel` hand `printenv` names nobody can read.
+SHELL_BINARIES = frozenset(("sh", "bash", "zsh", "dash", "ksh"))
+SHELL_SCRIPT_FLAG = "c"
+SCRIPT_FLAG_WORDS = SHELL_BINARIES | frozenset(("su", "runuser", "script", "flock"))
+STDIN_ARGUMENT_WORDS = frozenset(("xargs", "parallel"))
+COMMAND_PREFIX_WORDS = (
+    HARMLESS_COMMAND_PREFIX_WORDS
+    | SHELL_BINARIES
+    | STDIN_ARGUMENT_WORDS
+    | frozenset(("builtin", "ionice", "stdbuf", "setsid", "watch", "strace", "unshare", "doas", "busybox"))
+)
+COMMAND_BUILTIN = "command"
+COMMAND_LOOKUP_FLAGS = frozenset(("-v", "-V"))
+PREFIX_NUMBER_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+# `function NAME` opens a body, and the first word behind `trap` is a whole
+# script. `eval` joins its words with a blank and runs the line they make, so
+# an empty word among them is gone (`eval '' declare -p`).
+FUNCTION_KEYWORD = "function"
+FUNCTION_HEAD_WIDTH = 2
+TRAP_BUILTIN = "trap"
+EVAL_BUILTIN = "eval"
+EVAL_WORD_JOIN = " "
+# Words that run a command elsewhere. Behind `REMOTE_COMMAND_WORDS` a command
+# follows only a verb that runs one; behind `OPERAND_COMMAND_WORDS` it follows
+# an operand (a host, a directory, a lock file). With a `--` the command
+# starts behind it, or one word on when the operand stands there too (`ssh --
+# host env`); ahead of the `--` a later word that names a command still
+# counts, since the `--` may be the inner command's (`ssh host printenv --
+# NAME`).
+REMOTE_COMMAND_WORDS = frozenset(("kubectl", "oc", "docker", "docker-compose", "podman", "nerdctl", "crictl")) | PACKAGE_RUN_VERB_WORDS
+REMOTE_COMMAND_VERBS = frozenset(("exec", "run"))
+OPERAND_COMMAND_WORDS = frozenset(("ssh", "nsenter", "chroot", "runuser", "flock")) | PACKAGE_RUNNER_WORDS
+OPERAND_AND_COMMAND_WIDTH = 2
+# A walk past its step limit withholds on one of these words, or an interpreter's name, anywhere on the command.
+WALK_LIMIT_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | NODE_BINARIES | frozenset(TOKEN_PRINTER_PATHS)
+REMOTE_NAMED_COMMAND_WORDS = WALK_LIMIT_COMMAND_WORDS | SHELL_BINARIES
+# A word that may be an argument names a command by its bare name or by a path into a `bin` directory.
+BINARY_DIRECTORY_SUFFIX = "bin"
+FIND_BINARY = "find"
+FIND_COMMAND_FLAGS = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+# The word that ends the command of one of these flags.
+FIND_COMMAND_END = ";"
+# The words that take a quoted argument as a script.
+SCRIPT_RUNNING_WORDS = SHELL_BINARIES | frozenset(("ssh", "su", "watch", "trap", "parallel", "script", "flock", "runuser"))
+# Every word the walk has a rule for; a command that starts with another word costs nothing to read.
+COMMAND_READING_WORDS = (
+    TOKEN_OR_ENVIRONMENT_COMMAND_WORDS
+    | FILE_READER_WORDS
+    | COMMAND_PREFIX_WORDS
+    | REMOTE_COMMAND_WORDS
+    | OPERAND_COMMAND_WORDS
+    | SCRIPT_FLAG_WORDS
+    | NODE_BINARIES
+    | frozenset(TOKEN_PRINTER_PATHS)
+    | frozenset((TRAP_BUILTIN, EVAL_BUILTIN, FIND_BINARY))
+)
+OPTION_PREFIXES = ("-", "+")
+FLAG_AND_VALUE_WIDTH = 2
+# The walk of one command stops after this many word steps, a line reads this
+# many substitutions, a substitution is read as words up to this length, and
+# text with an unclosed quote is read line by line up to this many lines.
+MAX_READ_STEPS = 4096
+MAX_READ_SUBSTITUTIONS = 16
+MAX_READ_SUBSTITUTION_CHARS = 4096
+MAX_READ_LINES = 256
+# One call reads at most this many characters, counted for each line it reads
+# with `READ_COST_CHARS` on top: nested substitutions and scripts can make the
+# same text read many times over. A call past its budget withholds.
+MAX_READ_CHARS_FACTOR = 6
+MAX_READ_CHARS_FLOOR = 65536
+READ_COST_CHARS = 16
+# A script that stood in double quotes keeps the backslash ahead of a `$` or a
+# backtick; the shell that runs the script reads them as a substitution's
+# start. A backslash that another backslash escapes is no such backslash: in
+# `"\\$(env)"` the pair is one literal backslash and the `$(` is live.
+SCRIPT_ESCAPED_SUBSTITUTION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\([$`])")
+SCRIPT_ESCAPED_SUBSTITUTION_REPLACEMENT = r"\1\2"
+SHELL_BACKTICK = "`"
+SUBSHELL_OPEN = "("
+SUBSHELL_CLOSE = ")"
+SHELL_COMMAND_END = ";"
+SHELL_EXPANSION = "$"
+SUBSTITUTION_OPEN = SHELL_EXPANSION + SUBSHELL_OPEN
+PARENTHESIS_RE = re.compile(r"[()]")
+# A call's read budget is a list with a slot for each of the rule's two reads. The first read and
+# the word walk count against the first slot, also when the second read calls the walk.
+MARKS_BUDGET = 0
+SHELL_READER_BUDGET = 1
+READ_COUNT = 2
+# The openers of a substitution in a word (`$(`, `<(`, `>(`, a backtick).
+SPAN_OPENERS = (SUBSTITUTION_OPEN, "<(", ">(", SHELL_BACKTICK)
+# The second read reads substitutions inside substitutions to this depth, and withholds past it.
+MAX_SUBSTITUTION_NESTING = 16
+# The shell reader marks operators and substitutions in its text with this character.
+SHELL_READER_MARK_CHAR = "\x00"
+# Behind these words a word that is only a substitution gives names in the usual case
+# (`export $(cat .env | xargs)`), so it stays a word when the words are read without their substitutions.
+NAME_TAKING_BUILTINS = DECLARING_BUILTINS | frozenset((SET_BUILTIN,))
+# A backtick pair, written as the substitution it is.
+BACKTICK_OPENS = f" {SUBSTITUTION_OPEN} "
+BACKTICK_CLOSES = f" {SUBSHELL_CLOSE} "
+SHELL_PUNCTUATION_CHARS = frozenset("();<>|&")
+REDIRECT_OPERATOR_CHARS = frozenset("<>")
+SHELL_INPUT_REDIRECT_CHAR = "<"
+HERE_STRING_OPERATOR = "<<<"
+# What a scan of shell text stops at: an escaped character, a quote, a comment
+# mark, a backtick and a substitution's start. A `#` starts a comment as the
+# first character of a word, outside quotes.
+SHELL_MARK_RE = re.compile(r"\\.|['\"#`]|\$\(", re.DOTALL)
+SHELL_ESCAPE_CHAR = "\\"
+SHELL_COMMENT_CHAR = "#"
+COMMENT_LEAD_CHARS = frozenset(" \t\n;|&()")
+# No script without one of these fragments, or `/proc/`, is withheld by this
+# rule. Quotes, backslashes and a continuation's line break can stand inside
+# a shell word (`e"n"v`), so the fragments are looked for in the text without
+# them.
+TOKEN_OR_ENVIRONMENT_FRAGMENTS = tuple(
+    sorted(
+        TOKEN_OR_ENVIRONMENT_COMMAND_WORDS
+        | GCLOUD_TOKEN_PRINTERS
+        | frozenset((ENVIRON_FILE,))
+        | frozenset(path[-1] for paths in TOKEN_PRINTER_PATHS.values() for path in paths)
+    )
+)
+SHELL_QUOTING_CHARS_REMOVED = str.maketrans("", "", "\"'\\\n")
+PROC_DIRECTORY = "/proc/"
+# A line that cannot be read as words withholds on this much: a token printer
+# anywhere, or a dump at the start of a line, of a command or of a
+# substitution. There a dump is `printenv`, bare `set`, or `env` or a
+# declaring builtin with nothing but options behind it (`export PATH=...` sets
+# a variable).
+_UNSPLIT_DUMP = (
+    "(?:"
+    + PRINTENV_BINARY
+    + r"(?![\w-])[^\n;|&()]*|(?:"
+    + "|".join(sorted(DECLARING_BUILTINS | {ENV_BINARY}))
+    + r")(?:[ \t]+-[\w-]*)*[ \t]*|"
+    + SET_BUILTIN
+    + r"[ \t]*)"
+)
+# Another tool's printer there: the tool's name as a word, and its path's
+# words together, each anywhere in the text (two searches, each linear).
+UNSPLIT_PRINTER_RES = tuple(
+    (
+        re.compile(rf"(?<![\w-]){re.escape(tool)}(?![\w-])"),
+        re.compile(r"(?<![\w-])" + r"\s+".join(re.escape(word) for word in path) + r"(?![\w-])"),
+    )
+    for tool, paths in sorted(TOKEN_PRINTER_PATHS.items())
+    for path in paths
+)
+UNSPLIT_LINE_RE = re.compile(
+    r"(?:^|[\n;&|])[ \t]*" + _UNSPLIT_DUMP + r"(?=[\n;|&<>#]|$)"
+    r"|\$\([ \t]*" + _UNSPLIT_DUMP + r"(?=[;|&<>)])"
+    r"|(?<![\w-])(?:" + "|".join(sorted(GCLOUD_TOKEN_PRINTERS)) + r")(?![\w-])"
+)
+
+
+def _load_shell_reader() -> Tuple[Any, str]:
+    """The reader module and the path it came from."""
+    own_folder = Path(__file__).resolve().parent
+    paths = (own_folder / SHELL_READER_FILENAME, own_folder.joinpath(*SHELL_READER_REPOSITORY_PARTS))
+    for path in paths:
+        if path.is_file():
+            spec = importlib.util.spec_from_file_location(SHELL_READER_MODULE_NAME, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module, str(path)
+    raise ImportError("no shell reader at " + " or ".join(str(path) for path in paths))
+
+
+SHELL_READER, SHELL_READER_PATH = _load_shell_reader()
 
 
 def scrub_secret_blocks(redactor: Any, text: str) -> str:
@@ -590,18 +1008,51 @@ def scrub_secret_blocks(redactor: Any, text: str) -> str:
     # `apiVersion`. A `stringData` object is a Secret's wherever it sits. A
     # log line's or an API envelope's `data` is kept, whatever an earlier
     # line said.
+    # The nearest opener line before a block and the first marker at or after
+    # that line are followed with two iterators over the text, each read once.
+    # Before, the opener line was looked for again from the text's start for
+    # each block (quadratic on JSON lines), and the marker from the opener
+    # line (quadratic on many blocks with no opener line before them). Two
+    # facts make one read enough: `re.sub` calls `_mask_json_block` for the
+    # blocks in the text's order, so both places only move forward; and two
+    # marker matches never overlap (a marker is a quoted key, blanks and a
+    # colon), so the first marker at or after the opener line is the one a
+    # search from there finds, and when it ends after the block's start, no
+    # marker stands between the two.
+    openers = JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined)
+    markers = JSON_MANIFEST_MARKER_RE.finditer(joined)
+    next_opener = next(openers, None)
+    document_start = 0
+    next_marker = next(markers, None)
+
+    def _mask_json_pair(pair: "re.Match[str]") -> str:
+        return pair.group(1) + REDACTED_SECRET_MARKER + pair.group(3)
+
     def _mask_json_block(m: "re.Match[str]") -> str:
+        nonlocal next_opener, document_start, next_marker
         if JSON_STRING_DATA_KEY_QUOTED not in m.group(1):
-            document_start = 0
-            for opener in JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined, 0, m.start() + 1):
-                document_start = opener.start()
-            if not JSON_MANIFEST_MARKER_RE.search(joined, document_start, m.start()):
+            # An opener line counts when its `{` stands before the block.
+            while next_opener is not None and next_opener.end() <= m.start() + 1:
+                document_start = next_opener.start()
+                next_opener = next(openers, None)
+            while next_marker is not None and next_marker.start() < document_start:
+                next_marker = next(markers, None)
+            if next_marker is None or next_marker.end() > m.start():
                 return m.group(0)
-        return (
-            m.group(1)
-            + JSON_PAIR_RE.sub(lambda p: p.group(1) + REDACTED_SECRET_MARKER + p.group(3), m.group(2))
-            + m.group(3)
-        )
+        # `_mask_json_pair` is called for a pair only, as the pattern's `sub`
+        # called its function before: a call for each string that opens no
+        # pair would be one Python frame more than before at that place, and
+        # a deeply nested step would reach the recursion limit sooner.
+        body = m.group(2)
+        pieces: list[str] = []
+        done = 0
+        for pair in JSON_PAIR_RE.finditer(body):
+            if pair.group(1) is not None:
+                pieces.append(body[done : pair.start()])
+                pieces.append(_mask_json_pair(pair))
+                done = pair.end()
+        pieces.append(body[done:])
+        return m.group(1) + "".join(pieces) + m.group(3)
 
     return JSON_SECRET_BLOCK_RE.sub(_mask_json_block, joined)
 
@@ -654,9 +1105,25 @@ def blank_quoted_spans(text: str) -> str:
     replaced by spaces, keeping the quotes and the length."""
     if not any(q in text for q in SHELL_QUOTE_CHARS):
         return text
-    return SHELL_QUOTED_SPAN_RE.sub(
-        lambda m: m.group(0)[0] + SHELL_QUOTE_BLANK_CHAR * (len(m.group(0)) - 2) + m.group(0)[-1], text
-    )
+
+    def blank(match: "re.Match[str]") -> str:
+        # One Python frame per span, and no call below it: a deeper call here
+        # would make a deeply nested command reach the recursion limit sooner.
+        span = match.group(0)
+        if match.group(SHELL_OPEN_QUOTE_GROUP) is None:
+            return span[0] + SHELL_QUOTE_BLANK_CHAR * len(span[1:-1]) + span[-1]
+        if SHELL_SINGLE_QUOTE not in span:
+            return span
+        pieces: list[str] = []
+        done = 0
+        for single in SHELL_SINGLE_QUOTED_SPAN_RE.finditer(span, len(SHELL_DOUBLE_QUOTE)):
+            pieces.append(span[done : single.start()])
+            pieces.append(SHELL_SINGLE_QUOTE + SHELL_QUOTE_BLANK_CHAR * len(single.group(0)[1:-1]) + SHELL_SINGLE_QUOTE)
+            done = single.end()
+        pieces.append(span[done:])
+        return "".join(pieces)
+
+    return SHELL_QUOTED_SPAN_RE.sub(blank, text)
 
 
 def sub_shell_segments(
@@ -1150,7 +1617,7 @@ def supplement_redact(
                 return m.group(0)
 
             value = INLINE_JSON_OBJECT_RE.sub(_scrub_inline_obj, value)
-        text = redactor.PRIVATE_KEY_PATTERN.sub(REDACTED_PRIVATE_KEY_MARKER, value)
+        text = redactor.mask_private_keys(value)
         text = UNTERMINATED_PRIVATE_KEY_RE.sub(REDACTED_PRIVATE_KEY_MARKER, text)
         text = URL_USERINFO_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_MARKER, text)
         return blank_named_values(redactor, scrub_secret_blocks(redactor, text), span)
@@ -1579,12 +2046,682 @@ def _quoted_scripts(command: str) -> List[str]:
     return [token for token in tokens if _holds_whitespace(token)]
 
 
+def _base_word(token: str) -> str:
+    """A command word without its directory (`/usr/bin/env` is `env`)."""
+    return token.rsplit(PATH_SEPARATOR, 1)[-1]
+
+
+def _is_named_word(token: str, names: frozenset) -> bool:
+    """Whether a word that may be an argument names one of `names`: the bare name, or a path to it in a `bin` directory."""
+    if token in names:
+        return True
+    directory, separator, base = token.rpartition(PATH_SEPARATOR)
+    return bool(separator) and base in names and directory.endswith(BINARY_DIRECTORY_SUFFIX)
+
+
+def _is_flag_cluster_with(token: str, flag: str) -> bool:
+    """Whether `token` is a cluster of short flags that holds `flag` (`-p`, `-px`)."""
+    return bool(SHORT_FLAG_CLUSTER_RE.match(token)) and flag in token
+
+
+def _is_environ_file(token: str) -> bool:
+    """Whether a word names a file `environ`: bare, or as the end of a path."""
+    return token == ENVIRON_FILE or token.endswith(ENVIRON_PATH_SUFFIX)
+
+
+def _reads_process_environment(text: str) -> bool:
+    """Whether `text` holds a path under `/proc` to a process's environment (see `PROC_PATH_RE`)."""
+    for path in PROC_PATH_RE.finditer(text):
+        if ENVIRON_FILE in path.group():
+            return True
+        names = [name for name in path.group().split(PATH_SEPARATOR) if name]
+        if len(names) <= PROC_PROCESS_DEPTH or PROC_UNREADABLE_NAME_CHARS.isdisjoint(names[-1]):
+            continue
+        process = names[PROC_PROCESS_INDEX]
+        if PROC_PROCESS_NAME_RE.match(process) or not PROC_UNREADABLE_NAME_CHARS.isdisjoint(process):
+            return True
+    return False
+
+
+def _env_command_index(rest: Sequence[str]) -> Optional[int]:
+    """Where the command behind `env` starts in the words after it; None when `env` has none and prints the environment."""
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token in ENV_VALUE_FLAGS:
+            index += FLAG_AND_VALUE_WIDTH
+        elif token.startswith(OPTION_PREFIXES) or WORD_ASSIGNMENT_RE.match(token):
+            index += 1
+        else:
+            return index
+    return None
+
+
+def _prints_variables(word: str, rest: Sequence[str]) -> bool:
+    """Whether `printenv`, a declaring builtin or `set` with these words prints the environment or a credential-shaped variable."""
+    names = [token for token in rest if not token.startswith(OPTION_PREFIXES)]
+    # An assignment (`export NAME=value`) sets a variable and prints none.
+    withheld_name = any(ENV_NAME_WITHHELD_RE.search(name) for name in names if EQUALS_SEPARATOR not in name)
+    if word == PRINTENV_BINARY:
+        return not names or withheld_name
+    if word in DECLARING_BUILTINS:
+        return not names or (withheld_name and any(_is_flag_cluster_with(token, DECLARATION_PRINT_FLAG) for token in rest))
+    return word == SET_BUILTIN and not rest
+
+
+def _gcloud_auth_is_served(after: Sequence[str]) -> bool:
+    """Whether the words after `gcloud auth` name a subcommand that prints no token."""
+    # A flag with no `=` may take the next word as its value, so the subcommand cannot be told.
+    if after[:1] and after[0].startswith(OPTION_PREFIXES) and EQUALS_SEPARATOR not in after[0]:
+        return False
+    subcommand = [token for token in after if not token.startswith(OPTION_PREFIXES)]
+    if subcommand[:1] == [GCLOUD_AUTH_SCOPE]:
+        return bool(subcommand[1:2]) and subcommand[1] in GCLOUD_AUTH_SCOPE_SERVED
+    return bool(subcommand[:1]) and subcommand[0] in GCLOUD_AUTH_SERVED
+
+
+def _gcloud_prints_token(rest: Sequence[str]) -> bool:
+    """Whether the words after `gcloud` run an `auth` subcommand not named as served.
+
+    `auth` is the group only as the first word behind `gcloud`'s own flags,
+    their values and a release track; behind another group's words it is a
+    resource's name (`gcloud run services describe auth`).
+    """
+    after_flag = False
+    for index, word in enumerate(rest):
+        if word.startswith(OPTION_PREFIXES):
+            after_flag = EQUALS_SEPARATOR not in word
+        elif word == GCLOUD_AUTH_GROUP:
+            return not _gcloud_auth_is_served(rest[index + 1 :])
+        elif after_flag or word in GCLOUD_RELEASE_TRACKS:
+            after_flag = False
+        else:
+            return False
+    return False
+
+
+def _runs_token_printer(paths: Sequence[Sequence[str]], words: Sequence[str], behind: int) -> bool:
+    """Whether the words from `behind` on run one of a tool's token-printer paths (see `TOKEN_PRINTER_PATHS`)."""
+    return any(tuple(words[start : start + len(path)]) == tuple(path) for start in _first_operands(words, behind) for path in paths)
+
+
+def _code_prints_environment(code: str, environment_re: "re.Pattern[str]", served_before_re: "re.Pattern[str]") -> bool:
+    """Whether inline code uses a language's whole environment (see `PYTHON_BINARY_RE`)."""
+    for found in environment_re.finditer(code):
+        if not served_before_re.search(code[max(0, found.start() - CODE_LOOKBACK_CHARS) : found.start()]):
+            return True
+    return False
+
+
+def _python_code_prints_environment(code: str) -> bool:
+    """Whether inline Python code uses its whole environment, under `os.environ` or under the name it imports from `os`."""
+    if _code_prints_environment(code, PYTHON_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE):
+        return True
+    return bool(PYTHON_ENVIRONMENT_IMPORT_RE.search(code)) and _code_prints_environment(
+        code, PYTHON_IMPORTED_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE
+    )
+
+
+def _inline_codes(rest: Sequence[str], flag_re: "re.Pattern[str]", long_flags: frozenset) -> List[str]:
+    """The words after an interpreter that may be its inline code; none when no word is a code flag.
+
+    Every word may be the code, and so may the text behind a code flag in one
+    word with it (`-c'print(1)'` is the word `-cprint(1)`).
+    """
+    flags = [flag_re.match(word) for word in rest]
+    if not any(flags) and not any(word.partition(EQUALS_SEPARATOR)[0] in long_flags for word in rest):
+        return []
+    return [*rest, *(word[flag.end() :] for word, flag in zip(rest, flags) if flag)]
+
+
+def _interpreter_prints_environment(base: str, rest: Sequence[str]) -> bool:
+    """Whether an interpreter's inline code, among the words after it, prints its whole environment."""
+    if PYTHON_BINARY_RE.match(base):
+        return any(_python_code_prints_environment(code) for code in _inline_codes(rest, PYTHON_CODE_FLAG_RE, frozenset()))
+    if base in NODE_BINARIES:
+        return any(
+            _code_prints_environment(code, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE)
+            for code in _inline_codes(rest, NODE_CODE_FLAG_RE, NODE_CODE_LONG_FLAGS)
+        )
+    return False
+
+
+def _flag_values(words: Sequence[str], flag: str) -> List[str]:
+    """The values of `flag` among `words`: `flag=value`, and the word behind a bare `flag`."""
+    joined = flag + EQUALS_SEPARATOR
+    values = [word[len(joined) :] for word in words if word.startswith(joined)]
+    return values + [words[index + 1] for index, word in enumerate(words[:-1]) if word == flag]
+
+
+def _first_operands(words: Sequence[str], start: int) -> List[int]:
+    """Where the first operand at or after `start` may stand: the first word that is no option, number or assignment.
+
+    A word right after an option may be that option's value, so it is one
+    place and the scan goes on to the word behind it.
+    """
+    found: List[int] = []
+    after_option = False
+    for index in range(start, len(words)):
+        token = words[index]
+        if token.startswith(OPTION_PREFIXES):
+            after_option = True
+        elif WORD_ASSIGNMENT_RE.match(token) or PREFIX_NUMBER_RE.match(token):
+            after_option = False
+        else:
+            found.append(index)
+            if not after_option:
+                break
+            after_option = False
+    return found
+
+
+def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: List[int]) -> bool:
+    """Whether one command's words print a token or the environment."""
+    words = list(words)
+    if words[:1] == [FUNCTION_KEYWORD]:
+        words = words[FUNCTION_HEAD_WIDTH:]
+    if not words:
+        return False
+    if any(word.endswith(ENVIRON_PATH_SUFFIX) for word in words):
+        return True
+    if any(GCLOUD_TOKEN_PRINTER_GROUPS[word] in words[:index] for index, word in enumerate(words) if word in GCLOUD_TOKEN_PRINTERS):
+        return True
+    steps = 0
+    starts, read = [(0, False)], set()
+    while starts:
+        start, stdin_arguments = starts.pop()
+        while start < len(words) and WORD_ASSIGNMENT_RE.match(words[start]):
+            start += 1
+        if start >= len(words) or start in read:
+            continue
+        read.add(start)
+        base = _base_word(words[start])
+        if base not in COMMAND_READING_WORDS and not PYTHON_BINARY_RE.match(base):
+            continue
+        steps += len(words) - start
+        if steps > MAX_READ_STEPS:
+            return any(_is_named_word(word, WALK_LIMIT_COMMAND_WORDS) or PYTHON_BINARY_RE.match(_base_word(word)) for word in words)
+        behind = start + 1
+        rest = words[behind:]
+        if base in TOKEN_PRINTER_PATHS and _runs_token_printer(TOKEN_PRINTER_PATHS[base], words, behind):
+            return True
+        if _interpreter_prints_environment(base, rest):
+            return True
+        if base in SCRIPT_FLAG_WORDS:
+            script_flag = next((index for index, word in enumerate(rest) if _is_flag_cluster_with(word, SHELL_SCRIPT_FLAG)), None)
+            if script_flag is not None:
+                if any(_script_word_prints(words[index], depth, budget) for index in _first_operands(words, behind + script_flag + 1)):
+                    return True
+                if base in SHELL_BINARIES:
+                    continue
+            if any(_script_value_prints(script, depth, budget) for script in _flag_values(rest, SCRIPT_LONG_FLAG)):
+                return True
+        if base == GCLOUD_BINARY:
+            if _gcloud_prints_token(rest):
+                return True
+            if GCLOUD_SSH_COMMAND in rest:
+                if END_OF_FLAGS in rest:
+                    starts.append((behind + rest.index(END_OF_FLAGS) + 1, False))
+                if any(_script_value_prints(script, depth, budget) for script in _flag_values(rest, SCRIPT_LONG_FLAG)):
+                    return True
+        elif base == ENV_BINARY:
+            command = _env_command_index(rest)
+            if command is None:
+                return True
+            starts.append((behind + command, stdin_arguments))
+        elif base in ENVIRONMENT_DUMP_WORDS:
+            if (stdin_arguments and base == PRINTENV_BINARY) or _prints_variables(base, rest):
+                return True
+        elif base in FILE_READER_WORDS:
+            if any(_is_environ_file(word) for word in rest):
+                return True
+        elif base in REMOTE_COMMAND_WORDS or base in OPERAND_COMMAND_WORDS:
+            named_among = rest
+            if END_OF_FLAGS in rest:
+                dashes = rest.index(END_OF_FLAGS)
+                starts.append((behind + dashes + 1, False))
+                if base in OPERAND_COMMAND_WORDS and all(word.startswith(OPTION_PREFIXES) for word in rest[:dashes]):
+                    starts.append((behind + dashes + OPERAND_AND_COMMAND_WIDTH, False))
+                named_among = rest[:dashes]
+            if base in OPERAND_COMMAND_WORDS or not REMOTE_COMMAND_VERBS.isdisjoint(rest):
+                starts.extend(
+                    (behind + index, False)
+                    for index, word in enumerate(named_among)
+                    if _is_named_word(word, REMOTE_NAMED_COMMAND_WORDS) or PYTHON_BINARY_RE.match(_base_word(word))
+                )
+        elif base == EVAL_BUILTIN:
+            if _quoted_script_prints(EVAL_WORD_JOIN.join(rest), depth, budget):
+                return True
+        elif base == TRAP_BUILTIN:
+            if any(_script_word_prints(words[index], depth, budget) for index in _first_operands(words, behind)):
+                return True
+        elif base == FIND_BINARY:
+            starts.extend((behind + index + 1, False) for index, word in enumerate(rest) if word in FIND_COMMAND_FLAGS)
+            # The command behind `-exec` ends at the `;` word (`find . -exec env \;` runs a bare `env`),
+            # so each command is also read by itself. The shell reader gives that word; the first read never does.
+            for index, word in enumerate(rest):
+                if word in FIND_COMMAND_FLAGS and FIND_COMMAND_END in rest[index + 1 :]:
+                    command = rest[index + 1 : rest.index(FIND_COMMAND_END, index + 1)]
+                    budget[MARKS_BUDGET] -= READ_COST_CHARS * len(command)
+                    if budget[MARKS_BUDGET] < 0 or _words_print_token_or_environment(command, depth, budget):
+                        return True
+        elif base == COMMAND_BUILTIN and rest[:1] and rest[0] in COMMAND_LOOKUP_FLAGS:
+            continue
+        elif base in COMMAND_PREFIX_WORDS:
+            stdin_next = stdin_arguments or base in STDIN_ARGUMENT_WORDS
+            starts.extend((index, stdin_next) for index in _first_operands(words, behind))
+    return False
+
+
+def _holds_print_fragment(text: str) -> bool:
+    """Whether `text` holds a fragment of a word this rule withholds on (see `TOKEN_OR_ENVIRONMENT_FRAGMENTS`)."""
+    unquoted = text.translate(SHELL_QUOTING_CHARS_REMOVED)
+    return any(fragment in unquoted for fragment in TOKEN_OR_ENVIRONMENT_FRAGMENTS)
+
+
+def _script_word_prints(script: str, depth: int, budget: List[int]) -> bool:
+    """Whether a script given as one word prints a token or the environment.
+
+    A script of several words is a quoted script, which its command's words
+    hand to `_quoted_script_prints`. Past the nesting limit a script is not
+    read, and it withholds.
+    """
+    if _holds_whitespace(script):
+        return False
+    script = SCRIPT_ESCAPED_SUBSTITUTION_RE.sub(SCRIPT_ESCAPED_SUBSTITUTION_REPLACEMENT, script)
+    return depth >= MAX_NESTED_COMMAND_DEPTH or _text_prints_token_or_environment(script, depth + 1, budget)
+
+
+def _quoted_script_prints(script: str, depth: int, budget: List[int]) -> bool:
+    """Whether a quoted script of several words, read as a script of its own, prints a token or the environment."""
+    script = SCRIPT_ESCAPED_SUBSTITUTION_RE.sub(SCRIPT_ESCAPED_SUBSTITUTION_REPLACEMENT, script)
+    return depth >= MAX_NESTED_COMMAND_DEPTH or script_prints_token_or_environment(script, depth + 1, budget)
+
+
+def _is_quoted_script(word: str) -> bool:
+    """Whether a shell word can be a quoted script: it holds a blank, a shell operator or a backtick, which only quotes keep in one word."""
+    return _holds_whitespace(word) or SHELL_BACKTICK in word or not SHELL_PUNCTUATION_CHARS.isdisjoint(word)
+
+
+def _script_value_prints(script: str, depth: int, budget: List[int]) -> bool:
+    """Whether a script that is one argument, of one word or several, prints a token or the environment."""
+    return _quoted_script_prints(script, depth, budget) if _holds_whitespace(script) else _script_word_prints(script, depth, budget)
+
+
+def _shell_marks(text: str) -> Iterator[Tuple[int, int, str, Optional[str]]]:
+    """Each comment, backtick and `$(` of `text`: its start, its end, its mark, and the quote it stands in (None, `'` or `"`).
+
+    A comment runs to the end of its line, continuation or not, and nothing
+    inside one is a mark: an apostrophe in a comment opens no quote. `text`
+    is the line before its continuations are folded; a continuation joins
+    the characters on its two sides, so a `#` behind one starts a word only
+    when the character ahead of the continuation ends one.
+    """
+    quote: Optional[str] = None
+    comment_end = 0
+    # The last continuation (a backslash and a line break): where it, or the run of them it ends, starts, and where it ends.
+    continuation_start = continuation_end = -1
+    for found in SHELL_MARK_RE.finditer(text):
+        start, mark = found.start(), found.group()
+        if start < comment_end:
+            continue
+        if mark[0] == SHELL_ESCAPE_CHAR:
+            # Inside single quotes a backslash is a plain character, so the quote behind it closes them.
+            if quote == SHELL_SINGLE_QUOTE:
+                if mark[-1] == SHELL_SINGLE_QUOTE:
+                    quote = None
+            elif mark[-1] == LINE_BREAK:
+                continuation_start = continuation_start if start == continuation_end else start
+                continuation_end = found.end()
+        elif mark in SHELL_QUOTE_CHARS:
+            if quote is None:
+                quote = mark
+            elif quote == mark:
+                quote = None
+        elif mark != SHELL_COMMENT_CHAR:
+            yield start, found.end(), mark, quote
+        elif quote is None and _starts_a_word(text, continuation_start if start == continuation_end else start):
+            line_end = text.find(LINE_BREAK, start)
+            comment_end = len(text) if line_end < 0 else line_end
+            yield start, comment_end, mark, quote
+
+
+def _starts_a_word(text: str, index: int) -> bool:
+    """Whether the character at `index` is the first of a shell word: the text starts there, or a blank or an operator stands ahead of it."""
+    return index == 0 or text[index - 1] in COMMENT_LEAD_CHARS
+
+
+def _rewritten(text: str, replaced: Sequence[Tuple[int, int, str]]) -> str:
+    """`text` with each (start, end, replacement) of `replaced`, in order, written in."""
+    pieces: List[str] = []
+    kept = 0
+    for start, end, replacement in replaced:
+        pieces.extend((text[kept:start], replacement))
+        kept = end
+    pieces.append(text[kept:])
+    return "".join(pieces) if replaced else text
+
+
+def strip_shell_comments(text: str) -> str:
+    """`text` without its shell comments: a `#` that starts a word outside quotes, to the end of its line."""
+    return _rewritten(text, [(start, end, "") for start, end, mark, _ in _shell_marks(text) if mark == SHELL_COMMENT_CHAR])
+
+
+def _backticks_as_substitutions(text: str) -> str:
+    """`text` with each backtick pair outside single quotes written as `$( ... )`."""
+    replaced: List[Tuple[int, int, str]] = []
+    for start, end, mark, quote in _shell_marks(text):
+        if mark == SHELL_BACKTICK and quote != SHELL_SINGLE_QUOTE:
+            replaced.append((start, end, BACKTICK_CLOSES if len(replaced) % 2 else BACKTICK_OPENS))
+    return _rewritten(text, replaced)
+
+
+def _substitution_texts(text: str) -> Optional[List[str]]:
+    """The text inside each `$(` outside single quotes, to the `)` that closes it; None when the line holds more than the limit.
+
+    The `)` is the one that balances the parentheses behind the `$(`
+    (`$(gcloud --format='value(token)' auth print-access-token)`); with none,
+    the text runs to the end.
+    """
+    texts: List[str] = []
+    for _, end, mark, quote in _shell_marks(text):
+        if mark != SUBSTITUTION_OPEN or quote == SHELL_SINGLE_QUOTE:
+            continue
+        if len(texts) >= MAX_READ_SUBSTITUTIONS:
+            return None
+        close, depth = len(text), 1
+        for paren in PARENTHESIS_RE.finditer(text, end):
+            depth += 1 if paren.group() == SUBSHELL_OPEN else -1
+            if not depth:
+                close = paren.start()
+                break
+        texts.append(text[end:close])
+    return texts
+
+
+def _unsplit_text_prints(text: str) -> bool:
+    """Whether text the rule cannot read as words holds a dump, a token printer or an environment name (see `UNSPLIT_LINE_RE`)."""
+    if UNSPLIT_LINE_RE.search(text):
+        return True
+    if any(tool_re.search(text) and path_re.search(text) for tool_re, path_re in UNSPLIT_PRINTER_RES):
+        return True
+    # The same patterns as the word walk's, so that the two cannot know different spellings.
+    return _python_code_prints_environment(text) or _code_prints_environment(text, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE)
+
+
+def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) -> bool:
+    """Whether a shell line, read as words and operators, holds a command that prints a token or the environment."""
+    budget[0] -= len(text) + READ_COST_CHARS
+    if budget[0] < 0:
+        return True
+    # A backslash that ends the text escapes nothing the lexer can read: the split took the blank behind it off.
+    if (len(text) - len(text.rstrip(SHELL_ESCAPE_CHAR))) % 2:
+        text = text[: -len(SHELL_ESCAPE_CHAR)]
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    # A `#` inside a word is no comment; the caller took the comments off.
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # An unclosed quote, as an apostrophe in a heredoc's prose leaves one: each line is read by itself.
+        lines = [line for line in text.split(LINE_BREAK) if _holds_print_fragment(line)] if LINE_BREAK in text else []
+        if lines and len(lines) <= MAX_READ_LINES:
+            return any(_text_prints_token_or_environment(line, depth, budget) for line in lines)
+        return _unsplit_text_prints(text)
+    segment: List[str] = []
+    here_strings: List[str] = []
+    foreign = False
+    prefix_only = True
+    # The redirection operator whose target the next word is.
+    redirect: Optional[str] = None
+    for token in [*tokens, SHELL_COMMAND_END]:
+        if not token or not SHELL_PUNCTUATION_CHARS.issuperset(token):
+            # A word that spans lines is read as a script of its own, whatever its command: an
+            # apostrophe in a heredoc's prose can pair with a later quote and make commands one word.
+            if LINE_BREAK in token and depth < MAX_NESTED_COMMAND_DEPTH and script_prints_token_or_environment(token, depth + 1, budget):
+                return True
+            if redirect is None:
+                segment.append(token)
+                prefix_only = prefix_only and token in HARMLESS_COMMAND_PREFIX_WORDS
+            elif redirect.endswith(HERE_STRING_OPERATOR):
+                here_strings.append(token)
+            elif SHELL_INPUT_REDIRECT_CHAR in redirect and _is_environ_file(token):
+                return True
+            redirect = None
+            continue
+        if token.startswith(SUBSHELL_OPEN) and segment and not segment[-1].endswith(SHELL_EXPANSION):
+            # A `(` behind a word opens no command. Behind shell keywords the words go on (`if (env); then`);
+            # behind another word this is no shell command but another language's call, a function's
+            # head or prose (`print(set())`, `seen | set()`, `f() { ...; }`), and its words are not read.
+            foreign = foreign or not prefix_only
+            if token == SUBSHELL_OPEN:
+                continue
+        redirects = SUBSHELL_OPEN not in token and not REDIRECT_OPERATOR_CHARS.isdisjoint(token)
+        if redirects:
+            # A redirection goes off with its file descriptor and its target.
+            if segment and segment[-1].isdigit():
+                segment.pop()
+            redirect = token
+            if SHELL_COMMAND_END not in token:
+                continue
+        if not foreign:
+            if _words_print_token_or_environment(segment, depth, budget):
+                return True
+            # A shell reads a here-string as its script (`bash <<< env`).
+            if any(_base_word(word) in SHELL_BINARIES for word in segment) and any(_script_word_prints(script, depth, budget) for script in here_strings):
+                return True
+            # A quoted argument on one line is a script where a word on the command runs one.
+            if any(_base_word(word) in SCRIPT_RUNNING_WORDS for word in segment):
+                if any(_script_value_prints(word, depth, budget) for word in (*segment, *here_strings) if _is_quoted_script(word) and LINE_BREAK not in word):
+                    return True
+        foreign, prefix_only, segment, here_strings = False, True, [], []
+        redirect = token if redirects else None
+    return False
+
+
+def _text_prints_token_or_environment(text: str, depth: int, budget: List[int]) -> bool:
+    """Whether one command's text prints a token or the environment: its words, then each substitution by itself."""
+    text = _backticks_as_substitutions(text)
+    if _line_prints_token_or_environment(text, depth, budget):
+        return True
+    # A `$(...)` runs inside double quotes too, where the line's words do not show it.
+    substitutions = _substitution_texts(text)
+    if substitutions is None:
+        return _unsplit_text_prints(text)
+    for inner in substitutions:
+        if len(inner) > MAX_READ_SUBSTITUTION_CHARS:
+            if _unsplit_text_prints(inner):
+                return True
+        elif _line_prints_token_or_environment(inner, depth, budget):
+            return True
+    return False
+
+
+def _first_read_prints(script: str, depth: int, budget: Optional[List[int]] = None) -> bool:
+    """Whether a shell script holds a command that prints the caller's token or its environment (see `GCLOUD_BINARY`).
+
+    The script is a tool call's line, or a quoted argument that a word on
+    its command runs as a script. It is read without its comments: a comment
+    hides no command (`env # all of it`), and an apostrophe in one would
+    join the lines behind it into one quoted word.
+    """
+    may_print = _holds_print_fragment(script)
+    if not may_print and PROC_DIRECTORY not in script.translate(SHELL_QUOTING_CHARS_REMOVED):
+        return False
+    if budget is None:
+        budget = [MAX_READ_CHARS_FACTOR * len(script) + MAX_READ_CHARS_FLOOR]
+    budget[0] -= len(script)
+    if budget[0] < 0:
+        return True
+    # A comment ends at its line's end even behind a backslash, so the comments go off before the continuations fold.
+    folded = fold_shell_continuations(strip_shell_comments(script))
+    if _reads_process_environment(folded):
+        return True
+    return may_print and any(_text_prints_token_or_environment(simple, depth, budget) for simple in split_shell_commands(folded) if _holds_print_fragment(simple))
+
+
+def _without_substitutions(words: Sequence[str], spans: Sequence[str], budget: List[int]) -> Optional[List[str]]:
+    """The words as they are when each substitution prints nothing; None when the read budget ends first.
+
+    A word is then what stands beside its substitution (`env$(true)` runs
+    `env`), and a word that is only a substitution is no word (`env $(true)`
+    runs a bare `env`). Behind a builtin that takes names such a word stays
+    (`NAME_TAKING_BUILTINS`).
+    """
+    # The longest first: one substitution's text can stand inside another's.
+    texts = sorted(set(spans), key=len, reverse=True)
+    bare: List[str] = []
+    for word in words:
+        if isinstance(word, SHELL_READER._ShellOperator) or not any(opener in word for opener in SPAN_OPENERS):
+            bare.append(word)
+            continue
+        budget[SHELL_READER_BUDGET] -= len(texts)
+        if budget[SHELL_READER_BUDGET] < 0:
+            return None
+        without = word
+        for text in texts:
+            without = without.replace(text, "")
+        if without or (bare and _base_word(bare[-1]) in NAME_TAKING_BUILTINS):
+            bare.append(without or word)
+    return bare
+
+
+def _script_part_prints(script: str, depth: int, budget: List[int]) -> bool:
+    """Whether a quoted argument that a word on its command runs as a script prints a token or the environment, by either read."""
+    if _script_value_prints(script, depth, budget):
+        return True
+    # A script of several words went to both reads there. A script of one word went to the first read alone.
+    if _holds_whitespace(script) or depth >= MAX_NESTED_COMMAND_DEPTH:
+        return False
+    return _read_script_prints(SCRIPT_ESCAPED_SUBSTITUTION_RE.sub(SCRIPT_ESCAPED_SUBSTITUTION_REPLACEMENT, script), depth + 1, budget)
+
+
+def _commands_print(words: Sequence[str], depth: int, budget: List[int]) -> bool:
+    """Whether a command among the shell reader's words and operators prints a token or the environment."""
+    segment: List[str] = []
+    here_strings: List[str] = []
+    foreign = False
+    prefix_only = True
+    # The redirection operator whose target the next word is.
+    redirect: Optional[str] = None
+    for word in [*words, SHELL_READER._ShellOperator(SHELL_COMMAND_END)]:
+        if not isinstance(word, SHELL_READER._ShellOperator):
+            if _reads_process_environment(word):
+                return True
+            if redirect is None:
+                # A flag of a prefix word keeps the prefix (`time -p (env)`).
+                prefix_only = prefix_only and (word in HARMLESS_COMMAND_PREFIX_WORDS or word.startswith(OPTION_PREFIXES))
+                segment.append(word)
+            elif redirect.endswith(HERE_STRING_OPERATOR):
+                here_strings.append(word)
+            elif SHELL_INPUT_REDIRECT_CHAR in redirect and _is_environ_file(word):
+                return True
+            redirect = None
+            continue
+        if word == SUBSHELL_OPEN:
+            # A `(` behind a word opens no command. Behind shell keywords the words go on (`if (env); then`);
+            # behind another word this is no shell command but another language's call, a function's
+            # head or prose (`print(set())`, `seen | set()`, `f() { ...; }`), and its words are not read.
+            foreign = foreign or not prefix_only
+            continue
+        if SHELL_READER._is_redirect(word):
+            # A redirection goes off with its file descriptor and its target.
+            if segment and segment[-1].isdigit():
+                segment.pop()
+            redirect = word
+            continue
+        if not foreign:
+            if _words_print_token_or_environment(segment, depth, budget):
+                return True
+            # A shell reads a here-string as its script (`bash <<< env`).
+            if any(_base_word(part) in SHELL_BINARIES for part in segment) and any(_script_word_prints(script, depth, budget) for script in here_strings):
+                return True
+            # A quoted argument is a script where a word on the command runs one.
+            if any(_base_word(part) in SCRIPT_RUNNING_WORDS for part in segment):
+                if any(_script_part_prints(part, depth, budget) for part in (*segment, *here_strings) if _is_quoted_script(part)):
+                    return True
+        foreign, prefix_only, segment, here_strings = False, True, [], []
+        redirect = None
+    return False
+
+
+def _read_script_prints(text: str, depth: int, budget: List[int], nesting: int = 0) -> bool:
+    """Whether a shell script, read as the shell reader's words and operators, holds a command that prints a token or the environment.
+
+    This is the rule's second read. It decides only on text that the reader
+    gives words for. It serves the rest, which the first read decides: text
+    with an unclosed quote or a redirect with no target, for which the reader
+    gives no words, and text that holds the reader's mark character, which
+    this read keeps away from the reader. The reader has words for such text
+    too, so that guard is a choice of this rule and not a limit of the reader.
+    """
+    if len(budget) < READ_COUNT:
+        # The first read made this budget, in a call by its own name.
+        budget.append(MAX_READ_CHARS_FACTOR * len(text) + MAX_READ_CHARS_FLOOR)
+    budget[SHELL_READER_BUDGET] -= len(text) + READ_COST_CHARS
+    if budget[SHELL_READER_BUDGET] < 0:
+        return True
+    if SHELL_READER_MARK_CHAR in text:
+        return False
+    words, spans = SHELL_READER._shell_words_and_spans(text)
+    if _commands_print(words, depth, budget):
+        return True
+    if not spans:
+        return False
+    if nesting >= MAX_SUBSTITUTION_NESTING:
+        return True
+    bare = _without_substitutions(words, spans, budget)
+    if bare is None or (bare != words and _commands_print(bare, depth, budget)):
+        return True
+    # The shell runs each substitution of the line, inside double quotes too.
+    for span in spans:
+        inner = SHELL_READER._substitution_commands(span)
+        if inner is not None and _read_script_prints(inner, depth, budget, nesting + 1):
+            return True
+    return False
+
+
+def script_prints_token_or_environment(script: str, depth: int, budget: Optional[List[int]] = None) -> bool:
+    """Whether either read of a shell script finds a command that prints the caller's token or its environment.
+
+    The first read (`_first_read_prints`) finds comments, backticks and `$(`
+    with marks of its own. The second (`_read_script_prints`) takes words,
+    operators and substitutions from the shell reader. Each read knows
+    spellings the other does not, so the script is withheld when either
+    withholds it.
+    """
+    if not _holds_print_fragment(script) and PROC_DIRECTORY not in script.translate(SHELL_QUOTING_CHARS_REMOVED):
+        return False
+    if budget is None:
+        budget = [MAX_READ_CHARS_FACTOR * len(script) + MAX_READ_CHARS_FLOOR] * READ_COUNT
+    return _first_read_prints(script, depth, budget) or _read_script_prints(script, depth, budget)
+
+
 def _simple_command_reads_a_secret(command: str, depth: int) -> bool:
     """Whether one simple command prints a secret's value: a store's family not in its named lists, a kubectl read, or a quoted script that does."""
-    for family_re, named_lists_re in SECRET_STORE_FAMILIES:
-        for family in family_re.finditer(command):
-            if not named_lists_re.match(family.group(1)):
-                return True
+    for words_start_re, parts_re, words_re, named_lists_re, no_tool, no_gate in SECRET_STORE_FAMILIES:
+        # A command with no start of the family's words holds nothing to read. Most commands stop here, at the cost of one search.
+        if not words_start_re.search(command):
+            continue
+        # The loop is written here, not in a function of its own, so that the read is no deeper in Python frames.
+        tool, gate, read_to = no_tool, no_gate, 0
+        for part in parts_re.finditer(command):
+            if part.start() < read_to:
+                continue
+            kind = part.lastgroup
+            if kind == STORE_SEPARATOR_GROUP:
+                tool = False
+            elif kind == STORE_TOOL_GROUP:
+                tool = True
+            elif kind == STORE_GATE_GROUP:
+                gate = gate or tool
+            elif (tool if no_gate else gate):
+                words = words_re.match(command, part.start())
+                if words:
+                    if not named_lists_re.match(words.group(1)):
+                        return True
+                    tool, gate, read_to = no_tool, no_gate, words.end()
     if kubectl_command_reads_a_secret(command):
         return True
     if depth < MAX_NESTED_COMMAND_DEPTH:
@@ -1603,7 +2740,7 @@ def _command_reads_a_secret(command: str, depth: int) -> bool:
 
 def command_reads_a_secret(command: str) -> bool:
     """Whether the shell line `command` prints a secret's value, deciding closed where it cannot tell."""
-    return _command_reads_a_secret(command, 0)
+    return _command_reads_a_secret(command, 0) or script_prints_token_or_environment(command, 0)
 
 
 def is_secret_read_tool_call(raw_args: Any) -> bool:

@@ -19,6 +19,10 @@ from credential_proxy_client import authorization_headers
 
 
 LOGGER = logging.getLogger("slack-relay-patch")
+# The relay is the credential broker, an in-cluster Service: a proxy from the
+# environment must not get this request and its bearer token, and urllib does
+# not leave out a cluster host by itself.
+_RELAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
 # The agent container starts before the credential-proxy sidecar, and the
 # sidecar has been observed taking the better part of a minute to come up.
@@ -168,7 +172,7 @@ def install() -> None:
             headers=headers,
             method="GET" if body is None else "POST",
         )
-        with urllib.request.urlopen(req, timeout=35) as response:
+        with _RELAY_OPENER.open(req, timeout=35) as response:
             return json.load(response)
 
     def json_value(value: Any, *, file_value: bool = False) -> Any:

@@ -150,7 +150,7 @@ type agentProfileTierIdentity struct {
 //     A profile is not the route to borrowing them.
 //
 // Each is reserved whether or not this agent renders it now (the session
-// account only on next, the MCP account only under A2A_MCP_DOOR, the scope
+// account only on next, the MCP account only while A2A_MCP_DOOR is not false, the scope
 // publisher's only while a publisher may run, the dispatcher's only while it
 // is switched on): a flip or a flag turned on
 // later must not find a profile or an override already holding the name.
@@ -204,7 +204,7 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	// whole map, so the check is against the rendered set rather than a
 	// list someone has to remember to extend.
 	mapKeys := map[string]string{}
-	for _, id := range calloutIdentities(agent) {
+	for _, id := range mappedIdentities(agent) {
 		mapKeys[id.serviceAccount] = id.user
 	}
 	// Oldest first, so an incumbent keeps a contested ServiceAccount and a
@@ -254,6 +254,11 @@ func resolveOneAgentProfile(p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.
 		// profile admitted by an older or edited CRD drops out of the map
 		// instead of failing the whole render.
 		return agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name), reason: reasonAgentProfileInvalid}
+	case !agentProfileHarnessSupported(p.Spec.Harness.Type):
+		// The CRD's enum refuses these too. Refused here as well so that a
+		// type admitted by an older, newer or edited CRD renders no worker
+		// rather than one this operator would start as Claude Code.
+		return agentProfileResolution{refused: fmt.Errorf("spec.harness.type %q is not a harness this operator renders (supported: %s)", p.Spec.Harness.Type, agentv1alpha1.AgentProfileHarnessClaudeCode), reason: reasonAgentProfileHarnessNotSupported}
 	case malformedTopicGrant(p) != "":
 		return agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
 	case foreignPublishTopic(p) != "":
@@ -268,6 +273,13 @@ func resolveOneAgentProfile(p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.
 		// The CRD refuses this name too; the operator does not rely on
 		// admission alone, because CRD validation can be bypassed by an
 		// older CRD left on the cluster.
+		//
+		// `session` (agentv1alpha1.DefaultRouteSession, the gateway's session
+		// route) is reserved too, but deliberately not refused here. The
+		// CRD refuses a new profile of that name at create only, so a
+		// profile created under the name before the rule existed keeps its
+		// identity across the upgrade; refusing it here would drop that
+		// profile from the identity map on the first pass after the upgrade.
 		return agentProfileResolution{refused: fmt.Errorf("profile name %q is the Hermes bridge's addressee", p.Name), reason: reasonAgentProfileInvalid}
 	case named != "" && len(tiers) > 1:
 		// The CRD refuses this too: one named ServiceAccount can't be the
@@ -475,4 +487,10 @@ func isDispatcherBucketUser(name string) bool {
 	}
 	n, err := strconv.Atoi(rest)
 	return err == nil && n >= 0 && n < a2aDispatcherBuckets
+}
+
+// agentProfileHarnessSupported is whether the operator renders workers for
+// a profile's spec.harness.type: absent (Claude Code) or claude-code.
+func agentProfileHarnessSupported(t string) bool {
+	return t == "" || t == agentv1alpha1.AgentProfileHarnessClaudeCode
 }

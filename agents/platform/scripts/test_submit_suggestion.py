@@ -779,6 +779,24 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 self.assertNotIn("has not used", said)
                 self.assertEqual(self.broker.payloads("branch-delete"), [])
 
+    def test_a_read_refused_with_a_code_that_is_not_a_text_is_a_read_that_did_not_finish(self):
+        """The helper looks the refusal's code up in a set, and a list cannot enter one: the
+        lookup raised TypeError. `vcs_client.VcsError` keeps a code only when it is a text, so
+        such a refusal reads as one with no code."""
+        for number, code in enumerate((["FORGE_CALL_FAILED"], {"name": "GIT_FAILED"})):
+            with self.subTest(code=code):
+                branch = f"platform-agent/scale-web-read-odd-{number}"
+                git(self.origin, "checkout", "--quiet", "-b", branch)
+                (self.origin / "app.yaml").write_text(f"replicas: {number + 9}\n")
+                git(self.origin, "commit", "--quiet", "-am", "round one")
+                git(self.origin, "checkout", "--quiet", "main")
+                self.existing_proposal(branch)["state"] = "closed"
+                self.broker.view_fails_with = vcs_client.VcsError("could not read", code=code)
+                with self.assertRaises(ValueError) as caught:
+                    self.prepare(branch)
+                self.assertIn("run prepare again", str(caught.exception))
+                self.assertEqual(self.broker.payloads("branch-delete"), [])
+
     def test_a_broker_without_the_branch_verbs_refuses_the_name_by_code(self):
         branch = "platform-agent/scale-web"
         git(self.origin, "checkout", "--quiet", "-b", branch)
@@ -2298,6 +2316,88 @@ class TestRepositoryOnAnotherForge(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 submit_suggestion.validate_repo("demo/gke-fleet-iac")
+
+
+class DecisionMemoryGuardTest(unittest.TestCase):
+    """Tests for `_check_decision_memory` pre-submit verification."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ka-dm-guard-test-"))
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "--quiet", "-b", "main")
+        (self.repo / "clusters" / "prod").mkdir(parents=True)
+        (self.repo / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 2Gi\n"
+        )
+        (self.repo / "knowledge" / "lessons").mkdir(parents=True)
+        (self.repo / "knowledge" / "lessons" / "LES-2026-001-checkout-memory.md").write_text(
+            "---\n"
+            "type: lesson\n"
+            "id: LES-2026-001\n"
+            "title: Keep checkout memory request >= 2Gi\n"
+            "status: active\n"
+            "date: 2026-03-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/checkout.yaml\n"
+            "guard:\n"
+            "  rule: Keep checkout memory request >= 2Gi.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/checkout.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: '>='\n"
+            "    value: 2Gi\n"
+            "evidence:\n"
+            "  pull_request: '#10'\n"
+            "---\n\n"
+            "## What happened\n\nOOMKilled below 2Gi.\n"
+        )
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "--quiet", "-m", "initial")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_blocking_guard_raises_permission_error_even_if_guard_deleted_in_head(self):
+        git(self.repo, "checkout", "--quiet", "-b", "platform-agent/lower-mem")
+        (self.repo / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n"
+        )
+        (self.repo / "knowledge" / "lessons" / "LES-2026-001-checkout-memory.md").unlink()
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "--quiet", "-m", "lower memory and try deleting guard")
+
+        session = {"path": str(self.repo), "baseRevision": "main"}
+        with self.assertRaises(PermissionError) as caught:
+            submit_suggestion._check_decision_memory(session, "main")
+        self.assertIn("DECISION MEMORY GUARD BLOCKED THIS CHANGE", str(caught.exception))
+        self.assertIn("LES-2026-001", str(caught.exception))
+
+        # Also verify force=True when the entire knowledge/ directory is removed in the working tree
+        shutil.rmtree(self.repo / "knowledge")
+        with self.assertRaises(PermissionError) as caught_force:
+            submit_suggestion._check_decision_memory(session, "main", force=True)
+        self.assertIn("LES-2026-001", str(caught_force.exception))
+
+    def test_consistent_change_passes_guard(self):
+        git(self.repo, "checkout", "--quiet", "-b", "platform-agent/raise-mem")
+        (self.repo / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n"
+        )
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "--quiet", "-m", "raise memory to 4Gi")
+
+        session = {"path": str(self.repo), "baseRevision": "main"}
+        out = submit_suggestion._check_decision_memory(session, "main")
+        self.assertEqual(out["verdict"], "ok")
 
 
 if __name__ == "__main__":

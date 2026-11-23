@@ -10,7 +10,17 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 # stay pinned in the Dockerfile and images.json); unset ones are simply not
 # passed, so an ordinary build is unchanged:
 #   make docker-build HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent
-BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
+# GOLANG_VERSION is the one tag among them: a mirrored golang copy is frozen at
+# one patch, and the builder stages run with GOTOOLCHAIN=local, so when a `go`
+# directive moves past that patch, a rebuild needs a tag that names a newer one.
+# Each list holds it where its Dockerfile declares the arg. It counts from the
+# make command line only: the golang image exports an environment variable of
+# the same name (a bare version, no `-alpine`), and a build inside such a
+# container must not take its builder tag from there.
+ifneq ($(filter environment%,$(origin GOLANG_VERSION)),)
+override GOLANG_VERSION :=
+endif
+BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE GOLANG_VERSION
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
 # The sandbox image is built from a different Dockerfile and shares none of
@@ -19,8 +29,11 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE DISTROLESS_IMAGE
+KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE GOLANG_VERSION DISTROLESS_IMAGE
 KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
+
+HERMES_BRIDGE_IMAGE_VARS := GOLANG_IMAGE GOLANG_VERSION
+HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
 # What the image reports as its own version. Hermes interpolates it into the
 # `User-Agent` of every remote-MCP call, so an image built without it is
@@ -32,7 +45,7 @@ KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--bui
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -52,7 +65,7 @@ help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\n"} /^[a-zA-Z_0-9][a-zA-Z_0-9 -]*:.*##/ { printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # Docker builds
-docker-build: docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox ## Build every image this repository ships (the default target).
+docker-build: docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox ## Build every image this repository ships (the default target).
 docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build the agent images (see the AGENTS variable).
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
@@ -66,8 +79,15 @@ $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
 	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
+# The operator takes the bridge sidecar's image from a `platform-agent` image:
+# the same registry path and tag, with the name `hermes-bridge`. So the bridge
+# is built FROM the agent image that this run tagged, and the agent build is its
+# prerequisite. The context is the a2a module, as a2a/Dockerfile.hermes-bridge says.
+docker-build-hermes-bridge: docker-build-platform ## Build the Hermes bridge sidecar image from this run's platform-agent image.
+	docker build --platform linux/amd64 $(HERMES_BRIDGE_IMAGE_ARGS) --build-arg PLATFORM_AGENT_IMAGE=$(REPO)/platform-agent:latest -t $(REPO)/hermes-bridge:latest -f a2a/Dockerfile.hermes-bridge a2a
+
 docker-build-kube-proxy: ## Build the kube-proxy image.
-	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
+	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) $(VERSION_ARG) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
 
 # Context is the repository root, not deploy/sandbox: the image ships the same
 # credential-proxy client and PATH script the agent image does, and copying
@@ -205,6 +225,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard deploy/sandbox/test_*.py) \
 	$(wildcard hack/replay-proxy/test_*.py) \
 	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
@@ -255,7 +276,7 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # The files the sweep hands out first. xargs feeds the workers in list order,
 # and the globs above sort by path, so a long file that sorts late started
 # late: on 2026-10-14 (run 38592675526) every other file had finished at
-# 16:01:24 and tests/test_rollback_roundtrip.py, 182 s on its own and sorted
+# 16:01:24 and one 182 s file (since deleted), sorted
 # into the last tenth of the list, ran alone until 16:03:32 with three of four
 # workers idle.
 # Longest-first is the schedule that closes that gap, and the simulation over
@@ -269,7 +290,6 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # tail again until someone adds it; the per-file blocks the sweep prints carry
 # the `Ran N tests in S s` line to find it by.
 PYTHON_TEST_HEAVY_FILES := \
-	tests/test_rollback_roundtrip.py \
 	agents/platform/scripts/test_credential_proxy.py \
 	tests/test_fleet_fixture_state.py \
 	scripts/test_eval_dashboard_pages.py \
@@ -401,10 +421,45 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # One file per test file, not one for the sweep, so a test that writes a
 # context into its KUBECONFIG cannot hand it to a file running beside it.
 #
+# Each file also runs with a stand-in gcloud first on PATH, in a folder of its
+# own. A test that runs gcloud with no stub of its own gets the stand-in: it
+# appends its arguments as a line to `calls` in that folder, says so on stderr
+# and fails with the code tests/testing/no_live_gcloud.py uses. A record that
+# is not empty fails the file, also when its tests passed: a test that
+# tolerates the failure here is a test that, run outside this sweep on a
+# machine with gcloud, runs the real one with the developer's login. The
+# file's block shows the count and the first calls only: an argument can hold
+# a project id or an account name. An argument with a newline takes more than
+# one line, and the count is then high by those lines. The two files and the
+# folder are removed after the file's run, on a failure too, by the worker
+# that made the folder and by no other.
+# Not seen: a test that builds a PATH of its own without this folder; one that
+# names gcloud by an absolute path, or through a link to the stand-in, which
+# then writes its record beside the link; and a run outside this sweep, which
+# is `test-python` and `coverage` only.
+# A test's own gcloud ahead on PATH, or a mock, never reaches the stand-in.
+#
 # $(1) is interpolated into a single-quoted sh -c string, so it must not contain
 # a single quote. It also must not contain a comma: $(call) splits arguments on
 # commas before the body ever sees them, so `python3 -c "import os, sys"` would
 # arrive silently truncated at the comma. Both callers avoid each.
+
+# How many recorded gcloud calls a file's block shows: REPORTED_CALLS of
+# tests/testing/no_live_gcloud.py, on purpose the same number.
+PYTHON_TEST_GCLOUD_SHOWN := 5
+# The stand-in's exit code: STAND_IN_EXIT_CODE of tests/testing/no_live_gcloud.py.
+PYTHON_TEST_GCLOUD_EXIT := 97
+# The line in a file's block above the calls the stand-in recorded.
+PYTHON_TEST_GCLOUD_HEADER := gcloud ran with no stub of its own in this file
+# The stand-in, as a printf format for the worker below, which sits inside
+# single quotes and then inside double quotes: \043 is the hash sign, \042 a
+# double quote, \044 a dollar sign, %% a percent sign. It writes:
+#   #!/bin/sh
+#   printf "%s\n" "$*" >>"${0%/*}/calls"
+#   echo "gcloud is not available in the test sweep: stub it in the test" >&2
+#   exit 97
+PYTHON_TEST_GCLOUD_STAND_IN := \043!/bin/sh\nprintf \042%%s\\\\n\042 \042\044*\042 >>\042\044{0%%/*}/calls\042\necho \042gcloud is not available in the test sweep: stub it in the test\042 >&2\nexit $(PYTHON_TEST_GCLOUD_EXIT)\n
+
 define sweep_python_test_files
 work=$$(mktemp -d); \
 trap 'rm -rf "$$work"' EXIT INT TERM; \
@@ -417,13 +472,27 @@ xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	dir="$$(dirname "$$file")"; \
 	name="$$(basename "$$file")"; \
 	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
+	made=0; mkdir "$$stem.gcloud" 2>/dev/null && made=1; \
 	if ( [ -f "$$file" ] || { echo "not a file: $$file"; exit 1; }; \
+	     [ "$$made" = "1" ] || { echo "could not make the stand-in gcloud folder for $$file"; exit 1; }; \
 	     : >"$$stem.kubeconfig" && export KUBECONFIG="$$stem.kubeconfig" && \
+	     printf "$(PYTHON_TEST_GCLOUD_STAND_IN)" >"$$stem.gcloud/gcloud" && \
+	     chmod +x "$$stem.gcloud/gcloud" && export PATH="$$stem.gcloud:$$PATH" && \
 	     cd "$$dir" && $(1) -p "$$name" ) >"$$stem.log" 2>&1; then \
-		rc=0; printf "    ok  %s\n" "$$file"; \
+		rc=0; \
 	else \
-		rc=1; printf "  FAIL  %s\n" "$$file"; \
+		rc=1; \
 	fi; \
+	if [ "$$made" = "1" ]; then \
+		if [ -s "$$stem.gcloud/calls" ]; then \
+			rc=1; \
+			{ echo "$(PYTHON_TEST_GCLOUD_HEADER): $$(wc -l <"$$stem.gcloud/calls" | tr -d " ") call(s). The first $(PYTHON_TEST_GCLOUD_SHOWN) at most:"; \
+			  head -n $(PYTHON_TEST_GCLOUD_SHOWN) "$$stem.gcloud/calls" | sed "s/^/  gcloud /"; } >>"$$stem.log"; \
+		fi; \
+		rm -f "$$stem.gcloud/gcloud" "$$stem.gcloud/calls"; \
+		rmdir "$$stem.gcloud" 2>/dev/null; \
+	fi; \
+	if [ "$$rc" = "0" ]; then printf "    ok  %s\n" "$$file"; else printf "  FAIL  %s\n" "$$file"; fi; \
 	echo "$$rc" >"$$stem.rc" \
 ' _ {} <"$$work/shard.list"; \
 echo; \
@@ -814,7 +883,10 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # fail here in a second instead. The same rules gate in CI through
 # scripts/test_task_registration.py (the tree-level scans, the sanitizer and
 # the run-record guard, as assertions of their own there); this target is the
-# fast path to them.
+# fast path to them. One rule loads each check entry with the harness's own
+# parser, which is in the bench package (`make test-bench-deps`): without the
+# package it does not run and the last line of the output says so, and its
+# gate in CI is bench/tests/test_case_entries_load.py.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
@@ -832,8 +904,12 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 # Install a Go toolchain before trusting a green run here: the injector seam
 # compiles the real Go client, and without `go` on PATH it skips itself rather
 # than failing, which reads exactly like a pass.
+#
+# The tests run with KUBECONFIG set to an empty file, as each file of the
+# test-python sweep does, so an unstubbed kubectl or helm call finds no cluster.
 test-integration: ## Run just the integration seam tests; CI reaches them through the PYTHON_TEST_DIRS sweep.
-	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
+	@kubeconfig=$$(mktemp) && trap 'rm -f "$$kubeconfig"' EXIT INT TERM && \
+	cd tests/integration && KUBECONFIG="$$kubeconfig" PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 
 # The agent's own instructions are prose, and prose is not compiled: a persona
 # that cites a renamed skill or an SOP that names a moved script merges clean
@@ -868,7 +944,7 @@ skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG=
 skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
 	@$(SKILL_OVERLAY) generate $(SKILL)
 
-skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, and every shipped skill document fits skill_view.
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line, and every shipped skill document fits skill_view.
 	@$(SKILL_OVERLAY) check
 	@python3 scripts/check_skill_size.py
 
@@ -912,7 +988,7 @@ docs-check-prose: ## Fail when a published site page's prose is out of step with
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
-docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it (or the one scripts/upgrade_table_traces.txt names), or says pending after a release contains it (needs the full history and the release tags).
+docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it (or the one scripts/upgrade_table_traces.txt names), or says pending after a release contains it, or sits out of newest-first order (needs the full history and the release tags).
 	@python3 scripts/check_upgrade_table_releases.py
 
 docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).
@@ -953,38 +1029,47 @@ tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for 
 # mock_provider put this at 1.7. drift-pubsub's suite raised it to 1.11, for
 # `override_during = plan`: a postcondition on a computed attribute is
 # unreachable without it, since the attribute is unknown at plan time and an
-# apply run leaves state behind that the runs after it silently reuse.
-TERRAFORM_TEST_MIN_VERSION := 1.11.0
+# apply run leaves state behind that the runs after it silently reuse. The
+# scope resolver's suites raised it to 1.15, the first release that accepts a
+# function call (jsonencode) in an override_data value.
+TERRAFORM_TEST_MIN_VERSION := 1.15.0
 
-# Every module and composition that carries a tests/ directory -- the set
-# the validate job initialises -- against mocked providers, so a plan-time
-# rule -- a precondition, a postcondition on a read, the set of bindings a
-# declaration plans -- runs rather than being grepped for
-# (tests/test_scope_iam.py pins the text; these pin the behaviour). A
-# directory without tests/ is skipped, and a new one's tests/ is reached with
-# no edit here; tests/test_terraform_module_tests.py pins the loop, the step
-# and that no test file sits outside it. Every directory runs even after one
-# fails and the failures are named again at the end, for the reason
-# test-python gives: a red run that hides the next suite's result costs a CI
-# round trip to discover.
-terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.11, see TERRAFORM_TEST_MIN_VERSION).
-	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider and override_during); none on PATH" >&2; exit 1; }; \
+# Where each root keeps its suites. Not Terraform's default `tests`: from 1.6
+# `terraform init` parses a root's tests/ directory, so suites there would
+# break init on every release from 1.6 up to the one their newest test syntax
+# needs, inside the `~> 1.5` the roots declare (1.5 itself never reads tests/;
+# see scripts/installer/min_versions.sh). Both commands below name it.
+TERRAFORM_TEST_DIR := tftests
+
+# Every module and composition that carries a $(TERRAFORM_TEST_DIR)/
+# directory -- the set the validate job initialises -- against mocked
+# providers, so a plan-time rule -- a precondition, a postcondition on a read,
+# the set of bindings a declaration plans -- runs rather than being grepped
+# for (tests/test_scope_iam.py pins the text; these pin the behaviour). A
+# directory without one is skipped, and a new one's is reached with no edit
+# here; tests/test_terraform_module_tests.py pins the loop, the step and that
+# no test file sits outside it. Every directory runs even after one fails and
+# the failures are named again at the end, for the reason test-python gives:
+# a red run that hides the next suite's result costs a CI round trip to
+# discover.
+terraform-test: ## Run each terraform/{modules,examples}/*/tftests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.15, see TERRAFORM_TEST_MIN_VERSION).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider, override_during and functions in override values); none on PATH" >&2; exit 1; }; \
 	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
 	if [ -z "$$version" ]; then \
 	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
 	fi; \
 	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
-	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider and override_during (the install floor is lower, the suites are not)" >&2; exit 1; \
+	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider, override_during and functions in override values (the install floor is lower, the suites are not)" >&2; exit 1; \
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
-	  if [ -d "$$dir/tests" ]; then \
+	  if [ -d "$$dir/$(TERRAFORM_TEST_DIR)" ]; then \
 	    stale="$$(ls "$$dir"*_override.tf 2>/dev/null)"; \
 	    if [ -n "$$stale" ]; then \
 	      echo "terraform-test: $$dir holds an override file that terraform test would merge silently, so its assertions would run against the override rather than the module; remove it first (lifecycle.sh writes one around each import and removes it, unless killed outright):" >&2; \
 	      printf '  %s\n' $$stale >&2; failed="$$failed $$dir"; continue; \
 	    fi; \
 	    echo "Testing $$dir..."; \
-	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
+	    (cd "$$dir" && terraform init -backend=false -input=false -test-directory=$(TERRAFORM_TEST_DIR) >/dev/null && terraform test -test-directory=$(TERRAFORM_TEST_DIR)) || failed="$$failed $$dir"; \
 	  fi; \
 	done; \
 	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi

@@ -81,6 +81,13 @@ mcp_servers:
       # container (platformagent_manifests.go), so only the allowlist was
       # missing. test_mcp_env_contract.py is what catches this class of gap.
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
+      # The Teams half, declared for the same contract: send_notification
+      # derives TEAMS_HOME_CHANNEL from the platform table. On the Planning
+      # Agent path the operator puts the value on the container; with the A2A
+      # gateway's Teams backend armed it does not, send_notification reads
+      # empty, and the bare `teams` target rides the gateway's own home
+      # through `a2a notify`, which is the intended route there.
+      TEAMS_HOME_CHANNEL: "${TEAMS_HOME_CHANNEL}"
       # Under next send_notification posts through the A2A gateway with
       # `a2a notify` (chat_notify.py) instead of `hermes send`: the platform it
       # routes, and the bus address and identity the CLI connects with, and
@@ -90,8 +97,8 @@ mcp_servers:
       # environment, so nothing else is needed. A2A_NOTIFY_PLATFORM and
       # A2A_NOTIFY_CONVERSATIONS each hold a comma-separated list of platform
       # names, Chat first: every armed route with a CR home channel in the
-      # first, every armed route in the second. routed_platforms() adds Slack
-      # when the projected file names a learned channel, and sends home posts
+      # first, every armed route in the second. routed_platforms() adds a
+      # platform whose projected file names a learned home, and sends home posts
       # to every armed route when no platform has a home, so the child needs
       # both.
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
@@ -421,3 +428,7 @@ plugins:
     - tool_call_audit
     - incident_context
     - pr_opened
+    # Off unless KUBEAGENTS_EVAL_RUN_TAGS is on (eval installs only): then it adds
+    # the eval run, case and repetition to each model request's headers for the
+    # replay proxy's log (plugins/eval_run_tag/__init__.py). Off, it registers nothing.
+    - eval_run_tag

@@ -26,6 +26,14 @@ const (
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
 	ReasonStopped           = "stopped"
+	// ReasonChangeNeedsJob refuses a task whose confirmed change would put
+	// a write permit on its credential while its tier has no Job runner: a
+	// permit-carrying task runs in its own one-pod Job, never on a pool pod.
+	ReasonChangeNeedsJob = "change-needs-job"
+	// ReasonTierEnded ends a task whose tier an administrator ended the
+	// drain of (lib.DrainingTier.Ending, #5850), held or with its Job still
+	// starting (#6134): canceled, not failed.
+	ReasonTierEnded = "tier-ended"
 	// The re-check of a child whose parent is an AgentProfile task (#5686):
 	// the gateway checks the same at mint, and the dispatcher holds a child
 	// an older gateway sent, or one that breaks either rule, to them.
@@ -38,6 +46,9 @@ const (
 	// ReasonOutsideParentScope: the child's target lies outside its parent's
 	// scope.
 	ReasonOutsideParentScope = "outside-parent-scope"
+	// ReasonScriptNotAllowed: the submission's trigger names a script its
+	// profile's spec.scripts doesn't list (#5622).
+	ReasonScriptNotAllowed = "script-not-allowed"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.
@@ -86,8 +97,10 @@ func terminalEnvelopeID(hk holdKey) string {
 }
 
 // publishTerminal is the dispatcher's one write to a task: a final status
-// update on its `.supervisor` subject (lib.TaskSupervisorSubject, contract
-// addendum 6), `rejected` for a submission refused at admission (nothing
+// update on its `.supervisor` subject, the five-token
+// lib.TaskSupervisorSubject or the six-token lib.ProfileSupervisorSubject as
+// the dispatch config says (DispatchConfig.SupervisorSubjectFor; contract
+// addendum 6, #5301), `rejected` for a submission refused at admission (nothing
 // ran) or `failed` once a worker had it. `.supervisor`, not `.events`, so
 // `.events` stays the executor's alone and replay can tell the two apart.
 // Every terminal the dispatcher writes goes through here.
@@ -111,5 +124,34 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.busFor(hk.profile).Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
+	// The five- or six-token form, as the operator's config says (#5301):
+	// readers read the five-token form as a profile task's fallback only
+	// until the install's cutoff, and past it that terminal isn't read. The
+	// operator moves the dispatcher to the six-token form only once every
+	// reader that can run watches both.
+	subject := d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID)
+	err = d.busFor(hk.profile).Publish(ctx, subject, env)
+	five := lib.TaskSupervisorSubject(hk.profile, sub.TaskID)
+	if err == nil || subject == five {
+		return err
+	}
+	// The six-token write failed: most likely a grant that hasn't reached
+	// this connection (a callout restart, a partial rollback) or was taken
+	// away. Both forms are granted, and readers read the five-token one
+	// until the install's cutoff (past it, this fallback terminal isn't
+	// read), so the terminal goes on the five-token one now rather than
+	// being retried without end while the task holds its slot. The envelope id is the
+	// same, so a six-token write that did land is deduplicated onto it.
+	//
+	// The fallback gets its own deadline. A refused publish draws no
+	// JetStream ack, so the first one waits out the caller's context, and a
+	// caller that gave both one deadline (publishTerminalRetry's kvOpTimeout)
+	// would hand the fallback an expired one: it would fail at once and the
+	// held task would be retried without end anyway.
+	d.supervisorFallbacks.Add(1)
+	d.log.Warn("profile task terminal refused on the six-token supervisor subject; writing it on the five-token one",
+		"profile", hk.profile, "task", sub.TaskID, "subject", subject, "err", err)
+	fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kvOpTimeout)
+	defer cancel()
+	return d.busFor(hk.profile).Publish(fallbackCtx, five, env)
 }
