@@ -149,7 +149,8 @@ k8s-api-proxy/
     │   └── jwtauth.go            # Signed-JWT CallerAuthenticator against an issuer's JSON Web Key Set
     └── upstream/
         ├── upstream.go           # GKE HTTPS UpstreamTransport for in-cluster and fleet GKE clusters
-        └── gke.go                # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com
+        ├── gke.go                # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com
+        └── static.go             # Static HTTP/HTTPS UpstreamTransport for single-upstream bridges
 ```
 
 #### Core interfaces (`pkg/k8sapiproxy`)
@@ -208,15 +209,18 @@ const (
 
 // Config configures NewHandler.
 type Config struct {
-	Authenticator            CallerAuthenticator
-	Upstream                 UpstreamTransport
-	Mode                     Mode
-	RedactSecrets            bool
-	AllowUpgradeSubresources bool
-	Metrics                  *Metrics
-	AuditSink                AuditSink
-	TracerProvider           trace.TracerProvider
-	Cache                    *CacheConfig
+	Authenticator    CallerAuthenticator
+	Upstream         UpstreamTransport
+	Policy           Policy
+	Audit            AuditSink
+	Logger           *slog.Logger
+	Metrics          *Metrics
+	TracerProvider   trace.TracerProvider
+	Cache            *CacheConfig
+	Exclusions       *Exclusions
+	CallerPartition  func(*CallerIdentity) string
+	MaxInFlight      int
+	DefaultClusterID string
 }
 ```
 
@@ -310,7 +314,7 @@ Because `Config.Authenticator` is an interface (`CallerAuthenticator`), deployme
 - **Projected `ServiceAccount` JWT (`TokenReview`)**: Default for multi-pod Kubernetes sandboxes (`kube-agents`).
 - **Signed JWT from the sandbox platform (`pkg/jwtauth`)**: The platform mints a per-sandbox token (for example an agent runtime's actor token, injected at its egress gateway); the proxy verifies it against the issuer's key set, issuer, audience and expiry, with no call back to the issuer per request.
 - **Workload mTLS (`client-certificate` / `client-key` or SPIFFE X.509 SVID)**: The sandbox authenticates to `kube-proxy` with a client TLS certificate without reading a bearer token file.
-- **Host-local network isolation (`veth` pair or Unix domain socket)**: When `kube-proxy` runs on the host or hypervisor boundary for a single local sandbox (such as a local VM or NVIDIA OpenShell supervisor), binding `kube-proxy` to the dedicated host-side interface or socket authenticates the caller by transport endpoint (`StaticAuthenticator`).
+- **Host-local network isolation (`veth` pair or Unix domain socket)**: When `kube-proxy` runs on the host or hypervisor boundary for a single local sandbox (such as a local VM or NVIDIA OpenShell supervisor), binding `kube-proxy` to the dedicated host-side interface or socket authenticates the caller by transport endpoint (`--auth-mode=none` or a caller-provided `CallerAuthenticator`).
 
 ### 6. Request parsing and L7 verb policy (`pkg/k8sapiproxy/policy.go`)
 
@@ -373,7 +377,7 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 
 Today the proxy does not change `User-Agent`: the header reaches `kube-apiserver` as the caller sent it, with no `kproxy/<caller-username>` suffix. The target cluster's audit log therefore shows the proxy's upstream identity and `kubectl`'s own `User-Agent`, and does not name the sandbox caller. The record of the caller is the proxy's own audit record (`caller_username`, `caller_uid`, `caller_groups`; see section 10). A request that the proxy forwarded is matched to the cluster's audit log by its `cluster`, its time (the record is written when the request ends, and `duration_ms` gives the start) and its request fields (`verb`, `api_group`, `resource`, `namespace`, `name`). A record whose `cache` is `hit` or `coalesced` has no entry of its own in the cluster's audit log. The two logs share no request ID.
 
-For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering.
+For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering. When `Policy.DenyStreaming` (`--deny-streaming` or `KUBE_PROXY_DENY_STREAMING`) is set, the proxy refuses `watch` requests, `log` `follow` streams (`streaming_blocked`), and protocol upgrades with `403 Forbidden`.
 
 ### 8a. HTTP response cache and in-flight coalescing (`pkg/k8sapiproxy/cache.go`)
 

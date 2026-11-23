@@ -162,6 +162,36 @@ func TestSplitClusterPathWithDefault(t *testing.T) {
 	}
 }
 
+func TestValidateURLPath(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		path    string
+		rawPath string
+		wantMsg string
+	}{
+		{name: "clean path and empty rawPath", path: "/api/v1/pods"},
+		{name: "literal dot-dot in rawPath with clean path", path: "/api/v1/pods", rawPath: "/api/v1/../secrets", wantMsg: "dot segments"},
+		{name: "literal dot-dot in rawPath with empty path", rawPath: "/api/v1/../secrets", wantMsg: "dot segments"},
+		{name: "literal single dot in rawPath", path: "/api/v1/pods", rawPath: "/api/v1/./pods", wantMsg: "dot segments"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateURLPath(tc.path, tc.rawPath)
+			if tc.wantMsg == "" {
+				if err != nil {
+					t.Fatalf("ValidateURLPath(%q, %q) = %v, want nil", tc.path, tc.rawPath, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateURLPath(%q, %q) = nil, want error containing %q", tc.path, tc.rawPath, tc.wantMsg)
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("ValidateURLPath(%q, %q) = %q, want substring %q", tc.path, tc.rawPath, err.Error(), tc.wantMsg)
+			}
+		})
+	}
+}
+
 type policyCase struct {
 	name    string
 	method  string

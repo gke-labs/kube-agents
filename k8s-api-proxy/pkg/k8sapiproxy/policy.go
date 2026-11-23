@@ -241,9 +241,7 @@ func ValidateURLPath(path, rawPath string) error {
 		if strings.ContainsFunc(p, IsDisallowedURLRune) {
 			return fmt.Errorf("backslashes and control characters are not permitted in the path")
 		}
-	}
-	if path != "" {
-		for _, seg := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		for _, seg := range strings.Split(strings.TrimPrefix(p, "/"), "/") {
 			if seg == "." || seg == ".." {
 				return fmt.Errorf("dot segments ('.' or '..') are not permitted")
 			}

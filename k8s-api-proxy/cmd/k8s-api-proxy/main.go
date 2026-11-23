@@ -30,6 +30,7 @@ const (
 	int64Bits               = 64
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 	listenAddrEnv           = "KUBE_PROXY_LISTEN_ADDR"
+	listenAddrFlag          = "listen-addr"
 	defaultListenAddr       = ":8443"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
@@ -105,6 +106,7 @@ func (unauthenticatedAuthenticator) AuthenticateRequest(*http.Request) (*k8sapip
 type proxyConfig struct {
 	showVersion              bool
 	listenAddr               string
+	listenAddrSet            bool
 	metricsPort              int
 	tlsCertFile              string
 	tlsKeyFile               string
@@ -139,8 +141,9 @@ type proxyConfig struct {
 }
 
 func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
+	cfg.listenAddrSet = strings.TrimSpace(os.Getenv(listenAddrEnv)) != ""
 	fs.BoolVar(&cfg.showVersion, "version", false, "Print the release or commit this binary was built for and exit")
-	fs.StringVar(&cfg.listenAddr, "listen-addr", envOrDefault(listenAddrEnv, defaultListenAddr), "TCP address to listen on")
+	fs.StringVar(&cfg.listenAddr, listenAddrFlag, envOrDefault(listenAddrEnv, defaultListenAddr), "TCP address to listen on")
 	fs.IntVar(&cfg.metricsPort, metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 	fs.StringVar(&cfg.tlsCertFile, tlsCertFileFlag, envOrDefault(tlsCertFileEnv, defaultTLSCertFile), "TLS server certificate chain PEM file, re-read when it changes; give the same path as --"+tlsKeyFileFlag+" for one PEM file holding the chain and its private key (empty for plain HTTP)")
 	fs.StringVar(&cfg.tlsKeyFile, tlsKeyFileFlag, envOrDefault(tlsKeyFileEnv, defaultTLSKeyFile), "TLS server private key PEM file, re-read when it changes; the --"+tlsCertFileFlag+" path when that file holds the key (empty for plain HTTP)")
@@ -165,6 +168,19 @@ func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
 	fs.StringVar(&cfg.containerAPIURLOverride, "container-api-url", envOrDefault(containerAPIURLEnv, ""), "Optional override for the GKE Container API base URL (derived from --universe-domain when empty)")
 	fs.DurationVar(&cfg.cacheDiscoveryTTL, "cache-discovery-ttl", envDurationOrDefault(cacheDiscoveryTTLEnv, k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
 	fs.IntVar(&cfg.maxInFlight, "max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
+}
+
+func parseFlags(fs *flag.FlagSet, args []string, cfg *proxyConfig) error {
+	registerFlags(fs, cfg)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == listenAddrFlag {
+			cfg.listenAddrSet = true
+		}
+	})
+	return nil
 }
 
 func loadEnvOnlyConfig(cfg *proxyConfig) {
@@ -320,6 +336,9 @@ func buildHandler(
 			return nil, fmt.Errorf("failed to initialize TokenReview authenticator: %w", err)
 		}
 	case authModeNone:
+		if !cfg.listenAddrSet || strings.TrimSpace(cfg.listenAddr) == "" {
+			return nil, errors.New("--" + listenAddrFlag + " (or " + listenAddrEnv + ") must be set explicitly when --auth-mode=none")
+		}
 		if strings.TrimSpace(cfg.allowedCallers) != "" {
 			return nil, errors.New("--auth-mode=none cannot be combined with --allowed-callers (or CREDENTIAL_PROXY_ALLOWED_CALLERS)")
 		}
@@ -455,8 +474,7 @@ func versionString() string {
 
 func main() {
 	var cfg proxyConfig
-	registerFlags(flag.CommandLine, &cfg)
-	flag.Parse()
+	_ = parseFlags(flag.CommandLine, os.Args[1:], &cfg)
 	if cfg.showVersion {
 		fmt.Println(versionString())
 		return

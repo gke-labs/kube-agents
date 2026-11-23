@@ -152,15 +152,18 @@ func TestVersionStringNamesTheBuild(t *testing.T) {
 }
 
 func TestRegisterFlagsReadsBridgeEnvVars(t *testing.T) {
+	t.Setenv(listenAddrEnv, "127.0.0.1:18443")
 	t.Setenv(authModeEnv, authModeNone)
 	t.Setenv(upstreamURLEnv, "http://127.0.0.1:18080/k8s")
 	t.Setenv(denyStreamingEnv, "true")
 
 	var cfg proxyConfig
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	registerFlags(fs, &cfg)
-	if err := fs.Parse(nil); err != nil {
-		t.Fatalf("Parse: %v", err)
+	if err := parseFlags(fs, nil, &cfg); err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if !cfg.listenAddrSet || cfg.listenAddr != "127.0.0.1:18443" {
+		t.Errorf("listenAddr = %q (set=%v), want 127.0.0.1:18443 (set=true)", cfg.listenAddr, cfg.listenAddrSet)
 	}
 	if cfg.authMode != authModeNone {
 		t.Errorf("authMode = %q, want %q", cfg.authMode, authModeNone)
@@ -171,6 +174,83 @@ func TestRegisterFlagsReadsBridgeEnvVars(t *testing.T) {
 	if !cfg.denyStreaming {
 		t.Error("denyStreaming = false, want true")
 	}
+}
+
+func TestParseFlagsTracksExplicitListenAddrForAuthModeNone(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	t.Run("default listen-addr without env or flag", func(t *testing.T) {
+		t.Setenv(listenAddrEnv, "")
+		t.Setenv(authModeEnv, "")
+		t.Setenv(upstreamURLEnv, "http://127.0.0.1:18080")
+
+		var cfg proxyConfig
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		if err := parseFlags(fs, nil, &cfg); err != nil {
+			t.Fatalf("parseFlags: %v", err)
+		}
+		if cfg.listenAddr != defaultListenAddr || cfg.listenAddrSet {
+			t.Fatalf("listenAddr = %q (set=%v), want %q (set=false)", cfg.listenAddr, cfg.listenAddrSet, defaultListenAddr)
+		}
+
+		tokenCfg := cfg
+		tokenCfg.allowedCallers = "system:serviceaccount:ns:sa"
+		tokenCfg.kubeAPIServer = "http://127.0.0.1:18080"
+		tokenCfg.kubeCAFile = ""
+		tokenCfg.kubeTokenFile = ""
+		if _, err := buildHandler(context.Background(), tokenCfg, k8sapiproxy.ModeReadOnlyWithDryRun, logger, nil, nil); err != nil {
+			t.Fatalf("buildHandler(token-review) with default listen-addr failed: %v", err)
+		}
+
+		noneCfg := cfg
+		noneCfg.authMode = authModeNone
+		if _, err := buildHandler(context.Background(), noneCfg, k8sapiproxy.ModeReadOnlyWithDryRun, logger, nil, nil); err == nil {
+			t.Fatal("buildHandler(none) with implicit default listen-addr succeeded, want error")
+		} else if !strings.Contains(err.Error(), "--"+listenAddrFlag) {
+			t.Errorf("err = %q, want substring %q", err.Error(), "--"+listenAddrFlag)
+		}
+	})
+
+	t.Run("listen-addr set via env", func(t *testing.T) {
+		t.Setenv(listenAddrEnv, "127.0.0.1:18443")
+		t.Setenv(authModeEnv, authModeNone)
+		t.Setenv(upstreamURLEnv, "http://127.0.0.1:18080")
+
+		var cfg proxyConfig
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		if err := parseFlags(fs, nil, &cfg); err != nil {
+			t.Fatalf("parseFlags: %v", err)
+		}
+		if !cfg.listenAddrSet {
+			t.Fatal("listenAddrSet = false, want true when KUBE_PROXY_LISTEN_ADDR is set")
+		}
+		if _, err := buildHandler(context.Background(), cfg, k8sapiproxy.ModeReadOnlyWithDryRun, logger, nil, nil); err != nil {
+			t.Fatalf("buildHandler: %v", err)
+		}
+	})
+
+	t.Run("explicit wildcard listen-addr via CLI flag", func(t *testing.T) {
+		t.Setenv(listenAddrEnv, "")
+		t.Setenv(authModeEnv, "")
+		t.Setenv(upstreamURLEnv, "")
+
+		var cfg proxyConfig
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		args := []string{
+			"--listen-addr=:8443",
+			"--auth-mode=none",
+			"--upstream-url=http://127.0.0.1:18080",
+		}
+		if err := parseFlags(fs, args, &cfg); err != nil {
+			t.Fatalf("parseFlags: %v", err)
+		}
+		if !cfg.listenAddrSet || cfg.listenAddr != ":8443" {
+			t.Fatalf("listenAddr = %q (set=%v), want :8443 (set=true)", cfg.listenAddr, cfg.listenAddrSet)
+		}
+		if _, err := buildHandler(context.Background(), cfg, k8sapiproxy.ModeReadOnlyWithDryRun, logger, nil, nil); err != nil {
+			t.Fatalf("buildHandler with explicit --listen-addr=:8443 failed: %v", err)
+		}
+	})
 }
 
 func TestBuildHandlerStandaloneBridgeEndToEnd(t *testing.T) {
@@ -193,6 +273,7 @@ func TestBuildHandlerStandaloneBridgeEndToEnd(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 	cfg := proxyConfig{
 		listenAddr:         "127.0.0.1:18443",
+		listenAddrSet:      true,
 		authMode:           authModeNone,
 		upstreamURL:        up.URL + "/bridge",
 		denyStreaming:      true,
@@ -282,6 +363,8 @@ func TestBuildHandlerStandaloneBridgeEndToEnd(t *testing.T) {
 
 func TestBuildHandlerRejectsConflictingOrInvalidFlags(t *testing.T) {
 	base := proxyConfig{
+		listenAddr:    "127.0.0.1:18443",
+		listenAddrSet: true,
 		authMode:      authModeNone,
 		upstreamURL:   "http://127.0.0.1:18080",
 		redactSecrets: true,
@@ -296,6 +379,22 @@ func TestBuildHandlerRejectsConflictingOrInvalidFlags(t *testing.T) {
 			name:    "unknown auth-mode",
 			mutate:  func(c *proxyConfig) { c.authMode = "NONE" },
 			wantMsg: "invalid --auth-mode",
+		},
+		{
+			name: "auth-mode none without explicit listen-addr",
+			mutate: func(c *proxyConfig) {
+				c.listenAddr = defaultListenAddr
+				c.listenAddrSet = false
+			},
+			wantMsg: "--" + listenAddrFlag + " (or " + listenAddrEnv + ") must be set explicitly when --auth-mode=none",
+		},
+		{
+			name: "auth-mode none with empty listen-addr",
+			mutate: func(c *proxyConfig) {
+				c.listenAddr = "   "
+				c.listenAddrSet = true
+			},
+			wantMsg: "--" + listenAddrFlag + " (or " + listenAddrEnv + ") must be set explicitly when --auth-mode=none",
 		},
 		{
 			name:    "token-review without allowed-callers",
