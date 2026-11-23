@@ -69,7 +69,7 @@ checked; `Options.RequireIntegrity` refuses it instead. A profile worker
 sets that from `A2A_PERSONA_INTEGRITY=required`, and logs whether its
 persona loaded verified or unverified. Neither the operator nor the chart
 sets that variable, and an AgentProfile has no field for it: it is a
-worker-level setting, off by default.
+worker-level setting, off by default. The shipped personas don't need it: a build-contract test keeps their manifest present, and a manifest that is present is checked either way.
 
 The check shows that the persona's files are the ones its build recorded:
 it catches a bad build, a corrupted layer or a staging copy that went
