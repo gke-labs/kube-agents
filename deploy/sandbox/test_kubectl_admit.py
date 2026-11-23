@@ -234,7 +234,9 @@ class StateTest(unittest.TestCase):
         self.assertNotIn("argv", text)
 
 
-class AdmitTest(unittest.TestCase):
+class AdmitFixture(unittest.TestCase):
+    """A state directory in a temporary tree, a guard reading a fixed figure, and no kubectl."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -271,6 +273,13 @@ class AdmitTest(unittest.TestCase):
     def logged(self):
         return [json.loads(l)["event"] for l in self.events.read_text().splitlines()] if self.events.exists() else []
 
+    def fill(self, directory, count, base):
+        for pid in range(base, base + count):
+            admit.write_shared(os.path.join(directory, str(pid)), {"pid": pid})
+
+
+
+class AdmitTest(AdmitFixture):
     def test_a_read_that_fits_runs_under_a_reservation(self):
         self.assertEqual(self.admit("get", "nodes", "-o", "json"), 0)
         self.assertEqual(self.booked(), 255 * MIB)
@@ -378,10 +387,6 @@ class AdmitTest(unittest.TestCase):
         self.assertTrue(self.stderr.getvalue().startswith("capacity: the shell is too busy"))
         self.assertEqual(self.logged(), ["refused-lock"] * 2)
 
-    def fill(self, directory, count, base):
-        for pid in range(base, base + count):
-            admit.write_shared(os.path.join(directory, str(pid)), {"pid": pid})
-
     def test_a_flood_is_refused_at_once_without_the_lock(self):
         slots = admit.max_slots(guard.high_watermark(2 * GIB))
         self.fill(admit.SLOT_DIR, slots, 10000)
@@ -412,6 +417,191 @@ class AdmitTest(unittest.TestCase):
         self.fill(admit.WAIT_DIR, slots, 20000)  # dead pids: nothing waits
         self.assertEqual(admit.count_alive(admit.WAIT_DIR), 0)
         self.assertEqual(self.admit("get", "nodes", "-o", "json"), 0)
+
+
+class OnBusyRunTest(AdmitFixture):
+    """ON_BUSY=run, as a session pod sets it: whatever the sandbox refuses as busy runs, and only
+    a read larger than one read may ever take is still refused."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(admit, "ON_BUSY", admit.ON_BUSY_RUN)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def logged_records(self):
+        return [json.loads(l) for l in self.events.read_text().splitlines()] if self.events.exists() else []
+
+    def test_a_command_past_the_slot_cap_runs_after_the_wait(self):
+        slots = admit.max_slots(guard.high_watermark(2 * GIB))
+        self.fill(admit.SLOT_DIR, slots, 10000)
+        waited = []
+        with mock.patch.object(admit, "alive", side_effect=lambda pid: pid != 99999), \
+                mock.patch.object(admit.time, "sleep", side_effect=waited.append), \
+                mock.patch.object(admit, "ADMIT_WAIT_SECONDS", 0.05):
+            for argv in [("logs", "x"), ("get", "nodes", "-o", "json")]:
+                with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, "pass_through"):
+                    self.admit(*argv)
+        self.assertTrue(waited)  # it waited first, as in the sandbox
+        admit.pass_through.assert_called_with(["get", "nodes", "-o", "json"])
+        admit.run.assert_not_called()
+        self.assertEqual(self.stderr.getvalue(), "")
+        self.assertEqual([(r["event"], r["reason"]) for r in self.logged_records()], [("ran-busy", "slots")] * 2)
+        self.assertEqual(os.listdir(admit.WAIT_DIR), [])  # its place in the queue is given back
+        self.assertEqual(len(os.listdir(admit.SLOT_DIR)), slots)  # and it took no slot
+
+    def test_a_read_that_does_not_fit_by_the_deadline_runs(self):
+        self.used = 1700 * MIB
+        with self.assertRaisesRegex(SystemExit, "pass_through"):
+            self.admit("get", "nodes", "-o", "json")
+        admit.run.assert_not_called()
+        self.assertEqual([(r["event"], r["reason"]) for r in self.logged_records()], [("ran-busy", "memory")])
+        self.assertEqual(os.listdir(admit.LEDGER_DIR) + os.listdir(admit.SLOT_DIR), [])
+
+    def test_a_read_that_can_never_fit_is_still_refused_at_once(self):
+        self.assertEqual(self.admit("get", "deploy,sts,ds,cronjob,pod", "-A", "-o", "json"), admit.REFUSED_NOW)
+        admit.run.assert_not_called()
+        admit.pass_through.assert_not_called()
+        self.assertTrue(self.stderr.getvalue().startswith("capacity: `kubectl get deploy,sts,ds,cronjob,pod`"))
+        self.assertEqual(self.logged(), ["refused-size"])
+
+    def test_a_flood_runs_at_once(self):
+        slots = admit.max_slots(guard.high_watermark(2 * GIB))
+        self.fill(admit.SLOT_DIR, slots, 10000)
+        self.fill(admit.WAIT_DIR, slots, 20000)
+        with mock.patch.object(admit, "alive", return_value=True), \
+                mock.patch.object(admit, "take_lock", side_effect=AssertionError("took the lock")), \
+                mock.patch.object(admit.time, "sleep", side_effect=AssertionError("waited")), \
+                self.assertRaisesRegex(SystemExit, "pass_through"):
+            self.admit("logs", "x")
+        self.assertEqual([(r["event"], r["reason"]) for r in self.logged_records()], [("ran-busy", "flood")])
+
+    def test_a_lock_it_cannot_take_runs_the_command(self):
+        with mock.patch.object(admit, "take_lock", return_value=False):
+            for argv in [("get", "nodes", "-o", "json"), ("logs", "x")]:
+                with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, "pass_through"):
+                    self.admit(*argv)
+        admit.run.assert_not_called()
+        self.assertEqual(self.stderr.getvalue(), "")
+        self.assertEqual(self.logged(), ["ran-busy"] * 2)
+
+    def test_a_read_that_cannot_be_spawned_runs_in_this_process(self):
+        with mock.patch.object(admit, "run", side_effect=OSError("EAGAIN")), \
+                self.assertRaisesRegex(SystemExit, "pass_through"):
+            self.admit("get", "nodes", "-o", "json")
+        self.assertEqual(os.listdir(admit.SLOT_DIR) + os.listdir(admit.LEDGER_DIR), [])
+        self.assertEqual(self.logged(), ["admitted", "ran-busy"])
+
+    def test_a_read_that_fits_is_admitted_as_in_the_sandbox(self):
+        self.assertEqual(self.admit("get", "nodes", "-o", "json"), 0)
+        self.assertEqual(self.booked(), 255 * MIB)
+        self.assertEqual(self.logged(), ["admitted"])
+
+
+class SettingsTest(unittest.TestCase):
+    """The environment overrides a session pod sets, and the sandbox defaults when none is set."""
+
+    def load_with(self, environ):
+        with mock.patch.dict(os.environ, environ, clear=False):
+            for name in ("KUBECTL_ADMIT_RUN_DIR", "KUBECTL_ADMIT_GUARD_PATH", "KUBECTL_ADMIT_ON_BUSY"):
+                if name not in environ:
+                    os.environ.pop(name, None)
+            return load("kubectl_admit_settings", "kubectl-admit.py")
+
+    def test_unset_is_the_sandbox_layout(self):
+        module = self.load_with({})
+        self.assertEqual(module.RUN_DIR, "/run/kube-agents-sandbox")
+        self.assertEqual(module.TIER_FILE, "/run/kube-agents-sandbox/kubectl-cost-tier")
+        self.assertEqual(module.LIMIT_FILE, "/run/kube-agents-sandbox/memory-limit-bytes")
+        self.assertEqual(module.LEDGER_DIR, "/run/kube-agents-sandbox/kubectl-admission/reservations")
+        self.assertEqual(module.GUARD_PATH, "/usr/local/libexec/shell-memory-guard")
+        self.assertEqual(module.ON_BUSY, module.ON_BUSY_REFUSE)
+
+    def test_the_run_dir_moves_every_state_path(self):
+        module = self.load_with({"KUBECTL_ADMIT_RUN_DIR": "/tmp/x"})
+        self.assertEqual(module.RUN_DIR, "/tmp/x")
+        self.assertEqual(module.TIER_FILE, "/tmp/x/kubectl-cost-tier")
+        self.assertEqual(module.LIMIT_FILE, "/tmp/x/memory-limit-bytes")
+        for path in (module.STATE_DIR, module.LEDGER_DIR, module.LEDGER_LOCK, module.SLOT_DIR, module.WAIT_DIR,
+                     module.EVENTS_LOG):
+            self.assertTrue(path.startswith("/tmp/x/kubectl-admission"), path)
+
+    def test_a_relative_path_is_ignored(self):
+        module = self.load_with({"KUBECTL_ADMIT_RUN_DIR": "tmp/x", "KUBECTL_ADMIT_GUARD_PATH": "guard"})
+        self.assertEqual(module.RUN_DIR, "/run/kube-agents-sandbox")
+        self.assertEqual(module.GUARD_PATH, "/usr/local/libexec/shell-memory-guard")
+
+    def test_the_guard_path_and_on_busy(self):
+        module = self.load_with({"KUBECTL_ADMIT_GUARD_PATH": "/opt/g", "KUBECTL_ADMIT_ON_BUSY": "run"})
+        self.assertEqual(module.GUARD_PATH, "/opt/g")
+        self.assertEqual(module.ON_BUSY, module.ON_BUSY_RUN)
+        for value in ("refuse", "", "yes", "running"):
+            with self.subTest(value=value):
+                self.assertEqual(self.load_with({"KUBECTL_ADMIT_ON_BUSY": value}).ON_BUSY, module.ON_BUSY_REFUSE)
+
+    def test_a_tier_is_a_plain_lowercase_name_as_the_entrypoint_takes_it(self):
+        for value, want in [("fleet", "fleet"), (" fleet-2 ", "fleet-2"), ("Fleet", None), ("2fleet", None),
+                            ("-fleet", None), ("fleet_x", None), ("../x", None), ("fl\u00e9et", None), ("", None),
+                            (None, None), ("a" * 32, "a" * 32), ("a" * 33, None)]:
+            with self.subTest(value=value):
+                self.assertEqual(admit.plain_tier(value), want)
+
+
+class MainSettingsTest(unittest.TestCase):
+    """main() under a session pod's settings: the tier from the environment, the state made on first use."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.run_dir = Path(tmp.name) / "run"
+        state = self.run_dir / "kubectl-admission"
+        self.guard = mock.Mock(memory_in_use=lambda: 200 * MIB, effective_watermark=guard.effective_watermark,
+                               on_gvisor=lambda: False, process_count=lambda: 0, memory_limit=lambda _env: 2 * GIB)
+        self.loaded = []
+        for name, value in [("RUN_DIR", str(self.run_dir)), ("TIER_FILE", str(self.run_dir / "kubectl-cost-tier")),
+                            ("LIMIT_FILE", str(self.run_dir / "memory-limit-bytes")), ("STATE_DIR", str(state)),
+                            ("LEDGER_DIR", str(state / "reservations")), ("SLOT_DIR", str(state / "slots")),
+                            ("WAIT_DIR", str(state / "waiting")), ("LEDGER_LOCK", str(state / "ledger.lock")),
+                            ("EVENTS_LOG", str(state / "events.log")), ("GUARD_PATH", "/opt/guard"),
+                            ("COST_TABLE", str(TABLE_PATH)),
+                            ("load_guard", lambda path: self.loaded.append(path) or self.guard),
+                            ("admit", mock.Mock(return_value=0))]:
+            patcher = mock.patch.object(admit, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def main(self, environ):
+        with mock.patch.dict(os.environ, environ):
+            if "KUBEAGENTS_KUBECTL_COST_TIER" not in environ:
+                os.environ.pop("KUBEAGENTS_KUBECTL_COST_TIER", None)
+            self.assertEqual(admit.main(["get", "pods", "-A"]), 0)
+        return admit.admit.call_args.args
+
+    def test_the_tier_comes_from_the_environment_when_no_file_names_one(self):
+        for value, want in [("fleet", "fleet"), ("FLEET", "default"), ("x/../y", "default"), ("", "default")]:
+            with self.subTest(value=value):
+                self.assertEqual(self.main({"KUBEAGENTS_KUBECTL_COST_TIER": value})[3], want)
+        self.assertEqual(self.main({})[3], "default")
+
+    def test_the_tier_file_wins_over_the_environment(self):
+        self.run_dir.mkdir()
+        (self.run_dir / "kubectl-cost-tier").write_text("small\n")
+        self.assertEqual(self.main({"KUBEAGENTS_KUBECTL_COST_TIER": "fleet"})[3], "small")
+
+    def test_the_guard_loads_from_its_path_and_the_limit_from_the_cgroup(self):
+        args = self.main({})
+        self.assertEqual(self.loaded, ["/opt/guard"])
+        self.assertEqual(args[4], 2 * GIB)  # no limit file: the guard's figure
+
+    def test_an_overridden_run_dir_gets_its_state_dirs(self):
+        self.main({})
+        for name in ("reservations", "slots", "waiting"):
+            self.assertTrue((self.run_dir / "kubectl-admission" / name).is_dir(), name)
+
+    def test_the_sandbox_run_dir_is_left_to_the_entrypoint(self):
+        with mock.patch.object(admit, "RUN_DIR", admit.DEFAULT_RUN_DIR):
+            self.main({})
+        self.assertFalse(self.run_dir.exists())
 
 
 class LockTest(unittest.TestCase):

@@ -15,9 +15,12 @@ directory (the base directory the harness gives when it loads the skill), then
 run `python3 "$V" <verb>` from anywhere. Every verb prints one JSON object.
 `--repo` takes `owner/name` or the repository's URL.
 
-**Use the repository the task names. If the task names none, say so in your
-answer and stop; don't guess one.** The broker serves only the install's
-managed repositories, and nothing here lists them for you.
+**Use the repository the task names. If it names none, run
+`python3 "$V" identity` with no `--repo`, before cloning anything: it answers the
+install's managed repositories (`managedRepositories`), the only ones the broker
+serves. Use the one the task means, passing its name to `--repo` exactly as
+listed; if none fits, or more than one could, say so in your answer and stop;
+don't guess one.**
 
 ## When to Use
 

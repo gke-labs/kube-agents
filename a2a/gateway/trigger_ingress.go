@@ -472,6 +472,9 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 			ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
 			Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
 			RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
+			// Its scope, recorded as a profile task's is: the scope its
+			// children are held to when it fans out (#6744).
+			Scope: string(route.Scope),
 		})
 		if len(rec.Tasks) > taskHistoryCap {
 			rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
@@ -570,7 +573,7 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if addressee == "" || !run.Published {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	task, err := g.replayForTerminal(ctx, addressee, q.TaskID)
+	task, err := g.replayForTerminal(ctx, addressee, q.TaskID, g.taskIsProfile(rec, q.TaskID, addressee))
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
@@ -649,7 +652,7 @@ func (g *Gateway) handleTriggerStop(ctx context.Context, subject string, data []
 	if !held {
 		return lib.TriggerStopReply{Result: lib.TriggerStopUnknownRun}
 	}
-	if task, err := g.replayForTerminal(ctx, ref.Addressee, q.TaskID); err == nil && task != nil && task.Final {
+	if task, err := g.replayForTerminal(ctx, ref.Addressee, q.TaskID, ref.Tier != ""); err == nil && task != nil && task.Final {
 		return lib.TriggerStopReply{Result: lib.TriggerStopAlreadyFinal}
 	}
 	if ref.Canceled {

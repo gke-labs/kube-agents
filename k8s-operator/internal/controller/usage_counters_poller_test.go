@@ -395,6 +395,18 @@ func (s *stubUsageSource) setDataVolume(addr string, total, free int64) {
 	s.readings[addr] = reading
 }
 
+// clearWatcherFleet drops addr's cluster and data-volume readings while leaving
+// its counter sample intact, matching a watcher scraped during startup with
+// watch_set_ready=0.
+func (s *stubUsageSource) clearWatcherFleet(addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Clusters = nil
+	reading.DataVolume = nil
+	s.readings[addr] = reading
+}
+
 func (s *stubUsageSource) fail(addr string, kind string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5152,5 +5164,87 @@ func TestUsagePoller_AFailingLiteLLMListenerNamesItsThreeFields(t *testing.T) {
 		}
 	default:
 		t.Fatal("no Warning after two failed polls of the LiteLLM listener")
+	}
+}
+
+// When a single-replica watcher restarts and answers /metrics before
+// buildWatchSet finishes (watch_set_ready=0 -> Clusters=nil), Poll 1 holds the
+// cluster gauges, ScopeUndeclared, and StorageStatus/DataVolumeNearlyFull without
+// patching; recovering once ready keeps them unbroken, while two consecutive
+// unready polls reach usageScrapeFailureEventStreak and clear all three.
+func TestUsagePoller_WatcherRestartDuringStartupHoldsThenRecoversOrClearsAtStreak(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := scopeUndeclaredTestAgent(created)
+	h := dataVolumeHarness(t, agent)
+	const totalBytes, freeBytes int64 = 1000, 50
+
+	// Poll 1: healthy fleet + adopted neighbour + low free volume.
+	h.stub.set(gatewayAddr(), 0, ptr.To(100.0))
+	h.stub.setClusterRefs(gatewayAddr(), scopeTestHost, scopeTestNeighbourA)
+	h.stub.setDataVolume(gatewayAddr(), totalBytes, freeBytes)
+	h.poll(5)
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 2 || gaugeValue(status.ClustersMonitored) != 2 {
+		t.Fatalf("after poll 1 gauges = %d/%d, want 2/2", gaugeValue(status.ClustersRegistered), gaugeValue(status.ClustersMonitored))
+	}
+	if scopeCond := scopeCondition(t, h); scopeCond == nil || scopeCond.Status != metav1.ConditionTrue {
+		t.Fatalf("after poll 1 ScopeUndeclared = %+v, want True", scopeCond)
+	}
+	if st := h.agent().Status.StorageStatus; st.FreeBytes == nil || *st.FreeBytes != freeBytes {
+		t.Fatalf("after poll 1 StorageStatus = %+v, want free=%d", st, freeBytes)
+	}
+	if volCond := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition); volCond == nil || volCond.Status != metav1.ConditionTrue {
+		t.Fatalf("after poll 1 DataVolumeNearlyFull = %+v, want True", volCond)
+	}
+
+	// Poll 2: restarted watcher serves /metrics with watch_set_ready=0 before
+	// buildWatchSet finishes -> Clusters=nil and DataVolume=nil -> held with zero patches.
+	patchesBeforeRestart := h.patches
+	h.stub.set(gatewayAddr(), 0, ptr.To(200.0))
+	h.stub.clearWatcherFleet(gatewayAddr())
+	h.poll(10)
+	if h.patches != patchesBeforeRestart {
+		t.Fatalf("startup poll wrote %d unexpected status patch(es)", h.patches-patchesBeforeRestart)
+	}
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 2 || gaugeValue(status.ClustersMonitored) != 2 {
+		t.Fatalf("after 1st startup poll gauges = %d/%d, want held at 2/2", gaugeValue(status.ClustersRegistered), gaugeValue(status.ClustersMonitored))
+	}
+	if scopeCond := scopeCondition(t, h); scopeCond == nil || scopeCond.Status != metav1.ConditionTrue {
+		t.Fatalf("after 1st startup poll ScopeUndeclared = %+v, want held True", scopeCond)
+	}
+	if st := h.agent().Status.StorageStatus; st.FreeBytes == nil || *st.FreeBytes != freeBytes {
+		t.Fatalf("after 1st startup poll StorageStatus = %+v, want held", st)
+	}
+	if volCond := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition); volCond == nil || volCond.Status != metav1.ConditionTrue {
+		t.Fatalf("after 1st startup poll DataVolumeNearlyFull = %+v, want held True", volCond)
+	}
+
+	// Poll 3: watcher finishes buildWatchSet and reports clusters again; no dip occurred.
+	h.stub.setClusterRefs(gatewayAddr(), scopeTestHost, scopeTestNeighbourA)
+	h.stub.setDataVolume(gatewayAddr(), totalBytes, freeBytes)
+	h.poll(15)
+	if h.patches != patchesBeforeRestart {
+		t.Fatalf("recovery poll wrote %d unexpected status patch(es)", h.patches-patchesBeforeRestart)
+	}
+
+	// Polls 4 & 5: watcher stuck before buildWatchSet across 2 consecutive polls
+	// reaches usageScrapeFailureEventStreak and clears gauges, ScopeUndeclared, and DataVolume.
+	h.stub.set(gatewayAddr(), 0, ptr.To(300.0))
+	h.stub.clearWatcherFleet(gatewayAddr())
+	h.poll(20)
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 2 || scopeCondition(t, h) == nil || h.agent().Status.StorageStatus.FreeBytes == nil {
+		t.Fatalf("after 1st miss of second streak readings were cleared early: status=%+v cond=%+v", status, scopeCondition(t, h))
+	}
+	h.poll(25)
+	if status := h.status(); status.ClustersRegistered != nil || status.ClustersMonitored != nil {
+		t.Fatalf("after streak=%d gauges = %+v, want cleared to nil", usageScrapeFailureEventStreak, status)
+	}
+	if scopeCond := scopeCondition(t, h); scopeCond != nil {
+		t.Fatalf("after streak=%d ScopeUndeclared = %+v, want removed", usageScrapeFailureEventStreak, scopeCond)
+	}
+	if st := h.agent().Status.StorageStatus; st.FreeBytes != nil || st.CapacityBytes != nil {
+		t.Fatalf("after streak=%d StorageStatus = %+v, want cleared", usageScrapeFailureEventStreak, st)
+	}
+	if volCond := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition); volCond != nil {
+		t.Fatalf("after streak=%d DataVolumeNearlyFull = %+v, want removed", usageScrapeFailureEventStreak, volCond)
 	}
 }

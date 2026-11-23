@@ -82,7 +82,8 @@ verification_spec:
   # and a row joins a heredoc on one line, so a write quoted in a heredoc
   # body (in backticks, a table cell, parentheses) reads as a run. A row
   # shows a chain as its first command only, so a write chained behind a read
-  # is on no row; the entry below reads it. No resource_property safeguard:
+  # is on no row; this entry reads it in the card's typed call when the call
+  # holds no heredoc, and the entry below reads each typed call. No resource_property safeguard:
   # bench/README.md "Validated Capabilities suite" rule 3 keeps one on every
   # case so the expected-fail marker cannot hide a plant that failed; this
   # baseline has no marker and no Kubernetes object, so a plant that did not

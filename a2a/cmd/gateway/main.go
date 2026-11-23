@@ -237,6 +237,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		lib.WithLogger(log),
 		lib.WithAgreementPolicy(gateway.SupervisorAgreement(cfg)),
 		lib.WithNATSOptions(natsOpts...),
+		// Unset until the operator renders it from the latched profile
+		// supervisor form (#5301); a malformed value reads as unset.
+		lib.WithProfileSupervisorCutoff(lib.ProfileSupervisorCutoffFromEnv(os.Getenv, log)),
 	)
 	if err != nil {
 		log.Error("nats connect", "err", err)

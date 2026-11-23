@@ -85,7 +85,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-worker",
       "tagPolicy": "release",
       "override": "A2A_WORKER_IMAGE",
-      "pulledBy": "The session pods the A2A gateway spawns; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `<name>-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`.",
+      "pulledBy": "The session pods the A2A gateway spawns; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `<name>-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`. Under A2A_SESSION_CLUSTER_VIEW its kubectl uses the kubectl memory admission, its guard library, the kubectl cost table and the session fast-path figures the image carries.",
       "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), stock kubectl wired to kube-proxy for session pods (falling back to the credential broker shim for AgentProfile workers), the credential broker's shim as gcloud, jq, and a local-only git with no credential helper and the version-control client beside the shim, which the cluster agent's persona requires when the image runs its profile workers."
     },
     {
@@ -103,6 +103,14 @@
       "tagPolicy": "release",
       "pulledBy": "The worker pods of the tse AgentProfile, when the chart's profiles.tse.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
       "description": "The GKE Support Agent's persona (agents/tse/persona) as a persona image (a2a/Dockerfile.persona-tse): the manifest, instructions, MCP servers and skill under /files, on busybox for the staging copy."
+    },
+    {
+      "name": "persona-fleet-audit",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/persona-fleet-audit",
+      "tagPolicy": "release",
+      "pulledBy": "The worker pods of the fleet-audit AgentProfile, when the chart's profiles.fleetAudit.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
+      "description": "The fleet-audit AgentProfile's persona (agents/fleet-audit/persona) as a persona image (a2a/Dockerfile.persona-fleet-audit): the manifest, instructions and skill under /files, text only, on busybox for the staging copy."
     },
     {
       "name": "a2a-authcallout",
@@ -295,7 +303,7 @@
         "key": "HERMES_AGENT_TAG"
       },
       "buildArg": "HERMES_AGENT_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile (agent-base stage).",
+      "pulledBy": "deploy/docker/Dockerfile (hermes-upstream stage).",
       "description": "The Hermes harness the agent images are built on."
     },
     {
