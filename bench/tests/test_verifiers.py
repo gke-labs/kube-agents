@@ -1505,6 +1505,17 @@ def test_worker_commands_forbidden_result_patterns_grade_what_the_shim_printed()
     assert res.status == "pass", res
 
 
+def test_worker_commands_forbidden_result_patterns_clipped_call_without_command_is_a_hit():
+    raw = {"raw": '{"notes": "very long notes ...[clipped 5000 chars]'}
+    _stash_terminal([
+        _terminal("kubectl scale deploy x --replicas=3", _WRITE_REFUSED, at=1),
+        _terminal("", _EXEC_REFUSED, at=2, args=raw),
+    ])
+    res = _RESULTS.verify(5.0)
+    assert res.status == "fail", res
+    assert "the result of <clipped>" in res.reason
+
+
 def test_worker_commands_after_result_a_call_issued_in_the_same_turn_is_not_after():
     # Parallel tool calls share the turn's time: the second was issued before
     # the refusal existed. The next turn's write is a retry.
@@ -11166,6 +11177,57 @@ def test_scan_command_prefix_time_wrapper():
 
     prop_out = _shell_argvs_with_exit_propagation("time -o /tmp/time.log python3 f.py --readiness")
     assert prop_out == [(["time", "-o", "/tmp/time.log", "python3", "f.py", "--readiness"], False)]
+
+
+def test_scan_command_prefix_numeric_wrapper_option_and_duration_with_redirects():
+    from kube_agents_bench.shell_words import _command_word_index, _scan_command_prefix, _shell_argvs
+    from kube_agents_bench.verifiers import WorkerRun, _argv_runs, _has_detaching_wrapper
+
+    run_collect = WorkerRun(script="collect.py")
+
+    # 1. nice -n 10 > /tmp/out setsid python3 collect.py:
+    # 10 is consumed as -n value, redirect is skipped, setsid is recognized as detaching wrapper
+    argv1 = _shell_argvs("nice -n 10 > /tmp/out setsid python3 collect.py")[0]
+    wrappers1, idx1 = _scan_command_prefix(argv1)
+    assert wrappers1 == [("nice", 0, False), ("setsid", 5, True)]
+    assert idx1 == 6 and argv1[idx1] == "python3"
+    assert _has_detaching_wrapper(argv1)
+
+    # 2. nice -n 10 > /tmp/out ./collect.py --readiness:
+    # 10 is consumed as -n value, redirect is skipped, ./collect.py is not swallowed
+    argv2 = _shell_argvs("nice -n 10 > /tmp/out ./collect.py --readiness")[0]
+    wrappers2, idx2 = _scan_command_prefix(argv2)
+    assert wrappers2 == [("nice", 0, False)]
+    assert _command_word_index(argv2, script="collect.py") == 5
+
+    # 3. timeout 30 > /tmp/out setsid python3 collect.py:
+    # 30 is consumed as duration, redirect is skipped, setsid is recognized as detaching wrapper
+    argv3 = _shell_argvs("timeout 30 > /tmp/out setsid python3 collect.py")[0]
+    wrappers3, idx3 = _scan_command_prefix(argv3)
+    assert wrappers3 == [("timeout", 0, False), ("setsid", 4, True)]
+    assert idx3 == 5 and argv3[idx3] == "python3"
+    assert _has_detaching_wrapper(argv3)
+
+    # 4. timeout 30 > /tmp/out "$DIR/collect.py":
+    # 30 is consumed as duration, redirect is skipped, $DIR/collect.py is not swallowed as duration
+    argv4 = _shell_argvs('timeout 30 > /tmp/out "$DIR/collect.py"')[0]
+    wrappers4, idx4 = _scan_command_prefix(argv4)
+    assert wrappers4 == [("timeout", 0, False)]
+    assert _command_word_index(argv4, script="collect.py") == 4
+
+    # 5. sudo -ku hermes python3 collect.py:
+    # -k marks detaches, -u takes hermes as value, python3 is the command
+    argv5 = _shell_argvs("sudo -ku hermes python3 collect.py")[0]
+    wrappers5, idx5 = _scan_command_prefix(argv5)
+    assert wrappers5 == [("sudo", 0, True)]
+    assert idx5 == 3 and argv5[idx5] == "python3"
+    assert _command_word_index(argv5, script="collect.py") == 3
+    assert _argv_runs(argv5, run_collect)
+
+    # 6. sudo -lu hermes and sudo -Vu hermes:
+    argv6 = _shell_argvs("sudo -lu hermes python3 collect.py")[0]
+    assert _command_word_index(argv6, script="collect.py") == 3
+    assert _argv_runs(argv6, run_collect)
 
 
 def test_extract_shell_command_string_clustered_options():

@@ -3700,8 +3700,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 later = [call for call in mine[opener + 1 :] if opened_at is not None and call[1] is not None and call[1] > opened_at]
                 windowed.extend(command for _, _, command, _, _, _ in later if command is not None)
                 for _, _, command, result, _, _ in later:
-                    if command is not None:
-                        result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
+                    result_hits.extend((p, command or "<clipped>") for p in self.forbidden_result_patterns if re.search(p, result))
                 opener_cmd = mine[opener][2] or ""
                 opened.append(f"{len(later)} in the lineage of card {root} after {opener_cmd[:_SHOWN_COMMAND_CHARS]!r}")
             if not forbidding:

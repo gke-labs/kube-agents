@@ -543,7 +543,13 @@ def _scan_command_prefix(
                 redirect_target = False
                 idx += 1
                 continue
-            if _is_redirect(argv[idx]) or (argv[idx].isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
+            if _is_redirect(argv[idx]) or (
+                not duration_needed
+                and positionals == 0
+                and argv[idx].isdigit()
+                and idx + 1 < len(argv)
+                and _is_redirect(argv[idx + 1])
+            ):
                 redirect_target = not argv[idx].isdigit()
                 idx += 1
                 continue
@@ -646,7 +652,6 @@ def _scan_command_prefix(
                                 break
                             else:
                                 detaches = True
-                                break
                     else:
                         detaches = True
                 elif wrapper_name == "command":
@@ -686,8 +691,8 @@ def _scan_command_prefix(
                             redirect_target = False
                             idx += 1
                             continue
-                        if _is_redirect(argv[idx]) or (argv[idx].isdigit() and idx + 1 < len(argv) and _is_redirect(argv[idx + 1])):
-                            redirect_target = not argv[idx].isdigit()
+                        if _is_redirect(argv[idx]):
+                            redirect_target = True
                             idx += 1
                             continue
                         # Found option value
