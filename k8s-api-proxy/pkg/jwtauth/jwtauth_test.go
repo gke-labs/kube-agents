@@ -217,8 +217,18 @@ func TestNewAuthenticatorValidatesConfig(t *testing.T) {
 		t.Fatalf("valid config: %v", err)
 	}
 	for name, mutate := range map[string]func(*Config){
-		"no issuer":      func(c *Config) { c.Issuer = "" },
-		"no key set URL": func(c *Config) { c.KeySetURL = "" },
+		"no issuer": func(c *Config) { c.Issuer = "" },
+		"no key set URL and an issuer that is not a URL": func(c *Config) { c.Issuer, c.KeySetURL = "issuer-name", "" },
+		"no key set URL and an http issuer":              func(c *Config) { c.Issuer, c.KeySetURL = "http://issuer.test", "" },
+		"no key set URL and an issuer with a query":      func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test?tenant=a", "" },
+		"no key set URL and an issuer with a bare ?":     func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test/a?", "" },
+		"no key set URL and an issuer with a fragment":   func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test/a#keys", "" },
+		"no key set URL and an issuer with a bare #":     func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test/a#", "" },
+		"allowed partitions with only empty entries":     func(c *Config) { c.PartitionClaim, c.AllowedPartitions = "tenant", []string{"", "  "} },
+		"one empty allowed partition":                    func(c *Config) { c.AllowedPartitions = []string{""} },
+		"empty key in a claim path":                      func(c *Config) { c.UsernameClaim = "a..b" },
+		"claim path ending in a separator":               func(c *Config) { c.PartitionClaim = "a." },
+		"allowed partitions without a partition claim":   func(c *Config) { c.AllowedPartitions = []string{"team-a"} },
 		"non-http URL":   func(c *Config) { c.KeySetURL = "file:///etc/keys" },
 		"no audience":    func(c *Config) { c.Audiences = nil },
 		"blank audience": func(c *Config) { c.Audiences = []string{" "} },
