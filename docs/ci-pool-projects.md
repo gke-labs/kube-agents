@@ -639,6 +639,27 @@ unreadable the install has no Slack and the lane skips; with any of the lane's t
 logs one skip line. The eval app serves this lane alone, since Socket Mode splits an app's events
 across every install connected to it, and the test user is a dedicated account, never a person's.
 
+### 5.13 The post-merge sync's read-only deploy key
+
+Config Sync on the seeded fleet's slot-a cluster syncs one directory of the project's GitOps
+repository, `clusters/seeded-a/seeded-post-merge/`, into the `seeded-post-merge` namespace, so a
+merged PodDisruptionBudget for `order-ledger` is applied the way a customer's reconciler applies it
+([`bench/tf/fleet/README.md`](../bench/tf/fleet/README.md)). It reads the repository through a
+deploy key: one repository, read-only, the narrowest credential Config Sync accepts for GitHub. A
+token or a GitHub App would reach every repository its owner or installation does.
+
+`scripts/provision_ci_pool_post_merge_sync.sh <project-id>` makes the repository side: it seeds
+`order-ledger`'s declaration in that directory when the file is absent, adds the deploy key without
+write access, keeps its private half and GitHub's SSH host keys as the current version of the
+Secret Manager secret `kube-agents-eval-gitops-deploy-key` in the project, and grants
+`roles/secretmanager.secretAccessor` on that secret alone to the fleet reconciler, which reads it
+on every apply. It prints no key. `scripts/provision_ci_pool_project.sh` runs it in step 1.4,
+before the fleet apply needs the secret. For a registered project run it by hand, as the repair;
+it is idempotent and replaces the key only when the stored one no longer matches the repository's
+read-only key or GitHub's host keys changed. Whoever runs it holds `roles/secretmanager.admin` on
+the project and admin on the repository. To rotate the key, delete it from the repository's deploy
+keys and run the script again.
+
 ## 6. The seeded dirty fleet
 
 Six of the evaluation scenarios assert on defects that were planted on purpose — a crashlooping `payments-api`, a workload with no PodDisruptionBudget, an idle node pool, a control plane held a minor behind, a cluster missing master authorized networks. Those fixtures are not provisioned per run. They live on four small standing GKE clusters, `seeded-a` to `seeded-d`, and **each pool project needs its own set**: Boskos leases at random, so a project without them is a project where every fleet check reports `status: "error"` and `VerificationCoverage` drops below 1.0 for that run.

@@ -723,6 +723,9 @@ seed_gitops_file() {
 }
 seed_gitops_file "${GITOPS_INTENT_NOTE_PATH}" "${GITOPS_INTENT_NOTE_MESSAGE}" "${GITOPS_INTENT_NOTE_CONTENT}" "the declared-intent note"
 seed_gitops_file "${GITOPS_WORKLOAD_MANIFEST_PATH}" "${GITOPS_WORKLOAD_MANIFEST_MESSAGE}" "${GITOPS_WORKLOAD_MANIFEST_CONTENT}" "checkout-gateway's declaration"
+# The post-merge sync's declaration and its read-only deploy key (docs/ci-pool-projects.md 5.13).
+# bench/tf/fleet reads the key's secret, so it runs before Step 2.2's fleet apply.
+"${SCRIPT_DIR}/provision_ci_pool_post_merge_sync.sh" "${PROJECT_ID}" "${GITOPS_REPO}"
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then
