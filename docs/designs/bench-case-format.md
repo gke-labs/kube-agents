@@ -120,6 +120,20 @@ later reports on a UTC day reply inside its first report's thread (one thread pe
 mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
 own. Slack transport only: the other transports refuse it, so
 such a case runs on the Slack lane alone and keeps no inject record.
+A first line of `[bench:session-cap-queue]`, optionally with `max-cap=<n>` (default 2) and
+`hold=<seconds>`, with a `/session` ask under it, grades the gateway's session-cap line (#6882):
+the harness reads the install's session cap off the gateway Deployment, fills it with busy
+`/session` conversations through the inject door, sends the ask on one more, and writes
+`harness_session_cap_queued`, completed when the conversation shows the queued notice, then the
+task, then its answer
+([`bench/kube_agents_bench/session_cap.py`](../../bench/kube_agents_bench/session_cap.py)). A cap
+above `max-cap`, or one the fillers did not hold, is infrastructure; the ask's POST refused with the
+cap's own text is the graded red. Inject transport only.
+
+A first line that opens with `[bench:` and names none of these directives is infrastructure: the
+harness does not send a directive it does not know to the agent as text. A pull request is graded
+with its base commit's `bench/` (`hack/ci-eval-pr.sh`, `pin_grader`), so a case that uses a new
+directive lands after the harness change that reads it.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
 carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which

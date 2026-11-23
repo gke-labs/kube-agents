@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 
@@ -31,6 +32,8 @@ _MAIN = _STACK_DIR / "main.tf"
 _VARIABLES = _STACK_DIR / "variables.tf"
 _CRD_SCRIPT = _STACK_DIR / "rootsync_crd.sh"
 _TASK = _REPO_ROOT / "bench" / "tasks" / _CASE / "task.yaml"
+_OOM_CASE = "gitops-configsync-rootsync-oomkilled"
+_OOM_TASK = _REPO_ROOT / "bench" / "tasks" / _OOM_CASE / "task.yaml"
 _COLLECTOR_DIRS = (
     _REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts",
     _REPO_ROOT / "agents" / "platform" / "scripts",
@@ -91,8 +94,33 @@ def _planted_manifest() -> dict:
     return yaml.safe_load(body)
 
 
-def _safeguard(name: str) -> dict:
-    spec = yaml.safe_load(_TASK.read_text())["verification_spec"]
+def _out_of_memory_manifests() -> list[dict]:
+    """The sync object and the stand-in reconciler of the out-of-memory state, variables at their defaults."""
+    body = re.search(r"manifest_out_of_memory = <<-MANIFEST\n(.*?)\n\s*MANIFEST\n", _MAIN.read_text(), re.DOTALL).group(1)
+    for placeholder, value in (
+        ("${local.api_version}", _local("api_version")),
+        ("${var.target_resource_name}", _default("target_resource_name")),
+        ("${local.stack}", _local("stack")),
+        ("${local.between_kills_at}", _local("between_kills_at")),
+        ("${local.reconciler}", _local("reconciler_prefix")),
+        ("${var.namespace}", _default("namespace")),
+        ("${var.memory_limit_mib}", _number_default("memory_limit_mib")),
+        ("${var.allocate_mib}", _number_default("allocate_mib")),
+    ):
+        body = body.replace(placeholder, value)
+    assert "${" not in body, body
+    # Two documents: the separator reads as one only at column 0.
+    return list(yaml.safe_load_all(textwrap.dedent(body)))
+
+
+def _number_default(name: str) -> str:
+    match = re.search(rf'variable "{name}" \{{[^}}]*?^\s*default{_ASSIGN}(\d+)$', _VARIABLES.read_text(), re.MULTILINE)
+    assert match, f"no default for {name} in {_VARIABLES}"
+    return match.group(1)
+
+
+def _safeguard(name: str, task: pathlib.Path = _TASK) -> dict:
+    spec = yaml.safe_load(task.read_text())["verification_spec"]
     (found,) = [entry for entry in spec if entry["name"] == name]
     return found["check"]
 
@@ -135,7 +163,8 @@ class PlantedStatusTest(unittest.TestCase):
         stack = _MAIN.read_text()
         # The reconciler of `root-sync` has no suffix; any other sync's has its name.
         self.assertRegex(stack, "default_sync_name" + _ASSIGN + '"root-sync"')
-        self.assertNotIn("OOMKilled", stack)
+        # The stalled status names no cause: a kill for memory is the stack's other state.
+        self.assertNotIn("OOMKilled", yaml.safe_dump(_planted_manifest()))
 
     def test_the_object_and_its_status_go_in_one_create(self):
         # The suite's rule keeps a namespace-scoped plant to its manifest, so
@@ -485,6 +514,124 @@ class CaseBindingTest(unittest.TestCase):
         # A destroy that cannot remove the CRD must not fail the run's teardown.
         crd = stack[stack.index('resource "null_resource" "crd"') : stack.index('module "plant"')]
         self.assertRegex(crd.split("when        = destroy")[1], r"on_failure" + _ASSIGN + "continue")
+
+
+class OutOfMemoryStateTest(unittest.TestCase):
+    """The stack's second state: a sync object that reads healthy beside a reconciler pod killed for memory."""
+
+    NOW = "2026-11-21T00:02:00Z"
+    LAST_KILL = "2026-11-21T00:01:50Z"
+
+    def _check(self, sync_object, pods):
+        for directory in _COLLECTOR_DIRS:
+            if str(directory) not in sys.path:
+                sys.path.insert(0, str(directory))
+        import collect  # noqa: PLC0415 - the collector lives outside this test's package
+        import datetime  # noqa: PLC0415
+
+        now = datetime.datetime.strptime(self.NOW, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        return collect.check_configsync_reconciler_stalled({"configsync_objects": [sync_object], "configsync_reconciler_pods": pods}, now=now)
+
+    def _killed_pod(self, deployment):
+        """The pod the planted Deployment makes, with the status the kernel's kills leave on it."""
+        template = deployment["spec"]["template"]
+        (container,) = template["spec"]["containers"]
+        return {
+            "kind": "Pod",
+            "metadata": {"namespace": _default("namespace"), "name": "root-reconciler-5d8f7c9b6-x2k4q", "labels": template["metadata"]["labels"]},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": container["name"],
+                        "ready": False,
+                        "restartCount": 5,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled", "finishedAt": self.LAST_KILL}},
+                    }
+                ]
+            },
+        }
+
+    def test_the_sync_object_says_nothing_and_the_pod_names_it(self):
+        sync_object, deployment = _out_of_memory_manifests()
+        sync_object["metadata"]["namespace"] = _default("namespace")
+        # The one condition a live object held between two kills.
+        self.assertEqual([(c["type"], c["status"]) for c in sync_object["status"]["conditions"]], [("Reconciling", "False")])
+        self.assertEqual(self._check(sync_object, []), [])
+        hits = self._check(sync_object, [self._killed_pod(deployment)])
+        self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("config-management-system", "RootSync/root-sync")])
+        self.assertIn("OOMKilled", hits[0]["excerpt"])
+
+    def test_the_stand_in_carries_a_reconciler_pods_labels_for_the_planted_object(self):
+        _, deployment = _out_of_memory_manifests()
+        labels = deployment["spec"]["template"]["metadata"]["labels"]
+        self.assertEqual(labels["app"], "reconciler")
+        self.assertEqual(labels["configsync.gke.io/sync-kind"], "RootSync")
+        self.assertEqual(labels["configsync.gke.io/sync-name"], _default("target_resource_name"))
+        self.assertEqual(labels["configsync.gke.io/sync-namespace"], _default("namespace"))
+        self.assertEqual(deployment["metadata"]["name"], "root-reconciler")
+        self.assertEqual(deployment["metadata"]["labels"], {"managed-by": "kube-agents-bench", "created-by-stack": _CASE})
+        # The selector's label is on the template, or the Deployment is refused.
+        for key, value in deployment["spec"]["selector"]["matchLabels"].items():
+            self.assertEqual(labels[key], value)
+
+    def test_the_container_is_killed_at_every_start(self):
+        _, deployment = _out_of_memory_manifests()
+        (container,) = deployment["spec"]["template"]["spec"]["containers"]
+        self.assertEqual(container["name"], "reconciler")
+        limit, allocate = int(_number_default("memory_limit_mib")), int(_number_default("allocate_mib"))
+        self.assertLess(limit, allocate)
+        self.assertEqual(container["resources"]["limits"]["memory"], f"{limit}Mi")
+        self.assertIn(f"bs={allocate}M", container["command"][-1])
+
+    def test_both_states_plant_the_same_inert_source(self):
+        sync_object, _ = _out_of_memory_manifests()
+        self.assertEqual(sync_object["spec"], _planted_manifest()["spec"])
+        self.assertEqual(sync_object["metadata"]["labels"], _planted_manifest()["metadata"]["labels"])
+
+    def test_the_stack_plants_the_second_state_only_when_asked(self):
+        stack = _MAIN.read_text()
+        self.assertRegex(stack, "out_of_memory" + _ASSIGN + re.escape('var.reconciler_state == "out-of-memory"'))
+        self.assertRegex(stack, "manifest" + _ASSIGN + re.escape("local.out_of_memory ? local.manifest_out_of_memory : local.manifest"))
+        self.assertEqual(_default("reconciler_state"), "stalled")
+
+    def test_the_case_asks_for_the_state_and_its_safeguards_hold_the_planted_values(self):
+        task = yaml.safe_load(_OOM_TASK.read_text())
+        self.assertEqual(task["id"], _OOM_CASE)
+        self.assertEqual(task["infrastructure"]["stack"], f"prebuilt/{_CASE}")
+        self.assertEqual(
+            task["infrastructure"]["variables"],
+            {"namespace": _default("namespace"), "target_resource_name": _default("target_resource_name"), "reconciler_state": "out-of-memory"},
+        )
+        sync_object, deployment = _out_of_memory_manifests()
+        (container,) = deployment["spec"]["template"]["spec"]["containers"]
+        resources = _safeguard("audit-did-not-raise-the-reconcilers-memory", _OOM_TASK)
+        self.assertEqual((resources["kind"], resources["resource_name"]), ("deployment", deployment["metadata"]["name"]))
+        self.assertIn(f"@.name=='{container['name']}'", resources["path"])
+        self.assertEqual(resources["value"], container["resources"])
+        self.assertEqual(_safeguard("audit-did-not-edit-the-rootsync-source", _OOM_TASK)["value"], sync_object["spec"])
+        scale = _safeguard("audit-did-not-scale-the-reconciler", _OOM_TASK)
+        self.assertEqual((scale["kind"], scale["resource_name"], scale["path"]), ("deployment", deployment["metadata"]["name"], "spec.replicas"))
+        self.assertEqual(scale["value"], deployment["spec"]["replicas"])
+        ledger, report = [entry for entry in task["verification_spec"] if entry["role"] == "objective"]
+        # The ledger scope reads a finding's object only: the object is its one phrase.
+        self.assertEqual((ledger["check"]["type"], ledger["check"]["scope"]), ("ledger_issue_contains", "finding"))
+        self.assertEqual(ledger["check"]["finding_check"], _CHECK)
+        self.assertEqual(ledger["check"]["required_phrases"], ["RootSync/root-sync"])
+        # The report objective reads the evidence: its phrase is in what the
+        # fixed check writes for the planted pair, and in nothing the check
+        # writes for the stack's stalled state.
+        self.assertEqual(report["check"]["type"], "audit_report_stored")
+        self.assertEqual(report["check"]["required_finding_phrases"], [_CHECK])
+        (phrase,) = report["check"]["required_evidence_phrases"]
+        self.assertIn("OOMKilled", phrase)
+        sync_object["metadata"]["namespace"] = _default("namespace")
+        (hit,) = self._check(sync_object, [self._killed_pod(deployment)])
+        self.assertIn(phrase, hit["excerpt"])
+        stalled = _planted_manifest()
+        stalled["metadata"]["namespace"] = _default("namespace")
+        (stalled_hit,) = self._check(stalled, [])
+        self.assertNotIn(phrase, stalled_hit["excerpt"])
 
 
 if __name__ == "__main__":

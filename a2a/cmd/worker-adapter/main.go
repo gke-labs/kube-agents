@@ -27,6 +27,8 @@
 // pool. It answers /readyz on lib.ProfileWorkerStatusPort once it's
 // listening. It exits 0 when it stops (at SIGTERM, or after one task with
 // PROFILE_WORKER_ONE_SHOT), and 1 if it can't start.
+// A2A_PERSONA_INTEGRITY=required refuses a persona without a build-time
+// content manifest; any other non-empty value exits 1.
 package main
 
 import (
@@ -182,13 +184,20 @@ func run() int {
 		// The harness configFromEnv selected: its driver names it.
 		harness := cfg.Driver.Harness()
 		cfg = profileModeConfig(cfg)
+		requireIntegrity, err := workeradapter.ParsePersonaIntegrity(os.Getenv(lib.EnvPersonaIntegrity))
+		if err != nil {
+			log.Error("profile worker failed", "err", err)
+			return 1
+		}
 		pw := workeradapter.ProfileWorkerConfig{
 			Tier:       os.Getenv(lib.EnvProfileTier),
 			OneShot:    oneShot == "1" || oneShot == "true",
 			ReadyAddr:  fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
 			PersonaDir: lib.ProfilePersonaDir,
-			Harness:    harness,
-			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
+			// Whether the persona must carry a build-time content manifest.
+			RequirePersonaIntegrity: requireIntegrity,
+			Harness:                 harness,
+			ConfigRoot:              envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
 			// The persona's MCP servers through the broker's relay (#5495).
@@ -680,12 +689,12 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	// Antigravity runs without the per-task HOME locking and workspace scrub
 	// it needs (#6710), so only a pod that says it accepts that may select
 	// it: a test, or a deliberate dev run. Nothing in the operator or chart
-	// sets either variable today, so only the pod spec or the worker
-	// image's own ENV can. Where the operator renders A2A_HARNESS, it
-	// renders this one empty beside it, so the image's ENV can't set it
+	// sets it to allow. Where the operator renders A2A_HARNESS, it renders
+	// this one empty beside it, so the worker image's own ENV can't set it
 	// there: on a profile worker whose profile names spec.harness.type
-	// (#6832), and on session pods (#6716). A profile with no type gets
-	// neither, by design: its image is already trusted code.
+	// (#6832), and later on session pods (#6716). Elsewhere only the pod
+	// spec or the image's ENV can set it; a profile with no type gets
+	// neither variable, by design, since its image is already trusted code.
 	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
 		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
 			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)

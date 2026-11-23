@@ -83,9 +83,19 @@ const (
 	// EnvHarnessUnisolated must be HarnessUnisolatedAllow for a worker to
 	// select persona.Antigravity, which runs without its per-task HOME
 	// locking and workspace scrub until #6710 lands; #6710 removes it.
-	// Nothing in the operator or chart sets it.
+	// Nothing in the operator or chart sets it to allow; the operator
+	// renders it empty beside A2A_HARNESS on a profile that names
+	// spec.harness.type.
 	EnvHarnessUnisolated   = "A2A_HARNESS_UNISOLATED"
 	HarnessUnisolatedAllow = "allow"
+	// EnvPersonaIntegrity sets whether a profile worker requires its persona
+	// to carry a build-time content manifest (persona.IntegrityManifestFile).
+	// PersonaIntegrityRequired refuses a persona without one; unset loads it
+	// unchecked and logs that. A manifest that is present is checked either
+	// way, and any other value stops the worker.
+	EnvPersonaIntegrity = "A2A_PERSONA_INTEGRITY"
+	// PersonaIntegrityRequired is EnvPersonaIntegrity's one value.
+	PersonaIntegrityRequired = "required"
 	// EnvPrimerFile names the file the spawner mounts the conversation's
 	// transcript primer at (the pod's rehydration-primer annotation, through
 	// the downward API). A pod spawned cold for a conversation that already
