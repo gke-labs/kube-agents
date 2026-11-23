@@ -38,6 +38,10 @@ conversation.
 A case asks about a detail only the report carries; an agent that has the
 report answers it, and one that does not cannot.
 
+A reply turn that hands its work to cards is waited out as a first turn's
+is, off the board, before the run is graded: a case can then grade what the
+cards did (a finding's state), not only the turn's own answer.
+
 It runs on the inject transport only, which every CI lane uses: the API
 server has no conversation the bridge keys the row to.
 

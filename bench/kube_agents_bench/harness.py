@@ -396,6 +396,8 @@ _MID_TURN_POLL_SECONDS = 1.0
 # many times in all, this long apart.
 _PUSHED_REPLY_ATTEMPTS = 3
 _PUSHED_REPLY_RETRY_SECONDS = 10.0
+# No wait for delegated cards: the default of a replay driven without a delegation budget.
+_NO_DELEGATION_WAIT = 0.0
 
 
 @dataclass(frozen=True)
@@ -3806,6 +3808,8 @@ class KubeAgentsHarness(AgentHarness):
         replay: pushed_report.Replay,
         *,
         retry_seconds: float = _PUSHED_REPLY_RETRY_SECONDS,
+        delegation_timeout: float = _NO_DELEGATION_WAIT,
+        poll_interval: float = _NO_DELEGATION_WAIT,
     ) -> AgentResult:
         """Store the replay's report for the conversation, then send its reply there.
 
@@ -3828,6 +3832,13 @@ class KubeAgentsHarness(AgentHarness):
         is sent again under a fresh message id, :data:`_PUSHED_REPLY_ATTEMPTS`
         times in all, ``retry_seconds`` apart; a reply still refused after
         that is infrastructure, as a status turn's is.
+
+        A reply turn that hands its work to cards is waited out as a first
+        turn's is, off the board (:meth:`_await_delegated_cards`, up to
+        ``delegation_timeout``): a follow-up turn returns before that wait, and
+        without it a case that grades what the cards did (a row's state) would
+        read it while they still ran. A reply that files no card waits for
+        nothing.
         """
         if exchange.fold.terminal != inject.STATE_COMPLETED:
             opening.errors.append(
@@ -3897,6 +3908,16 @@ class KubeAgentsHarness(AgentHarness):
             # marker), not a merged record that reads as a completed task
             # beside an infrastructure failure.
             return reply
+        if delegation_timeout > _NO_DELEGATION_WAIT:
+            try:
+                self._await_delegated_cards(
+                    reply,
+                    session_id,
+                    delegation_timeout=delegation_timeout,
+                    poll_interval=poll_interval,
+                )
+            except _DelegationTransportExhausted as exc:
+                return _infra_failure(str(exc))
         return pushed_report.merge(opening, reply, entry)
 
     def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:
@@ -4665,7 +4686,13 @@ class KubeAgentsHarness(AgentHarness):
             return result
 
         if pushed is not None:
-            return self._reply_under_pushed_report(result, exchange, pushed)
+            return self._reply_under_pushed_report(
+                result,
+                exchange,
+                pushed,
+                delegation_timeout=delegation_timeout,
+                poll_interval=poll_interval,
+            )
 
         if delegation_timeout > 0:
             # The seam for delegated work, and it is the case runner's rather

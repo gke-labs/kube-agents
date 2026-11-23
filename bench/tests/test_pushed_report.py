@@ -479,6 +479,89 @@ def test_an_infra_failed_reply_is_the_runs_infra_failure_not_a_merge(monkeypatch
     assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
 
 
+DELEGATION_BUDGET = 600.0
+DELEGATION_POLL = 5.0
+CARD_RESULT_ENTRY = {"name": "kanban_show", "args": {"task_id": "t_1"}, "result": "dismissed three rows"}
+CARD_RESULT_TEXT = "\n\nResult of delegated task t_1: dismissed three rows"
+
+
+def _delegating_reply() -> AgentResult:
+    return AgentResult(
+        output="dismissing it.", trajectory=[{"name": "a2a.status-update", "args": {"state": "completed"}}],
+        tokens={}, errors=[], metadata={"final_message": "dismissing it.", "task_id": "task-2"},
+    )
+
+
+def test_a_reply_that_files_cards_is_waited_out_before_the_merge(monkeypatch):
+    """A follow-up turn returns before the card wait, so the replay runs the wait for its
+    reply: a case that grades what the cards did must not read it while they still run."""
+    conversation = "inject:devops-bench-abc/chat-reply-under-pushed-report/2"
+    reply = _delegating_reply()
+    waits: list = []
+
+    def fake_wait(self, result, session_id, *, delegation_timeout, poll_interval):
+        waits.append((result, session_id, delegation_timeout, poll_interval))
+        result.trajectory.append(CARD_RESULT_ENTRY)
+        result.output += CARD_RESULT_TEXT
+        return True
+
+    monkeypatch.setattr(harness, "_agent_shell", _stored)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: reply)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_await_delegated_cards", fake_wait)
+    got = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT),
+        delegation_timeout=DELEGATION_BUDGET, poll_interval=DELEGATION_POLL,
+    )
+
+    # The session the report was stored under is the one whose cards are awaited.
+    assert waits == [(reply, "a2a-ctx-77", DELEGATION_BUDGET, DELEGATION_POLL)]
+    assert got.output == "dismissing it." + CARD_RESULT_TEXT
+    assert got.trajectory[-1] == CARD_RESULT_ENTRY
+    assert got.trajectory[1]["name"] == pushed_report.PLANT_ENTRY
+
+    # A replay driven with no delegation budget waits for nothing.
+    unbudgeted = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT)
+    )
+    assert len(waits) == 1
+    assert unbudgeted.metadata["pushed_report"]["opening_final_message"] == "OK"
+
+
+def test_an_infra_failed_reply_waits_for_no_card(monkeypatch):
+    conversation = "inject:devops-bench-abc/chat-reply-under-pushed-report/2"
+    infra = harness._infra_failure("the inject exchange failed: tunnel died")
+    monkeypatch.setattr(harness, "_agent_shell", _stored)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: infra)
+    monkeypatch.setattr(
+        harness.KubeAgentsHarness, "_await_delegated_cards", lambda self, *a, **kw: pytest.fail("the reply waited")
+    )
+    got = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT),
+        delegation_timeout=DELEGATION_BUDGET, poll_interval=DELEGATION_POLL,
+    )
+    assert got is infra
+
+
+def test_a_board_lost_during_the_replys_card_wait_is_infrastructure(monkeypatch):
+    """The board went away after the wait began: nothing the cards did can be graded, so the
+    run is infrastructure, as a first turn's wait makes it, and not a merged record."""
+    conversation = "inject:devops-bench-abc/chat-reply-under-pushed-report/2"
+
+    def lost(self, result, session_id, *, delegation_timeout, poll_interval):
+        raise harness._DelegationTransportExhausted("the kanban board could not be read 3 times running")
+
+    monkeypatch.setattr(harness, "_agent_shell", _stored)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: _delegating_reply())
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_await_delegated_cards", lost)
+    got = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT),
+        delegation_timeout=DELEGATION_BUDGET, poll_interval=DELEGATION_POLL,
+    )
+    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "the kanban board could not be read" in got.errors[0]
+    assert "pushed_report" not in got.metadata
+
+
 def test_every_activity_marker_must_vouch_on_a_two_turn_record():
     clean = {"name": scoring.INJECT_ACTIVITY_EVENT, "args": {"dropped": 0}}
     lossy = {"name": scoring.INJECT_ACTIVITY_EVENT, "args": {"dropped": 2}}

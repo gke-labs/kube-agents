@@ -108,7 +108,8 @@ agent pod with the row the kanban notifier writes for a card's report inviting a
 into a Slack or Google Chat gateway conversation, then sends the reply as a second message on the same conversation
 ([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
 the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
-for the plant. Inject transport only, as the stop directives are.
+for the plant. Cards the reply turn files are waited out before the checks run, as a first turn's are.
+Inject transport only, as the stop directives are.
 A first line of `[bench:reply-under-home-post: <marker>]`, with the reply on the lines under it,
 grades a reply to a post the agent made on its own (its setup has the agent post a scheduled report
 or an alert into the home channel): the transport waits for the bot's newest top-level post holding
