@@ -336,3 +336,33 @@ func TestARepeatSixTokenTerminalIsConfirmedNotRepublished(t *testing.T) {
 		t.Errorf("%d terminals stored, want 1", n)
 	}
 }
+
+// A duplicate the dispatcher can't check (here TASKS has no direct gets; in
+// production, a missing grant) is never taken as landed: the terminal is
+// published again under a fresh id, so a planted id still doesn't swallow
+// it.
+func TestAnUncheckableDuplicateIsRepublishedNotTakenAsLanded(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-blind"}
+	sub := submissionEnv(t, "tse", "task-blind", "", map[string]string{})
+	six := lib.ProfileSupervisorSubject("tse", "task-blind")
+	if _, err := d.storedTerminal(b.ctx, "tse", six, "task-blind"); err == nil {
+		t.Fatal("the direct get worked; this test needs it to fail")
+	}
+	plant := nats.NewMsg(lib.TaskSupervisorSubject("tse", "task-blind"))
+	plant.Header.Set(jetstream.MsgIDHeader, terminalEnvelopeID(hk))
+	plant.Data = []byte(`{}`)
+	if _, err := b.js.PublishMsg(b.ctx, plant); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.publishTerminal(b.ctx, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
+		t.Fatalf("the terminal after a planted id with no direct get: %v", err)
+	}
+	if n := b.storedOn(six); n != 1 {
+		t.Fatalf("%d terminals on %s, want the real one re-published", n, six)
+	}
+}

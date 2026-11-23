@@ -561,8 +561,9 @@ leave open:
   form a duplicate ack is checked: a direct get of the task's six-token subject must find the
   dispatcher's final status. With none there, the terminal is published once more under a fresh
   id, and if that fails or is a duplicate too, the task takes the `terminal-unpublished` settle
-  at once. A direct get the dispatcher can't make takes the duplicate as landed, as every terminal
-  did before the check.
+  at once. A direct get that fails is not taken as the write landing: the terminal is re-published
+  under a fresh id the same way, so a retry whose first write did land can leave two identical
+  terminals, and readers fold past the second.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for

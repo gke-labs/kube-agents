@@ -179,21 +179,24 @@ var errTerminalUnpublished = errors.New("the terminal was taken as a duplicate a
 // id, which no earlier message can hold; if that fails too, or is again a
 // duplicate, errTerminalUnpublished.
 //
-// A read that fails (no grant for the direct get, a connection mid-reconnect)
-// can't tell the two apart, and takes the duplicate as the write landing, as
-// every terminal did before this check: re-publishing on every unreadable
-// duplicate would write a second terminal for each ordinary retry.
+// A read that fails (no grant for the direct get, a stream without direct
+// gets, a connection mid-reconnect) can't tell the two apart, and is not
+// taken as the write landing: a writer able to plant the id could otherwise
+// win by making the read fail. It takes the re-publish too. The cost is an
+// ordinary retry whose first write did land getting a second identical
+// terminal on the subject, which a reader folds past (the first final ends
+// the fold).
 func (d *Dispatcher) confirmDuplicateTerminal(ctx context.Context, hk holdKey, sub *lib.Envelope, subject string, state lib.TaskState, reason, detail string) error {
 	log := d.log.With("profile", hk.profile, "tier", hk.tier, "kind", hk.kind, "task", hk.taskID, "subject", subject)
 	stored, err := d.storedTerminal(ctx, hk.profile, subject, sub.TaskID)
-	if err != nil {
-		log.Warn("a profile task's terminal was taken as a duplicate and the six-token subject can't be read to confirm it; taking it as landed", "err", err)
+	switch {
+	case err != nil:
+		log.Warn("a profile task's terminal was taken as a duplicate and the six-token subject can't be read to confirm it; publishing it once under a fresh id", "err", err)
+	case stored:
 		return nil
+	default:
+		log.Warn("a profile task's terminal was taken as a duplicate, but no terminal is stored on the six-token supervisor subject; publishing it once under a fresh id")
 	}
-	if stored {
-		return nil
-	}
-	log.Warn("a profile task's terminal was taken as a duplicate, but no terminal is stored on the six-token supervisor subject; publishing it once under a fresh id")
 	env, err := terminalEnvelope(sub, state, reason, detail)
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
