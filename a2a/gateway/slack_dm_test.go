@@ -431,6 +431,48 @@ func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 	}
 }
 
+// TestSlackChannelThreadParkedAtTheCapCarriesUnmentionedReplies: a channel
+// mention parked at the session cap has started nothing in its thread, yet
+// the thread's unmentioned replies reach the turn waiting there: a follow-up
+// joins it, a status ask is answered with the place in line, and a stop
+// takes it out of the line. The adapter is not left holding a false for the
+// thread from before any of them.
+func TestSlackChannelThreadParkedAtTheCapCarriesUnmentionedReplies(t *testing.T) {
+	t.Parallel()
+	spawn := &fakeSpawner{}
+	spawn.setLive(1)
+	d := startSlackDMRigWith(t, spawn, func(c *Config) {
+		c.DefaultAddressee = RouteSession
+		c.MaxSessions = 1
+	})
+	const conv = "slack:C1/500.1"
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet", "500.1", "")
+	d.awaitPost(t, "the queued notice in the mention's thread", "C1", "500.1", "queued")
+
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "and the nodes too", "501.1", "500.1")
+	waitFor(t, "the unmentioned follow-up behind the parked turn", func() bool { return followUpsOf(d.r, conv) == 1 })
+
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "status", "501.5", "500.1")
+	waitFor(t, "the unmentioned status ask answered with the place in line", func() bool {
+		n := 0
+		for _, p := range d.posts() {
+			if p.channel == "C1" && p.thread == "500.1" && p.text == toMrkdwn(sessionQueuedNext) {
+				n++
+			}
+		}
+		return n == 2
+	})
+
+	d.adapter.events <- slackMsg("channel", "C1", "U1", "stop", "502.1", "500.1")
+	d.awaitPost(t, "the unmentioned stop took the turn out of the line", "C1", "500.1", "taken out of the line")
+	if d.r.g.parkedAtCap(conv) {
+		t.Fatal("the turn is still in line after the stop")
+	}
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d spawns", n)
+	}
+}
+
 // TestSlackChannelTopLevelControlPhrasesUnchanged: a channel mention roots
 // its own thread too, but the redirect is a DM affordance; a channel
 // mention reading "stop" gets the plain notice and one reading "any

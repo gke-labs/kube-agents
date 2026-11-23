@@ -2,12 +2,15 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // queueRig is a post-flip gateway whose cap of limit is full: every live
@@ -226,7 +229,7 @@ func TestAWaiterBehindTheHeadIsRefusedPastTheBound(t *testing.T) {
 		line = append(line, w)
 		r.g.capQueue = append(r.g.capQueue, w)
 	}
-	line[0].retrying = true
+	line[0].retry = 1 << 62
 	r.g.capMu.Unlock()
 	for _, w := range line {
 		r.g.postCapNotice(w)
@@ -264,7 +267,7 @@ func TestAWaiterBehindTheHeadIsRefusedPastTheBound(t *testing.T) {
 	// The head's try comes back through the cap check, finds no room, and
 	// meets the bound there as before.
 	r.g.capMu.Lock()
-	line[0].retrying = false
+	line[0].retry = 0
 	r.g.capMu.Unlock()
 	r.g.kickCapQueue()
 	waitFor(t, "the head's refusal", func() bool { return slices.Contains(r.adapter.postTextsFor(convs[0]), refusal) })
@@ -439,7 +442,8 @@ func TestAnInjectTurnWaitsAtTheCapAndItsCallerReadsTheAnswer(t *testing.T) {
 
 // The door counts a redelivery as handed, and refuses one while a turn it
 // handed over has not ended, so a POST waiting on its turn never reads a
-// redelivered turn's task as its own.
+// redelivered turn's task as its own. A replay of an admitted turn's
+// follow-ups is counted unconditionally.
 func TestTheInjectDoorClaimsARedeliveryOnlyWhenQuiet(t *testing.T) {
 	t.Parallel()
 	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
@@ -463,6 +467,15 @@ func TestTheInjectDoorClaimsARedeliveryOnlyWhenQuiet(t *testing.T) {
 	door.mu.Unlock()
 	if handed != 3 || turns != 1 {
 		t.Fatalf("handed=%d turns=%d after the claim, want 3 and 1", handed, turns)
+	}
+	// An admitted turn's follow-ups are replayed while that turn, one the
+	// line claimed, still runs: counted all the same.
+	door.ClaimReplay(key, 2)
+	door.mu.Lock()
+	handed = door.conversationLocked(key).handed
+	door.mu.Unlock()
+	if handed != 5 {
+		t.Fatalf("handed=%d after the replay's claim, want 5", handed)
 	}
 }
 
@@ -523,5 +536,248 @@ func TestTheLineNeverOvershootsTheCap(t *testing.T) {
 	r.g.capMu.Unlock()
 	if waiting != convs-frees {
 		t.Fatalf("%d waiting; want %d", waiting, convs-frees)
+	}
+}
+
+// steerTexts is the text of every message on session's in subject after its
+// task's own, in the order they were published: the steers it received.
+func steerTexts(t *testing.T, r *rig, session string) []string {
+	t.Helper()
+	var out []string
+	for i, e := range inSubjectEnvelopes(t, r.url, session) {
+		var m lib.Message
+		if i > 0 && e.Kind == lib.KindMessage && json.Unmarshal(e.Payload, &m) == nil {
+			out = append(out, joinTextParts(m.Parts))
+		}
+	}
+	return out
+}
+
+// holdInbox takes conv's session lock and puts msg on its inbox, and returns
+// once the conversation's inbox worker has taken msg, which then waits on the
+// lock, so whatever the line puts on the inbox after it runs after it. The
+// returned func lets the turn go.
+func holdInbox(t *testing.T, r *rig, conv string, msg InboundMessage) func() {
+	t.Helper()
+	l := r.g.lockSession(conv)
+	l.Lock()
+	r.adapter.inbox <- msg
+	waitFor(t, "the inbox worker took "+msg.MessageID, func() bool {
+		r.g.inbox.mu.Lock()
+		defer r.g.inbox.mu.Unlock()
+		pending, running := r.g.inbox.m[conv]
+		return running && len(pending) == 0
+	})
+	return l.Unlock
+}
+
+// waitRetrying waits until the head's retry is on the inbox.
+func waitRetrying(t *testing.T, r *rig, conv string) {
+	t.Helper()
+	waitFor(t, "the head's retry on the inbox", func() bool {
+		r.g.capMu.Lock()
+		defer r.g.capMu.Unlock()
+		w, i := r.g.capWaiterLocked(conv)
+		return i == 0 && w.retry != 0
+	})
+}
+
+func followUpsOf(r *rig, conv string) int {
+	r.g.capMu.Lock()
+	defer r.g.capMu.Unlock()
+	if w, _ := r.g.capWaiterLocked(conv); w != nil {
+		return len(w.followUps)
+	}
+	return -1
+}
+
+func queuedNotices(r *rig, conv string) int {
+	n := 0
+	for _, p := range r.adapter.postTextsFor(conv) {
+		if strings.HasPrefix(p, "⏳ **queued**") {
+			n++
+		}
+	}
+	return n
+}
+
+// Later messages of a parked conversation reach the task its turn starts
+// once admitted, in the order they were sent, as steers of that one task.
+func TestFollowUpsSteerTheAdmittedTurnInOrder(t *testing.T) {
+	t.Parallel()
+	r, spawn, free := queueRig(t, 1)
+	conv := "discord:g1/t-follow-order"
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
+	say(r, conv, "m2", "first, the nodes")
+	say(r, conv, "m3", "then the pods")
+	waitFor(t, "both follow-ups behind the turn", func() bool { return followUpsOf(r, conv) == 2 })
+
+	free()
+	waitFor(t, "the spawn", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	origin := r.awaitTask(t, session)
+	exec := r.execFor(t, origin, session)
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"first, the nodes", "then the pods"}
+	waitFor(t, "both steers, in order", func() bool { return slices.Equal(steerTexts(t, r, session), want) })
+	if n := len(spawn.calls()); n != 1 {
+		t.Fatalf("%d spawns; the follow-ups should steer the one task", n)
+	}
+}
+
+// A head that waits out its bound is refused, and its follow-ups are dropped
+// with it, as for a waiter behind it that expires: none of them starts a
+// task or parks again as a fresh turn.
+func TestAHeadThatGivesUpDropsItsFollowUps(t *testing.T) {
+	t.Parallel()
+	r, spawn, free := queueRig(t, 1)
+	r.g.capPollOverride.Store(int64(time.Hour))
+	r.g.kickCapQueue()
+	conv := "discord:g1/t-giveup-follow"
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
+	say(r, conv, "m2", "and the nodes too")
+	waitFor(t, "the follow-up behind the turn", func() bool { return followUpsOf(r, conv) == 1 })
+
+	r.g.capWaitOverride.Store(1)
+	r.g.kickCapQueue()
+	refusal := sessionCapRefusal(1, 1)
+	waitFor(t, "the cap's refusal", func() bool { return slices.Contains(r.adapter.postTextsFor(conv), refusal) })
+	waitFor(t, "the notice closed", noticeReads(r, conv, sessionQueuedGaveUp))
+
+	// A slot frees: nothing of the conversation's is left to take it.
+	free()
+	time.Sleep(300 * time.Millisecond)
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d spawns after the head gave up", n)
+	}
+	if n := queuedNotices(r, conv); n != 1 {
+		t.Fatalf("%d queued notices; the follow-up parked again as a fresh turn", n)
+	}
+	n := 0
+	for _, p := range r.adapter.postTextsFor(conv) {
+		if p == refusal {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d refusals, want one", n)
+	}
+	r.g.capMu.Lock()
+	waiting, stashed := len(r.g.capQueue), len(r.g.capAdmitted)
+	r.g.capMu.Unlock()
+	if waiting != 0 || stashed != 0 {
+		t.Fatalf("%d waiting, %d stashed, want none", waiting, stashed)
+	}
+}
+
+// A stop already on the inbox when the head's retry is put there runs first
+// and takes the turn out of the line; the retry behind it is dropped, not
+// started as a fresh turn.
+func TestARetryBehindAStopIsDropped(t *testing.T) {
+	t.Parallel()
+	r, spawn, free := queueRig(t, 1)
+	r.g.capPollOverride.Store(int64(time.Hour))
+	r.g.kickCapQueue()
+	conv := "discord:g1/t-stop-retry"
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
+
+	release := holdInbox(t, r, conv, InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-stop", Text: "stop"})
+	free()
+	waitRetrying(t, r, conv)
+	release()
+
+	waitFor(t, "the stop said", postedContaining(r, sessionQueueStoppedNotice))
+	time.Sleep(300 * time.Millisecond)
+	if n := len(spawn.calls()); n != 0 {
+		t.Fatalf("%d spawns; the stopped turn started", n)
+	}
+	if started(r, conv) || queuedNotices(r, conv) != 1 {
+		t.Fatalf("the stopped turn came back: started=%v notices=%d", started(r, conv), queuedNotices(r, conv))
+	}
+	waitFor(t, "the retry dropped, and said so in the log", func() bool {
+		return strings.Contains(r.logs.String(), "dropped a queued turn's retry")
+	})
+}
+
+// A follow-up already on the inbox when the head's retry is put there joins
+// the waiter, and when the retry is admitted it reaches the task the turn
+// started, not lost with the waiter.
+func TestAFollowUpAheadOfTheRetryReachesTheAdmittedTurn(t *testing.T) {
+	t.Parallel()
+	r, spawn, free := queueRig(t, 1)
+	r.g.capPollOverride.Store(int64(time.Hour))
+	r.g.kickCapQueue()
+	conv := "discord:g1/t-follow-retry"
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
+
+	release := holdInbox(t, r, conv, InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m2", Text: "and the nodes too"})
+	free()
+	waitRetrying(t, r, conv)
+	release()
+
+	waitFor(t, "the spawn", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	origin := r.awaitTask(t, session)
+	exec := r.execFor(t, origin, session)
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the follow-up steered the started task", func() bool {
+		return slices.Equal(steerTexts(t, r, session), []string{"and the nodes too"})
+	})
+	if n := len(spawn.calls()); n != 1 {
+		t.Fatalf("%d spawns", n)
+	}
+}
+
+// A try the cap check kept ends after the line has already put the next try
+// on the inbox: the ending try is not the one in flight, so the waiter stays
+// in line for the next, rather than leaving it as a try that never reached
+// the check (and the next being dropped as a retry whose waiter is gone).
+func TestAKeptTryEndingAfterTheNextIsQueuedLeavesTheWaiterInLine(t *testing.T) {
+	t.Parallel()
+	r, _, _ := queueRig(t, 1)
+	r.g.capPollOverride.Store(int64(time.Hour))
+	conv := "discord:g1/t-kept-try"
+	say(r, conv, "m1", "check the fleet")
+	waitFor(t, "the notice", noticeReads(r, conv, sessionQueuedNext))
+	// The park's own nudge sends the head to try once, and with no room it
+	// is kept; wait for that try's turn to be over.
+	waitFor(t, "the conversation's inbox idle, its try kept", func() bool {
+		r.g.inbox.mu.Lock()
+		_, running := r.g.inbox.m[conv]
+		r.g.inbox.mu.Unlock()
+		r.g.capMu.Lock()
+		defer r.g.capMu.Unlock()
+		w, _ := r.g.capWaiterLocked(conv)
+		return !running && w != nil && w.retry == 0
+	})
+
+	// A try in flight, which the check keeps; then the next try is put on
+	// the inbox before the kept one's turn has ended.
+	r.g.capMu.Lock()
+	w, _ := r.g.capWaiterLocked(conv)
+	r.g.capTicket++
+	first := r.g.capTicket
+	w.retry = first
+	r.g.capMu.Unlock()
+	var after []func()
+	if !r.g.capKeepOrGiveUp(w, &after) {
+		t.Fatal("the first try gave up inside the bound")
+	}
+	r.g.capMu.Lock()
+	r.g.capTicket++
+	w.retry = r.g.capTicket
+	r.g.capMu.Unlock()
+
+	r.g.capRetryDone(InboundMessage{Conversation: conv, capRetry: first})
+	if !r.g.parkedAtCap(conv) {
+		t.Fatal("the waiter left the line as the kept try ended, with its next try in flight")
 	}
 }

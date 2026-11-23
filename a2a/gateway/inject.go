@@ -1035,6 +1035,17 @@ func (a *InjectAdapter) ClaimRedelivery(conversation string, n int) bool {
 	return true
 }
 
+// ClaimReplay counts n replayed follow-ups of an admitted session-cap turn as
+// handed to the gateway, unconditionally: they run as that turn ends, which
+// ClaimRedelivery counted, so no POST's turn is running, and a POST that
+// arrives meanwhile waits in claimTurn until they have ended too. See
+// CapLineObserver.
+func (a *InjectAdapter) ClaimReplay(conversation string, n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.conversationLocked(conversation).handed += n
+}
+
 // TurnFinished records that a turn on this conversation has ended, which is
 // what tells a waiting POST that what it can see is all there is going to be.
 // See InboundObserver.

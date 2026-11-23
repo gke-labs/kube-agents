@@ -324,10 +324,13 @@ type Gateway struct {
 	// capQueue, guarded by capMu, is the line of turns waiting at the cap
 	// (session_cap_queue.go), oldest first; capTicket numbers its waiters.
 	// capKick nudges the line's loop when a slot may have freed.
+	// capAdmitted, guarded by capMu, holds an admitted waiter's follow-ups
+	// by its try's id until that turn ends and replays them (capRetryDone).
 	// capWaitOverride and capPollOverride, when positive, stand in for
 	// sessionCapWaitMax and sessionCapQueuePoll (tests only).
 	capQueue        []*capWaiter
 	capTicket       uint64
+	capAdmitted     map[uint64][]InboundMessage
 	capKick         chan struct{}
 	capWaitOverride atomic.Int64
 	capPollOverride atomic.Int64
@@ -2837,7 +2840,21 @@ func conversationIsOwnThread(backend, conversation string) bool {
 // clock would hold a true the registry had already withdrawn). For a
 // running task there is no bound to hand over, so it is now + IdleTTL: the
 // adapter asks again then, and a task still running is answered again.
+//
+// A conversation whose turn waits in the session-cap line is a session too,
+// though nothing has started in it yet: its stop, its status ask and its
+// later messages are what routeParked answers, and an adapter that dropped
+// them as replies to a thread the gateway is not in would leave the person
+// unable to reach their place in line. The line is memory, not the
+// registry, so it is read first, under capMu alone, and its true comes with
+// an until of now: the adapter asks again on the next reply, so a thread
+// whose turn has left the line (stopped, refused, or started, when
+// TaskStarted marks it anyway) carries no unmentioned reply on the line's
+// word after that.
 func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, time.Time, error) {
+	if g.parkedAtCap(conversation) {
+		return true, time.Now(), nil
+	}
 	rec, err := g.reg.Get(ctx, conversation)
 	if err != nil || rec == nil {
 		return false, time.Time{}, err

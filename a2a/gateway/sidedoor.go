@@ -438,7 +438,7 @@ func (s *sideDoorAdapter) TurnFinished(conversation string) {
 	}
 }
 
-// TurnQueued and ClaimRedelivery reach the owning door when it is a
+// TurnQueued, ClaimRedelivery and ClaimReplay reach the owning door when it is a
 // CapLineObserver (the inject door). A chat conversation's queued turn is
 // told in its thread, and its redelivery needs nobody's leave, so the
 // primary is asked nothing.
@@ -453,6 +453,12 @@ func (s *sideDoorAdapter) ClaimRedelivery(conversation string, n int) bool {
 		return observer.ClaimRedelivery(conversation, n)
 	}
 	return true
+}
+
+func (s *sideDoorAdapter) ClaimReplay(conversation string, n int) {
+	if observer, ok := s.doorFor(conversation).(CapLineObserver); ok {
+		observer.ClaimReplay(conversation, n)
+	}
 }
 
 // SetProbe hands the gateway's probe to every door, which are the halves

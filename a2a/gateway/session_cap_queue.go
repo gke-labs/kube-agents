@@ -98,7 +98,7 @@ func sessionQueuedNotice(ahead int) string {
 }
 
 // capWaiter is one parked turn. ticket, key and parkedAt never change;
-// msg, followUps and retrying are guarded by Gateway.capMu; noticeID and
+// msg, followUps and retry are guarded by Gateway.capMu; noticeID and
 // shownAhead by editMu, which also orders every edit of the notice, so a
 // position edit can never land after the edit that closed it.
 type capWaiter struct {
@@ -109,9 +109,12 @@ type capWaiter struct {
 	// the conversation's later messages, in order (routeParked).
 	msg       InboundMessage
 	followUps []InboundMessage
-	// retrying is the head's message put back on the inbox and not yet
-	// through refuseAtSessionCap.
-	retrying bool
+	// retry is the id of the head's try in flight: its message put back on
+	// the inbox (as capRetry) and not yet through refuseAtSessionCap; zero
+	// with none. Each try has its own, so a try that ends after the check
+	// kept the waiter, with the next try already on the inbox, is not
+	// mistaken for that next one (capRetryDone).
+	retry uint64
 	// closed is set as the waiter leaves the line, before its last edit.
 	closed atomic.Bool
 
@@ -157,14 +160,20 @@ func parksAtCap(backend string) bool {
 //
 // TurnQueued says the turn now ending waits in the line (parked, or a
 // later message held behind a parked turn), so it is not a turn that started
-// nothing. ClaimRedelivery is asked before the line puts n messages back on
-// the conversation's inbox, which ends in n turns no caller handed over; the
-// adapter counts them as handed, so its own bookkeeping of which turn is
-// whose stays whole, and reports false while a turn it handed over has not
-// ended, in which case nothing is put back and the line tries again later.
+// nothing. ClaimRedelivery is asked before the line puts the head's turn
+// back on the conversation's inbox, n messages that end in n turns no caller
+// handed over; the adapter counts them as handed, so its own bookkeeping of
+// which turn is whose stays whole, and reports false while a turn it handed
+// over has not ended, in which case nothing is put back and the line tries
+// again later. ClaimReplay counts n more such turns unconditionally: the
+// follow-ups of an admitted turn, replayed as that turn ends, on its inbox
+// worker. The admitted turn is one ClaimRedelivery counted, so no turn the
+// adapter handed over is running then, and a later one waits behind the
+// count.
 type CapLineObserver interface {
 	TurnQueued(conversation string)
 	ClaimRedelivery(conversation string, n int) bool
+	ClaimReplay(conversation string, n int)
 }
 
 // observeTurnQueued tells a CapLineObserver adapter that key's turn waits in
@@ -182,6 +191,14 @@ func (g *Gateway) claimRedelivery(key string, n int) bool {
 		return observer.ClaimRedelivery(key, n)
 	}
 	return true
+}
+
+// claimReplay tells a CapLineObserver adapter that n replayed follow-ups
+// go to key's gateway now (CapLineObserver.ClaimReplay).
+func (g *Gateway) claimReplay(key string, n int) {
+	if observer, ok := g.adapter.(CapLineObserver); ok {
+		observer.ClaimReplay(key, n)
+	}
 }
 
 func (g *Gateway) initCap() {
@@ -226,6 +243,14 @@ func (g *Gateway) capWaiterLocked(key string) (*capWaiter, int) {
 	return nil, -1
 }
 
+// parkedAtCap reports whether key has a turn waiting in the line.
+func (g *Gateway) parkedAtCap(key string) bool {
+	g.capMu.Lock()
+	defer g.capMu.Unlock()
+	w, _ := g.capWaiterLocked(key)
+	return w != nil
+}
+
 // dequeueLocked takes w out of the line and marks it closed. The caller
 // holds capMu.
 func (g *Gateway) dequeueLocked(w *capWaiter) {
@@ -260,9 +285,12 @@ func (g *Gateway) capDecision(key string, parkable bool) (own *capWaiter, behind
 
 // capAdmit is the check's grant to a waiter: out of the line, its notice
 // closed on the starting line after the check, and the next waiter nudged.
+// Its follow-ups are set aside for its turn's end (capRetryDone), which
+// replays them in order behind the turn they now steer.
 func (g *Gateway) capAdmit(w *capWaiter) func() {
 	g.capMu.Lock()
 	g.dequeueLocked(w)
+	g.stashFollowUpsLocked(w)
 	g.capMu.Unlock()
 	g.log.Info("session cap: queued turn admitted", "conversation", w.key, "waited", time.Since(w.parkedAt).Round(time.Second))
 	return func() {
@@ -279,11 +307,16 @@ func (g *Gateway) capKeepOrGiveUp(w *capWaiter, after *[]func()) bool {
 	g.capMu.Lock()
 	defer g.capMu.Unlock()
 	if time.Since(w.parkedAt) < g.capWaitMax() {
-		w.retrying = false
+		w.retry = 0
 		return true
 	}
 	g.dequeueLocked(w)
-	g.log.Warn("session cap: queued turn waited out its bound", "conversation", w.key, "waited", time.Since(w.parkedAt).Round(time.Second))
+	// Its later messages wait on nothing now and are dropped, as for a
+	// waiter behind it that expires (expireCapWaiters); the cap's refusal,
+	// posted by the caller, tells the person to send again.
+	dropped := len(w.followUps)
+	w.followUps = nil
+	g.log.Warn("session cap: queued turn waited out its bound", "conversation", w.key, "waited", time.Since(w.parkedAt).Round(time.Second), "droppedFollowUps", dropped)
 	*after = append(*after, func() {
 		g.closeCapNotice(w, sessionQueuedGaveUp)
 		g.kickCapQueue()
@@ -367,55 +400,89 @@ func (g *Gateway) refreshCapNotices() {
 	}
 }
 
-// retryCapHead puts the head waiter's turn back on its conversation's inbox
-// to try for a slot, then its follow-ups behind it in order, unless a retry
-// is already in flight. A follow-up processed after a retry that found no
-// room joins the waiter again (routeParked); after one that started the
-// turn, it reaches the running task the way any later message does.
+// retryCapHead puts the head waiter's turn, and only that, back on its
+// conversation's inbox to try for a slot, unless a retry is already in
+// flight. Its follow-ups stay with the waiter until the check admits the
+// turn (capAdmit), so a retry that finds no room, gives up, or is overtaken
+// by a stop already on the inbox never lets one run as a turn of its own.
 func (g *Gateway) retryCapHead() {
 	g.capMu.Lock()
-	if len(g.capQueue) == 0 || g.capQueue[0].retrying {
+	if len(g.capQueue) == 0 || g.capQueue[0].retry != 0 {
 		g.capMu.Unlock()
 		return
 	}
 	w := g.capQueue[0]
-	msgs := append([]InboundMessage{w.msg}, w.followUps...)
 	// A door with a turn of its own still running on the conversation says
 	// not yet; the next nudge or poll tries again. Asked under capMu so
 	// the count the door takes is the count put back.
-	if !g.claimRedelivery(w.key, len(msgs)) {
+	if !g.claimRedelivery(w.key, 1) {
 		g.capMu.Unlock()
 		return
 	}
-	w.retrying = true
-	msgs[0].capRetry = w.ticket
-	for i := range msgs {
-		msgs[i].capReplay = true
-	}
-	w.followUps = nil
+	g.capTicket++
+	w.retry = g.capTicket
+	msg := w.msg
+	msg.capRetry, msg.capReplay = w.retry, true
 	g.capMu.Unlock()
-	for _, m := range msgs {
-		g.inbox.enqueue(w.key, m)
+	g.inbox.enqueue(w.key, msg)
+}
+
+// stashFollowUpsLocked sets w's follow-ups aside for its turn's end, as w
+// leaves the line with its turn going ahead. The caller holds capMu.
+func (g *Gateway) stashFollowUpsLocked(w *capWaiter) {
+	if len(w.followUps) == 0 {
+		return
+	}
+	if g.capAdmitted == nil {
+		g.capAdmitted = map[uint64][]InboundMessage{}
+	}
+	g.capAdmitted[w.retry] = w.followUps
+	w.followUps = nil
+}
+
+// replayFollowUps runs an admitted turn's follow-ups, in order, as that turn
+// ends: on the conversation's inbox worker, with the session lock released,
+// so they reach the task the turn started (a steer, a stop, a status ask)
+// ahead of anything that arrived after them. They were counted once already
+// as messages a person sent, so they are marked replays.
+func (g *Gateway) replayFollowUps(msg InboundMessage) {
+	g.capMu.Lock()
+	followUps := g.capAdmitted[msg.capRetry]
+	delete(g.capAdmitted, msg.capRetry)
+	g.capMu.Unlock()
+	if len(followUps) == 0 || g.runCtx.Err() != nil {
+		return
+	}
+	g.log.Info("session cap: replaying a started turn's follow-ups", "conversation", msg.Conversation, "followUps", len(followUps))
+	g.claimReplay(msg.Conversation, len(followUps))
+	for _, f := range followUps {
+		f.capRetry, f.capReplay = 0, true
+		g.handleInbound(f)
 	}
 }
 
-// capRetryDone runs as the head's retried turn ends. A retry the cap check
-// answered has already left retrying; one still retrying never reached the
-// check: the turn went another way (the conversation's own pod could take
-// it after all) or failed before the check and has said so in the log. It
-// leaves the line either way, so the line never stalls behind it. At a
-// stop it stays, for the stop's refusal post.
+// capRetryDone runs as the head's retried turn ends. A try the cap check
+// admitted replays its follow-ups now (replayFollowUps); one it kept is no
+// longer the waiter's try in flight (retry), whether or not the next try
+// is on the inbox already. One that still is never reached the check: the
+// turn went another way (the conversation's own pod could take it after
+// all) or failed before the check and has said so in the log. It leaves the
+// line either way, so the line never stalls behind it, and its follow-ups
+// go on as the conversation's later messages, as they would have with no
+// line. At a stop it stays, for the stop's refusal post.
 func (g *Gateway) capRetryDone(msg InboundMessage) {
+	defer g.replayFollowUps(msg)
 	if g.runCtx.Err() != nil {
 		return
 	}
 	g.capMu.Lock()
 	w, _ := g.capWaiterLocked(msg.Conversation)
-	if w == nil || w.ticket != msg.capRetry || !w.retrying {
+	if w == nil || w.retry != msg.capRetry {
 		g.capMu.Unlock()
 		return
 	}
 	g.dequeueLocked(w)
+	g.stashFollowUpsLocked(w)
 	g.capMu.Unlock()
 	line := sessionQueuedLeft
 	if rec, err := g.reg.Get(g.runCtx, msg.Conversation); err == nil && rec != nil && rec.ActiveTask != nil {
@@ -429,20 +496,28 @@ func (g *Gateway) capRetryDone(msg InboundMessage) {
 // routeParked answers a message on a conversation that has a turn in the
 // line, and reports whether it did. Everything a later message would do
 // waits behind the parked turn, in order, the way the conversation's inbox
-// already orders turns: the follow-up joins the waiter and is put back on
-// the inbox behind the turn when it next tries, so it steers the task the
-// turn starts, or starts its own after it. Two answers can't wait. A stop
-// takes the turn out of the line and says so. A status ask is answered
-// with the turn's place in line. A press of a stop control that names a
-// task is about that task's line, not the waiter, and goes the way it
-// always did (false), as does the head's own retry.
+// already orders turns: the follow-up joins the waiter and runs behind the
+// turn once the cap check admits it (capAdmit, replayFollowUps), so it
+// steers the task the turn starts. Two answers can't wait. A stop takes the
+// turn out of the line and says so. A status ask is answered with the
+// turn's place in line. A press of a stop control that names a task is
+// about that task's line, not the waiter, and goes the way it always did
+// (false), as does the head's own retry. A retry whose waiter has left the
+// line since it was put on the inbox (a stop ahead of it on the inbox) is
+// dropped here: the turn it carries was taken out of the line, and must not
+// start, or park again, as a fresh one.
 func (g *Gateway) routeParked(rec *SessionRecord, msg InboundMessage, backend string, stopping bool) bool {
 	if g.spawner == nil {
 		return false
 	}
 	g.capMu.Lock()
 	w, ahead := g.capWaiterLocked(rec.Key)
-	if w == nil || (msg.capRetry != 0 && msg.capRetry == w.ticket) || (stopping && msg.TaskID != "") {
+	if msg.capRetry != 0 && (w == nil || msg.capRetry != w.retry) {
+		g.capMu.Unlock()
+		g.log.Info("session cap: dropped a queued turn's retry: it has left the line", "conversation", rec.Key, "try", msg.capRetry)
+		return true
+	}
+	if w == nil || msg.capRetry != 0 || (stopping && msg.TaskID != "") {
 		g.capMu.Unlock()
 		return false
 	}
@@ -491,7 +566,7 @@ func (g *Gateway) expireCapWaiters(ctx context.Context) {
 	g.capMu.Lock()
 	if len(g.capQueue) > 1 {
 		rest := slices.DeleteFunc(g.capQueue[1:], func(w *capWaiter) bool {
-			if w.retrying || time.Since(w.parkedAt) < bound {
+			if w.retry != 0 || time.Since(w.parkedAt) < bound {
 				return false
 			}
 			w.closed.Store(true)
