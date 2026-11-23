@@ -28,13 +28,27 @@ const (
 	strayReport  = "STRAY: a report on someone else's task."
 	reportDelay  = 200 * time.Millisecond
 	turnWaitSecs = 10
-	// cursorWait bounds waitCursor for a handful of frames.
+	// cursorWait bounds waitCursor, whose callers wait for a few hundred
+	// frames at most.
 	cursorWait = 5 * time.Second
 	// burstDrainWait bounds the wait for a listener to drain a burst. It is
 	// not an expectation of how long a drain takes: under the race detector
 	// on a loaded runner one takes seconds, so this only stops a listener
-	// that stalled or lost frames from hanging the test.
-	burstDrainWait = 2 * time.Minute
+	// that stalled or lost frames from hanging the test. Half the longest
+	// wait a turn takes, so that a turn sent with maxWaitSeconds is still
+	// gathering when it runs out.
+	burstDrainWait = maxWaitSeconds * time.Second / 2
+	// gatherEndWait bounds how long a turn takes to return once the root's
+	// result is published behind a burst: the turn's own subscription reads
+	// the burst before it reaches the result. It bounds a result that is
+	// never noted; without it such a turn returns when its wait runs out.
+	gatherEndWait = 30 * time.Second
+	// gatherTestWait bounds a call to gatherReports that a test expects to
+	// return for another reason.
+	gatherTestWait = time.Minute
+	// stoppedAtOnceLine is what a turn says when the root's result ended
+	// its gathering.
+	stoppedAtOnceLine = "the gateway's result for task `task-root1` said no cards were left pending, so gathering stopped at once"
 )
 
 func setReportQuiet(t *testing.T, d time.Duration) {
@@ -513,6 +527,7 @@ func TestTheListenerDrainsABurst(t *testing.T) {
 	const burst = 5000
 	_, b, nc, convs := eventsServer(t)
 	token, _ := convs.Resolve("burst", "")
+	start := time.Now()
 	for i := 0; i < burst; i++ {
 		data, _ := json.Marshal(notifyFrame(fmt.Sprintf("n-%d", i), "task-a", "x"))
 		_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), data)
@@ -521,6 +536,9 @@ func TestTheListenerDrainsABurst(t *testing.T) {
 	if !cursorReaches(b.Events(), burst, burstDrainWait) {
 		t.Fatalf("the listener heard %d of %d frames in %s", b.Events().Cursor(), burst, burstDrainWait)
 	}
+	// Logged, not asserted: a bound tight enough to catch a slow listener
+	// fails on a loaded runner.
+	t.Logf("published and drained %d frames in %s", burst, time.Since(start))
 	if err := b.client.Conn().LastError(); err != nil {
 		t.Errorf("the connection reports %v after a burst", err)
 	}
@@ -534,22 +552,53 @@ func TestTheListenerDrainsABurst(t *testing.T) {
 	// listener has heard the report published after the burst; the root's
 	// result then ends gathering at once.
 	setReportQuiet(t, time.Hour)
-	heard := make(chan *Events, 1)
+	// drain is what the fake gateway saw of the listener before it posted
+	// the root's result. Its goroutine can outlive the test, so it reports
+	// here and never through t.
+	type drain struct {
+		cursor uint64
+		took   time.Duration
+	}
+	heard, drained := make(chan *Events, 1), make(chan drain, 1)
 	s, _, _, tb := turnServer(t, gatewayScenario{finish: true, after: func(gnc *nats.Conn, token string, turn int32) {
+		start := time.Now()
 		for i := 0; i < burst; i++ {
 			data, _ := json.Marshal(notifyFrame(fmt.Sprintf("b-%d", i), "task-unrelated", "x"))
 			_ = gnc.Publish(fmt.Sprintf(consoleOutSubject, token), data)
 		}
 		publishNotify(gnc, token, notifyFrame("n-real", "task-root1", cardReport))
 		// The burst and the report are this listener's only frames.
-		if e := <-heard; !cursorReaches(e, burst+1, burstDrainWait) {
-			t.Errorf("during a turn the listener heard %d of %d frames in %s", e.Cursor(), burst+1, burstDrainWait)
-		}
+		e := <-heard
+		cursorReaches(e, burst+1, burstDrainWait)
+		drained <- drain{e.Cursor(), time.Since(start)}
 		publishNotify(gnc, token, resultFrame(fmt.Sprintf("task-root%d", turn), false))
 	}})
 	heard <- tb.Events()
-	text := send(t, s, map[string]any{"text": "busy", "wait_seconds": maxWaitSeconds})
-	mustContain(t, text, cardReport)
+	// The turn's wait is the longest there is, so nothing but the result
+	// ends it while the listener drains (burstDrainWait is half of it).
+	args := mustJSON(t, map[string]any{"text": "busy", "wait_seconds": maxWaitSeconds})
+	answered := make(chan CallToolResult, 1)
+	go func() { answered <- s.CallTool(context.Background(), ToolSendMessage, args) }()
+	select {
+	case d := <-drained:
+		if d.cursor < burst+1 {
+			t.Errorf("during a turn the listener heard %d of %d frames in %s", d.cursor, burst+1, d.took)
+		} else {
+			t.Logf("during a turn, published and drained %d frames in %s", burst+1, d.took)
+		}
+	case <-time.After(MaxTurnWait):
+		t.Fatal("the fake gateway never posted the burst")
+	}
+	var res CallToolResult
+	select {
+	case res = <-answered:
+	case <-time.After(gatherEndWait):
+		t.Fatalf("the turn was still gathering %s after the root's result was posted", gatherEndWait)
+	}
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, cardReport, stoppedAtOnceLine)
 	if err := tb.client.Conn().LastError(); err != nil {
 		t.Errorf("the connection reports %v after a burst during a turn", err)
 	}
@@ -1096,6 +1145,59 @@ func TestAResultWithoutCardsEndsGatheringAtOnce(t *testing.T) {
 		t.Errorf("the turn took %s; a result without cards pending should end gathering at once", elapsed)
 	}
 	mustContain(t, text, answerText, "the gateway's result for task `task-root1` said no cards were left pending, so gathering stopped at once")
+}
+
+// Gathering reads the buffer after it reads what ends it: a report the
+// listener kept before the root's result was noted, before the wait ran
+// out, or as the quiet period passed, is in the turn's reports. Each case
+// places the report between the two reads, where a buffer read first
+// missed it.
+func TestGatheringReturnsAReportKeptBeforeItsEnd(t *testing.T) {
+	const root = "task-root1"
+	for _, tc := range []struct {
+		name  string
+		quiet time.Duration
+		// at is the pass of the gathering loop the report is kept on.
+		at int
+		// then is what ends the gathering, just after the report is kept.
+		then func(w *turnWatch, cancel context.CancelFunc)
+		want reportsEnd
+	}{
+		{"the root's result", time.Hour, 1, func(w *turnWatch, _ context.CancelFunc) { w.noteResult(resultFrame(root, false)) }, reportsNoCards},
+		{"the wait running out", time.Hour, 1, func(_ *turnWatch, cancel context.CancelFunc) { cancel() }, reportsWaitOver},
+		// Nothing but the quiet period wakes the first pass, so the second
+		// is the one that follows it.
+		{"the quiet period", 20 * time.Millisecond, 2, func(*turnWatch, context.CancelFunc) {}, reportsQuiet},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setReportQuiet(t, tc.quiet)
+			e := NewEvents(&fakeSubscriber{})
+			if _, err := e.Watch("tok", false); err != nil {
+				t.Fatal(err)
+			}
+			b := &NATSBus{events: e}
+			ctx, cancel := context.WithTimeout(t.Context(), gatherTestWait)
+			defer cancel()
+			w := &turnWatch{token: "tok", known: map[string]bool{root: true}, results: map[string]bool{}, resultSeen: make(chan struct{}, 1)}
+			report := mustJSON(t, notifyFrame("n-real", root, cardReport))
+			pass := 0
+			w.beforeSnapshot = func() {
+				if pass++; pass != tc.at {
+					return
+				}
+				e.receive(e.logs["tok"], report)
+				tc.then(w, cancel)
+			}
+			out := TurnOutcome{Root: TaskRef{Addressee: fakeAddressee, TaskID: root}}
+			b.gatherReports(ctx, w, &out, true)
+			if len(out.Reports) != 1 || out.Reports[0].Text != cardReport {
+				t.Errorf("gathering returned %d reports, want the one kept before it ended", len(out.Reports))
+			}
+			if out.ReportsEnd != tc.want {
+				t.Errorf("ReportsEnd %d, want %d", out.ReportsEnd, tc.want)
+			}
+		})
+	}
 }
 
 // A streamed turn that ends with no card signal stops gathering at once,
