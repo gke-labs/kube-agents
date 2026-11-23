@@ -64,10 +64,13 @@ construction, well before any message is sent, and reading it through
 ``type(self)`` means an install with no relay is unaffected: it keeps the
 ``/setup-files`` instruction, because there the command works.
 
-Every install the operator deploys takes the relay branch --
-``k8s-operator/internal/controller/platformagent_manifests.go`` sets
-``GOOGLE_CHAT_RELAY_URL`` whenever ``integration.googleChat.enabled`` is true,
-and ``sitecustomize.py`` installs the patch on that variable alone. The other
+A container with ``sitecustomize.py`` on ``PYTHONPATH`` and
+``GOOGLE_CHAT_RELAY_URL`` set takes the relay branch: ``sitecustomize.py``
+installs the patch on that variable alone. The operator
+(``k8s-operator/internal/controller/platformagent_manifests.go``) set the
+variable whenever ``integration.googleChat.enabled`` was true; it renders it
+no longer, because the A2A gateway is Google Chat's one consumer and the
+Hermes ``google_chat`` platform does not run on an operator install. The other
 branch is for an image run outside the operator, and it is kept rather than
 folded away because deleting it would leave the instruction hard-coded off in
 the one configuration where it works.

@@ -18,10 +18,14 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -120,6 +124,66 @@ func TestTheAgentProfileCRDRefusesWhatTheLoaderRefused(t *testing.T) {
 		if err := c.Create(ctx, p); err == nil {
 			t.Errorf("%s: admitted; want refused", name)
 			_ = c.Delete(ctx, p)
+		}
+	}
+}
+
+// TestTheAgentProfileCRDHoldsScriptNamesToTheTriggerList holds
+// spec.scripts[].name to the names AgentSchedule.spec.script and
+// lib.ValidateTrigger take, on the one case list both of their tests read
+// (triggerScriptNamesPath): a profile can list exactly the scripts a schedule
+// can name.
+func TestTheAgentProfileCRDHoldsScriptNamesToTheTriggerList(t *testing.T) {
+	raw, err := os.ReadFile(triggerScriptNamesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names struct {
+		Accepted []string `json:"accepted"`
+		Refused  []string `json:"refused"`
+	}
+	if err := json.Unmarshal(raw, &names); err != nil {
+		t.Fatal(err)
+	}
+	if len(names.Accepted) == 0 || len(names.Refused) == 0 {
+		t.Fatalf("the case list is empty: %+v", names)
+	}
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "agentprofile-script-names"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	mk := func(script string) *agentv1alpha1.AgentProfile {
+		n++
+		p := testAgentProfile(ns, fmt.Sprintf("p-%d", n), func(p *agentv1alpha1.AgentProfile) {
+			p.Spec.Scripts = []agentv1alpha1.AgentProfileScript{
+				{Name: script, Path: agentv1alpha1.AgentProfileScriptRoot + "helper.py", TimeoutSeconds: 300},
+			}
+		})
+		p.Generation = 0
+		return &p
+	}
+	for _, name := range names.Accepted {
+		p := mk(name)
+		if err := c.Create(ctx, p); err != nil {
+			t.Errorf("script name %q refused: %v", name, err)
+			continue
+		}
+		var back agentv1alpha1.AgentProfile
+		if err := c.Get(ctx, client.ObjectKeyFromObject(p), &back); err != nil ||
+			len(back.Spec.Scripts) != 1 || back.Spec.Scripts[0].Name != name {
+			t.Errorf("script name %q read back as %+v (%v)", name, back.Spec.Scripts, err)
+		}
+	}
+	for _, name := range names.Refused {
+		if err := c.Create(ctx, mk(name)); err == nil || !apierrors.IsInvalid(err) {
+			t.Errorf("script name %q: create = %v, want refused as invalid", name, err)
 		}
 	}
 }

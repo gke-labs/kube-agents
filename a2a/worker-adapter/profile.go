@@ -586,7 +586,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 			// setting sources) after the base argv, which carries none.
 			cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
 			cfg.HarnessCommandNoDelegate = nil
-			cfg.HarnessEnv = append(cfg.HarnessEnv, "CLAUDE_CONFIG_DIR="+dir)
+			cfg.HarnessEnv = append(cfg.HarnessEnv, cfg.driver().ConfigDirEnv(dir))
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)
@@ -803,7 +803,7 @@ func taskParameters(origin *lib.Envelope) (map[string]string, error) {
 
 // scriptMarker is the script a held task is marked with, and what marks
 // it: the task credential's trigger, else the submission's own (its
-// authority block's trigger, which admission checked). Neither is "" for a
+// authority block's trigger, which admission checked). Both are "" for a
 // model task.
 func scriptMarker(h *held) (from, script string, err error) {
 	if h.proxyToken != "" {

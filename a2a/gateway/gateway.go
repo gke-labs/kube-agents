@@ -3447,14 +3447,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
 	// A chat thread's kept reports are forgotten once this turn is on the
 	// bus (below), not here: a publish that fails leaves them for the retry.
-	threadReportsRead := 0
+	var threadReportRead uint64
 	if ts.Role == "" {
-		if report, n, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+		if report, seq, ok := g.relayedReport(rec, ts.ReplyTo); ok {
 			if part, err := lib.PushedReportPart(report); err != nil {
 				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
 			} else {
 				extra = append(extra, part)
-				threadReportsRead = n
+				threadReportRead = seq
 			}
 		}
 	}
@@ -3626,11 +3626,12 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 		return "", false
 	}
-	if threadReportsRead > 0 {
+	if threadReportRead > 0 {
 		// The turn under the thread's newest report is on the bus: the
-		// reports it read are forgotten, so the next turn there is not under
-		// a report it was not about; one kept during the publish stays.
-		g.reports.forgetUpTo(rec.Key, threadReportsRead)
+		// reports through the one it read are forgotten, so the next turn
+		// there is not under a report it was not about; one kept during the
+		// publish stays, at the cap too.
+		g.reports.forgetThrough(rec.Key, threadReportRead)
 	}
 
 	// The submission is on the subject now, which is the first moment
@@ -3712,6 +3713,14 @@ var steerRefusalWhy = map[string]string{
 	lib.SteerReasonNoResume:   "this agent's executor can't continue a session, so follow-ups run on the api executor only",
 }
 
+// ruleSteerChangeRequested names the refusal of a steer into a task that
+// holds ChangeRequested (steerTask), and noticeSteerChangeRequested is what
+// its conversation is told.
+const (
+	ruleSteerChangeRequested   = "steer-change-requested"
+	noticeSteerChangeRequested = "⚠️ not sent: the running task is making a confirmed change, and what it's asked to do can't change while it runs. Stop it, then send what you want as a new confirm."
+)
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
@@ -3739,6 +3748,20 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
 			return
 		}
+	}
+	// A task that holds ChangeRequested was started by a person's
+	// structured confirm and may write. A steer would change what it is
+	// asked to do while it runs, and the gateway can't tell who on a door
+	// sent it (the console's human and its MCP server share one author), so
+	// no steer reaches it from any door: the requester stops the task and
+	// confirms again (#5884). A confirm is already refused while a task
+	// runs (noticeConfirmWhileRunning). Before the author is recorded, as
+	// for the checks below.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.ChangeRequested {
+		g.log.Warn("steer refused", "rule", ruleSteerChangeRequested, "taskId", active.TaskID, "conversation", rec.Key,
+			"steerBackend", author.Backend, "steerAuthor", author.Subject)
+		g.post(rec.Key, noticeSteerChangeRequested)
+		return
 	}
 	// A profile task's grant was minted once, at its authors' tier: a steer
 	// from someone at another tier is refused, before the author is

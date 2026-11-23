@@ -26,7 +26,7 @@ CONFIG_CONNECTOR_SKILL_DIR = (
     Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
 )
 # A fence may be indented, as one inside a numbered list is. The languages
-# are deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+# are the info strings a2a/cmd/session-persona/transform.go calls shellLangs.
 FENCED_SHELL_BLOCK = re.compile(
     r"^(?P<indent>[ \t]*)```(?:bash|sh|shell|zsh)[ \t]*\n(?P<body>.*?)^(?P=indent)```[ \t]*$",
     re.MULTILINE | re.DOTALL,
