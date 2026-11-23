@@ -963,10 +963,13 @@ def pool_baseline_span(tokens: dict[tuple, str]) -> tuple[int, int]:
 
 
 def pool_baseline_spans_cohort(tokens: dict[tuple, str]) -> bool:
-    """§4.15's second condition on a pool baseline: the pools that hold it sit
-    in at least `BASELINE_MIN_RATIO` of the clusters that voted."""
+    """§4.15's second condition on a pool baseline: at least `COHORT_FLOOR`
+    clusters voted, and the pools that hold the baseline sit in at least
+    `BASELINE_MIN_RATIO` of them. The floor is §2.4's, counted where it was
+    meant: `compute_baseline` counts pools, and eleven pools on one cluster
+    whose two peers have no readable pool are not three comparable clusters."""
     holders, voters = pool_baseline_span(tokens)
-    return voters > 0 and holders / voters >= BASELINE_MIN_RATIO
+    return voters >= COHORT_FLOOR and holders / voters >= BASELINE_MIN_RATIO
 
 
 def compute_baseline(tokens: dict[str, str]) -> tuple[str, int, int, float] | None:
@@ -1682,7 +1685,9 @@ def unvoted_facets(
     - **The cohort reached no baseline.** §3.3 wants `COHORT_FLOOR` readable
       values with one token on at least `BASELINE_MIN_RATIO` of them; a cohort
       that splits evenly has no majority to be an outlier from, and the facet
-      is then uncompared for every one of its members.
+      is then uncompared for every one of its members. A pool-voted facet has
+      §4.15's condition on top (`pool_baseline_spans_cohort`), and its entry
+      in the sentence says how the clusters split.
 
     Both are `limitations` rather than `checks_not_applicable`, because §3.1 is
     narrow about which is which: `checks_not_applicable` leaves the coverage
@@ -1759,8 +1764,15 @@ def unvoted_facets(
                     top = Counter(tokens.values()).most_common(1)
                     span = ""
                     if FACETS_BY_SLUG[slug].pool_token is not None and top:
+                        # A pool facet can clear §3.3 on its pools and still
+                        # have no baseline, so the sentence names the rule
+                        # that decided: without it "commonest on 20 of 22"
+                        # reads as a majority the collector ignored.
                         holders, voters = pool_baseline_span(tokens)
-                        span = f" in {holders} of {voters} clusters"
+                        span = (
+                            f" in {holders} of {voters} voting clusters, where §4.15 needs "
+                            f"{COHORT_FLOOR} voting clusters and the token in {BASELINE_MIN_RATIO:.0%} of them"
+                        )
                     detail.append(
                         f"`{slug}` ({len(tokens)} readable value(s)"
                         + (f", commonest on {top[0][1]}{span}" if top else "")

@@ -2384,7 +2384,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         candidates = self.check(self._straddling_shape())[1]
         self.assertNotIn(K("ap-0"), candidates)
 
-    def test_the_excerpt_does_not_claim_all_nineteen_abstained(self):
+    def test_the_excerpt_does_not_claim_all_twenty_abstained(self):
         """`abstaining` counts the cluster's whole roster, which is the right
         number only when both cohorts are short. Printed against a cluster
         being compared on eight, it overstates the gap by the eight it is
@@ -2618,7 +2618,11 @@ class BootDiskPoolVoteTest(unittest.TestCase):
             self.assertEqual(self.boot_disk(candidates, name), [])
             self.assertNotIn("boot-disk", checks_run[K(name)])
         entry = self.manifest(fleet)[T("s1")]
-        self.assertIn("`boot-disk` (22 readable value(s), commonest on 20 in 1 of 3 clusters)", entry["limitations"])
+        self.assertIn(
+            "`boot-disk` (22 readable value(s), commonest on 20 in 1 of 3 voting clusters, "
+            "where §4.15 needs 3 voting clusters and the token in 67% of them)",
+            entry["limitations"],
+        )
 
     def test_a_baseline_held_in_two_thirds_of_the_clusters_stands(self):
         fleet = [
@@ -2629,6 +2633,45 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         self.assertEqual(fd.pool_baseline_span(fd.facet_tokens(fd.FACETS_BY_SLUG["boot-disk"], fleet)), (2, 3))
         _, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertEqual([f["object"] for f in self.boot_disk(candidates, "c")], ["NodePool/p"])
+
+    def test_a_baseline_held_in_half_of_the_clusters_does_not_stand(self):
+        """Two of four is a simple majority of nothing: the span threshold is
+        `BASELINE_MIN_RATIO`, not one half. Ten of twelve pools agree."""
+        fleet = [
+            cluster("a", nodePools=[pool(f"p{j}") for j in range(9)]),
+            cluster("b"),
+            cluster("c", nodePools=[pool("p", disk_gb=50)]),
+            cluster("d", nodePools=[pool("p", disk_gb=200)]),
+        ]
+        self.assertEqual(fd.pool_baseline_span(fd.facet_tokens(fd.FACETS_BY_SLUG["boot-disk"], fleet)), (2, 4))
+        checks_run, candidates = fd.compute_drift(fleet, now=NOW)
+        for name in "abcd":
+            self.assertEqual(self.boot_disk(candidates, name), [])
+            self.assertNotIn("boot-disk", checks_run[K(name)])
+
+    def test_fewer_than_three_voting_clusters_is_no_baseline(self):
+        """§2.4's floor counts clusters. One cluster's eleven pools clear
+        §3.3's count of readable values on their own, and its two cohort peers
+        have no readable pool, so it would be compared against itself."""
+        fleet = [
+            cluster("a", nodePools=[pool(f"p{j}") for j in range(10)] + [pool("odd", disk_gb=50)]),
+            cluster("b", nodePools=[pool("p", disk_gb=None)]),
+            cluster("c", nodePools=[pool("p", disk_gb=None)]),
+        ]
+        checks_run, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual(self.boot_disk(candidates, "a"), [])
+        self.assertNotIn("boot-disk", checks_run[K("a")])
+        entry = self.manifest(fleet)[T("a")]
+        self.assertIn("commonest on 10 in 1 of 1 voting clusters, where §4.15 needs 3 voting clusters", entry["limitations"])
+
+    def test_two_voting_clusters_that_agree_are_still_under_the_floor(self):
+        fleet = [
+            cluster("a", nodePools=[pool(f"p{j}") for j in range(5)]),
+            cluster("b", nodePools=[pool("x"), pool("y", disk_gb=50)]),
+            cluster("c", nodePools=[]),
+        ]
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual(self.boot_disk(candidates, "b"), [])
 
     def test_an_inferred_environment_costs_the_pool_finding_one_level(self):
         """§3.5's inferred-environment rung, on the pool vote. The cohort is
@@ -2697,7 +2740,7 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         entry = entries[T("c0")]
         self.assertEqual([f for f in entry["candidates"] if f["check"] == "boot-disk"], [])
         self.assertIn("reached no baseline", entry["limitations"])
-        self.assertIn("`boot-disk` (4 readable value(s), commonest on 1 in 1 of 4 clusters)", entry["limitations"])
+        self.assertIn("`boot-disk` (4 readable value(s), commonest on 1 in 1 of 4 voting clusters, where §4.15", entry["limitations"])
 
     def test_the_finding_id_names_the_cluster_and_the_pool(self):
         import audit_report
