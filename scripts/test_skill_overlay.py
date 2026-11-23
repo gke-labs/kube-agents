@@ -112,7 +112,7 @@ class Scenario(unittest.TestCase):
                              env=self.env, capture_output=True, text=True)
         self.assertEqual(res.returncode, expect, res.stdout + res.stderr)
         if args[0] == "refresh":
-            self.fill_eval_cases()
+            self.fill_headers()
         return res.stdout + res.stderr
 
     def add_case(self, *case_ids):
@@ -122,12 +122,14 @@ class Scenario(unittest.TestCase):
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "task.yaml").write_text(f"id: {case_id}\n")
 
-    def fill_eval_cases(self):
+    def fill_headers(self):
         """Do what an author does after a refresh, so `check` judges the rest of the overlay."""
         for patch in (self.repo / "agents" / "platform" / "skill-overlays").glob("*/*.patch"):
             data = patch.read_bytes()  # bytes: a text-mode rewrite would change a CRLF patch
-            if b"Eval-Case: TODO" in data:
-                patch.write_bytes(data.replace(b"Eval-Case: TODO", b"Eval-Case: none (fixture)"))
+            filled = (data.replace(b"Eval-Case: TODO", b"Eval-Case: none (fixture)")
+                      .replace(b"Retire-When: TODO", b"Retire-When: never; fixture"))
+            if filled != data:
+                patch.write_bytes(filled)
 
     def skill(self, name="basics"):
         return self.repo / "agents" / "platform" / "skills" / name / "SKILL.md"
@@ -168,7 +170,7 @@ class Scenario(unittest.TestCase):
         self.adopt_with_two_patches()
         patch = self.overlay() / "0002-fix-typo.patch"
         filled = patch.read_text()
-        self.assertIn("Local-Issue: TODO\nEval-Case: none (fixture)\nUpstream-Issue: none\n", filled)
+        self.assertIn("Local-Issue: TODO\nEval-Case: none (fixture)\nRetire-When: never; fixture\n", filled)
         for value in (" TODO", " TODO: the case", "", "   "):
             patch.write_text(filled.replace("Eval-Case: none (fixture)", "Eval-Case:" + value))
             out = self.run_tool("check", expect=1)
@@ -213,6 +215,123 @@ class Scenario(unittest.TestCase):
             self.assertNotIn("0002-fix-typo.patch", out)
         patch.write_text(filled)
         self.assertIn("ok: 2", self.run_tool("check"))
+
+    def test_check_passes_each_form_of_the_retire_when_line(self):
+        self.adopt_with_two_patches()
+        patch = self.overlay() / "0002-fix-typo.patch"
+        filled = patch.read_text()
+        self.assertIn("Retire-When: never; fixture\n", filled)
+        for value in ("never; the rule is this repository's", "local the sandbox admits the command",
+                      "upstream fixes the typo", "upstream's reference names the flag", "upstream\tfixes the typo"):
+            patch.write_text(filled.replace("Retire-When: never; fixture", "Retire-When: " + value))
+            self.assertIn("ok: 2", self.run_tool("check"))
+        # The check reads the header only: a line after the diff, or the key inside another line, is not the line.
+        patch.write_text(filled.replace("Why: TODO", "Why: was Upstream-Issue: none and Retire-When: TODO")
+                         + "Retire-When: when upstream fixes it\nUpstream-Issue: none\n")
+        self.assertIn("ok: 2", self.run_tool("check"))
+
+    def test_check_fails_a_retire_when_line_with_none_of_the_three_forms(self):
+        self.adopt_with_two_patches()
+        patch = self.overlay() / "0002-fix-typo.patch"
+        filled = patch.read_text()
+        line = "Retire-When: never; fixture\n"
+        for header, problem in (
+                (filled.replace(line, ""), "no line"),
+                (filled.replace(line, "Retire-when: never; fixture\n"), "no line"),   # a key the tool does not read
+                (filled.replace(line, line + "Retire-When: upstream fixes the typo\n"), "2 lines"),
+                (filled.replace(line, "Retire-When:\n"), "an empty line"),
+                (filled.replace(line, "Retire-When:   \n"), "an empty line"),
+                (filled.replace(line, "Retire-When: TODO\n"), "the first word is `TODO`"),
+                (filled.replace(line, "Retire-When: never;\n"), "`never;` with no reason"),
+                (filled.replace(line, "Retire-When: never\n"), "the first word is `never`"),
+                (filled.replace(line, "Retire-When: never: a reason\n"), "the first word is `never:`"),
+                (filled.replace(line, "Retire-When: Never; a reason\n"), "the first word is `Never;`"),
+                (filled.replace(line, "Retire-When: local\n"), "`local` with no change after it"),
+                (filled.replace(line, "Retire-When: upstream\n"), "`upstream` with no change after it"),
+                (filled.replace(line, "Retire-When: upstream's\n"), "`upstream's` with no change after it"),
+                (filled.replace(line, "Retire-When: when upstream fixes the typo\n"), "the first word is `when`"),
+                # A word that only starts with a permitted word is a different first word.
+                (filled.replace(line, "Retire-When: upstreams fix the typo\n"), "the first word is `upstreams`"),
+                (filled.replace(line, "Retire-When: upstream, or a local change\n"), "the first word is `upstream,`"),
+                (filled.replace(line, "Retire-When: locally fixed\n"), "the first word is `locally`"),
+                (filled.replace(line, "Retire-When: never;reason\n"), "the first word is `never;reason`"),
+                (filled.replace(line, "Retire-When: Upstream fixes the typo\n"), "the first word is `Upstream`")):
+            patch.write_text(header)
+            out = self.run_tool("check", expect=1)
+            self.assertIn("basics: the Retire-When: header has none of its three forms in:\n"
+                          "  0002-fix-typo.patch: " + problem + "\n", out)
+            # The message names the three forms one time, and no patch that has one of them.
+            for form in ("`never; <reason>`", "`local <change>`", "`upstream <change>`"):
+                self.assertEqual(out.count(form), 1, out)
+            self.assertNotIn("0001-use-location.patch", out)
+        patch.write_text(filled)
+        self.assertIn("ok: 2", self.run_tool("check"))
+
+    def test_check_fails_a_patch_with_an_upstream_issue_line(self):
+        self.adopt_with_two_patches()
+        patch = self.overlay() / "0001-use-location.patch"
+        filled = patch.read_text()
+        for value in (" none", " none filed yet", " none (specific to this repository)", ""):
+            patch.write_text(filled.replace("Retire-When: never; fixture\n",
+                                            "Upstream-Issue:" + value + "\nRetire-When: never; fixture\n"))
+            out = self.run_tool("check", expect=1)
+            self.assertIn("basics: delete the Upstream-Issue: line of 0001-use-location.patch; "
+                          "the Retire-When: line decides.", out)
+            self.assertNotIn("0002-fix-typo.patch", out)
+            self.assertNotIn("three forms", out)
+        # The message names each patch that has the line.
+        second = self.overlay() / "0002-fix-typo.patch"
+        second.write_text(second.read_text().replace("Retire-When:", "Upstream-Issue: none\nRetire-When:"))
+        self.assertIn("basics: delete the Upstream-Issue: line of 0001-use-location.patch, 0002-fix-typo.patch; "
+                      "the Retire-When: line decides.", self.run_tool("check", expect=1))
+
+    def test_check_reports_the_header_failures_of_a_skill_together(self):
+        self.adopt_with_two_patches()
+        first, second = self.overlay() / "0001-use-location.patch", self.overlay() / "0002-fix-typo.patch"
+        first.write_text(first.read_text().replace("Eval-Case: none (fixture)", "Eval-Case: TODO")
+                         .replace("Retire-When: never; fixture", "Upstream-Issue: none\nRetire-When: TODO"))
+        second.write_text(second.read_text().replace("Eval-Case: none (fixture)", "Eval-Case: no-such-case")
+                          .replace("Retire-When: never; fixture", "Retire-When: when upstream fixes it"))
+        out = self.run_tool("check", expect=1)
+        # The two Eval-Case: texts are the texts that the check gave before it collected the failures.
+        self.assertIn("FAIL basics: fill in the Eval-Case: header of 0001-use-location.patch (add the line after "
+                      "Local-Issue: when the patch has none): the eval case id(s) from the pull request's Live "
+                      "validation, or `none (<reason>)`.\n", out)
+        self.assertIn("basics: the Eval-Case: header names no case folder in bench/tasks for 0002-fix-typo.patch: "
+                      "'no-such-case'. Name the folder of an eval case, or write `none (<reason>)`.\n", out)
+        self.assertIn("  0001-use-location.patch: the first word is `TODO`\n"
+                      "  0002-fix-typo.patch: the first word is `when`\n", out)
+        self.assertIn("basics: delete the Upstream-Issue: line of 0001-use-location.patch;", out)
+        # An unfilled Eval-Case: line is reported one time, not also as an unknown case id.
+        self.assertNotIn("'TODO'", out)
+        self.assertEqual(out.count("FAIL "), 1, out)
+
+    def test_a_skill_that_does_not_rebuild_is_reported_without_its_header_failures(self):
+        self.adopt_with_two_patches()
+        patch = self.overlay() / "0002-fix-typo.patch"
+        patch.write_text(patch.read_text().replace("Retire-When: never; fixture", "Retire-When: TODO"))
+        self.skill().write_text(self.skill().read_text() + "a hand edit\n")
+        out = self.run_tool("check", expect=1)
+        self.assertIn("basics: the committed skill differs from upstream copy + overlay", out)
+        self.assertNotIn("Retire-When:", out)
+
+    def test_a_new_patch_fails_check_until_its_retire_when_line_is_filled(self):
+        self.run_tool("sync", "basics", "--ref", "v1")
+        md = self.skill()
+        md.write_text(md.read_text().replace("recieve", "receive"))
+        res = subprocess.run([sys.executable, "scripts/skill_overlay.py", "refresh", "basics", "--message", "fix typo"],
+                             cwd=self.repo, env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("fill in its Why:, Eval-Case: and Retire-When: headers", res.stdout)
+        patch = self.overlay() / "0001-fix-typo.patch"
+        self.assertIn("Eval-Case: TODO\nRetire-When: TODO\n", patch.read_text())
+        self.assertNotIn("Upstream-Issue", patch.read_text())
+        patch.write_text(patch.read_text().replace("Eval-Case: TODO", "Eval-Case: none (fixture)"))
+        out = self.run_tool("check", expect=1)
+        self.assertIn("0001-fix-typo.patch: the first word is `TODO`", out)
+        self.assertNotIn("Eval-Case:", out)
+        patch.write_text(patch.read_text().replace("Retire-When: TODO", "Retire-When: upstream fixes the typo"))
+        self.assertIn("ok: 1", self.run_tool("check"))
 
     def test_eval_case_line_survives_a_sync_and_a_fold(self):
         self.adopt_with_two_patches()
@@ -607,7 +726,8 @@ class Helpers(unittest.TestCase):
 
     def test_a_new_patch_header_asks_for_its_eval_case(self):
         header = self.tool.PATCH_HEADER_TEMPLATE.format(subject="s")
-        self.assertIn("Local-Issue: TODO\nEval-Case: TODO\nUpstream-Issue: none\n", header)
+        self.assertIn("Local-Issue: TODO\nEval-Case: TODO\nRetire-When: TODO\n", header)
+        self.assertNotIn("Upstream-Issue", header)
 
     def test_strip_index_lines_keeps_binary_index_lines(self):
         diff = ("diff --git a/a.md b/a.md\nindex 111..222 100644\n--- a/a.md\n+++ b/a.md\n@@ -1 +1 @@\n-x\n+y\n"

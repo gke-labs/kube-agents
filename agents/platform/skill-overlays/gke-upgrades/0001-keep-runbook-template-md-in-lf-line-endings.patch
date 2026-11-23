@@ -3,7 +3,6 @@ Subject: Keep runbook-template.md in LF line endings
 Why: upstream ships references/runbook-template.md with CRLF line endings; the copy this repository ships has LF, because the old sync script rewrote the file in text mode. The patch keeps the shipped file byte-identical; later patches to this file build on it.
 Local-Issue: none (#2353)
 Eval-Case: none (came with the migration to overlays, a byte-identical move)
-Upstream-Issue: none (specific to this repository)
 Retire-When: upstream switches the file to LF, or this repository decides to ship CRLF
 
 diff --git a/references/runbook-template.md b/references/runbook-template.md
