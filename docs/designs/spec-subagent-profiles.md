@@ -604,6 +604,19 @@ verb and nothing of the output. Nothing the harness prints after the refusal is 
 refuses the write either way: a record that is lost leaves the task running, and every
 further write is refused too.
 
+A session pod's turn stops the same way, with the gateway's chat showing the reason. Its
+kubectl goes to `<agent>-kube-proxy`, not the broker, so no broker answer marks the refusal.
+Instead the kubectl wrapper (`deploy/sandbox/session-kubectl.sh`) records a write attempt
+when kubectl exits non-zero, the gateway has passed the pod a read-only kube-proxy mode
+(`KUBE_PROXY_MODE`, from the mode the operator gives kube-proxy), and the argv tries a
+change that mode refuses: a mutating verb, as the command policy resolves it, that is not
+a local render or, under `read-only-dry-run`, a server-side dry run. It reads the argv and
+the exit code, never kubectl's output. The adapter makes each turn's record file empty
+under the pod's scratch directory before the turn's harness starts, so one turn's record
+never stops the next. The wrapper can't tell which side refused, so the reason says a
+change was attempted and not made because writes are refused here, not that a server
+refused it. A writable kube-proxy mode, or none, records nothing.
+
 **Evicted.** Node drains, spot preemptions, and GKE upgrades deliver `SIGTERM` with a
 grace period, and the adapter MUST trap it: flush the pending output buffer, publish
 terminal `failed` with `reason: worker-evicted`, exit 143. That keeps an infrastructure
