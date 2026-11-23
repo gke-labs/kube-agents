@@ -1257,9 +1257,11 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 // again (#6861; bnaylor, 2026-11-20: a woken session may delegate again,
 // within the existing depth cap). It may when all of these hold:
 //
-//   - parent is a session turn or a wake: a session's chain. A profile task
-//     waits open for its child and is never woken (its parent has a tier),
-//     so a profile chain never gets here; checked anyway, so it can't.
+//   - parent is a session turn or a wake: a session's chain, and not below a
+//     schedule. A profile task waits open for its child and is never woken
+//     (its parent has a tier), and a scheduled run is a profile task at the
+//     unattended tier (#6744), so neither chain gets here; both are checked
+//     anyway, so neither can.
 //   - the wake's depth, the child's, is under DelegationDepthMax. The
 //     gateway refuses a delegation from a turn at the bound regardless
 //     (handleDelegateRequest); this keeps the tool off where it could only
@@ -1272,7 +1274,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 // is: the wake is the parent handleDelegateRequest reads, under the
 // requester and steer authors it carries.
 func (g *Gateway) wakeMayDelegate(parent, child TaskRef, cardsPending bool) bool {
-	if parent.Tier != "" {
+	if parent.Tier != "" || parent.belowSchedule() {
 		return false
 	}
 	if child.Depth >= g.cfg.DelegationDepthMax {
@@ -1356,6 +1358,10 @@ func (g *Gateway) startWake(ctx context.Context, rec *SessionRecord, child, pare
 		// The delegating turn's, as the child's was.
 		ChangeRequested: parent.ChangeRequested,
 		WakeDelegate:    mayDelegate,
+		// A wake continues its parent's chain, so it carries the schedule
+		// mark too (belowSchedule reads the task's own field, not a walk):
+		// a delegation from it is checked as one below a schedule.
+		Scheduled: parent.belowSchedule(),
 	})
 	if !ok {
 		// startTaskWith has said why. A wake that never reached the bus

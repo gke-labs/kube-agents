@@ -3168,6 +3168,10 @@ func TestAWakeMayDelegateOnlyInASessionChainUnderTheBoundWithNoCardsPending(t *t
 		{"past the bound", session, 4, false, false},
 		{"a card report still to come", session, 1, true, false},
 		{"a profile parent", TaskRef{ID: "p", Tier: "read", Addressee: "triage"}, 1, false, false},
+		// A scheduled run is a profile task at the unattended tier, and its
+		// chain carries the mark (#6744): never a wake that delegates.
+		{"a scheduled run", TaskRef{ID: "s", Tier: "unattended", Addressee: "triage"}, 1, false, false},
+		{"a turn below a schedule", TaskRef{ID: "b", Scheduled: true}, 1, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			child := TaskRef{ID: "child", Depth: tc.depth}
