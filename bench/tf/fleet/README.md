@@ -7,7 +7,9 @@ scenarios assert on.
 Boskos leases a project at random, so **a project without this stack applied is a
 project where every fleet check reports `status: "error"`**. The fleet is
 read-only for evaluations — every open pull request shares it, and no scenario may
-mutate it. Because we planted each defect and chose its name, the scenarios' assertions
+mutate it. The one exception is `post-merge-verified-fixed`, which takes the budget off its own
+fixture (`post-merge-sync-workload`) for its run: no other case reads that namespace, the case runs
+alone in the writers phase, and its setup stack's destroy restores the budget (and the repository reset before every writer unit, if a run was killed first). Because we planted each defect and chose its name, the scenarios' assertions
 can be exact rather than judged.
 
 The clusters carry `managed-by=kube-agents-seeded-fleet`, deliberately distinct from

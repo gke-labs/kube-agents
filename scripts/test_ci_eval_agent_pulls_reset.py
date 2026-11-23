@@ -356,7 +356,10 @@ class PlantedStackFileTest(unittest.TestCase):
         # The fixed paths, then the Config Connector declaration under the
         # default seeded-a name.
         reads = [f"/repos/{REPO}/contents/{path}?ref=main" for path in (*helper.PLANTED_STACK_FILES, KCC_PLANTED)]
-        self.assertEqual(contents, reads * 2)
+        # Between the two passes, the post-merge fixture's declaration, which
+        # decides whether its budget is this repository's to restore.
+        declaration = [f"/repos/{REPO}/contents/clusters/seeded-a/seeded-post-merge/order-ledger.yaml?ref=main"]
+        self.assertEqual(contents, reads + declaration + reads)
         self.assertEqual(err, "")
 
     def test_the_payments_directory_the_context_stack_left_is_deleted(self):
@@ -888,6 +891,115 @@ class CallSiteTest(unittest.TestCase):
         self.assertIn('release_streams "${streams}"', skip)
         self.assertLess(unit.index('reset_audit_ledgers "${name} rep ${rep}"'), unit.index("reset_agent_pulls"), "after the ledger reset")
         self.assertLess(unit.index("reset_agent_pulls"), unit.index("uv run devops-bench"), "before devops-bench")
+
+
+class _WritableGitHub(FakeGitHub):
+    """FakeGitHub that also takes a contents PUT, as GitHub does."""
+
+    def __init__(self, *args, refuse_put=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.refuse_put = refuse_put
+
+    def __call__(self, method, path, token, body=None):
+        if method == "PUT" and "/contents/" in path:
+            self.calls.append((method, path, body))
+            if self.refuse_put:
+                raise _http_error(409)
+            file_path = urllib.parse.unquote(path.split("/contents/", 1)[1])
+            assert body["branch"] == self.default
+            if file_path in self.files:
+                assert body["sha"] == f"sha-{len(self.files[file_path])}", body
+            self.files[file_path] = base64.b64decode(body["content"]).decode()
+            return {}
+        return super().__call__(method, path, token, body)
+
+
+class PostMergeSteadyStateTest(unittest.TestCase):
+    """The reset puts the post-merge fixture's budget back, where the fixture is provisioned."""
+
+    DIRECTORY = "clusters/seeded-a/seeded-post-merge"
+    DECLARATION = f"{DIRECTORY}/order-ledger.yaml"
+    BUDGET = f"{DIRECTORY}/order-ledger-pdb.yaml"
+
+    def setUp(self):
+        self.seeded = helper._post_merge_budget().BUDGET_CONTENT
+        patcher = mock.patch.dict(helper.os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        helper.os.environ.pop("BENCH_FLEET_KUBECONFIG_DIR", None)
+
+    def puts(self, github):
+        return [path for method, path, _ in github.calls if method == "PUT"]
+
+    def test_a_repository_without_the_declaration_is_left_alone(self):
+        github = _WritableGitHub()
+        record, _, _ = run_reset(github)
+        self.assertEqual(self.puts(github), [])
+        self.assertTrue(record["clean"])
+
+    def test_the_seeded_budget_is_left_alone(self):
+        github = _WritableGitHub(files={self.DECLARATION: "x", self.BUDGET: self.seeded})
+        record, _, _ = run_reset(github)
+        self.assertEqual(self.puts(github), [])
+        self.assertEqual(record["steady_files_restored"], [])
+
+    def test_a_missing_budget_is_put_back_as_seeded(self):
+        github = _WritableGitHub(files={self.DECLARATION: "x"})
+        record, out, _ = run_reset(github)
+        self.assertEqual(github.files[self.BUDGET], self.seeded)
+        self.assertEqual(record["steady_files_restored"], [self.BUDGET])
+        self.assertTrue(record["clean"])
+        self.assertIn("missing, put back as seeded", out)
+
+    def test_a_changed_budget_is_replaced(self):
+        github = _WritableGitHub(files={self.DECLARATION: "x", self.BUDGET: "# merged by a run\n" + self.seeded})
+        record, _, _ = run_reset(github)
+        self.assertEqual(github.files[self.BUDGET], self.seeded)
+
+    def test_a_refused_restore_is_not_clean(self):
+        github = _WritableGitHub(files={self.DECLARATION: "x"}, refuse_put=True)
+        record, _, _ = run_reset(github)
+        self.assertEqual(record["steady_files_unrestored"], [self.BUDGET])
+        self.assertFalse(record["clean"])
+
+    def test_dry_run_writes_nothing(self):
+        github = _WritableGitHub(files={self.DECLARATION: "x"})
+        run_reset(github, dry_run=True)
+        self.assertEqual(self.puts(github), [])
+
+    def _with_kubeconfig(self, states):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (pathlib.Path(tmp.name) / "post-merge-sync-workload.kubeconfig").write_text("x")
+        helper.os.environ["BENCH_FLEET_KUBECONFIG_DIR"] = tmp.name
+        budget = helper._post_merge_budget()
+        answers = iter(states)
+        budget.budget_state = lambda: next(answers)
+        helper.POST_MERGE_SYNC_POLL_SECONDS, helper.POST_MERGE_SYNC_WAIT_SECONDS = 0.0, 0.05
+        self.addCleanup(setattr, helper, "POST_MERGE_SYNC_WAIT_SECONDS", 300.0)
+        self.addCleanup(setattr, helper, "POST_MERGE_SYNC_POLL_SECONDS", 10.0)
+        return mock.patch.object(helper, "_post_merge_budget", return_value=budget)
+
+    def test_with_the_fleet_kubeconfig_it_waits_for_config_sync(self):
+        applied = {"metadata": {"labels": {"app": "order-ledger"}}, "spec": {"maxUnavailable": 1}}
+        with self._with_kubeconfig([{}, {}, applied]):
+            record, _, _ = run_reset(_WritableGitHub(files={self.DECLARATION: "x"}))
+        self.assertEqual(record["steady_files_restored"], [self.BUDGET])
+        self.assertTrue(record["clean"])
+
+    def test_a_sync_that_never_lands_is_not_clean(self):
+        import itertools
+
+        with self._with_kubeconfig(itertools.repeat({})):
+            record, _, _ = run_reset(_WritableGitHub(files={self.DECLARATION: "x"}))
+        self.assertEqual(record["steady_files_unrestored"], [self.BUDGET])
+        self.assertFalse(record["clean"])
+
+    def test_the_directory_is_the_one_the_setup_stack_restores(self):
+        variables = (helper.POST_MERGE_BUDGET_MODULE.parent / "variables.tf").read_text()
+        self.assertIn(f'default     = "{helper.POST_MERGE_DIRECTORY.format(cluster=helper.DEFAULT_KCC_CLUSTER)}"', variables)
 
 
 if __name__ == "__main__":
