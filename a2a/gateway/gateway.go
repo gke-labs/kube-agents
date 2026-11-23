@@ -321,6 +321,16 @@ type Gateway struct {
 	capCheck chan struct{}
 	capMu    sync.Mutex
 	capHolds map[string]capHold
+	// capQueue, guarded by capMu, is the line of turns waiting at the cap
+	// (session_cap_queue.go), oldest first; capTicket numbers its waiters.
+	// capKick nudges the line's loop when a slot may have freed.
+	// capWaitOverride and capPollOverride, when positive, stand in for
+	// sessionCapWaitMax and sessionCapQueuePoll (tests only).
+	capQueue        []*capWaiter
+	capTicket       uint64
+	capKick         chan struct{}
+	capWaitOverride atomic.Int64
+	capPollOverride atomic.Int64
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
@@ -994,6 +1004,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		if errors.Is(context.Cause(ctx), ErrTermBusLost) {
 			drain = min(drain, lostLeaseRelayDrain)
 		}
+		// The turns waiting at the session cap are memory; each is told it
+		// was not started while the adapter can still post.
+		g.refuseParkedAtStop()
 		g.relayInFlight.drain(drain)
 		if sub != nil {
 			sub.Stop()
@@ -1006,6 +1019,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
+		go g.capQueueLoop(ctx)
 	}
 
 	// The adapter's delivery goroutines only enqueue (or refuse a console
@@ -1202,6 +1216,11 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// a program say "the gateway answered without starting a task" as a fact
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
+	// The head of the session-cap line trying again: however this turn
+	// ends, the line must not stall behind it (capRetryDone).
+	if msg.capRetry != 0 {
+		defer g.capRetryDone(msg)
+	}
 
 	if g.droppedAtStop(msg) {
 		return
@@ -1211,7 +1230,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// counts the Hermes-side ingress before its allowlist, so the two halves
 	// of chatMessagesInboundTotal mean the same thing: a message a person
 	// sent, whether or not the gateway went on to answer it.
-	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok && !msg.capReplay {
 		g.metrics.messageInbound(platform)
 	}
 
@@ -1381,6 +1400,11 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 // route the message. The caller holds the conversation's session lock and
 // owns the context's clock.
 func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, principal string) {
+	// The turn as it arrived, for the session-cap line to park and deliver
+	// again whole (session_cap_queue.go), before anything below rewrites it.
+	if g.spawner != nil && parksAtCap(backend) && !g.unpostableTrigger(msg.Conversation) {
+		ctx = withParkableTurn(ctx, msg)
+	}
 	rec, err := g.reg.Get(ctx, msg.Conversation)
 	if err != nil {
 		g.log.Error("session lookup failed", "conversation", msg.Conversation, "err", err)
@@ -1529,7 +1553,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		g.cfg.CardStop && g.cardStopRoute(rec) {
 		msg.TaskID = ""
 	}
+	// A conversation with a turn waiting at the session cap: what a later
+	// message does waits behind that turn, but a stop or a status ask is
+	// answered now (routeParked).
+	parked := g.routeParked(rec, msg, backend, stopping)
 	switch {
+	case parked:
 	case msg.Intent == "" && bareFeedback:
 		// Answered without touching the record's task state: not a steer,
 		// not a stop, not a new task.
@@ -2564,6 +2593,7 @@ func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why
 		if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
 			g.log.Warn(why+": incarnation delete failed; pod may linger", "pod", rec.PodName, "err", err)
 		}
+		g.kickCapQueue()
 	}
 	rec.PodName = ""
 	return true
@@ -2905,6 +2935,11 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // the task its turn started, without reading TASKS.
 func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
+	// The task's pod is idle now, so the cap can evict it, or it is
+	// exiting: a slot for the session-cap line, maybe.
+	if g.spawner != nil {
+		g.kickCapQueue()
+	}
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(rec.Key, taskID, state, source, reason)
 	}

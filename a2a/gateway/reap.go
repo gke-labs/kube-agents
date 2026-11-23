@@ -155,6 +155,9 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 		}
 	}
 	g.log.Info("reaped idle session", "session", fresh.Key, "pod", fresh.PodName)
+	if g.spawner != nil {
+		g.kickCapQueue()
+	}
 	// The pod was an incarnation, not the identity: contextId persists
 	// until SessionTTL expires.
 	fresh.PodName = ""

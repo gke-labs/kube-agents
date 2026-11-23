@@ -406,10 +406,11 @@ func TestSlackDMTopLevelStatusPointsAtTheThread(t *testing.T) {
 	}
 }
 
-// TestSlackDMStopInARefusedThreadGetsThePlainNotice: a question refused at
+// TestSlackDMStopInARefusedThreadGetsThePlainNotice: a question parked at
 // the session cap leaves a thread conversation with no task in it. A stop
-// typed in that thread is in the right place, so it gets the plain notice,
-// not the redirect to the thread it is already in.
+// typed in that thread takes the question out of the line; another stop
+// there is in the right place, so it gets the plain notice, not the
+// redirect to the thread it is already in.
 func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 	spawn := &fakeSpawner{}
 	spawn.setLive(1)
@@ -418,8 +419,10 @@ func TestSlackDMStopInARefusedThreadGetsThePlainNotice(t *testing.T) {
 		c.MaxSessions = 1
 	})
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "100.1", "")
-	d.awaitPost(t, "the cap refusal in the question's thread", "D1", "100.1", "not started")
+	d.awaitPost(t, "the queued notice in the question's thread", "D1", "100.1", "queued")
 	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "102.1", "100.1")
+	d.awaitPost(t, "the stop in the question's thread", "D1", "100.1", "taken out of the line")
+	d.adapter.events <- slackMsg("im", "D1", "U1", "stop", "103.1", "100.1")
 	d.awaitPost(t, "the plain notice in the refused question's thread", "D1", "100.1", "nothing is running")
 	for _, p := range d.posts() {
 		if p.text == toMrkdwn(topLevelNothingRunningNotice) {
