@@ -20,7 +20,8 @@ it imports only the standard library and nothing from this package. That
 module's secret-read detector reads command lines with
 ``_shell_words_and_spans``, ``_ShellOperator``, ``_is_redirect`` and
 ``_substitution_commands``, so a change to one of them also changes which
-tool results the detector withholds.
+tool results the detector withholds. The second read of ``_shell_argvs``
+(``_commands_in_turn``) is not one of them.
 """
 
 from __future__ import annotations
@@ -66,6 +67,37 @@ _MAX_READ_CHARS_FLOOR = 65536
 _READ_COST_CHARS = 16
 _NESTING_LIMIT_TEXT = f"more than {_MAX_COMMAND_LINE_NESTING} levels of command lines inside the line"
 _READ_LIMIT_TEXT = f"more reading than {_MAX_READ_CHARS_FACTOR} x the line's length + {_MAX_READ_CHARS_FLOOR} characters"
+# The second read (:func:`_commands_in_turn`) knows two forms that the first read's quote model
+# does not: a heredoc and an ANSI-C quote. A call with neither, which the first read does not
+# refuse, is read the same by both reads.
+_HEREDOC_OPERATOR = "<<"
+_HERE_STRING_OPERATOR = "<<<"
+# `<<-` strips the leading tabs of the body lines and of the delimiter line.
+_HEREDOC_TAB_STRIP = "-"
+_HEREDOC_TAB = "\t"
+_HEREDOC_BLANKS = " \t"
+# `(( x << 2 ))` at the start of a command line is an arithmetic command: its `<<` is a shift.
+# Behind another command on the line (`x=1; (( y = x << 2 ))`) the reader takes it as a heredoc.
+_ARITHMETIC_COMMAND_OPENER = "(("
+_ANSI_C_QUOTE_OPENER = "$'"
+# The depth of a substitution opener is its count of this character (`$((` has two).
+_SUBSTITUTION_DEPTH_CHAR = "("
+# What joins the words of a command line that the reader writes.
+_WORD_SEPARATOR = " "
+# What an ANSI-C quote's escapes spell, for the ones a command line uses; another escape keeps
+# its backslash, as the first read keeps it.
+_ANSI_C_ESCAPES = {"\\": "\\", "'": "'", '"': '"', "n": "\n", "t": "\t", "r": "\r"}
+# A single quote inside a single-quoted word: close the quote, an escaped quote, open it again.
+_SINGLE_QUOTE_IN_SINGLE_QUOTES = "'\\''"
+# A heredoc body on a line that has one of these as a word can be a command line for that
+# shell, so it is read as commands, not as text. The test is on the words of the whole line, not
+# on the command that takes the heredoc.
+_HEREDOC_SHELL_PROGRAMS = frozenset((*_SHELL_PROGRAMS_WITH_COMMAND_STRING, "ssh"))
+# bash runs the substitutions of a heredoc body line when the delimiter has no quote, whatever
+# quotes stand around them. The ones that the reader did not see as spans of the line are read
+# as words of the null command.
+_BODY_SUBSTITUTION_OPENERS = ("$((", "$(")
+_NULL_COMMAND = ":"
 # A shell program is unwrapped only where the shell would run it: as the segment's command word,
 # or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
@@ -318,8 +350,10 @@ def _shell_words_and_spans(command: str) -> tuple[list[str], list[str]]:
     """The command line as the shell's words, quotes honoured and removed, bare operators
     (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``, the redirects) as :class:`_ShellOperator`
     words of their own, and the substitution spans the line carries; a line whose quotes do not
-    balance is one bash refuses and runs nothing of, so it yields no words and no run is
-    credited from it. Comments come off, substitutions fold into their words and operators are
+    balance, or with a redirect that has no target, yields no words. bash refuses such a line
+    and runs nothing of it when the line is one command; a call of more than one command is
+    read a command at a time by :func:`_shell_argvs`, which keeps the commands before the one
+    that is refused. Comments come off, substitutions fold into their words and operators are
     marked first, in one pass (:func:`_read_shell_line`), so the lexer splits on whitespace
     alone and its own ``#`` commenter is off, as in ``shlex.split``: it would cut a word at a
     ``#`` inside it (``readiness-#2.json``), which bash does not."""
@@ -335,8 +369,8 @@ def _shell_words_and_spans(command: str) -> tuple[list[str], list[str]]:
     for word in raw:
         mark = _OPERATOR_MARK_RE.match(word)
         words.append(_ShellOperator(operators[int(mark.group(1))]) if mark else _unfold_marks(word, spans))
-    # A redirect that ends a segment with no target (`>#log` once its comment is off) is a line
-    # bash refuses, so nothing on it runs.
+    # A redirect that ends a segment with no target (`>#log` once its comment is off) is a
+    # command bash refuses, so the line yields no words.
     for index, word in enumerate(words):
         if _is_redirect(word) and (index + 1 == len(words) or isinstance(words[index + 1], _ShellOperator)):
             return [], []
@@ -786,7 +820,271 @@ def _scan_command_prefix(
     return wrappers, None
 
 
-def _shell_argvs(command: str, _nesting: int = 0, _budget: list[int] | None = None) -> list[list[str]]:
+def _commands_in_turn(command: str) -> tuple[list[str], bool, int | None]:
+    """The call as the complete commands bash reads from it one after the other, each as text
+    that :func:`_shell_words_and_spans` reads; whether the call holds one of the two forms
+    below; and the index of the first command with a substitution that does not close here, or
+    None. bash reads a call a command at a time: it runs the commands before one that it
+    refuses, and nothing from that one on. A command ends at a newline outside quotes and
+    substitutions (the quote model of :func:`_read_shell_line`), with two forms that model does
+    not know:
+
+    - An ANSI-C quote (``$'...'``), in which ``\\'`` does not close the quote, is written as
+      one single-quoted word.
+    - A quote in a heredoc body opens nothing. The body lines are not shell text, but each one
+      is still a command of its own here when the reader can split it, as the first read takes
+      it; a line that the reader cannot split is dropped. In a body whose delimiter has no
+      quote, bash runs the substitutions of each line whatever quotes stand around them, so
+      those are read too (:func:`_heredoc_body_commands`). The delimiter line of such a body is
+      dropped. A body on a line with a shell word (``_HEREDOC_SHELL_PROGRAMS``) can be that
+      shell's command lines: it stays in the call as commands, delimiter line included. After
+      a body line with a substitution that does not close, the body lines stay whole.
+
+    A substitution that does not close in this model can close in bash: the two forms are not
+    modelled inside a substitution. The reader cannot say where such a command ends, so the
+    caller takes it and the rest of the call as not read.
+    """
+    commands: list[str] = []
+    out: list[str] = []
+    delimiters: list[tuple[str, bool, bool]] = []
+    special = False
+    open_from: int | None = None
+    quote: str | None = None
+    previous = _SHELL_LINE_END
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if quote is None and char == _SHELL_COMMENT_CHAR and previous in _SHELL_WORD_OPENERS:
+            end = command.find(_SHELL_LINE_END, i)
+            end = len(command) if end < 0 else end
+            out.append(command[i:end])
+            i = end
+            continue
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            out.append(command[i:i + 2])
+            previous = _SHELL_ESCAPE_CHAR
+            i += 2
+            continue
+        if quote is None and command.startswith(_ANSI_C_QUOTE_OPENER, i):
+            end = _ansi_c_quote_end(command, i + len(_ANSI_C_QUOTE_OPENER))
+            if end is None:
+                out.append(command[i:])
+                break
+            out.append(_single_quoted(_ansi_c_text(command[i + len(_ANSI_C_QUOTE_OPENER):end - 1])))
+            special = True
+            previous = _SHELL_SINGLE_QUOTE
+            i = end
+            continue
+        if char == quote:
+            quote = None
+        elif quote is None and char in _SHELL_QUOTE_CHARS:
+            quote = char
+        else:
+            openers = () if quote == _SHELL_SINGLE_QUOTE else _SHELL_QUOTED_SUBSTITUTION_OPENERS if quote == _SHELL_DOUBLE_QUOTE else _SHELL_SUBSTITUTION_OPENERS
+            opener = next((o for o in openers if command.startswith(o, i)), None)
+            if opener is not None or (char == _SHELL_BACKTICK and quote != _SHELL_SINGLE_QUOTE):
+                close = _backtick_end(command, i + 1) if opener is None else _substitution_end(command, i + len(opener), opener.count(_SUBSTITUTION_DEPTH_CHAR))
+                if close is None:
+                    open_from = len(commands) if open_from is None else open_from
+                    out.append(command[i:])
+                    break
+                out.append(command[i:close])
+                previous = command[close - 1]
+                i = close
+                continue
+            if quote is None and command.startswith(_HERE_STRING_OPERATOR, i):
+                out.append(_HERE_STRING_OPERATOR)
+                previous = char
+                i += len(_HERE_STRING_OPERATOR)
+                continue
+            if quote is None and command.startswith(_HEREDOC_OPERATOR, i) and not "".join(out).lstrip().startswith(_ARITHMETIC_COMMAND_OPENER):
+                end, delimiter, quoted, tabs = _heredoc_delimiter(command, i + len(_HEREDOC_OPERATOR))
+                if delimiter is not None:
+                    delimiters.append((delimiter, quoted, tabs))
+                    special = True
+                    out.append(command[i:end])
+                    previous = command[end - 1]
+                    i = end
+                    continue
+            if quote is None and char == _SHELL_LINE_END:
+                line = "".join(out)
+                commands.append(line)
+                out = []
+                previous = _SHELL_LINE_END
+                i += 1
+                if delimiters and not _HEREDOC_SHELL_PROGRAMS & {os.path.basename(word) for word in _read_shell_line(line)[0].split()}:
+                    for delimiter, quoted, tabs in delimiters:
+                        while i < len(command):
+                            end = command.find(_SHELL_LINE_END, i)
+                            end = len(command) if end < 0 else end
+                            body_line = command[i:end]
+                            i = end + 1
+                            if (body_line.lstrip(_HEREDOC_TAB) if tabs else body_line) == delimiter:
+                                break
+                            if open_from is not None:
+                                # Not read from the open substitution on: the lines stay whole.
+                                commands.append(body_line)
+                                continue
+                            body_commands, is_open = _heredoc_body_commands(body_line, quoted)
+                            if is_open:
+                                open_from = len(commands)
+                            commands.extend(body_commands)
+                delimiters = []
+                continue
+        out.append(char)
+        previous = char
+        i += 1
+    commands.append("".join(out))
+    return commands, special, open_from
+
+
+def _ansi_c_quote_end(command: str, start: int) -> int | None:
+    """The index just past the ``'`` that closes an ANSI-C quote opened before ``start``, a
+    backslash escaping the character after it; None when the line ends first."""
+    j = start
+    while j < len(command):
+        if command[j] == _SHELL_ESCAPE_CHAR:
+            j += 2
+            continue
+        if command[j] == _SHELL_SINGLE_QUOTE:
+            return j + 1
+        j += 1
+    return None
+
+
+def _ansi_c_text(body: str) -> str:
+    """The text an ANSI-C quote's ``body`` spells, for the escapes of ``_ANSI_C_ESCAPES``."""
+    out: list[str] = []
+    j = 0
+    while j < len(body):
+        if body[j] == _SHELL_ESCAPE_CHAR and j + 1 < len(body) and body[j + 1] in _ANSI_C_ESCAPES:
+            out.append(_ANSI_C_ESCAPES[body[j + 1]])
+            j += 2
+            continue
+        out.append(body[j])
+        j += 1
+    return "".join(out)
+
+
+def _single_quoted(text: str) -> str:
+    """``text`` as one single-quoted shell word."""
+    return _SHELL_SINGLE_QUOTE + text.replace(_SHELL_SINGLE_QUOTE, _SINGLE_QUOTE_IN_SINGLE_QUOTES) + _SHELL_SINGLE_QUOTE
+
+
+def _heredoc_body_commands(line: str, quoted: bool) -> tuple[list[str], bool]:
+    """The command lines that one heredoc body line gives the second read, and whether a
+    substitution of the line does not close on it. The line itself, when the reader can split
+    it (the first read takes a body line as a command). In a body whose delimiter has no quote
+    (``quoted`` is false), also the null command with the substitutions that bash runs in the
+    line and that the reader did not see as its spans, for example behind a quote."""
+    words, seen = _shell_words_and_spans(line)
+    commands = [line] if words else []
+    if quoted:
+        return commands, False
+    spans = _body_line_substitutions(line)
+    if spans is None:
+        return [line], True
+    if spans and spans != seen:
+        commands.append(_WORD_SEPARATOR.join([_NULL_COMMAND, *spans]))
+    return commands, False
+
+
+def _body_line_substitutions(line: str) -> list[str] | None:
+    """Each command substitution and backtick pair that bash runs in a heredoc body line whose
+    delimiter has no quote. Quotes are text in a body, so they hide none. None when one does
+    not close on the line."""
+    spans: list[str] = []
+    j = 0
+    while j < len(line):
+        if line[j] == _SHELL_ESCAPE_CHAR:
+            j += 2
+            continue
+        opener = next((o for o in _BODY_SUBSTITUTION_OPENERS if line.startswith(o, j)), None)
+        if opener is None and line[j] != _SHELL_BACKTICK:
+            j += 1
+            continue
+        close = _backtick_end(line, j + 1) if opener is None else _substitution_end(line, j + len(opener), opener.count(_SUBSTITUTION_DEPTH_CHAR))
+        if close is None:
+            return None
+        spans.append(line[j:close])
+        j = close
+    return spans
+
+
+def _heredoc_delimiter(command: str, start: int) -> tuple[int, str | None, bool, bool]:
+    """The index just past the delimiter word of a heredoc whose ``<<`` ends before ``start``;
+    the word with its quotes off, or None when no whole word follows; whether the word had a
+    quote or an escape, which makes the body plain text; and whether the operator is ``<<-``,
+    which strips leading tabs."""
+    j = start
+    tabs = command.startswith(_HEREDOC_TAB_STRIP, j)
+    if tabs:
+        j += 1
+    while j < len(command) and command[j] in _HEREDOC_BLANKS:
+        j += 1
+    word: list[str] = []
+    quoted = False
+    quote: str | None = None
+    while j < len(command):
+        char = command[j]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif char == _SHELL_LINE_END:
+                break
+            else:
+                word.append(char)
+        elif char in _SHELL_QUOTE_CHARS:
+            quote = char
+            quoted = True
+        elif char == _SHELL_ESCAPE_CHAR and j + 1 < len(command):
+            quoted = True
+            j += 1
+            word.append(command[j])
+        elif char in _SHELL_WORD_OPENERS:
+            break
+        else:
+            word.append(char)
+        j += 1
+    return j, "".join(word) if word and quote is None else None, quoted, tabs
+
+
+def _second_read_commands(command: str, words: list[str]) -> tuple[list[str], int | None] | None:
+    """The commands of the second read of ``command`` and the index of the first one with a
+    substitution that does not close (:func:`_commands_in_turn`), or None when the first read,
+    which gave ``words``, is all that the line needs. The first read can differ from what bash
+    runs in two ways that the second read knows: it gave no words for a line that has text, or
+    the line holds a heredoc operator or an ANSI-C quote opener. In such a line a substitution
+    that does not close also counts, because one of the two forms can be inside it. For
+    another line the two reads have one quote model and give the same argvs."""
+    refused = not words and bool(_read_shell_line(command)[0].strip())
+    if not refused and _HEREDOC_OPERATOR not in command and _ANSI_C_QUOTE_OPENER not in command:
+        return None
+    commands, special, open_from = _commands_in_turn(command)
+    return (commands, open_from) if refused or special or open_from is not None else None
+
+
+def _shell_argvs_and_unread(command: str) -> tuple[list[list[str]], list[str]]:
+    """:func:`_shell_argvs` of ``command``, and the parts of it that the reader did not read:
+    a command that the reader refuses (quotes that do not balance, a redirect with no target,
+    a substitution that does not close in a line with a heredoc or an ANSI-C quote) with each
+    command after it, at the top of the call and in each command line inside it. The reader
+    cannot tell if bash refuses such a part too, so it does not say that nothing ran there."""
+    unread: list[str] = []
+    argvs = _shell_argvs(command, _unread=unread)
+    return argvs, unread
+
+
+def _shell_argvs_first_read(command: str) -> list[list[str]]:
+    """:func:`_shell_argvs` of ``command`` with the first read alone, at each level: for text
+    that is not a shell call (an ``execute_code`` program), which a caller reads as before the
+    second read."""
+    return _shell_argvs(command, _in_turn=False)
+
+
+def _shell_argvs(
+    command: str, _nesting: int = 0, _budget: list[int] | None = None, _unread: list[str] | None = None, _in_turn: bool = True
+) -> list[list[str]]:
     """Each segment of a command line as an argv: comments come off and the line is tokenised
     first, so a quoted path is one word and a quoted sentence one word whatever it contains,
     then split where the shell starts a new command. A shell program anywhere on a segment
@@ -796,7 +1094,16 @@ def _shell_argvs(command: str, _nesting: int = 0, _budget: list[int] | None = No
     ... --readiness)``, ``cat <(...)``), whose commands the shell runs, and the words after an
     ``eval``, joined by spaces as ``eval`` joins them. A line whose command lines nest deeper
     than ``_MAX_COMMAND_LINE_NESTING`` levels, or need more reading than the line's budget,
-    raises :class:`ShellReadLimitError`; ``_nesting`` and ``_budget`` are the reader's own."""
+    raises :class:`ShellReadLimitError`; ``_nesting``, ``_budget``, ``_unread`` and ``_in_turn``
+    are the reader's own.
+
+    The line is read two times when the first read can miss what bash runs
+    (:func:`_second_read_commands`). The first read takes the line whole. The second takes it a
+    command at a time (:func:`_commands_in_turn`) and stops at the first command that the
+    reader refuses; that command and the rest go to ``_unread``. The result is the argvs of the
+    first read and each argv that only the second read gives, so a line never has fewer argvs
+    than the first read gives it. The second read costs budget too, at each level that needs
+    it, so a line can reach the budget sooner than with one read."""
     if _budget is None:
         _budget = [_MAX_READ_CHARS_FACTOR * len(command) + _MAX_READ_CHARS_FLOOR]
     if _nesting > _MAX_COMMAND_LINE_NESTING:
@@ -805,6 +1112,36 @@ def _shell_argvs(command: str, _nesting: int = 0, _budget: list[int] | None = No
     if _budget[0] < 0:
         raise ShellReadLimitError(_READ_LIMIT_TEXT)
     words, spans = _shell_words_and_spans(command)
+    second = _second_read_commands(command, words) if _in_turn else None
+    if second is None:
+        return _words_argvs(words, spans, _nesting, _budget, _unread, _in_turn)
+    commands, open_from = second
+    # The first read's inner lines are read again by the second read, so its unread parts are
+    # not kept: the second read reports them.
+    argvs = _words_argvs(words, spans, _nesting, _budget, None, _in_turn)
+    _budget[0] -= len(command) + _READ_COST_CHARS
+    if _budget[0] < 0:
+        raise ShellReadLimitError(_READ_LIMIT_TEXT)
+    first = list(argvs)
+    for index, line in enumerate(commands):
+        words, spans = _shell_words_and_spans(line)
+        if index == open_from or not words:
+            if index == open_from or _read_shell_line(line)[0].strip():
+                if _unread is not None:
+                    _unread.append(_SHELL_LINE_END.join(commands[index:]))
+                break
+            continue
+        for argv in _words_argvs(words, spans, _nesting, _budget, _unread, _in_turn):
+            if argv in first:
+                first.remove(argv)
+            else:
+                argvs.append(argv)
+    return argvs
+
+
+def _words_argvs(words: list[str], spans: list[str], nesting: int, budget: list[int], unread: list[str] | None, in_turn: bool) -> list[list[str]]:
+    """The argvs of one read of a line (:func:`_shell_argvs`): its own segments, then the
+    command lines inside it."""
     argvs: list[list[str]] = []
     argv: list[str] = []
     for word in [*words, _ShellOperator(";")]:
@@ -817,17 +1154,17 @@ def _shell_argvs(command: str, _nesting: int = 0, _budget: list[int] | None = No
     for argv in list(argvs):
         index = _command_word_index(argv)
         if index is not None and argv[index] == _SHELL_EVAL:
-            argvs.extend(_shell_argvs(_SHELL_EVAL_WORD_SEPARATOR.join(argv[index + 1:]), _nesting + 1, _budget))
+            argvs.extend(_shell_argvs(_SHELL_EVAL_WORD_SEPARATOR.join(argv[index + 1:]), nesting + 1, budget, unread, in_turn))
             continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
         cmd_string, _, _ = _extract_shell_command_string(argv, index + 1)
         if cmd_string is not None:
-            argvs.extend(_shell_argvs(cmd_string, _nesting + 1, _budget))
+            argvs.extend(_shell_argvs(cmd_string, nesting + 1, budget, unread, in_turn))
     for span in spans:
         inner = _substitution_commands(span)
         if inner is not None:
-            argvs.extend(_shell_argvs(inner, _nesting + 1, _budget))
+            argvs.extend(_shell_argvs(inner, nesting + 1, budget, unread, in_turn))
     return argvs
 
 

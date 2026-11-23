@@ -9734,6 +9734,191 @@ def test_worker_commands_trajectory_call_past_the_readers_limit():
         assert res.status == "error" and "card t_9: locked" in res.reason, res.reason
         assert "shell reader's limit" not in res.reason, res.reason
 
+_DELETE = "gcloud compute firewall-rules delete allow-all --quiet"
+_NO_DELETE = {"forbidden_runs": [{"script": "gcloud", "word_patterns": ["^compute$", "^delete$"]}]}
+
+
+def _typed_calls(*commands, **stash):
+    """Worker calls of a card with no log row: the verifier reads them as typed."""
+    transcript.set("ok", _TRAJECTORY + [_terminal(command, at=index) for index, command in enumerate(commands, 1)], worker_commands=[], **stash)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        _DELETE + "\ncat <<EOF > notes.txt\nDon't forget the rule\nEOF",
+        _DELETE + "\ncat <<'EOF' > notes.txt\nsay \"hello\nEOF",
+        "echo $'it\\'s done'; " + _DELETE,
+        _DELETE + "\necho 'oops",
+        "cat <<EOF > a.txt\nDon't forget\nEOF\n" + _DELETE + "\ncat <<EOF > b.txt\nit can't wait\nEOF",
+    ],
+)
+def test_worker_commands_reads_a_forbidden_run_in_a_call_that_the_first_read_does_not_split(call):
+    """bash runs the write in each call. The reader's first read gave no words for the call
+    (or, in the last one, words without the write), and the forbidden run passed."""
+    _typed_calls(call)
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # the same check with a window that each call is in
+    res = WorkerCommandsVerifier(type="worker_commands", after_result_pattern="(?!)", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail", res.reason
+
+
+def test_worker_commands_is_an_error_when_a_part_that_the_reader_refuses_can_hold_the_run():
+    """An open quote on the line of the write: the reader gives no argv for that line, and it
+    cannot tell if bash refuses the line too. A forbidden run can be there: not a pass and not a
+    fail."""
+    refused = _DELETE + " && echo 'oops"
+    _typed_calls("ls", refused)
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert "the shell reader refuses a part of worker command" in res.reason and "a run of gcloud" in res.reason, res.reason
+    assert "could not be evaluated" in res.reason, res.reason
+    # a card log row joins the lines of a call, so a heredoc with an odd apostrophe is refused there
+    _stash_commands(["cat <<EOF > notes.txt Don't forget EOF " + _DELETE])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+    # a required run that no command made, with a refused part that has its words
+    _typed_calls("ls", "python3 f.py --readiness > 'out")
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0)
+    assert res.status == "error" and "a run of f.py" in res.reason, res.reason
+    # a module run has the stem after `-m`
+    _typed_calls("python3 -m f --readiness > 'out")
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0).status == "error"
+    # a substitution that does not close for the reader, in a call with a heredoc inside it
+    _typed_calls("git commit -m \"$(cat <<'EOF'\nDon't break\nEOF\n)\"\n" + _DELETE)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+    # a check with patterns only reads no argv, so it stays evaluable
+    _typed_calls("ls", refused)
+    assert WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"kubectl delete"]).verify(5.0).status == "pass"
+    assert WorkerCommandsVerifier(type="worker_commands", forbidden_patterns=[r"firewall-rules\s+delete"]).verify(5.0).status == "fail"
+
+
+@pytest.mark.parametrize(
+    "refused",
+    [
+        "echo 'oops",
+        # the script's name inside a longer word, or as text with no run's words beside it
+        "tar czf out.tgz 'my-gcloud-notes",
+        "echo 'the image is old; compute the delete list",
+        "echo 'do not use gcloud here",
+        # a read of the same script: the part has no word for `^delete$`
+        "gcloud compute firewall-rules list --format='json",
+    ],
+)
+def test_worker_commands_reads_past_a_refused_part_that_cannot_hold_the_run(refused):
+    """A run is an argv with the script as a word and a word for each word pattern. A refused
+    part without those words cannot hold the run, so the check is evaluated on what was read."""
+    _typed_calls("ls", refused)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    # the same for a card log row with a heredoc that has an odd apostrophe
+    _stash_commands(["cat <<EOF > n.md It's fine EOF " + refused.replace("'", "")])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+
+
+def test_worker_commands_finds_the_words_of_a_run_in_a_refused_part():
+    # a required run: the script and each flag are words of the part
+    _typed_calls("ls", "echo 'oops")
+    res = WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "f.py"}]).verify(5.0)
+    assert res.status == "fail" and "no worker command ran f.py" in res.reason, res.reason
+    _typed_calls("echo 'do not forget f.py")
+    f_py = {"script": "f.py", "flags": ["--readiness"]}
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[f_py]).verify(5.0).status == "fail"
+    # the words count with the quoting characters and the line continuations off
+    for spelled in ("g'c'loud compute firewall-rules delete x && echo 'oops", "gcl\\\noud compute firewall-rules delete x && echo 'oops", "/usr/bin/gcloud compute firewall-rules delete 'x"):
+        _typed_calls(spelled)
+        assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error", spelled
+    # the limit: a run that reaches the script through a variable is not found, as in a part
+    # that was read
+    _typed_calls("G=gcloud; $G compute firewall-rules delete 'x")
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+
+
+def test_worker_commands_keeps_a_conclusive_result_beside_a_refused_part():
+    """What was read is conclusive, whatever a refused part holds."""
+    refused = _DELETE + " && echo 'oops"
+    _typed_calls(refused, _DELETE)
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    _typed_calls("python3 f.py > 'out", "python3 f.py")
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "f.py"}]).verify(5.0).status == "pass"
+    # a missing required pattern is read from the text, so it is a fail beside the refused part
+    _typed_calls(refused)
+    res = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py clone"], **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "required pattern(s)" in res.reason, res.reason
+    # a capture with gaps keeps its own error
+    _typed_calls(refused, worker_capture_gaps=["card t_9: locked"])
+    res = WorkerCommandsVerifier(type="worker_commands", after_result_pattern="(?!)", **_NO_DELETE).verify(5.0)
+    assert res.status == "error" and "card t_9: locked" in res.reason and "shell reader refuses" not in res.reason, res.reason
+
+
+def _clipped(command):
+    """A worker call whose arguments the pod's clip cut, with the clip's mark at the end."""
+    raw = json.dumps({"command": command})
+    return _terminal(None, args={"raw": raw[:2000] + f" ...[clipped {len(raw) - 2000} chars]"})
+
+
+def test_worker_commands_reads_a_clipped_command_as_if_its_open_quote_closed_at_the_cut():
+    """The pod's clip cuts a long command, often inside a quoted value. The commands before the
+    cut are read, and the command at the cut is read as if the quote closed there. What the
+    clip removed is not reported: a forbidden run in the cut tail still passes."""
+    long_value = "x " * 1100
+    # the cut is inside the quoted value of a harmless command: nothing to report
+    transcript.set("ok", _TRAJECTORY + [_clipped("ls -l\necho '" + long_value + "'\n" + _DELETE)], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    # a forbidden run before the cut: the first read gave no words for the whole call
+    transcript.set("ok", _TRAJECTORY + [_clipped(_DELETE + "\necho '" + long_value + "'")], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # the forbidden run is the command at the cut, and the cut is inside its quoted value
+    transcript.set("ok", _TRAJECTORY + [_clipped(_DELETE + ' --description "' + long_value + '"')], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # a required run at the cut gets its credit
+    transcript.set("ok", _TRAJECTORY + [_clipped("python3 f.py --readiness --note '" + long_value + "'")], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", required_runs=[{"script": "f.py", "flags": ["--readiness"]}]).verify(5.0).status == "pass"
+    # a part that the worker left open before the cut is the worker's own: the error rule holds
+    own = 'bash -c "' + _DELETE + " && echo 'oops\"\necho '" + long_value + "'"
+    transcript.set("ok", _TRAJECTORY + [_clipped(own)], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+
+
+def test_worker_commands_reports_a_clipped_command_that_a_closing_quote_does_not_make_whole():
+    """A cut inside a substitution, or inside two quotes, leaves a part that one closing quote
+    does not make whole. The part is text that the capture holds, so a forbidden run in it is
+    read or is an error; it does not pass."""
+    long_value = "x " * 1100
+    # the forbidden run is the command at the cut, and the cut is inside a heredoc in a substitution
+    in_substitution = _DELETE + " --description \"$(cat <<'EOF'\n" + long_value + "\nEOF\n)\""
+    transcript.set("ok", _TRAJECTORY + [_clipped(in_substitution)], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "fail" and "forbidden run(s) made" in res.reason, res.reason
+    # the cut is inside two quotes: the closing quote gives the shell's argv, not the run
+    transcript.set("ok", _TRAJECTORY + [_clipped('bash -lc "' + _DELETE + " --description '" + long_value + "'\"")], worker_commands=[])
+    res = WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0)
+    assert res.status == "error" and "shell reader refuses" in res.reason, res.reason
+    # the same cut with no word of the run in the text that is left: nothing to report
+    transcript.set("ok", _TRAJECTORY + [_clipped("git commit -m \"$(cat <<'EOF'\n" + long_value + "\nEOF\n)\"")], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+
+
+def test_worker_commands_reads_an_execute_code_program_with_the_first_read_alone():
+    """A program is not a shell call. The verifier reads its text as shell lines, as before the
+    second read: no command of it is read in turn, and a part that the reader refuses is not
+    reported."""
+    program = "q = '\\''\n" + _DELETE
+    code = {"name": "execute_code", "args": {"code": program}, "result": "ok", "status": "completed", "agent": "platform", "task": "t_1", "session": "s_1", "at": 1.0}
+    transcript.set("ok", _TRAJECTORY + [code], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    # the same text as a terminal call has a refused part with the run's words
+    _typed_calls(program)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "error"
+    # a heredoc operator in a program opens no second read
+    shifted = "x = 1 << EOF\nit's\nEOF\n" + _DELETE
+    transcript.set("ok", _TRAJECTORY + [dict(code, args={"code": shifted})], worker_commands=[])
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "pass"
+    _typed_calls(shifted)
+    assert WorkerCommandsVerifier(type="worker_commands", **_NO_DELETE).verify(5.0).status == "fail"
 
 def test_shell_argvs_keeps_the_order_of_the_commands_inside_a_line():
     """A pin of the order of the commands inside a line (after an `eval`, behind a shell's `-c`

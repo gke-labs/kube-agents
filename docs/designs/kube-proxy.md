@@ -257,6 +257,19 @@ Every request names its cluster in the path: `/clusters/{clusterID}/{k8s-path...
 
 Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path contains `.` or `..` segments, empty internal segments (`//`), or percent-encoded slashes (`%2f`, `%2F`) with `400 Bad Request`. This guarantees that `RequestInfoFactory` and the upstream `kube-apiserver` interpret the URL path identically.
 
+Once the cluster is known, and before policy, cache or upstream, two install-wide refusals apply, each answered as a `403` whose message ends in its `policy rule:` line and counted under that reason. A resource request gets the usual `Status`. A discovery path (`/api`, `/api/<v>`, `/apis`, `/apis/<g>`, `/apis/<g>/<v>`, `/version`, `/openapi/...`) gets the same message as `text/plain`, because client-go's discovery client can't decode a `Status` there and reports it as `unknown`, so `kubectl cluster-info` would hide the refusal; a text body becomes its error message:
+
+| Rule                       | When                                                                                                                                            |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scope.excluded-cluster`   | `spec.scope.exclude.clusters` names the cluster (`--scope-file`, `KUBE_PROXY_SCOPE_FILE`, the `scope.json` key of `<agent>-config`).            |
+| `scope.exclude-unreadable` | The configured scope file can't be read or parsed; every cluster is refused until it can.                                                       |
+| `scope.held-cluster`       | `spec.hold` names the cluster, or sets `all` (`--hold-file`, `KUBE_PROXY_HOLD_FILE`, the `hold.json` key of `<agent>-hold`). Quotes the reason. |
+| `scope.hold-unreadable`    | The configured hold file can't be read or parsed; every cluster is refused until it can.                                                        |
+
+Both files are ConfigMap directory mounts the proxy stats on every request and re-parses when they change, so an edit applies without a restart. An empty path refuses nothing. `in-cluster` is checked as `--exclude-host-cluster-id`. The credential broker refuses the same clusters under the same rule names (`scope_exclude.py`).
+
+Both refusals are checked when a request starts. A watch, a followed log, or an `exec`, `attach`, `portforward` or `proxy` stream opened before an exclusion or a hold reached the proxy keeps running until it ends; the broker's relayed watcher streams behave the same way.
+
 ### 4. Sandbox `kubectl` and `kubeconfig` setup
 
 In [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile):
@@ -335,7 +348,7 @@ When `Mode == ModeReadOnlyWithDryRun` and `info.Verb` is `create`, `update`, or 
 - It admits the request only when `dryRun` has exactly one value and that value is `All`. It does not rewrite the outbound query: the query that passed the check is the query that `kube-apiserver` receives.
 
 **Native Kubernetes refusal responses**:
-When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body:
+When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body (a scope refusal on a discovery path is the exception: plain text, section 3):
 
 ```json
 {

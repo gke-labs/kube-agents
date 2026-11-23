@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -251,6 +251,27 @@ project and location, so a case can exclude as many clusters as the install mana
 reconcile prunes nothing for them. The validator refuses a slot the catalogue does not declare and a list that
 excludes every slot. devops-bench ignores the key.
 
+`scope_hold` is for a case whose precondition is an install that holds a cluster
+(`spec.hold`): `scope_hold: {agent_cluster: true, reason: <text>}` holds the install's own
+host cluster, read from `AGENT_CLUSTER_CONTEXT`, so the case needs no seeded fleet, and
+`all: true` holds every cluster; at least one of the two is a bare `true`, and the reason is one
+line of at most `MAX_REASON_CHARS` (`bench/kube_agents_bench/scope_hold.py`). The runner
+(`hack/ci-eval-pr.sh`, `scope_hold_apply`) runs the case's repetitions alone, after every other
+unit and after the `scope_exclude` cases, because a hold refuses every Kubernetes API request to
+the held cluster. A hold restarts nothing, so there is no reconcile to wait for: the helper patches
+the CR, waits until the operator's `<agent>-hold` ConfigMap carries the hold, then waits
+`PROPAGATION_SECONDS` for the kubelet to refresh the copy the proxy and broker read. The hold it
+replaced is saved on the CR, so the EXIT trap and the next lease restore it after a run that died
+first. A hold that does not take effect is recorded as infrastructure. On an install whose
+PlatformAgent CRD has no `spec.hold` the helper patches nothing and the case runs on the
+install as it is, graded: the behaviour is missing, which is the case's red, not an
+infrastructure failure. For a local run, `python -m kube_agents_bench.scope_hold apply --task
+tasks/<id>/task.yaml --context <ctx> --namespace <ns> --name <cr>` before devops-bench and
+`python -m kube_agents_bench.scope_hold restore --context <ctx> --namespace <ns> --name <cr> [--wait]`
+after (restore takes no `--task`; `--wait` also waits `PROPAGATION_SECONDS` for the lift to reach
+the pods). The validator refuses a malformed value and a case that
+declares both `scope_hold` and `scope_exclude`. devops-bench ignores the key.
+
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
@@ -392,7 +413,7 @@ calls include one that may hold more than one line, which the row joins with a s
 with a clipped code-tool call, and a card whose calls did not reach the trajectory is read from its
 rows alone); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
-it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own; `succeeded` (for `required_runs` only, graded strictly from the worker trajectory, where a missing trajectory capture beside a card-log run or an unseen run under partial capture yields `status="error"`, while conclusive misses fail as `fail`) requires the command to have completed with integer exit code 0 (credited only when the line's exit status is the segment's own; the operator rules are `WorkerRun.succeeded`'s); `forbidden_runs` is the same shape without `succeeded` (which it rejects) for a run no worker may make (a logged row joins the lines of one call with a space, so a word of a later line counts for the command of the first), such as a `kubectl get` of the objects a script grades, read on each card log row and in a logged card's `terminal` calls as typed, so a run behind a chain or on a later line of a call is read, except in a call whose text holds `<<` (a heredoc), which stays on its row; `refused_result_pattern`, set with `forbidden_runs`, is a regular expression for the result of a refused call, and the forbidden runs do not read a typed call of one command whose result matches it, nor one row equal to it; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden patterns apply only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out, while the forbidden runs read every typed call; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
+it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own; `succeeded` (for `required_runs` only, graded strictly from the worker trajectory, where a missing trajectory capture beside a card-log run or an unseen run under partial capture yields `status="error"`, while conclusive misses fail as `fail`) requires the command to have completed with integer exit code 0 (credited only when the line's exit status is the segment's own; the operator rules are `WorkerRun.succeeded`'s); `forbidden_runs` is the same shape without `succeeded` (which it rejects) for a run no worker may make (a logged row joins the lines of one call with a space, so a word of a later line counts for the command of the first), such as a `kubectl get` of the objects a script grades, read on each card log row and in a logged card's `terminal` calls as typed, so a run behind a chain or on a later line of a call is read, except in a call whose text holds `<<` (a heredoc), which stays on its row; `refused_result_pattern`, set with `forbidden_runs`, is a regular expression for the result of a refused call, and the forbidden runs do not read a typed call of one command whose result matches it, nor one row equal to it; a call is read a command at a time, and a quote in a heredoc body opens nothing (a body line that reads as a command is still a run), so the commands before one that the bench's shell reader refuses (quotes that do not balance, a redirect with no target, a substitution that does not close) are read, and when the refused part has the words of a required run that is still missing, or of a forbidden run on a clean read (the script as a word, each flag, and a word for each word pattern), the check is `status: "error"`; a command that the pod clipped is read as if its open quote closed at the cut, and a run in the tail that the clip removed is not read and not reported; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden patterns apply only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out, while the forbidden runs read every typed call; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
@@ -708,7 +729,7 @@ compares a known boolean field such as `spec.suspend` to the string `"true"` or 
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
 descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters and an optional `absent` from 1 to `MAX_ABSENT`, names a slot
-`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
+`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a `scope_hold:` that is not `{agent_cluster: true, all: true, reason: ...}` with at least one flag a bare true and a one-line reason, or sits beside a `scope_exclude:`, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
 refuses (a key that overrides one merged in with `<<:` is not a repeat). It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
