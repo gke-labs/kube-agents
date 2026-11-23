@@ -906,6 +906,12 @@ def send_notification(message: str, session_id: str = "") -> str:
     """
     Post a formatted alert or operational notification directly to configured chat platforms (Google Chat and/or Slack).
 
+    Where the A2A gateway holds the platform (Slack, Google Chat), every post
+    goes to the home channel, and `session_id` makes it a reply in a thread of
+    that channel. With no home channel set the post is recorded for the
+    gateway's one notice (`KEPT:`), not delivered, so a missing home channel is
+    answered, never probed with a post.
+
     Link every artifact you name in the message — issue, PR, cluster, workload,
     console view — as a markdown link `[text](url)` with the URL written out in
     full. Never a bare `#39` and never a repo-relative reference: a chat message

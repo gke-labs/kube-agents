@@ -150,7 +150,7 @@ type agentProfileTierIdentity struct {
 //     A profile is not the route to borrowing them.
 //
 // Each is reserved whether or not this agent renders it now (the session
-// account only on next, the MCP account only under A2A_MCP_DOOR, the scope
+// account only on next, the MCP account only while A2A_MCP_DOOR is not false, the scope
 // publisher's only while a publisher may run, the dispatcher's only while it
 // is switched on): a flip or a flag turned on
 // later must not find a profile or an override already holding the name.

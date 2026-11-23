@@ -808,8 +808,9 @@ finished turn's `…in`. A session's request may mint a batch of children (`task
 side and queue at the dispatcher like any child, and wake the session once, when the last of them
 has ended, with every child's result or end (`spec-chatops-gateway.md`, "A fan-out's wake"). A
 child of such a batch that reaches `input-required` ends there, with its question as its result,
-rather than pausing the conversation. A stop that cancels every child is the next step of fan-out,
-which is why the gateway accepts no width but one for now.
+rather than pausing the conversation. One stop cancels every child, each on its own `…in`, with a
+stop record for a profile task, and nothing a canceled task writes afterwards reaches the room
+(`spec-chatops-gateway.md`, "Stop").
 
 **Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
 `{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?, "widthMax"?}}`: the
@@ -830,8 +831,8 @@ listed, and a turn with none reads as `platform` only.
   `truncated`; a card whose parameters break the rules is left out.
 - `widthMax` is how many children one `delegate` request from the turn may ask for, the gateway's
   `A2A_DELEGATION_WIDTH_MAX`. The gateway sets it only when it is over one; absent means one, the
-  single shape, so the tool offers `tasks` only when it is present. The gateway accepts no width but
-  one until a stop cancels a batch's every child, so no part carries it yet. It is at most 16
+  single shape, so the tool offers `tasks` only when it is present. The gateway's default is 10, and
+  it accepts no wider setting. It is at most 16
   (`lib.DelegateBatchMax`), the ceiling every reader holds a batch to; each entry's text has the
   single shape's 16 KiB cap.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
@@ -852,10 +853,13 @@ report up by the conversation alone.
 **Pushed report.** A turn under a report the gateway's notify route posted into the conversation
 carries `{"pushedReport": {"taskId"?, "text"}}`: the report's text, kept by the gateway from the
 report it posted (a post the kanban notifier marks as a card's report, `report`, naming its task
-with `reply_to`; `spec-chatops-gateway.md`, "Proactive posts"), and the root of the task it reported on. The gateway
+with `reply_to` on a console post; `spec-chatops-gateway.md`, "Proactive posts"), and, for a console
+report, the root of the task it reported on. The gateway
 attaches it to a human turn, on any route, that names the task (`replyTo`, read as its chain's
-root): a console or MCP turn, since only console posts name their task today; a chat thread reply
-keeps the executor's lookup. The hermes-bridge (the platform route, the install's default) frames
+root), a console or MCP turn, and to the next human turn that opens in a chat thread (a Slack or
+Google Chat thread key, `lib.ThreadKeyedConversation`), which names no task and carries the newest
+report kept for the thread's key, after which the gateway forgets the reports that turn read
+(`taskId` absent; `spec-chatops-gateway.md`, "Proactive posts"). The hermes-bridge (the platform route, the install's default) frames
 the text as it frames a report it looked up, untrusted and ahead of the words, and skips the lookup
 (`a2a/docs/hermes-bridge.md`). `text` is at most 64 KiB (`lib.PushedReportTextCap`), cut by the
 gateway with a note; a part with no text, text past the cap, a task id that is not a subject

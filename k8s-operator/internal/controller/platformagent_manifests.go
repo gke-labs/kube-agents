@@ -974,7 +974,7 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// consumer, so the Hermes google_chat and slack platforms never run
 	// (a2aChatArmed, a2aSlackArmed), and a pin would pin a platform that
 	// does not run.
-	if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+	if teams := integration.Teams; teams != nil && teamsOnHermes(agent) {
 		add("TEAMS_RELAY_URL", credentialProxyBaseURL(agent))
 		add("TEAMS_ALLOWED_USERS", strings.Join(teams.AllowedUsers, ","))
 		allowAll := false
@@ -2473,8 +2473,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			cfg.Platforms.Slack.Enabled = false
 		}
 		if teams := agent.Spec.Integration.Teams; teams != nil && teams.Enabled != nil {
-			cfg.Platforms.Teams.Enabled = *teams.Enabled
-			if *teams.Enabled {
+			// Off whenever the A2A gateway's teams backend is the consumer
+			// (a2aTeamsArmed): an enabled platform with no TEAMS_RELAY_URL
+			// would start and find nothing to pull.
+			cfg.Platforms.Teams.Enabled = teamsOnHermes(agent)
+			if cfg.Platforms.Teams.Enabled {
 				cfg.Platforms.Teams.TypingStatusText = "Kage is thinking…"
 				if teams.AdaptiveCards != nil {
 					cfg.Platforms.Teams.Extra["adaptive_cards"] = *teams.AdaptiveCards
@@ -3319,7 +3322,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: org,
 			})
 		}
-		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+		if teams := integration.Teams; teams != nil && teamsOnHermes(agent) {
 			allowAll := false
 			if teams.AllowAllUsers != nil {
 				allowAll = *teams.AllowAllUsers
@@ -5082,6 +5085,27 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 		// across every connection it has open, so the broker's own relay
 		// (credential_proxy.py, serve: SlackRelay) is never armed; see
 		// a2aSlackArmed.
+		// The a2a-chat audience and its binding when the Teams backend is the
+		// gateway's only relay caller: the Chat block above renders both
+		// beside the subscription, and a Teams-only install has no such
+		// block. The callers go with the audience here as there: with the
+		// binding the broker confers the a2a-chat role on the gateway's
+		// ServiceAccount alone (#6276); without it any allowed caller that
+		// presents the audience would get the role, which is the reach the
+		// binding exists to close, and the exec tier reads the same value.
+		if a2aTeamsArmed(agent) && !a2aChatArmed(agent) {
+			envVars = append(envVars,
+				corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+				corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},
+			)
+		}
+		// The broker opens its Teams routes to the a2a-chat role only on this
+		// word, so a Chat-armed gateway on an install whose Teams stays on
+		// Hermes cannot reach that queue (credential_proxy.py,
+		// _teams_route_roles).
+		if a2aTeamsArmed(agent) {
+			envVars = append(envVars, corev1.EnvVar{Name: credentialProxyTeamsA2ACallerEnvVar, Value: strconv.FormatBool(true)})
+		}
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			envVars = append(envVars,
 				corev1.EnvVar{Name: "TEAMS_APP_ID", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(teams.AppIdSecretRef, defaultPlatformAgentSecrets, "TEAMS_APP_ID")}},
@@ -5185,7 +5209,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
 		// And its callers: one that could set them would choose who holds
-		// the a2a-chat role. Rendered only while Chat is armed, so reserved
+		// the a2a-chat role. Rendered only while a relay is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
@@ -5194,6 +5218,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyA2AReportsCallersEnvVar,
 		a2aReportStoreURLEnvVar,
 		a2aReportStoreTokenFileEnvVar,
+		// One that could set the Teams caller word would open the broker's
+		// Teams routes to the a2a-chat role on an install whose Teams stays
+		// on Hermes, which is the reach the word exists to close.
+		credentialProxyTeamsA2ACallerEnvVar,
 		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
 		// shell's audience would hand the session the shell's role.
 		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
@@ -5508,6 +5536,26 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FINDINGS_FIRST_REPORT_CRITICALS": {},
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
 		"FINDINGS_NONCRITICAL_MAX":        {},
+
+		// The daily `leeway-watch` sweep's alert thresholds (`leeway_watch.py`,
+		// a `no_agent` cron script): the lowest severity it reports, the
+		// lowest drift and fullest-zone share a topology finding needs, how far
+		// past its pigeonhole floor an unknown-cause skew must be, and how many
+		// days pass before an open finding is posted again. Each is a severity
+		// word or a number checked against a range, and a value that does not
+		// parse or is out of range means its default, so an arbitrary value
+		// only filters which findings the sweep posts and keeps in its report
+		// (and the `topology-skew` topic that carries the report), and how
+		// often it re-posts them, at most once per daily run. That is the
+		// point of setting them, and it reaches nothing else: no value names a
+		// cluster, a path or a credential. LEEWAY_WATCH_CLUSTERS and
+		// LEEWAY_WATCH_PROJECTS, which choose what the sweep reads, and
+		// LEEWAY_WATCH_HOME, a path, are deliberately not here.
+		"LEEWAY_WATCH_MIN_DRIFT":             {},
+		"LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR": {},
+		"LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE":  {},
+		"LEEWAY_WATCH_MIN_SEVERITY":          {},
+		"LEEWAY_WATCH_REFRESH_DAYS":          {},
 
 		// Seconds a workload's admitted event folds its later events into
 		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in

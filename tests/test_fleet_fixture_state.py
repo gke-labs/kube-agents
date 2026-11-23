@@ -20,7 +20,10 @@ these tests pin, with ``kubectl``, ``gcloud`` and ``gh`` stubbed:
   outlier (slot c) is past the drift SOP's 24-hour age gate, which never
   holds a ``--wait``;
 * a re-run that finds a role converged removes a stale ``.drift`` file;
-* a malformed catalog or a directory the runner did not write is exit 1.
+* a malformed catalog or a directory the runner did not write is exit 1;
+* a tool that is not installed comes back as exit status 127, a tool that
+  cannot be run as 126 and a tool that runs past its timeout as 124, and a
+  read that got one of them is "not checked".
 
 The stubs answer from a JSON "world" file so each test names only its own
 defect; a key whose value is a list (a kubectl subject or a describe) is
@@ -224,8 +227,10 @@ elif args[0] == "compute" and args[2] == "list":
         sys.exit(1)
     if answer == "PARTIAL":
         # gcloud's default for a list that failed in part: a warning, what it
-        # could read (here nothing), and exit 0.
-        print("WARNING: Some requests did not succeed.\n - Internal error in zone us-central1-a", file=sys.stderr)
+        # could read (here nothing), and exit 0. After an empty answer its last
+        # line is the warning about the filter's key.
+        print("WARNING: Some requests did not succeed.\n - Internal error in zone us-central1-a\n - Internal error in zone us-central1-b\n", file=sys.stderr)
+        print("WARNING: The following filter keys were not present in any resource : name", file=sys.stderr)
         print("[]")
         sys.exit(0)
     # `name ~ ^<prefix>` is a prefix read; `name ~ ^<name>$` (the disk read
@@ -1009,6 +1014,65 @@ class CatalogTest(unittest.TestCase):
             for entry in cases:
                 with self.subTest(entry=entry), self.assertRaises(ffs.CatalogError):
                     ffs.load_assertions(self._catalog_with(pathlib.Path(tmp), entry))
+
+
+class RunCommandTest(unittest.TestCase):
+    """`_run` turns a tool that is not installed, a tool that cannot be run and
+    a tool that runs too long into exit statuses.
+
+    The statuses are the shell's: 127 for a command that is not found, 126 for
+    one that is there and cannot be started, 124 for one that `timeout` stopped.
+    Each real process here is this interpreter, a path that does not exist or
+    a file that is not executable, so no test starts `kubectl`, `gcloud` or
+    `gh`.
+    """
+
+    #: Short enough to keep the test fast, and a child that sleeps far longer.
+    TIMEOUT_SECONDS = 0.2
+    CHILD_SLEEP_SECONDS = 30
+
+    def test_a_tool_that_is_not_installed_is_status_127(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(pathlib.Path(tmp) / "no-such-tool")
+            rc, out, err = ffs._run([missing, "get", "pods"], self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (127, ""))
+        self.assertIn(missing, err)
+
+    def test_a_tool_that_cannot_be_run_is_status_126(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_executable = pathlib.Path(tmp) / "kubectl"
+            not_executable.write_text("#!/bin/sh\n")
+            not_executable.chmod(0o644)
+            rc, out, err = ffs._run([str(not_executable), "get", "pods"], self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (126, ""))
+        self.assertIn(str(not_executable), err)
+
+    def test_a_tool_that_runs_past_its_timeout_is_status_124(self):
+        cmd = [sys.executable, "-c", f"import time; time.sleep({self.CHILD_SLEEP_SECONDS})"]
+        rc, out, err = ffs._run(cmd, self.TIMEOUT_SECONDS)
+        self.assertEqual((rc, out), (124, ""))
+        self.assertEqual(err, f"timed out after {self.TIMEOUT_SECONDS:g}s: {' '.join(cmd)}")
+
+    def test_a_tool_that_answers_keeps_its_status_and_both_streams(self):
+        cmd = [sys.executable, "-c", "import sys; print('to stdout'); print('to stderr', file=sys.stderr); sys.exit(3)"]
+        self.assertEqual(ffs._run(cmd, 30), (3, "to stdout\n", "to stderr\n"))
+
+    def test_a_read_that_got_such_a_status_is_unreadable_and_names_it(self):
+        """A caller reports the status, so "not installed", "cannot be run" and
+        "too slow" read apart in the "not checked" line, and none is taken for
+        drift."""
+        failures = (
+            (FileNotFoundError(2, "No such file or directory", "kubectl"), 127, "No such file or directory"),
+            (PermissionError(13, "Permission denied", "kubectl"), 126, "Permission denied"),
+            (OSError(8, "Exec format error", "kubectl"), 126, "Exec format error"),
+            (subprocess.TimeoutExpired(["kubectl"], ffs.KUBECTL_TIMEOUT_SECONDS), 124, "timed out after"),
+        )
+        for failure, status, text in failures:
+            with self.subTest(status=status), mock.patch.object(subprocess, "run", side_effect=failure):
+                with self.assertRaises(ffs.Unreadable) as caught:
+                    ffs.read_kubectl(pathlib.Path("kubeconfig"), None, "deployment/x")
+                self.assertIn(f"({status})", str(caught.exception))
+                self.assertIn(text, str(caught.exception))
 
 
 class EvaluateTest(unittest.TestCase):
@@ -2166,7 +2230,9 @@ class ReservationSubjectTest(_Harness):
         assert self.drift_files() == {}, done.stderr
         assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert "fixture role 'missing-reservation-pool' could not be checked" in done.stderr
-        assert "compute reservations list was partial" in done.stderr
+        # The reason is each item under gcloud's first warning, not its last line.
+        assert "compute reservations list was partial: Internal error in zone us-central1-a; Internal error in zone us-central1-b" in done.stderr
+        assert "filter keys" not in done.stderr
 
     def test_a_refused_reservation_list_is_not_checked_and_leaves_no_drift_file(self):
         world = _healthy_world()

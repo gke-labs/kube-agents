@@ -261,6 +261,9 @@ type Dispatcher struct {
 	bg sync.WaitGroup
 	// droppedAnswers counts answers dropped over a pod's budget.
 	droppedAnswers atomic.Int64
+	// supervisorFallbacks counts terminals written on the five-token
+	// supervisor form because the six-token one was refused (#5301).
+	supervisorFallbacks atomic.Int64
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
 	// breakers hold back a (profile, tier) whose tasks keep losing their

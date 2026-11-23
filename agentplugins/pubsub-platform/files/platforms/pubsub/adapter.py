@@ -150,10 +150,19 @@ class RelayRefused(Exception):
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
-    """A 3xx from the relay is an error, not a place to re-send the token to."""
+    """A 3xx is an error, not a place to re-send the call's headers to."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
         return None
+
+
+# For the gateway's own API, which is on loopback. No proxy from the
+# environment: a proxy cannot reach this pod's loopback, so the turn would
+# fail, and the proxy would get the alert's prompt and the call's headers.
+# No redirect: urllib follows a 301, 302 or 303 answer to a POST with a GET
+# that keeps the Authorization header and has no body, so neither call of the
+# API can work through one.
+_GATEWAY_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
 
 class PubsubRelay:
@@ -164,13 +173,15 @@ class PubsubRelay:
     broker adds the Google credential; this side presents the gateway's
     projected token, read from CREDENTIAL_PROXY_TOKEN_FILE on every call, and
     never follows a redirect with it (credential_proxy_client's guard, kept
-    here because this file is loaded by path with no sibling module).
+    here because this file is loaded by path with no sibling module). It takes
+    no proxy from the environment, as that client does not: the relay is an
+    in-cluster Service, and a proxy in between would get the token.
     """
 
     def __init__(self, base_url: str, token_file: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.token_file = token_file
-        self._opener = urllib.request.build_opener(_NoRedirects)
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -1259,7 +1270,7 @@ class PubSubAdapter(BasePlatformAdapter):
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
             )
-            return urllib.request.urlopen(req, timeout=timeout)
+            return _GATEWAY_API_OPENER.open(req, timeout=timeout)
 
         try:
             await asyncio.to_thread(
