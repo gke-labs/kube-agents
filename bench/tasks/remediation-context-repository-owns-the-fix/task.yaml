@@ -89,8 +89,10 @@
 # hard guarantees are the tool-call checks: no write run, no decrypt run.
 # Known limits, shared with inspect-repository-unmanaged-and-context-read: the
 # worker_commands check reads a card log row as hermes renders it (a chain
-# keeps its first command, a heredoc is one argv of bash), so a write or a
-# decrypt chained behind another command on a front-filed card is not seen,
+# keeps its first command, a heredoc is one argv of bash) and, for the
+# forbidden runs, a front-filed card's typed call that holds no heredoc, so a
+# write or a decrypt chained behind another command is seen there and is not
+# seen in a call with a heredoc,
 # a worker-filed card is read as typed, and a script reached through a shell
 # variable that holds its path (`python3 $V publish`, the alias the
 # version-control skill's examples set) is not a run of that script.

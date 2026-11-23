@@ -856,7 +856,7 @@ leaves the record as it was:
    console is `read`, and a requester with no identity is refused. The one path that mints
    `unattended` is the trigger ingress (`trigger_ingress.go`, scheduling-on-profiles.md §3), which
    ships dark until the callout grants a trigger source its submit subject. A delegated profile child runs at its
-   parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
+   parent's tier when the parent is a profile task (`read` when the parent is `unattended`), and at its requester's otherwise. A profile
    task can't delegate to `platform`, whose child would be minted at the install's tier and
    scope.
 4. **Submit.** The submission goes on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the `PROFILE_SUBMITS` stream, `top`
@@ -882,8 +882,12 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent runs at `unattended`
-(`delegation.unattended-parent`), whose trigger binding a child's grant doesn't carry yet. A child's
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
+(a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
+parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
+trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
+(`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
+child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its

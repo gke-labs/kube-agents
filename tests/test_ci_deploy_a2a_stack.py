@@ -87,8 +87,9 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_DISPATCHER_URI",
     "_PERSONA_CLUSTER_URI",
     "_PERSONA_TSE_URI",
+    "_PERSONA_FLEET_AUDIT_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse", "persona-fleet-audit")
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 # The retired flag, in the spellings a job environment could still carry.
@@ -401,6 +402,8 @@ class A2AStackTest(unittest.TestCase):
             ("profiles.cluster.harness", "a2a-worker"),
             ("profiles.tse.persona", "persona-tse"),
             ("profiles.tse.harness", "a2a-worker"),
+            ("profiles.fleetAudit.persona", "persona-fleet-audit"),
+            ("profiles.fleetAudit.harness", "a2a-worker"),
         ):
             expected += [
                 "--set-string",
@@ -1899,6 +1902,10 @@ class BridgeImageBuildTest(unittest.TestCase):
         # The tse persona, the same way (#3842).
         uri = f"{_AR_REPO}/persona-tse:{_TAG}"
         expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse agents/tse/persona")
+        expected.append(f"docker push {uri}")
+        # The fleet-audit persona, the same way (#5623).
+        uri = f"{_AR_REPO}/persona-fleet-audit:{_TAG}"
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-fleet-audit agents/fleet-audit/persona")
         expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 

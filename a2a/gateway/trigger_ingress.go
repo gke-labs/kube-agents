@@ -472,6 +472,9 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 			ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
 			Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
 			RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
+			// Its scope, recorded as a profile task's is: the scope its
+			// children are held to when it fans out (#6744).
+			Scope: string(route.Scope),
 		})
 		if len(rec.Tasks) > taskHistoryCap {
 			rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
