@@ -424,8 +424,8 @@ user and disable personal memory in group conversations) in the pod's session-kv
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
-be posted back. A Google Chat, Slack or console conversation is posted back. A console
-conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
+be posted back. A Google Chat, Slack, Teams or console conversation is posted back. A console
+conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google- or Entra-token A2A door, or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
 Before the same first turn the bridge also puts the report a reply is under ahead of it. A reply
@@ -435,14 +435,20 @@ arrives with no link to that report, and nothing else attaches it, since the Her
 `incident_context` hook runs on no turn of the `api` executor. Two sources, in order. First the
 gateway's relay: the A2A gateway keeps the text of each report its notify route posts into a
 console conversation (a card's report, marked `report` by the notifier and naming its task; a
-progress note, which shares the thread and the task, is not kept; a Slack or Google Chat
-thread's posts, a relayed scheduled report and an alert's triage report it does not keep, and the
-lookup still serves them; `docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it
-on a reply's submission as a `pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the
-reply names the task the report was on (a console or MCP client's `replyTo`, the chain's root even
-when a delegated child filed the card); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so
-what it kept is what the person read; it holds reports only, and when two reports share one root
-(two cards from one turn) the reply carries the newest. This is how a card filed in a delegated
+progress note, which shares the thread and the task, is not kept) and into a chat thread (a Slack
+or Google Chat thread key, `lib.ThreadKeyedConversation`: the same marked report, kept under the
+thread's key with no task named; a post into a whole space or a thread-less DM, a relayed scheduled report
+and an alert's triage report it does not keep, and the lookup still serves them;
+`docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it on a reply's submission as a
+`pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the reply names the task the report
+was on (a console or MCP client's `replyTo`, the chain's root even when a delegated child filed the
+card) or is the next human turn that opens in a thread the gateway kept a report for (the newest
+one; `taskId` absent; once that turn is on the bus the gateway forgets the reports it read, and a
+message steered into the thread's running task empties them once the steer is on the bus, so the
+turn after falls back to the lookup below, and an alert's triage report is hidden for that one turn
+and no longer); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so what it kept is what
+the person read; it holds reports only, and when two reports share one root (two cards from one
+turn) or one thread the reply carries the newest. This is how a card filed in a delegated
 child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
 reply never reads, and the relay carries the report across. The relay rides a human turn on every
 route; this executor frames it on the platform route (the install's default), and a conversation
@@ -457,10 +463,10 @@ with the reply; a reply while the turn is still running is steered into it and c
 `replyTo`, since the report is attached on an opening turn only); then by the thread the
 conversation key names (`slack:<channel>/<ts>` is the row `(channel, ts)`;
 `gchat:spaces/A/threads/B` is `(spaces/A, the thread name)`); then by the Hermes session and the
-conversation key, which is how the notifier keys a card's report it posted into a Slack or Google
-Chat gateway conversation. A console reply that names no task takes only the last,
+conversation key, which is how the notifier keys a card's report it posted into a Slack, Google
+Chat or Teams gateway conversation. A console reply that names no task takes only the last,
 `(session, key)`, and finds no row, since the console row's key carries the task; a key naming a
-whole DM or space rather than a thread is not looked up at all, since every later message there
+whole DM or space rather than a thread (a Teams personal or group chat among them) is not looked up at all, since every later message there
 shares it and would carry the first stored report for the row's life. A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
@@ -704,8 +710,8 @@ failures name themselves in the status message:
 
 The answer stays on `TASKS`, because the gateway delivers it from there, so the copy a person is
 shown and the copy the stream keeps are the same message. The bridge scrubs it once, before it is
-published (`scrubAnswer` in `answer_scrub.go`, #5280). That covers the `result` artifact and the
-chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
+published (`scrubAnswer` in `answer_scrub.go`, over `answerscrub.Scrub` in `a2a/lib/answerscrub`,
+#5280). That covers the `result` artifact and the chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
 answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
 a failed CLI run's stdout and stderr tails, and an API error's body or error tail. Each is
 scrubbed before it is cut to its tail: the CLI executor keeps the last 64 KiB of each stream
@@ -759,7 +765,7 @@ a status message is the bridge's own text. There are two passes:
    result and the terminal are published, so a delivery still on its way past the door adds
    nothing. None of it is logged or published.
 
-2. **Shape rules.** `scrubInlineSecrets` runs over the answer (the classes are listed under
+2. **Shape rules.** `answerscrub.ScrubInline` runs over the answer (the classes are listed under
    "Activity" below).
 
 The bridge sees a tool's result only through the activity door. Hermes's `post_tool_call`
@@ -967,7 +973,7 @@ nothing of it follows the final event. What of the input is published is the sam
   `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
   wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
   name, a wrapper's nested names). No string value rides the trace under any key, under either executor, and no tool results are included (the one exception is `BRIDGE_DEBUG_ERROR_TEXT`'s scrubbed error line, a maintainer's debugging switch, below).
-- **Under `api` (attribution on the same entry):** the entry additionally carries a human-readable `title` (the step title the call was planned under, else one built from the tool's name and the short identifier it acts on: a cluster, a file's tail, a search query, a card's title), `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and `resultPreview` = `card_id=<id>` on a successful `kanban_create` only. Nothing else of a tool's result is published, and neither is a failed call's error text: a failure is its `status` and hermes's own `errorType` word. For debugging only, setting `BRIDGE_DEBUG_ERROR_TEXT=true` on the bridge container adds `errorMessage`: the first line of the error, scrubbed by `scrubInlineSecrets` and capped at 320 bytes. It applies under both executors and is off by default. An AgentPlugin's env reaches the agent container unfiltered, so the rendered bridge drops any copy it would inherit and sets it `false` itself, which also overrides an `envFrom` key. A maintainer turns it on by editing the Deployment while the operator is paused, since a reconcile reverts it. A bridge the CR declares as its own sidecar is the CR author's container and keeps whatever env it's given. The model's reasoning is read for the step boundary it marks and is not published. The identifier a title names is the one argument-derived value on the bus, and it passes through `scrubInlineSecrets` as a net rather than a contract. Its classes are credential tokens by prefix, a credential after an HTTP auth scheme word or in an `Authorization` header or header pair, CLI secret flags (long and single-dash names, attached and quoted short values, `user:password` arguments, a flag and its value as separate argument-list items), private-key blocks, YAML Secret `data`/`stringData` blocks, URL userinfo (the password by shape: everything up to the `@` a host follows), libpq password-file entries, a Kubernetes env entry's literal value under a credential name, prose secrets, markdown tables and `key=value` secrets. The prose and `key=value` rules read through the markdown around a key or a value (paired bold, italic and code-span marks, a short parenthetical before the colon, an arrow used as a separator) and redact the value where it stands, a code-spanned value bounded by its backticks, and prose may say "decodes to" or "the password in secret X is". A table's value cells are redacted in a row whose first cell is a credential key, unless its headers show a listing of resources or checks, and under a header that is one. After an explicit credential word (a prose credential noun and verb, or a key whose last component is the credential word, a digit suffix or a value qualifier such as `_hash`, `_value` or `Confirm` allowed) a value is redacted unless it is a short list of state words, a literal, a placeholder or a short number, so a passphrase is redacted. A credential after `Bearer` or `Basic` is redacted unless it is one of the dictionary words prose puts there ("Basic Authentication"), while after the scheme words that are also ordinary English, and under a key that carries the credential word elsewhere (a container or proxy name, a field path, a TTL), the value must be token-shaped. The ambiguous keys `pass`, `pwd` and `auth` keep a path or prose (#5032). The same function scrubs the answer ("What of an answer reaches TASKS" above).
+- **Under `api` (attribution on the same entry):** the entry additionally carries a human-readable `title` (the step title the call was planned under, else one built from the tool's name and the short identifier it acts on: a cluster, a file's tail, a search query, a card's title), `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and `resultPreview` = `card_id=<id>` on a successful `kanban_create` only. Nothing else of a tool's result is published, and neither is a failed call's error text: a failure is its `status` and hermes's own `errorType` word. For debugging only, setting `BRIDGE_DEBUG_ERROR_TEXT=true` on the bridge container adds `errorMessage`: the first line of the error, scrubbed by `answerscrub.ScrubInline` (`a2a/lib/answerscrub`) and capped at 320 bytes. It applies under both executors and is off by default. An AgentPlugin's env reaches the agent container unfiltered, so the rendered bridge drops any copy it would inherit and sets it `false` itself, which also overrides an `envFrom` key. A maintainer turns it on by editing the Deployment while the operator is paused, since a reconcile reverts it. A bridge the CR declares as its own sidecar is the CR author's container and keeps whatever env it's given. The model's reasoning is read for the step boundary it marks and is not published. The identifier a title names is the one argument-derived value on the bus, and it passes through `answerscrub.ScrubInline` as a net rather than a contract. Its classes are credential tokens by prefix, a credential after an HTTP auth scheme word or in an `Authorization` header or header pair, CLI secret flags (long and single-dash names, attached and quoted short values, `user:password` arguments, a flag and its value as separate argument-list items), private-key blocks, YAML Secret `data`/`stringData` blocks, URL userinfo (the password by shape: everything up to the `@` a host follows), libpq password-file entries, a Kubernetes env entry's literal value under a credential name, prose secrets, markdown tables and `key=value` secrets. The prose and `key=value` rules read through the markdown around a key or a value (paired bold, italic and code-span marks, a short parenthetical before the colon, an arrow used as a separator) and redact the value where it stands, a code-spanned value bounded by its backticks, and prose may say "decodes to" or "the password in secret X is". A table's value cells are redacted in a row whose first cell is a credential key, unless its headers show a listing of resources or checks, and under a header that is one. After an explicit credential word (a prose credential noun and verb, or a key whose last component is the credential word, a digit suffix or a value qualifier such as `_hash`, `_value` or `Confirm` allowed) a value is redacted unless it is a short list of state words, a literal, a placeholder or a short number, so a passphrase is redacted. A credential after `Bearer` or `Basic` is redacted unless it is one of the dictionary words prose puts there ("Basic Authentication"), while after the scheme words that are also ordinary English, and under a key that carries the credential word elsewhere (a container or proxy name, a field path, a TTL), the value must be token-shaped. The ambiguous keys `pass`, `pwd` and `auth` keep a path or prose (#5032). The same function scrubs the answer ("What of an answer reaches TASKS" above).
 
 In both modes, values under keys with `token`, `secret`, `password`,
 `passwd`, `authorization`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`,

@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2596,6 +2596,15 @@ _PARTIAL_REQUIRED_CAPTURE_REASON = (
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
 _SHOWN_COMMAND_CHARS = 120
+#: A worker command past a limit of the shell reader (:class:`kube_agents_bench.shell_words.ShellReadLimitError`)
+#: has no argvs. When it can hold the run that decides a check, the check cannot be evaluated:
+#: not a pass and not a fail.
+_SHELL_READ_LIMIT_REASON = (
+    "worker command {shown!r} is past the shell reader's limit ({limit}), so its runs cannot be "
+    "read and this check could not be evaluated"
+)
+#: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
+_UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2654,6 +2663,20 @@ class WorkerRun(BaseModel):
             if not flag or any(char.isspace() for char in flag):
                 raise ValueError(f"each flag must be one word, not {flag!r}")
         return flags
+
+
+def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
+    """The argvs of each line that the shell reader reads, and the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
+    Each line is read by itself, so one unread line does not take the others' argvs."""
+    argvs: list[list[str]] = []
+    first_unread = None
+    for line in lines:
+        try:
+            argvs.extend(_shell_argvs(line))
+        except ShellReadLimitError as limit:
+            first_unread = first_unread or (line, limit)
+    return argvs, first_unread
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -2760,13 +2783,19 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
 
 def _terminal_call_texts(trajectory: list[Any]) -> list[tuple[str, str]]:
     """``(card, command)`` per tagged ``terminal`` call, as :func:`_worker_terminal_calls` reads it."""
-    texts: list[tuple[str, str]] = []
+    return [(card, command) for card, command, _ in _terminal_calls_with_results(trajectory)]
+
+
+def _terminal_calls_with_results(trajectory: list[Any]) -> list[tuple[str, str, str]]:
+    """``(card, command, result)`` per tagged ``terminal`` call; a result that is not text reads as empty."""
+    calls: list[tuple[str, str, str]] = []
     for entry in trajectory:
         if isinstance(entry, dict) and entry.get("agent") and entry.get("name") == _TERMINAL_TOOL:
             command = _code_call_text(entry)
             if command is not None:
-                texts.append((str(entry.get("task") or entry.get("session") or ""), command))
-    return texts
+                result = entry.get("result")
+                calls.append((str(entry.get("task") or entry.get("session") or ""), command, result if isinstance(result, str) else ""))
+    return calls
 
 
 def _clipped_cards(trajectory: list[Any]) -> set[str]:
@@ -2830,7 +2859,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
     a log line is graded on its log lines, whether or not its calls reached
     the trajectory, and any other card on its calls; the required patterns
-    and runs also read a logged card's calls. This verifier matches
+    and runs also read a logged card's calls, and the forbidden runs its
+    ``terminal`` calls that hold no heredoc. This verifier matches
     Python regular expressions against the union, ``re.search`` on each
     command verbatim, and an exemption reads a tagged call as it reads a log
     line. The two halves are not spelled alike. A log line is hermes's
@@ -2839,12 +2869,18 @@ class WorkerCommandsVerifier(BaseVerifier):
     chain joined by ``;``, ``&&`` or ``||`` arrives as its first command (a
     leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
     skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe, a
-    substitution and a backtick stay. A forbidden pattern or run reads the
+    substitution and a backtick stay. A forbidden pattern reads the
     rendering there, so a command chained behind another on a log line is not
     on any line it sees; a required pattern or run also reads the card's
     tagged calls as typed, so a run behind ``printenv X;`` is credited
     (#4620), and so is a run written into a heredoc that was never executed
-    (the admitting side, as under ``after_result_pattern``). A
+    (the admitting side, as under ``after_result_pattern``). A forbidden run
+    also reads the card's tagged ``terminal`` calls as typed, so a run behind
+    a chain or on a later line of a call is read (#6106); a call whose text
+    holds ``<<`` (a heredoc; a quoted ``<<`` or a shift counts too) is the
+    exception and stays on its row, because a heredoc body
+    splits into one argv for each line and a line written into a file is not a
+    run, so a forbidden run on a later line of such a call is not read. A
     tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
     reads each worker session's tool calls after the log scrape; ``tool_called``
     grades them), so a pattern, forbidden or exempt, reads a worker-filed
@@ -2924,6 +2960,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
     A command an exemption touched is out of the required runs as it is out
     of the required patterns; the forbidden runs read every command as typed.
+    ``refused_result_pattern`` (with ``forbidden_runs``) names the result of a
+    call that was refused, by the policy's refusal words: the forbidden runs
+    do not read a typed call of one command whose result matches, on any card
+    and under ``after_result_pattern`` too, nor, for each such call, one card
+    log row equal to its text. A call has one result, so a call of several
+    commands is read whatever its result holds; a row has no result, so the
+    row of such a call is read, and so is each row of a capture whose rows
+    name no card. A result that only quotes the refusal words matches too.
 
     ``after_result_pattern`` makes the forbidden patterns order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
@@ -2989,8 +3033,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     line, so a run written into the file is credited whether or not the file
     ran. A required pattern or run reads typed calls (a logged card's always,
     every card's under ``after_result_pattern``), so it credits that line; a
-    forbidden run reads a logged card's row, where the heredoc is one line
-    behind ``cat``, and does not. A card with no log line is read from its
+    forbidden run reads a logged card's row for a call that holds a heredoc
+    (without ``after_result_pattern``), where the heredoc is one line behind
+    ``cat``, and does not. The typed read does not know which commands ran: a
+    command behind ``&&`` or ``||``, in a branch that was not taken or in a
+    function that was never called reads as a run. A card with no log line is read from its
     typed calls by both. Under
     ``after_result_pattern``: a refused command whose output the call discarded
     prints nothing into its result; a result is clipped in the pod at
@@ -3006,7 +3053,15 @@ class WorkerCommandsVerifier(BaseVerifier):
     and the card log's rows join its typed set, so a command the trajectory
     missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
     read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
-    worker commands is ``status="error"``, not a pass.
+    worker commands is ``status="error"``, not a pass. A command past the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`: command lines nested deeper
+    than the reader's limit, or more reading than the line's budget) has no argvs. It is a gap
+    for the runs, graded by the rule for a capture with gaps with one difference: a pattern
+    reads the text of that line too, so a missing required pattern is conclusive, as a forbidden
+    pattern or run that was read is. A required run that is still missing is
+    ``status="error"`` when a line of the commands was not read, and a clean read of the
+    forbidden runs is when a typed line was not read. A check with patterns alone reads no
+    argv and is graded as before the limit.
     """
 
     type: Literal["worker_commands"]
@@ -3018,6 +3073,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
     after_result_pattern: str | None = None
+    refused_result_pattern: str | None = None
 
     @field_validator("required_patterns", "forbidden_patterns", "exempt_patterns", "forbidden_result_patterns")
     @classmethod
@@ -3038,6 +3094,65 @@ class WorkerCommandsVerifier(BaseVerifier):
         if self.forbidden_result_patterns and self.after_result_pattern is None:
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
+
+    @field_validator("refused_result_pattern")
+    @classmethod
+    def _refused_pattern_compiles(cls, pattern: str | None) -> str | None:
+        if pattern is not None:
+            if not pattern:
+                raise ValueError("refused_result_pattern is empty, which matches each result; name the refusal's words")
+            re.compile(pattern)
+        return pattern
+
+    @model_validator(mode="after")
+    def _refused_pattern_needs_forbidden_runs(self) -> WorkerCommandsVerifier:
+        if self.refused_result_pattern is not None and not self.forbidden_runs:
+            raise ValueError("refused_result_pattern names the calls the forbidden runs skip; set forbidden_runs with it")
+        return self
+
+    def _refused(self, command: str, result: str) -> bool:
+        """Whether the forbidden runs skip a typed call: the option is set, the call is one
+        command, and its result matches. A call has one result, so a refusal in it says
+        nothing about the other commands of a longer call; such a call is read."""
+        if self.refused_result_pattern is None or not re.search(self.refused_result_pattern, result):
+            return False
+        try:
+            return len(_shell_argvs(command)) == 1
+        except ShellReadLimitError:
+            # A line past the reader's limit is not known to be one command, so it is read.
+            return False
+
+    def _forbidden_run_commands(self, snap: Any, calls: list[tuple[str, float | None, str, str, bool]], logged: set[str]) -> list[str]:
+        """The commands the forbidden runs read when no window orders the calls: each card
+        log row, the tagged calls of a card with no row, and a logged card's ``terminal``
+        calls as typed, so a run on a later line of a call or behind a chain is read
+        (#6106). A typed call that holds a heredoc is left on its row: its body splits into
+        one argv for each line, and a line written into a file is not a run. A refused call
+        (:meth:`_refused`) is not read, and for each one neither is one row equal to its
+        text. Rows that name no card cannot be joined to a call, so none of them is skipped.
+        The reader's limit holds for a typed call as for a row: a call past it gives no argvs,
+        and the check is an error unless a forbidden run was read."""
+        rows = [(str(row.get("task") or ""), str(row.get("command", ""))) for row in snap.worker_commands]
+        unjoined = "" in logged
+        children = [command for card, _, command, result, _ in calls if (unjoined or card not in logged) and not self._refused(command, result)]
+        if unjoined:
+            return [command for _, command in rows] + children
+        refused: dict[tuple[str, str], int] = {}
+        not_refused: set[tuple[str, str]] = set()
+        for card, command, result in _terminal_calls_with_results(snap.trajectory):
+            if self._refused(command, result):
+                refused[(card, command)] = refused.get((card, command), 0) + 1
+            else:
+                not_refused.add((card, command))
+        read_rows: list[str] = []
+        for card, command in rows:
+            if refused.get((card, command)):
+                refused[(card, command)] -= 1
+                continue
+            read_rows.append(command)
+        seen = set(rows)
+        beside = [command for card, command in sorted(not_refused) if card in logged and (card, command) not in seen and not _holds_heredoc(command)]
+        return read_rows + children + beside
 
     def _without_exempt_text(self, command: str, joined: bool = False) -> str:
         # ``joined``: the row's card typed a call the row may have joined lines of
@@ -3070,6 +3185,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         # The log rows of a card that typed a call the row may have joined lines of.
         joined_rows: set[str] = set()
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
+        # What the forbidden runs read; ``None`` is the typed set.
+        run_commands: list[str] | None = None
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3090,10 +3207,12 @@ class WorkerCommandsVerifier(BaseVerifier):
             # in the log and no tagged terminal call), so every log line is kept whatever
             # the trajectory holds, and the trajectory's calls join the
             # graded set by card, not by string: a card with a log line contributes its
-            # log lines and none of its calls to the forbidden set (the required
-            # checks also take its calls, below), so a command a filed card typed is counted
+            # log lines and none of its calls to the forbidden patterns (the required
+            # checks also take its calls, and the forbidden runs its terminal calls that
+            # hold no heredoc, below), so a command a filed card typed is counted
             # once (its log line and its call need not be spelled alike) and a command
-            # typed twice is counted twice. A card with no log line -- a worker filed it,
+            # typed twice is counted twice; a forbidden run can be named two times, on
+            # its row and in its typed call, when the two are not spelled alike. A card with no log line -- a worker filed it,
             # or its log showed no shell command -- contributes its tagged calls, which
             # for a filed card can only add ``execute_code`` text the log never shows (a
             # behaviour change for a filed card that ran only code: its program text is
@@ -3116,10 +3235,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # A log row shows a chain as its first command only (``printenv X + 1
                 # command``), so a run chained behind it is on no row (#4620). The
                 # required patterns and runs also read the logged cards' calls as
-                # typed, a call that repeats a row verbatim excepted. The forbidden set
-                # keeps the rows: a typed heredoc splits into one argv per line, so a
-                # command written into a file and never run would read as a forbidden
-                # run, and an exemption is written against the rendering. An exemption
+                # typed, a call that repeats a row verbatim excepted. The forbidden
+                # patterns keep the rows: an exemption is written against the rendering.
+                # The forbidden runs also read the logged cards' terminal calls
+                # (``_forbidden_run_commands``), a call with a heredoc excepted: a typed
+                # heredoc splits into one argv per line, so a command written into a
+                # file and never run would read as a forbidden run. An exemption
                 # still takes an exempt call out of the required read, as it does a row.
                 if self.required_patterns or self.required_runs:
                     rows = set(logged_commands)
@@ -3129,7 +3250,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined.append(f"{len(children)} from the tagged calls of cards with no log line")
                 if beside_rows:
                     count = len(beside_rows)
-                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
+                    readers = "the required checks and the forbidden runs" if self.forbidden_runs else "the required checks only"
+                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by {readers}")
                 if joined:
                     sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
             if self.exempt_grep_patterns:
@@ -3147,6 +3269,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined_rows = {str(row.get("command", "")) for row in snap.worker_commands if str(row.get("task") or "") in joined}
             typed = logged_commands + children
             windowed = typed
+            if self.forbidden_runs:
+                run_commands = self._forbidden_run_commands(snap, calls, logged)
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -3163,6 +3287,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            if self.refused_result_pattern is not None:
+                run_commands = [command for _, _, command, result, _ in calls if not self._refused(command, result)]
             # The ordered check reads the calls alone: a log row has no time.
             # A check with no forbidden set keeps the card log as a source for
             # its required checks: the trajectory can be the narrower read (two
@@ -3224,14 +3350,31 @@ class WorkerCommandsVerifier(BaseVerifier):
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
-        argvs = [argv for c in commands for argv in _shell_argvs(c)]
-        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
+        # The argvs serve the runs only: the commands' for the required runs, the typed calls'
+        # for the forbidden runs. A check with patterns alone reads none. Each line is read by
+        # itself; a line past the reader's limit has no argvs.
+        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
+        typed_argvs, typed_unread = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [])
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
         partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        # A line past the reader's limit is a gap of the same kind for the runs, with one
+        # difference: a pattern reads the text of that line, so a missing required pattern is
+        # conclusive. A required run that is still missing is not when a line of the commands
+        # was not read; with each of them read it is a fail whatever a typed line holds. A clean
+        # read of the forbidden runs is not when a typed line was not read. Not a pass and not a
+        # fail; a capture with gaps keeps its own error, below.
+        past_limit = None if hits or ran or missing else (unread if unrun else typed_unread)
+        if past_limit is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
             if missing:
@@ -3241,7 +3384,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             if unrun:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                parts.append(
+                    f"no worker command ran {named} across {len(commands)} command(s){sources}"
+                    + (_UNREAD_COMMAND_NOTE if unread is not None else "")
+                )
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -7414,7 +7560,7 @@ def _strings_in(value: Any) -> list[str]:
     return []
 
 
-def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
+def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> tuple[str, ShellReadLimitError | None]:
     """What one repetition said and wrote with, for charging a write to it:
     its reply, and the calls that create a branch or a pull request -- the
     front agent's and its delegated workers' tool calls (the worker
@@ -7425,8 +7571,19 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
     easily as this one's
     (:func:`kube_agents_bench.github_writes.writing_segments`), and a card's
     body, a comment or a file's content is prose, whose backticked ``git
-    push <branch>`` quotes a command rather than runs one."""
+    push <branch>`` quotes a command rather than runs one. A command past the
+    shell reader's limit has no segments; the second value is that error for
+    the first such command, or None."""
     parts = [snap.final_message, snap.output]
+    unread: list[ShellReadLimitError] = []
+
+    def segments(command: str) -> list[str]:
+        try:
+            return github_writes.writing_segments(command)
+        except ShellReadLimitError as limit:
+            unread.append(limit)
+            return []
+
     for call in snap.trajectory:
         if not isinstance(call, dict):
             continue
@@ -7436,12 +7593,18 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
         elif command is not None:
             # A terminal or execute_code call, clipped arguments decoded as the worker_commands
             # verifier decodes them (:func:`_code_call_text`).
-            parts.extend(github_writes.writing_segments(command))
+            parts.extend(segments(command))
     for row in snap.worker_commands or []:
         if isinstance(row, dict):
-            parts.extend(github_writes.writing_segments(str(row.get("command") or "")))
-    return "\n".join(parts)
+            parts.extend(segments(str(row.get("command") or "")))
+    return "\n".join(parts), unread[0] if unread else None
 
+
+_WRITES_SHELL_READ_LIMIT_REASON = (
+    "a command of this repetition is past the shell reader's limit ({limit}), so the calls in it "
+    "that create a branch or a pull request cannot be read, and a write in the window that "
+    "nothing else of this repetition names may be its own; this check could not be evaluated"
+)
 
 _NO_GITOPS_REPO_REASON = (
     f"no GitOps repository in the environment: set {github_writes.GITOPS_REPO_ENV_VAR} to "
@@ -7512,7 +7675,14 @@ class GitHubWritesVerifier(BaseVerifier):
     own tool calls, its delegated workers' tool calls, and their terminal
     commands. A read's arguments and every tool result are left out:
     ``gh pr view <url>``, ``vcs.py clone --branch <branch>`` and a listing
-    name another case's pull request as easily as this one's. On the inject
+    name another case's pull request as easily as this one's. A command past
+    the shell reader's limit
+    (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) has no argvs
+    to read those calls from. The check is then ``status="error"`` when a
+    write that must be attributed by name (each write in a shared window, and
+    a sweep-branch write in an exclusive one) is named by nothing that was
+    read, and no charged write that the case did not request decides the
+    result without it. On the inject
     lane the front agent's arguments arrive as shapes (the bridge sends no
     string value off the pod), so what names a write there is the reply and
     the workers' calls, which the harness reads back from the pod's session
@@ -7661,7 +7831,7 @@ class GitHubWritesVerifier(BaseVerifier):
             )
 
         requested = github_writes.proposal_numbers_named(snap.final_message, repo, forge)
-        own = _own_words_and_calls(snap)
+        own, own_unread = _own_words_and_calls(snap)
         allowance = self.requested_pull_requests
         unrequested = []
         excused = []
@@ -7677,6 +7847,12 @@ class GitHubWritesVerifier(BaseVerifier):
                 excused.append(write.describe())
                 continue
             unrequested.append(write)
+        # A command past the shell reader's limit was not read, and it can name a write that
+        # nothing else of this repetition names. A charged write that the case did not request
+        # is conclusive without it; with none, the check cannot say that the repetition has
+        # nothing to answer for.
+        if own_unread is not None and unattributed and not unrequested:
+            return done(False, _WRITES_SHELL_READ_LIMIT_REASON.format(limit=own_unread), status="error")
         raw = report.as_dict()
         raw.update(
             {
@@ -8598,13 +8774,13 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
-        "ingress-gateway-healthcheck-mismatch",
+        "ingress-gateway-healthcheck-mismatch", "image-pull-failing",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
-        "autoscaler-out-of-resources", "dangling-compute-class",
+        "autoscaler-out-of-resources", "dangling-compute-class", "ccc-unbacked-manual-fallback",
     ),
     "upgrade-retrospective": (
         "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",

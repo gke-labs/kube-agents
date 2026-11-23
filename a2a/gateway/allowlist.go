@@ -3,7 +3,8 @@ package gateway
 import "strings"
 
 // The platform agent's trusted-human allowlists, rendered by the operator from
-// the PlatformAgent CR's integration.{googleChat,slack}.allowedUsers. They
+// the PlatformAgent CR's integration.{googleChat,slack,teams}.allowedUsers
+// (Teams only while the gateway's Teams backend is armed). They
 // gate the one thing the ingress allowlist does not: a session asking the
 // gateway to mint a child task to the platform agent on a human's behalf
 // (spec-chatops-gateway.md, "Sessions by default"). The names are spelled
@@ -11,6 +12,7 @@ import "strings"
 const (
 	EnvTargetAllowedUsersGchat = "A2A_TARGET_ALLOWED_USERS_GCHAT"
 	EnvTargetAllowedUsersSlack = "A2A_TARGET_ALLOWED_USERS_SLACK"
+	EnvTargetAllowedUsersTeams = "A2A_TARGET_ALLOWED_USERS_TEAMS"
 )
 
 // targetPlatform is the only target with a rendered list today.
@@ -24,8 +26,9 @@ type targetAllowed map[string]map[string]map[string]bool
 
 // requesterSubject is the requester as the gateway stores and compares it:
 // the author id normalized in its backend's vocabulary (trimmed; Google Chat
-// ids are emails and lowercased, Slack member ids and every other backend's
-// kept exact), then pseudonymized under the install salt the way the
+// ids are emails and lowercased, Teams ids are lowercased as its ingress
+// list is, Slack member ids and every other backend's kept exact), then
+// pseudonymized under the install salt the way the
 // authority block's identifiers are. The session-state KV holds this and not
 // the id (spec-chatops-gateway.md, "Identifiers in `authority` are
 // pseudonymous"), and the target allowlists are hashed through the same
@@ -33,7 +36,7 @@ type targetAllowed map[string]map[string]map[string]bool
 // blank after trimming has no subject: "".
 func requesterSubject(ps *Pseudonymizer, backend, authorID string) string {
 	id := strings.TrimSpace(authorID)
-	if backend == gchatBackend {
+	if backend == gchatBackend || backend == teamsBackend {
 		id = strings.ToLower(id)
 	}
 	return ps.Hash(id)

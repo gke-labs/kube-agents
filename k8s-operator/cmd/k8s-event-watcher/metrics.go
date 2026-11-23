@@ -20,10 +20,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // processStartTimeMetric is the gauge the operator's usage poller reads to
@@ -34,6 +36,12 @@ import (
 // a second under an unchanged process, which the poller would read as a
 // restart. docs/designs/usage-counters-producer.md, "Resets".
 const processStartTimeMetric = "process_start_time_seconds"
+
+// watchSetReadyMetric is 0 while buildWatchSet is assembling the initial
+// watch set and 1 once cluster_up has been published for every initial
+// cluster. The operator's usage poller treats 0 as "still starting" so a
+// scrape during startup reads as no fleet reading rather than an empty fleet.
+const watchSetReadyMetric = "k8s_event_watcher_watch_set_ready"
 
 // metrics holds the Prometheus counters and gauges for the event watcher.
 //
@@ -151,6 +159,12 @@ type metrics struct {
 	// reloadAlertExcludeFile again on each change to the file.
 	alertExcludeRules   prometheus.Gauge
 	alertExcludeRefused prometheus.Gauge
+	// watchSetReady is 0 at boot until buildWatchSet returns and cluster_up
+	// is seeded for every initial cluster, then 1 for the life of the process.
+	// watchSetMu serializes that initial publish against scrapes so both
+	// families are collected from the same state.
+	watchSetReady prometheus.Gauge
+	watchSetMu    sync.RWMutex
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -276,6 +290,10 @@ func newMetrics() *metrics {
 			Name: processStartTimeMetric,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
 		}),
+		watchSetReady: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: watchSetReadyMetric,
+			Help: "1 once buildWatchSet has assembled the initial watch set and published k8s_event_watcher_cluster_up for every initial cluster; 0 while startup is still building it.",
+		}),
 		fleetNodes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_fleet_nodes",
 			Help: "Nodes across the clusters counted in the last fleet-shape probe: each cluster's currentNodeCount from its GKE description, summed. The direct cluster contributes 0 until a profile names it. 0 until the first probe finishes.",
@@ -310,6 +328,9 @@ func newMetrics() *metrics {
 		}, []string{"outcome"}),
 	}
 	m.processStart.Set(processStartSeconds(time.Now()))
+	// Seeded to 0 from the first scrape so a reader sees an unready startup
+	// rather than an omitted gauge before buildWatchSet finishes.
+	m.watchSetReady.Set(0)
 	// Both children from the first scrape, so a reader finds counted=0
 	// before the first probe rather than an absent series.
 	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeCounted).Set(0)
@@ -331,7 +352,7 @@ func newMetrics() *metrics {
 		m.triageSessions,
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
-		m.clusterUp,
+		watchSetCollector{m: m},
 		m.relists,
 		m.processStart,
 		m.fleetNodes,
@@ -344,6 +365,45 @@ func newMetrics() *metrics {
 		m.alertExcludeRefused,
 	)
 	return m
+}
+
+// watchSetCollector collects clusterUp and watchSetReady together under
+// watchSetMu.RLock so Gather never observes watch_set_ready=1 while the initial
+// cluster_up series are still being registered.
+type watchSetCollector struct {
+	m *metrics
+}
+
+func (c watchSetCollector) Describe(ch chan<- *prometheus.Desc) {
+	c.m.clusterUp.Describe(ch)
+	c.m.watchSetReady.Describe(ch)
+}
+
+func (c watchSetCollector) Collect(ch chan<- prometheus.Metric) {
+	c.m.watchSetMu.RLock()
+	defer c.m.watchSetMu.RUnlock()
+	c.m.clusterUp.Collect(ch)
+	// Emit an immutable snapshot captured under watchSetMu.RLock instead of
+	// delegating to watchSetReady.Collect: Registry.Gather calls Metric.Write
+	// after Collect returns and RUnlock has run, which would otherwise read 1
+	// from a concurrent publishWatchSet alongside 0 cluster_up series.
+	var snap dto.Metric
+	if err := c.m.watchSetReady.Write(&snap); err != nil {
+		ch <- prometheus.NewInvalidMetric(c.m.watchSetReady.Desc(), err)
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.m.watchSetReady.Desc(), prometheus.GaugeValue, snap.GetGauge().GetValue())
+}
+
+// publishWatchSet seeds cluster_up=0 for every initial cluster and marks
+// watch_set_ready=1 atomically under watchSetMu.
+func (m *metrics) publishWatchSet(clusters []targetCluster) {
+	m.watchSetMu.Lock()
+	defer m.watchSetMu.Unlock()
+	for _, tc := range clusters {
+		m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+	}
+	m.watchSetReady.Set(1)
 }
 
 // publishFleetShape sets the six fleet gauges from one probe's reading.

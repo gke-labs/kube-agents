@@ -90,7 +90,7 @@ const (
 // peopleBackends are the chat backends whose verified senders are people.
 // Named here, not derived from a metrics label set: the doors and the
 // console are programs or operators, not people.
-var peopleBackends = []string{gchatBackend, slackBackend, discordBackend}
+var peopleBackends = []string{gchatBackend, slackBackend, teamsBackend, discordBackend}
 
 // peopleDesk notes verified chat people in the people bucket and follows the
 // bucket in memory for count.

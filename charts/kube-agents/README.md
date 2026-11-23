@@ -748,20 +748,20 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod (plus its exec tier on port 8766 while `platformAgent.deployment.credentialProxy.exec.replicas` is above 0), so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod, so it scrapes the gateway's inbound-message,
-task terminal and Google Chat pull counters from its metrics-only port 9096.
-The operator's policies on all three pods admit the
+task terminal and Google Chat pull counters from its metrics-only port 9096, and the kube-proxy pod on port 8444, and `<name>-curator-monitoring`, so it scrapes the OKF memory curator (`<name>-curator`) `kubeagents_curator_*` series from port 8080 when operator env `A2A_CURATOR=true` renders the curator pod (matching no pod while `A2A_CURATOR` is off), and `<name>-a2a-nats-monitoring` on port 7777 when the A2A NATS exporter renders.
+The operator's policies on those pods admit the
 collector's namespace, `gke-gmp-system`, and the operator's own pods on those ports
 either way; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
 
-Non-GMP clusters scrape these metrics through the corresponding alternative knobs:
+Non-GMP clusters scrape the gateway, credential-proxy (including exec tier when `credentialProxy.exec.replicas > 0`), A2A gateway, and kube-proxy pods (ports 9095, 9097, 8766, 9096, and 8444) through the corresponding alternative knobs (`<name>-a2a-nats-monitoring` on port 7777 and `<name>-curator-monitoring` on port 8080 are `PodMonitoring`-only):
 
-- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the three pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
-- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the three pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
+- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the gateway, credential-proxy, A2A gateway, and kube-proxy pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
+- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the gateway, credential-proxy, A2A gateway, and kube-proxy pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
 
 Each monitoring knob (`podMonitoring`, `serviceMonitor`, `vmPodScrape`) is an independent tri-state:
 `null`, the default, renders them when the cluster serves the corresponding API and
@@ -982,11 +982,14 @@ install runs at once and renders only when set.
 
 ### MCP server (`operator.mcpServer.enabled`)
 
-`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
-then renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
-manages. It defaults to `false`. An
-`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
-still works and wins over the value. The
+The operator renders the MCP server (`<agent>-a2a-mcp`) beside every `PlatformAgent` it
+manages by default (`operator.mcpServer.enabled: true`). Setting `operator.mcpServer.enabled: false`
+sets `A2A_MCP_DOOR=false` on the controller manager and removes the server, its Service, its
+ServiceAccount, its NetworkPolicy and its token Secret. An `A2A_MCP_DOOR` entry in
+`operator.extraEnv` still works and wins over the value. A hand-run `helm upgrade` from a
+release where `operator.mcpServer.enabled` defaulted to `false` uses
+`--reset-then-reuse-values` (or `--set operator.mcpServer.enabled=true`), since
+`--reuse-values` preserves the earlier chart's default. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
 
@@ -1010,6 +1013,16 @@ It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it t
 when the gateway runs the Slack adapter. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
 user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
 off a real install, and a listed member's posts through any app in the workspace read as theirs.
+
+### Microsoft Teams on the A2A gateway (`A2A_TEAMS_BACKEND`)
+
+An `operator.extraEnv` entry `A2A_TEAMS_BACKEND=true` (no value key yet) has the A2A gateway's
+`teams` backend consume the credential broker's Teams queue for every `PlatformAgent` whose
+`integration.teams` is enabled, in place of the Planning Agent's Teams adapter: replies render as
+Adaptive Cards, the gateway's `chat.notify` route posts proactive alerts and reports into
+`integration.teams.homeChannel`, the agent's delivery resolver names Teams for the roster's scheduled reports (a Hermes cron job that names `deliver: teams` or `deliver: chat` by hand does not reach Teams there: the Hermes scheduler has no Teams platform on an armed install), and the broker admits the gateway on its Teams routes only on this switch. Off by default,
+so an operator upgrade moves no Teams install on its own. `docs/chatops/microsoft-teams.md` in the
+repository has the details.
 
 ### Data volume size (`platformAgent.storage.size`)
 
@@ -1408,8 +1421,9 @@ object — and the content policy only selects manifests carrying the
 Another, `kube-agents-a2a-gateway-pod`, is generated from
 `k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
 the A2A gateway's ServiceAccount creates to the session pod shape: the session
-ServiceAccount, no automount, the session token audiences, no Secret or host
-access, Pod Security "restricted", exactly the session labels, no runtime
+ServiceAccount, no automount, the session token audiences, no Secret volume, no
+Secret read but the session's own inference key, no host access, Pod Security
+"restricted", exactly the session labels, no runtime
 class, node selector, affinity or positive priority, and only the scheduler and
 tolerations the API server and GKE add. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
@@ -1506,11 +1520,12 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an operator flag,
-listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning).
-The profile dispatcher runs by default, so it is in `footprint.yaml`, and switched off
-(`operator.profileDispatcher.enabled: false`) it is still counted. It has a ceiling: about 200
+It also counts the standing pods the operator renders only behind an opt-in operator flag,
+listed with their sizes in `files/flagged-pods.yaml` (such as the OKF memory curator when
+`A2A_CURATOR` is `true`).
+The MCP server and the profile dispatcher both run by default, so they are in `footprint.yaml`,
+and switched off (`operator.mcpServer.enabled: false` or `operator.profileDispatcher.enabled: false`)
+each is still counted. The profile dispatcher has a ceiling: about 200
 AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 1.30+, where each
 carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
 profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones

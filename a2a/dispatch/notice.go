@@ -125,7 +125,33 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
 	// The five- or six-token form, as the operator's config says (#5301):
-	// readers watch both, and the operator moves the dispatcher to the
-	// six-token one only once every reader that can run does.
-	return d.busFor(hk.profile).Publish(ctx, d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID), env)
+	// readers read the five-token form as a profile task's fallback only
+	// until the install's cutoff, and past it that terminal isn't read. The
+	// operator moves the dispatcher to the six-token form only once every
+	// reader that can run watches both.
+	subject := d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID)
+	err = d.busFor(hk.profile).Publish(ctx, subject, env)
+	five := lib.TaskSupervisorSubject(hk.profile, sub.TaskID)
+	if err == nil || subject == five {
+		return err
+	}
+	// The six-token write failed: most likely a grant that hasn't reached
+	// this connection (a callout restart, a partial rollback) or was taken
+	// away. Both forms are granted, and readers read the five-token one
+	// until the install's cutoff (past it, this fallback terminal isn't
+	// read), so the terminal goes on the five-token one now rather than
+	// being retried without end while the task holds its slot. The envelope id is the
+	// same, so a six-token write that did land is deduplicated onto it.
+	//
+	// The fallback gets its own deadline. A refused publish draws no
+	// JetStream ack, so the first one waits out the caller's context, and a
+	// caller that gave both one deadline (publishTerminalRetry's kvOpTimeout)
+	// would hand the fallback an expired one: it would fail at once and the
+	// held task would be retried without end anyway.
+	d.supervisorFallbacks.Add(1)
+	d.log.Warn("profile task terminal refused on the six-token supervisor subject; writing it on the five-token one",
+		"profile", hk.profile, "task", sub.TaskID, "subject", subject, "err", err)
+	fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kvOpTimeout)
+	defer cancel()
+	return d.busFor(hk.profile).Publish(fallbackCtx, five, env)
 }

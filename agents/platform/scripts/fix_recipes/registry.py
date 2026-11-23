@@ -6,15 +6,18 @@ rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
 (`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
 A recipe's safety checks are its `checks.py`, which the broker's label gate
-loads through :func:`checks_module`.
+and the sandbox's pre-flight (`fleet-audit/scripts/fix_preflight.py`) both load
+through :func:`checks_module`.
 Those are the lists; the code that handles one kind's fix is still per kind
-(`automerge_eligibility.FIX_TYPE`, `audit_report.GENERATED_FIX_CHECK`), so a
-recipe alone gets a dial row and post-merge records but no broker label. How the
-post-merge check sees the fix applied, and whether it holds a health window, is
-declared here (`applied`, `health`) and run by `fix_recipes/probes.py`.
+(`automerge_eligibility.FIX_TYPE`, `audit_report.GENERATED_FIX_CHECK`,
+`fix_preflight.CHANGES`), so a recipe alone gets a dial row and post-merge
+records but no broker label. How the post-merge check sees the fix applied, and
+whether it holds a health window, is declared here (`applied`, `health`) and run
+by `fix_recipes/probes.py`.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
-through `automation_rules`, and neither may depend on PyYAML being there. So
+(through `automation_rules`, and the proxy also through
+`automerge_eligibility`), and neither may depend on PyYAML being there. So
 `recipe.yaml` is a strict subset of YAML: one `key: value` per line, `#`
 comments, a value plain or in double quotes. Anything else refuses the file,
 and a refused or missing recipe is an import-time error, caught by the tests,
@@ -45,6 +48,12 @@ The verification fields, all optional:
 - `health`: `restart_flat` (the default) holds the health window on the
   workload the record names; `none` passes the window on the run after the fix
   is applied, for a fix whose object is not a workload.
+
+A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
+`generator(kind)`, and stdlib only for the same reason. `no-pdb` has one:
+the audit calls it through `audit_report._pdb_manifest`, and the broker
+re-runs it to verify a pull request
+(`automerge_eligibility.verify_added_manifest`).
 """
 
 from __future__ import annotations
@@ -53,12 +62,14 @@ import functools
 import importlib.util
 import json
 import re
-from types import ModuleType
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 RECIPE_FILE = "recipe.yaml"
+# A recipe's fix generator, beside its recipe.yaml (optional until every kind has one).
+FIX_FILE = "fix.py"
 #: A recipe's safety checks: `read_kinds` (one namespace read) and
 #: `checks(change, live)`, each result named and `pass`, `fail` or `unknown`.
 CHECKS_FILE = "checks.py"
@@ -216,6 +227,30 @@ def kinds() -> frozenset[str]:
 def recipe(kind: str) -> Recipe | None:
     """The recipe for `kind`, or None for a kind the registry does not list."""
     return next((found for found in recipes() if found.kind == kind), None)
+
+def generator(kind: str, root: Path = HERE) -> ModuleType:
+    """The `fix.py` of `kind`'s recipe, loaded once per file.
+
+    Loaded from its path: a kind is a check id such as `no-pdb`, and a hyphen
+    is not an importable package name. RecipeError for a kind with no valid
+    recipe or no `fix.py`.
+    """
+    if not KIND_RE.fullmatch(kind) or not (root / kind / RECIPE_FILE).is_file():
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    if kind not in {found.kind for found in (recipes() if root == HERE else load(root))}:
+        raise RecipeError(f"no recipe for kind {kind!r}")
+    path = root / kind / FIX_FILE
+    if not path.is_file():
+        raise RecipeError(f"{kind}/{FIX_FILE}: missing")
+    return _load_fix(path.resolve(), kind)
+
+
+@functools.cache
+def _load_fix(path: Path, kind: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(f"fix_recipes.{kind.replace('-', '_')}_fix", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @functools.lru_cache(maxsize=None)
