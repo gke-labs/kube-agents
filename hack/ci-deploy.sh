@@ -3244,16 +3244,25 @@ echo "${EVAL_FRONT_DOOR}" >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null |
 # front-door.txt with both routes, and fails the deploy on a mismatch or a
 # route it can't read.
 verify_front_door() {
-  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved="" out attempt
+  local gateway="deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" resolved="" out errfile attempt
+  # kubectl's stderr goes to its own file, never into the value parsed: a read
+  # that succeeds with a warning on stderr still yields the route. An empty
+  # read is retried as a failed one is.
+  errfile="$(mktemp)"
   for ((attempt = 1; attempt <= BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
     if out="$(kubectl get "${gateway}" -n "${NAMESPACE}" \
-      -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>&1)"; then
+      -o jsonpath='{range .spec.template.spec.containers[*]}{range .env[?(@.name=="A2A_DEFAULT_ADDRESSEE")]}{.value}{"\n"}{end}{end}' 2>"${errfile}")"; then
       resolved="$(awk 'NF { print; exit }' <<<"${out}")"
-      break
+      if [ -n "${resolved}" ]; then
+        break
+      fi
+      echo "front door: ${gateway} has no A2A_DEFAULT_ADDRESSEE yet (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS})" >&2
+    else
+      echo "front door: reading ${gateway} failed (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS}): $(cat "${errfile}")" >&2
     fi
-    echo "front door: reading ${gateway} failed (attempt ${attempt} of ${BRIDGE_TEMPLATE_READ_ATTEMPTS}): ${out}" >&2
     sleep "${MODE_NEXT_POLL_SECONDS}"
   done
+  rm -f "${errfile}"
   printf 'requested=%s\nresolved=%s\n' "${EVAL_FRONT_DOOR}" "${resolved:-unknown}" \
     >"${DEPLOY_ARTIFACT_DIR}/front-door.txt" 2>/dev/null || true
   if [ -z "${resolved}" ]; then

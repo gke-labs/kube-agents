@@ -1956,7 +1956,9 @@ def _front_door_record(tmp: str) -> str:
     return pathlib.Path(tmp, "front-door.txt").read_text(encoding="utf-8")
 
 
-def verify_front_door_run(asked: str, rendered: str | None, tmp: str, fail_first: int = 0) -> subprocess.CompletedProcess:
+def verify_front_door_run(
+    asked: str, rendered: str | None, tmp: str, fail_first: int = 0, empty_first: int = 0, warn: bool = False
+) -> subprocess.CompletedProcess:
     """ci-deploy's verify_front_door over a stub kubectl. The stub answers
     only the read the function should make (the gateway Deployment, in the
     namespace, filtered to A2A_DEFAULT_ADDRESSEE), failing its first
@@ -1974,6 +1976,10 @@ def verify_front_door_run(asked: str, rendered: str | None, tmp: str, fail_first
             "  esac",
             '  echo x >>"${_calls_file}"',
             f'  if [ "$(wc -l <"${{_calls_file}}")" -le {fail_first} ]; then echo "connection refused" >&2; return 1; fi',
+            f'  if [ "$(wc -l <"${{_calls_file}}")" -le {fail_first + empty_first} ]; then return 0; fi',
+            # A warning on stderr, as a version skew or an auth plugin prints
+            # on a read that still succeeds.
+            '  echo "W1123 20:10:09 memcache.go:265] couldn\'t get current server API group list" >&2' if warn else "  :",
             f"  {answer}",
             "}",
             "sleep() { :; }",
@@ -2023,6 +2029,19 @@ class FrontDoorVerifiedTest(unittest.TestCase):
             self.assertIn("attempt 1 of 3", result.stderr)
             self.assertIn("connection refused", result.stderr)
             self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=session\n")
+
+    def test_a_warning_on_a_good_read_is_not_the_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "session", tmp, warn=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=session\n")
+
+    def test_an_empty_read_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("platform", "platform", tmp, empty_first=2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("has no A2A_DEFAULT_ADDRESSEE yet (attempt 2 of 3)", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=platform\nresolved=platform\n")
 
     def test_an_unreadable_route_fails_the_deploy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
