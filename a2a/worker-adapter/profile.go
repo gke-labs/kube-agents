@@ -647,6 +647,9 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		}
 	}
 	cfg.HarnessEnv = append(cfg.HarnessEnv, taskParameterEnv(h.origin, cfg.Logger)...)
+	// After the parameters, so that even a name they could spell can't stand
+	// in for the trigger's (they can't: their prefix is PROFILE_TASK_).
+	cfg.HarnessEnv = append(cfg.HarnessEnv, taskTriggerEnv(h.origin, cfg.Logger)...)
 	a := newTaskAdapter(cfg, bus)
 	a.dispatched = true
 	a.abandon = h.abandon
@@ -772,6 +775,43 @@ func (w *profileWorker) finish(h *held, out turnOutcome) {
 	if err := w.b.nc.Flush(); err != nil {
 		w.cfg.Logger.Warn("flushing the final renewal", "task", h.offer.TaskID, "err", err)
 	}
+}
+
+// The trigger a dispatched task came from (#4685, #5623), as the harness
+// reads it. Runtime-owned: they come from the submission's authority block,
+// never from a task parameter, whose names all take the PROFILE_TASK_ prefix
+// (taskParameterEnv), so no parameter can set or override them. The fleet
+// audit's shadow run names its report stream after the schedule
+// (audit_report.py's SHADOW_TRIGGER_STREAM_ENV).
+const (
+	profileTriggerStreamEnv = "PROFILE_TRIGGER_STREAM"
+	profileTriggerOriginEnv = "PROFILE_TRIGGER_ORIGIN"
+)
+
+// taskTriggerEnv is the submission's trigger, PROFILE_TRIGGER_STREAM and
+// PROFILE_TRIGGER_ORIGIN, each only when the trigger names it; nothing for a
+// task no trigger started. The block's trigger is a claim the dispatcher
+// checked against the grant before it offered the task; a script that acts
+// on the stream does it through the broker, which holds every report write
+// to the stream the signed task credential names. A block that can't be read
+// passes none on.
+func taskTriggerEnv(origin *lib.Envelope, log interface{ Warn(string, ...any) }) []string {
+	trigger, err := capability.TriggerFromAuthority(origin.Authority)
+	if err != nil {
+		log.Warn("the submission's trigger can't be read; none is passed on", "task", origin.TaskID, "err", err)
+		return nil
+	}
+	if trigger == nil {
+		return nil
+	}
+	var env []string
+	if trigger.Stream != "" {
+		env = append(env, profileTriggerStreamEnv+"="+trigger.Stream)
+	}
+	if trigger.Origin != "" {
+		env = append(env, profileTriggerOriginEnv+"="+trigger.Origin)
+	}
+	return env
 }
 
 // taskParameterEnv is the submission's declared parameters as the harness
