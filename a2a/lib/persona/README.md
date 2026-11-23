@@ -58,8 +58,10 @@ An adapter maps a loaded persona to a harness and reads nothing else: no
 network, no credentials, no environment. Whatever the pod knows, such as
 the relay's address, the worker passes in as a `Target`. What a harness
 cannot express comes back as a warning, never an error.
-`render.For(harness)` picks the adapter by the harness value the worker is
-started with (`claude-code` or `antigravity`).
+`render.For(harness)` picks the adapter by the harness the worker is started
+with: `A2A_HARNESS`, or on a profile worker `PROFILE_HARNESS` when that is
+unset (`claude-code` or `antigravity`; a worker refuses `antigravity` until it
+has a driver for it).
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
