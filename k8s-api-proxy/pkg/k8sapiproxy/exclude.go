@@ -93,16 +93,27 @@ func parseExclusions(path string) (map[clusterRef]bool, map[[2]string]bool, erro
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, nil, fmt.Errorf("the install's scope file can't be parsed")
 	}
-	refs, numbered := map[clusterRef]bool{}, map[[2]string]bool{}
 	if doc.Exclude == nil {
-		return refs, numbered, nil
+		return map[clusterRef]bool{}, map[[2]string]bool{}, nil
 	}
-	for _, entry := range doc.Exclude.Clusters {
+	refs, numbered, ok := parseClusterRefs(doc.Exclude.Clusters)
+	if !ok {
+		return nil, nil, fmt.Errorf("the install's scope file can't be parsed")
+	}
+	return refs, numbered, nil
+}
+
+// parseClusterRefs reads a list of {projectId, location, clusterName} entries, as
+// exclude.clusters and hold.clusters spell them, and also indexes the entries spelled by
+// project number by location and name. ok is false for any malformed entry.
+func parseClusterRefs(entries []map[string]any) (refs map[clusterRef]bool, numbered map[[2]string]bool, ok bool) {
+	refs, numbered = map[clusterRef]bool{}, map[[2]string]bool{}
+	for _, entry := range entries {
 		parts := [3]string{}
 		for i, key := range []string{"projectId", "location", "clusterName"} {
-			value, ok := entry[key].(string)
-			if !ok || !excludeNamePart.MatchString(value) {
-				return nil, nil, fmt.Errorf("the install's scope file can't be parsed")
+			value, isString := entry[key].(string)
+			if !isString || !excludeNamePart.MatchString(value) {
+				return nil, nil, false
 			}
 			parts[i] = value
 		}
@@ -111,7 +122,7 @@ func parseExclusions(path string) (map[clusterRef]bool, map[[2]string]bool, erro
 			numbered[[2]string{parts[1], parts[2]}] = true
 		}
 	}
-	return refs, numbered, nil
+	return refs, numbered, true
 }
 
 // check returns the refusal for a request to clusterID, or nil to let it through.

@@ -373,16 +373,20 @@ func TestTeamsRelayError(t *testing.T) {
 
 // fakeTeamsRelay speaks the credential proxy's Teams relay: one event is
 // handed out on the first pull, every later pull is empty, and every ack,
-// nack and api call is recorded.
+// nack and api call is recorded. A test that sets pullStatus or apiStatus
+// has that route refuse instead, with apiBody as the refusal's body.
 type fakeTeamsRelay struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 
-	event   map[string]any
-	pulled  bool
-	acks    []string
-	apiCall []map[string]any
-	tokens  []string
+	event      map[string]any
+	pulled     bool
+	acks       []string
+	apiCall    []map[string]any
+	tokens     []string
+	pullStatus int
+	apiStatus  int
+	apiBody    map[string]any
 }
 
 func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
@@ -398,6 +402,10 @@ func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case teamsRelayEventsPath:
+			if f.pullStatus != 0 {
+				w.WriteHeader(f.pullStatus)
+				return
+			}
 			if f.pulled || f.event == nil {
 				_ = json.NewEncoder(w).Encode(map[string]any{"event": nil})
 				return
@@ -409,6 +417,11 @@ func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
 			_ = json.NewEncoder(w).Encode(map[string]any{"settled": true})
 		case teamsRelayAPIPath:
 			f.apiCall = append(f.apiCall, body)
+			if f.apiStatus != 0 {
+				w.WriteHeader(f.apiStatus)
+				_ = json.NewEncoder(w).Encode(f.apiBody)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"response": map[string]any{"id": "1794603936403-reply"}})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -419,8 +432,12 @@ func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
 }
 
 func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
-	relay := newFakeTeamsRelay(t, testTeamsActivity("f:9", "<at>Kage</at> how many nodes?"))
+	event := testTeamsActivity("f:9", "<at>Kage</at> how many nodes?")
+	event["timestamp"] = time.Now().Add(-1500 * time.Millisecond).UTC().Format(time.RFC3339Nano)
+	relay := newFakeTeamsRelay(t, event)
 	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan InboundMessage, 1)
 	done := make(chan error, 1)
@@ -432,6 +449,15 @@ func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no turn handed over")
+	}
+	// Every pull after the one that carried the activity comes back empty,
+	// and each is counted: the series an idle install shows rising.
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEmpty)) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("no empty pull counted")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err == nil {
@@ -446,6 +472,161 @@ func TestTeamsRunPullsAcksAndHandsOver(t *testing.T) {
 		if tok != "projected-token" {
 			t.Fatalf("relay saw token %q", tok)
 		}
+	}
+	// The pull that carried the activity is counted under events, and the
+	// turn's lag from the activity's own timestamp is observed once.
+	if got := counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEvents)); got != 1 {
+		t.Errorf("events pulls %v, want 1", got)
+	}
+	if got := counterValue(t, m.teamsEventsReceived); got != 1 {
+		t.Errorf("events received %v, want 1", got)
+	}
+	if got := histogramCount(t, m.teamsIngressLag.WithLabelValues()); got != 1 {
+		t.Errorf("ingress lag observations %d, want 1", got)
+	}
+}
+
+// runTeamsOnce runs the adapter against a relay holding one activity until
+// the activity is acked, and returns the turns handed over.
+func runTeamsOnce(t *testing.T, event map[string]any, m *Metrics) []InboundMessage {
+	t.Helper()
+	relay := newFakeTeamsRelay(t, event)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	a.SetMetrics(m)
+	ctx, cancel := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	var turns []InboundMessage
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Run(ctx, func(msg InboundMessage) {
+			mu.Lock()
+			defer mu.Unlock()
+			turns = append(turns, msg)
+		})
+	}()
+	// An empty pull after the activity's means the activity was acked and
+	// either handed over or passed by.
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEmpty)) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the activity was never passed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	return turns
+}
+
+// The lag is a turn's: an activity the adapter does not take as a turn is
+// not observed, whatever its timestamp.
+func TestTeamsIngressLagSkipsAnActivityThatIsNotATurn(t *testing.T) {
+	event := testTeamsActivity("f:10", "<at>Kage</at> hi")
+	event["type"] = "conversationUpdate"
+	event["timestamp"] = time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano)
+	m := NewMetrics()
+	if turns := runTeamsOnce(t, event, m); len(turns) != 0 {
+		t.Fatalf("a conversationUpdate was handed over: %+v", turns)
+	}
+	if got := histogramCount(t, m.teamsIngressLag.WithLabelValues()); got != 0 {
+		t.Errorf("ingress lag observations %d, want 0", got)
+	}
+}
+
+// The timestamp is telemetry only: one that is not a string is not observed
+// and the message is still a turn.
+func TestTeamsATimestampOfAnotherTypeStillHandsTheTurnOver(t *testing.T) {
+	event := testTeamsActivity("f:11", "<at>Kage</at> how many nodes?")
+	event["timestamp"] = 1794603936
+	m := NewMetrics()
+	turns := runTeamsOnce(t, event, m)
+	if len(turns) != 1 || turns[0].Text != "how many nodes?" {
+		t.Fatalf("handed over: %+v", turns)
+	}
+	if got := histogramCount(t, m.teamsIngressLag.WithLabelValues()); got != 0 {
+		t.Errorf("ingress lag observations %d, want 0", got)
+	}
+}
+
+func TestTeamsPostIsTimedUnderTheCreateOperation(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
+	if _, err := a.Post("teams:"+testTeamsChannel, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Edit("teams:"+testTeamsChannel, "1794603936403-reply", "hello again"); err != nil {
+		t.Fatal(err)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodCreate, teamsCallOK)); got != 1 {
+		t.Errorf("create ok observations %d, want 1", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodUpdate, teamsCallOK)); got != 1 {
+		t.Errorf("update ok observations %d, want 1", got)
+	}
+}
+
+// A 429 Microsoft answered reaches the gateway as the broker's 502 with the
+// status under teams.status; through Post it reads rate_limited and counts,
+// while a 429 the broker answered itself is an error and does not.
+func TestTeamsPostReadsMicrosofts429ThroughTheBroker(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	relay.apiStatus = http.StatusBadGateway
+	relay.apiBody = map[string]any{"error": "upstream", "teams": map[string]any{"status": 429}}
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
+	if _, err := a.Post("teams:"+testTeamsChannel, "hello"); err == nil {
+		t.Fatal("a post Microsoft refused 429 succeeded")
+	}
+	if got := counterValue(t, m.teamsRateLimited.WithLabelValues(teamsAPIMethodCreate)); got != 1 {
+		t.Errorf("rate-limited creates = %v, want 1", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodCreate, teamsCallRateLimited)); got != 1 {
+		t.Errorf("create/rate_limited observations = %d, want 1", got)
+	}
+
+	relay.mu.Lock()
+	relay.apiStatus = http.StatusTooManyRequests
+	relay.apiBody = map[string]any{"error": "slow down"}
+	relay.mu.Unlock()
+	if err := a.Edit("teams:"+testTeamsChannel, "1794603936403-reply", "hello again"); err == nil {
+		t.Fatal("an edit the broker refused 429 succeeded")
+	}
+	if got := counterValue(t, m.teamsRateLimited.WithLabelValues(teamsAPIMethodUpdate)); got != 0 {
+		t.Errorf("rate-limited updates = %v, want 0", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodUpdate, teamsCallError)); got != 1 {
+		t.Errorf("update/error observations = %d, want 1", got)
+	}
+}
+
+// A pull the broker refuses counts under failed and the loop keeps going.
+func TestTeamsRunCountsARefusedPullAsFailed(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	relay.pullStatus = http.StatusInternalServerError
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	m := NewMetrics()
+	a.SetMetrics(m)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) { t.Error("a refused pull handed over a turn") }) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for counterValue(t, m.teamsPulls.WithLabelValues(teamsPullFailed)) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("no failed pull counted")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("Run returned nil after cancel")
+	}
+	if got := counterValue(t, m.teamsPulls.WithLabelValues(teamsPullEvents)); got != 0 {
+		t.Errorf("events pulls %v, want 0", got)
 	}
 }
 

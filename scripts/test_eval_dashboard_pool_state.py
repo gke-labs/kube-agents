@@ -214,7 +214,16 @@ class OneProject(ScanHarness):
         # and fails at its first agent call on a wrong restriction.
         for finding_id in verifier.GEMINI_KEY_FINDINGS:
             self.assertFalse(pool_state.passes_leases(finding_id), finding_id)
-        candidates = (FINDING, "gke/host-otel-scope", verifier.FINDING_COMPUTE_SWEEPER_MISSING, "gke/cluster/seeded-b", verifier.FINDING_DNS_API) + tuple(verifier.FORGE_FINDINGS) + tuple(verifier.GEMINI_KEY_FINDINGS)
+        # The seeded fleet's Config Sync needs the API and the reconciler's
+        # gkehub grant; only the reconcile reads them, so a leased run passes.
+        self.assertTrue(pool_state.passes_leases(verifier.FINDING_CONFIG_MANAGEMENT_API))
+        self.assertTrue(pool_state.passes_leases(verifier.FINDING_FLEET_RECONCILER_GKEHUB))
+        candidates = (
+            (FINDING, "gke/host-otel-scope", verifier.FINDING_COMPUTE_SWEEPER_MISSING, "gke/cluster/seeded-b", verifier.FINDING_DNS_API)
+            + tuple(verifier.FORGE_FINDINGS)
+            + tuple(verifier.GEMINI_KEY_FINDINGS)
+            + (verifier.FINDING_CONFIG_MANAGEMENT_API, verifier.FINDING_FLEET_RECONCILER_GKEHUB)
+        )
         self.assertEqual(frozenset(f for f in candidates if pool_state.passes_leases(f)), verifier.LEASE_SILENT_FINDINGS)
 
     def test_the_stub_exits_the_way_the_verifier_does(self):

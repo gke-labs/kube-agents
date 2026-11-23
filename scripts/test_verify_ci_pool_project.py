@@ -536,8 +536,16 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertEqual(
             checker.LEASE_SILENT_FINDINGS,
             frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API})
-            | checker.FORGE_FINDINGS,
+            | checker.FORGE_FINDINGS
+            | {checker.FINDING_CONFIG_MANAGEMENT_API, checker.FINDING_FLEET_RECONCILER_GKEHUB},
         )
+        # The seeded fleet's Config Sync needs the API and the reconciler's
+        # gkehub grant; only the reconcile reads them, so a leased run passes
+        # without them. The ids are the ones the API and IAM checks emit.
+        self.assertEqual(checker.FINDING_CONFIG_MANAGEMENT_API, "apis/anthosconfigmanagement.googleapis.com")
+        self.assertIn("anthosconfigmanagement.googleapis.com", checker.REQUIRED_APIS)
+        self.assertEqual(checker.FINDING_FLEET_RECONCILER_GKEHUB, "iam/fleet-reconciler/missing/roles/gkehub.editor")
+        self.assertIn("roles/gkehub.editor", checker.FLEET_RECONCILER_ROLES)
         # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
         # public lanes read none of them, so a leased run passes with any of them.
         # The Gemini key findings red runs (GeminiApiKeyCheckTest).
@@ -4934,6 +4942,11 @@ FLEET_RESOURCE_ROLES = {
     # orphan_snapshot.py's probe, whose reads are `gcloud compute snapshots
     # describe` and `disks list`: compute.storageAdmin's, held already.
     "external": {"roles/container.admin", "roles/compute.storageAdmin"},
+    # seeded-a's fleet membership and its Config Sync (config-sync.tf). The
+    # membership's create also reads the cluster, which container.admin covers.
+    "google_gke_hub_membership": {"roles/gkehub.editor", "roles/container.admin"},
+    "google_gke_hub_feature": {"roles/gkehub.editor"},
+    "google_gke_hub_feature_membership": {"roles/gkehub.editor"},
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.

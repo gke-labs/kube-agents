@@ -20,9 +20,11 @@
 # Sealed Secrets is a public chart that needs nothing outside the cluster and
 # that no install carries.
 #
-# Where it runs: no reconciler syncs anything on an eval pool project (the
-# seeded fleet carries no Argo CD, Flux or Config Sync) or on a dev install's
-# own cluster, so every install this case reaches is a "stop" install: either
+# Where it runs: no reconciler renders charts on an eval pool project (the
+# seeded fleet carries no Argo CD or Flux; the Config Sync a project may turn
+# on for seeded-a, bench/tf/fleet/config-sync.tf, syncs one namespace's plain
+# manifests and renders no chart) or on a dev install's own cluster, so every
+# install this case reaches is a "stop" install: either
 # a registered repository that nothing renders charts from, or no registered
 # repository at all. Both stops pass; the reply has to say which piece is
 # missing. Nothing is planted and nothing needs cleaning up.

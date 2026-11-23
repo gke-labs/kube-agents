@@ -163,13 +163,22 @@ func (claudeBuilder) env(env []string, has func(string) bool) []string {
 
 // userSettings: settings.json in $CLAUDE_CONFIG_DIR, else in ~/.claude.
 func (claudeBuilder) userSettings(getenv func(string) string) string {
-	dir := getenv(claudeConfigDirEnv)
+	dir := claudeConfigDir(getenv)
 	if dir == "" {
-		home := getenv("HOME")
-		if home == "" {
-			return ""
-		}
-		dir = filepath.Join(home, claudeDefaultConfigDir)
+		return ""
 	}
 	return filepath.Join(dir, claudeUserSettingsFile)
+}
+
+// claudeConfigDir is Claude Code's config directory: $CLAUDE_CONFIG_DIR,
+// else ~/.claude. "" when neither is known.
+func claudeConfigDir(getenv func(string) string) string {
+	if dir := getenv(claudeConfigDirEnv); dir != "" {
+		return dir
+	}
+	home := getenv("HOME")
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, claudeDefaultConfigDir)
 }

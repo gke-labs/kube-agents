@@ -19298,6 +19298,32 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(self.upstream_requests))
 
+    def test_the_get_credentials_check_is_refused_for_a_held_cluster(self):
+        # spec.hold answers on the same route, under its own rule, and
+        # the cluster's describe without the header stays a control-plane read.
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "scope.json").write_text("{}", encoding="utf-8")
+        (directory / "hold.json").write_text(json.dumps({"clusters": [
+            {"projectId": "acme-prod", "location": "us-central1", "clusterName": "paused"}], "reason": "INC-9"}),
+            encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(directory / "scope.json"),
+            holds=scope_exclude.Holds(path=lambda: str(directory / "hold.json")),
+        )
+        self.reply["body"] = b'{"name":"paused","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="paused"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, body["rule"])
+        self.assertIn("INC-9", body["message"])
+        self.assertEqual([], self.upstream_requests)
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="paused"))
+        self.assertEqual(200, status)
+
     def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
         self._exclude("acme-prod", "us-central1", "secret-cluster")
         self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
@@ -23007,6 +23033,44 @@ class ExcludedClusterPathTest(unittest.TestCase):
                 self.exclude()
                 result = executor.execute(["kubectl", "get", "pods"])
                 self.assertNotIn("ExcludedCluster", result.stderr)
+
+    def hold(self, document):
+        """Rewrite hold.json, as an edit to spec.hold lands in its ConfigMap mount."""
+        text = json.dumps(document)
+        self.hold_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(text)
+        os.utime(self.hold_file, ns=(stamp, stamp))
+
+    def held_executor(self):
+        import scope_exclude
+
+        self.hold_file = Path(self.temp_dir.name) / "hold.json"
+        executor = self.executor()
+        executor.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(self.scope_file), holds=scope_exclude.Holds(path=lambda: str(self.hold_file)))
+        return executor
+
+    def test_a_held_cluster_is_refused_until_the_hold_is_lifted_and_its_describe_stays_allowed(self):
+        import scope_exclude
+
+        executor = self.held_executor()
+        self.hold({"clusters": [{"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": self.EXCLUDED}],
+                   "reason": "INC-7"})
+        for call in (
+            lambda: executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)),
+            lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True),
+        ):
+            with self.assertRaises(scope_exclude.HeldCluster) as caught:
+                call()
+            self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, caught.exception.rule)
+            self.assertIn("INC-7", str(caught.exception))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.hold({})
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
 
     def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
         """Control-plane reads are the project's, and stay allowed."""
