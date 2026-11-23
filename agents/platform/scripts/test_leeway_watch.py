@@ -2323,6 +2323,67 @@ class BatchTests(unittest.TestCase):
             {"p1/l/c00": watch.iso(T0), "p1/l/c01": watch.iso(T0), "p9/l/other": old},
         )
 
+    def test_cluster_stamps_for_out_of_scope_projects_and_removed_explicit_clusters_expire_by_age(self) -> None:
+        self.roster = {"p1": triples("p1", 1)}
+        at_cutoff = watch.iso(T0 - timedelta(days=watch.CLUSTER_RUNS_RETENTION_MULTIPLIER * watch.REFRESH_DAYS_DEFAULT))
+        past_cutoff = watch.iso(
+            T0 - timedelta(days=watch.CLUSTER_RUNS_RETENTION_MULTIPLIER * watch.REFRESH_DAYS_DEFAULT, seconds=1)
+        )
+        self.write_ledger(
+            **{
+                watch.CLUSTER_RUNS_KEY: {
+                    "p9/l/at-cutoff": at_cutoff,
+                    "p9/l/expired": past_cutoff,
+                    "p9/l/corrupt": "not-an-iso-timestamp",
+                }
+            }
+        )
+        self.tick(0)
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
+            {"p1/l/c00": watch.iso(T0), "p9/l/at-cutoff": at_cutoff},
+        )
+
+        # In LEEWAY_WATCH_CLUSTERS mode, a removed explicit cluster stays within
+        # the retention window and is pruned once older than 2 * LEEWAY_WATCH_REFRESH_DAYS.
+        with mock.patch.dict(
+            os.environ,
+            {watch.CLUSTERS_ENV: "p1/l/c00", watch.PROJECTS_ENV: "", watch.REFRESH_DAYS_ENV: "3"},
+        ):
+            within_six_days = watch.iso(T0 - timedelta(days=6))
+            older_than_six_days = watch.iso(T0 - timedelta(days=6, seconds=1))
+            self.write_ledger(
+                **{
+                    watch.CLUSTER_RUNS_KEY: {
+                        "p2/l/kept": within_six_days,
+                        "p2/l/dropped": older_than_six_days,
+                    }
+                }
+            )
+            self.tick(0)
+            self.assertEqual(
+                watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
+                {"p1/l/c00": watch.iso(T0), "p2/l/kept": within_six_days},
+            )
+
+        # A failed tick saves updated sweep-order stamps via save_stamps without pruning old entries.
+        self.write_ledger(**{watch.CLUSTER_RUNS_KEY: {"p9/l/expired": past_cutoff}})
+        self.tick(0, hangs(*self.roster["p1"]))
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
+            {"p1/l/c00": watch.iso(T0), "p9/l/expired": past_cutoff},
+        )
+
+        # An empty scope (no project scanned) does not prune existing cluster_runs entries.
+        self.write_ledger(**{watch.CLUSTER_RUNS_KEY: {"p9/l/expired": past_cutoff}})
+        empty = mock.Mock(projects=(), excluded_clusters=())
+        with mock.patch.object(watch, "declared_scope", return_value=empty):
+            self.tick(0)
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
+            {"p9/l/expired": past_cutoff},
+        )
+
     # --- one turn per project ---------------------------------------------
 
     def test_a_timed_out_call_ends_the_projects_turn_and_costs_only_its_own_clusters(self) -> None:
