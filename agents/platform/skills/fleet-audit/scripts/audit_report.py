@@ -3878,12 +3878,19 @@ def task_is_shadow() -> bool | None:
 
 
 def run_is_shadow(audit_id: str) -> bool | None:
-    """What this run's `start` recorded: True for a shadow run, False for a live one, None with no record."""
+    """What the run now in flight recorded at `start`: True for a shadow run, False for a live one.
+
+    None when there is no record, it isn't this stream's, or it wasn't
+    written by the run now in flight (`written_in_this_run`, as
+    `this_runs_decision` reads it): a run that is over can't steer a later one.
+    """
     try:
         record = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or record.get("audit") != audit_id:
+        return None
+    if not written_in_this_run(audit_id, record.get(RUN_RECORD_STARTED_KEY)):
         return None
     return record.get(RUN_RECORD_SHADOW_KEY) is True
 
@@ -3900,7 +3907,10 @@ def shadow_store_repo(audit_id: str) -> str:
     """
     try:
         return resolve_repo_or_no_forge(audit_id)
-    except RuntimeError:
+    except NoGitOpsRepo:
+        # Several repositories and none chosen: the broker's answer is
+        # no_forge too. Anything else (a list that can't be read or used)
+        # raises: the run can't know where it may write.
         return NO_FORGE_REPO
 
 
@@ -3964,11 +3974,11 @@ def shadow_stream(audit_id: str) -> str:
     return raw
 
 
-def refuse_remediate_in_shadow(args: argparse.Namespace) -> None:
-    """`remediate` drafts nothing in a shadow run: ValidationError when the flag or the runtime says it is one."""
-    if getattr(args, "store_only", False) or task_is_shadow():
+def refuse_remediate_in_shadow(args: argparse.Namespace, audit_id: str) -> None:
+    """`remediate` drafts nothing in a shadow run: ValidationError when the flag, the runtime or this run's `start` says it is one."""
+    if getattr(args, "store_only", False) or task_is_shadow() or run_is_shadow(audit_id):
         raise ValidationError(
-            f"remediate: this is a shadow run ({STORE_ONLY_FLAG}, or {SHADOW_TASK_ENV}=true), "
+            f"remediate: this is a shadow run ({STORE_ONLY_FLAG}, {SHADOW_TASK_ENV}, or this run's `start`), "
             "which writes its report to the store and nothing else; it opens no remediation."
         )
 
@@ -22772,6 +22782,14 @@ def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> 
     # not get this far leaves no record at all, and `finish` withholds rather
     # than measuring the document against yesterday's list.
     context_entries = context_repo_entries()
+    if shadow:
+        # A live run's search starts from the install's GitOps repository; a
+        # shadow run has no ledger repository, so that repository joins the
+        # search as a context repository (read, never written), and the two
+        # runs owe the same declared-intent search.
+        gitops = shadow_store_repo(audit_id)
+        if gitops != NO_FORGE_REPO and gitops not in {entry["repo"] for entry in context_entries}:
+            context_entries = [{"repo": gitops, "ref": None, REFUSED_REF_KEY: None}, *context_entries]
     context = [entry["repo"] for entry in context_entries]
     # The harness's half of the declared-intent step, before the record is
     # written so the record carries what it read: every repository the step
@@ -23745,7 +23763,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     findings a run on its own, but a human who asked for one by name gets it.
     """
     audit_id = validate_audit_id(args.audit)
-    refuse_remediate_in_shadow(args)
+    refuse_remediate_in_shadow(args, audit_id)
     data = load_findings(args.findings_file, audit_id)
     opt_repo = getattr(args, "repo", None)
     # The same withhold `finish` applies, against the same record. A direct
@@ -24657,7 +24675,9 @@ def _finish_without_forge(
     marker = diverted_marker(unreachable)
     store_repo = shadow_repo or (unreachable[0] if unreachable and unreachable[0] else NO_FORGE_REPO)
     delta_known = previous_ids is not None
-    earlier = earlier_finish(audit_id, NO_FORGE_REPO, now)
+    # The chat record is the live stream's, keyed by the audit; a shadow run
+    # keeps none, so it has no earlier finish of its own to read there.
+    earlier = None if shadow else earlier_finish(audit_id, NO_FORGE_REPO, now)
     # A posture `finish` withheld is in the document, only not published,
     # which is how the ledger branch's `held_exclude` reads it too.
     held = sorted(
@@ -26228,10 +26248,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # repository on a best-effort basis.
     # A shadow run reads its own stream under the install's key, so its
     # wording never comes from the live stream's record or a forge lookup.
-    shadow_repo = shadow_store_repo(audit_id) if store_only else None
+    # The preview of a shadow run (`--dry-run` in a shadow task) reads what
+    # the shadow run will, so the two publish the same words.
+    is_shadow = store_only or bool(task_is_shadow() or run_is_shadow(audit_id))
+    shadow_repo = shadow_store_repo(audit_id) if is_shadow else None
     previous_document = (
         previous_run_document(shadow_stream(audit_id), shadow_repo)
-        if store_only
+        if is_shadow
         else previous_run_document(audit_id, _dry_run_repo(audit_id, repo_hint))
     )
     for fid in carry_unchanged_findings(data["findings"], previous_document):
