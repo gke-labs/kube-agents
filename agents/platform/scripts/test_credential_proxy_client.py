@@ -51,6 +51,18 @@ class RecordingResponse(io.BytesIO):
         return False
 
 
+def a_parser_fault_for(body, fault):
+    """A patch: the client's `json.load` raises `fault` when it reads `body`, and works for each other source."""
+    real_load = json.load
+
+    def load(source, *args, **kwargs):
+        if source is body:
+            raise fault
+        return real_load(source, *args, **kwargs)
+
+    return patch.object(credential_proxy_client.json, "load", load)
+
+
 # A well-formed GKE context name, which is the only thing the broker accepts.
 GKE_CONTEXT = "gke_acme-prod_us-central1_ka-cluster-a"
 
@@ -1220,6 +1232,50 @@ class VcsCallErrorTest(unittest.TestCase):
                 credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
         self.assertIsInstance(caught.exception.__cause__, RecursionError)
 
+    # The three tests below hold the clause for a 2xx body nested too deep to RecursionError.
+
+    def test_a_2xx_body_that_is_not_json_keeps_the_error_of_the_parser(self):
+        with self._no_token_file, self._answer(b"<html>busy</html>"), self.assertRaises(json.JSONDecodeError):
+            credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+
+    def test_a_2xx_body_that_breaks_while_it_is_read_is_a_dropped_connection(self):
+        for fault in (http.client.IncompleteRead(b"{"), ConnectionResetError("reset by peer")):
+
+            class Breaks(io.BytesIO):
+                def read(self, *args, fault=fault):
+                    raise fault
+
+            def answer(request, *args, **kwargs):
+                return Breaks()
+
+            with self.subTest(fault=type(fault).__name__), self._no_token_file:
+                with patch.object(credential_proxy_client, "open_broker_request", answer):
+                    with self.assertRaises(credential_proxy_client.BrokerDisconnected) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                self.assertIs(caught.exception.__cause__, fault)
+
+    def test_a_fault_of_the_2xx_parse_of_another_type_gets_out(self):
+        """RecursionError is a RuntimeError: the parent type is not taken. The refusal's parse takes
+        TypeError; this one does not."""
+        for fault in (RuntimeError("another fault of the parser"), TypeError("another fault of the parser")):
+            body = io.BytesIO(b"{}")
+            with self.subTest(fault=type(fault).__name__), self._no_token_file:
+                with patch.object(credential_proxy_client, "open_broker_request", lambda request: body):
+                    with a_parser_fault_for(body, fault), self.assertRaises(type(fault)) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                self.assertIs(caught.exception, fault)
+
+    def test_a_fault_of_the_refusal_parse_of_the_parent_type_gets_out_and_the_refusal_is_closed(self):
+        """The clause for a refusal body nested too deep names RecursionError, and not its parent RuntimeError."""
+        stream = io.BytesIO(b"{}")
+        error = self._held_refusal(502, stream)
+        fault = RuntimeError("another fault of the parser")
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=error), a_parser_fault_for(error, fault):
+            with self.assertRaises(RuntimeError) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+        self.assertIs(caught.exception, fault)
+        self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
     def test_a_refusal_nested_too_deep_for_the_parser_is_the_status_alone(self):
         for status in (404, 502):
             with self.subTest(status=status):
@@ -2125,6 +2181,19 @@ class TestExecTierRouting(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual(1, len(calls))
         self.assertIn("the connection dropped while the refusal was read", stderr)
+
+    def test_a_fault_of_the_refusal_parse_of_the_parent_type_gets_out_and_the_refusal_is_closed(self):
+        """The clause for a refusal body nested too deep names RecursionError, and not its parent RuntimeError."""
+        stream = io.BytesIO(b"{}")
+        refusal = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=503, msg="Service Unavailable", hdrs=http.client.HTTPMessage(), fp=stream,
+        )
+        self.addCleanup(refusal.close)
+        fault = RuntimeError("another fault of the parser")
+        with a_parser_fault_for(refusal, fault), self.assertRaises(RuntimeError) as caught:
+            self.run_shim([refusal])
+        self.assertIs(caught.exception, fault)
+        self.assertTrue(stream.closed, "the refusal was left open")
 
     def test_a_second_refusal_is_retried_again_until_the_count_is_spent(self):
         code, calls, stderr = self.run_shim([busy_error("slot"), busy_error("slot"), self.OK])
@@ -3397,6 +3466,24 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertIn("the connection dropped after the request was sent", err.getvalue())
         self.assertNotIn("HTTP 200", err.getvalue())
 
+    def test_a_fault_of_the_2xx_parse_of_the_parent_type_gets_out_of_execute(self):
+        """The clause for a 2xx body that is not JSON names RecursionError, and not its parent RuntimeError."""
+
+        class Answer(RecordingResponse):
+            status = 200
+
+        body = Answer(b"{}")
+        fault = RuntimeError("another fault of the parser")
+        with patch.object(credential_proxy_client, "open_broker_request", lambda _request: body), \
+                a_parser_fault_for(body, fault), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(RuntimeError) as caught:
+                credential_proxy_client.execute(
+                    "http://broker.invalid:8765", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+                )
+        self.assertIs(caught.exception, fault)
+        self.assertEqual([], self.sleeps)
+
     def test_a_2xx_object_with_a_field_of_a_wrong_type_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
         """The fields are checked before anything is written. The line names the field and the type, never a value."""
         whole = {"stdout": "NAME STATUS\n", "stderr": "a warning\n", "exitCode": 0}
@@ -3971,6 +4058,22 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
                 self.assertIs(refused, session.get(self.URL, timeout=30))
                 self.assertEqual(1, len(http_.calls))
                 self.assertEqual([], self.sleeps)
+
+    def test_an_error_of_json_of_another_type_gets_out_of_the_read(self):
+        """The session reads three errors of `json()` as a body that is not JSON: ValueError, AttributeError
+        and RecursionError. Another error is not hidden as one. RuntimeError is the parent of RecursionError."""
+        for fault in (TypeError("a fault of the reply object"), RuntimeError("another fault"), OSError("the read broke")):
+
+            class Broken(self.Response):
+                def json(self, fault=fault):
+                    raise fault
+
+            with self.subTest(fault=type(fault).__name__):
+                http_, session = self.session([Broken(503, None), self.Response(200, {"timeSeries": []})])
+                with self.assertRaises(type(fault)) as caught:
+                    session.get(self.URL, timeout=30)
+                self.assertIs(caught.exception, fault)
+                self.assertEqual(1, len(http_.calls))
 
     def test_a_real_reply_with_a_document_that_the_parser_refuses_has_no_json_body(self):
         """The same through a reply object of `requests` and a document that the parser of this run refuses."""
