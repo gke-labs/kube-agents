@@ -226,8 +226,8 @@ _REPORT_RUNS_DIR = "runs"
 # selected findings, and how many envelopes hold the planted mark.
 _LISTED_FINDINGS_KEY = "findings"
 _LISTED_MARK_ENVELOPES_KEY = "mark_envelopes"
-# A literal IPv4 range, the thing a remediation command must not carry where
-# the SOP says the value is the owner's to give.
+# A literal IPv4 address or range, the thing a remediation command must not
+# carry where the SOP says the value is the owner's to give.
 _CIDR_LITERAL_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?(?![\d.])")
 _SHELL_COMMENT_PREFIX = "#"
 _SHELL_TRAILING_COMMENT = " #"
@@ -9751,7 +9751,7 @@ def report_store_command(
     only carried), or the ``error`` that kept it unread. With ``excerpts``, also
     each finding's ``evidence.excerpt`` as ``finding_excerpts`` (id -> excerpt),
     which ``finish`` takes from the collector. With ``fragments``, also
-    the ``recommendation`` and ``remediation`` of each finding whose id contains
+    the ``title``, ``recommendation`` and ``remediation`` of each finding whose id contains
     every fragment (``findings``); with ``mark``, how many envelopes of that
     directory, ``latest.json`` and the ring, hold it (``mark_envelopes``). The
     rest stays in the pod.
@@ -9982,7 +9982,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     it: what the collector observed and ``finish`` published, read where it was
     stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
     also carries ids a run held without finding them.
-    ``finding`` reads one finding's recommendation and remediation as data
+    ``finding`` reads one finding's title, recommendation and remediation as data
     (:class:`StoredFindingCheck`).
 
     No envelope from this run is a fail: the audit published nothing where the

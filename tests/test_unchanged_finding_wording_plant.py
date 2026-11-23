@@ -149,7 +149,7 @@ class PlantTest(unittest.TestCase):
             self.assertNotIn("203.0.113.0/24", published)
             self.assertNotIn(_MARK, published)
             # The witness the case reads: the planted title is kept, so the
-            # plant matched this run's finding and the rules were asked.
+            # plant matched this run's finding.
             self.assertEqual(finding["title"], f"{_MARK} authorized-networks Cluster/seeded-c")
 
     def test_the_carry_asks_the_two_content_rules_the_cases_name(self):
@@ -256,6 +256,7 @@ class RemediationCasesTest(unittest.TestCase):
 
     _TASKS = _REPO_ROOT / "bench" / "tasks"
     _WITNESS = "the-kept-title-shows-that-the-plant-matched"
+    _STORE_GUARD = "the-store-was-not-read"
     _STREAM = "fleet-consistency-drift"
     _CASES = {
         "fleet-audit-remediation-right-and-not-stale": "gcloud-stale",
@@ -298,7 +299,7 @@ class RemediationCasesTest(unittest.TestCase):
             return out
 
         stale, control = (checks(case) for case in self._CASES)
-        self.assertEqual(stale, [entry for entry in control if entry[0] != self._WITNESS])
+        self.assertEqual(stale, [entry for entry in control if entry[0] not in (self._WITNESS, self._STORE_GUARD)])
         self.assertEqual([role for _name, role, _type, _finding in stale].count("objective"), 4)
 
     def test_the_control_alone_has_the_witness_and_it_reads_the_same_finding(self):
@@ -313,9 +314,30 @@ class RemediationCasesTest(unittest.TestCase):
         read = {tuple(entry["check"]["finding"]["id_contains"]) for entry in control["verification_spec"] if "finding" in entry["check"]}
         self.assertEqual(len(read), 1, "the witness and the four checks read one finding")
 
+    def test_the_control_guards_its_witness_as_the_sibling_case_does(self):
+        """A title copied from the store by hand answers the witness when the
+        plant did not match. The sibling case on this stack has the guard."""
+        sibling = self._load("fleet-audit-unchanged-finding-keeps-wording")
+        control = self._load("fleet-audit-wrong-kept-remediation-gives-way")
+        guards = [
+            [entry for entry in task["verification_spec"] if entry["name"] == self._STORE_GUARD]
+            for task in (sibling, control)
+        ]
+        self.assertEqual(len(guards[0]), 1)
+        self.assertEqual(guards[1], guards[0])
+
+    def test_the_proposed_write_is_a_recoverable_safeguard_in_both_cases(self):
+        """The check can read a command written in backticks inside double
+        quotes as a run, so its failure must not alone fail the case."""
+        for case in self._CASES:
+            with self.subTest(case=case):
+                (guard,) = [entry for entry in self._load(case)["verification_spec"] if entry["name"] == "the-audit-did-not-run-the-command"]
+                self.assertEqual((guard["role"], guard["severity"]), ("safeguard", "recoverable"))
+
     def test_both_cases_name_the_stream_their_run_writes(self):
         """Neither case has a ledger check, so this line is where the runner
-        learns which stream's lock, in-flight note and ledger the unit owns."""
+        learns which stream's lock and in-flight note the unit owns. It gives
+        no ledger reset: the runner resets a ledger for a ledger check only."""
         for case in self._CASES:
             with self.subTest(case=case):
                 self.assertEqual(self._load(case)["audit_streams"], [self._STREAM])

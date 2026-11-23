@@ -47,7 +47,7 @@ variable "mark" {
 
 variable "planted_remediation" {
   type        = string
-  description = "What the planted authorized-networks finding proposes: manual (a marked note), gcloud-stale (a marked gcloud command with a literal range, on evidence that differs from this run's, which finish must not carry), or gcloud-same (the same command on equal evidence: finish keeps the planted title and impact, and its content rules make the planted command give way to this run's)."
+  description = "What the planted authorized-networks finding proposes: manual (a marked note), gcloud-stale (a marked gcloud command with a literal range, on evidence that differs from this run's, which finish must not carry), or gcloud-same (the same command on equal evidence: finish keeps the planted title and impact, and its content rules make the planted command give way to this run's, when this run's own passes them)."
   default     = "manual"
 
   validation {

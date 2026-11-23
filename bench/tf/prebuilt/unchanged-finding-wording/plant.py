@@ -34,11 +34,12 @@ go green or red for the reason it tests.
 `manual` (the default) is the marked note above. `gcloud-stale` is a marked
 `gcloud` command with a literal range, on evidence that differs from this
 run's: `finish` must not carry it, and each run of the case is then measured
-on its own words. `gcloud-same` is the same command on equal evidence: the
-plant of fleet-audit-wrong-kept-remediation-gives-way. `finish`
-keeps the planted title and impact, and judges the planted command by its
-content rules: a literal range where the procedure leaves the value to the
-owner gives way to this run's own remediation.
+on its own words (the plant of fleet-audit-remediation-right-and-not-stale).
+`gcloud-same` is the same command on equal evidence: the plant of
+fleet-audit-wrong-kept-remediation-gives-way. `finish` keeps the planted
+title and impact, and judges the planted command by its content rules: a
+literal range where the procedure leaves the value to the owner gives way to
+this run's own remediation, when this run's own passes the rules.
 
 teardown: removes each stored envelope of the stream, `latest.json` and the
 ring entries, that holds <mark>. A kept wording then does not stay in the
@@ -56,7 +57,8 @@ from pathlib import Path
 AUDIT = "fleet-consistency-drift"
 COLLECTOR = "fleet_drift.py"
 CREDENTIAL_PROXY_BIN = "/opt/credential-proxy/bin"
-# `finish` keeps the remediation only where both runs wrote `manual`.
+# The kind of the default plant. `finish` keeps a `manual` remediation only
+# where this run wrote `manual` too.
 MANUAL_KIND = "manual"
 # A placeholder evidence object, which `adopt_collector_evidence` replaces
 # with the collector's command and excerpt.
@@ -89,7 +91,11 @@ PLANTED_RUN_AGE = timedelta(days=7)
 # A ring entry named for a week ago is the first one a prune drops on a store
 # that already holds that many newer runs, and a case that reads the plant
 # after the run would then find it gone. The entry is named for a minute ago:
-# newer than every earlier run, older than the run under test.
+# newer than every run that finished more than a minute ago, older than the
+# run under test. The name is then not the envelope's own time, which
+# report_status.py takes a ring entry's name to be: its reader answers for the
+# planted run from the ring entry and says that `latest.json` may be behind.
+# No check of the cases on this stack reads through that reader.
 PLANTED_RING_AGE = timedelta(minutes=1)
 STDERR_TAIL_CHARS = 500
 

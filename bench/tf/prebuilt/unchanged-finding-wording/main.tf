@@ -27,8 +27,8 @@
 # candidate on the unchanged seeded fleet, and wording that starts with
 # var.mark. var.planted_remediation chooses what the planted authorized-networks
 # finding proposes, and whether its evidence equals this run's (plant.py says
-# which state each case uses). The planted envelope names no issue, so it does
-# not change the delta of the next run.
+# what each state plants; each case's task.yaml names its state). The planted
+# envelope names no issue, so it does not change the delta of the next run.
 
 terraform {
   required_version = ">= 1.5.0"

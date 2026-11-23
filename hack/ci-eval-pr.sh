@@ -4917,7 +4917,8 @@ unit_cost_hint() {
     # The same stack and the same full drift audit, with another plant state.
     # Unmeasured on the lane.
     fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 900 ;;
-    # The sibling's plant plus a real scheduled drift run the stack fires and
+    # The plant of fleet-audit-unchanged-finding-keeps-wording plus a real
+    # scheduled drift run the stack fires and
     # waits out: a full audit on an image without the gate, a collector and a
     # precheck with it. Unmeasured; priced at the band plus the plant.
     fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
