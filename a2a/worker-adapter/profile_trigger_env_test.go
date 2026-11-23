@@ -136,3 +136,21 @@ func TestThePodsEnvCantHandATaskATrigger(t *testing.T) {
 		t.Errorf("withoutTriggerEnv(%v) = %v, want PATH alone", base, got)
 	}
 }
+
+// A script run never sees the trigger env: scriptEnv is an allowlist, and
+// this holds it, so a later change that seeded it from the harness env fails
+// here, even with the worker's own environment carrying the names.
+func TestAScriptRunNeverSeesTheTriggerEnv(t *testing.T) {
+	sub := withAuthority(t, profileSubmission(t, "task-tr-5", "audit", map[string]string{"cluster": "prod-east"}),
+		`{"trigger":{"name":"schedule/compliance-audit-canary","origin":"builtin","stream":"compliance-audit-canary"}}`)
+	pod := map[string]string{"PATH": "/bin", profileTriggerStreamEnv: "compliance-audit-canary", profileTriggerOriginEnv: "builtin"}
+	env, err := scriptEnv(sub, func(k string) string { return pod[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PROFILE_TRIGGER_") {
+			t.Errorf("a script's env carries %q; env %v", kv, env)
+		}
+	}
+}
