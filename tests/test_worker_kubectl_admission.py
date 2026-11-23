@@ -160,6 +160,24 @@ class WorkerWrapperTest(unittest.TestCase):
         self.assertIn('KUBECTL_NEXT = "/usr/local/libexec/kubectl"', admit_source)
         self.assertIn("-o /usr/local/libexec/kubectl ", text)
 
+    def test_the_image_writes_the_session_fast_path_figures_from_its_own_admission_guard_and_table(self):
+        # deploy/sandbox/kubectl_session_fastpath.py, run on the installed files once python3 is in,
+        # writes the file session-kubectl.sh's all_fast reads (tests/test_session_kubectl_fast_path.py
+        # checks its figures).
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        target = "/usr/local/share/kube-agents/kubectl-session-fastpath"
+        self.assertIn("COPY deploy/sandbox/kubectl_session_fastpath.py /tmp/kubectl_session_fastpath.py\n", text)
+        run = re.search(r"(?m)^RUN python3 -I -B /tmp/kubectl_session_fastpath\.py (\S+) \\\n\s+(\S+) (\S+) \\\n"
+                        rf"\s+>{re.escape(target)} \\\n\s+&& chmod 0644 {re.escape(target)} \\\n"
+                        rf"\s+&& test -s {re.escape(target)} \\\n\s+&& rm /tmp/kubectl_session_fastpath\.py$", text)
+        self.assertIsNotNone(run)
+        self.assertEqual(run.groups(), (ADMIT, GUARD, COSTS))
+        for before in (f"deploy/sandbox/kubectl-admit.py {ADMIT}", f"deploy/sandbox/shell-memory-guard.py {GUARD}",
+                       f"deploy/sandbox/kubectl-costs.json {COSTS}", "apt-get install -y --no-install-recommends",
+                       "COPY deploy/sandbox/kubectl_session_fastpath.py"):
+            self.assertLess(text.index(before), run.start(), before)
+        self.assertIn(target, WRAPPER_SCRIPT.read_text(encoding="utf-8"))
+
     def test_the_session_pod_writes_no_limit_file(self):
         # The limit comes from the cgroup (guard.memory_limit) only while nothing writes this.
         self.assertNotIn("/tmp/kube-agents-session/memory-limit-bytes", DOCKERFILE.read_text(encoding="utf-8"))

@@ -502,9 +502,9 @@ func TestClusterViewPassesTheExecTierURLWhenSet(t *testing.T) {
 }
 
 // The kubectl admission's tier reaches the session pod beside KUBE_PROXY_URL,
-// only when the gateway has a valid one, and only where the wrapper runs the
-// admission (the cluster view with a kube-proxy).
-func TestClusterViewPassesTheKubectlCostTierWhenSet(t *testing.T) {
+// always named there (the gateway's valid tier, else "default"), and only where
+// the wrapper runs the admission (the cluster view with a kube-proxy).
+func TestClusterViewPassesTheKubectlCostTier(t *testing.T) {
 	const proxy = "https://agent-kube-proxy.test-ns.svc.cluster.local:8443"
 	for name, tc := range map[string]struct {
 		view  bool
@@ -513,8 +513,8 @@ func TestClusterViewPassesTheKubectlCostTierWhenSet(t *testing.T) {
 		want  string
 	}{
 		"view with tier":       {view: true, proxy: proxy, tier: "fleet", want: "fleet"},
-		"view without tier":    {view: true, proxy: proxy},
-		"view with a bad tier": {view: true, proxy: proxy, tier: "Fleet/../x"},
+		"view without tier":    {view: true, proxy: proxy, want: "default"},
+		"view with a bad tier": {view: true, proxy: proxy, tier: "Fleet/../x", want: "default"},
 		"view without a proxy": {view: true, tier: "fleet"},
 		"no view":              {proxy: proxy, tier: "fleet"},
 	} {

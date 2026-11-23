@@ -18,9 +18,12 @@
 # With KUBE_PROXY_URL (a session pod with the cluster view), stock kubectl runs
 # against <agent>-kube-proxy, in steps:
 #   1. the kubeconfig context is ensured, as before;
-#   2. an argv the admission never charges (another verb, a named object, a watch,
-#      --raw, a file, or a list of known namespaced kinds without -A), judged in the
-#      shell without a fork, execs kubectl directly, as before. Any other argv, or
+#   2. on a pod where the admission can refuse nothing (all_fast below: not gVisor, and
+#      a memory limit at or above the figure the image build wrote for the tier the
+#      gateway names, so the tier's largest read fits), every argv execs kubectl directly.
+#      Elsewhere, an argv the admission never charges (another verb, a named object, a
+#      watch, --raw, a file, or a list of known namespaced kinds without -A), judged in
+#      the shell without a fork, execs kubectl directly, as before. Any other argv, or
 #      one the shell is unsure of, runs under the memory admission (kubectl-admit.py),
 #      exec'd, so a signal sent to this pid reaches it. The admission in turn
 #      execs kubectl, or, for a read it charges, runs kubectl as its child and
@@ -119,6 +122,59 @@ uncharged() {
   done
 }
 
+# Whether $1 is a decimal the guard would read, of at most 18 digits (so shell arithmetic, 64-bit
+# in dash, cannot overflow) and no leading zero (no octal), and at least $2. Else false.
+at_least() {
+  case $1 in
+  '' | 0* | *[!0-9]*) return 1 ;;
+  esac
+  [ ${#1} -le 18 ] && [ $(($1 >= $2)) -eq 1 ]
+}
+
+# Whether the admission could refuse no command on this pod, so every one may run kubectl
+# directly. On a session pod (KUBECTL_ADMIT_ON_BUSY=run) its only refusal is a read larger than
+# the guard's watermark less the shell's floor; the image build wrote, per cost tier, the smallest
+# memory limit at which the tier's largest read fits (deploy/sandbox/kubectl_session_fastpath.py).
+# True only when the tier is named and listed there, the kernel is not gVisor (whose watermark
+# also falls per process), no limit or tier file overrides what the admission reads, and every
+# limit the guard or the admission would take is a decimal at or above the tier's figure: the
+# guard's variable when set, and cgroup v2 memory.max, which must be readable. Anything else, an
+# unreadable file included, is false, and the paths below apply. Builtins only: no fork.
+all_fast() {
+  case ${KUBEAGENTS_KUBECTL_COST_TIER:-} in
+  '' | [!a-z]* | *[!a-z0-9-]*) return 1 ;;
+  esac
+  [ ${#KUBEAGENTS_KUBECTL_COST_TIER} -le 32 ] || return 1
+  [ -r /usr/local/share/kube-agents/kubectl-session-fastpath ] || return 1
+  [ -e /tmp/kube-agents-session/kubectl-cost-tier ] && return 1
+  [ -e /tmp/kube-agents-session/memory-limit-bytes ] && return 1
+  f_min=''
+  while read -r f_tier f_bytes; do
+    case $f_tier in
+    "$KUBEAGENTS_KUBECTL_COST_TIER")
+      f_min=$f_bytes
+      break
+      ;;
+    esac
+  done </usr/local/share/kube-agents/kubectl-session-fastpath
+  case $f_min in
+  '' | 0* | *[!0-9]*) return 1 ;;
+  esac
+  [ ${#f_min} -le 18 ] || return 1
+  f_release=''
+  read -r f_release 2>/dev/null </proc/sys/kernel/osrelease
+  case $f_release in
+  '' | *[Gg][Vv][Ii][Ss][Oo][Rr]*) return 1 ;; # unreadable, or the guard's GVISOR_RELEASE_MARK
+  esac
+  case ${SANDBOX_MEMORY_LIMIT_BYTES:-} in
+  '') ;;
+  *) at_least "$SANDBOX_MEMORY_LIMIT_BYTES" "$f_min" || return 1 ;;
+  esac
+  f_max=''
+  read -r f_max 2>/dev/null </sys/fs/cgroup/memory.max
+  at_least "$f_max" "$f_min"
+}
+
 if [ -n "${KUBE_PROXY_URL:-}" ]; then
   case " $* " in
   *" --context"*)
@@ -130,7 +186,7 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
     fi
     ;;
   esac
-  if uncharged "$@"; then
+  if all_fast || uncharged "$@"; then
     exec "$REAL_KUBECTL" "$@"
   fi
   export KUBECTL_ADMIT_RUN_DIR=/tmp/kube-agents-session KUBECTL_ADMIT_GUARD_PATH=/usr/local/libexec/shell-memory-guard KUBECTL_ADMIT_ON_BUSY=run

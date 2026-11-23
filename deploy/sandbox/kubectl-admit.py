@@ -347,6 +347,32 @@ def cost(table: dict, tier: str, cmd: dict) -> tuple[int, bool]:
     return int(column.get("other", {}).get("peak_mib", 0)) * MIB, False
 
 
+def max_cost(table: dict, tier: str) -> int:
+    """The most cost() can return on this tier for any argv, in bytes. cost() returns one entry
+    (its key's), or `other`, or a sum over distinct kinds, one entry each, all of one scope and
+    format; such a sum can only pick up the single-kind entries (`get <kind> ...`, no comma), the
+    format's own where the table has one, else the scope's json. So the bound is the largest of
+    the largest entry, `other`, and, per scope and format, that sum over every single-kind entry.
+    The session wrapper's fast path (kubectl_session_fastpath.py) rests on this: change it with
+    cost()."""
+    column = table.get("tiers", {}).get(tier) or table.get("tiers", {}).get(DEFAULT_TIER, {})
+    commands = column.get("commands", {})
+    best = max([int(e["peak_mib"]) for e in commands.values()] + [int(column.get("other", {}).get("peak_mib", 0))])
+    singles: dict[str, set[str]] = {}  # scope -> kinds with an entry there
+    for key in commands:
+        parts = key.split(" ")
+        if len(parts) == 4 and parts[0] == "get" and "," not in parts[1]:
+            singles.setdefault(parts[2], set()).add(parts[1])
+    for scope, kinds in singles.items():
+        for fmt in ("json", "table"):
+            total = 0
+            for k in kinds:
+                entry = commands.get(f"get {k} {scope} {fmt}") or commands.get(f"get {k} {scope} json")
+                total += int(entry["peak_mib"]) if entry else 0
+            best = max(best, total)
+    return best * MIB
+
+
 def collection(kinds: list[str]) -> str:
     """The API path of the first kind, for a count by `?limit=1`."""
     name = kinds[0] if kinds else ""

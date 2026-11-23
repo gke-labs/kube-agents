@@ -164,6 +164,10 @@ const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
 // file names one: the shell sandbox's name for it, on the session pod.
 const envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
 
+// defaultKubectlCostTier is the tier the admission charges when none is
+// named; spawn names it rather than leave the variable unset.
+const defaultKubectlCostTier = "default"
+
 // The A2A door's Microsoft Entra sign-in class (a2adoor_entra.go), set by
 // hand on the gateway as the Google class's variables are.
 const (
@@ -724,7 +728,7 @@ type Config struct {
 	// admission charges; spawn passes it on as KUBEAGENTS_KUBECTL_COST_TIER
 	// beside KUBE_PROXY_URL. The operator forwards it normalised, as for the
 	// shell sandbox; anything but a plain lowercase name is dropped here too,
-	// and empty leaves the admission on its default tier.
+	// and empty passes the admission's default tier by name.
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
