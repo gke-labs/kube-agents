@@ -206,5 +206,61 @@ class PlantTest(unittest.TestCase):
             self.assertEqual(os.environ["PATH"], f"{proxy}:/usr/bin:/bin")
 
 
+class RemediationCasesTest(unittest.TestCase):
+    """The two cases that read the drift outlier's remediation in the stored
+    report: one plant state each, the same four checks, each case's own mark."""
+
+    _TASKS = _REPO_ROOT / "bench" / "tasks"
+    _CASES = {
+        "fleet-audit-remediation-right-and-not-stale": "gcloud-stale",
+        "fleet-audit-wrong-kept-remediation-gives-way": "gcloud-same",
+    }
+
+    def _load(self, case):
+        import yaml  # noqa: PLC0415 - only this class reads the case files
+
+        return yaml.safe_load((self._TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+
+    def test_each_case_plants_its_state_and_reads_its_own_mark(self):
+        marks = set()
+        for case, state in self._CASES.items():
+            with self.subTest(case=case):
+                task = self._load(case)
+                self.assertEqual(task["id"], case)
+                variables = task["infrastructure"]["variables"]
+                self.assertEqual(task["infrastructure"]["stack"], "prebuilt/unchanged-finding-wording")
+                self.assertEqual(variables["planted_remediation"], state)
+                mark = variables["mark"]
+                marks.add(mark)
+                (not_previous,) = [
+                    entry["check"]["finding"]
+                    for entry in task["verification_spec"]
+                    if "planted_mark" in (entry["check"].get("finding") or {})
+                ]
+                self.assertEqual((not_previous["forbidden_text"], not_previous["planted_mark"]), ([mark], mark))
+        self.assertEqual(len(marks), len(self._CASES), "one mark per case, or one case's plant answers the other's check")
+
+    def test_both_cases_read_the_same_finding_with_the_same_four_checks(self):
+        def checks(case):
+            spec = self._load(case)["verification_spec"]
+            out = []
+            for entry in spec:
+                finding = dict(entry["check"].get("finding") or {})
+                finding.pop("forbidden_text", None)
+                finding.pop("planted_mark", None)
+                out.append((entry["name"], entry["role"], entry["check"]["type"], finding))
+            return out
+
+        stale, control = (checks(case) for case in self._CASES)
+        self.assertEqual(stale, control)
+        self.assertEqual([role for _name, role, _type, _finding in stale].count("objective"), 4)
+
+    def test_the_states_the_cases_ask_for_are_states_the_plant_knows(self):
+        spec = importlib.util.spec_from_file_location("unchanged_finding_wording_plant_states", _PLANT)
+        plant = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plant)
+        self.assertLessEqual(set(self._CASES.values()), set(plant.REMEDIATIONS))
+
+
 if __name__ == "__main__":
     unittest.main()
