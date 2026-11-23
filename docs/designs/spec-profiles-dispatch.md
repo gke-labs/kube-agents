@@ -525,7 +525,20 @@ leave open:
   terminal when the server stored it after that time; contract addendum 6, #5301). The operator
   renders that env on the gateway and the MCP server once the `ProfileSupervisorForm` condition
   has latched True, as the condition's `lastTransitionTime` plus ten minutes, in RFC3339 UTC; an
-  unlatched install renders none, so its readers take both forms and nothing rolls. The terminal never goes on `.events`, which stays
+  unlatched install renders none, so its readers take both forms and nothing rolls. The gate
+  holds against the gateway, whose grant still reaches the five-token form, so both its inputs
+  are the operator's: which addressees are profiles comes only from the profile names file it
+  renders beside the env (`A2A_PROFILE_NAMES_FILE`, the `<agent>-a2a-profile-names` ConfigMap:
+  the admitted and draining profiles, the same names nats.conf denies the gateway the
+  supervisor subjects of), never from the gateway's session record, `.in` traffic, the
+  console's status lines or the directory. The gateway's Role writes no ConfigMap but its
+  home-channel record and cannot write its own Deployment, and the MCP server has no API
+  access. A reader with a cutoff and no readable names takes every addressee as a profile. The
+  stored time is the server's: a consumer delivery's metadata, or on a direct get the one
+  `Nats-Time-Stamp` header the server adds; a message carrying a header of that name of its
+  own has an unknown time, and is refused where the time would decide. A cutoff that doesn't
+  parse is taken as the reader's start time, logged at Error, and shown on the gateway's
+  `profile_supervisor_cutoff_timestamp_seconds` series and the MCP server's `/healthz`. The terminal never goes on `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
