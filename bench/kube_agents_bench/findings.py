@@ -46,8 +46,12 @@ ROW_LIMIT = 1000
 REQUEST_TIMEOUT_SEC = 20.0
 # The fields of a row a verdict reads; the rest stays in the pod. first_shown_at
 # is when a paced publisher's message first named the row (findings_queue.py's
-# column), for findings_item_state's unless_shown.
-ROW_FIELDS = ("id", "state", "check_slug", "project", "cluster", "namespace", "object", "first_shown_at")
+# column), for findings_item_state's unless_shown. first_seen (the row's
+# insert) and last_verified (each registration or verification since) are
+# SQLite UTC stamps, for findings_queue_untouched's window.
+ROW_FIELDS = (
+    "id", "state", "check_slug", "project", "cluster", "namespace", "object", "first_shown_at", "first_seen", "last_verified",
+)
 
 # Runs in the agent container. Prints the sentinel and one JSON line: the rows
 # under the project, or the error that stopped the read.
@@ -88,7 +92,7 @@ def read_command(project: str) -> str:
 
 
 def read_project(shell: Callable[[str, float], str], project: str, timeout: float) -> dict[str, Any] | None:
-    """The queue's rows under ``project``, or ``None`` if the pod could not be read.
+    """The queue's rows under ``project`` (every row when it is empty), or ``None`` if the pod could not be read.
 
     Returns ``{"findings": [...], "error": None}``, or ``{"findings": None,
     "error": "..."}`` when the pod answered but the queue did not. ``shell`` is
