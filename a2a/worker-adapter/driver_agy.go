@@ -136,6 +136,9 @@ type agyStepUpdate struct {
 
 type agyToolInfo struct {
 	Parameters json.RawMessage `json:"parameters"`
+	// Output is what the tool gave the model back, on the step's terminal
+	// state: a string, as run_command's "Command output:" text.
+	Output json.RawMessage `json:"output"`
 }
 
 type agyResult struct {
@@ -198,8 +201,10 @@ func (d *agyDecoder) Decode(line []byte) ([]Event, error) {
 
 // step maps a step_update onto progress and activity. The model's prose
 // streams as agent_response text deltas; a tool step is announced once, when
-// it starts. User input, system messages, error messages and a tool step's
-// later states carry nothing the artifacts show; the result decides failure.
+// it starts. A tool step's terminal state carries the tool's output, which
+// goes to the adapter as an EventToolResult for the answer scrub's seen set
+// and is never published. User input, system messages and error messages
+// carry nothing the artifacts show; the result decides failure.
 func (d *agyDecoder) step(s *agyStepUpdate) []Event {
 	if s == nil {
 		return nil
@@ -213,8 +218,35 @@ func (d *agyDecoder) step(s *agyStepUpdate) []Event {
 			input = s.ToolInfo.Parameters
 		}
 		return []Event{{Kind: EventActivity, Tool: s.ToolName, Input: input}}
+	case s.StepType == "tool" && (s.State == "DONE" || s.State == "ERROR") && s.ToolInfo != nil && !agyAbsent(s.ToolInfo.Output):
+		return []Event{{Kind: EventToolResult, ToolResult: agyToolResult(s.ToolInfo.Output)}}
 	}
 	return nil
+}
+
+// agyCommandOutputMarker opens what the command printed in run_command's
+// output, after the line with its exit code.
+const agyCommandOutputMarker = "\nCommand output:\n"
+
+// agyToolResult is a tool step's output as CollectToolResult reads it. The
+// seen set's shape rules read a Secret object only when it is the whole
+// text, and run_command's output puts its exit-code line in front of what
+// the command printed, so the printed part goes in as a text of its own,
+// beside the whole output. Output that is not a string goes in as it is.
+func agyToolResult(raw json.RawMessage) json.RawMessage {
+	var out string
+	if json.Unmarshal(raw, &out) != nil {
+		return raw
+	}
+	texts := []string{out}
+	if _, printed, ok := strings.Cut(out, agyCommandOutputMarker); ok {
+		texts = append(texts, strings.TrimRight(printed, "\r\n"))
+	}
+	b, err := json.Marshal(texts)
+	if err != nil {
+		return raw
+	}
+	return b
 }
 
 func (d *agyDecoder) result(r agyResult) Event {
