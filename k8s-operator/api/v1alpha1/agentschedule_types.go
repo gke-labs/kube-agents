@@ -113,7 +113,8 @@ type AgentScheduleDelivery struct {
 }
 
 // AgentScheduleSpec is a recurring task: when it runs, which profile runs
-// it, and what it asks (docs/designs/scheduling-on-profiles.md, section 1).
+// it, and what it asks or which script it runs
+// (docs/designs/scheduling-on-profiles.md, section 1).
 // Each run is submitted through the A2A gateway as an Unattended task.
 // +kubebuilder:validation:XValidation:rule="has(self.prompt) != has(self.script)",message="exactly one of spec.prompt and spec.script must be set"
 // +kubebuilder:validation:XValidation:rule="!has(self.script) || (!has(self.skills) && !has(self.maxTurns))",message="spec.skills and spec.maxTurns apply to a model run; a script run takes neither"
@@ -160,7 +161,8 @@ type AgentScheduleSpec struct {
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty"`
 
-	// Skills the run asks the profile to use.
+	// Skills the run asks the profile to use. A script run takes none: set
+	// it only with prompt.
 	// +kubebuilder:validation:MaxItems=16
 	// +listType=set
 	// +optional
@@ -197,7 +199,8 @@ type AgentScheduleSpec struct {
 	// +optional
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
 
-	// MaxTurns caps the run's model turns.
+	// MaxTurns caps the run's model turns. A script run takes none: set it
+	// only with prompt.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
@@ -334,9 +337,9 @@ type AgentScheduleStatus struct {
 // +kubebuilder:printcolumn:name="Next",type=date,JSONPath=`.status.nextScheduleTime`
 // +kubebuilder:printcolumn:name="Last",type=string,JSONPath=`.status.lastOutcome`
 
-// AgentSchedule runs a prompt on an AgentProfile on a cron schedule, each run
-// an Unattended task submitted through the A2A gateway
-// (docs/designs/scheduling-on-profiles.md).
+// AgentSchedule runs a prompt, or a built-in schedule's helper script, on an
+// AgentProfile on a cron schedule, each run an Unattended task submitted
+// through the A2A gateway (docs/designs/scheduling-on-profiles.md).
 type AgentSchedule struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
