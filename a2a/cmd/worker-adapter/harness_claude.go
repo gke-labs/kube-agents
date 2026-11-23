@@ -23,10 +23,10 @@ type harnessSpec struct {
 	delegate            *delegateServer
 	prompts             []string
 	extra               []string
-	// turnBudget is the task deadline less the kill grace: how long the
-	// harness may run before the adapter stops it. A harness with its own
-	// wall-clock bound sets it below this, so the harness ends the turn
-	// with a result rather than the adapter killing it (agyBuilder).
+	// turnBudget is the task deadline less the kill grace. The adapter
+	// sends SIGTERM at the deadline and SIGKILL a kill grace later, so this
+	// keeps a harness's own wall-clock bound clear of both: the harness
+	// ends the turn with a result rather than being stopped (agyBuilder).
 	// TODO(#6710 PR 2): with one agy process per turn, each spawn's bound
 	// must come from the time left on the task deadline, not this budget
 	// fixed once at startup.

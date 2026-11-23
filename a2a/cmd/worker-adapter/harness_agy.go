@@ -13,9 +13,12 @@ import (
 //     prompts (harnessSpec.tools and what goes with it): #6711 and #6712;
 //   - the model and the gateway (AGY_LLM_GATEWAY_*): #6714. The pod's
 //     values reach agy unchanged, and the builder adds none;
-//   - HOME, set per task by the driver's ConfigDirEnv, and its locking: #6710;
+//   - HOME: a session pod's agy uses the pod's own HOME, shared by every
+//     turn of a reused pod, until #6710 gives each task its own and locks
+//     it. That is part of what the A2A_HARNESS_UNISOLATED waiver accepts;
 //   - a default path: the image is #6715's, so A2A_HARNESS_PATH is required
-//     (selectHarness refuses without it);
+//     unless A2A_HARNESS_CMD replaces the whole argv (selectHarness refuses
+//     otherwise);
 //   - maxTurns: agy has no turn budget, and --print-timeout is its only
 //     bound.
 type agyBuilder struct{}
@@ -27,13 +30,13 @@ const (
 	// print-timeout reason.
 	agyPrintTimeoutFlag = "--print-timeout"
 	// agyPrintTimeoutMargin is how far below the turn budget agy's own bound
-	// sits, so agy writes its result before the adapter stops it. agy
+	// sits, so agy writes its result before the adapter's deadline. agy
 	// retries a failing model call five times, about 50s, before its ERROR
 	// result; a tighter margin turns a gateway error into a print-timeout.
 	agyPrintTimeoutMargin = 60 * time.Second
-	// agyMinPrintTimeout is the floor for a turn budget at or below the
-	// margin, as in tests with a short deadline: there the adapter's own
-	// deadline ends the turn first.
+	// agyMinPrintTimeout is the floor: a turn budget at or below the margin
+	// plus the floor (120s), as in tests with a short deadline, gets 60s,
+	// and there the adapter's own deadline may end the turn first.
 	agyMinPrintTimeout = 60 * time.Second
 )
 
@@ -65,6 +68,6 @@ func agyPrintTimeout(budget time.Duration) time.Duration {
 // placeholder or CLAUDE_CODE_* switches, which mean nothing to agy.
 func (agyBuilder) env(env []string, _ func(string) bool) []string { return env }
 
-// userSettings: none. agy's settings live under the per-task HOME, which
-// #6710 resets.
+// userSettings: none. agy's settings live under its HOME (see the type's
+// comment), which #6710 makes per task and resets.
 func (agyBuilder) userSettings(func(string) string) string { return "" }

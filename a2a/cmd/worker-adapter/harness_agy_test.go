@@ -67,9 +67,9 @@ func TestAgysArgvCarriesNoneOfClaudeCodesPolicy(t *testing.T) {
 	}
 }
 
-// TestAgysPrintTimeoutHasAFloor: a turn budget at or below the margin, as in
-// a test with a short deadline, gets the floor; the adapter's own deadline
-// ends such a turn first.
+// TestAgysPrintTimeoutHasAFloor: a turn budget at or below the margin plus
+// the floor (120s), as in a test with a short deadline, gets the floor; the
+// adapter's own deadline may end such a turn first.
 func TestAgysPrintTimeoutHasAFloor(t *testing.T) {
 	for _, c := range []struct {
 		budget, want time.Duration
@@ -189,4 +189,30 @@ func mustDriver(t *testing.T, h persona.Harness) workeradapter.Driver {
 		t.Fatal(err)
 	}
 	return d
+}
+
+// TestAgysArgvTakesItsTimeoutFromTheDeadlineVariables: both argv call sites,
+// a session pod's (harnessCommand) and a profile worker's base argv
+// (profileHarnessCommand), hand agy a --print-timeout from
+// A2A_TASK_DEADLINE_SECONDS and A2A_KILL_GRACE_SECONDS, not the floor.
+func TestAgysArgvTakesItsTimeoutFromTheDeadlineVariables(t *testing.T) {
+	was := activeHarness
+	t.Cleanup(func() { activeHarness = was })
+	activeHarness = agyBuilder{}
+	t.Setenv("A2A_HARNESS_CMD", "")
+	t.Setenv("A2A_HARNESS_PATH", "/opt/agy/bin/agy")
+	t.Setenv("A2A_HARNESS_EXTRA_ARGS", "")
+	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "600")
+	t.Setenv("A2A_KILL_GRACE_SECONDS", "20")
+	// 600s - 20s - 60s margin.
+	const want = "8m40s"
+	for name, argv := range map[string][]string{
+		"harnessCommand":        harnessCommand(),
+		"profileHarnessCommand": profileHarnessCommand(),
+	} {
+		i := slices.Index(argv, "--print-timeout")
+		if i < 0 || i+1 >= len(argv) || argv[i+1] != want {
+			t.Errorf("%s argv %q, want --print-timeout %s", name, argv, want)
+		}
+	}
 }
