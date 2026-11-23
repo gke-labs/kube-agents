@@ -199,14 +199,20 @@ type profileWorker struct {
 // build-time content manifest, and, under RequirePersonaIntegrity, one with
 // no manifest. Which of verified or unverified it loaded as is logged.
 func renderPersona(pw ProfileWorkerConfig, log *slog.Logger) (*persona.Output, error) {
-	adapter, err := render.For(pw.Harness)
-	if err != nil {
-		return nil, err
-	}
+	// The persona loads, and its files are checked, before the harness is
+	// looked at: the check is the same for every harness, and a persona that
+	// differs from its build is refused as that, whichever driver the
+	// profile runs.
 	p, err := persona.LoadWithOptions(pw.PersonaDir, persona.Options{RequireIntegrity: pw.RequirePersonaIntegrity})
 	if err != nil {
 		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
 	}
+	adapter, err := render.For(pw.Harness)
+	if err != nil {
+		return nil, err
+	}
+	// Logged once the persona is one this harness can use, so a refused
+	// harness doesn't follow a success line.
 	logPersonaIntegrity(log, pw.PersonaDir, p)
 	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay})
 	if err != nil {
