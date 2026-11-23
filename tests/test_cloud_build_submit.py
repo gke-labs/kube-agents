@@ -1,4 +1,4 @@
-"""Unit tests for scripts/ci/cloud_build_submit.sh.
+"""Unit tests for .github/scripts/cloud_build_submit.sh.
 
 docker-publish-gcp.yml runs every Cloud Build through it. It submits once more
 only when the build died on BuildKit's "flightcontrol: exceeded retry timeout"
@@ -14,7 +14,7 @@ import textwrap
 import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_SCRIPT = _REPO_ROOT / "scripts" / "ci" / "cloud_build_submit.sh"
+_SCRIPT = _REPO_ROOT / ".github" / "scripts" / "cloud_build_submit.sh"
 _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "docker-publish-gcp.yml"
 
 _FLIGHTCONTROL = "Step #1: #37 ERROR: flightcontrol: exceeded retry timeout"
@@ -109,7 +109,7 @@ class PublishWorkflowUsesTheWrapperTest(unittest.TestCase):
     def test_every_cloud_build_in_the_gcp_publish_goes_through_the_wrapper(self):
         text = _WORKFLOW.read_text()
         self.assertNotIn("gcloud builds submit", text.replace("`gcloud builds submit`", ""))
-        self.assertGreater(text.count("scripts/ci/cloud_build_submit.sh"), 1)
+        self.assertGreater(text.count(".github/scripts/cloud_build_submit.sh"), 1)
 
 
 if __name__ == "__main__":

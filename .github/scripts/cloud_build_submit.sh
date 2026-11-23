@@ -21,7 +21,7 @@
 # tagged by commit SHA, and nothing pulls these by SHA but this workflow; the
 # smoke reads `:latest` and `:buildcache` only as a build cache.
 #
-# Usage: scripts/ci/cloud_build_submit.sh <gcloud builds submit arguments...>
+# Usage: .github/scripts/cloud_build_submit.sh <gcloud builds submit arguments...>
 set -euo pipefail
 
 # The BuildKit message the retry is for. Matched as a fixed string.
