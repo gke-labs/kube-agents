@@ -80,8 +80,9 @@ const (
 	// operator reconcile, so a profile that drops out of the config briefly
 	// (its identity not rendered for a moment) is back before it fires.
 	// On a latched install (the six-token supervisor form, #5301) it also
-	// bounds a terminal refused for a profile still listed: past it the task
-	// is settled without one, as ReasonTerminalUnpublished.
+	// bounds a terminal the server refuses for its permissions for a profile
+	// still listed (an outage doesn't count): past it the task is settled
+	// without one, as ReasonTerminalUnpublished.
 	DefaultDroppedTerminalGiveUp = 15 * time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
@@ -123,7 +124,8 @@ type Config struct {
 	SweepAfter    time.Duration
 	// DroppedTerminalGiveUp bounds the retries of a terminal whose profile
 	// the install config no longer lists, and on a latched install of any
-	// refused terminal (DefaultDroppedTerminalGiveUp).
+	// terminal the server refuses for its permissions
+	// (DefaultDroppedTerminalGiveUp).
 	DroppedTerminalGiveUp time.Duration
 	Submitter             string
 	Stream                string

@@ -47,10 +47,10 @@ type Health struct {
 	// were dropped over a pod's budget, since start.
 	DroppedAnswers int64
 	// SupervisorGiveUps counts profile tasks settled without a terminal on a
-	// latched install (#5301): the six-token terminal refused for
-	// DroppedTerminalGiveUp (a grant that never reached this connection), or
-	// taken as a duplicate of a message that isn't it and not landed under a
-	// fresh id either. Each is logged at Error as ReasonTerminalUnpublished.
+	// latched install (#5301): the six-token terminal refused by the server's
+	// permissions for DroppedTerminalGiveUp (a grant that never reached this
+	// connection), or taken as a duplicate of a message that isn't it and
+	// taken as a duplicate again under a fresh id. Each is logged at Error as ReasonTerminalUnpublished.
 	SupervisorGiveUps int64
 	// OpenBreakers are the (profile, tier) pairs, as profile/tier, whose
 	// breaker is open, holding every new submission queued, and

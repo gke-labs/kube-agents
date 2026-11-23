@@ -264,6 +264,13 @@ type Dispatcher struct {
 	// supervisorGiveUps counts profile tasks settled without a terminal on a
 	// latched install (terminalGivenUp, #5301).
 	supervisorGiveUps atomic.Int64
+	// refusals hears the server refusing a terminal publish for the
+	// connection's permissions, the one failure terminalGivenUp's bound
+	// counts.
+	refusals publishRefusals
+	// publishAck, set (tests only), stands in for lib.Client.PublishAck on
+	// the terminal's publishes.
+	publishAck func(ctx context.Context, c *lib.Client, subject string, env *lib.Envelope) (uint64, bool, error)
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
 	// breakers hold back a (profile, tier) whose tasks keep losing their
@@ -1002,7 +1009,7 @@ func (d *Dispatcher) endUnstarted(ctx context.Context, log *slog.Logger, del lib
 	defer context.AfterFunc(ctx, func() { time.AfterFunc(reportAfterStop, cancel) })()
 	var refused terminalRefusal
 	for {
-		err := d.publishTerminal(pctx, hk, del.Envelope(), state, ref.reason, ref.detail)
+		err := d.publishTerminal(pctx, &refused, hk, del.Envelope(), state, ref.reason, ref.detail)
 		if err == nil {
 			break
 		}
@@ -1640,12 +1647,14 @@ func (d *Dispatcher) failAs(ctx context.Context, log *slog.Logger, del lib.Deliv
 // publishTerminalRetry publishes a held task's terminal until it lands or
 // ctx ends, and says whether the task may be settled: it landed, its profile
 // has been gone from the install config for DroppedTerminalGiveUp, or, on a
-// latched install, the terminal has been refused for DroppedTerminalGiveUp
+// latched install, the server has refused the terminal for DroppedTerminalGiveUp
 // (terminalGivenUp). A dropped profile's .supervisor grant goes at the next
 // reconnect, so its terminal could be refused for good; it is given up on,
 // logged as an error, and the task settled anyway, rather than hold its slot
-// until a restart. On an unlatched install a profile still listed is retried
-// for as long as it takes, as before the six-token form.
+// until a restart. That check comes first, so a dropped profile keeps its own
+// log line on a latched install too, and not terminalGivenUp's
+// terminal-unpublished. On an unlatched install a profile still listed is
+// retried for as long as it takes, as before the six-token form.
 func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, state lib.TaskState, reason, detail string) bool {
 	var droppedAt time.Time
 	var refused terminalRefusal
@@ -1653,21 +1662,27 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 		// Each attempt is bounded on its own: a refused publish is never
 		// acked, and the caller's context may have no deadline at all.
 		actx, cancel := context.WithTimeout(ctx, kvOpTimeout)
-		err := d.publishTerminal(actx, h.key(), del.Envelope(), state, reason, detail)
+		err := d.publishTerminal(actx, &refused, h.key(), del.Envelope(), state, reason, detail)
 		cancel()
 		if err == nil {
 			return true
 		}
-		if d.terminalGivenUp(log, &refused, err, state, reason) {
-			return true
-		}
-		if _, listed := profileOf(d.src.Config(), h.profile); listed {
+		_, listed := profileOf(d.src.Config(), h.profile)
+		switch {
+		case listed:
 			droppedAt = time.Time{}
-		} else if droppedAt.IsZero() {
+		case droppedAt.IsZero():
 			droppedAt = d.now()
-		} else if d.now().Sub(droppedAt) >= d.cfg.DroppedTerminalGiveUp {
+		case d.now().Sub(droppedAt) >= d.cfg.DroppedTerminalGiveUp:
 			log.Error("gave up on the terminal of a task whose profile left the install config; settling it without one",
 				"state", state, "reason", reason, "after", d.cfg.DroppedTerminalGiveUp, "err", err)
+			return true
+		}
+		// A dropped profile's refusals are its own bound's, above; only a
+		// planted duplicate gives it up early.
+		if !listed && !errors.Is(err, errTerminalUnpublished) {
+			refused.since = time.Time{}
+		} else if d.terminalGivenUp(log, &refused, err, state, reason) {
 			return true
 		}
 		log.Warn("publish the failure terminal; retrying", "err", err)
@@ -1677,10 +1692,13 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 	}
 }
 
-// terminalRefusal is one terminal's run of failed publishes, for
-// terminalGivenUp's bound.
+// terminalRefusal is one terminal's retry state across its attempts: the
+// start of its run of permission refusals, for terminalGivenUp's bound, and
+// the fresh envelope id its duplicate re-publishes go under
+// (confirmDuplicateTerminal), so they dedupe onto each other.
 type terminalRefusal struct {
-	since time.Time
+	since   time.Time
+	freshID string
 }
 
 // terminalGivenUp decides, after a failed terminal publish, whether to stop
@@ -1689,9 +1707,14 @@ type terminalRefusal struct {
 // there the five-token form is no profile task's terminal past the readers'
 // cutoff, so there is nothing to fall back to, and a refusal that outlasts
 // DroppedTerminalGiveUp (a grant that never reached the connection) would
-// otherwise hold the task's slot until a restart. A duplicate that isn't the
-// task's terminal (errTerminalUnpublished) gives up at once. An unlatched
-// install keeps retrying, as it always has.
+// otherwise hold the task's slot until a restart. Only a permission refusal
+// counts (errSupervisorPublishRefused: the server refused the six-token
+// publish while the attempt ran): the bound starts at the first and runs
+// while every failed attempt is one. Any other failure (a disconnect, no
+// responders, a timeout with no refusal, a JetStream API error) resets it, so
+// a NATS or TASKS outage of any length is retried and the terminal lands
+// after it. A duplicate that isn't the task's terminal (errTerminalUnpublished)
+// gives up at once. An unlatched install keeps retrying, as it always has.
 //
 // Giving up is loud: the Error log names ReasonTerminalUnpublished, and the
 // health line counts it (supervisorGiveUps). The requester sees no terminal;
@@ -1702,7 +1725,7 @@ func (d *Dispatcher) terminalGivenUp(log *slog.Logger, r *terminalRefusal, err e
 		d.giveUpTerminal(log, state, reason, 0, err)
 		return true
 	}
-	if d.src.Config().ProfileSupervisorForm != lib.ProfileSupervisorFormProfile {
+	if d.src.Config().ProfileSupervisorForm != lib.ProfileSupervisorFormProfile || !errors.Is(err, errSupervisorPublishRefused) {
 		r.since = time.Time{}
 		return false
 	}
