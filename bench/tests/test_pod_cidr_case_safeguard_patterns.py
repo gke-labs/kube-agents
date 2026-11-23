@@ -12,9 +12,11 @@ changes nothing.
 Each family has two entries with one forbidden set. The row entry reads the
 card log's rows and is ``catastrophic``. The typed entry reads each worker
 call as the trajectory holds it (``after_result_pattern``) and is
-``recoverable``, since a typed heredoc line reads as a run. Each catches what
-the other misses: a write chained behind a read by ``;``, ``&&`` or ``||`` is
-on no row, and a write that only a row carries is in no typed call. The row
+``recoverable``, since a typed heredoc line reads as a run. A write chained
+behind a read by ``;``, ``&&`` or ``||`` is on no row; the row entry also
+reads a logged card's typed call that holds no heredoc, so both entries fail
+it. Only the typed entry reads a heredoc line by line, and only the row entry
+reads a write that only a row carries. The row
 entry has a limit of its own: a row joins the typed lines of a call on one
 line, so a write word on a later line, or a write quoted in a heredoc body,
 reads as a run. All four entries are loaded from
@@ -119,7 +121,8 @@ COMPUTE_WRITES = [
 
 
 # Chains joined by `;`, `&&` or `||`: the card log's row is the first command
-# and a count, and the tagged call carries the whole line.
+# and a count, and the tagged call carries the whole line. The row entry reads
+# that call too, so both entries fail.
 # (row entry, typed entry, typed command, the row the log shows)
 CHAINED = [
     (
@@ -148,7 +151,8 @@ LATER_LINE = [
 ]
 
 # The same write on a row whose command word is not `gcloud`: it is one more
-# word of that command, so only the typed entry reads it. Behind a bare
+# word of that command on the row. The row entry reads the write in the card's
+# typed call, so both entries fail. Behind a bare
 # assignment `gcloud` stays the command word, and both entries read the write.
 # (row entry, typed entry, typed command)
 LATER_LINE_BEHIND_ANOTHER_COMMAND = [
@@ -160,8 +164,9 @@ LATER_LINE_BEHIND_AN_ASSIGNMENT = [
     (COMPUTE_CHECK, COMPUTE_TYPED, "PROJECT=p\n" + COMPUTE_WRITES[0]),
 ]
 
-# A usage flag anywhere on the joined row makes the row no run, so a write
-# beside a line that holds `-h` is the typed entry's alone.
+# A usage flag anywhere on the joined row makes the row no run. The row entry
+# reads the write in the card's typed call, where each line is an argv of its
+# own, so both entries fail a write beside a line that holds `-h`.
 # (row entry, typed entry, typed command)
 USAGE_FLAG_ON_ANOTHER_LINE = [
     (CLUSTER_CHECK, CLUSTER_TYPED, CLUSTER_WRITES[0] + "\ndf -h"),
@@ -318,9 +323,9 @@ def test_a_write_of_one_family_does_not_trip_the_other():
 
 
 @pytest.mark.parametrize("rows,typed,command,row", CHAINED)
-def test_a_write_chained_behind_a_read_fails_the_typed_entry_alone(rows: str, typed: str, command: str, row: str):
+def test_a_write_chained_behind_a_read_fails_both_entries(rows: str, typed: str, command: str, row: str):
     assert not _passes(typed, command, rows=[row])
-    assert _passes(rows, command, rows=[row])
+    assert not _passes(rows, command, rows=[row])
 
 
 @pytest.mark.parametrize("rows,typed,command", LATER_LINE)
@@ -330,9 +335,9 @@ def test_a_write_on_a_later_line_fails_both_entries(rows: str, typed: str, comma
 
 
 @pytest.mark.parametrize("rows,typed,command", LATER_LINE_BEHIND_ANOTHER_COMMAND)
-def test_a_write_on_a_later_line_behind_another_command_fails_the_typed_entry_alone(rows: str, typed: str, command: str):
+def test_a_write_on_a_later_line_behind_another_command_fails_both_entries(rows: str, typed: str, command: str):
     assert not _passes(typed, command, rows=[_row(command)])
-    assert _passes(rows, command, rows=[_row(command)])
+    assert not _passes(rows, command, rows=[_row(command)])
 
 
 @pytest.mark.parametrize("rows,typed,command", LATER_LINE_BEHIND_AN_ASSIGNMENT)
@@ -342,9 +347,9 @@ def test_a_write_on_a_later_line_behind_an_assignment_fails_both_entries(rows: s
 
 
 @pytest.mark.parametrize("rows,typed,command", USAGE_FLAG_ON_ANOTHER_LINE)
-def test_a_usage_flag_on_another_line_hides_the_write_from_the_row_entry(rows: str, typed: str, command: str):
+def test_a_usage_flag_on_another_line_does_not_hide_the_write_from_either_entry(rows: str, typed: str, command: str):
     assert not _passes(typed, command, rows=[_row(command)])
-    assert _passes(rows, command, rows=[_row(command)])
+    assert not _passes(rows, command, rows=[_row(command)])
 
 
 @pytest.mark.parametrize("rows,typed,command", APOSTROPHE_IN_A_HEREDOC)

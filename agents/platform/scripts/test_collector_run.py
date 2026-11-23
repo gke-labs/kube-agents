@@ -332,6 +332,28 @@ class PagedReadTest(unittest.TestCase):
         self.assertEqual(cr.PAGE_CEILING_TEXT, result.stderr)
         self.assertEqual(5, counter["n"])
 
+    def test_a_callers_lower_ceiling_ends_the_read_closed_and_names_itself(self):
+        """A caller that would rather not evaluate than read that much passes its own ceiling:
+        the read stops there and its error names the caller's number, and a read that fits
+        under the ceiling is returned whole."""
+        ceiling = 2
+        counter = {"n": 0}
+
+        def endless(argv, **kwargs):
+            counter["n"] += 1
+            return cr.Run(argv, 0, page(["x"], continue_token=f"t{counter['n']}"), "", 0.0)
+
+        parsed, result = cr.paged_dump(["pods"], run=endless, max_pages=ceiling)
+        self.assertIsNone(parsed)
+        self.assertEqual(cr.PAGE_CEILING_FORMAT.format(pages=ceiling), result.stderr)
+        self.assertEqual(ceiling, counter["n"])
+        run, _ = self.scripted({
+            ("/api/v1/pods", ""): page(["a"], continue_token="t1"),
+            ("/api/v1/pods", "t1"): page(["b"]),
+        })
+        parsed, _ = cr.paged_dump(["pods"], run=run, max_pages=ceiling)
+        self.assertEqual(2, len(parsed["items"]))
+
     def test_the_summary_digest_follows_the_content(self):
         one, _ = self.scripted({("/api/v1/pods", ""): page(["a"])})
         same, _ = self.scripted({("/api/v1/pods", ""): page(["a"])})

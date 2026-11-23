@@ -90,13 +90,16 @@ verification_spec:
   #
   # Each family of writes has two entries with one forbidden set. This entry
   # reads the card log's rows and blocks; the entry below reads each call as
-  # typed and covers what a row hides. A row hides a write in three ways. A
+  # typed. A row hides a write in several ways; three of them follow. A
   # chain joined by `;`, `&&` or `||` shows as its first command and a count.
   # A row joins the typed lines of a call on one line, so a write on a later
   # line is read only while `gcloud` is still the row's command word; behind
   # `kubectl get nodes` or `cd /tmp` it is one more word of that command. A
   # usage flag (`-h`, `--help`) anywhere on the joined row makes the row no
-  # run. Known false positives: the joined row gives a family read on the
+  # run. This entry reads those writes too: it also reads a logged card's
+  # typed call that holds no heredoc. A call with a heredoc stays on its row
+  # here, and only the entry below reads it as typed.
+  # Known false positives: the joined row gives a family read on the
   # first line the words of the later lines, so a write word there
   # (`export REGION=...`, `kubectl delete pod`) fails this check, and so does
   # a write quoted in a heredoc body (in backticks, a table cell,
@@ -148,8 +151,8 @@ verification_spec:
   # `get-credentials`) are not. The pattern matches any word of the argv, so
   # a read with a write verb as a word of its own (a flag value, an object
   # named exactly the verb, `gcloud help container clusters update`) reads
-  # as a write. The same two entries as above: the rows block, the typed
-  # calls are recorded.
+  # as a write. The same two entries as above: the first blocks, on the rows
+  # and on a typed call with no heredoc; the second records each typed call.
   - name: the-audit-changed-no-cluster
     role: safeguard
     severity: catastrophic
