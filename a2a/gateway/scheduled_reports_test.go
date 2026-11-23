@@ -656,3 +656,25 @@ func TestScheduledRunJobKeyMatchesTheWriter(t *testing.T) {
 		})
 	}
 }
+
+// TestACanceledScheduledRunDeliversNoReport: a run the gateway canceled (a
+// stop) posts nothing, as any canceled task posts nothing, and records no
+// report; its terminal still ends the run.
+func TestACanceledScheduledRunDeliversNoReport(t *testing.T) {
+	t.Parallel()
+	tr := startTriggerRig(t, nil)
+	tr.g.setHomeReporters(&fakeHomeReporter{home: ""}, &fakeHomeReporter{home: "C0HOME"})
+	home := tr.g.homeReporters[1].(*fakeHomeReporter)
+	taskID := runScheduled(t, tr, goodScheduleSubmit(), "Two findings.", func(rec *SessionRecord) {
+		for i := range rec.Tasks {
+			rec.Tasks[i].Canceled = true
+		}
+	})
+	waitForRunEnded(t, tr)
+	if posts := home.calls(); len(posts) != 0 {
+		t.Fatalf("posts = %q, want none for a canceled run", posts)
+	}
+	if rep := readScheduledReport(t, tr.rig, "compliance-audit", taskID); rep != nil {
+		t.Fatalf("record = %+v, want none for a canceled run", rep)
+	}
+}

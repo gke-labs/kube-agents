@@ -683,8 +683,9 @@ SECRET_READ_COMMAND_RE = re.compile(
 # substitution whole, and gives each simple command to the same word walk. The
 # rule withholds when either read withholds, so the second read can only add a
 # withhold. It reads only text that the reader gives words for: text with an
-# unclosed quote, a redirect with no target or the reader's mark character is
-# the first read's alone.
+# unclosed quote or a redirect with no target has no words, and text with the
+# reader's mark character is kept away from the reader, so each of them is the
+# first read's alone.
 #
 # `gcloud auth`, as the first group behind `gcloud`: every subcommand withholds
 # but the ones named here, which print no token, and a flag right behind
@@ -2650,8 +2651,10 @@ def _read_script_prints(text: str, depth: int, budget: List[int], nesting: int =
 
     This is the rule's second read. It decides only on text that the reader
     gives words for. It serves the rest, which the first read decides: text
-    with an unclosed quote or a redirect with no target, and text that holds
-    the reader's mark character.
+    with an unclosed quote or a redirect with no target, for which the reader
+    gives no words, and text that holds the reader's mark character, which
+    this read keeps away from the reader. The reader has words for such text
+    too, so that guard is a choice of this rule and not a limit of the reader.
     """
     if len(budget) < READ_COUNT:
         # The first read made this budget, in a call by its own name.

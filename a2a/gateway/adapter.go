@@ -306,6 +306,37 @@ type LineAnswerer interface {
 	AnswersOnLine(conversation string) bool
 }
 
+// WholeLineAnswerer is a LineAnswerer that takes a completed task's whole
+// answer on the task's live message when it fits one piece (PieceSizer):
+// the line becomes the answer, in place of a post under a bare mark. Teams
+// implements it: it draws no reaction, so without it every direct answer
+// sits under a card holding ✅ alone. An answer past the piece size posts
+// as on any backend, and the line ends as lineDoneMark. An edit raises no
+// notification where a post does; a backend takes that trade knowingly.
+type WholeLineAnswerer interface {
+	AnswersWholeOnLine(conversation string) bool
+}
+
+// PieceSizer names the most bytes one post or edit to conversation carries
+// A backend that does not implement it takes discordChunk, Discord's cap,
+// which every other backend fits under; one whose cap is far above it
+// (Teams, 28 KiB an activity) says so, and a table that fits one card is not
+// cut into two. The relay splits posts at it (Gateway.post) and truncates
+// line edits to it; the notifier splits home and conversation posts at it.
+type PieceSizer interface {
+	PieceSize(conversation string) int
+}
+
+// pieceSizeOf is the backend's PieceSize for conversation, or discordChunk.
+func pieceSizeOf(a any, conversation string) int {
+	if sizer, ok := a.(PieceSizer); ok {
+		if n := sizer.PieceSize(conversation); n > 0 {
+			return n
+		}
+	}
+	return discordChunk
+}
+
 // OutMessage is one post or edit as a value: the text, and the chat message
 // that lays the same content out (spec-a2a-payloads.md, "Chat messages").
 type OutMessage struct {

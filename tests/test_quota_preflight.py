@@ -111,8 +111,8 @@ data:
 # Totals for a stock install, re-derived by hand from values.yaml and footprint.yaml. These
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here. The A2A stack is in them: the three NATS servers,
-# two callouts, two verifiers, the console, the gateway and its standby, the profile
-# dispatcher, the provisioning Job, and the hermes-bridge container in the agent pod.
+# two callouts, two verifiers, the console, the MCP server, the gateway and its standby, the
+# profile dispatcher, the provisioning Job, and the hermes-bridge container in the agent pod.
 # The session pods at the default cap (#6028): maxSessions (10) times the operator's
 # DefaultSession* figures, 150m / 320Mi requested, 2 CPU / 2Gi limits, 1088Mi ephemeral.
 _DEFAULT_MAX_SESSIONS = 10
@@ -121,20 +121,20 @@ _SESSION_LIMIT_MILLIS = 2000
 _SESSION_REQUEST_MEMORY_BYTES = 320 * 1024**2
 _SESSION_LIMIT_MEMORY_BYTES = 2 * 1024**3
 _SESSION_EPHEMERAL_BYTES = 1088 * 1024**2
-_DEFAULT_PODS = 21 + _DEFAULT_MAX_SESSIONS
-_DEFAULT_REQUESTS_CPU_MILLIS = 4436 + _DEFAULT_MAX_SESSIONS * _SESSION_REQUEST_MILLIS
-_DEFAULT_LIMITS_CPU_MILLIS = 23050 + _DEFAULT_MAX_SESSIONS * _SESSION_LIMIT_MILLIS
+_DEFAULT_PODS = 22 + _DEFAULT_MAX_SESSIONS
+_DEFAULT_REQUESTS_CPU_MILLIS = 4536 + _DEFAULT_MAX_SESSIONS * _SESSION_REQUEST_MILLIS
+_DEFAULT_LIMITS_CPU_MILLIS = 23550 + _DEFAULT_MAX_SESSIONS * _SESSION_LIMIT_MILLIS
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 15120 * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_REQUEST_MEMORY_BYTES
-_DEFAULT_LIMITS_MEMORY_BYTES = 33056 * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_LIMIT_MEMORY_BYTES
+_DEFAULT_REQUESTS_MEMORY_BYTES = 15248 * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_REQUEST_MEMORY_BYTES
+_DEFAULT_LIMITS_MEMORY_BYTES = 33312 * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_LIMIT_MEMORY_BYTES
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi) plus 512Mi (128Mi on each NATS server and on the provisioning Job), LiteLLM's
-# 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two replicas, and the
-# cleanup hook's 1088Mi, and the profile dispatcher's 64Mi.
+# 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two replicas, the cleanup
+# hook's 1088Mi, and the profile dispatcher's and MCP server's 64Mi each.
 _LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 512 + 2 * 1280 + 1088 + 64) * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_EPHEMERAL_BYTES
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 512 + 2 * 1280 + 1088 + 64 + 64) * 1024**2 + _DEFAULT_MAX_SESSIONS * _SESSION_EPHEMERAL_BYTES
 # The same three additions, because each sets its limit equal to its request.
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -1457,32 +1457,32 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(delta["pods"], sum(p["replicas"] for p in pods))
         self.assertEqual(delta["surgeRequestsCpu"], 0, "each rolls Recreate")
 
-    def test_the_mcp_server_is_counted_when_its_flag_is_on(self) -> None:
-        """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), so no
+    def test_the_curator_is_counted_when_its_flag_is_on(self) -> None:
+        """The operator renders the curator only under A2A_CURATOR=true (#5566), so no
         golden carries it and the chart adds it from files/flagged-pods.yaml."""
-        mcp = self._flagged()["mcp"]
-        self.assertGreater(mcp["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        curator = self._flagged()["curator"]
+        self.assertGreater(curator["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
         for name, env in (
-            ("true", [{"name": "A2A_MCP_DOOR", "value": "true"}]),
-            ("by valueFrom", [{"name": "A2A_MCP_DOOR",
+            ("true", [{"name": "A2A_CURATOR", "value": "true"}]),
+            ("by valueFrom", [{"name": "A2A_CURATOR",
                                "valueFrom": {"configMapKeyRef": {"name": "x", "key": "door"}}}]),
-            ("not a string", [{"name": "A2A_MCP_DOOR", "value": True}]),
-            ("last of two", [{"name": "A2A_MCP_DOOR", "value": "false"},
-                             {"name": "A2A_MCP_DOOR", "value": "true"}]),
+            ("not a string", [{"name": "A2A_CURATOR", "value": True}]),
+            ("last of two", [{"name": "A2A_CURATOR", "value": "false"},
+                             {"name": "A2A_CURATOR", "value": "true"}]),
             ("a $(VAR) reference the kubelet expands", [{"name": "DOOR", "value": "true"},
-                                                        {"name": "A2A_MCP_DOOR", "value": "$(DOOR)"}]),
+                                                        {"name": "A2A_CURATOR", "value": "$(DOOR)"}]),
         ):
             with self.subTest(name):
-                self._assert_counts(self._flagged_delta(env), mcp)
+                self._assert_counts(self._flagged_delta(env), curator)
 
-    def test_the_mcp_server_is_not_counted_when_the_operator_reads_its_flag_as_off(self) -> None:
+    def test_the_curator_is_not_counted_when_the_operator_reads_its_flag_as_off(self) -> None:
         for name, env in (
-            ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
-            ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
-            ("no value", [{"name": "A2A_MCP_DOOR"}]),
-            ("a null value", [{"name": "A2A_MCP_DOOR", "value": None}]),
-            ("last of two", [{"name": "A2A_MCP_DOOR", "value": "true"},
-                             {"name": "A2A_MCP_DOOR", "value": "false"}]),
+            ("false", [{"name": "A2A_CURATOR", "value": "false"}]),
+            ("TRUE, which the operator does not take", [{"name": "A2A_CURATOR", "value": "TRUE"}]),
+            ("no value", [{"name": "A2A_CURATOR"}]),
+            ("a null value", [{"name": "A2A_CURATOR", "value": None}]),
+            ("last of two", [{"name": "A2A_CURATOR", "value": "true"},
+                             {"name": "A2A_CURATOR", "value": "false"}]),
         ):
             with self.subTest(name):
                 self.assertEqual(set(self._flagged_delta(env).values()), {0})
@@ -1504,10 +1504,27 @@ class PreflightDecisionTest(unittest.TestCase):
         off = {"operator": {"profileDispatcher": {"enabled": False}}}
         self.assertEqual(self._requirements([], values=off), base)
 
-    def test_the_mcp_server_is_counted_beside_the_dispatcher(self) -> None:
+    def test_the_mcp_server_is_counted_by_default(self) -> None:
+        """The operator renders the MCP server by default, so the goldens carry it,
+        footprint.yaml counts it, and files/flagged-pods.yaml no longer lists it."""
+        footprint = yaml.safe_load((_CHART / "files" / "footprint.yaml").read_text())
+        self.assertIn("a2aMcp", footprint["operatorRendered"])
+        self.assertNotIn("mcp", self._flagged())
+
+    def test_the_mcp_server_count_does_not_follow_its_switch(self) -> None:
+        """Switching the MCP server off (operator.mcpServer.enabled=false or A2A_MCP_DOOR=false)
+        still counts its one pod: an over-count, in the safe direction, which the chart's values
+        comment states."""
+        base = self._requirements([])
+        off = {"operator": {"mcpServer": {"enabled": False}}}
+        self.assertEqual(self._requirements([], values=off), base)
+        env_off = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "false"}]}}
+        self.assertEqual(self._requirements([], values=env_off), base)
+
+    def test_the_curator_is_counted_beside_the_default_a2a_pods(self) -> None:
         pods = self._flagged()
-        env = [{"name": "A2A_MCP_DOOR", "value": "true"}]
-        self._assert_counts(self._flagged_delta(env), pods["mcp"])
+        env = [{"name": "A2A_CURATOR", "value": "true"}]
+        self._assert_counts(self._flagged_delta(env), pods["curator"])
 
     def _scope_publisher(self) -> dict:
         """files/transient-pods.yaml's entry; TestTheChartCountsTheScopePublishersJobPod holds it to the operator."""
@@ -1585,32 +1602,6 @@ class PreflightDecisionTest(unittest.TestCase):
                 )
                 self.assertNotEqual(res.returncode, 0, "a damaged transient-pods.yaml must fail the render")
                 self.assertIn("transient-pods.yaml is missing or unreadable", res.stderr)
-
-    def _mcp_server_delta(self, env: list) -> dict:
-        base = self._requirements()
-        req = self._requirements(values={"operator": {"mcpServer": {"enabled": True}, "extraEnv": env}})
-        return {key: req[key] - base[key] for key in base}
-
-    def test_the_mcp_server_is_counted_when_operator_mcp_server_enabled_is_true(self) -> None:
-        """operator.mcpServer.enabled sets A2A_MCP_DOOR=true, so the count follows it, and an
-        extraEnv entry that does not turn the flag off leaves it counted."""
-        mcp = self._flagged()["mcp"]
-        for name, env in (
-            ("the value alone", []),
-            ("beside extraEnv true", [{"name": "A2A_MCP_DOOR", "value": "true"}]),
-            ("beside an unrelated extraEnv entry", [{"name": "GOMEMLIMIT", "value": "100MiB"}]),
-        ):
-            with self.subTest(name):
-                self._assert_counts(self._mcp_server_delta(env), mcp)
-
-    def test_an_extra_env_false_turns_off_the_mcp_server_the_value_turned_on(self) -> None:
-        """extraEnv is rendered after the value and wins, in the Deployment and in the count."""
-        for name, env in (
-            ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
-            ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
-        ):
-            with self.subTest(name):
-                self.assertEqual(set(self._mcp_server_delta(env).values()), {0})
 
     def test_a_larger_a2a_bridge_resources_is_counted_as_written(self) -> None:
         """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
@@ -2405,7 +2396,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"43550m"', res.stderr)
+        self.assertIn('"limits.cpu":"44050m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -2414,7 +2405,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"56608Mi"', res.stderr)
+        self.assertIn('"limits.memory":"56864Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -2425,8 +2416,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        # The release's 26368Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"limits.ephemeral-storage":"27Gi"', res.stderr)
+        # The release's 26432Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"limits.ephemeral-storage":"27712Mi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -2435,8 +2426,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 5936m, the session pods at the cap included, plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"6036m"', res.stderr)
+        # The release's 6036m, the session pods at the cap included, plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"6136m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -2445,8 +2436,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        # The release's 18320Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 2Gi.
-        self.assertIn('"memory":"20368Mi"', res.stderr)
+        # The release's 18448Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 2Gi.
+        self.assertIn('"memory":"20496Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -2457,8 +2448,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        # The release's 26368Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"ephemeral-storage":"27Gi"', res.stderr)
+        # The release's 26432Mi, the session pods at the cap included, plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"ephemeral-storage":"27712Mi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""

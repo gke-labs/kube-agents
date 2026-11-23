@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -568,6 +569,14 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 	}
 	if perSession != a2aSessionConsumersPerSession {
 		t.Errorf("A2A_SESSION_CONSUMERS is %d, a2aSessionConsumersPerSession is %d", perSession, a2aSessionConsumersPerSession)
+	}
+	// A session run (EVAL_FRONT_DOOR=session, #6539) sizes its cap at the
+	// session route's per-session cost, which adds the replays.
+	if asks := read("A2A_SESSION_REPLAY_ASKS"); asks != a2aTasksReplaySessionAsks {
+		t.Errorf("A2A_SESSION_REPLAY_ASKS is %d, a2aTasksReplaySessionAsks is %d", asks, a2aTasksReplaySessionAsks)
+	}
+	if per := a2aTasksConsumersPerSession(&agentv1alpha1.PlatformAgent{Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{DefaultRoute: ptr.To(agentv1alpha1.DefaultRouteSession)}}}}); per != perSession+read("A2A_SESSION_REPLAY_ASKS") {
+		t.Errorf("the session route's per-session cost is %d, A2A_SESSION_CONSUMERS + A2A_SESSION_REPLAY_ASKS is %d", per, perSession+read("A2A_SESSION_REPLAY_ASKS"))
 	}
 	if want := a2aTasksReservedConsumersFor(0); fixed != want {
 		t.Errorf("A2A_RESERVE_FIXED is %d, the reserve at zero workers is %d", fixed, want)

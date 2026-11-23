@@ -51,4 +51,4 @@ The admin console is a Streamlit prototype for one operator's machine. `./script
 
 ## Other ways in
 
-Two doors are not browser pages. The Hermes CLI runs inside the gateway pod over `kubectl exec` ([When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled)). The opt-in [MCP server](/kube-agents/reference/a2a-mcp/) lets an external coding agent or IDE talk to the install over the same bus the A2A console uses.
+Two doors are not browser pages. The Hermes CLI runs inside the gateway pod over `kubectl exec` ([When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled)). The [MCP server](/kube-agents/reference/a2a-mcp/) runs by default (`operator.mcpServer.enabled: false` switches it off) and lets an external coding agent or IDE talk to the install over the same bus the A2A console uses.

@@ -123,8 +123,9 @@ def test_discovery_rejects_cluster_cloud_forge_harness_scripts_and_http_probes()
 
 def test_discovery_catches_chained_and_multiline_commands_collapsed_in_card_log():
     chained = f"{PREFLIGHT_LIST} && kubectl get configmap -n kubeagents-system platform-agent-gitops-state -o yaml"
-    # Hermes collapses chains in the card log to `<first> + 1 command`, so the row member
-    # alone passes while the paired typed-call member catches the chained kubectl.
+    # Hermes collapses chains in the card log to `<first> + 1 command`. The row member reads
+    # the logged card's typed call too (#6106), so it catches the chained kubectl as the
+    # paired typed-call member does.
     row_member = _entry(DISCOVERY_CHECK)["check"]["checks"][0]
     transcript.set(
         "Manages gke-agentic/example-infra.",
@@ -132,7 +133,7 @@ def test_discovery_catches_chained_and_multiline_commands_collapsed_in_card_log(
         worker_commands=[{"task": "t_1", "command": f"{PREFLIGHT_LIST} + 1 command"}],
     )
     try:
-        assert WorkerCommandsVerifier(**row_member).verify(5.0).status == "pass"
+        assert WorkerCommandsVerifier(**row_member).verify(5.0).status == "fail"
     finally:
         transcript.clear()
     assert _run_entry(DISCOVERY_CHECK, [chained], rows=[f"{PREFLIGHT_LIST} + 1 command"]) == "fail"

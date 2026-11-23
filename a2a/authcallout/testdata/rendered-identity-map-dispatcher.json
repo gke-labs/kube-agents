@@ -1,5 +1,5 @@
 {
-  "version": "d282723e7adfc373",
+  "version": "758d003cd5162549",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -84,6 +84,7 @@
           "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
           "chat.notify.gchat",
           "chat.notify.slack",
+          "chat.notify.teams",
           "chat.notify.console",
           "_INBOX.agent.>"
         ],
@@ -190,10 +191,12 @@
           "chat.console.*.confirm",
           "chat.notify.gchat",
           "chat.notify.slack",
+          "chat.notify.teams",
           "chat.notify.console",
           "chat.board.reply.gateway.>",
           "a2a.trigger.*.submit",
           "a2a.trigger.*.status",
+          "a2a.trigger.*.stop",
           "chat.incident.reply.gateway.>",
           "_INBOX.gateway.>"
         ],
@@ -242,6 +245,7 @@
           "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-tse-read-child",
           "$JS.ACK.PROFILE_SUBMITS.profile-tse-read-child.>",
           "a2a.tasks.tse.*.supervisor",
+          "a2a.tasks.p.tse.*.supervisor",
           "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.*",
           "$KV.PROFILE_LEASES.>",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
