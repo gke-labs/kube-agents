@@ -1268,11 +1268,13 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 }
 
 // endRefused publishes the terminal of a task stopped at a definitive write
-// refusal: rejected, the state no supervisor retries and the gateway renders
-// with its reason, carrying the refused verb, and the rule where the reason
-// names one, and no other output.
+// refusal: failed (work ran first, so not rejected), which no supervisor
+// retries and the gateway renders with its reason's detail, carrying the
+// refused verb, and the rule where the reason names one, and no other output.
 func (a *adapter) endRefused(r *writeRefusal) (Result, error) {
-	state := lib.StateRejected
+	// failed, not rejected: work ran before the refusal, and rejected means
+	// refused before the start (spec-a2a-payloads.md).
+	state := lib.StateFailed
 	return Result{State: state}, a.finalize(state, writeRefusedReason(r), "")
 }
 

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -168,11 +170,13 @@ func (r refusalRun) run(t *testing.T) (runOutcome, string, string, string) {
 	submit(t, c, session, r.taskID, "look at kube-dns")
 	dir := t.TempDir()
 	pidFile, markerFile := filepath.Join(dir, "pid"), filepath.Join(dir, "reached-the-rest")
-	// A harness meant to be stopped pauses past the task's deadline, so only
-	// the stop ends it in time; one meant to finish doesn't pause.
-	pause := 0
+	// A harness meant to be stopped pauses below the task's deadline and the
+	// run must end well inside that pause, so only the stop can end it in
+	// time: without the stop the harness wakes and completes. One meant to
+	// finish doesn't pause.
+	pause, within := 0, 60*time.Second
 	if r.expectStop {
-		pause = 60
+		pause, within = 10, 5*time.Second
 	}
 	cfg := adapterConfig(url, r.taskID, session, refusalStub(t, r.records, r.first, r.rest, pause, pidFile, markerFile))
 	cfg.StopOnWriteRefusal = r.stop
@@ -189,7 +193,7 @@ func (r refusalRun) run(t *testing.T) (runOutcome, string, string, string) {
 		cfg.WriteRefusalFile = recordFile
 		cfg.HarnessEnv = append(cfg.HarnessEnv, EnvWriteRefusalFile+"="+recordFile, EnvWriteRefusalTask+"="+r.taskID)
 	}
-	out := waitOutcome(t, runAdapter(context.Background(), cfg), 60*time.Second)
+	out := waitOutcome(t, runAdapter(context.Background(), cfg), within)
 	return out, terminalText(t, url, session, r.taskID), pidFile, markerFile
 }
 
@@ -211,7 +215,7 @@ func assertCompleted(t *testing.T, out runOutcome, markerFile string) {
 
 // TestWriteRefusalRecordStopsTheHarness: the broker client's first record
 // stops the harness (its process is gone, it never reaches what follows) and
-// ends the task rejected, naming the record's rule and verb and nothing of
+// ends the task failed, naming the record's rule and verb and nothing of
 // the tool output.
 func TestWriteRefusalRecordStopsTheHarness(t *testing.T) {
 	const task = "task-refusal-1"
@@ -222,7 +226,7 @@ func TestWriteRefusalRecordStopsTheHarness(t *testing.T) {
 		stop:       true,
 		expectStop: true,
 	}.run(t)
-	if out.err != nil || out.res.State != lib.StateRejected {
+	if out.err != nil || out.res.State != lib.StateFailed {
 		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
 	}
 	waitDead(t, pidFile)
@@ -246,7 +250,7 @@ func TestWriteRefusalFirstRecordIsTheOneReported(t *testing.T) {
 	out, text, pidFile, markerFile := refusalRun{
 		taskID: task,
 		records: []string{
-			refusalRecord(t, true, "caller.vcs-permit", "publish", task),
+			refusalRecord(t, true, "caller.kubectl-flag", "scale", task),
 			refusalRecord(t, true, "kubernetes.read-only", "delete", task),
 		},
 		first:      innocuousCall(t, "toolu_1"),
@@ -254,14 +258,14 @@ func TestWriteRefusalFirstRecordIsTheOneReported(t *testing.T) {
 		stop:       true,
 		expectStop: true,
 	}.run(t)
-	if out.res.State != lib.StateRejected {
+	if out.res.State != lib.StateFailed {
 		t.Fatalf("state %q err %v", out.res.State, out.err)
 	}
 	waitDead(t, pidFile)
 	if _, err := os.Stat(markerFile); err == nil {
 		t.Fatal("the harness reached its next call")
 	}
-	if !strings.Contains(text, "credential broker's caller.vcs-permit rule refused the verb publish.") || strings.Contains(text, "delete") || strings.Contains(text, "pull request") {
+	if !strings.Contains(text, "credential broker's caller.kubectl-flag rule refused the verb scale.") || strings.Contains(text, "delete") || strings.Contains(text, "pull request") {
 		t.Fatalf("terminal %q, want the first record's rule and verb only", text)
 	}
 }
@@ -446,7 +450,7 @@ func TestSessionTurnStopsAtAWriteAttempt(t *testing.T) {
 		expectStop: true,
 		sessionDir: dir,
 	}.run(t)
-	if out.err != nil || out.res.State != lib.StateRejected {
+	if out.err != nil || out.res.State != lib.StateFailed {
 		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
 	}
 	waitDead(t, pidFile)
@@ -565,5 +569,128 @@ func TestSessionReadCountsOnlyTheWrappersOwnRecord(t *testing.T) {
 	// A profile pod's read is unchanged: the broker's rule counts.
 	if r, err := readWriteRefusalFor(path, "t1", false); err != nil || r == nil || r.rule != "kubernetes.read-only" {
 		t.Fatalf("profile read = %+v, %v", r, err)
+	}
+}
+
+// TestReadCountsOnlyTheStopRules: the record file is the harness's to write
+// and the reason reaches a parent, so a record naming a rule other than the
+// read-only and flag rules, or a verb no kubectl write has, is skipped, and a
+// later genuine record still counts.
+func TestReadCountsOnlyTheStopRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), writeRefusalFileName)
+	lines := []string{
+		refusalRecord(t, true, "caller.vcs-permit", "publish", "t1"),
+		refusalRecord(t, true, "some.other-rule", "scale", "t1"),
+		refusalRecord(t, true, "kubernetes.read-only", "http://x.example/y", "t1"),
+		refusalRecord(t, true, "kubernetes.read-only", "Scale NOW", "t1"),
+		refusalRecord(t, true, "caller.kubectl-flag", "rollout restart", "t1"),
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := readWriteRefusal(path, "t1")
+	if err != nil || r == nil || r.rule != "caller.kubectl-flag" || r.verb != "rollout restart" {
+		t.Fatalf("read = %+v, %v; want the flag rule's rollout restart", r, err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines[:4], "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := readWriteRefusal(path, "t1"); err != nil || r != nil {
+		t.Fatalf("read of skipped records = %+v, %v; want none", r, err)
+	}
+}
+
+// TestAProfileWorkerStopsATaskAtItsRecordedWriteRefusal: through the profile
+// worker's own start, the record file is made beside the task token and named
+// to the harness with the task's id. A record the harness's broker client
+// writes stops the task, which ends failed with the write-refused reason,
+// well before the harness would have finished.
+func TestAProfileWorkerStopsATaskAtItsRecordedWriteRefusal(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	call := claudeToolCall(t, "toolu_1", "kubectl annotate deploy/x a=b", "exit status 77", true)
+	dir := t.TempDir()
+	callFile := filepath.Join(dir, "call.jsonl")
+	if err := os.WriteFile(callFile, []byte(strings.Join(call, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := stub(t, fmt.Sprintf(`
+echo '{"type":"system","subtype":"init","session_id":"pw-refusal"}'
+read first || exit 1
+printf '{"write_refusal":true,"rule":"kubernetes.read-only","verb":"annotate","route":"/v1/exec","time":"2026-11-23T00:00:00Z","task":"%%s"}\n' "$%[1]s" >> "$%[2]s"
+cat %[3]s
+sleep 10
+echo '{"type":"result","subtype":"success","result":"finished the task"}'
+`, EnvWriteRefusalTask, EnvWriteRefusalFile, callFile))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startProfileWorkerWith(t, ctx, profileWorkerConfig(t, url, harness), ProfileWorkerConfig{
+		Tier: pwTier, OneShot: true, TaskTokenFile: filepath.Join(dir, "token"),
+	})
+	const task = "task-pw-refusal"
+	d.offer(task, profileSubmission(t, task, "annotate the deployment", nil), 5)
+	if a := d.nextAccept(5 * time.Second); a.TaskID != task || !a.Accepted {
+		t.Fatalf("answer = %+v, want an accept", a)
+	}
+	start := time.Now()
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+	if _, final := drainLeases(d, task, 8*time.Second); !final {
+		t.Fatal("no final renewal: the task was not stopped at its record")
+	}
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Fatalf("the task took %v; the stop should end it well inside the harness's pause", elapsed)
+	}
+	got := foldTask(t, testClient(t, url), pwProfile, task)
+	if got.State != lib.StateFailed {
+		t.Fatalf("state %q, want failed", got.State)
+	}
+	if text := finalText(got); !strings.HasPrefix(text, "reason: write-refused - ") || !strings.Contains(text, "refused the verb annotate") {
+		t.Fatalf("terminal %q", text)
+	}
+}
+
+// TestTheRecordsNamesAgreeWithTheBrokerClient: the record's field names, the
+// two environment names and the stop rules' ids are written in Python (the
+// broker client and the broker) and read here in Go. Each Python constant is
+// pinned to the Go side, so a rename on one side fails here instead of
+// silently stopping no task.
+func TestTheRecordsNamesAgreeWithTheBrokerClient(t *testing.T) {
+	scripts := filepath.Join("..", "..", "agents", "platform", "scripts")
+	read := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(scripts, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	client, policy, broker := read("credential_proxy_client.py"), read("command_policy.py"), read("credential_proxy.py")
+	field := func(tag string) string {
+		st, ok := reflect.TypeOf(writeRefusalRecord{}).FieldByName(tag)
+		if !ok {
+			t.Fatalf("writeRefusalRecord has no field %s", tag)
+		}
+		return st.Tag.Get("json")
+	}
+	for _, tc := range []struct{ src, constant, want string }{
+		{client, "WRITE_REFUSAL_KEY", field("WriteRefusal")},
+		{client, "REFUSAL_FILE_ENV", EnvWriteRefusalFile},
+		{client, "REFUSAL_TASK_ENV", EnvWriteRefusalTask},
+		{client, "REFUSAL_RECORD_RULE", field("Rule")},
+		{client, "REFUSAL_RECORD_VERB", field("Verb")},
+		{client, "REFUSAL_RECORD_ROUTE", field("Route")},
+		{client, "REFUSAL_RECORD_TIME", field("Time")},
+		{client, "REFUSAL_RECORD_TASK", field("Task")},
+		{policy, "KUBERNETES_READ_ONLY_RULE", kubernetesReadOnlyRule},
+		{broker, "RULE_CALLER_KUBECTL_FLAG", callerKubectlFlagRule},
+	} {
+		line := regexp.MustCompile(`(?m)^` + tc.constant + ` = "([^"]*)"`).FindStringSubmatch(tc.src)
+		if line == nil {
+			t.Errorf("%s not found as a string constant", tc.constant)
+			continue
+		}
+		if line[1] != tc.want {
+			t.Errorf("%s = %q in Python, %q in Go", tc.constant, line[1], tc.want)
+		}
 	}
 }
