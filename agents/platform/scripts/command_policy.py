@@ -1655,8 +1655,16 @@ KUBECTL_MUTATING_SUBVERBS: dict[str, frozenset[str]] = {
 }
 
 
-# A short-flag cluster carrying the help letter (`-hv=9`), which prints help.
-_SHORT_HELP_CLUSTER_RE = re.compile(r"\A-[A-Za-z]*h[A-Za-z]*(?:=|\Z)")
+# A short-flag cluster (`-hv=9`): its letters, then `=` or the end. One
+# unambiguous character class, so the match is linear on any input; the help
+# letter is looked for in the letters afterwards (_short_help_cluster).
+_SHORT_FLAG_CLUSTER_RE = re.compile(r"\A-([A-Za-z]+)(?:=|\Z)")
+
+
+def _short_help_cluster(token: str) -> bool:
+    """Whether ``token`` is a short-flag cluster carrying the help letter."""
+    m = _SHORT_FLAG_CLUSTER_RE.match(token)
+    return m is not None and "h" in m.group(1)
 
 
 def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
@@ -1674,7 +1682,7 @@ def kubectl_definitive_write(argv: list[str]) -> tuple[str, ...] | None:
     # view-last-applied` reads as `apply`, though kubectl skips the flag and
     # runs the read. A help flag inside a short cluster (`-hv=9`) also only
     # prints help. Neither is marked: a missed mark only lets the task run on.
-    if _LOCAL_RENDER_SUBCOMMAND in own[1:] or any(_SHORT_HELP_CLUSTER_RE.match(t) for t in own[1:]):
+    if _LOCAL_RENDER_SUBCOMMAND in own[1:] or any(_short_help_cluster(t) for t in own[1:]):
         return None
     verb, _ = _kubectl_verb_and_flag(argv)
     if not kubectl_verb_is_mutating(verb):
