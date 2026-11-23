@@ -371,6 +371,15 @@ func firstDeliveryLevel(item relayItem) slog.Level {
 	return slog.LevelDebug
 }
 
+// storedAt is when the stream stored the item's message, zero when it has no
+// delivery or the server sent no metadata.
+func (item relayItem) storedAt() time.Time {
+	if item.d == nil {
+		return time.Time{}
+	}
+	return item.d.Received()
+}
+
 // sequence is the item's stream sequence, 0 when it has none.
 func (item relayItem) sequence() uint64 {
 	if item.d == nil {
@@ -555,6 +564,18 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			addressee, _, _, _ := lib.ParseTaskSubject(item.subject)
 			g.log.Warn("relay: event dropped; it came on another addressee's subject",
 				"session", sessionKey, "taskId", item.env.TaskID, "subjectAddressee", addressee, "taskAddressee", taskAddressee(rec, item.env.TaskID))
+			g.settle(item)
+			continue
+		}
+		if !g.client.AcceptSupervisorEvent(item.subject, item.storedAt(), g.taskIsProfile(rec, item.env.TaskID, taskAddressee(rec, item.env.TaskID))) {
+			// A five-token supervisor message on a profile task, stored
+			// after the install's cutoff (#5301): the dispatcher writes a
+			// profile task's terminal on the six-token form by then, so
+			// this one is not the task's. Settled, never rendered and
+			// never a wake; the client counts it.
+			g.log.Warn("relay: five-token supervisor event on a profile task, stored after the cutoff, dropped",
+				"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
+				"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
 			g.settle(item)
 			continue
 		}
@@ -1028,7 +1049,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
 		addressee := rec.AddresseeFor(taskID)
-		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
+		if task, err := g.replayForTerminal(ctx, addressee, taskID, g.taskIsProfile(rec, taskID, addressee)); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
 				replayedResult = art.Parts
@@ -1468,14 +1489,15 @@ func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID 
 	}
 }
 
-// replayForTerminal is relayTerminal's read of the task's stream.
-func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+// replayForTerminal is relayTerminal's read of the task's stream. profile is
+// taskIsProfile's answer for the task.
+func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string, profile bool) (*lib.Task, error) {
 	if g.terminalReplayHook != nil {
 		if err := g.terminalReplayHook(taskID); err != nil {
 			return nil, err
 		}
 	}
-	return g.client.TasksGet(ctx, addressee, taskID)
+	return g.client.TasksGet(ctx, addressee, taskID, lib.ProfileTaskIf(profile))
 }
 
 // reasonToken is the token of an executor's `reason: <token>[ - detail]`

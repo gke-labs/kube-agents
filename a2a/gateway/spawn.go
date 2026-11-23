@@ -614,6 +614,16 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			if s.cfg.KubeProxyMode != "" {
 				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_MODE", Value: s.cfg.KubeProxyMode})
 			}
+			// The kubectl admission's tier (a2a/Dockerfile.worker runs the
+			// admission only when KUBE_PROXY_URL is set), always named: the
+			// wrapper skips the admission for every command only on a tier it
+			// is told, and the admission reads unset as the default tier
+			// anyway. Checked again here for a Config built without FromEnv.
+			tier := kubectlCostTier(s.cfg.KubectlCostTier)
+			if tier == "" {
+				tier = defaultKubectlCostTier
+			}
+			c.Env = append(c.Env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
 		}
 		if s.cfg.KubeProxyCAConfigMap != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})

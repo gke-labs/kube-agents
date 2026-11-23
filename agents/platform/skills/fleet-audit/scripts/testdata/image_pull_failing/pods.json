@@ -1,0 +1,211 @@
+{
+  "source": "The pods of the two planted Deployments of bench/tasks/workload-image-pull-refused-node-identity and bench/tasks/workload-image-pull-refused-pull-secret, as the API server of a GKE Autopilot cluster on Kubernetes 1.35 returned them about five minutes after the plant (2026-11-19), cut to what the collector reads. Node names are replaced, and of the pod conditions only Initialized is kept.",
+  "items": [
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "streamed-image-service-79dd67676b-kmjl9",
+        "namespace": "seeded-streaming",
+        "labels": {
+          "app": "streamed-image-service",
+          "pod-template-hash": "79dd67676b"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "streamed-image-service-79dd67676b",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-19T00:01:27Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T00:01:27Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": ErrImagePull: failed to pull and unpack image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to resolve reference \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Abench-no-such-streaming-registry-project%2Fapps%2Fstreamed-image-service%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden",
+                "reason": "ImagePullBackOff"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "streamed-image-service-79dd67676b-x49sn",
+        "namespace": "seeded-streaming",
+        "labels": {
+          "app": "streamed-image-service",
+          "pod-template-hash": "79dd67676b"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "streamed-image-service-79dd67676b",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-19T00:01:22Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T00:01:22Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": ErrImagePull: failed to pull and unpack image \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to resolve reference \"us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Abench-no-such-streaming-registry-project%2Fapps%2Fstreamed-image-service%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden",
+                "reason": "ImagePullBackOff"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "private-image-worker-65f8c9fbdb-6lwzl",
+        "namespace": "seeded-registry",
+        "labels": {
+          "app": "private-image-worker",
+          "pod-template-hash": "65f8c9fbdb"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "private-image-worker-65f8c9fbdb",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2"
+          }
+        ],
+        "imagePullSecrets": [
+          {
+            "name": "private-reg-creds"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-19T00:01:35Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T00:01:35Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": ErrImagePull: [failed to pull and unpack image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to resolve reference \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Aprivate-registry-project%2Fapps%2Fprivate-image-worker%3Apull&service=us-east4-docker.pkg.dev: 401 Unauthorized, failed to pull and unpack image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to resolve reference \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Aprivate-registry-project%2Fapps%2Fprivate-image-worker%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden]",
+                "reason": "ImagePullBackOff"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "private-image-worker-65f8c9fbdb-jcz8v",
+        "namespace": "seeded-registry",
+        "labels": {
+          "app": "private-image-worker",
+          "pod-template-hash": "65f8c9fbdb"
+        },
+        "ownerReferences": [
+          {
+            "kind": "ReplicaSet",
+            "name": "private-image-worker-65f8c9fbdb",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "app",
+            "image": "us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2"
+          }
+        ],
+        "imagePullSecrets": [
+          {
+            "name": "private-reg-creds"
+          }
+        ],
+        "nodeName": "node-1"
+      },
+      "status": {
+        "phase": "Pending",
+        "startTime": "2026-11-19T00:01:32Z",
+        "conditions": [
+          {
+            "type": "Initialized",
+            "status": "True",
+            "lastTransitionTime": "2026-11-19T00:01:32Z"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "app",
+            "state": {
+              "waiting": {
+                "message": "Back-off pulling image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": ErrImagePull: [failed to pull and unpack image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to resolve reference \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Aprivate-registry-project%2Fapps%2Fprivate-image-worker%3Apull&service=us-east4-docker.pkg.dev: 401 Unauthorized, failed to pull and unpack image \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to resolve reference \"us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2\": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-east4-docker.pkg.dev/v2/token?scope=repository%3Aprivate-registry-project%2Fapps%2Fprivate-image-worker%3Apull&service=us-east4-docker.pkg.dev: 403 Forbidden]",
+                "reason": "ImagePullBackOff"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
