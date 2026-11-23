@@ -1726,8 +1726,10 @@ checks run as a delegated `cluster` task. Its one parameter, `dry_run`, marks a
 shadow run. Its persona is the `persona-fleet-audit`
 image, built from `agents/fleet-audit/persona`, and its report scripts are in the
 `a2a-worker` image under `/opt/kube-agents/scripts/fleet-audit`. `profiles.fleetAudit.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
-control its spec. Its tiers are `read` and `unattended`, since a scheduled audit
-runs at `unattended`. No schedule runs on it yet.
+control its spec. Its one tier is `unattended`, the tier a scheduled audit runs
+at. It has no `read` tier until its persona can do an on-demand run, since a
+`read` tier would make it a delegate target of every chat session. No schedule
+runs on it yet.
 
 ## Uninstalling
 

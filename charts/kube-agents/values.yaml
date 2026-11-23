@@ -2350,9 +2350,11 @@ profiles:
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
       model: model-default
       maxTurns: 120
-    # A scheduled audit runs at unattended; read is for an on-demand run.
+    # A scheduled audit runs at unattended. No read tier until the persona
+    # can do an on-demand run: a read tier on the card makes the profile a
+    # delegate target of every chat session, and today a run without dry_run
+    # only says it can't and stops.
     allowedTiers:
-      - read
       - unattended
     lifecycle:
       activeDeadlineSeconds: 3600

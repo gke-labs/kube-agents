@@ -546,7 +546,9 @@ class HelmFleetAuditProfileTest(unittest.TestCase):
         spec = self._profile(proc.stdout)["spec"]
         self.assertEqual(spec["persona"]["image"], "us-docker.pkg.dev/my-proj/my-mirror/persona-fleet-audit:v2026.11.02")
         self.assertEqual(spec["harness"]["image"], "us-docker.pkg.dev/my-proj/my-mirror/a2a-worker:v2026.11.02")
-        self.assertEqual(spec["allowedTiers"], ["read", "unattended"])
+        # Unattended alone: a read tier would make it a chat session's
+        # delegate target before the persona can do an on-demand run.
+        self.assertEqual(spec["allowedTiers"], ["unattended"])
         # The broker's report-store allowlist names this profile, so its name is fixed.
         self.assertEqual(self._profile(proc.stdout)["metadata"]["name"], "fleet-audit")
         self.assertNotIn("yieldToPinned", spec)
@@ -554,8 +556,9 @@ class HelmFleetAuditProfileTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
     def test_its_parameters_are_the_personas(self):
-        # The worker refuses a task when the CR's parameters and the persona's
-        # differ, so the chart's list is the persona's own: dry_run alone.
+        # The design has the worker refuse a task whose CR parameters and
+        # persona parameters differ; no code does that yet, so this test holds
+        # the chart's list to the persona's own (dry_run alone) until it does.
         persona = yaml.safe_load(_FLEET_AUDIT_PERSONA.read_text(encoding="utf-8"))
         want = [(p["name"], bool(p.get("required", False))) for p in persona["parameters"]]
         self.assertEqual(want, [("dry_run", False)])

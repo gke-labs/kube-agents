@@ -137,7 +137,6 @@ harness:
   model: model-default
   maxTurns: 120
 allowedTiers:
-  - read
   - unattended
 lifecycle:
   activeDeadlineSeconds: 3600
