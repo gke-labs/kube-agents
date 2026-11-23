@@ -217,3 +217,18 @@ func TestThePromptBoundCountsCharacters(t *testing.T) {
 		t.Fatalf("a prompt one character over: err = %v", err)
 	}
 }
+
+// The stop subject parses back to its source, and anything else is refused.
+func TestTheTriggerStopSubjectParsesToItsSource(t *testing.T) {
+	if got, err := ParseTriggerStopSubject(TriggerStopSubject("schedule")); err != nil || got != "schedule" {
+		t.Fatalf("parse = %q, %v", got, err)
+	}
+	for _, bad := range []string{"a2a.trigger.schedule.status", "a2a.trigger.a.b.stop", "a2a.trigger..stop", "a2a.other.schedule.stop"} {
+		if _, err := ParseTriggerStopSubject(bad); err == nil {
+			t.Errorf("%q parsed", bad)
+		}
+	}
+	if err := ValidateTriggerStop("triage", TriggerStop{Schedule: ScheduleRef{Namespace: "ns", Name: "n"}, TaskID: "t"}); err == nil {
+		t.Error("a stop from a source other than the schedule validated")
+	}
+}

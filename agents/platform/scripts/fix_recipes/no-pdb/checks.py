@@ -19,7 +19,8 @@ scope, before it reads anything. And whether the read is whole: `judge` cannot
 tell "no budgets or autoscalers" from "not read", so a partial read (a failed
 or forbidden kind) must be refused before it gets here, as
 `recheck.read_target` does for the sandbox. The budget file's own shape is
-`automerge_eligibility.parse_budget`'s in the broker and
+the recipe's `fix.py` (which `automerge_eligibility.verify_added_manifest`
+holds a pull request's file to in the broker) and
 `fix_preflight.budget_from_text`'s in the sandbox.
 
 A live budget whose selector this cannot read (an operator it does not know)
@@ -259,6 +260,6 @@ def checks(change: Any, live: dict) -> list[dict]:
     """The recipe interface: :func:`judge` for the fix `change` against the namespace read `live`.
 
     `change` carries `object` (`Kind/name`), `namespace`, `name` (the budget's)
-    and `selector`, as `automerge_eligibility.parse_budget`'s answer does.
+    and `selector`, as `automerge_eligibility.verify_added_manifest`'s answer does.
     """
     return judge(live, change.object, change.namespace, change.name, change.selector)

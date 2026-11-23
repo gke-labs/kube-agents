@@ -46,7 +46,15 @@ import chat_notify
 # governance reports to a Slack leg with no home channel.
 # On an install the A2A gateway serves, chat_notify.in_routed_order then puts a
 # configured home ahead of a learned one.
-CHAT_PLATFORMS = ("google_chat", "slack")
+CHAT_PLATFORMS = ("google_chat", "slack", "teams")
+
+# The platforms this resolver names only when the A2A gateway routes them
+# (`chat_notify.routes`): no config file or environment signal enables them
+# here. Teams on the Hermes path has its own cron delivery (`deliver: teams`)
+# and was never a destination of these callers; the gateway's Teams backend
+# (the operator's A2A_TEAMS_BACKEND switch) is, through its chat.notify route,
+# so an install moves to it only with that switch, never on an upgrade.
+ROUTE_ONLY_PLATFORMS = ("teams",)
 
 # The managed scope, mounted read-only by the operator and machine-global — one
 # /etc/hermes for every profile in the pod, so a cron child in the platform-agent
@@ -220,6 +228,8 @@ def enabled_chat_platforms() -> list[str]:
         # still a platform this install posts to.
         if chat_notify.routes(name):
             enabled = True
+        elif name in ROUTE_ONLY_PLATFORMS:
+            enabled = False
         elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
@@ -233,4 +243,4 @@ def enabled_chat_platforms() -> list[str]:
     return chat_notify.in_routed_order(resolved) or [DEFAULT_PLATFORM]
 
 
-__all__ = ["CHAT_PLATFORMS", "DEFAULT_PLATFORM", "enabled_chat_platforms"]
+__all__ = ["CHAT_PLATFORMS", "DEFAULT_PLATFORM", "ROUTE_ONLY_PLATFORMS", "enabled_chat_platforms"]

@@ -23,12 +23,10 @@ Hermes does not list one under a skill's support directories (``scripts/``
 among them) as a skill either; ``skill_view`` opens it only as a file of the
 skill that holds it.
 
-``scripts/check_skill_size.py``, ``tests/test_skill_inline_commands.py`` and
-``deploy/docker/check_skill_commands.py`` all read skills through this module,
-and ``deploy/docker/test_skill_documents.py`` holds them to it, so a document
-kind one check reads cannot fall out of another's view. It sits beside
-``check_skill_commands.py`` because the image build copies the two together.
-Standard library only.
+``scripts/check_skill_size.py`` and ``tests/test_skill_inline_commands.py``
+both read skills through this module, and
+``deploy/docker/test_skill_documents.py`` holds them to it, so a document kind
+one check reads cannot fall out of the other's view. Standard library only.
 """
 
 from __future__ import annotations

@@ -2130,6 +2130,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
+    NOTIFY_TEAMS_PROBE = "chat.notify.teams"
     NOTIFY_CONSOLE_PROBE = "chat.notify.console"
     NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
 
@@ -2137,7 +2138,8 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """The chat.notify route: only the agent asks, only the gateway answers.
 
         The gateway posts what arrives on `chat.notify.gchat` (or, on a
-        Slack-armed gateway, `chat.notify.slack`) to the home channel as the
+        Slack-armed gateway, `chat.notify.slack`; on a Teams-armed one,
+        `chat.notify.teams`) to the home channel as the
         install's bot, and what arrives on `chat.notify.console` into a console
         conversation, so a second writer there is a second
         principal that can make the bot speak; and the agent takes the answer
@@ -2150,6 +2152,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         for probe, want in (
             (self.NOTIFY_PROBE, ["agent"]),
             (self.NOTIFY_SLACK_PROBE, ["agent"]),
+            (self.NOTIFY_TEAMS_PROBE, ["agent"]),
             (self.NOTIFY_CONSOLE_PROBE, ["agent"]),
             (self.NOTIFY_REPLY_PROBE, ["gateway"]),
         ):
@@ -2913,11 +2916,25 @@ class A3TheA2AChatRoleIsTheA2AGatewaysAlone(unittest.TestCase):
             "the operator renders the a2a-chat binding under a name the broker does not read: "
             "the binding is dropped and the audience alone decides",
         )
+        # Every audience render carries the binding beside it: the Chat-armed
+        # block and the Teams-only block each render the pair, so a binding
+        # found somewhere in the file does not show the block that lost it.
         render = h.text("manifests_go")
-        self.assertRegex(
+        audiences = re.findall(
+            r"Name:\s*credentialProxyA2AChatAudienceEnvVar,\s*Value:\s*credentialProxyA2AChatAudience",
             render,
-            r"Name:\s*credentialProxyA2AChatCallersEnvVar,\s*Value:\s*a2aGatewayBrokerCaller\(agent\)",
-            "the broker env no longer names the A2A gateway's ServiceAccount as the a2a-chat caller",
+        )
+        paired_bindings = re.findall(
+            r"Name:\s*credentialProxyA2AChatAudienceEnvVar,\s*Value:\s*credentialProxyA2AChatAudience\}\s*,\s*"
+            r"corev1\.EnvVar\{Name:\s*credentialProxyA2AChatCallersEnvVar,\s*Value:\s*a2aGatewayBrokerCaller\(agent\)",
+            render,
+        )
+        self.assertGreaterEqual(len(audiences), 1, "the broker env no longer arms the a2a-chat audience")
+        self.assertEqual(
+            len(paired_bindings),
+            len(audiences),
+            "every a2a-chat audience render in the broker env must bind "
+            "credentialProxyA2AChatCallersEnvVar to a2aGatewayBrokerCaller(agent)",
         )
 
     def test_A3_the_exec_tier_keeps_the_a2a_chat_binding(self) -> None:
