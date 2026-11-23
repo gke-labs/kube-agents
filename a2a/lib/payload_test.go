@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -402,22 +403,32 @@ func TestScopeClustersBounds(t *testing.T) {
 	for i := range widest {
 		widest[i] = ScopeCluster{Project: long, Location: long, Cluster: long}
 	}
-	// The widest page of the longest labels fits the byte bound, so the
-	// byte bound never cuts a page the other rules allow.
-	if _, err := ScopeClustersPart(ScopeClusters{Count: 1 << 20, Truncated: true, Clusters: widest}); err != nil {
+	// The widest page and unlisted list of the longest labels fit the byte
+	// bound, so the byte bound never cuts a page the other rules allow.
+	unlisted := make([]string, ScopeClustersUnlistedMax)
+	for i := range unlisted {
+		unlisted[i] = long
+	}
+	if _, err := ScopeClustersPart(ScopeClusters{Count: 1 << 20, Truncated: true, Clusters: widest,
+		Unknown: true, UnlistedProjects: unlisted, UnlistedCount: 1 << 20, OldestListing: "2026-11-23T10:00:00Z"}); err != nil {
 		t.Fatalf("widest page refused: %v", err)
 	}
 	for name, s := range map[string]ScopeClusters{
-		"page past the max":   {Count: ScopeClustersPageMax + 1, Clusters: page(ScopeClustersPageMax + 1)},
-		"count under page":    {Count: 1, Truncated: false, Clusters: page(2)},
-		"negative count":      {Count: -1},
-		"truncated, all here": {Count: 1, Truncated: true, Clusters: []ScopeCluster{one}},
-		"cut, not truncated":  {Count: 2, Clusters: []ScopeCluster{one}},
-		"cursor set":          {Count: 1, Clusters: []ScopeCluster{one}, Cursor: "next"},
-		"empty project":       {Count: 1, Clusters: []ScopeCluster{{Location: "l", Cluster: "c"}}},
-		"dotted location":     {Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "us.central1", Cluster: "c"}}},
-		"upper-case cluster":  {Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "Prod"}}},
-		"label past 63":       {Count: 1, Clusters: []ScopeCluster{{Project: long + "a", Location: "l", Cluster: "c"}}},
+		"page past the max":      {Count: ScopeClustersPageMax + 1, Clusters: page(ScopeClustersPageMax + 1)},
+		"count under page":       {Count: 1, Truncated: false, Clusters: page(2)},
+		"negative count":         {Count: -1},
+		"truncated, all here":    {Count: 1, Truncated: true, Clusters: []ScopeCluster{one}},
+		"cut, not truncated":     {Count: 2, Clusters: []ScopeCluster{one}},
+		"cursor set":             {Count: 1, Clusters: []ScopeCluster{one}, Cursor: "next"},
+		"empty project":          {Count: 1, Clusters: []ScopeCluster{{Location: "l", Cluster: "c"}}},
+		"dotted location":        {Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "us.central1", Cluster: "c"}}},
+		"upper-case cluster":     {Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "Prod"}}},
+		"label past 63":          {Count: 1, Clusters: []ScopeCluster{{Project: long + "a", Location: "l", Cluster: "c"}}},
+		"unknown, not truncated": {Count: 0, Unknown: true},
+		"unlisted past the max":  {UnlistedProjects: append(slices.Clone(unlisted), "p"), UnlistedCount: ScopeClustersUnlistedMax + 1},
+		"unlisted count under":   {UnlistedProjects: []string{"p", "q"}, UnlistedCount: 1},
+		"unlisted not a label":   {UnlistedProjects: []string{"P_1"}, UnlistedCount: 1},
+		"oldest not a time":      {Count: 1, Clusters: []ScopeCluster{one}, OldestListing: "yesterday"},
 	} {
 		if _, err := ScopeClustersPart(s); err == nil {
 			t.Errorf("%s: ScopeClustersPart accepted %+v", name, s)
@@ -430,6 +441,41 @@ func TestScopeClustersBounds(t *testing.T) {
 	noList := Part{Kind: "data", Data: json.RawMessage(`{"scopeClusters":{"count":0}}`)}
 	if _, ok, err := ScopeClustersOf([]Part{noList}); !ok || err == nil {
 		t.Errorf("no clusters list: ok %v err %v, want found and refused", ok, err)
+	}
+}
+
+// The fields that say what a page can't (unknown, unlisted, the oldest
+// listing) round-trip, and are absent from a part that doesn't set them, so
+// that part is byte for byte the shape first written.
+func TestScopeClustersUnknownAndUnlisted(t *testing.T) {
+	want := ScopeClusters{Count: 1, Truncated: true, Unknown: true,
+		Clusters:         []ScopeCluster{{Project: "proj-a", Location: "us-central1", Cluster: "prod-1"}},
+		UnlistedProjects: []string{"mgmt", "proj-x"}, UnlistedCount: 3, OldestListing: "2026-11-23T10:00:00Z"}
+	part, err := ScopeClustersPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := ScopeClustersOf([]Part{part})
+	if err != nil || !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ScopeClustersOf = %+v %v %v, want %+v", got, ok, err, want)
+	}
+	// Unknown with nothing known: an empty page, still truncated.
+	if _, err := ScopeClustersPart(ScopeClusters{Unknown: true, Truncated: true}); err != nil {
+		t.Errorf("unknown empty page refused: %v", err)
+	}
+	// Unknown lets the count stand under what a page would hold.
+	if _, err := ScopeClustersPart(ScopeClusters{Count: 1, Truncated: true, Unknown: true,
+		Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}}); err != nil {
+		t.Errorf("unknown with all known clusters on the page refused: %v", err)
+	}
+	plain, err := ScopeClustersPart(ScopeClusters{Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"unknown", "unlistedProjects", "unlistedCount", "oldestListing"} {
+		if strings.Contains(string(plain.Data), key) {
+			t.Errorf("a part without %s carries it: %s", key, plain.Data)
+		}
 	}
 }
 

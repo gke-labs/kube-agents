@@ -7,6 +7,7 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -550,11 +551,28 @@ func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
 // how many clusters are in scope in all, so Truncated is Count past the
 // page. Cursor is reserved for a later paging contract and is always empty
 // for now; a reader ignores it.
+//
+// Three fields say what the page can't. Unknown is set when the gateway has
+// no full cluster list to count (the resolved scope carries none, or dropped
+// it for size): Count is then only the clusters it knows of, a lower bound,
+// and Truncated is always set. UnlistedProjects names projects in scope
+// whose clusters no list the gateway reads carries (an explicitly declared
+// project, the management project, a member not yet listed), sorted and cut
+// at ScopeClustersUnlistedMax, with UnlistedCount the total; their clusters
+// are listed elsewhere, and a delegation to one is still checked as it
+// arrives. OldestListing is when the oldest listing the counted clusters
+// came from was read (RFC 3339), so a reader can tell a stale one. All
+// three are left out when unset, so a part without them is the shape first
+// written.
 type ScopeClusters struct {
-	Count     int            `json:"count"`
-	Clusters  []ScopeCluster `json:"clusters"`
-	Truncated bool           `json:"truncated"`
-	Cursor    string         `json:"cursor"`
+	Count            int            `json:"count"`
+	Clusters         []ScopeCluster `json:"clusters"`
+	Truncated        bool           `json:"truncated"`
+	Cursor           string         `json:"cursor"`
+	Unknown          bool           `json:"unknown,omitempty"`
+	UnlistedProjects []string       `json:"unlistedProjects,omitempty"`
+	UnlistedCount    int            `json:"unlistedCount,omitempty"`
+	OldestListing    string         `json:"oldestListing,omitempty"`
 }
 
 // ScopeCluster is one cluster on a scopeClusters page: the target a
@@ -568,11 +586,14 @@ type ScopeCluster struct {
 // ScopeClustersPageMax is the most clusters one scopeClusters page carries:
 // the widest batch any gateway accepts (DelegateBatchMax). A gateway caps its
 // page at its own delegation width under this bound, so the page is one
-// batch's worth of targets. ScopeClustersMaxBytes bounds the encoded part,
-// which the session pod hands its tool server in one environment variable.
+// batch's worth of targets. ScopeClustersUnlistedMax is the most projects
+// UnlistedProjects names. ScopeClustersMaxBytes bounds the encoded part,
+// which the session pod hands its tool server in one environment variable;
+// the widest page and unlisted list of the longest labels fit under it.
 const (
-	ScopeClustersPageMax  = DelegateBatchMax
-	ScopeClustersMaxBytes = 4 * 1024
+	ScopeClustersPageMax     = DelegateBatchMax
+	ScopeClustersUnlistedMax = 16
+	ScopeClustersMaxBytes    = 8 * 1024
 )
 
 const scopeClustersKey = "scopeClusters"
@@ -584,7 +605,10 @@ func validateScopeClusters(s ScopeClusters) error {
 	if s.Count < len(s.Clusters) {
 		return fmt.Errorf("scope clusters: count %d is under the page's %d", s.Count, len(s.Clusters))
 	}
-	if s.Truncated != (s.Count > len(s.Clusters)) {
+	if s.Unknown && !s.Truncated {
+		return errors.New("scope clusters: an unknown count is always truncated")
+	}
+	if !s.Unknown && s.Truncated != (s.Count > len(s.Clusters)) {
 		return fmt.Errorf("scope clusters: truncated is %t with count %d and a page of %d", s.Truncated, s.Count, len(s.Clusters))
 	}
 	if s.Cursor != "" {
@@ -593,6 +617,22 @@ func validateScopeClusters(s ScopeClusters) error {
 	for _, c := range s.Clusters {
 		if !validDNS1123Label(c.Project) || !validDNS1123Label(c.Location) || !validDNS1123Label(c.Cluster) {
 			return fmt.Errorf("scope clusters: %q/%q/%q is not a cluster target", c.Project, c.Location, c.Cluster)
+		}
+	}
+	if len(s.UnlistedProjects) > ScopeClustersUnlistedMax {
+		return fmt.Errorf("scope clusters: %d unlisted projects, at most %d", len(s.UnlistedProjects), ScopeClustersUnlistedMax)
+	}
+	if s.UnlistedCount < len(s.UnlistedProjects) {
+		return fmt.Errorf("scope clusters: unlisted count %d is under the %d named", s.UnlistedCount, len(s.UnlistedProjects))
+	}
+	for _, p := range s.UnlistedProjects {
+		if !validDNS1123Label(p) {
+			return fmt.Errorf("scope clusters: unlisted %q is not a project", p)
+		}
+	}
+	if s.OldestListing != "" {
+		if _, err := time.Parse(time.RFC3339, s.OldestListing); err != nil {
+			return fmt.Errorf("scope clusters: oldest listing %q is not a time", s.OldestListing)
 		}
 	}
 	if raw, err := json.Marshal(s); err != nil || len(raw) > ScopeClustersMaxBytes {
